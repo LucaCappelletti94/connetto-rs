@@ -66,7 +66,7 @@ The oplog is a ring buffer with a configurable retention window, expressed as:
 
 Entries older than the window are purged. Tombstones follow the same retention rules as regular entries.
 
-The default window is an open question; it must be large enough to handle common offline durations (hours to a day) without requiring a full re-sync.
+**Default: 72 hours or 1M entries, whichever is hit first.** Both are configurable per deployment. Pruning is unconditional on the retention window — no per-client cursor tracking. Clients outside the window get a full re-sync.
 
 ---
 
@@ -103,17 +103,15 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 1. Server checks `last_lsn` against the oldest entry in the oplog.
 2. If `last_lsn >= oplog_min_lsn`: the server can replay.
 3. For each re-declared subscription:
-   - Server sends `SnapshotBegin` → `SnapshotRows` (catchup patch: only rows changed since `last_lsn` that match the subscription) → `SnapshotEnd(current_lsn)`.
-   - Alternatively, if the client already has the full snapshot and only needs incremental changes: send `RowUpdate` messages for all matching oplog entries since `last_lsn` without a full snapshot.
-
-The "catchup patch as a mini-snapshot vs. RowUpdate stream" choice is an open question.
+   - Server queries the oplog for entries since `last_lsn` that match the subscription + auth context, converts them into a SQLite PatchSet, and sends it. Same format as the live path — no special catchup message type.
 
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 
 1. The client's resume cursor predates the oldest available oplog entry. It cannot catch up incrementally.
-2. For each re-declared subscription:
+2. Server sends `FullResyncRequired { reason: "lsn_outside_retention_window" }` — the client shows a "re-syncing..." state and clears local data for affected subscriptions.
+3. For each re-declared subscription:
    - Server sends a full snapshot: `SnapshotBegin` → `SnapshotRows` (all matching rows) → `SnapshotEnd(current_lsn)`.
-3. The client replaces its local data for each subscription with the snapshot.
+4. The client applies the snapshot as a full replacement (not a merge).
 
 ### Case 3: Schema changed while offline
 
@@ -162,7 +160,9 @@ Tombstones also ensure that auth-filtered rows are correctly handled: if a row w
 
 ## Decisions
 
-*(none yet)*
+**Oplog is a PostgreSQL table, replicated across the mesh.** Each row is a change record (table, pk, op, old/new values, LSN/position, timestamp). It must be a PostgreSQL table because the mesh requires all nodes to see it. Retention window is managed by periodic cleanup.
+
+**Delivery format is SQLite PatchSet.** The server reads oplog entries relevant to the client's subscriptions and auth context, converts them into a SQLite PatchSet, and sends it. On the live path: CDC event → match subscriptions → auth filter → convert to PatchSet → send. On the reconnect path: query oplog since client's last position → filter by subscriptions + auth → convert to PatchSet → send. The PatchSet format is native to the client (SQLite session extension), so no conversion is needed on the client side.
 
 ---
 

@@ -66,7 +66,8 @@ When a CDC event arrives:
 
 1. Check if it affects any aggregate subscriptions (by table + predicate matching).
 2. For each affected subscription, apply the incremental update rule to the accumulator.
-3. If the accumulator value changed, push `AggregateUpdate { sub_id, value }` to the client.
+3. For GROUP BY subscriptions with a HAVING clause, evaluate the HAVING predicate against the updated accumulator to determine whether each affected group enters, exits, or stays in the result set.
+4. If the accumulator value changed (and passes HAVING, if present), push `AggregateUpdate { sub_id, value }` to the client.
 
 For GROUP BY aggregates, the `value` is the updated group map (or a delta of changed groups).
 
@@ -132,18 +133,24 @@ Both paths are indexed by table name and filtered by predicate.
 ## Open Questions
 
 1. **Which aggregate shapes get IVM (incremental view maintenance) vs. re-execution fallback?** The initial list above is a starting point. MIN and MAX with deletions are the hardest — are they in scope for IVM?
-2. **Having clauses**: should `HAVING` filters be supported in the aggregate spec? These apply after grouping and are harder to evaluate incrementally.
-3. **Multi-table aggregates**: aggregates that JOIN multiple tables (e.g. `SELECT COUNT(*) FROM orders JOIN users ...`) are not addressed here. Are they in scope?
-4. **Accumulator persistence**: is the accumulator state kept only in memory (lost on server restart, requiring re-execution to rebuild) or persisted? Memory is simpler; persistence is more efficient for long-running subscriptions.
-5. **Rate-limiting re-execution**: what is the right throttle for re-execution? Per-subscription cooldown? Global quota?
-6. **Delta format for GROUP BY**: when many groups change at once (e.g. a batch import), should the server send full group map replacement or a delta list? At what size does full replacement become preferable?
+2. ~~**Having clauses**: should `HAVING` filters be supported in the aggregate spec? These apply after grouping and are harder to evaluate incrementally.~~ **Decided (Q5.2):** HAVING is evaluated server-side by `subql`. Groups that fail the HAVING predicate are never sent to the client. Follows the same two-tier pattern: in-process fast path for predicates `subql` can evaluate against accumulator state, SQL re-execution fallback for the rest. Per-session map tracks which queries require re-execution; coverage expands over time as `subql`'s fast solver adds support for more HAVING shapes.
+3. ~~**Multi-table aggregates**: aggregates that JOIN multiple tables (e.g. `SELECT COUNT(*) FROM orders JOIN users ...`) are not addressed here. Are they in scope?~~ **Decided (Q5.3):** Yes, supported via re-execution fallback. Multi-table aggregates go into the per-session re-execution map. `subql` tracks all involved tables and triggers re-execution on CDC events from any of them. No in-process IVM for joins.
+4. ~~**Accumulator persistence**: is the accumulator state kept only in memory (lost on server restart, requiring re-execution to rebuild) or persisted? Memory is simpler; persistence is more efficient for long-running subscriptions.~~ **Decided (Q5.4):** Not a connetto concern. `subql` owns accumulator lifecycle. Currently in-memory; rebuilt via re-execution on restart. Persistence is a future `subql` optimization.
+5. ~~**Rate-limiting re-execution**: what is the right throttle for re-execution? Per-subscription cooldown? Global quota?~~ **Decided (Q5.5):** Not a connetto concern. `subql` owns re-execution scheduling — debounce, concurrency caps, and burst coalescing are internal to `subql`.
+6. ~~**Delta format for GROUP BY**: when many groups change at once (e.g. a batch import), should the server send full group map replacement or a delta list? At what size does full replacement become preferable?~~ **Decided (Q5.6):** Dissolved. IVM path naturally produces per-group deltas (only changed groups). Re-execution fallback naturally produces full results. No threshold switching needed — the format follows from which path was used.
 7. **Client schema for aggregate results**: the client stores aggregate results in local SQLite — what does the schema look like for GROUP BY results? A key-value table? A typed table generated from the spec?
 
 ---
 
 ## Decisions
 
-*(none yet)*
+**All aggregates go through the server-side accumulator path.** Materialized views and trigger-maintained tables are not used for aggregate subscriptions. Even on tables where RLS is absent, everything is treated as per-user to avoid a split code path.
+
+**Reason RLS kills materialized views:** a materialized view is a single computed result. Under RLS, `COUNT(*) FROM orders` returns a different value per user — there is no single server-side value to mirror. The result only exists in the context of a specific user's authorization context.
+
+**Aggregate results are connetto-managed client storage, not application schema.** The schema symmetry principle (client mirrors server) applies to row-level data only. Aggregate results have no PostgreSQL counterpart — they are per-session computed values cached by connetto on the client.
+
+**Wire format for aggregate results: JSON.** Results are delivered as JSON and deserialized on the client into `T: serde::DeserializeOwned`. The application defines the result struct; connetto provides the raw JSON.
 
 ---
 

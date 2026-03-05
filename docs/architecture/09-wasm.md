@@ -140,7 +140,7 @@ trait FileStore: Send {
 }
 ```
 
-Native implementations use `tokio-tungstenite`, `rusqlite`, and `std::fs`. WASM implementations use `web-sys::WebSocket`, `sqlite-wasm` over OPFS, and OPFS file APIs.
+Native implementations use `tokio-tungstenite`, `diesel` (with SQLite backend), and `std::fs`. WASM implementations use `web-sys::WebSocket`, `sqlite-wasm-rs` over OPFS, and OPFS file APIs.
 
 The sync engine crate depends only on these traits — it has no direct dependency on native or WASM I/O primitives.
 
