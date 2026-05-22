@@ -369,12 +369,13 @@
       <text x="135" y="50" text-anchor="middle" font-size="9" fill="#888">reconnect loop, exp backoff</text>
     </g>
 
-    <!-- ===== geolite ===== -->
+    <!-- ===== sqlitegis ===== -->
     <g transform="translate(1288, 372)">
-      <rect width="270" height="56" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#42A5F5" />
-      <text x="135" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">geolite</text>
-      <text x="135" y="36" text-anchor="middle" font-size="9" fill="#42A5F5">PostGIS-like spatial, WASM-compat</text>
+      <rect width="270" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="56" rx="1" fill="#4CAF50" />
+      <text x="135" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlitegis</text>
+      <text x="135" y="36" text-anchor="middle" font-size="9" font-family="monospace" fill="#4CAF50">v0.1.3 · crates.io</text>
+      <text x="135" y="50" text-anchor="middle" font-size="9" fill="#888">PostGIS-style spatial, WASM-compat</text>
     </g>
 
     <!-- WS arrow from transport to native sync engine -->
@@ -458,12 +459,12 @@
       <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">auto-extension (nice-to-have for WASM)</text>
     </g>
 
-    <!-- geolite (WASM) -->
+    <!-- sqlitegis (WASM) -->
     <g transform="translate(1288, 852)">
-      <rect width="260" height="40" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
-      <rect width="3" height="40" rx="1" fill="#42A5F5" />
-      <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">geolite</text>
-      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">same as native</text>
+      <rect width="260" height="40" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="40" rx="1" fill="#4CAF50" />
+      <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlitegis</text>
+      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#4CAF50">v0.1.3 · same as native</text>
     </g>
 
     <!-- WebSocket via web-sys -->
