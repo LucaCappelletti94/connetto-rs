@@ -29,7 +29,7 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Server session | One struct per connected client: holds the WebSocket (or other) sink/stream, client ID, current subscription set, and flow-control budget. |
 | Client connector | Opens the connection, sends handshake, drives the read loop, and exposes a typed message channel to higher layers. |
-| Reconnect loop | Client-side: exponential back-off, re-sends subscriptions and pending mutations after reconnect. |
+| Reconnect loop | Client-side: exponential back-off, re-sends subscriptions and pending mutations after reconnect. *(Reliability: see §10.)* |
 | Flow control | Per-session send-window to prevent the server from flooding a slow client. Server back-pressures CDC delivery when window is exhausted. |
 | Keepalive | Ping/pong at a configurable interval; server drops a session after N missed heartbeats. |
 
@@ -51,9 +51,9 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Piece | Description |
 |---|---|
-| Local mutation queue | Client persists pending mutations in SQLite before sending; survives process restart and offline. |
-| Mutation sender | Reads from the local queue, sends in order, awaits acknowledgement before dequeuing. |
-| Server mutation handler | Validates schema and authorization, applies to PostgreSQL, and returns `Ack` or `Reject`. |
+| Local mutation queue | Client persists pending mutations in SQLite before sending; survives process restart and offline. *(Reliability: see §10.)* |
+| Mutation sender | Reads from the local queue, sends in order, awaits acknowledgement before dequeuing. *(Reliability: see §10.)* |
+| Server mutation handler | Validates schema and authorization, applies to PostgreSQL, and returns `Ack` or `Reject`. Owned by the Subscription Materializer (§10); transient PG failures retried per its policy. |
 | Conflict detector | Compares mutation's base version to current server version; emits `Conflict` response when they diverge. |
 | Conflict resolution policy | Configurable per-table strategy (last-writer-wins, server-wins, client-wins, or custom merge). |
 | Optimistic rollback | On `Reject` or unresolvable `Conflict`, client rolls back the optimistic local write. |
@@ -64,11 +64,11 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Piece | Description |
 |---|---|
-| CDC source | Logical replication or `LISTEN`/`NOTIFY` listener that produces a stream of `ChangeRecord`s from PostgreSQL. |
-| Subscription matcher | For each incoming `ChangeRecord`, identifies which active subscriptions are potentially affected. |
-| Auth filter | Per-subscription, per-row check: "can this client see this row after this change?" Rows that fail are dropped or replaced with a delete event. |
-| Delta packager | Groups affected rows into a batch message; adds server LSN / clock for the client to store as its resume position. |
-| Delivery queue | Per-session outbound queue; respects flow-control window; drops or back-pressures when client is slow. |
+| CDC source | Logical replication or `LISTEN`/`NOTIFY` listener that produces a stream of `ChangeRecord`s from PostgreSQL. Owned by the Subscription Materializer (§10); reconnects on slot drop with backoff. |
+| Subscription matcher | For each incoming `ChangeRecord`, identifies which active subscriptions are potentially affected. **In-process** via subql; no DB or network, no retry surface. |
+| Auth filter | Per-subscription, per-row check via OpenFGA: "can this client see this row after this change?" Rows that fail are dropped or replaced with a delete event. *(Reliability: see §10 — fail-closed under transient auth outage.)* |
+| Delta packager | Groups affected rows into a batch message; adds server LSN / clock for the client to store as its resume position. Implemented via `sqlite-diff-rs` patchsets, built by the Subscription Materializer (§10). |
+| Delivery queue | Per-session outbound queue; respects flow-control window; drops or back-pressures when client is slow. *(Reliability: see §10.)* |
 
 ---
 
@@ -88,7 +88,7 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Accumulator state | Per-subscription server-side state for supported aggregate shapes (COUNT, SUM, etc.). |
 | Incremental update handler | On CDC event: update accumulator and push delta to client if it changes the result. |
-| Full re-execution fallback | For unsupported shapes or when accumulator is invalid: re-run the query and push the new value. |
+| Full re-execution fallback | For unsupported shapes or when accumulator is invalid: subql emits a `NeedsReexecution { query_id }` trigger; the Subscription Materializer (§10) re-runs the query against PG, coalesces duplicate triggers, and `install`s the new value back into subql. *(Reliability: see §10.)* |
 
 *(See `05-aggregate-queries.md` for full discussion.)*
 
@@ -124,9 +124,9 @@ A structured inventory of every component that must exist. This is not a depende
 | File metadata table | A normal synced table: file ID, path, size, content hash, version. Syncs through the standard row-sync path. |
 | Content channel | Separate from the row-sync channel; transfers raw bytes. |
 | Chunker | Splits file content into fixed-size chunks addressed by hash. |
-| Upload path | Client → server: client announces intent, uploads chunks, server reassembles and stores. |
-| Download path | Server → client: server announces new/changed file via metadata update, client requests chunks by hash. |
-| Resumability | Client tracks which chunks it already has; skips re-downloading identical chunks. |
+| Upload path | Client → server: client announces intent, uploads chunks, server reassembles and stores. *(Reliability: per-chunk retry; see §10.)* |
+| Download path | Server → client: server announces new/changed file via metadata update, client requests chunks by hash. *(Reliability: per-chunk retry; see §10.)* |
+| Resumability | Client tracks which chunks it already has; skips re-downloading identical chunks. The retry policy and idempotency story for individual chunk transfers live in §10. |
 | WASM constraints | No direct filesystem; content must be streamed into browser storage. *(See `09-wasm.md`.)* |
 
 ---
@@ -137,8 +137,8 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Policy source | PostgreSQL RLS definitions (or a derived equivalent) compiled into a fast in-process policy engine. |
 | Auth context | Per-session identity and claims passed to every policy evaluation. |
-| Read filter | Applied to every row before delivery — both at snapshot time and on CDC push. |
-| Write gate | Applied to every mutation before it is executed. |
+| Read filter | Applied to every row before delivery — both at snapshot time and on CDC push. *(Reliability: see §10 — fail-closed; transient OpenFGA outage does not let unauthorized rows through.)* |
+| Write gate | Applied to every mutation before it is executed. *(Reliability: see §10.)* |
 | Auth batching | Policies are evaluated in batch per CDC event to avoid per-row round-trips. |
 | File session token | Short-lived token issued for a specific file; gates chunk upload/download without per-chunk auth calls. |
 

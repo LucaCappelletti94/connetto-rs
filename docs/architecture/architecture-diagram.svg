@@ -171,7 +171,7 @@
       <rect width="310" height="70" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
       <rect width="4" height="70" rx="1" fill="#42A5F5" />
       <text x="155" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">sqlite-diff-rs</text>
-      <text x="155" y="38" text-anchor="middle" font-size="10" font-family="monospace" fill="#42A5F5">unpublished</text>
+      <text x="155" y="38" text-anchor="middle" font-size="10" font-family="monospace" fill="#42A5F5">v0.1.0 · git-only</text>
       <text x="155" y="54" text-anchor="middle" font-size="10" fill="#78909C">PatchSet binary format (no SQLite needed)</text>
     </g>
 
@@ -179,48 +179,48 @@
     <rect x="545" y="190" width="310" height="400" rx="8" fill="#E3F2FD" stroke="#42A5F5" stroke-width="1.5" />
     <rect x="545" y="190" width="5" height="400" rx="2" fill="#42A5F5" />
     <text x="700" y="210" text-anchor="middle" font-size="13" font-weight="600" fill="#1565C0">subql</text>
-    <text x="700" y="224" text-anchor="middle" font-size="10" fill="#42A5F5">unpublished</text>
+    <text x="700" y="224" text-anchor="middle" font-size="10" fill="#42A5F5">v0.1.0 · git-only</text>
 
     <!-- Subscription Registry -->
     <g transform="translate(558, 236)">
       <rect width="284" height="44" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#42A5F5" />
       <text x="142" y="18" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Subscription Registry &amp; Predicate Evaluator</text>
-      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#888">WHERE clause fast-path + SQL re-execution fallback</text>
+      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#42A5F5">shipped · WHERE compile, dedup, VM eval, ConsumerNotifications</text>
     </g>
 
     <!-- Accumulator State (IVM) -->
     <g transform="translate(558, 292)">
-      <rect width="284" height="70" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1" />
-      <rect width="3" height="70" rx="1" fill="#EF5350" />
+      <rect width="284" height="70" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
+      <rect width="3" height="70" rx="1" fill="#42A5F5" />
       <text x="142" y="18" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Accumulator State (IVM)</text>
-      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#EF5350">not started</text>
-      <text x="142" y="48" text-anchor="middle" font-size="9" fill="#EF5350">COUNT, SUM, AVG, GROUP BY</text>
-      <text x="142" y="62" text-anchor="middle" font-size="9" fill="#EF5350">MIN/MAX, DISTINCT, HAVING, UPDATE transitions</text>
+      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#42A5F5">partial · scalar aggregates shipped, GROUP BY IVM v2 deferred</text>
+      <text x="142" y="48" text-anchor="middle" font-size="9"><tspan fill="#42A5F5">COUNT, SUM, AVG, VAR, STDDEV, scalar MIN/MAX</tspan></text>
+      <text x="142" y="62" text-anchor="middle" font-size="9" fill="#EF5350">GROUP BY, DISTINCT, per-group MIN/MAX, HAVING fast path</text>
     </g>
 
     <!-- Re-execution Fallback -->
     <g transform="translate(558, 374)">
-      <rect width="284" height="36" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1" />
-      <rect width="3" height="36" rx="1" fill="#EF5350" />
+      <rect width="284" height="36" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
+      <rect width="3" height="36" rx="1" fill="#42A5F5" />
       <text x="142" y="14" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Re-execution Fallback</text>
-      <text x="142" y="28" text-anchor="middle" font-size="9" fill="#EF5350">not started · rate-limited SQL for complex predicates/JOINs</text>
+      <text x="142" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">shipped · scalar NeedsReexecution + Diesel connectors; row-set decode deferred</text>
     </g>
 
     <!-- Per-session cursor + pending buffer -->
     <g transform="translate(558, 422)">
-      <rect width="284" height="44" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1" />
-      <rect width="3" height="44" rx="1" fill="#EF5350" />
+      <rect width="284" height="44" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
+      <rect width="3" height="44" rx="1" fill="#42A5F5" />
       <text x="142" y="18" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Per-session Cursor &amp; Pending Buffer</text>
-      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#EF5350">not started · LSN tracking, PatchSet buffering for reconnect</text>
+      <text x="142" y="34" text-anchor="middle" font-size="9"><tspan fill="#42A5F5">cursor API shipped (advance/force/drop, monotonic)</tspan><tspan fill="#EF5350"> · pending PatchSet buffer TBD</tspan></text>
     </g>
 
     <!-- OpenFGA SDK integration -->
     <g transform="translate(558, 478)">
-      <rect width="284" height="36" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="36" rx="1" fill="#4CAF50" />
+      <rect width="284" height="36" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1" />
+      <rect width="3" height="36" rx="1" fill="#EF5350" />
       <text x="142" y="14" text-anchor="middle" font-size="11" font-weight="500" fill="#333">OpenFGA SDK Integration</text>
-      <text x="142" y="28" text-anchor="middle" font-size="9" fill="#888">batch check, cache TTL, session invalidation</text>
+      <text x="142" y="28" text-anchor="middle" font-size="9" fill="#EF5350">not started · lives in connetto-server (§10 materializer)</text>
     </g>
 
     <!-- pg-walstream (inside subql) -->
@@ -228,7 +228,7 @@
       <rect width="284" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="50" rx="1" fill="#4CAF50" />
       <text x="142" y="18" text-anchor="middle" font-size="11" font-weight="600" fill="#333">pg-walstream</text>
-      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#4CAF50">v0.5.1 · crates.io · WAL streaming</text>
+      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#4CAF50">v0.7.0 · crates.io · WAL streaming</text>
     </g>
 
     <!-- Arrow: subql OpenFGA → backend OpenFGA -->
@@ -240,7 +240,7 @@
       <rect width="304" height="50" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#42A5F5" />
       <text x="152" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">pg2sqlite</text>
-      <text x="152" y="36" text-anchor="middle" font-size="9" fill="#42A5F5">unpublished · PG→SQLite schema translation</text>
+      <text x="152" y="36" text-anchor="middle" font-size="9" fill="#42A5F5">v0.1.0 · git-only fork · PG→SQLite schema translation</text>
     </g>
 
     <!-- ===== rls2fga ===== -->
@@ -248,7 +248,7 @@
       <rect width="304" height="50" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#42A5F5" />
       <text x="152" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">rls2fga</text>
-      <text x="152" y="36" text-anchor="middle" font-size="9" fill="#42A5F5">RLS → FGA model translator · working, git-only dep</text>
+      <text x="152" y="36" text-anchor="middle" font-size="9" fill="#42A5F5">v0.1.0 · git-only · RLS → FGA model translator</text>
     </g>
 
     <!-- Arrow: rls2fga → OpenFGA (external) -->
@@ -297,7 +297,7 @@
       <rect width="268" height="64" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="64" rx="1" fill="#42A5F5" />
       <text x="134" y="16" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Diesel PR #4969</text>
-      <text x="134" y="30" text-anchor="middle" font-size="9" fill="#42A5F5">SQLite hooks (open, not merged)</text>
+      <text x="134" y="30" text-anchor="middle" font-size="9" fill="#42A5F5">SQLite hooks · closed, landed in fork branch</text>
       <text x="134" y="44" text-anchor="middle" font-size="9" fill="#888">on_insert / on_update / on_delete → UI</text>
       <text x="134" y="56" text-anchor="middle" font-size="9" fill="#888">on_commit / on_rollback → batch</text>
     </g>
@@ -307,7 +307,7 @@
       <rect width="268" height="34" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="34" rx="1" fill="#42A5F5" />
       <text x="134" y="14" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Diesel PR #4976</text>
-      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">sqlite3_db_config security hardening</text>
+      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">sqlite3_db_config · merged, awaiting release</text>
     </g>
 
     <!-- Diesel PR #4975 -->
@@ -315,7 +315,7 @@
       <rect width="268" height="34" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="34" rx="1" fill="#42A5F5" />
       <text x="134" y="14" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Diesel PR #4975</text>
-      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">sqlite3_limit API</text>
+      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">sqlite3_limit · merged, awaiting release</text>
     </g>
 
     <!-- Aggregate routing -->
@@ -339,7 +339,7 @@
       <rect width="268" height="34" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="34" rx="1" fill="#42A5F5" />
       <text x="134" y="14" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Diesel PR #4993</text>
-      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">auto-extension support</text>
+      <text x="134" y="28" text-anchor="middle" font-size="9" fill="#42A5F5">auto-extension · merged, awaiting release</text>
     </g>
 
     <!-- ===== diesel-sqlite-session ===== -->
@@ -347,7 +347,7 @@
       <rect width="270" height="56" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#42A5F5" />
       <text x="135" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">diesel-sqlite-session</text>
-      <text x="135" y="36" text-anchor="middle" font-size="10" fill="#42A5F5">git-only, awaiting Diesel release</text>
+      <text x="135" y="36" text-anchor="middle" font-size="10" fill="#42A5F5">v0.1.0 · git-only, awaiting Diesel release</text>
       <text x="135" y="50" text-anchor="middle" font-size="9" fill="#888">PatchSet apply/generate via Diesel</text>
     </g>
 
@@ -374,7 +374,7 @@
       <rect width="270" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="135" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlitegis</text>
-      <text x="135" y="36" text-anchor="middle" font-size="9" font-family="monospace" fill="#4CAF50">v0.1.3 · crates.io</text>
+      <text x="135" y="36" text-anchor="middle" font-size="9" font-family="monospace" fill="#4CAF50">v0.1.4 · crates.io</text>
       <text x="135" y="50" text-anchor="middle" font-size="9" fill="#888">PostGIS-style spatial, WASM-compat</text>
     </g>
 
@@ -438,7 +438,7 @@
       <rect width="260" height="40" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="40" rx="1" fill="#42A5F5" />
       <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">diesel-sqlite-session</text>
-      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">same as native (git-only)</text>
+      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">v0.1.0 · same as native, git-only</text>
     </g>
 
     <!-- sqlite-wasm-rs -->
@@ -446,7 +446,7 @@
       <rect width="260" height="70" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="70" rx="1" fill="#4CAF50" />
       <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlite-wasm-rs</text>
-      <text x="130" y="32" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">v0.5.2 · Spxg · crates.io</text>
+      <text x="130" y="32" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">v0.5.5 · Spxg · crates.io</text>
       <text x="130" y="46" text-anchor="middle" font-size="9" fill="#888">SQLite over OPFS</text>
       <text x="130" y="58" text-anchor="middle" font-size="9" fill="#888">SyncAccessHandlePoolVFS</text>
     </g>
@@ -456,7 +456,7 @@
       <rect width="260" height="40" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
       <rect width="3" height="40" rx="1" fill="#42A5F5" />
       <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="500" fill="#333">Diesel PR #4993</text>
-      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">auto-extension (nice-to-have for WASM)</text>
+      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#42A5F5">auto-extension · merged (nice-to-have for WASM)</text>
     </g>
 
     <!-- sqlitegis (WASM) -->
@@ -464,7 +464,7 @@
       <rect width="260" height="40" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="40" rx="1" fill="#4CAF50" />
       <text x="130" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlitegis</text>
-      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#4CAF50">v0.1.3 · same as native</text>
+      <text x="130" y="32" text-anchor="middle" font-size="9" fill="#4CAF50">v0.1.4 · same as native</text>
     </g>
 
     <!-- WebSocket via web-sys -->
