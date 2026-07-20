@@ -26,7 +26,9 @@ In these cases, the server must compute and maintain the aggregate and push upda
 
 ## Primary Approach: Server-Side Accumulator
 
-The server maintains per-subscription accumulator state for supported aggregate shapes. When the underlying data changes, the server updates the accumulator incrementally and pushes a delta (or new total) to the client.
+`subql` maintains per-subscription accumulator state in memory for supported aggregate shapes. On a CDC event it updates the accumulator incrementally and emits a signed delta, which the materializer authorizes and pushes to the client as a new total or delta.
+
+In the crate split, the accumulator state and its incremental maintenance live in `subql`. The materializer wraps them with authorization, the re-execution `Connector`, and per-session delivery (see `10-subscription-materializer.md`).
 
 ### Supported aggregate shapes (initial scope — open question)
 

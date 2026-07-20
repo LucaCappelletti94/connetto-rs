@@ -84,7 +84,7 @@ On `MutationReject`, the client:
 
 ### 1. CDC source
 
-The server listens to PostgreSQL's logical replication stream (via `pgoutput` or `wal2json`) or uses `LISTEN`/`NOTIFY` triggers. Each event produces a `ChangeRecord`:
+`subql`'s `CdcSource` holds PostgreSQL's logical replication connection (`pgoutput` or `wal2json`) and surfaces typed events to the server. Conceptually each event is a `ChangeRecord`:
 
 ```
 ChangeRecord {
@@ -105,7 +105,7 @@ For each `ChangeRecord`, the CDC fanout engine queries the subscription registry
 
 This is an index lookup: subscriptions are indexed by the tables they reference. The result is a set of `(session_id, sub_id, spec)` candidates.
 
-For row-level subscriptions, each candidate is tested: does the changed row fall within the subscription's filter predicate? This may be evaluated in-process (if the predicate is simple) or via a lightweight SQL query against the subscription's WHERE clause parameters.
+`subql` evaluates this in-process (bitmap prune plus predicate VM). Predicates it cannot decide against a single row image (JOINs, subqueries, MIN or MAX extreme removal) fall to re-execution against PostgreSQL through the materializer's `Connector`. See `10-subscription-materializer.md`.
 
 ### 3. Authorization filter
 

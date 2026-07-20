@@ -69,7 +69,7 @@ The system does **not**:
 3. Authorization filter removes rows the client cannot see
 4. Relevant clients receive the update and apply it to local SQLite
 
-> **Reliability**: every cross-process arrow above — client ↔ server, server ↔ PostgreSQL (CDC source and re-execution), server ↔ OpenFGA, server ↔ session sink — is retried under the unified policy in [`10-subscription-materializer.md`](10-subscription-materializer.md). The Subscription Materializer is the server-side component that owns those side effects and their retries; subql, the in-process filter it wraps, holds no retry surface.
+> **Reliability**: every cross-process arrow above (client and server, server and PostgreSQL for the CDC source and re-execution, server and OpenFGA, server and the session sink) is retried under the unified policy in [`10-subscription-materializer.md`](10-subscription-materializer.md). The Subscription Materializer is the server-side component that owns those side effects and their retries. subql, the in-process engine it wraps, holds no retry surface: the CDC source and re-exec `Connector` it uses are supplied and retried by the materializer.
 
 ---
 

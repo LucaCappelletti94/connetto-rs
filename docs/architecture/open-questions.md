@@ -82,7 +82,7 @@ Principle: JSON is reserved exclusively for data whose shape is not known at com
 
 **Q3.4** ~~— **Predicate evaluation on CDC events**: for complex subscription filters, should matching be done fully in-process, or should the server issue a SQL query per CDC event? In-process is faster; SQL is more accurate for complex predicates.~~
 
-**Decision: in-process via `subql`; SQL re-execution fallback for unsupported cases.** The `subql` crate handles in-process predicate evaluation with bitmap-indexed candidate pruning, bytecode VM evaluation, WAL parsing, and predicate deduplication. For predicates outside `subql`'s scope (JOINs, subqueries, functions, MIN/MAX), the server re-runs the registered query against PostgreSQL when a change in the involved tables is detected. Note: `subql` currently only evaluates `new_row` for UPDATE events — it needs to be fixed to evaluate both `old_row` and `new_row` and return a transition (enter/exit/update/no-op) so connetto can deliver correct INSERT/DELETE events when rows move in and out of a subscription's result set. This is a `subql` issue, not a connetto concern.
+**Decision: in-process via `subql`, with SQL re-execution fallback for unsupported cases.** `subql` handles in-process predicate evaluation with bitmap-indexed candidate pruning, bytecode VM evaluation, WAL parsing, and predicate deduplication. For predicates outside its scope (JOINs, subqueries, unsupported functions, MIN or MAX extreme removal), the `reexec` engine re-runs the registered query against PostgreSQL through a caller `Connector` when a change touches an involved table. UPDATE transition detection has shipped: `subql` evaluates both `old_row` and `new_row` and returns enter, exit, update, or no-op per consumer, so connetto delivers correct INSERT and DELETE events when rows move in and out of a result set.
 
 **Q3.5** ~~— **Own-mutation echo suppression**: should the server suppress the CDC echo for the originating client (send only `MutationAck`, no `RowUpdate`), or always send both? Suppression is an optimization but complicates LSN tracking.~~
 
@@ -118,12 +118,12 @@ Principle: JSON is reserved exclusively for data whose shape is not known at com
 
 **Q5.1** ~~— **IVM scope**: which aggregate shapes get incremental view maintenance vs. re-execution fallback? MIN and MAX with deletions are the hardest — are they in scope for IVM?~~
 
-**Decision: follows `subql` capabilities; MIN/MAX need to be added to `subql`.**
+**Decision: follows `subql` capabilities.** The plain aggregates and a v1 single-table MIN/MAX path have shipped.
 
-Currently supported incrementally by `subql`: COUNT(*), COUNT(col), SUM(col), AVG(col).
-Currently unsupported (re-execution fallback): MIN, MAX.
+Supported incrementally by `subql`: COUNT(*), COUNT(col), SUM(col), AVG(col), and the variance and standard-deviation family (VAR_POP, VAR_SAMP, STDDEV_POP, STDDEV_SAMP).
+MIN and MAX ship as a v1 incremental path (single-table scalar) that folds inserts and most updates and deletes in memory and re-executes only when the current extreme is removed or displaced.
 
-**MIN/MAX approach**: not self-maintainable — deleting the current extreme requires touching the base table (Gupta et al., VLDB'93). The standard production approach is to re-query the specific affected group only, not a full scan. This is what PostgreSQL `pg_ivm` does. Streaming systems (Flink, RisingWave) maintain ordered state per group to avoid any SQL round-trip, at O(distinct values) memory per group — overkill for connetto. Targeted re-query on delete of extreme is the right approach and needs to be implemented in `subql`.
+**MIN/MAX approach**: not self-maintainable, since deleting the current extreme requires touching the base table (Gupta et al., VLDB'93). The standard production approach is to re-query only the affected group, not a full scan. This is what PostgreSQL `pg_ivm` does. Streaming systems (Flink, RisingWave) maintain ordered state per group to avoid any SQL round-trip, at O(distinct values) memory per group, which is overkill for connetto. `subql`'s `reexec` engine implements the targeted re-query on removal of the extreme.
 
 References:
 - Gupta et al., "Maintaining Views Incrementally", VLDB'93: https://www.vldb.org/conf/1993/P157.PDF
@@ -207,7 +207,7 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 
 **Q5.5** ~~— **Re-execution rate limiting**: what is the right throttle for query re-execution? Per-subscription cooldown? Global quota?~~
 
-**Decision: not a connetto concern — `subql` owns re-execution scheduling.** Rate limiting of SQL re-execution (per-subscription debounce, global concurrency cap, coalescing of rapid CDC bursts) is internal to `subql`. connetto receives results from `subql` regardless of how `subql` manages its query load. Documented as a required `subql` feature.
+**Decision: `subql` classifies and coalesces within a batch; the materializer owns retry, debounce, and concurrency.** `subql`'s `reexec` engine collapses duplicate re-execution within a dispatch batch but holds no retry surface and no cross-batch scheduler. Cross-batch debounce, the global concurrency cap, and retry against PostgreSQL live above the engine, in the Subscription Materializer and its `Connector` (see `10-subscription-materializer.md`). The throttle goals are unchanged: per-subscription trailing-edge debounce, and a global concurrency cap to protect the database under load.
 
 **Q5.6** ~~— **GROUP BY delta format**: when many groups change at once (e.g. a batch import), should the server send a full group-map replacement or a delta list? At what size does full replacement become preferable?~~
 

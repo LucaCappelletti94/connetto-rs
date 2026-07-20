@@ -64,10 +64,10 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Piece | Description |
 |---|---|
-| CDC source | Logical replication or `LISTEN`/`NOTIFY` listener that produces a stream of `ChangeRecord`s from PostgreSQL. Owned by the Subscription Materializer (§10); reconnects on slot drop with backoff. |
-| Subscription matcher | For each incoming `ChangeRecord`, identifies which active subscriptions are potentially affected. **In-process** via subql; no DB or network, no retry surface. |
+| CDC source | Logical replication stream (pgoutput or wal2json) or a slot poll. `subql`'s `CdcSource` holds the replication connection and produces typed events. The Subscription Materializer (§10) drives the consume loop and owns reconnect with backoff. |
+| Subscription matcher | For each incoming event, identifies which active subscriptions are potentially affected. Matching is in-process via `subql` (bitmap prune plus predicate VM) and has no retry surface. Its surrounding CDC ingestion and re-execution reach the database through connections the materializer supplies (§10). |
 | Auth filter | Per-subscription, per-row check via OpenFGA: "can this client see this row after this change?" Rows that fail are dropped or replaced with a delete event. *(Reliability: see §10 — fail-closed under transient auth outage.)* |
-| Delta packager | Groups affected rows into a batch message; adds server LSN / clock for the client to store as its resume position. Implemented via `sqlite-diff-rs` patchsets, built by the Subscription Materializer (§10). |
+| Delta packager | Groups affected rows into a batch and adds the server LSN for the client's resume position. `subql` folds matched events into `sqlite-diff-rs` patchsets. The Subscription Materializer (§10) selects each session's authorized subset and invokes the builder. |
 | Delivery queue | Per-session outbound queue; respects flow-control window; drops or back-pressures when client is slow. *(Reliability: see §10.)* |
 
 ---
@@ -86,9 +86,9 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Piece | Description |
 |---|---|
-| Accumulator state | Per-subscription server-side state for supported aggregate shapes (COUNT, SUM, etc.). |
-| Incremental update handler | On CDC event: update accumulator and push delta to client if it changes the result. |
-| Full re-execution fallback | For unsupported shapes or when accumulator is invalid: subql emits a `NeedsReexecution { query_id }` trigger; the Subscription Materializer (§10) re-runs the query against PG, coalesces duplicate triggers, and `install`s the new value back into subql. *(Reliability: see §10.)* |
+| Accumulator state | Per-subscription aggregate state (COUNT, SUM, and the variance family), held in memory by `subql` and rebuilt via re-execution on restart. |
+| Incremental update handler | On a CDC event, `subql` updates the accumulator and emits a signed delta. The materializer pushes it to the client when the result changes. |
+| Full re-execution fallback | For unsupported shapes or when the accumulator is invalid, `subql`'s `reexec` engine classifies the query and either emits a re-execution trigger or auto-resolves it through a caller `Connector`. The Subscription Materializer (§10) runs the query against PG over its own pool, coalesces duplicates, and `install`s the value back into `subql`. *(Reliability: see §10.)* |
 
 *(See `05-aggregate-queries.md` for full discussion.)*
 
