@@ -44,7 +44,8 @@ pub use oplog::{
 #[cfg(feature = "pg-async")]
 pub use oplog::{PgOplog, PgOplogError};
 pub use session::{
-    NoConnector, SessionConfig, SessionError, SessionManager, Snapshot, SnapshotSource,
+    NoConnector, ReconnectPolicy, SessionConfig, SessionError, SessionManager, Snapshot,
+    SnapshotSource,
 };
 #[cfg(feature = "pg-async")]
 pub use snapshot::PgSnapshotSource;

@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
@@ -87,6 +88,49 @@ impl Default for SessionConfig {
             initial_credits: 64,
             schema_version: SchemaVersion::new("v0", Vec::new()),
         }
+    }
+}
+
+/// Backoff policy for reconnecting a dropped CDC stream.
+///
+/// [`SessionManager::ingest_with_reconnect`] reconnects the source after the
+/// stream fails, resuming from the replication slot's confirmed position.
+#[derive(Debug, Clone)]
+pub struct ReconnectPolicy {
+    /// Backoff before the first retry.
+    pub initial_backoff: Duration,
+    /// Ceiling for the exponential backoff.
+    pub max_backoff: Duration,
+    /// Give up after this many consecutive failed attempts. `None` retries
+    /// forever, which is what a long-running server wants.
+    pub max_attempts: Option<u32>,
+    /// A connection that stayed up at least this long is treated as healthy, so
+    /// the backoff resets after it drops.
+    pub healthy_after: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_secs(30),
+            max_attempts: None,
+            healthy_after: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// Backoff before the `attempt`-th retry (1-based): exponential from
+    /// `initial_backoff`, capped at `max_backoff`.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u128.saturating_pow(attempt.saturating_sub(1));
+        let millis = self
+            .initial_backoff
+            .as_millis()
+            .saturating_mul(factor)
+            .min(self.max_backoff.as_millis());
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
     }
 }
 
@@ -496,6 +540,60 @@ where
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
+        }
+    }
+
+    /// Ingest CDC events, reconnecting the source with backoff when the stream
+    /// fails.
+    ///
+    /// `connect` produces a fresh source each time, resuming from the
+    /// replication slot's confirmed position, so a dropped connection loses no
+    /// events. Returns `Ok(())` when a source signals a clean shutdown, or an
+    /// error only once `policy` exhausts its attempts (a policy with no
+    /// `max_attempts` retries forever).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] when the reconnect policy gives up, or when a dispatch
+    /// fails.
+    pub async fn ingest_with_reconnect<S, Connect, F, E>(
+        &self,
+        mut connect: Connect,
+        policy: &ReconnectPolicy,
+    ) -> Result<(), SessionError>
+    where
+        S: CdcSource<Event = ChangeEvent>,
+        S::Error: core::fmt::Display,
+        Connect: FnMut() -> F,
+        F: core::future::Future<Output = Result<S, E>>,
+        E: core::fmt::Display,
+    {
+        let mut attempt: u32 = 0;
+        loop {
+            let error = match connect().await {
+                Ok(mut source) => {
+                    let started = Instant::now();
+                    match self.ingest(&mut source).await {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            if started.elapsed() >= policy.healthy_after {
+                                attempt = 0;
+                            }
+                            err.to_string()
+                        }
+                    }
+                }
+                Err(err) => err.to_string(),
+            };
+            attempt = attempt.saturating_add(1);
+            if let Some(max) = policy.max_attempts
+                && attempt >= max
+            {
+                return Err(SessionError::Transport(format!(
+                    "cdc ingest gave up after {attempt} attempts: {error}"
+                )));
+            }
+            tokio::time::sleep(policy.backoff(attempt)).await;
         }
     }
 

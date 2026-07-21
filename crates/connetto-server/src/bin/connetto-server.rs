@@ -26,8 +26,8 @@ use anyhow::{Context, Result, anyhow};
 use connetto_core::auth::AuthContext;
 use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
-    Materializer, PermissiveAuth, PgSnapshotSource, RlsAuth, RlsAuthError, SessionConfig,
-    SessionManager, WebSocketTransport, pg_write_target,
+    Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth, RlsAuthError,
+    SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -156,16 +156,35 @@ async fn run(
     pg_ddl: &str,
     bind: &str,
 ) -> Result<()> {
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
+    // Fail fast on a bad catalog DDL; the reconnect loop rebuilds the catalog
+    // per connect and must not spin on a deterministic parse error.
+    ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-    let config = PgStreamingConfig::new(database_url, slot, publication);
-    let mut source = PgStreamingCdcSource::connect(config, catalog)
-        .await
-        .map_err(|err| anyhow!("opening CDC stream: {err}"))?;
 
     let ingest_manager = manager.clone();
+    let url = database_url.to_owned();
+    let slot = slot.to_owned();
+    let publication = publication.to_owned();
+    let ddl = pg_ddl.to_owned();
     tokio::spawn(async move {
-        if let Err(err) = ingest_manager.ingest(&mut source).await {
+        // Reconnect the replication stream forever; the slot resumes from its
+        // confirmed position, so a dropped connection loses no events.
+        let connect = || {
+            let (url, slot, publication, ddl) =
+                (url.clone(), slot.clone(), publication.clone(), ddl.clone());
+            async move {
+                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
+                    .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
+                let config = PgStreamingConfig::new(url, slot, publication);
+                PgStreamingCdcSource::connect(config, catalog)
+                    .await
+                    .map_err(|err| anyhow!("opening CDC stream: {err}"))
+            }
+        };
+        if let Err(err) = ingest_manager
+            .ingest_with_reconnect(connect, &ReconnectPolicy::default())
+            .await
+        {
             eprintln!("cdc ingest stopped: {err}");
         }
     });
