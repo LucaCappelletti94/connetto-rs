@@ -134,6 +134,29 @@ impl ReconnectPolicy {
     }
 }
 
+/// An event from [`SessionManager::ingest_with_reconnect`], for logging or
+/// metrics. The loop is otherwise silent, so a caller wanting visibility into
+/// reconnect churn observes it here.
+#[derive(Debug)]
+pub enum ReconnectEvent<'a> {
+    /// The CDC stream failed; the loop retries after `backoff`.
+    Retrying {
+        /// Consecutive failed-attempt count (1-based).
+        attempt: u32,
+        /// Delay before the next connect.
+        backoff: Duration,
+        /// The failure that triggered the retry.
+        error: &'a str,
+    },
+    /// The policy's `max_attempts` was reached; the loop stops.
+    GaveUp {
+        /// Total attempts made.
+        attempts: u32,
+        /// The last failure.
+        error: &'a str,
+    },
+}
+
 /// Failure surfaced by the session layer.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -548,8 +571,9 @@ where
     ///
     /// `connect` produces a fresh source each time, resuming from the
     /// replication slot's confirmed position, so a dropped connection loses no
-    /// events. Returns `Ok(())` when a source signals a clean shutdown, or an
-    /// error only once `policy` exhausts its attempts (a policy with no
+    /// events. `on_event` observes each retry and the final give-up, for logging
+    /// or metrics. Returns `Ok(())` when a source signals a clean shutdown, or
+    /// an error only once `policy` exhausts its attempts (a policy with no
     /// `max_attempts` retries forever).
     ///
     /// # Errors
@@ -560,6 +584,7 @@ where
         &self,
         mut connect: Connect,
         policy: &ReconnectPolicy,
+        mut on_event: impl FnMut(ReconnectEvent<'_>),
     ) -> Result<(), SessionError>
     where
         S: CdcSource<Event = ChangeEvent>,
@@ -589,11 +614,21 @@ where
             if let Some(max) = policy.max_attempts
                 && attempt >= max
             {
+                on_event(ReconnectEvent::GaveUp {
+                    attempts: attempt,
+                    error: &error,
+                });
                 return Err(SessionError::Transport(format!(
                     "cdc ingest gave up after {attempt} attempts: {error}"
                 )));
             }
-            tokio::time::sleep(policy.backoff(attempt)).await;
+            let backoff = policy.backoff(attempt);
+            on_event(ReconnectEvent::Retrying {
+                attempt,
+                backoff,
+                error: &error,
+            });
+            tokio::time::sleep(backoff).await;
         }
     }
 

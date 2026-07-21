@@ -182,7 +182,9 @@ async fn run(
             }
         };
         if let Err(err) = ingest_manager
-            .ingest_with_reconnect(connect, &ReconnectPolicy::default())
+            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
+                eprintln!("cdc reconnect: {event:?}");
+            })
             .await
         {
             eprintln!("cdc ingest stopped: {err}");

@@ -3,8 +3,9 @@
 //! Spawns the real `connetto-server` and two `connetto-client` binaries as
 //! separate OS processes and drives a full sync loop over real Postgres logical
 //! replication: each client receives the initial snapshot, then a live insert
-//! fans out to both. This is the product spine end to end, unlike the in-process
-//! session tests.
+//! fans out to both, and after the walsender is terminated the server's
+//! reconnect loop resumes so a further insert still reaches both clients. This
+//! is the product spine end to end, unlike the in-process session tests.
 //!
 //! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`,
 //! and both binaries built in the same profile as the test. Run it with:
@@ -161,7 +162,7 @@ async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
 
 #[tokio::test]
 #[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
-async fn e2e_two_clients_receive_snapshot_and_live() {
+async fn e2e_two_clients_snapshot_live_and_reconnect() {
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -226,5 +227,27 @@ async fn e2e_two_clients_receive_snapshot_and_live() {
         wait_for_rows(&db_b, 2, secs).await,
         2,
         "client-b live patch"
+    );
+
+    // Reliability: terminate the walsender, then insert again. The server's
+    // reconnect loop must resume from the slot and fan the new row to both
+    // clients.
+    exec(
+        &pool,
+        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+         WHERE slot_name = 'connetto_slot' AND active_pid IS NOT NULL",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    exec(&pool, "INSERT INTO orders VALUES (8, 4.0, 2, 'resumed')").await;
+    assert_eq!(
+        wait_for_rows(&db_a, 3, secs).await,
+        3,
+        "client-a did not converge after reconnect"
+    );
+    assert_eq!(
+        wait_for_rows(&db_b, 3, secs).await,
+        3,
+        "client-b did not converge after reconnect"
     );
 }

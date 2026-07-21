@@ -205,7 +205,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
             }
         };
         ingest_manager
-            .ingest_with_reconnect(connect, &policy)
+            .ingest_with_reconnect(connect, &policy, |_| {})
             .await
             .expect("ingest");
     });
