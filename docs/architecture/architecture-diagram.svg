@@ -168,10 +168,10 @@
 
     <!-- ===== sqlite-diff-rs ===== -->
     <g transform="translate(545, 108)">
-      <rect width="310" height="70" rx="6" fill="#fff" stroke="#42A5F5" stroke-width="1.5" />
-      <rect width="4" height="70" rx="1" fill="#42A5F5" />
+      <rect width="310" height="70" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="70" rx="1" fill="#4CAF50" />
       <text x="155" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">sqlite-diff-rs</text>
-      <text x="155" y="38" text-anchor="middle" font-size="10" font-family="monospace" fill="#42A5F5">v0.1.0 · git-only</text>
+      <text x="155" y="38" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">v0.6.1 · crates.io</text>
       <text x="155" y="54" text-anchor="middle" font-size="10" fill="#78909C">PatchSet binary format (no SQLite needed)</text>
     </g>
 
@@ -225,10 +225,10 @@
 
     <!-- pg-walstream (inside subql) -->
     <g transform="translate(558, 526)">
-      <rect width="284" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="50" rx="1" fill="#4CAF50" />
+      <rect width="284" height="50" rx="5" fill="#fff" stroke="#42A5F5" stroke-width="1" />
+      <rect width="3" height="50" rx="1" fill="#42A5F5" />
       <text x="142" y="18" text-anchor="middle" font-size="11" font-weight="600" fill="#333">pg-walstream</text>
-      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#4CAF50">v0.7.0 · crates.io · WAL streaming</text>
+      <text x="142" y="34" text-anchor="middle" font-size="9" fill="#42A5F5">v0.8.0 · git fork · WAL streaming</text>
     </g>
 
     <!-- Arrow: subql OpenFGA → backend OpenFGA -->

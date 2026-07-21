@@ -35,6 +35,7 @@ pub mod messages;
 pub mod schema;
 pub mod traits;
 pub mod version;
+pub mod write;
 
 pub use auth::AuthContext;
 pub use cursor::Cursor;
@@ -45,3 +46,4 @@ pub use traits::{
     AuthPolicy, FileStore, IncomingFrame, MutationOp, PendingMutation, Store, Transport,
 };
 pub use version::PROTOCOL_VERSION;
+pub use write::{VersionColumn, WritableCatalog};

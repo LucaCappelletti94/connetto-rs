@@ -9,8 +9,8 @@ Tracking document for features and responsibilities that connetto's architecture
 
 - **CDC ingestion.** The `CdcSource` trait plus `PgStreamingCdcSource`, `PollingPgCdcSource`, and `SqliteCdcSource`. The source holds the replication connection. The materializer drives the consume loop and acks.
 - **Event to patchset conversion.** `wal2json_patchset`, `pgoutput_patchset`, and `maxwell_patchset`, plus changeset counterparts, fold events over a source-agnostic catalog into one `sqlite-diff-rs` diffset.
-- **Inbound apply.** `SubscriptionEngine::apply_diffset_bytes` applies uploaded SQLite session bytes to the source through native diesel adapters.
-- **Re-execution engine.** The `reexec` module: `ReExecEngine` (trigger path) and `AutoResolvingEngine` (driven through a caller `Connector`). The DB query and its retry live in the caller.
+- **Inbound apply.** `SubscriptionEngine::apply_diffset_bytes` applies uploaded SQLite session bytes to the source through native diesel adapters. A `diesel-async` counterpart `apply_diffset_bytes_async` (plus `apply_patchset_async` and `apply_changeset_async`) runs the same reconstructed batch over an `AsyncConnection` for Postgres and MySQL, behind the `apply-patchset-postgres-async` and `apply-patchset-mysql-async` features. SQLite apply stays synchronous.
+- **Re-execution engine.** The `reexec` module: `ReExecEngine` (trigger path) and `AutoResolvingEngine` (driven through a caller `Connector`). The DB query and its retry live in the caller. Async peers `AsyncAutoResolvingEngine` and the `AsyncConnector` trait exist, with shipped `PgAsyncDieselConnector` and `MysqlAsyncDieselConnector` built on `diesel-async` (bb8-pooled) behind the `executor-diesel-async-postgres` and `executor-diesel-async-mysql` features.
 
 The items below track the finer-grained responsibilities and their status.
 
