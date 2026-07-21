@@ -143,7 +143,7 @@ mod pg {
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::{DatabaseLike, ParserDB, PgLsn};
 
-    use connetto_core::Cursor;
+    use connetto_core::{AuthContext, Cursor};
 
     use super::{SnapshotError, encode_json_rows, table_from_select};
     use crate::session::{Snapshot, SnapshotSource};
@@ -193,9 +193,14 @@ mod pg {
     impl<DB: DatabaseLike + Send + Sync> SnapshotSource for PgSnapshotSource<DB> {
         type Error = SnapshotError;
 
-        async fn snapshot(&self, select_sql: &str) -> Result<Snapshot, Self::Error> {
+        async fn snapshot(
+            &self,
+            select_sql: &str,
+            auth: &AuthContext,
+        ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
             let wrapped = format!("SELECT to_jsonb(_snap) AS row FROM ({select_sql}) AS _snap");
+            let user_id = auth.user_id.clone();
             let mut conn = self
                 .pool
                 .get()
@@ -206,6 +211,12 @@ mod pg {
                     async move {
                         // Pin one MVCC snapshot so the rows and the LSN agree.
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+                            .execute(c)
+                            .await?;
+                        // Establish the requesting user's RLS context so the read
+                        // returns only rows that user may see.
+                        sql_query("SELECT set_config('app.user_id', $1, true)")
+                            .bind::<Text, _>(user_id)
                             .execute(c)
                             .await?;
                         let rows: Vec<JsonRow> = sql_query(&wrapped).load(c).await?;

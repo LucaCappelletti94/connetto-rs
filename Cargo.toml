@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/connetto-core", "crates/connetto-server"]
+members = ["crates/connetto-core", "crates/connetto-server", "crates/connetto-client"]
 
 # Additional crates land here as their real content is ready:
 #   - crates/connetto-server         # session manager + subscription materializer
@@ -21,8 +21,10 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main for reproducibility (main HEAD 2b90db1, PR #10, adds diesel-async).
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2b90db1f5b1b261fdb8604ea45c2de5f19896f00", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
+# on main for reproducibility (main HEAD f331aced: byte-level diffset apply now
+# has catalog-only entry points, so the write path applies from a shared catalog
+# without rebuilding an engine per write).
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "f331aced755f5891fcf7af5e31cf379269cab729", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"
@@ -32,6 +34,8 @@ diesel = { version = "2", features = ["sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 rmp-serde = "1.3"
+# Application-level error handling for the server and client binaries.
+anyhow = "1"
 
 # Mirror of subql's [patch] blocks. subql's own Cargo.toml is the source of
 # truth for the exact revs. Cargo [patch] does not cross workspaces and a git

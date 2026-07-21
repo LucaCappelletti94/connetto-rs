@@ -38,7 +38,11 @@ impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(&self, _select_sql: &str) -> Result<Snapshot, Self::Error> {
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -130,7 +134,7 @@ async fn drive_cdc<S: SnapshotSource, A: AuthPolicy + Send + Sync>(
     manager: &SessionManager<S, A>,
     sql: &str,
 ) {
-    source.execute(sql).expect("execute dml");
+    source.execute_sql(sql).expect("execute dml");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager
             .dispatch_event(&event)

@@ -8,9 +8,9 @@
 //!
 //! * [`materializer`] holds the session-agnostic [`Materializer`] core that
 //!   wraps one `subql` engine.
-//! * [`transport`] holds the [`Transport`](connetto_core::traits::Transport)
-//!   implementations: an in-memory [`LoopbackTransport`] and the native
-//!   [`WebSocketTransport`].
+//! * the native [`Transport`](connetto_core::traits::Transport) implementations
+//!   ([`LoopbackTransport`], [`WebSocketTransport`]) are re-exported from
+//!   `connetto-core` behind its `native-transport` feature.
 //! * [`session`] holds the [`SessionManager`], the per-session state machine,
 //!   and the [`SnapshotSource`] seam.
 //! * [`snapshot`] holds [`encode_json_rows`] and the Postgres-backed fill of
@@ -21,23 +21,34 @@
 
 pub mod auth;
 pub mod materializer;
+pub mod oplog;
+pub mod pk;
 pub mod session;
 pub mod snapshot;
-pub mod transport;
+pub mod write_target;
 
 pub use auth::PermissiveAuth;
+#[cfg(feature = "pg-async")]
+pub use auth::{RlsAuth, RlsAuthError};
+pub use connetto_core::transport::{
+    LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
+};
 pub use materializer::{
     AggregateCapture, AggregateChange, Dispatched, MatchedPatch, Materializer, MaterializerError,
     PendingReExec, Registration, RuntimeVersionColumn, RuntimeWritableCatalog,
     RuntimeWritableCatalogBuilder,
 };
+pub use oplog::{
+    CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, OplogConfig, catchup_decision,
+};
+#[cfg(feature = "pg-async")]
+pub use oplog::{PgOplog, PgOplogError};
 pub use session::{
     NoConnector, SessionConfig, SessionError, SessionManager, Snapshot, SnapshotSource,
-    SqliteWriteTarget, sqlite_write_target,
 };
 #[cfg(feature = "pg-async")]
 pub use snapshot::PgSnapshotSource;
 pub use snapshot::{SnapshotError, encode_json_rows};
-pub use transport::{
-    LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
-};
+#[cfg(feature = "pg-async")]
+pub use write_target::{PgWriteTarget, pg_write_target};
+pub use write_target::{SqliteWriteTarget, WriteTarget, sqlite_write_target};

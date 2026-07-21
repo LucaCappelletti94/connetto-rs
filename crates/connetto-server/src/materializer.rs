@@ -38,14 +38,16 @@ use diesel::sqlite::Sqlite;
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, sql_query};
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, TableSchema, Value};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
+use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
 use subql::emit::pgoutput_patchset;
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
 use subql::{
     ChangeEvent, DatabaseLike, DefaultIds, OpaqueCheckpoint, ParserDB, SubscriptionEngine,
-    SubscriptionId, SubscriptionRequest, catalog_helpers,
+    SubscriptionId, SubscriptionRequest, TableLike, catalog_helpers,
 };
+
+use crate::oplog::ChangeRecord;
 
 #[cfg(feature = "pg-async")]
 use diesel_async::AsyncPgConnection;
@@ -516,6 +518,76 @@ where
         })
     }
 
+    /// Build the oplog record for a dispatched CDC event.
+    ///
+    /// Resolves the table name and a stable primary-key encoding from the
+    /// catalog once, so the oplog and the catchup auth filter carry them without
+    /// a second catalog pass. Returns `None` when the event carries no checkpoint
+    /// or its table is absent from the catalog. Call only after
+    /// [`dispatch`](Self::dispatch) has accepted the event, which guarantees it
+    /// is a row event.
+    #[must_use]
+    pub fn oplog_record(&self, event: &ChangeEvent) -> Option<ChangeRecord> {
+        let lsn = event.checkpoint()?.0;
+        let (table, pk) = self.event_identity(event)?;
+        Some(ChangeRecord::new(lsn, table, pk, event.clone()))
+    }
+
+    /// Row consumers a replayed event notifies, for reconnect catchup.
+    ///
+    /// Runs the same predicate matching the live path uses, but only through the
+    /// core engine, so it folds no aggregates and fires no re-execution triggers.
+    /// Matching is a pure function of the event's row images, so replaying a
+    /// historical event yields the same consumers it did live.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
+    pub fn match_row_consumers(
+        &mut self,
+        event: &ChangeEvent,
+    ) -> Result<Vec<u64>, MaterializerError> {
+        let notifs = self.engine.inner_mut().consumers(event)?;
+        let mut consumers: Vec<u64> = Vec::new();
+        consumers.extend_from_slice(notifs.inserted());
+        consumers.extend_from_slice(notifs.updated());
+        consumers.extend_from_slice(notifs.deleted());
+        consumers.sort_unstable();
+        consumers.dedup();
+        Ok(consumers)
+    }
+
+    /// Fold one event into a compressed patchset, the catchup delivery payload.
+    ///
+    /// Identical to the row payload [`dispatch`](Self::dispatch) produces on the
+    /// live path, so a replayed patch is indistinguishable from a live one.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
+    /// [`MaterializerError::Compression`] on a compression failure.
+    pub fn encode_patch(&self, event: &ChangeEvent) -> Result<Vec<u8>, MaterializerError> {
+        let raw = pgoutput_patchset(self.engine.inner().database(), std::slice::from_ref(event))
+            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        Ok(compress(&raw)?)
+    }
+
+    /// The `(table, primary-key bytes)` identity of a CDC event, for the auth
+    /// read filter. Primary-key columns are read from the event's PK image and
+    /// encoded by [`crate::pk`] into a stable, self-describing byte string the
+    /// auth policy treats as opaque and decodes back into typed values.
+    fn event_identity(&self, event: &ChangeEvent) -> Option<(String, Vec<u8>)> {
+        let db = self.engine.inner().database();
+        let table_id = event.table_id(db);
+        let index = usize::try_from(table_id).ok()?;
+        let table = db.table_by_id(index)?.table_name().to_owned();
+        let mut values = Vec::new();
+        for col in event.pk_columns(db) {
+            values.push(event.value_at(db, RowKind::Pk, col).ok()?);
+        }
+        Some((table, crate::pk::encode(&values)))
+    }
+
     /// Advance the resume cursor for `(session_id, sub_id)`.
     ///
     /// # Errors
@@ -610,7 +682,7 @@ where
         Ok(PlannedOp {
             table,
             op: verb,
-            pk: encode_pk(&pk_values),
+            pk: crate::pk::encode_wire(&pk_values),
             conflict,
         })
     }
@@ -630,7 +702,7 @@ where
                 Ok(PlannedOp {
                     table,
                     op: MutationOp::Insert,
-                    pk: encode_pk(&pk_values),
+                    pk: crate::pk::encode_wire(&pk_values),
                     conflict: None,
                 })
             }
@@ -869,6 +941,109 @@ fn read_current_row(
     }))
 }
 
+/// `SELECT EXISTS(...)` row from Postgres, which yields a boolean.
+#[cfg(feature = "pg-async")]
+#[derive(QueryableByName)]
+struct PresentBool {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    present: bool,
+}
+
+/// Probe one op for a stale-version conflict against a Postgres target, the
+/// async peer of [`probe_conflict_sqlite`]. The read runs under whatever RLS
+/// context the caller has set on `conn`.
+///
+/// # Errors
+///
+/// [`MaterializerError::Apply`] on a query failure, [`MaterializerError::Parse`]
+/// when the read-back row is not valid JSON.
+#[cfg(feature = "pg-async")]
+pub(crate) async fn probe_conflict_pg(
+    conflict: &PlannedConflict,
+    conn: &mut AsyncPgConnection,
+) -> Result<ConflictProbe, MaterializerError> {
+    let mut predicate: Vec<String> = conflict
+        .pk_columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| format!("{} = ${}", quote_ident(col), index + 1))
+        .collect();
+    predicate.push(format!(
+        "{} = ${}",
+        quote_ident(&conflict.version_column),
+        conflict.pk_columns.len() + 1
+    ));
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
+        quote_ident(&conflict.table),
+        predicate.join(" AND "),
+    );
+    let mut query = sql_query(sql).into_boxed::<diesel::pg::Pg>();
+    for value in &conflict.pk_values {
+        query = bind_value_pg(query, value);
+    }
+    query = bind_value_pg(query, &conflict.basis);
+    let present: PresentBool = diesel_async::RunQueryDsl::get_result(query, conn).await?;
+    if present.present {
+        return Ok(ConflictProbe::Clear);
+    }
+    Ok(ConflictProbe::Stale(
+        read_current_row_pg(conflict, conn).await?,
+    ))
+}
+
+/// Read the current row for a conflict reply from Postgres, as a JSON object.
+#[cfg(feature = "pg-async")]
+async fn read_current_row_pg(
+    conflict: &PlannedConflict,
+    conn: &mut AsyncPgConnection,
+) -> Result<Option<ServerRow>, MaterializerError> {
+    let predicate: Vec<String> = conflict
+        .pk_columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| format!("{} = ${}", quote_ident(col), index + 1))
+        .collect();
+    let sql = format!(
+        "SELECT row_to_json(t)::text AS row_json FROM {} t WHERE {} LIMIT 1",
+        quote_ident(&conflict.table),
+        predicate.join(" AND "),
+    );
+    let mut query = sql_query(sql).into_boxed::<diesel::pg::Pg>();
+    for value in &conflict.pk_values {
+        query = bind_value_pg(query, value);
+    }
+    let rows: Vec<RowJson> = diesel_async::RunQueryDsl::load(query, conn).await?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let json: serde_json::Value = serde_json::from_str(&row.row_json)
+        .map_err(|err| MaterializerError::Parse(format!("{err}")))?;
+    let version = json
+        .get(&conflict.version_column)
+        .map(json_scalar_to_string)
+        .unwrap_or_default();
+    Ok(Some(ServerRow {
+        version,
+        row_json: row.row_json,
+    }))
+}
+
+/// Bind one wire value with the Postgres SQL type matching its variant.
+#[cfg(feature = "pg-async")]
+fn bind_value_pg<'a>(
+    query: BoxedSqlQuery<'a, diesel::pg::Pg, SqlQuery>,
+    value: &WireValue,
+) -> BoxedSqlQuery<'a, diesel::pg::Pg, SqlQuery> {
+    match value {
+        Value::Integer(int) => query.bind::<BigInt, _>(*int),
+        Value::Real(real) => query.bind::<Double, _>(*real),
+        Value::Text(text) => query.bind::<Text, _>(text.clone()),
+        Value::Blob(blob) => query.bind::<Binary, _>(blob.clone()),
+        Value::Null => query.bind::<Nullable<Text>, _>(None::<String>),
+    }
+}
+
 /// `SELECT EXISTS(...)` row.
 #[derive(QueryableByName)]
 struct Present {
@@ -928,39 +1103,6 @@ fn column_name_at<DB: DatabaseLike>(
         u16::try_from(index).map_err(|_| MaterializerError::SchemaMismatch(index.to_string()))?;
     catalog_helpers::column_name(db, table_id, column_id)
         .ok_or_else(|| MaterializerError::SchemaMismatch(format!("column {index}")))
-}
-
-/// Encode a primary key into stable bytes for the authorization check.
-///
-/// Each component is tagged by kind so distinct values never collide, and
-/// components are `NUL`-separated. Opaque to the auth policy for now.
-fn encode_pk(pk: &[WireValue]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (index, value) in pk.iter().enumerate() {
-        if index > 0 {
-            out.push(0);
-        }
-        match value {
-            Value::Integer(int) => {
-                out.push(b'i');
-                out.extend_from_slice(int.to_string().as_bytes());
-            }
-            Value::Real(real) => {
-                out.push(b'r');
-                out.extend_from_slice(format!("{real}").as_bytes());
-            }
-            Value::Text(text) => {
-                out.push(b't');
-                out.extend_from_slice(text.as_bytes());
-            }
-            Value::Blob(blob) => {
-                out.push(b'b');
-                out.extend_from_slice(blob);
-            }
-            Value::Null => out.push(b'n'),
-        }
-    }
-    out
 }
 
 /// Quote a SQL identifier, doubling embedded quotes.

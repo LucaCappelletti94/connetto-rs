@@ -119,14 +119,14 @@ async fn in_process_loop_round_trips_cdc_and_a_mutation() {
 
     // INSERT: the row enters the result set and reaches the replica.
     source
-        .execute("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 1, 'paid')")
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 1, 'paid')")
         .expect("insert 7");
     drain_to_replica(&mut source, &mut mat, &mut replica).await;
     assert_eq!(orders(&mut replica), vec![order(7, 9.5, 1, "paid")]);
 
     // A second INSERT.
     source
-        .execute("INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'new')")
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'new')")
         .expect("insert 8");
     drain_to_replica(&mut source, &mut mat, &mut replica).await;
     assert_eq!(
@@ -136,7 +136,7 @@ async fn in_process_loop_round_trips_cdc_and_a_mutation() {
 
     // UPDATE: the row stays in the set, only quantity changes on the replica.
     source
-        .execute("UPDATE orders SET quantity = 5 WHERE id = 7")
+        .execute_sql("UPDATE orders SET quantity = 5 WHERE id = 7")
         .expect("update 7");
     drain_to_replica(&mut source, &mut mat, &mut replica).await;
     assert_eq!(
@@ -146,7 +146,7 @@ async fn in_process_loop_round_trips_cdc_and_a_mutation() {
 
     // DELETE: the row leaves the set and is removed from the replica.
     source
-        .execute("DELETE FROM orders WHERE id = 8")
+        .execute_sql("DELETE FROM orders WHERE id = 8")
         .expect("delete 8");
     drain_to_replica(&mut source, &mut mat, &mut replica).await;
     assert_eq!(orders(&mut replica), vec![order(7, 9.5, 5, "paid")]);

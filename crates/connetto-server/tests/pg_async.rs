@@ -13,8 +13,8 @@ use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PermissiveAuth, PgSnapshotSource, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, sqlite_write_target,
+    Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, loopback, sqlite_write_target,
 };
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
@@ -23,6 +23,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use subql::reexec::PgAsyncDieselConnector;
+use subql::{CdcSource, PgSqliteEmuSource};
 
 diesel::table! {
     notes (id) {
@@ -158,7 +159,10 @@ async fn async_pg_snapshot_reads_rows() {
 
     let source = PgSnapshotSource::from_ddl(pool, ORDERS_PG_DDL).expect("build source");
     let snapshot = source
-        .snapshot("SELECT * FROM orders WHERE quantity > 0")
+        .snapshot(
+            "SELECT * FROM orders WHERE quantity > 0",
+            &connetto_core::AuthContext::new("test-user"),
+        )
         .await
         .expect("produce snapshot");
     assert!(
@@ -209,7 +213,11 @@ impl SnapshotSource for NoSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(&self, _select_sql: &str) -> Result<Snapshot, Self::Error> {
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
             cursor: connetto_core::Cursor::new(Vec::new()),
@@ -297,4 +305,89 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
         Some(IncomingFrame::Control(msg)) => msg,
         other => panic!("expected control frame, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn pg_oplog_appends_and_reads_back() {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+
+    {
+        let mut conn = pool.get().await.expect("get connection");
+        sql_query("DROP TABLE IF EXISTS connetto_oplog_test")
+            .execute(&mut *conn)
+            .await
+            .expect("drop oplog table");
+    }
+    let oplog = PgOplog::new(pool.clone(), "connetto_oplog_test", OplogConfig::default());
+    oplog.ensure_schema().await.expect("ensure schema");
+
+    // Turn insert, update, and delete events from the emulator into oplog
+    // records and append each. The emulator now stamps monotonic LSNs, so no
+    // test-side stamping is needed.
+    let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
+    let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
+    let mut expected: Vec<(u64, String, bool)> = Vec::new();
+    for sql in [
+        "INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'paid')",
+        "UPDATE orders SET quantity = 7 WHERE id = 1",
+        "DELETE FROM orders WHERE id = 1",
+    ] {
+        source.execute_sql(sql).expect("execute dml");
+        while let Some(event) = source.next_event().await.expect("poll source") {
+            let record = mat.oplog_record(&event).expect("build oplog record");
+            expected.push((
+                record.lsn(),
+                record.table().to_owned(),
+                record.is_tombstone(),
+            ));
+            oplog.append(record).await.expect("append record");
+        }
+    }
+    assert_eq!(expected.len(), 3, "one record per statement");
+    let first_lsn = expected[0].0;
+    let last_lsn = expected[expected.len() - 1].0;
+
+    assert_eq!(oplog.min_lsn().await.expect("min lsn"), Some(first_lsn));
+    assert_eq!(
+        oplog.current_lsn().await.expect("current lsn"),
+        Some(last_lsn)
+    );
+
+    let entries = oplog.entries_since(0).await.expect("read entries");
+    let got: Vec<(u64, String, bool)> = entries
+        .iter()
+        .map(|record| {
+            (
+                record.lsn(),
+                record.table().to_owned(),
+                record.is_tombstone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got, expected,
+        "records round-trip through Postgres in LSN order",
+    );
+    assert!(
+        entries.last().expect("has entries").is_tombstone(),
+        "the delete round-trips as a tombstone",
+    );
+
+    // A mid-stream read returns only the entries after the given LSN.
+    let tail = oplog.entries_since(first_lsn).await.expect("read tail");
+    assert_eq!(
+        tail.len(),
+        2,
+        "entries_since is strictly greater than the lsn"
+    );
+
+    let mut conn = pool.get().await.expect("get connection");
+    sql_query("DROP TABLE IF EXISTS connetto_oplog_test")
+        .execute(&mut *conn)
+        .await
+        .expect("drop oplog table");
 }

@@ -14,6 +14,11 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "connetto-server"
+path = "src/bin/connetto-server.rs"
+required-features = ["pg-async"]
+
 [features]
 # Real-Postgres paths: subql's diesel-async apply and the async re-exec
 # connector, both over a bb8-pooled AsyncPgConnection. Off by default because
@@ -24,12 +29,14 @@ pg-async = [
     "diesel-async/bb8",
     "diesel/postgres_backend",
     "diesel/serde_json",
+    "diesel/uuid",
     "subql/apply-patchset-postgres-async",
     "subql/executor-diesel-async-postgres",
+    "subql/pg-streaming",
 ]
 
 [dependencies]
-connetto-core.workspace = true
+connetto-core = { workspace = true, features = ["native-transport"] }
 subql.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
@@ -40,12 +47,9 @@ sqlparser = { version = "0.62", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5). The
 # materializer compresses outbound patchsets and decompresses inbound ones.
 zstd = "0.13"
-# Native WebSocket transport (per docs/architecture/09-wasm.md). Plaintext only:
-# no TLS features, so no extra C deps. accept_async / client_async run the ws
-# handshake over a raw TcpStream.
-tokio-tungstenite = "0.24"
-# Sink/Stream extension traits (send/next) for driving the WebSocket stream.
-futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# The native WebSocket and loopback transports now live in connetto-core behind
+# its native-transport feature (per docs/architecture/09-wasm.md), re-exported
+# from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
 sqlite-diff-rs = { version = "0.7.0", default-features = false }
@@ -55,3 +59,14 @@ serde_json = "1"
 parking_lot = "0.12"
 # Async Postgres write path (feature pg-async). tokio-postgres backed, no libpq.
 diesel-async = { version = "0.7", default-features = false, optional = true }
+# Canonical primary-key codec: serialize the pk as Vec<subql Value<Postgres>>.
+rmp-serde.workspace = true
+# Binary error handling (connetto-server bin, behind pg-async via required-features).
+anyhow.workspace = true
+
+[dev-dependencies]
+# Constructing Uuid and Timestamp primary keys in the Docker-gated RLS test.
+uuid = "1"
+chrono = "0.4"
+# Isolated per-client SQLite database directories in the multi-process e2e test.
+tempfile = "3"

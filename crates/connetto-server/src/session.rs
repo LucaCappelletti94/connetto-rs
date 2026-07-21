@@ -25,23 +25,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck,
-    LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    Subscribe,
+    AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason, FullResyncReason,
+    FullResyncRequired, HandshakeAck, LivePatch, MutationConflict, MutationHeader, MutationPatch,
+    MutationReject, MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
-use diesel::SqliteConnection;
-use subql::backend::{Postgres, ScalarKind, Value as PgValue};
+use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
-use subql::{ChangeEvent, PgLsn, SubscriptionId};
+use subql::{CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::materializer::{
-    ConflictProbe, Materializer, MaterializerError, Registration, compress, probe_conflict_sqlite,
-    value_to_json,
-};
+use crate::materializer::{Materializer, MaterializerError, Registration, compress, value_to_json};
+use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::write_target::{WriteError, WriteOutcome, WriteTarget};
 
 /// Initial rows for a subscription, produced by a [`SnapshotSource`].
 pub struct Snapshot {
@@ -52,23 +50,26 @@ pub struct Snapshot {
     pub cursor: Cursor,
 }
 
-/// Produces a subscription's initial snapshot.
+/// Produces a subscription's initial snapshot for a given identity.
 ///
-/// Phase 2 delivers whatever this yields. Phase 4 implements it over the
-/// re-exec `Connector`: run the subscription's `SELECT` against Postgres at a
-/// snapshot LSN and encode the rows into an insert-patchset with
-/// `sqlite-diff-rs`. No SQLite lives on the backend in either case.
+/// Phase 4 implements it over the re-exec `Connector`: run the subscription's
+/// `SELECT` against Postgres at a snapshot LSN and encode the rows into an
+/// insert-patchset with `sqlite-diff-rs`. No SQLite lives on the backend. The
+/// `auth` context lets the implementation run the read under the requesting
+/// user's Row-Level Security so the snapshot already excludes rows the user
+/// cannot see.
 #[allow(async_fn_in_trait)]
 pub trait SnapshotSource: Send + Sync {
     /// Snapshot-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Produce the initial snapshot for the subscription's `select_sql`.
+    /// Produce the initial snapshot for `select_sql`, authorized as `auth`.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backend read or encoding failure.
-    async fn snapshot(&self, select_sql: &str) -> Result<Snapshot, Self::Error>;
+    async fn snapshot(&self, select_sql: &str, auth: &AuthContext)
+    -> Result<Snapshot, Self::Error>;
 }
 
 /// Per-session server configuration.
@@ -98,6 +99,9 @@ pub enum SessionError {
     /// The snapshot source failed.
     #[error("snapshot error: {0}")]
     Snapshot(String),
+    /// The oplog backing store failed.
+    #[error("oplog error: {0}")]
+    Oplog(String),
     /// A materializer operation failed.
     #[error(transparent)]
     Materializer(#[from] MaterializerError),
@@ -111,6 +115,24 @@ pub enum SessionError {
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Transport(err.to_string())
+}
+
+fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
+    SessionError::Oplog(err.to_string())
+}
+
+/// Decode a resume cursor into an LSN. The cursor is an 8-byte big-endian LSN;
+/// anything else (empty, absent, or malformed) is a client that never synced,
+/// which maps to LSN 0 and takes the full-resync path.
+fn resume_lsn_from_cursor(cursor: Option<&Cursor>) -> u64 {
+    match cursor.map(Cursor::as_bytes) {
+        Some(bytes) if bytes.len() == 8 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(bytes);
+            u64::from_be_bytes(buf)
+        }
+        _ => 0,
+    }
 }
 
 /// Map a materializer failure to the reason sent back on the wire.
@@ -147,6 +169,9 @@ struct Route {
     sub_id: SubscriptionId,
     label: String,
     tx: mpsc::UnboundedSender<Outbound>,
+    /// The subscribing session's identity, consulted per event for the read
+    /// filter before a live patch is delivered.
+    auth_ctx: AuthContext,
 }
 
 /// Route from a captured aggregate query to its session's outbound channel.
@@ -169,18 +194,9 @@ struct SessionState {
     pending_header: Option<MutationHeader>,
     /// Sequence numbers already applied, so a replayed upload applies once.
     applied_seqs: HashSet<u64>,
-}
-
-/// A shared, synchronous SQLite write target. The server applies mutations and
-/// reads current rows for conflict detection through it. `SQLite` stays
-/// synchronous; the async Postgres apply lives on the materializer. The lock is
-/// never held across an `.await`.
-pub type SqliteWriteTarget = Arc<parking_lot::Mutex<SqliteConnection>>;
-
-/// Wrap a SQLite connection as a shared [`SqliteWriteTarget`].
-#[must_use]
-pub fn sqlite_write_target(conn: SqliteConnection) -> SqliteWriteTarget {
-    Arc::new(parking_lot::Mutex::new(conn))
+    /// Resume LSN decoded from the handshake cursor. 0 means a fresh session, so
+    /// every re-declared subscription replays from here on reconnect.
+    resume_lsn: u64,
 }
 
 /// An [`AsyncConnector`] that fails every call: the default when a manager runs
@@ -228,11 +244,12 @@ impl AsyncConnector for NoConnector {
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against an [`AuthPolicy`], a SQLite write target, and a
 /// re-execution connector for aggregate subscriptions.
-pub struct SessionManager<Snap, Auth, C = NoConnector>
+pub struct SessionManager<Snap, Auth, C = NoConnector, O = InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
+    O: Oplog,
 {
     materializer: Arc<Mutex<Materializer>>,
     routes: Mutex<HashMap<u64, Route>>,
@@ -240,55 +257,91 @@ where
     snapshot_source: Snap,
     auth: Auth,
     connector: C,
-    target: SqliteWriteTarget,
+    oplog: O,
+    target: WriteTarget,
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
 }
 
-impl<Snap, Auth> SessionManager<Snap, Auth, NoConnector>
+impl<Snap, Auth> SessionManager<Snap, Auth, NoConnector, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
 {
-    /// Build a manager with no re-execution connector.
+    /// Build a manager with no re-execution connector and a default in-memory
+    /// oplog.
     ///
     /// Aggregate subscriptions need a connector; use
-    /// [`with_connector`](Self::with_connector) to supply one.
+    /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
+    /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
     #[must_use]
     pub fn new(
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        target: SqliteWriteTarget,
+        target: impl Into<WriteTarget>,
         config: SessionConfig,
     ) -> Arc<Self> {
-        Self::with_connector(
+        Self::with_oplog(
             materializer,
             snapshot_source,
             auth,
             NoConnector,
+            InMemoryOplog::default(),
             target,
             config,
         )
     }
 }
 
-impl<Snap, Auth, C> SessionManager<Snap, Auth, C>
+impl<Snap, Auth, C> SessionManager<Snap, Auth, C, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
 {
-    /// Build a manager with a re-execution connector for aggregate subscriptions.
+    /// Build a manager with a re-execution connector and a default in-memory
+    /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
     #[must_use]
     pub fn with_connector(
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
         connector: C,
-        target: SqliteWriteTarget,
+        target: impl Into<WriteTarget>,
+        config: SessionConfig,
+    ) -> Arc<Self> {
+        Self::with_oplog(
+            materializer,
+            snapshot_source,
+            auth,
+            connector,
+            InMemoryOplog::default(),
+            target,
+            config,
+        )
+    }
+}
+
+impl<Snap, Auth, C, O> SessionManager<Snap, Auth, C, O>
+where
+    Snap: SnapshotSource,
+    Auth: AuthPolicy + Send + Sync,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
+    C::Error: core::fmt::Display,
+    O: Oplog,
+{
+    /// Build a manager with an explicit re-execution connector and oplog.
+    #[must_use]
+    pub fn with_oplog(
+        materializer: Materializer,
+        snapshot_source: Snap,
+        auth: Auth,
+        connector: C,
+        oplog: O,
+        target: impl Into<WriteTarget>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -298,7 +351,8 @@ where
             snapshot_source,
             auth,
             connector,
-            target,
+            oplog,
+            target: target.into(),
             next_session: AtomicU64::new(1),
             next_consumer: AtomicU64::new(1),
             config,
@@ -338,14 +392,39 @@ where
     ///
     /// # Errors
     ///
-    /// [`MaterializerError`] when dispatch, a cursor advance, or an install
-    /// fails.
-    pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), MaterializerError> {
+    /// [`SessionError`] when dispatch, a cursor advance, an install, or the
+    /// oplog append fails.
+    pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
         let dispatched = { self.materializer.lock().await.dispatch(event)? };
+
+        // Record the event in the oplog before fan-out. The append is per event,
+        // not per consumer, since reconnect catchup re-filters per client.
+        let record = { self.materializer.lock().await.oplog_record(event) };
+        // The event's (table, primary key, is-delete) for the per-consumer read
+        // filter below.
+        let identity = record
+            .as_ref()
+            .map(|r| (r.table().to_owned(), r.pk().to_vec(), r.is_tombstone()));
+        if let Some(record) = record {
+            self.oplog.append(record).await.map_err(oplog_err)?;
+        }
 
         for patch in dispatched.patches {
             let route = { self.routes.lock().await.get(&patch.consumer_id).cloned() };
             let Some(route) = route else { continue };
+            // Read filter: deliver only rows the session may see. A delete
+            // replays regardless (a tombstone), so a client drops a row it may
+            // still hold locally even after it can no longer see it.
+            if let Some((table, pk, is_delete)) = identity.as_ref()
+                && !is_delete
+                && !self
+                    .auth
+                    .can_read(&route.auth_ctx, table, pk)
+                    .await
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             {
                 self.materializer.lock().await.advance_cursor(
                     route.session_id,
@@ -385,6 +464,41 @@ where
         Ok(())
     }
 
+    /// Drive a CDC source to completion, dispatching every event and acking its
+    /// checkpoint so the upstream can recycle its log.
+    ///
+    /// This is the standing ingestor: one per server, fanning out to every
+    /// session. It is generic over the [`CdcSource`], so it runs the same way
+    /// against the SQLite emulator (Docker-free) and a real
+    /// `PgStreamingCdcSource`. Reconnect on a transient source error lands in
+    /// Phase 6; for now an error ends the loop.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] when a dispatch fails or the source errors.
+    pub async fn ingest<S>(&self, source: &mut S) -> Result<(), SessionError>
+    where
+        S: CdcSource<Event = ChangeEvent>,
+        S::Error: core::fmt::Display,
+    {
+        loop {
+            match source.next_event().await {
+                Ok(Some(event)) => {
+                    self.dispatch_event(&event).await?;
+                    if let Some(lsn) = event.checkpoint() {
+                        source
+                            .ack(lsn)
+                            .await
+                            .map_err(|err| SessionError::Transport(err.to_string()))?;
+                    }
+                }
+                // A clean source shutdown ends ingestion.
+                Ok(None) => return Ok(()),
+                Err(err) => return Err(SessionError::Transport(err.to_string())),
+            }
+        }
+    }
+
     /// Send an aggregate result to the session owning `query_id`, if routed.
     async fn deliver_aggregate(&self, query_id: u64, result_json: String) {
         let route = { self.agg_routes.lock().await.get(&query_id).cloned() };
@@ -398,21 +512,19 @@ where
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
 
-    /// Serve one connection to completion: handshake, then the run loop, then
-    /// cleanup on disconnect.
+    /// Receive and validate the handshake, decode the resume cursor, and reply
+    /// with the ack carrying the server's current watermark.
     ///
-    /// # Errors
-    ///
-    /// [`SessionError`] on a transport failure, a protocol violation, a
-    /// snapshot failure, or a materializer error.
-    pub async fn serve<T: Transport>(
-        self: Arc<Self>,
-        mut transport: T,
-    ) -> Result<(), SessionError> {
+    /// Returns the session number, the auth context, and the resume LSN, or
+    /// `None` when the peer closed before sending a handshake.
+    async fn run_handshake<T: Transport>(
+        &self,
+        transport: &mut T,
+    ) -> Result<Option<(u64, AuthContext, u64)>, SessionError> {
         let handshake = match transport.recv().await.map_err(transport_err)? {
             Some(IncomingFrame::Control(ControlMessage::Handshake(hs))) => hs,
             Some(_) => return Err(SessionError::Protocol("expected handshake first".into())),
-            None => return Ok(()),
+            None => return Ok(None),
         };
         if handshake.protocol_version != PROTOCOL_VERSION {
             let _ = transport
@@ -434,17 +546,44 @@ where
         // identity carried into the auth policy.
         let auth_ctx = AuthContext::new(handshake.client_id.clone());
 
+        // Decode the resume cursor and read the server watermark for the ack. An
+        // 8-byte cursor is the client's resume LSN; anything else is a fresh
+        // client (LSN 0), which takes the full-resync path on subscribe.
+        let resume_lsn = resume_lsn_from_cursor(handshake.last_cursor.as_ref());
+        let current_cursor = match self.oplog.current_lsn().await.map_err(oplog_err)? {
+            Some(lsn) => Cursor::new(lsn.to_be_bytes().to_vec()),
+            None => Cursor::new(Vec::new()),
+        };
+
         let session_num = self.next_session_id();
         transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 session_id: format!("session-{session_num}"),
                 session_token: format!("token-{session_num}"),
-                current_cursor: Cursor::new(Vec::new()),
+                current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
             }))
             .await
             .map_err(transport_err)?;
+        Ok(Some((session_num, auth_ctx, resume_lsn)))
+    }
+
+    /// Serve one connection to completion: handshake, then the run loop, then
+    /// cleanup on disconnect.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on a transport failure, a protocol violation, a
+    /// snapshot failure, or a materializer error.
+    pub async fn serve<T: Transport>(
+        self: Arc<Self>,
+        mut transport: T,
+    ) -> Result<(), SessionError> {
+        let Some((session_num, auth_ctx, resume_lsn)) = self.run_handshake(&mut transport).await?
+        else {
+            return Ok(());
+        };
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
         let mut state = SessionState {
@@ -456,6 +595,7 @@ where
             auth_ctx,
             pending_header: None,
             applied_seqs: HashSet::new(),
+            resume_lsn,
         };
 
         loop {
@@ -631,55 +771,54 @@ where
             }
         }
 
-        // Conflict-check every version-bearing op against the current server row.
-        for op in &plan.ops {
-            let Some(conflict) = &op.conflict else {
-                continue;
-            };
-            let probe = {
-                let mut conn = self.target.lock();
-                probe_conflict_sqlite(conflict, &mut conn)
-            };
-            match probe {
-                Ok(ConflictProbe::Clear) => {}
-                Ok(ConflictProbe::Stale(row)) => {
-                    let (server_updated_at, server_row_json) = row.map_or_else(
-                        || (String::new(), "null".to_owned()),
-                        |row| (row.version, row.row_json),
-                    );
-                    transport
-                        .send_control(ControlMessage::MutationConflict(MutationConflict {
-                            client_seq,
-                            table: conflict.table.clone(),
-                            server_updated_at,
-                            server_row_json,
-                        }))
-                        .await
-                        .map_err(transport_err)?;
-                    return Ok(());
-                }
-                Err(err) => {
-                    return self
-                        .reject(transport, client_seq, reject_reason(&err))
-                        .await;
-                }
-            }
-        }
-
-        // Apply the whole changeset in one transaction.
-        let applied = {
-            let materializer = self.materializer.lock().await;
-            let mut conn = self.target.lock();
-            materializer.apply_diffset(&patch.patchset_zstd, &mut conn)
-        };
-        match applied {
-            Ok(_) => {
+        // Probe conflicts and apply through the write target, which owns the
+        // backend specifics: the Postgres target applies under the user's RLS
+        // context so the database gates the write.
+        match self
+            .target
+            .commit(
+                &self.materializer,
+                &state.auth_ctx,
+                &plan,
+                &patch.patchset_zstd,
+            )
+            .await
+        {
+            Ok(WriteOutcome::Applied) => {
                 state.applied_seqs.insert(client_seq);
                 Ok(())
             }
-            Err(err) => {
+            Ok(WriteOutcome::Conflict {
+                table,
+                server_updated_at,
+                server_row_json,
+            }) => {
+                transport
+                    .send_control(ControlMessage::MutationConflict(MutationConflict {
+                        client_seq,
+                        table,
+                        server_updated_at,
+                        server_row_json,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(())
+            }
+            Err(WriteError::Unauthorized) => {
+                self.reject(transport, client_seq, MutationRejectReason::Unauthorized)
+                    .await
+            }
+            Err(WriteError::Materializer(err)) => {
                 self.reject(transport, client_seq, reject_reason(&err))
                     .await
+            }
+            Err(WriteError::Backend(detail)) => {
+                self.reject(
+                    transport,
+                    client_seq,
+                    MutationRejectReason::Other { detail },
+                )
+                .await
             }
         }
     }
@@ -738,8 +877,47 @@ where
         }
     }
 
-    /// Deliver a row subscription's snapshot and route its live patches.
+    /// Deliver a row subscription, by snapshot or by oplog catchup.
+    ///
+    /// A fresh session snapshots. A resuming session (nonzero `resume_lsn`)
+    /// whose cursor is still inside the retained window catches up from the
+    /// oplog instead of re-snapshotting; one outside the window is told to
+    /// full-resync and then snapshots.
     async fn subscribe_row<T: Transport>(
+        &self,
+        transport: &mut T,
+        sub: Subscribe,
+        state: &mut SessionState,
+        session_num: u64,
+        consumer_id: u64,
+        sub_id: SubscriptionId,
+    ) -> Result<(), SessionError> {
+        if state.resume_lsn != 0 {
+            let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
+            let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
+            match catchup_decision(state.resume_lsn, min, current) {
+                CatchupDecision::Catchup => {
+                    return self
+                        .catch_up_row(transport, sub, state, session_num, consumer_id, sub_id)
+                        .await;
+                }
+                CatchupDecision::FullResync => {
+                    transport
+                        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                            sub_id: sub.sub_id.clone(),
+                            reason: FullResyncReason::CursorOutsideRetention,
+                        }))
+                        .await
+                        .map_err(transport_err)?;
+                }
+            }
+        }
+        self.snapshot_row(transport, sub, state, session_num, consumer_id, sub_id)
+            .await
+    }
+
+    /// Snapshot a row subscription: begin, patch, end, then route live patches.
+    async fn snapshot_row<T: Transport>(
         &self,
         transport: &mut T,
         sub: Subscribe,
@@ -757,7 +935,7 @@ where
             .map_err(transport_err)?;
         let snapshot = self
             .snapshot_source
-            .snapshot(&sub.spec.query)
+            .snapshot(&sub.spec.query, &state.auth_ctx)
             .await
             .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let payload = compress(&snapshot.patchset)?;
@@ -784,10 +962,108 @@ where
                 sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
+                auth_ctx: state.auth_ctx.clone(),
             },
         )
         .await;
         state.subs.insert(sub.sub_id, (consumer_id, sub_id));
+        Ok(())
+    }
+
+    /// Catch a resuming row subscription up from the oplog.
+    ///
+    /// Registers the route first, so live events for LSNs past the watermark
+    /// queue behind the catchup (the run loop is blocked here until this
+    /// returns, so nothing is delivered meanwhile), then replays each retained
+    /// entry the subscription matches as a `LivePatch` carrying that entry's
+    /// cursor, in the live-path format. Entries past the pre-catchup watermark
+    /// are skipped because the live path will deliver them, so replay and live
+    /// delivery never double up. The auth read filter runs per client, but a
+    /// delete tombstone replays regardless so a client drops a row it may still
+    /// hold locally.
+    async fn catch_up_row<T: Transport>(
+        &self,
+        transport: &mut T,
+        sub: Subscribe,
+        state: &mut SessionState,
+        session_num: u64,
+        consumer_id: u64,
+        sub_id: SubscriptionId,
+    ) -> Result<(), SessionError> {
+        self.add_route(
+            consumer_id,
+            Route {
+                session_id: session_num,
+                sub_id,
+                label: sub.sub_id.clone(),
+                tx: state.outbound.clone(),
+                auth_ctx: state.auth_ctx.clone(),
+            },
+        )
+        .await;
+        state.subs.insert(sub.sub_id.clone(), (consumer_id, sub_id));
+
+        // Watermark just after the route exists. An entry at or below it was
+        // appended before this consumer could receive live delivery, so
+        // replaying it cannot duplicate a live patch.
+        let ceiling = self
+            .oplog
+            .current_lsn()
+            .await
+            .map_err(oplog_err)?
+            .unwrap_or(0);
+        let entries = self
+            .oplog
+            .entries_since(state.resume_lsn)
+            .await
+            .map_err(oplog_err)?;
+        for record in entries {
+            if record.lsn() > ceiling {
+                continue;
+            }
+            let matched = {
+                self.materializer
+                    .lock()
+                    .await
+                    .match_row_consumers(record.event())?
+                    .contains(&consumer_id)
+            };
+            if !matched {
+                continue;
+            }
+            if !record.is_tombstone() {
+                let allowed = self
+                    .auth
+                    .can_read(&state.auth_ctx, record.table(), record.pk())
+                    .await
+                    .unwrap_or(false);
+                if !allowed {
+                    continue;
+                }
+            }
+            let payload = {
+                self.materializer
+                    .lock()
+                    .await
+                    .encode_patch(record.event())?
+            };
+            let cursor = record.lsn().to_be_bytes().to_vec();
+            {
+                self.materializer
+                    .lock()
+                    .await
+                    .advance_cursor(session_num, sub_id, &cursor)?;
+            }
+            let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
+            enqueue_and_flush(
+                transport,
+                &mut state.credits,
+                &mut state.pending,
+                BulkMessage::LivePatch(live),
+            )
+            .await
+            .map_err(transport_err)?;
+        }
         Ok(())
     }
 

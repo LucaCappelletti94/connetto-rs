@@ -1,0 +1,84 @@
+//! The connetto sync client as a runnable process.
+//!
+//! Configuration comes from the environment:
+//!
+//! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/`).
+//! - `CONNETTO_DB`: local SQLite file path (required, not `:memory:`, since the
+//!   capture and apply connections share the file).
+//! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: local schema DDL.
+//! - `CONNETTO_CLIENT_ID`: identity presented at handshake (default `anonymous`).
+//! - `CONNETTO_TOKEN`: opaque auth token (default empty).
+//! - `CONNETTO_SUB_ID`: subscription id (default `default`).
+//! - `CONNETTO_QUERY`: the row subscription `SELECT` (required).
+//!
+//! Connects, subscribes, and pumps inbound frames, printing each client event
+//! until the server closes the connection.
+
+use anyhow::{Context, Result, anyhow};
+use connetto_client::{ClientConfig, ClientEvent, SyncClient};
+use connetto_core::transport::WebSocketTransport;
+use tokio::net::TcpStream;
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Read a DDL from `<key>` directly, or from the path in `<key>_FILE`.
+fn read_ddl(key: &str) -> Result<String> {
+    if let Ok(inline) = std::env::var(key) {
+        return Ok(inline);
+    }
+    let file_key = format!("{key}_FILE");
+    let path = std::env::var(&file_key).map_err(|_| anyhow!("set {key} or {file_key}"))?;
+    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let server = env_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
+    let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
+    let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
+    let sub_id = env_or("CONNETTO_SUB_ID", "default");
+    let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
+    let config = ClientConfig {
+        client_id: env_or("CONNETTO_CLIENT_ID", "anonymous"),
+        auth_token: env_or("CONNETTO_TOKEN", ""),
+    };
+
+    // The ws URL's authority is also the TCP target.
+    let authority = server
+        .strip_prefix("ws://")
+        .unwrap_or(&server)
+        .split('/')
+        .next()
+        .unwrap_or(&server);
+    let tcp = TcpStream::connect(authority)
+        .await
+        .with_context(|| format!("connecting to {authority}"))?;
+    let transport = WebSocketTransport::connect(&server, tcp)
+        .await
+        .map_err(|err| anyhow!("websocket handshake to {server}: {err}"))?;
+
+    let mut client = SyncClient::connect(transport, &db_path, &sqlite_ddl, &config, None)
+        .await
+        .map_err(|err| anyhow!("connecting sync client: {err}"))?;
+    eprintln!("connected, session {}", client.session_id());
+    client
+        .subscribe(&sub_id, &query)
+        .await
+        .map_err(|err| anyhow!("subscribing: {err}"))?;
+
+    loop {
+        match client
+            .pump_one()
+            .await
+            .map_err(|err| anyhow!("pumping frames: {err}"))?
+        {
+            ClientEvent::Closed => {
+                eprintln!("server closed the connection");
+                return Ok(());
+            }
+            event => println!("{event:?}"),
+        }
+    }
+}

@@ -81,7 +81,11 @@ impl SnapshotSource for NoSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(&self, _select_sql: &str) -> Result<Snapshot, Self::Error> {
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
             cursor: connetto_core::Cursor::new(Vec::new()),
@@ -110,7 +114,7 @@ fn aggregate_value(msg: ControlMessage) -> String {
 }
 
 async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
-    source.execute(sql).expect("execute dml");
+    source.execute_sql(sql).expect("execute dml");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager
             .dispatch_event(&event)

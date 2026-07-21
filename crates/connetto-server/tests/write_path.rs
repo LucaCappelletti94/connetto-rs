@@ -37,7 +37,11 @@ impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(&self, _select_sql: &str) -> Result<Snapshot, Self::Error> {
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
             cursor: connetto_core::Cursor::new(Vec::new()),

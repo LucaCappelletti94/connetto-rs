@@ -1,4 +1,5 @@
-//! [`Transport`] implementations for the session layer.
+//! Native [`Transport`] implementations shared by the server and the native
+//! client.
 //!
 //! Two backings are provided:
 //!
@@ -7,17 +8,20 @@
 //! * [`WebSocketTransport`]: the native `tokio-tungstenite` transport per
 //!   `docs/architecture/09-wasm.md`.
 //!
+//! This module is gated behind the `native-transport` feature so the default
+//! `connetto-core` build stays dependency-light and `WASM`-friendly. The server
+//! and the native client enable it; the browser client provides its own
+//! `web-sys`-backed transport instead.
+//!
 //! Over a raw byte transport a control and a bulk frame must be told apart.
-//! `connetto-core` leaves that to the transport ("WebSocket binary vs text
-//! frames, or the caller's own discipline"). `MessagePack` payloads are not
-//! valid UTF-8, so text frames are out. Each WebSocket message is therefore a
-//! binary frame whose first byte is a kind tag (`TAG_CONTROL` or `TAG_BULK`)
-//! followed by the `MessagePack` payload.
+//! Each `WebSocket` message is a binary frame whose first byte is a kind tag
+//! (`TAG_CONTROL` or `TAG_BULK`) followed by the `MessagePack` payload.
+//! `MessagePack` payloads are not valid UTF-8, so text frames are never used.
 
-use connetto_core::CodecError;
-use connetto_core::codec::{decode_bulk, decode_control, encode_bulk, encode_control};
-use connetto_core::messages::{BulkMessage, ControlMessage};
-use connetto_core::traits::{IncomingFrame, Transport};
+use crate::codec::{decode_bulk, decode_control, encode_bulk, encode_control};
+use crate::error::CodecError;
+use crate::messages::{BulkMessage, ControlMessage};
+use crate::traits::{IncomingFrame, Transport};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;

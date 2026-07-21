@@ -34,6 +34,8 @@ pub mod error;
 pub mod messages;
 pub mod schema;
 pub mod traits;
+#[cfg(feature = "native-transport")]
+pub mod transport;
 pub mod version;
 pub mod write;
 
@@ -44,6 +46,10 @@ pub use messages::{BulkMessage, ControlMessage};
 pub use schema::SchemaVersion;
 pub use traits::{
     AuthPolicy, FileStore, IncomingFrame, MutationOp, PendingMutation, Store, Transport,
+};
+#[cfg(feature = "native-transport")]
+pub use transport::{
+    LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
 pub use version::PROTOCOL_VERSION;
 pub use write::{VersionColumn, WritableCatalog};
