@@ -43,8 +43,11 @@ use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
 use diesel::sqlite::{CommitDecision, Sqlite, SqliteChangeOps, SqliteUpdateRouter};
 use diesel::{Connection, SqliteConnection};
-use diesel_sqlite_session::{ConflictAction, ConflictType, Session, SqliteSessionExt};
-use std::collections::HashSet;
+use diesel_sqlite_session::{
+    ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
+};
+use sqlite_diff_rs::{ParsedDiffSet, Value};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
@@ -86,7 +89,7 @@ pub struct ClientConfig {
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
     /// The server began an initial snapshot for a subscription.
     SnapshotBegin {
@@ -126,11 +129,15 @@ pub enum ClientEvent {
     MutationRejected {
         /// The rejected mutation's sequence number.
         client_seq: u64,
+        /// Rows the rejected write touched, rolled back locally.
+        rows: Vec<AffectedRow>,
     },
     /// The server reported a conflict on a prior mutation.
     MutationConflict {
         /// The conflicting mutation's sequence number.
         client_seq: u64,
+        /// Rows the conflicting write touched, rolled back locally.
+        rows: Vec<AffectedRow>,
     },
     /// A keepalive reply.
     Pong {
@@ -139,6 +146,43 @@ pub enum ClientEvent {
     },
     /// The connection closed.
     Closed,
+}
+
+/// A primary-key column value carried on a mutation event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyValue {
+    /// SQL NULL.
+    Null,
+    /// Integer key column.
+    Int(i64),
+    /// Real key column.
+    Real(f64),
+    /// Text key column.
+    Text(String),
+    /// Blob key column.
+    Blob(Vec<u8>),
+}
+
+impl From<Value<String, Vec<u8>>> for KeyValue {
+    fn from(value: Value<String, Vec<u8>>) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(int) => Self::Int(int),
+            Value::Real(real) => Self::Real(real),
+            Value::Text(text) => Self::Text(text),
+            Value::Blob(blob) => Self::Blob(blob),
+        }
+    }
+}
+
+/// A row a mutation touched, identified by table and primary key. Reported when
+/// the server rejects or conflicts the mutation and the client rolls it back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffectedRow {
+    /// Table containing the row.
+    pub table: String,
+    /// The row's primary-key column values, in key order.
+    pub key: Vec<KeyValue>,
 }
 
 /// The outcome of one [`ConnettoConnection::next_event`]: the observed event and
@@ -160,6 +204,41 @@ fn server_wins(conflict: ConflictType) -> ConflictAction {
         ConflictType::Data | ConflictType::Conflict => ConflictAction::Replace,
         _ => ConflictAction::Omit,
     }
+}
+
+/// Maximum number of pushed mutations retained for rollback. A server rejection
+/// arrives well within this window, so the changeset to invert is still held.
+const PENDING_CAP: usize = 256;
+
+/// Conflict resolution for a rollback: a row a concurrent server patch already
+/// changed is left as the server left it, so only a cleanly-matching optimistic
+/// write is reverted.
+fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
+    ConflictAction::Omit
+}
+
+/// Decode a pushed changeset into the rows it touched, each as its table and
+/// primary key, for reporting on a rejected or conflicting mutation.
+fn affected_rows(changeset: &[u8]) -> Result<Vec<AffectedRow>, ClientError> {
+    let parsed = ParsedDiffSet::parse(changeset)
+        .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?;
+    let rows = match parsed {
+        ParsedDiffSet::Changeset(diff) => diff
+            .iter()
+            .map(|op| AffectedRow {
+                table: op.table().name().to_owned(),
+                key: op.primary_key().into_iter().map(KeyValue::from).collect(),
+            })
+            .collect(),
+        ParsedDiffSet::Patchset(diff) => diff
+            .iter()
+            .map(|op| AffectedRow {
+                table: op.table().name().to_owned(),
+                key: op.primary_key().into_iter().map(KeyValue::from).collect(),
+            })
+            .collect(),
+    };
+    Ok(rows)
 }
 
 /// Count the ops in a captured changeset for the advisory `MutationHeader`.
@@ -209,6 +288,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// Transaction bookkeeping for the diesel `Connection` impl. The manager
     /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `dev`.
     transaction_state: AnsiTransactionManager,
+    /// Changesets of pushed mutations awaiting resolution, keyed by `client_seq`,
+    /// so a server rejection can be inverted and rolled back locally. Bounded by
+    /// `PENDING_CAP`.
+    pending: BTreeMap<u64, Vec<u8>>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -292,6 +375,7 @@ where
             dirty,
             changed,
             transaction_state: AnsiTransactionManager::default(),
+            pending: BTreeMap::new(),
         })
     }
 
@@ -410,6 +494,10 @@ where
             .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.pending.insert(seq, changeset);
+        if self.pending.len() > PENDING_CAP {
+            self.pending.pop_first();
+        }
         // Reset capture: a fresh session records only writes after this push.
         let mut fresh = self
             .dev
@@ -420,6 +508,25 @@ where
             .map_err(|e| ClientError::Session(e.to_string()))?;
         self.session = fresh;
         Ok(Some(seq))
+    }
+
+    /// Roll back the optimistic local write for `client_seq` after the server
+    /// rejected or conflicted it: decode the touched rows for the event, invert
+    /// the captured changeset, and apply the inverse on the apply connection,
+    /// which the capture session does not observe, so the rollback is never
+    /// re-uploaded. A row a concurrent server patch already changed is left
+    /// alone. Returns the touched rows, empty when the changeset is gone.
+    fn rollback(&mut self, client_seq: u64) -> Result<Vec<AffectedRow>, ClientError> {
+        let Some(changeset) = self.pending.remove(&client_seq) else {
+            return Ok(Vec::new());
+        };
+        let rows = affected_rows(&changeset)?;
+        let inverse = invert_changeset(&changeset)
+            .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
+        self.apply
+            .apply_changeset(&inverse, rollback_omit)
+            .map_err(|err| ClientError::Apply(err.to_string()))?;
+        Ok(rows)
     }
 
     /// Flush locally captured writes as one mutation when the capture session
@@ -498,12 +605,20 @@ where
             ControlMessage::FullResyncRequired(resync) => Ok(ClientEvent::FullResync {
                 sub_id: resync.sub_id,
             }),
-            ControlMessage::MutationReject(reject) => Ok(ClientEvent::MutationRejected {
-                client_seq: reject.client_seq,
-            }),
-            ControlMessage::MutationConflict(conflict) => Ok(ClientEvent::MutationConflict {
-                client_seq: conflict.client_seq,
-            }),
+            ControlMessage::MutationReject(reject) => {
+                let rows = self.rollback(reject.client_seq)?;
+                Ok(ClientEvent::MutationRejected {
+                    client_seq: reject.client_seq,
+                    rows,
+                })
+            }
+            ControlMessage::MutationConflict(conflict) => {
+                let rows = self.rollback(conflict.client_seq)?;
+                Ok(ClientEvent::MutationConflict {
+                    client_seq: conflict.client_seq,
+                    rows,
+                })
+            }
             ControlMessage::Pong(pong) => Ok(ClientEvent::Pong { nonce: pong.nonce }),
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"

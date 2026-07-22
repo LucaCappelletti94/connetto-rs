@@ -143,9 +143,11 @@ Implementing `Connection` requires diesel's `i-implement-a-third-party-backend-a
 
 Mutation interception (auto-submit) is landed. An `on_commit` hook on the app connection sets a dirty flag whenever a local write commits. The hook may only signal, since SQLite forbids using the connection inside it and the async send cannot run there. The driver's `flush()` then drains the capture session and uploads the mutation, so the app never calls `push()`. `next_event()` flushes pending writes and applies one inbound server frame in a single step, returning the event plus the tables that changed.
 
+Rejection rollback is landed. Each pushed changeset is retained keyed by `client_seq` (bounded by `PENDING_CAP`). When the server replies `MutationReject` or `MutationConflict`, the connection inverts that changeset with `invert_changeset` and applies the inverse on the apply connection, undoing the optimistic local write. The apply connection is not observed by the capture session, so the rollback is never re-uploaded, and a row a concurrent server patch already changed is left as the server left it (the inverse is omitted on any conflict). Both events carry the affected rows as `AffectedRow { table, key }`, the table name and primary-key values (`Vec<KeyValue>`) decoded from the pushed changeset via `op.primary_key()`, so the app can show which rows reverted.
+
 Reactivity is landed. `on_update` hooks on both the app connection and the apply connection record the name of every table whose rows change (local writes and applied server patches alike) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection is `Send` (the capture `Session` is `Send`, mirroring diesel's own `SqliteConnection`), so it can move between threads, but it is driven by one task at a time and is not `Sync`. In WASM this same object is the worker-side connection with a worker `Transport`, while the main-thread tab uses a separate proxy connection that forwards queries over `postMessage`.
 
-Still ahead: aggregate query routing, rolling back a locally applied write the server rejects, and the WASM variants above.
+Still ahead: aggregate query routing and the WASM variants above. On a `MutationConflict` the write is rolled back but the server's authoritative row is not yet merged in, which is the remaining conflict-resolution refinement.
 
 ---
 

@@ -25,7 +25,7 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.7.0", default-features = false }
+sqlite-diff-rs = { version = "0.7.1", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 tokio.workspace = true

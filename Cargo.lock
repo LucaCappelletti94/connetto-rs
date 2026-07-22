@@ -1785,9 +1785,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "376e85d403d98ea571dd4456d17df1c874661ff7e5317642c3468a8a1cb8cc0b"
+checksum = "d15c51e159cdbeb2398a1ab18bd977684518f77af325a7b0051356f7ee12e42d"
 dependencies = [
  "diesel",
  "diesel-async",

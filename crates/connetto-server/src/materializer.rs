@@ -36,7 +36,7 @@ use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, sql_query};
-use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, TableSchema, Value};
+use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, SchemaWithPK, TableSchema, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
 use subql::emit::pgoutput_patchset;
@@ -650,33 +650,19 @@ where
         if !self.write.is_writable(&table) {
             return Err(MaterializerError::NotWritable(table));
         }
-        let pk_idx = pk_indices(schema);
-        let (verb, pk_values, conflict) = match op {
-            ChangesetOp::Insert { values, .. } => {
-                let pk: Vec<WireValue> = pk_idx.iter().map(|&i| values[i].clone()).collect();
-                (MutationOp::Insert, pk, None)
-            }
+        let pk_values = op.primary_key();
+        let (verb, conflict) = match op {
+            ChangesetOp::Insert { .. } => (MutationOp::Insert, None),
             ChangesetOp::Update { values, .. } => {
-                let pk = pk_idx
-                    .iter()
-                    .map(|&i| {
-                        values[i]
-                            .0
-                            .clone()
-                            .or_else(|| values[i].1.clone())
-                            .ok_or_else(|| MaterializerError::MissingVersion(table.clone()))
-                    })
-                    .collect::<Result<Vec<WireValue>, _>>()?;
-                let conflict = self.plan_conflict(&table, &pk_idx, &pk, |idx| {
+                let conflict = self.plan_conflict(schema, &pk_values, |idx| {
                     values.get(idx).and_then(|cell| cell.0.clone())
                 })?;
-                (MutationOp::Update, pk, conflict)
+                (MutationOp::Update, conflict)
             }
             ChangesetOp::Delete { old_values, .. } => {
-                let pk: Vec<WireValue> = pk_idx.iter().map(|&i| old_values[i].clone()).collect();
                 let conflict =
-                    self.plan_conflict(&table, &pk_idx, &pk, |idx| old_values.get(idx).cloned())?;
-                (MutationOp::Delete, pk, conflict)
+                    self.plan_conflict(schema, &pk_values, |idx| old_values.get(idx).cloned())?;
+                (MutationOp::Delete, conflict)
             }
         };
         Ok(PlannedOp {
@@ -696,16 +682,12 @@ where
             return Err(MaterializerError::NotWritable(table));
         }
         match op {
-            PatchsetOp::Insert { values, .. } => {
-                let pk_idx = pk_indices(op.table());
-                let pk_values: Vec<WireValue> = pk_idx.iter().map(|&i| values[i].clone()).collect();
-                Ok(PlannedOp {
-                    table,
-                    op: MutationOp::Insert,
-                    pk: crate::pk::encode_wire(&pk_values),
-                    conflict: None,
-                })
-            }
+            PatchsetOp::Insert { .. } => Ok(PlannedOp {
+                table,
+                op: MutationOp::Insert,
+                pk: crate::pk::encode_wire(&op.primary_key()),
+                conflict: None,
+            }),
             // A patchset carries no prior image, so an update or delete cannot
             // be conflict-checked. Fail closed.
             PatchsetOp::Update { .. } | PatchsetOp::Delete { .. } => {
@@ -719,11 +701,11 @@ where
     /// value at a column index from the op's old image.
     fn plan_conflict(
         &self,
-        table: &str,
-        pk_idx: &[usize],
+        schema: &TableSchema<String>,
         pk_values: &[WireValue],
         basis: impl Fn(usize) -> Option<WireValue>,
     ) -> Result<Option<PlannedConflict>, MaterializerError> {
+        let table = schema.name();
         let Some(version) = self.write.version_column(table) else {
             return Ok(None);
         };
@@ -736,9 +718,10 @@ where
         let basis = basis(usize::from(version_idx))
             .ok_or_else(|| MaterializerError::MissingVersion(table.to_owned()))?;
 
-        let pk_columns = pk_idx
-            .iter()
-            .map(|&idx| column_name_at(db, table_id, idx))
+        let pk_columns = schema
+            .primary_key_columns()
+            .into_iter()
+            .map(|idx| column_name_at(db, table_id, idx))
             .collect::<Result<Vec<_>, _>>()?;
         let arity = catalog_helpers::table_arity(db, table_id)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
@@ -1079,18 +1062,6 @@ fn json_scalar_to_string(value: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
-}
-
-/// Primary-key column indices of a parsed table, in key order.
-fn pk_indices(schema: &TableSchema<String>) -> Vec<usize> {
-    let mut cols: Vec<(usize, u8)> = schema
-        .pk_flags()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &flag)| (flag > 0).then_some((idx, flag)))
-        .collect();
-    cols.sort_by_key(|&(_, flag)| flag);
-    cols.into_iter().map(|(idx, _)| idx).collect()
 }
 
 /// Resolve a column name by ordinal index.

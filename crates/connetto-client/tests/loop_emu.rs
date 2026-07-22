@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{AffectedRow, ClientConfig, ClientEvent, ConnettoConnection, KeyValue};
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
@@ -110,12 +110,31 @@ fn server_write_target() -> SqliteWriteTarget {
     sqlite_write_target(conn)
 }
 
+/// A SQLite write target seeded with one `orders` row at `status`, standing in
+/// for a server whose version already moved past the client's snapshot basis.
+fn seeded_orders_target(status: &str) -> SqliteWriteTarget {
+    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
+    sql_query(SQLITE_DDL)
+        .execute(&mut conn)
+        .expect("create table");
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(1_i64),
+            orders::price.eq(1.0_f64),
+            orders::quantity.eq(3_i64),
+            orders::status.eq(status),
+        ))
+        .execute(&mut conn)
+        .expect("seed order");
+    sqlite_write_target(conn)
+}
+
 /// Pump the client until it observes an event matching `pred`, applying every
 /// frame in between.
 async fn pump_until(
     client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
     pred: impl Fn(&ClientEvent) -> bool,
-) {
+) -> ClientEvent {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let event = tokio::time::timeout_at(deadline, client.pump_one())
@@ -124,7 +143,7 @@ async fn pump_until(
             .expect("client pump failed");
         assert_ne!(event, ClientEvent::Closed, "connection closed early");
         if pred(&event) {
-            return;
+            return event;
         }
     }
 }
@@ -478,6 +497,200 @@ async fn connection_is_a_diesel_connection() {
             "the typed write auto-submitted to the server",
         );
     }
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_write_rolls_back_locally() {
+    // A materializer with no writable tables rejects every client mutation, so
+    // the optimistic local write must be undone when the reject arrives.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "client-a".to_owned(),
+        auth_token: "token".to_owned(),
+    };
+    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+
+    // Optimistic local write through the connection.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(99_i64),
+            orders::price.eq(1.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("nope"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic insert");
+    assert_eq!(
+        orders::table
+            .order(orders::id)
+            .select(Order::as_select())
+            .load::<Order>(&mut client)
+            .expect("load"),
+        vec![order(99, 1.0, 1, "nope")],
+        "the optimistic write is visible locally before the server responds",
+    );
+
+    // Auto-submit, then pump the rejection. Handling the reject rolls it back.
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("a mutation was submitted");
+    let event = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        ClientEvent::MutationRejected {
+            client_seq: 0,
+            rows: vec![AffectedRow {
+                table: "orders".to_owned(),
+                key: vec![KeyValue::Int(99)],
+            }],
+        },
+        "the reject event names the rolled-back row by table and primary key",
+    );
+
+    // The server-rejected write was undone on the client.
+    assert_eq!(
+        orders::table
+            .order(orders::id)
+            .select(Order::as_select())
+            .load::<Order>(&mut client)
+            .expect("load"),
+        Vec::<Order>::new(),
+        "the rejected write was rolled back locally",
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_write_rolls_back_and_reports_keys() {
+    // orders.status is the declared version column. The snapshot seeds the
+    // client at status "seed", but the server row already moved to "server", so
+    // the client's update carries a stale basis and the server reports a
+    // conflict rather than applying it.
+    let writable = RuntimeWritableCatalog::builder()
+        .versioned("orders", "status")
+        .build();
+    let materializer =
+        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let target = seeded_orders_target("server");
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "client-a".to_owned(),
+        auth_token: "token".to_owned(),
+    };
+    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+
+    // Sync the seed row so the client has a local (stale) basis to update from.
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "the snapshot seeded the client at the stale version",
+    );
+
+    // Optimistic update bumps the version column; its old image "seed" is stale.
+    diesel::update(orders::table.find(1_i64))
+        .set(orders::status.eq("mine"))
+        .execute(&mut client)
+        .expect("optimistic update");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("a mutation was submitted");
+
+    let event = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationConflict { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        ClientEvent::MutationConflict {
+            client_seq: 0,
+            rows: vec![AffectedRow {
+                table: "orders".to_owned(),
+                key: vec![KeyValue::Int(1)],
+            }],
+        },
+        "the conflict event names the rolled-back row by table and primary key",
+    );
+
+    // The conflicting write was undone locally; the stale basis is restored and
+    // the server row is left for the sync stream to converge.
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "the conflicting write was rolled back locally",
+    );
 
     client.close().await.expect("close");
     server.await.expect("join server");
