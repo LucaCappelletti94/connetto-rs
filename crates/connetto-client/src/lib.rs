@@ -34,7 +34,14 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use core::sync::atomic::{AtomicBool, Ordering};
 use diesel::connection::SimpleConnection;
-use diesel::sqlite::{CommitDecision, SqliteChangeOps, SqliteUpdateRouter};
+use diesel::connection::{
+    AnsiTransactionManager, CacheSize, ConnectionSealed, DefaultLoadingMode, Instrumentation,
+    LoadConnection,
+};
+use diesel::expression::QueryMetadata;
+use diesel::query_builder::{Query, QueryFragment, QueryId};
+use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
+use diesel::sqlite::{CommitDecision, Sqlite, SqliteChangeOps, SqliteUpdateRouter};
 use diesel::{Connection, SqliteConnection};
 use diesel_sqlite_session::{ConflictAction, ConflictType, Session, SqliteSessionExt};
 use std::collections::HashSet;
@@ -199,6 +206,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// Names of tables whose rows changed since the last drain, from the update
     /// hooks on both `dev` (local writes) and `apply` (server patches).
     changed: Arc<Mutex<HashSet<String>>>,
+    /// Transaction bookkeeping for the diesel `Connection` impl. The manager
+    /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `dev`.
+    transaction_state: AnsiTransactionManager,
 }
 
 impl<T> ConnettoConnection<T>
@@ -281,6 +291,7 @@ where
             session_id,
             dirty,
             changed,
+            transaction_state: AnsiTransactionManager::default(),
         })
     }
 
@@ -512,5 +523,76 @@ where
             .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+}
+
+impl<T: Transport> SimpleConnection for ConnettoConnection<T> {
+    fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        self.dev.batch_execute(query)
+    }
+}
+
+impl<T: Transport> ConnectionSealed for ConnettoConnection<T> {}
+
+/// `ConnettoConnection` is a diesel `Connection` over the managed local SQLite,
+/// so applications run ordinary diesel queries on `&mut conn`. Execution
+/// delegates to the capture connection `dev`, so local writes are recorded and
+/// auto-submitted by the driver. `establish` is unsupported: build the
+/// connection with [`ConnettoConnection::connect`], which owns the transport and
+/// handshake. diesel's query methods never call `establish`.
+impl<T: Transport + Send> Connection for ConnettoConnection<T> {
+    type Backend = Sqlite;
+    type TransactionManager = AnsiTransactionManager;
+
+    fn establish(_database_url: &str) -> ConnectionResult<Self> {
+        Err(ConnectionError::BadConnection(
+            "ConnettoConnection is built with ConnettoConnection::connect, not establish"
+                .to_owned(),
+        ))
+    }
+
+    fn execute_returning_count<Q>(&mut self, source: &Q) -> QueryResult<usize>
+    where
+        Q: QueryFragment<Self::Backend> + QueryId,
+    {
+        self.dev.execute_returning_count(source)
+    }
+
+    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
+        &mut self.transaction_state
+    }
+
+    fn instrumentation(&mut self) -> &mut dyn Instrumentation {
+        self.dev.instrumentation()
+    }
+
+    fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
+        self.dev.set_instrumentation(instrumentation);
+    }
+
+    fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
+        self.dev.set_prepared_statement_cache_size(size);
+    }
+}
+
+impl<T: Transport + Send> LoadConnection<DefaultLoadingMode> for ConnettoConnection<T> {
+    type Cursor<'conn, 'query>
+        = <SqliteConnection as LoadConnection<DefaultLoadingMode>>::Cursor<'conn, 'query>
+    where
+        T: 'conn;
+    type Row<'conn, 'query>
+        = <SqliteConnection as LoadConnection<DefaultLoadingMode>>::Row<'conn, 'query>
+    where
+        T: 'conn;
+
+    fn load<'conn, 'query, Q>(
+        &'conn mut self,
+        source: Q,
+    ) -> QueryResult<Self::Cursor<'conn, 'query>>
+    where
+        Q: Query + QueryFragment<Self::Backend> + QueryId + 'query,
+        Self::Backend: QueryMetadata<Q::SqlType>,
+    {
+        self.dev.load(source)
     }
 }

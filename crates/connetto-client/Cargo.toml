@@ -18,8 +18,11 @@ workspace = true
 # Wire types, framing, and the native WebSocket/loopback transports.
 connetto-core = { workspace = true, features = ["native-transport"] }
 # Local store plus the SQLite session extension: the capture hook for local
-# writes and the native apply for server patches.
-diesel.workspace = true
+# writes and the native apply for server patches. The third-party-backend
+# feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
+diesel = { workspace = true, features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
 sqlite-diff-rs = { version = "0.7.0", default-features = false }

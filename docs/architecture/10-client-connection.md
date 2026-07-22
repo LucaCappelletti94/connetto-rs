@@ -137,13 +137,15 @@ For aggregate backing tables, the same hooks fire when connetto updates them wit
 
 ## Native driver: `ConnettoConnection` (v1 landed)
 
-`connetto-client`'s native connection is `ConnettoConnection` (renamed from the earlier `SyncClient`). It exposes the explicit primitives `conn()` (a managed `SqliteConnection` for ordinary app reads and writes, whose writes a SQLite session captures), `subscribe()`, `push()`, and `pump_one()`, plus the ergonomic driver the application uses.
+`connetto-client`'s native connection is `ConnettoConnection` (renamed from the earlier `SyncClient`). It implements diesel's `Connection` and `LoadConnection`, so the application runs ordinary diesel queries directly on `&mut conn` (`users::table.load(&mut conn)`, `insert_into(...).execute(&mut conn)`). Execution delegates to the managed capture connection, so those writes are recorded for upload. `conn()` remains as an escape hatch to the underlying `SqliteConnection`, and the driver methods `subscribe()`, `push()`, `pump_one()`, `flush()`, and `next_event()` sit alongside.
+
+Implementing `Connection` requires diesel's `i-implement-a-third-party-backend-and-opt-into-breaking-changes` feature (which unseals `ConnectionSealed`), enabled on `connetto-client`. `establish` is stubbed to error, since the connection is built by the async `connect(...)` that owns the transport and handshake, not from a URL. That is the one impedance mismatch of layering an async-transport connection under diesel's synchronous `Connection`, and diesel's query methods never call `establish`.
 
 Mutation interception (auto-submit) is landed. An `on_commit` hook on the app connection sets a dirty flag whenever a local write commits. The hook may only signal, since SQLite forbids using the connection inside it and the async send cannot run there. The driver's `flush()` then drains the capture session and uploads the mutation, so the app never calls `push()`. `next_event()` flushes pending writes and applies one inbound server frame in a single step, returning the event plus the tables that changed.
 
-Reactivity is landed. `on_update` hooks on both the app connection and the apply connection record the name of every table whose rows change (local writes and applied server patches alike) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection stays single-threaded: the `Session` holds a raw SQLite handle and is `!Send`, so the app drives `next_event()` from one task and issues writes between awaits.
+Reactivity is landed. `on_update` hooks on both the app connection and the apply connection record the name of every table whose rows change (local writes and applied server patches alike) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection is `Send` (the capture `Session` is `Send`, mirroring diesel's own `SqliteConnection`), so it can move between threads, but it is driven by one task at a time and is not `Sync`. In WASM this same object is the worker-side connection with a worker `Transport`, while the main-thread tab uses a separate proxy connection that forwards queries over `postMessage`.
 
-Still ahead: implementing Diesel's `Connection` and `LoadConnection` on `ConnettoConnection` so app queries run directly on it (today they run on `conn()`), aggregate query routing, rolling back a locally applied write the server rejects, and the WASM variants above.
+Still ahead: aggregate query routing, rolling back a locally applied write the server rejects, and the WASM variants above.
 
 ---
 

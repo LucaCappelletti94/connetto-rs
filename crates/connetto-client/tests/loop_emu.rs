@@ -387,3 +387,98 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     client.close().await.expect("close");
     server.await.expect("join server");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_is_a_diesel_connection() {
+    // orders is writable so the client mutation applies. No subscription is
+    // needed: this exercises the diesel Connection impl and auto-submit.
+    let writable = RuntimeWritableCatalog::builder().writable("orders").build();
+    let materializer =
+        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target.clone(),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "client-a".to_owned(),
+        auth_token: "token".to_owned(),
+    };
+    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+
+    // Write through the diesel Connection impl: a typed insert runs on
+    // `&mut client` directly, with no `.conn()` and no manual push.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(15_i64),
+            orders::price.eq(3.5_f64),
+            orders::quantity.eq(2_i64),
+            orders::status.eq("typed"),
+        ))
+        .execute(&mut client)
+        .expect("typed insert through the connection");
+
+    // Read back through the LoadConnection impl on `&mut client`.
+    assert_eq!(
+        orders::table
+            .order(orders::id)
+            .select(Order::as_select())
+            .load::<Order>(&mut client)
+            .expect("typed load"),
+        vec![order(15, 3.5, 2, "typed")],
+        "the typed write is visible through a typed load on the connection",
+    );
+
+    // The commit hook marked the write dirty; flush auto-submits it.
+    let seq = client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("a mutation was auto-submitted");
+    assert_eq!(seq, 0, "first auto-submitted mutation carries client_seq 0");
+
+    // Barrier: the pong proves the server handled the mutation.
+    client.ping(1).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 1),
+    )
+    .await;
+
+    // The write reached the server's write target through the diesel connection.
+    {
+        let mut conn = target.lock();
+        assert_eq!(
+            orders(&mut conn),
+            vec![order(15, 3.5, 2, "typed")],
+            "the typed write auto-submitted to the server",
+        );
+    }
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
