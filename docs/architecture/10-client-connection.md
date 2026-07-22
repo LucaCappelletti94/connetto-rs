@@ -147,7 +147,7 @@ Rejection rollback is landed. Each pushed changeset is retained keyed by `client
 
 Reactivity is landed. `on_update` hooks on both the app connection and the apply connection record the name of every table whose rows change (local writes and applied server patches alike) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection is `Send` (the capture `Session` is `Send`, mirroring diesel's own `SqliteConnection`), so it can move between threads, but it is driven by one task at a time and is not `Sync`. In WASM this same object is the worker-side connection with a worker `Transport`, while the main-thread tab uses a separate proxy connection that forwards queries over `postMessage`.
 
-Still ahead: aggregate query routing and the WASM variants above. On a `MutationConflict` the write is rolled back but the server's authoritative row is not yet merged in, which is the remaining conflict-resolution refinement.
+Still ahead: aggregate query routing and the WASM variants above. Conflict convergence is landed and rides the existing sync stream: once a `MutationConflict` rolls the local write back, the server's authoritative row arrives as a normal `LivePatch` and applies on the apply connection with the server-wins resolver, so the client converges without the conflict message carrying any server state. Verified end to end by the `loop_emu` test `conflicting_write_converges_to_server_after_rollback`.
 
 ---
 

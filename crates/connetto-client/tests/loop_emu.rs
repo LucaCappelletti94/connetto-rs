@@ -695,3 +695,169 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     client.close().await.expect("close");
     server.await.expect("join server");
 }
+
+/// Connect one client over the socket with a fresh file-backed replica. The
+/// caller owns `db_path` (its backing temp file must outlive the connection).
+async fn connect_client(
+    addr: std::net::SocketAddr,
+    client_id: &str,
+    db_path: &str,
+) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: client_id.to_owned(),
+        auth_token: "token".to_owned(),
+    };
+    ConnettoConnection::connect(transport, db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflicting_write_converges_to_server_after_rollback() {
+    // Two clients share one server. Client B lands an update that moves the
+    // server row past client A's basis, so A's stale update conflicts and rolls
+    // back. The concurrent change then arrives on the sync stream as a live
+    // patch, converging A's local row to the server's authoritative value.
+    let writable = RuntimeWritableCatalog::builder()
+        .versioned("orders", "status")
+        .build();
+    let materializer =
+        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let target = seeded_orders_target("seed");
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let accept_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+            let session_manager = accept_manager.clone();
+            sessions.push(tokio::spawn(async move {
+                session_manager.serve(transport).await.expect("session ok");
+            }));
+        }
+        for session in sessions {
+            session.await.expect("join session");
+        }
+    });
+
+    let db_a = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db a");
+    let db_b = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db b");
+    let path_a = db_a.path().to_str().expect("utf8 path").to_owned();
+    let path_b = db_b.path().to_str().expect("utf8 path").to_owned();
+    let mut client_a = connect_client(addr, "client-a", &path_a).await;
+    let mut client_b = connect_client(addr, "client-b", &path_b).await;
+
+    // Both clients sync the seed row (status "seed").
+    client_a
+        .subscribe("orders", QUERY)
+        .await
+        .expect("subscribe a");
+    pump_until(&mut client_a, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    client_b
+        .subscribe("orders", QUERY)
+        .await
+        .expect("subscribe b");
+    pump_until(&mut client_b, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    assert_eq!(
+        orders(client_a.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "client A synced the seed row",
+    );
+
+    // Client B lands an update, moving the server row to "server". The barrier
+    // pong proves the server applied it before client A writes.
+    diesel::update(orders::table.find(1_i64))
+        .set(orders::status.eq("server"))
+        .execute(&mut client_b)
+        .expect("B update");
+    client_b
+        .flush()
+        .await
+        .expect("flush B")
+        .expect("B mutation submitted");
+    client_b.ping(1).await.expect("ping B");
+    pump_until(
+        &mut client_b,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 1),
+    )
+    .await;
+
+    // Client A updates from its now-stale basis "seed"; the server conflicts and
+    // A rolls the optimistic write back locally.
+    diesel::update(orders::table.find(1_i64))
+        .set(orders::status.eq("mine"))
+        .execute(&mut client_a)
+        .expect("A update");
+    client_a
+        .flush()
+        .await
+        .expect("flush A")
+        .expect("A mutation submitted");
+    pump_until(&mut client_a, |e| {
+        matches!(e, ClientEvent::MutationConflict { .. })
+    })
+    .await;
+    assert_eq!(
+        orders(client_a.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "A's conflicting write rolled back to the basis",
+    );
+
+    // The server re-delivers the authoritative row for the conflicted key over
+    // the sync stream. The client applies it on the un-captured connection with
+    // the server-wins resolver, upserting its stale local copy: the convergence
+    // path a real CDC echo of the concurrent write takes.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql(
+            "INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 3, 'server')",
+        )
+        .expect("emu authoritative row");
+    while let Some(event) = source.next_event().await.expect("poll event") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+
+    // A converges to the server's authoritative value.
+    pump_until(&mut client_a, |e| {
+        matches!(e, ClientEvent::LivePatch { .. })
+    })
+    .await;
+    assert_eq!(
+        orders(client_a.conn()),
+        vec![order(1, 1.0, 3, "server")],
+        "A converged to the server's authoritative row",
+    );
+
+    client_a.close().await.expect("close A");
+    client_b.close().await.expect("close B");
+    server.await.expect("join server");
+}
