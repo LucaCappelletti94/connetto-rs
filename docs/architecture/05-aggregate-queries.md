@@ -24,6 +24,18 @@ In these cases, the server must compute and maintain the aggregate and push upda
 
 ---
 
+## Delivered design (landed): two answer paths
+
+Where an aggregate is answered is dictated by where the data lives, and it splits cleanly in two.
+
+Client-authorized view (rows, and per-client aggregates over them). The client holds a local SQLite replica of exactly the rows it is authorized to see, kept current by CDC. Any aggregate scoped to that view (count of my orders, average of my amounts, and the full statistical family) is computed locally over the replica. This is the primary answer path: immediate, available offline, and correct as of the last sync. The server subscription for such a table carries row patches, not aggregate values, so its role is to keep the replica fresh (apply CDC, raise the reactive changed-tables signal, the client recomputes). On reconnect, catchup reconciles whatever was missed offline.
+
+Global, cross-client statistics (non-RLS only). A statistic over rows the client does not hold (total order count across all users, an anonymized average) cannot be computed on the device, so only these go through the server-side delta accumulator that subql maintains in process and pushes as a `ClientEvent::Aggregate`. subql rejects an aggregator on an RLS-protected table at registration (`RegisterError::AggregatorOnRlsTable`), which connetto surfaces as a `ClientEvent::NonFatal` with the session intact, because a single shared accumulator cannot represent a value that differs per viewer. The server-side family is therefore global statistics only, by construction.
+
+The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP`, seeded once through the connector then folded per CDC event. `MIN` and `MAX` stay on the re-execution path. See `10-subscription-materializer.md` for the server mechanics and `10-client-connection.md` for the client-query mechanism.
+
+---
+
 ## Primary Approach: Server-Side Accumulator
 
 `subql` maintains per-subscription accumulator state in memory for supported aggregate shapes. On a CDC event it updates the accumulator incrementally and emits a signed delta, which the materializer authorizes and pushes to the client as a new total or delta.
@@ -95,16 +107,11 @@ Re-execution is more expensive but always correct. The server should rate-limit 
 
 ---
 
-## Authorization in Aggregates
+## Authorization in aggregates
 
-Aggregate subscriptions do not expose individual rows to the client. The server applies row-level authorization *before* updating the accumulator:
+Server-side aggregates are global, non-RLS statistics, so no per-viewer authorization is applied to the accumulator: every consumer of a given server-side aggregate observes the same value. This is enforced at registration, where subql refuses an aggregator on an RLS-protected table (see the delivered design above), so a server-side accumulator never straddles viewers with different authorized row sets.
 
-- For a `COUNT(*)` subscription: only count rows the client is authorized to see.
-- For a `SUM(col)` subscription: only sum values from rows the client is authorized to see.
-
-This means the accumulator's state reflects the authorized view, not the raw table state.
-
-When a row's authorization status changes (e.g. it becomes visible to the client), the accumulator is updated as if that row was newly inserted.
+A per-viewer aggregate, the value over the rows a given client may see, is not a server-side accumulator at all. The client computes it locally over its authorized replica, which already reflects that client's RLS view. The one place that knows a client's authorized rows, its own replica, is where the per-viewer aggregate is computed.
 
 ---
 
@@ -146,7 +153,7 @@ Both paths are indexed by table name and filtered by predicate.
 
 ## Decisions
 
-**All aggregates go through the server-side accumulator path.** Materialized views and trigger-maintained tables are not used for aggregate subscriptions. Even on tables where RLS is absent, everything is treated as per-user to avoid a split code path.
+**Server-side aggregates are global non-RLS statistics only; per-client aggregates are computed locally.** The earlier plan to route every aggregate through one per-user server-side path was reversed. A per-viewer value cannot be shared across consumers, and the client already holds its authorized rows, so it computes its own view locally over the replica. The server-side delta accumulator is reserved for global statistics over data the client does not replicate, and subql rejects aggregators on RLS tables to enforce it.
 
 **Reason RLS kills materialized views:** a materialized view is a single computed result. Under RLS, `COUNT(*) FROM orders` returns a different value per user — there is no single server-side value to mirror. The result only exists in the context of a specific user's authorization context.
 

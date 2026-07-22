@@ -43,8 +43,9 @@ use subql::emit::pgoutput_patchset;
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
 use subql::{
-    ChangeEvent, DatabaseLike, DefaultIds, OpaqueCheckpoint, ParserDB, SubscriptionEngine,
-    SubscriptionId, SubscriptionRequest, TableLike, catalog_helpers,
+    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, DatabaseLike, DefaultIds,
+    OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableLike,
+    catalog_helpers,
 };
 
 use crate::oplog::ChangeRecord;
@@ -263,6 +264,10 @@ pub enum Registration {
     /// A captured single-table scalar aggregate the materializer must bootstrap
     /// and re-execute through a connector.
     Aggregate(AggregateCapture),
+    /// A single-table delta aggregate the materializer maintains in-process by
+    /// folding per-event deltas into a seeded accumulator (`COUNT`, `SUM`,
+    /// `AVG`, and the variance and stddev family).
+    DeltaAggregate(DeltaAggregateCapture),
 }
 
 /// A captured aggregate query awaiting bootstrap.
@@ -277,6 +282,23 @@ pub struct AggregateCapture {
     pub kind: ScalarKind,
 }
 
+/// A captured delta aggregate awaiting its bootstrap seed.
+///
+/// Unlike [`AggregateCapture`], the engine maintains this subscription directly
+/// (it has a [`SubscriptionId`] and matches CDC events), and the materializer
+/// folds the per-event [`AggDelta`](subql::AggDelta)s the engine produces into a running value.
+/// The session seeds the initial value through the connector before folding.
+pub struct DeltaAggregateCapture {
+    /// Consumer that registered it, the key for the folded accumulator state.
+    pub consumer_id: u64,
+    /// Engine subscription id, for CDC routing and unregistration.
+    pub subscription_id: SubscriptionId,
+    /// Aggregate the accumulator computes.
+    pub spec: AggSpec,
+    /// Runnable seed query and its per-column decode kinds.
+    pub bootstrap: AggregateBootstrap,
+}
+
 /// The result of dispatching one CDC event.
 pub struct Dispatched {
     /// Row patches to fan out to matched consumers.
@@ -286,6 +308,9 @@ pub struct Dispatched {
     /// Captured queries whose value must be re-executed through a connector,
     /// coalesced by `query_id`.
     pub triggers: Vec<PendingReExec>,
+    /// Delta aggregate values folded in-process from this event's per-consumer
+    /// [`AggDelta`](subql::AggDelta)s, ready to deliver to the owning session.
+    pub delta_aggregates: Vec<DeltaAggregateChange>,
 }
 
 /// An aggregate value that changed in-process, ready to deliver.
@@ -298,6 +323,14 @@ pub struct AggregateChange {
     pub result_json: String,
     /// Resume cursor for the event that produced it.
     pub cursor: Vec<u8>,
+}
+
+/// A delta aggregate value the materializer folded for one consumer.
+pub struct DeltaAggregateChange {
+    /// Consumer that owns the folded accumulator.
+    pub consumer_id: u64,
+    /// The new folded value serialized as JSON.
+    pub result_json: String,
 }
 
 /// A captured query needing re-execution against the backend.
@@ -331,6 +364,9 @@ where
     engine: ReExecEngine<ChangeEvent, DefaultIds, DB>,
     write: W,
     reexec: HashMap<ReExecQueryId, ReExecMeta>,
+    /// Per-consumer delta aggregate state, keyed by consumer id. Seeded by the
+    /// session after bootstrap, then folded on each dispatched event.
+    deltas: HashMap<u64, (AggSpec, AggAccumulator)>,
 }
 
 impl Materializer<ParserDB, RuntimeWritableCatalog> {
@@ -370,6 +406,7 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
             engine: ReExecEngine::new(SubscriptionEngine::new(catalog, PostgreSqlDialect {})),
             write,
             reexec: HashMap::new(),
+            deltas: HashMap::new(),
         })
     }
 }
@@ -382,9 +419,12 @@ where
     /// Register a subscription for `consumer_id` from a SQL `SELECT`.
     ///
     /// A row subscription returns [`Registration::Row`] with its
-    /// [`SubscriptionId`]. A single-table scalar MIN or MAX the engine cannot
-    /// maintain from row images returns [`Registration::Aggregate`], which the
-    /// caller bootstraps and re-executes.
+    /// [`SubscriptionId`]. A delta aggregate the engine maintains from row
+    /// images (`COUNT`, `SUM`, `AVG`, variance, stddev) returns
+    /// [`Registration::DeltaAggregate`], which the caller seeds through a
+    /// connector and then folds. A single-table scalar MIN or MAX the engine
+    /// cannot maintain returns [`Registration::Aggregate`], which the caller
+    /// bootstraps and re-executes.
     ///
     /// # Errors
     ///
@@ -398,7 +438,22 @@ where
             .engine
             .register(SubscriptionRequest::new(consumer_id, select_sql))?
         {
-            Registered::Engine(result) => Ok(Registration::Row(result.subscription_id)),
+            Registered::Engine(result) => match result.aggregate_spec() {
+                Some(spec) => {
+                    let spec = spec.clone();
+                    let bootstrap = result
+                        .aggregate_bootstrap
+                        .clone()
+                        .expect("aggregate registration carries a bootstrap");
+                    Ok(Registration::DeltaAggregate(DeltaAggregateCapture {
+                        consumer_id,
+                        subscription_id: result.subscription_id,
+                        spec,
+                        bootstrap,
+                    }))
+                }
+                None => Ok(Registration::Row(result.subscription_id)),
+            },
             Registered::ReExec {
                 query_id,
                 sql,
@@ -436,6 +491,22 @@ where
     /// Returns whether the query exists.
     pub fn install_scalar(&mut self, query_id: ReExecQueryId, value: PgValue<Postgres>) -> bool {
         self.engine.install(query_id, value)
+    }
+
+    /// Seed a delta aggregate's accumulator for `consumer_id`.
+    ///
+    /// Called once after the session bootstraps the initial value through the
+    /// connector. Later [`dispatch`](Self::dispatch) calls fold each event's
+    /// [`AggDelta`](subql::AggDelta) into this accumulator.
+    pub fn install_aggregate(&mut self, consumer_id: u64, spec: AggSpec, acc: AggAccumulator) {
+        self.deltas.insert(consumer_id, (spec, acc));
+    }
+
+    /// Drop a delta aggregate: its folded accumulator and its engine
+    /// subscription. Returns whether the subscription existed.
+    pub fn unregister_delta_aggregate(&mut self, consumer_id: u64, sub_id: SubscriptionId) -> bool {
+        self.deltas.remove(&consumer_id);
+        self.engine.inner_mut().unregister_subscription(sub_id)
     }
 
     /// Dispatch one CDC event into row patches, in-process aggregate changes,
@@ -511,10 +582,32 @@ where
                 .collect()
         };
 
+        // Fold this event's per-consumer deltas into the seeded accumulators.
+        // Skip the engine call entirely when no delta aggregate is installed,
+        // which is the common case and avoids a spurious error path for events
+        // the aggregate machinery treats specially (e.g. Truncate).
+        let delta_aggregates = if self.deltas.is_empty() {
+            Vec::new()
+        } else {
+            let deltas = self.engine.inner_mut().aggregate_deltas(event)?;
+            let mut changes = Vec::with_capacity(deltas.len());
+            for (consumer_id, delta) in deltas {
+                if let Some((_, acc)) = self.deltas.get_mut(&consumer_id) {
+                    acc.apply(&delta);
+                    changes.push(DeltaAggregateChange {
+                        consumer_id,
+                        result_json: agg_value_to_json(acc.value()),
+                    });
+                }
+            }
+            changes
+        };
+
         Ok(Dispatched {
             patches,
             aggregates,
             triggers,
+            delta_aggregates,
         })
     }
 
@@ -842,6 +935,18 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
         PgValue::Time(t) => serde_json::Value::String(t.to_string()),
         PgValue::Decimal(d) => serde_json::Value::String(d.to_string()),
         PgValue::Json(j) | PgValue::Jsonb(j) => j.clone(),
+    };
+    json.to_string()
+}
+
+/// Serialize a folded [`AggValue`] as a JSON string for delivery, matching the
+/// numeric and null shape [`value_to_json`] produces for the re-execution path.
+pub(crate) fn agg_value_to_json(value: AggValue) -> String {
+    let json = match value {
+        AggValue::Count(c) => serde_json::Value::from(c),
+        AggValue::Sum(s) | AggValue::Real(Some(s)) => serde_json::Number::from_f64(s)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        AggValue::Real(None) => serde_json::Value::Null,
     };
     json.to_string()
 }

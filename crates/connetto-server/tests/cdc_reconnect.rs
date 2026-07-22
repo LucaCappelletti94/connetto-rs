@@ -178,7 +178,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::row(QUERY),
+            spec: SubscriptionSpec::new(QUERY),
         }))
         .await
         .expect("send subscribe");

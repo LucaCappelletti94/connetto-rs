@@ -157,7 +157,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "cheapest".to_owned(),
-            spec: SubscriptionSpec::aggregate("SELECT MIN(amount) FROM orders"),
+            spec: SubscriptionSpec::new("SELECT MIN(amount) FROM orders"),
         }))
         .await
         .expect("send subscribe");

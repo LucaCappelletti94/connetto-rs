@@ -34,9 +34,9 @@ pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
 pub use materializer::{
-    AggregateCapture, AggregateChange, Dispatched, MatchedPatch, Materializer, MaterializerError,
-    PendingReExec, Registration, RuntimeVersionColumn, RuntimeWritableCatalog,
-    RuntimeWritableCatalogBuilder,
+    AggregateCapture, AggregateChange, DeltaAggregateCapture, DeltaAggregateChange, Dispatched,
+    MatchedPatch, Materializer, MaterializerError, PendingReExec, Registration,
+    RuntimeVersionColumn, RuntimeWritableCatalog, RuntimeWritableCatalogBuilder,
 };
 pub use oplog::{
     CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, OplogConfig, catchup_decision,

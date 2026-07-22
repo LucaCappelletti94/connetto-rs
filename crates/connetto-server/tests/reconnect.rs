@@ -197,7 +197,7 @@ async fn subscribe<T: Transport>(client: &mut T) {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::row(QUERY),
+            spec: SubscriptionSpec::new(QUERY),
         }))
         .await
         .expect("send subscribe");

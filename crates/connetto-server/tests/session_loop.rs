@@ -186,7 +186,7 @@ async fn loopback_session_full_lifecycle() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::row("SELECT * FROM orders WHERE quantity > 0"),
+            spec: SubscriptionSpec::new("SELECT * FROM orders WHERE quantity > 0"),
         }))
         .await
         .expect("send subscribe");
@@ -319,7 +319,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::row("SELECT * FROM orders WHERE quantity > 0"),
+            spec: SubscriptionSpec::new("SELECT * FROM orders WHERE quantity > 0"),
         }))
         .await
         .expect("send subscribe");

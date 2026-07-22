@@ -3,22 +3,12 @@
 //! The subscription language is SQL `WHERE` clause text handed to `subql` for
 //! parsing (Q4.1). Priority tiers control delivery ordering (Q4.3): tier 0
 //! completes before tier 1 begins. Row-level and aggregate subscriptions share
-//! this envelope. The `kind` discriminant selects which materializer path runs
-//! server-side.
+//! this envelope. The server classifies each subscription from its SQL, so the
+//! envelope carries no kind discriminant.
 
 use serde::{Deserialize, Serialize};
 
 use crate::cursor::Cursor;
-
-/// Subscription flavour. Row-level subscriptions produce `SQLite` patchsets,
-/// aggregate subscriptions produce JSON result envelopes (Q5.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SubscriptionKind {
-    /// Row-level `SELECT`. Server pushes patchsets against the client's local mirror.
-    Row,
-    /// Aggregate. Server pushes `AggregateUpdate` values keyed by group.
-    Aggregate,
-}
 
 /// Delivery priority tier. Lower values are delivered first.
 ///
@@ -59,31 +49,20 @@ impl Default for SubscriptionPriority {
 /// The observation contract handed to `subql` at registration time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
-    /// Which materializer path this subscription rides.
-    pub kind: SubscriptionKind,
     /// Delivery priority tier.
     #[serde(default)]
     pub priority: SubscriptionPriority,
-    /// SQL text handed to `subql`. For [`SubscriptionKind::Row`] this is a full
-    /// `SELECT` statement. For [`SubscriptionKind::Aggregate`] this is a full
-    /// aggregate query. `subql` rejects unsupported syntax at registration time.
+    /// Full `SELECT` handed to `subql`, either a row projection or a single
+    /// scalar aggregate. The server classifies which from the SQL and rejects
+    /// unsupported syntax at registration time.
     pub query: String,
 }
 
 impl SubscriptionSpec {
-    /// Build a row-level subscription with the default priority.
-    pub fn row(query: impl Into<String>) -> Self {
+    /// Build a subscription with the default priority. The server decides from
+    /// the query whether it is a row or an aggregate subscription.
+    pub fn new(query: impl Into<String>) -> Self {
         Self {
-            kind: SubscriptionKind::Row,
-            priority: SubscriptionPriority::default(),
-            query: query.into(),
-        }
-    }
-
-    /// Build an aggregate subscription with the default priority.
-    pub fn aggregate(query: impl Into<String>) -> Self {
-        Self {
-            kind: SubscriptionKind::Aggregate,
             priority: SubscriptionPriority::default(),
             query: query.into(),
         }
@@ -158,15 +137,16 @@ mod tests {
     }
 
     #[test]
-    fn spec_row_helper_sets_kind() {
-        let spec = SubscriptionSpec::row("SELECT * FROM orders WHERE user_id = 1");
-        assert_eq!(spec.kind, SubscriptionKind::Row);
+    fn spec_new_defaults_priority_and_keeps_query() {
+        let spec = SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1");
+        assert_eq!(spec.query, "SELECT * FROM orders WHERE user_id = 1");
+        assert_eq!(spec.priority, SubscriptionPriority::default());
     }
 
     #[test]
-    fn spec_aggregate_helper_sets_kind() {
-        let spec =
-            SubscriptionSpec::aggregate("SELECT region, COUNT(*) FROM orders GROUP BY region");
-        assert_eq!(spec.kind, SubscriptionKind::Aggregate);
+    fn spec_with_priority_overrides() {
+        let spec = SubscriptionSpec::new("SELECT COUNT(*) FROM orders")
+            .with_priority(SubscriptionPriority::HIGHEST);
+        assert_eq!(spec.priority, SubscriptionPriority::HIGHEST);
     }
 }

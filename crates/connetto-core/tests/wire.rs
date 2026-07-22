@@ -17,7 +17,7 @@ use connetto_core::{
         FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, Ping,
         Pong, SchemaBlob, SchemaUpdate, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionKind, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -76,16 +76,13 @@ fn handshake_and_ack_round_trip() {
 fn subscription_lifecycle_round_trips() {
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-orders".into(),
-        spec: SubscriptionSpec::row("SELECT * FROM orders WHERE user_id = 1")
+        spec: SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1")
             .with_priority(SubscriptionPriority::HIGHEST),
     }));
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-count".into(),
-        spec: SubscriptionSpec {
-            kind: SubscriptionKind::Aggregate,
-            priority: SubscriptionPriority::new(2),
-            query: "SELECT region, COUNT(*) FROM orders GROUP BY region".into(),
-        },
+        spec: SubscriptionSpec::new("SELECT region, COUNT(*) FROM orders GROUP BY region")
+            .with_priority(SubscriptionPriority::new(2)),
     }));
     round_trip_control(&ControlMessage::Unsubscribe(Unsubscribe {
         sub_id: "sub-orders".into(),

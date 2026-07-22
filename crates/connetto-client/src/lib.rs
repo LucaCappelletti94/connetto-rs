@@ -28,7 +28,7 @@
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, Ping,
-    Subscribe, SubscriptionSpec,
+    Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -124,6 +124,15 @@ pub enum ClientEvent {
     FullResync {
         /// Subscription id.
         sub_id: String,
+    },
+    /// The server reported a non-fatal error attached to a request, most
+    /// commonly a rejected subscription. The session stays open.
+    NonFatal {
+        /// The request or subscription id the error refers to, when the server
+        /// attributed it.
+        related_to: Option<String>,
+        /// Human-readable detail.
+        detail: String,
     },
     /// The server rejected a prior mutation.
     MutationRejected {
@@ -397,7 +406,12 @@ where
         self.last_cursor.as_ref()
     }
 
-    /// Declare a row subscription.
+    /// Declare a subscription from a `SELECT`. The server classifies it from the
+    /// SQL: a row projection streams patchsets into the local replica (observe
+    /// [`ClientEvent::LivePatch`] and read rows with diesel), while a single
+    /// scalar aggregate pushes each value as a [`ClientEvent::Aggregate`] and
+    /// leaves the replica untouched. `subql` rejects unsupported syntax, which
+    /// surfaces as a [`ClientEvent::NonFatal`] with the session intact.
     ///
     /// # Errors
     ///
@@ -406,7 +420,22 @@ where
         self.transport
             .send_control(ControlMessage::Subscribe(Subscribe {
                 sub_id: sub_id.to_owned(),
-                spec: SubscriptionSpec::row(query),
+                spec: SubscriptionSpec::new(query),
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// Cancel a subscription (row or aggregate) by its client-assigned id. The
+    /// server tolerates an unknown id silently.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the unsubscribe frame cannot be sent.
+    pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        self.transport
+            .send_control(ControlMessage::Unsubscribe(Unsubscribe {
+                sub_id: sub_id.to_owned(),
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -620,6 +649,10 @@ where
                 })
             }
             ControlMessage::Pong(pong) => Ok(ClientEvent::Pong { nonce: pong.nonce }),
+            ControlMessage::NonFatalError(err) => Ok(ClientEvent::NonFatal {
+                related_to: err.related_to,
+                detail: err.detail,
+            }),
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
             ))),

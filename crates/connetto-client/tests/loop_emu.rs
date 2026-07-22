@@ -13,18 +13,22 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use connetto_client::{AffectedRow, ClientConfig, ClientEvent, ConnettoConnection, KeyValue};
 use connetto_core::Cursor;
 use connetto_server::{
-    Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, SqliteWriteTarget, WebSocketTransport, sqlite_write_target,
+    Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    Snapshot, SnapshotSource, SqliteWriteTarget, WebSocketTransport, sqlite_write_target,
 };
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::backend::{Postgres, ScalarKind, Value as PgValue};
+use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
+use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 
 const PG_DDL: &str =
@@ -859,5 +863,684 @@ async fn conflicting_write_converges_to_server_after_rollback() {
 
     client_a.close().await.expect("close A");
     client_b.close().await.expect("close B");
+    server.await.expect("join server");
+}
+
+/// An [`AsyncConnector`] that answers `execute_scalar` from a queue of canned
+/// integers (the MIN/MAX re-execution path) and `execute_scalar_row` from a
+/// queue of canned component rows (the delta aggregate seed path), standing in
+/// for the Postgres backend in the Docker-free aggregate loop.
+struct QueuedConnector {
+    responses: Mutex<VecDeque<i64>>,
+    rows: Mutex<VecDeque<Vec<PgValue<Postgres>>>>,
+}
+
+impl QueuedConnector {
+    fn new(responses: impl IntoIterator<Item = i64>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+            rows: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// A connector that only serves delta aggregate seeds, one canned component
+    /// row per `execute_scalar_row` call, in order.
+    fn with_rows(rows: impl IntoIterator<Item = Vec<PgValue<Postgres>>>) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::new()),
+            rows: Mutex::new(rows.into_iter().collect()),
+        }
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl AsyncConnector for QueuedConnector {
+    type AuthContext = ();
+    type Error = std::io::Error;
+    type Checkpoint = PgLsn;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        _sql: &str,
+        _kind: ScalarKind,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+    > + Send {
+        let next = self.responses.lock().expect("queue poisoned").pop_front();
+        async move {
+            next.map(|n| (PgValue::Int(n), Some(PgLsn(1))))
+                .ok_or_else(|| std::io::Error::other("no more canned responses"))
+        }
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+    > + Send {
+        async {
+            Err(std::io::Error::other(
+                "execute_rows is not used in the aggregate loop test",
+            ))
+        }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        _sql: &str,
+        _kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
+    > + Send {
+        let next = self.rows.lock().expect("queue poisoned").pop_front();
+        async move {
+            next.map(|row| (row, Some(PgLsn(1)))).ok_or_else(|| {
+                ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
+            })
+        }
+    }
+}
+
+/// Extract the JSON value from a `cheapest` aggregate event.
+fn aggregate_result(event: ClientEvent) -> String {
+    match event {
+        ClientEvent::Aggregate {
+            sub_id,
+            result_json,
+        } => {
+            assert_eq!(sub_id, "cheapest");
+            result_json
+        }
+        other => panic!("expected an aggregate event, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
+    // The client subscribes to MIN(quantity). The server bootstraps the value
+    // through the connector, folds a lower insert in-process, and re-executes
+    // through the connector when the current extreme is deleted. Each value
+    // reaches the client as a ClientEvent::Aggregate.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    // Bootstrap answers 3; the re-execution after the delete answers 9.
+    let connector = QueuedConnector::new([3, 9]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    // Subscribe to the scalar aggregate; the server bootstraps its value.
+    client
+        .subscribe("cheapest", "SELECT MIN(quantity) FROM orders")
+        .await
+        .expect("subscribe aggregate");
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
+    assert_eq!(
+        aggregate_result(event),
+        "3",
+        "the bootstrap value reached the client",
+    );
+
+    // A lower value folds in-process, without consulting the connector.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (5, 1.0, 1, 'x')")
+        .expect("emu insert");
+    while let Some(event) = source.next_event().await.expect("poll event") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
+    assert_eq!(
+        aggregate_result(event),
+        "1",
+        "the in-process fold reached the client",
+    );
+
+    // Deleting the current extreme forces a re-execution through the connector.
+    source
+        .execute_sql("DELETE FROM orders WHERE id = 5")
+        .expect("emu delete");
+    while let Some(event) = source.next_event().await.expect("poll event") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
+    assert_eq!(
+        aggregate_result(event),
+        "9",
+        "the re-executed value reached the client",
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_subscription_is_rejected_without_closing() {
+    // A query subql cannot register (a grouped aggregate) is refused at
+    // registration and surfaces as a NonFatal event, not a dropped connection.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe(
+            "grouped",
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        )
+        .await
+        .expect("subscribe");
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::NonFatal { .. })).await;
+    let ClientEvent::NonFatal { related_to, detail } = event else {
+        unreachable!()
+    };
+    assert_eq!(related_to.as_deref(), Some("grouped"));
+    assert!(
+        detail.contains("subscription rejected"),
+        "detail should explain the rejection, got {detail:?}",
+    );
+
+    // The session survives the rejection: a ping still round-trips.
+    client.ping(7).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 7),
+    )
+    .await;
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// Drive the emulator to completion, dispatching every produced CDC event
+/// through the manager so delta aggregates fold in-process.
+async fn drain_events<C, O>(
+    manager: &SessionManager<SeedSnapshot, PermissiveAuth, C, O>,
+    source: &mut PgSqliteEmuSource,
+) where
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
+    C::Error: core::fmt::Display,
+    O: Oplog,
+{
+    while let Some(event) = source.next_event().await.expect("poll event") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+}
+
+/// Pump the client until it has observed one aggregate value for each label in
+/// `subs`, returning the latest `result_json` per label. Each dispatched CDC
+/// event delivers exactly one update per subscribed aggregate, so one event (or
+/// the bootstrap burst) yields exactly one value per label.
+async fn collect_aggregates(
+    client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
+    subs: &[&str],
+) -> HashMap<String, String> {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    while seen.len() < subs.len() {
+        let event = pump_until(client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
+        if let ClientEvent::Aggregate {
+            sub_id,
+            result_json,
+        } = event
+        {
+            seen.insert(sub_id, result_json);
+        }
+    }
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
+    // The client subscribes to COUNT(*), SUM(quantity), and AVG(quantity) at
+    // once. The server seeds each through the connector's multi-column row path,
+    // then folds every CDC insert and delete in-process (no connector
+    // round-trip per event) and delivers the running value to the client.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    // Seed rows in subscribe order over the empty table: COUNT(*)=0, SUM=NULL,
+    // AVG=(NULL sum, 0 count).
+    let connector = QueuedConnector::with_rows([
+        vec![PgValue::Int(0)],
+        vec![PgValue::Null],
+        vec![PgValue::Null, PgValue::Int(0)],
+    ]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe count");
+    client
+        .subscribe("sum", "SELECT SUM(quantity) FROM orders")
+        .await
+        .expect("subscribe sum");
+    client
+        .subscribe("avg", "SELECT AVG(quantity) FROM orders")
+        .await
+        .expect("subscribe avg");
+
+    let subs = ["count", "sum", "avg"];
+    let seeded = collect_aggregates(&mut client, &subs).await;
+    assert_eq!(seeded["count"], "0", "COUNT(*) seed over empty table");
+    assert_eq!(seeded["sum"], "0.0", "SUM seed over empty table");
+    assert_eq!(
+        seeded["avg"], "null",
+        "AVG seed over empty table is undefined"
+    );
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+
+    // Insert quantity 10: COUNT 1, SUM 10, AVG 10.
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 10, 'x')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    let after_first = collect_aggregates(&mut client, &subs).await;
+    assert_eq!(after_first["count"], "1");
+    assert_eq!(after_first["sum"], "10.0");
+    assert_eq!(after_first["avg"], "10.0");
+
+    // Insert quantity 20: COUNT 2, SUM 30, AVG 15.
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 1.0, 20, 'y')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    let after_second = collect_aggregates(&mut client, &subs).await;
+    assert_eq!(after_second["count"], "2");
+    assert_eq!(after_second["sum"], "30.0");
+    assert_eq!(after_second["avg"], "15.0");
+
+    // Delete quantity 10: COUNT 1, SUM 20, AVG 20.
+    source
+        .execute_sql("DELETE FROM orders WHERE id = 1")
+        .expect("emu delete");
+    drain_events(&manager, &mut source).await;
+    let after_delete = collect_aggregates(&mut client, &subs).await;
+    assert_eq!(after_delete["count"], "1");
+    assert_eq!(after_delete["sum"], "20.0");
+    assert_eq!(after_delete["avg"], "20.0");
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_on_rls_table_is_rejected_without_closing() {
+    // subql rejects an aggregator on an RLS-protected table at registration.
+    // connetto surfaces that as a NonFatal event, leaving the session intact.
+    const RLS_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, \
+         status TEXT); ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+    let materializer = Materializer::new(RLS_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("total", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe");
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::NonFatal { .. })).await;
+    let ClientEvent::NonFatal { related_to, detail } = event else {
+        unreachable!()
+    };
+    assert_eq!(related_to.as_deref(), Some("total"));
+    assert!(
+        detail.contains("subscription rejected"),
+        "detail should explain the rejection, got {detail:?}",
+    );
+    assert!(
+        detail.contains("RLS-protected"),
+        "detail should name the RLS cause, got {detail:?}",
+    );
+
+    // The session survives the rejection: a ping still round-trips.
+    client.ping(9).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 9),
+    )
+    .await;
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
+    // A valid COUNT(*) registers as a delta aggregate, but this manager has no
+    // connector able to run the multi-column seed (NoConnector's
+    // execute_scalar_row is the trait default that rejects every seed). The
+    // failed bootstrap unregisters the subscription and surfaces as a NonFatal
+    // event, leaving the session intact.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe");
+    let event = pump_until(&mut client, |e| matches!(e, ClientEvent::NonFatal { .. })).await;
+    let ClientEvent::NonFatal { related_to, detail } = event else {
+        unreachable!()
+    };
+    assert_eq!(related_to.as_deref(), Some("count"));
+    assert!(
+        detail.contains("aggregate bootstrap failed"),
+        "detail should explain the bootstrap failure, got {detail:?}",
+    );
+
+    // The session survives the failed bootstrap: a ping still round-trips.
+    client.ping(11).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 11),
+    )
+    .await;
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_subscription_and_delta_aggregate_coexist() {
+    // One client holds a row subscription and a COUNT(*) delta aggregate on the
+    // same table. A single insert must fan out on both paths at once: a row
+    // LivePatch to the row route and a folded AggregateUpdate to the delta
+    // route. The two delivery paths are independent in one dispatch.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("orders-live", QUERY)
+        .await
+        .expect("subscribe row");
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe aggregate");
+
+    // Drain the subscribe phase: the row snapshot completes and the aggregate
+    // bootstrap arrives (in either order).
+    let mut row_ready = false;
+    let mut boot = false;
+    while !(row_ready && boot) {
+        let event = pump_until(&mut client, |e| {
+            matches!(
+                e,
+                ClientEvent::SnapshotEnd { .. } | ClientEvent::Aggregate { .. }
+            )
+        })
+        .await;
+        match event {
+            ClientEvent::SnapshotEnd { sub_id } if sub_id == "orders-live" => row_ready = true,
+            ClientEvent::Aggregate { sub_id, .. } if sub_id == "count" => boot = true,
+            _ => {}
+        }
+    }
+
+    // One insert (id 2 avoids the snapshot's seed row id 1) fans out on both
+    // paths: a row LivePatch and the folded COUNT = 1.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 1.0, 10, 'x')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+
+    let mut saw_live = false;
+    let mut count_val = None;
+    while !(saw_live && count_val.as_deref() == Some("1")) {
+        let event = pump_until(&mut client, |e| {
+            matches!(
+                e,
+                ClientEvent::LivePatch { .. } | ClientEvent::Aggregate { .. }
+            )
+        })
+        .await;
+        match event {
+            ClientEvent::LivePatch { sub_id, .. } if sub_id == "orders-live" => saw_live = true,
+            ClientEvent::Aggregate {
+                sub_id,
+                result_json,
+            } if sub_id == "count" => {
+                count_val = Some(result_json);
+            }
+            _ => {}
+        }
+    }
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsubscribing_a_delta_aggregate_stops_updates() {
+    // After an Unsubscribe, the server drops the accumulator and the route, so a
+    // further CDC event produces no aggregate update for that consumer.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe aggregate");
+    let seeded = collect_aggregates(&mut client, &["count"]).await;
+    assert_eq!(seeded["count"], "0");
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 10, 'x')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    let after = collect_aggregates(&mut client, &["count"]).await;
+    assert_eq!(after["count"], "1");
+
+    // Unsubscribe, then fence with a ping. Control frames are processed in
+    // order, so receiving this Pong proves the server handled the Unsubscribe.
+    client.unsubscribe("count").await.expect("unsubscribe");
+    client.ping(1).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 1),
+    )
+    .await;
+
+    // A further insert must produce no aggregate update. Fence again and assert
+    // that only the Pong arrives before it.
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 1.0, 20, 'y')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    client.ping(2).await.expect("ping");
+    let mut saw_aggregate = false;
+    loop {
+        let event = pump_until(&mut client, |e| {
+            matches!(e, ClientEvent::Aggregate { .. } | ClientEvent::Pong { .. })
+        })
+        .await;
+        match event {
+            ClientEvent::Pong { nonce: 2 } => break,
+            ClientEvent::Aggregate { .. } => saw_aggregate = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_aggregate,
+        "no aggregate update should arrive after unsubscribe",
+    );
+
+    client.close().await.expect("close");
     server.await.expect("join server");
 }

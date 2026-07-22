@@ -35,10 +35,13 @@ use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
-use subql::{CdcSource, ChangeEvent, PgLsn, SubscriptionId};
+use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::materializer::{Materializer, MaterializerError, Registration, compress, value_to_json};
+use crate::materializer::{
+    DeltaAggregateCapture, Materializer, MaterializerError, Registration, agg_value_to_json,
+    compress, value_to_json,
+};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::write_target::{WriteError, WriteOutcome, WriteTarget};
 
@@ -241,7 +244,8 @@ struct Route {
     auth_ctx: AuthContext,
 }
 
-/// Route from a captured aggregate query to its session's outbound channel.
+/// Route from an aggregate subscription (re-execution query or delta aggregate)
+/// to its session's outbound channel.
 #[derive(Clone)]
 struct AggRoute {
     label: String,
@@ -254,6 +258,9 @@ struct SessionState {
     pending: VecDeque<BulkMessage>,
     subs: HashMap<String, (u64, SubscriptionId)>,
     agg_subs: HashMap<String, u64>,
+    /// Delta aggregate subscriptions by client label: consumer id and engine
+    /// subscription id, both needed to tear the subscription down.
+    delta_agg_subs: HashMap<String, (u64, SubscriptionId)>,
     outbound: mpsc::UnboundedSender<Outbound>,
     /// Session identity, established at handshake and consulted per write.
     auth_ctx: AuthContext,
@@ -321,6 +328,10 @@ where
     materializer: Arc<Mutex<Materializer>>,
     routes: Mutex<HashMap<u64, Route>>,
     agg_routes: Mutex<HashMap<u64, AggRoute>>,
+    /// Delta aggregate routes keyed by consumer id. Kept separate from
+    /// `agg_routes` (keyed by re-execution query id) because the two u64
+    /// keyspaces are distinct and could otherwise collide.
+    delta_agg_routes: Mutex<HashMap<u64, AggRoute>>,
     snapshot_source: Snap,
     auth: Auth,
     connector: C,
@@ -415,6 +426,7 @@ where
             materializer: Arc::new(Mutex::new(materializer)),
             routes: Mutex::new(HashMap::new()),
             agg_routes: Mutex::new(HashMap::new()),
+            delta_agg_routes: Mutex::new(HashMap::new()),
             snapshot_source,
             auth,
             connector,
@@ -448,6 +460,17 @@ where
 
     async fn remove_agg_route(&self, query_id: u64) {
         self.agg_routes.lock().await.remove(&query_id);
+    }
+
+    async fn add_delta_agg_route(&self, consumer_id: u64, route: AggRoute) {
+        self.delta_agg_routes
+            .lock()
+            .await
+            .insert(consumer_id, route);
+    }
+
+    async fn remove_delta_agg_route(&self, consumer_id: u64) {
+        self.delta_agg_routes.lock().await.remove(&consumer_id);
     }
 
     /// Dispatch one CDC event: fan row patches to sessions, deliver in-process
@@ -527,6 +550,14 @@ where
                     .install_scalar(trigger.query_id, value);
             }
             self.deliver_aggregate(trigger.query_id, result_json).await;
+        }
+
+        // Delta aggregates are global by construction (subql rejects aggregators
+        // on RLS tables), so no per-row read filter applies: deliver each folded
+        // value unconditionally to its owning session.
+        for change in dispatched.delta_aggregates {
+            self.deliver_delta_aggregate(change.consumer_id, change.result_json)
+                .await;
         }
         Ok(())
     }
@@ -645,6 +676,26 @@ where
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
 
+    /// Send a folded delta aggregate value to the session owning `consumer_id`,
+    /// if routed.
+    async fn deliver_delta_aggregate(&self, consumer_id: u64, result_json: String) {
+        let route = {
+            self.delta_agg_routes
+                .lock()
+                .await
+                .get(&consumer_id)
+                .cloned()
+        };
+        let Some(route) = route else { return };
+        let update = AggregateUpdate {
+            sub_id: route.label,
+            group_key: None,
+            result_json,
+            is_full_result: true,
+        };
+        let _ = route.tx.send(Outbound::Aggregate(update));
+    }
+
     /// Receive and validate the handshake, decode the resume cursor, and reply
     /// with the ack carrying the server's current watermark.
     ///
@@ -724,6 +775,7 @@ where
             pending: VecDeque::new(),
             subs: HashMap::new(),
             agg_subs: HashMap::new(),
+            delta_agg_subs: HashMap::new(),
             outbound: outbound_tx,
             auth_ctx,
             pending_header: None,
@@ -784,6 +836,13 @@ where
                 .await
                 .unregister_aggregate(query_id);
         }
+        for (consumer_id, sub_id) in state.delta_agg_subs.into_values() {
+            self.remove_delta_agg_route(consumer_id).await;
+            self.materializer
+                .lock()
+                .await
+                .unregister_delta_aggregate(consumer_id, sub_id);
+        }
         Ok(())
     }
 
@@ -810,6 +869,13 @@ where
                         .lock()
                         .await
                         .unregister_aggregate(query_id);
+                }
+                if let Some((consumer_id, sub_id)) = state.delta_agg_subs.remove(&unsub.sub_id) {
+                    self.remove_delta_agg_route(consumer_id).await;
+                    self.materializer
+                        .lock()
+                        .await
+                        .unregister_delta_aggregate(consumer_id, sub_id);
                 }
                 Ok(())
             }
@@ -1005,6 +1071,10 @@ where
             }
             Registration::Aggregate(capture) => {
                 self.subscribe_aggregate(transport, sub, state, capture)
+                    .await
+            }
+            Registration::DeltaAggregate(capture) => {
+                self.subscribe_delta_aggregate(transport, sub, state, capture)
                     .await
             }
         }
@@ -1247,6 +1317,70 @@ where
         )
         .await;
         state.agg_subs.insert(sub.sub_id.clone(), capture.query_id);
+        transport
+            .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
+                sub_id: sub.sub_id,
+                group_key: None,
+                result_json,
+                is_full_result: true,
+            }))
+            .await
+            .map_err(transport_err)?;
+        Ok(())
+    }
+
+    /// Seed a delta aggregate through the connector, deliver its initial value,
+    /// and route future folded updates keyed by consumer id.
+    async fn subscribe_delta_aggregate<T: Transport>(
+        &self,
+        transport: &mut T,
+        sub: Subscribe,
+        state: &mut SessionState,
+        capture: DeltaAggregateCapture,
+    ) -> Result<(), SessionError> {
+        let row = match self
+            .connector
+            .execute_scalar_row(&capture.bootstrap.sql, &capture.bootstrap.kinds, &())
+            .await
+        {
+            Ok((row, _lsn)) => row,
+            Err(err) => {
+                self.materializer
+                    .lock()
+                    .await
+                    .unregister_delta_aggregate(capture.consumer_id, capture.subscription_id);
+                transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(sub.sub_id),
+                        detail: format!("aggregate bootstrap failed: {err}"),
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
+        };
+        let acc = AggAccumulator::seed_from_row(&capture.spec, &row);
+        let result_json = agg_value_to_json(acc.value());
+        {
+            self.materializer.lock().await.install_aggregate(
+                capture.consumer_id,
+                capture.spec,
+                acc,
+            );
+        }
+
+        self.add_delta_agg_route(
+            capture.consumer_id,
+            AggRoute {
+                label: sub.sub_id.clone(),
+                tx: state.outbound.clone(),
+            },
+        )
+        .await;
+        state.delta_agg_subs.insert(
+            sub.sub_id.clone(),
+            (capture.consumer_id, capture.subscription_id),
+        );
         transport
             .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
                 sub_id: sub.sub_id,

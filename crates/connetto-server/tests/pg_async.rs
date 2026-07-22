@@ -282,7 +282,7 @@ async fn async_pg_reexec_bootstraps_min() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "cheapest".to_owned(),
-            spec: SubscriptionSpec::aggregate("SELECT MIN(amount) FROM aggs"),
+            spec: SubscriptionSpec::new("SELECT MIN(amount) FROM aggs"),
         }))
         .await
         .expect("send subscribe");
@@ -390,4 +390,112 @@ async fn pg_oplog_appends_and_reads_back() {
         .execute(&mut *conn)
         .await
         .expect("drop oplog table");
+}
+
+/// Subscribe to an aggregate and return the bootstrap value the server seeds
+/// through the connector, asserting it is a full result for `sub_id`.
+async fn bootstrap_agg<T: Transport>(client: &mut T, sub_id: &str, query: &str) -> String {
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: sub_id.to_owned(),
+            spec: SubscriptionSpec::new(query),
+        }))
+        .await
+        .expect("send subscribe");
+    match next_control(client).await {
+        ControlMessage::AggregateUpdate(update) => {
+            assert_eq!(update.sub_id, sub_id);
+            assert!(update.is_full_result);
+            update.result_json
+        }
+        other => panic!("expected aggregate update, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn async_pg_delta_aggregate_bootstraps_family() {
+    // The delta aggregate family seeds through the real connector's
+    // multi-column `execute_scalar_row`, which the SQLite-emulator tests cannot
+    // exercise. It pins the Postgres decode: `SUM` over a `BIGINT` column comes
+    // back as `NUMERIC` and must decode to a double, and the two- and
+    // three-column seeds (`AVG`, `VAR_POP`) must line up with the accumulator.
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    {
+        // A dedicated table so this test never races the shared `aggs` DDL of
+        // `async_pg_reexec_bootstraps_min` under the concurrent test harness.
+        let mut conn = pool.get().await.expect("get connection");
+        sql_query("DROP TABLE IF EXISTS agg_family")
+            .execute(&mut *conn)
+            .await
+            .expect("drop table");
+        sql_query("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT)")
+            .execute(&mut *conn)
+            .await
+            .expect("create table");
+        sql_query("INSERT INTO agg_family (id, amount) VALUES (1, 10), (2, 20), (3, 30)")
+            .execute(&mut *conn)
+            .await
+            .expect("seed rows");
+    }
+
+    let connector = PgAsyncDieselConnector::new(pool);
+    let materializer =
+        Materializer::new("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
+            .expect("build materializer");
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let session = SessionManager::with_connector(
+        materializer,
+        NoSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(session.clone().serve(server_transport));
+
+    client
+        .send_control(ControlMessage::Handshake(Handshake::new(
+            PROTOCOL_VERSION,
+            "aggregator",
+            "token",
+        )))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+
+    // COUNT(*) is an exact integer.
+    assert_eq!(
+        bootstrap_agg(&mut client, "count", "SELECT COUNT(*) FROM agg_family").await,
+        "3",
+    );
+    // SUM(amount) over BIGINT arrives from PG as NUMERIC and decodes to a double.
+    assert_eq!(
+        bootstrap_agg(&mut client, "sum", "SELECT SUM(amount) FROM agg_family").await,
+        "60.0",
+    );
+    // AVG exercises the two-column (SUM, COUNT) seed.
+    assert_eq!(
+        bootstrap_agg(&mut client, "avg", "SELECT AVG(amount) FROM agg_family").await,
+        "20.0",
+    );
+    // VAR_POP exercises the three-column (SUM, SUM(x*x), COUNT) seed. Assert with
+    // a tolerance since the value is not exactly representable.
+    let var_json =
+        bootstrap_agg(&mut client, "var", "SELECT VAR_POP(amount) FROM agg_family").await;
+    let var: f64 = var_json.parse().expect("parse var_pop");
+    assert!(
+        (var - 200.0_f64 / 3.0).abs() < 1e-9,
+        "VAR_POP over [10, 20, 30] should be 200/3, got {var_json}",
+    );
+
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
 }

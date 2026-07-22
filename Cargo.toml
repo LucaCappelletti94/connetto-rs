@@ -21,10 +21,12 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main for reproducibility (main HEAD f331aced: byte-level diffset apply now
-# has catalog-only entry points, so the write path applies from a shared catalog
-# without rebuilding an engine per write).
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "f331aced755f5891fcf7af5e31cf379269cab729", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
+# on main for reproducibility (main HEAD 5459584: adds connector
+# execute_scalar_row plus RegisterResult::aggregate_bootstrap_kinds so the full
+# delta aggregate family can be seeded through the connector, on top of the
+# RLS-guarded in-process delta aggregators and aggregate_bootstrap_sql /
+# AggAccumulator::seed_from_row bootstrap path).
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "5459584dae2f66243dd35f8303165c0ce04caf28", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"
