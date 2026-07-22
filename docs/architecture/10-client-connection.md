@@ -135,6 +135,18 @@ For aggregate backing tables, the same hooks fire when connetto updates them wit
 
 ---
 
+## Native driver: `ConnettoConnection` (v1 landed)
+
+`connetto-client`'s native connection is `ConnettoConnection` (renamed from the earlier `SyncClient`). It exposes the explicit primitives `conn()` (a managed `SqliteConnection` for ordinary app reads and writes, whose writes a SQLite session captures), `subscribe()`, `push()`, and `pump_one()`, plus the ergonomic driver the application uses.
+
+Mutation interception (auto-submit) is landed. An `on_commit` hook on the app connection sets a dirty flag whenever a local write commits. The hook may only signal, since SQLite forbids using the connection inside it and the async send cannot run there. The driver's `flush()` then drains the capture session and uploads the mutation, so the app never calls `push()`. `next_event()` flushes pending writes and applies one inbound server frame in a single step, returning the event plus the tables that changed.
+
+Reactivity is landed. `on_update` hooks on both the app connection and the apply connection record the name of every table whose rows change (local writes and applied server patches alike) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection stays single-threaded: the `Session` holds a raw SQLite handle and is `!Send`, so the app drives `next_event()` from one task and issues writes between awaits.
+
+Still ahead: implementing Diesel's `Connection` and `LoadConnection` on `ConnettoConnection` so app queries run directly on it (today they run on `conn()`), aggregate query routing, rolling back a locally applied write the server rejects, and the WASM variants above.
+
+---
+
 ## Open Questions
 
 1. **Query serialization for `ConnettoProxyConnection`**: what is the format for serializing a Diesel query + bind parameters over `postMessage`? Raw SQL string + binds as MessagePack? Or a higher-level representation?

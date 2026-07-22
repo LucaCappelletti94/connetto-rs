@@ -6,13 +6,14 @@
 //! - `DATABASE_URL`: Postgres conninfo for the CDC replication stream, snapshot
 //!   reads, and aggregate re-execution. The role needs `REPLICATION`.
 //! - `CONNETTO_PG_DDL` or `CONNETTO_PG_DDL_FILE`: the Postgres catalog DDL.
-//! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: schema for the write
-//!   target that client mutations apply to.
+//! - `CONNETTO_WRITABLE`: comma-separated tables that accept client mutations,
+//!   each `table` or `table:version_column` (the version column conflict-checks
+//!   version-bearing updates and deletes). Unset means no table is writable, so
+//!   every client mutation is rejected. Writes apply to the source Postgres.
 //! - `CONNETTO_SLOT`: pre-created logical replication slot (default
 //!   `connetto_slot`).
 //! - `CONNETTO_PUBLICATION`: publication the slot follows (default
 //!   `connetto_pub`).
-//! - `CONNETTO_SQLITE_TARGET`: write-target path (default `:memory:`).
 //! - `CONNETTO_READER_URL`: optional non-superuser conninfo. When set, snapshots
 //!   and read authorization run under Postgres Row-Level Security as that role.
 //!   Otherwise the server authorizes reads permissively.
@@ -27,7 +28,7 @@ use connetto_core::auth::AuthContext;
 use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
     Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth, RlsAuthError,
-    SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -95,6 +96,22 @@ fn read_ddl(key: &str) -> Result<String> {
     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))
 }
 
+/// Parse `CONNETTO_WRITABLE` into a runtime write policy. Each comma-separated
+/// entry is a table, or `table:version_column` to conflict-check version-bearing
+/// updates and deletes on that table. Unset or empty yields no writable tables,
+/// so every client mutation is rejected.
+fn writable_catalog() -> RuntimeWritableCatalog {
+    let spec = env_or("CONNETTO_WRITABLE", "");
+    let mut builder = RuntimeWritableCatalog::builder();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        builder = match entry.split_once(':') {
+            Some((table, version)) => builder.versioned(table.trim(), version.trim()),
+            None => builder.writable(entry),
+        };
+    }
+    builder.build()
+}
+
 async fn build_pool(url: &str) -> Result<Pool<AsyncPgConnection>> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
     Pool::builder()
@@ -112,8 +129,8 @@ async fn main() -> Result<()> {
     let publication = env_or("CONNETTO_PUBLICATION", "connetto_pub");
     let pool = build_pool(&database_url).await?;
     let connector = PgAsyncDieselConnector::new(pool.clone());
-    let materializer =
-        Materializer::new(&pg_ddl).map_err(|err| anyhow!("building materializer: {err}"))?;
+    let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
+        .map_err(|err| anyhow!("building materializer: {err}"))?;
 
     // Snapshots, read authorization, and the write apply all run under RLS when
     // a reader role is configured. That role must be subject to RLS

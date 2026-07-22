@@ -10,13 +10,20 @@
 //! - `CONNETTO_TOKEN`: opaque auth token (default empty).
 //! - `CONNETTO_SUB_ID`: subscription id (default `default`).
 //! - `CONNETTO_QUERY`: the row subscription `SELECT` (required).
+//! - `CONNETTO_WRITE`: optional SQL run on the managed local connection after
+//!   subscribing, one statement per line. Each line is run and pushed to the
+//!   server as a separate mutation, in order. The server applies them to
+//!   Postgres.
 //!
 //! Connects, subscribes, and pumps inbound frames, printing each client event
-//! until the server closes the connection.
+//! until the server closes the connection. When `CONNETTO_WRITE` is set, the
+//! client applies those writes locally and pushes them right after subscribing,
+//! then observes its own rows echoed back over CDC.
 
 use anyhow::{Context, Result, anyhow};
-use connetto_client::{ClientConfig, ClientEvent, SyncClient};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::transport::WebSocketTransport;
+use diesel::connection::SimpleConnection;
 use tokio::net::TcpStream;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -59,7 +66,7 @@ async fn main() -> Result<()> {
         .await
         .map_err(|err| anyhow!("websocket handshake to {server}: {err}"))?;
 
-    let mut client = SyncClient::connect(transport, &db_path, &sqlite_ddl, &config, None)
+    let mut client = ConnettoConnection::connect(transport, &db_path, &sqlite_ddl, &config, None)
         .await
         .map_err(|err| anyhow!("connecting sync client: {err}"))?;
     eprintln!("connected, session {}", client.session_id());
@@ -67,6 +74,24 @@ async fn main() -> Result<()> {
         .subscribe(&sub_id, &query)
         .await
         .map_err(|err| anyhow!("subscribing: {err}"))?;
+
+    if let Ok(writes) = std::env::var("CONNETTO_WRITE") {
+        for stmt in writes
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            client
+                .conn()
+                .batch_execute(stmt)
+                .map_err(|err| anyhow!("running CONNETTO_WRITE: {err}"))?;
+            let seq = client
+                .push()
+                .await
+                .map_err(|err| anyhow!("pushing local write: {err}"))?;
+            eprintln!("pushed local write as client_seq {seq:?}");
+        }
+    }
 
     loop {
         match client

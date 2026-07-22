@@ -5,7 +5,7 @@
 //! does the rest.
 //!
 //! * **Local writes** are captured by a SQLite session hooked onto the
-//!   application's connection ([`SqliteSessionExt`]). [`SyncClient::push`] drains
+//!   application's connection ([`SqliteSessionExt`]). [`ConnettoConnection::push`] drains
 //!   that session into a changeset (which carries the old row image, so the
 //!   server's conflict check works), compresses it, and uploads it as a
 //!   `MutationHeader` plus `MutationPatch`.
@@ -23,7 +23,7 @@
 //!
 //! The client is single-threaded ([`diesel_sqlite_session::Session`] holds a raw
 //! SQLite handle and is `!Send`): drive it from one task with
-//! [`SyncClient::pump_one`], interleaving [`SyncClient::push`] after local
+//! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
 use connetto_core::messages::{
@@ -32,9 +32,13 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
+use core::sync::atomic::{AtomicBool, Ordering};
 use diesel::connection::SimpleConnection;
+use diesel::sqlite::{CommitDecision, SqliteChangeOps, SqliteUpdateRouter};
 use diesel::{Connection, SqliteConnection};
 use diesel_sqlite_session::{ConflictAction, ConflictType, Session, SqliteSessionExt};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -74,7 +78,7 @@ pub struct ClientConfig {
     pub auth_token: String,
 }
 
-/// One observable outcome of [`SyncClient::pump_one`].
+/// One observable outcome of [`ConnettoConnection::pump_one`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
     /// The server began an initial snapshot for a subscription.
@@ -130,6 +134,17 @@ pub enum ClientEvent {
     Closed,
 }
 
+/// The outcome of one [`ConnettoConnection::next_event`]: the observed event and
+/// the local tables whose rows changed while producing it, so the app knows what
+/// to re-query.
+#[derive(Debug, Clone)]
+pub struct Reactive {
+    /// The event pumped from the server.
+    pub event: ClientEvent,
+    /// Sorted, de-duplicated names of tables whose rows changed.
+    pub changed_tables: Vec<String>,
+}
+
 /// Conflict resolution for applying authoritative server patches: the server
 /// wins on a data or version conflict, and a missing target is skipped so a
 /// replayed delete or update is idempotent.
@@ -153,8 +168,22 @@ fn count_ops(changeset: &[u8]) -> u32 {
     }
 }
 
+/// Install an update hook recording the name of every table whose rows change on
+/// `conn` into the shared `changed` set. Feeds the reactivity signal that tells
+/// the app which tables to re-query.
+fn install_change_tracker(conn: &mut SqliteConnection, changed: &Arc<Mutex<HashSet<String>>>) {
+    let sink = Arc::clone(changed);
+    conn.on_update(
+        SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
+            if let Ok(mut tables) = sink.lock() {
+                tables.insert(event.table_name.to_owned());
+            }
+        }),
+    );
+}
+
 /// A native sync client bound to one transport and one local SQLite database.
-pub struct SyncClient<T: Transport> {
+pub struct ConnettoConnection<T: Transport> {
     transport: T,
     // `session` is declared before `dev` so it drops first: it holds a raw
     // pointer into the connection's SQLite handle and must not outlive it.
@@ -164,9 +193,15 @@ pub struct SyncClient<T: Transport> {
     last_cursor: Option<Cursor>,
     next_seq: u64,
     session_id: String,
+    /// Set by the commit hook on `dev` whenever a local write commits, so the
+    /// driver knows there is a captured mutation to flush.
+    dirty: Arc<AtomicBool>,
+    /// Names of tables whose rows changed since the last drain, from the update
+    /// hooks on both `dev` (local writes) and `apply` (server patches).
+    changed: Arc<Mutex<HashSet<String>>>,
 }
 
-impl<T> SyncClient<T>
+impl<T> ConnettoConnection<T>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -192,10 +227,21 @@ where
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         apply.batch_execute("PRAGMA journal_mode=WAL")?;
         apply.batch_execute(sqlite_ddl)?;
+        let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        install_change_tracker(&mut apply, &changed);
 
         let mut dev = SqliteConnection::establish(db_path)
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         dev.batch_execute("PRAGMA journal_mode=WAL")?;
+        let dirty = Arc::new(AtomicBool::new(false));
+        install_change_tracker(&mut dev, &changed);
+        {
+            let dirty = Arc::clone(&dirty);
+            dev.on_commit(move || {
+                dirty.store(true, Ordering::Relaxed);
+                CommitDecision::Proceed
+            });
+        }
         let mut session = dev
             .create_session()
             .map_err(|e| ClientError::Session(e.to_string()))?;
@@ -233,6 +279,8 @@ where
             last_cursor: resume,
             next_seq: 0,
             session_id,
+            dirty,
+            changed,
         })
     }
 
@@ -361,6 +409,54 @@ where
             .map_err(|e| ClientError::Session(e.to_string()))?;
         self.session = fresh;
         Ok(Some(seq))
+    }
+
+    /// Flush locally captured writes as one mutation when the capture session
+    /// recorded a committed change since the last flush.
+    ///
+    /// Returns the assigned `client_seq`, or `None` when nothing was pending.
+    /// This is the automatic submit: writes made on [`conn`](Self::conn) are
+    /// uploaded here without an explicit [`push`](Self::push).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a session, compression, or transport failure.
+    pub async fn flush(&mut self) -> Result<Option<u64>, ClientError> {
+        if self.dirty.swap(false, Ordering::Relaxed) {
+            self.push().await
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Drive one step of the sync loop: flush pending local writes, apply one
+    /// inbound server frame, and report the event with the tables that changed.
+    ///
+    /// This is the app-facing driver. The application writes ordinary diesel
+    /// queries on [`conn`](Self::conn) and awaits `next_event` in a loop, using
+    /// [`Reactive::changed_tables`] to re-query what changed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a transport, apply, or protocol failure.
+    pub async fn next_event(&mut self) -> Result<Reactive, ClientError> {
+        self.flush().await?;
+        let event = self.pump_one().await?;
+        Ok(Reactive {
+            event,
+            changed_tables: self.take_changed(),
+        })
+    }
+
+    /// Drain the set of tables whose rows changed since the last call, sorted.
+    pub fn take_changed(&mut self) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .changed
+            .lock()
+            .map(|mut set| set.drain().collect())
+            .unwrap_or_default();
+        tables.sort();
+        tables
     }
 
     /// Close the transport.

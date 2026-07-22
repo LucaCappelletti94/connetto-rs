@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ClientEvent, SyncClient};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
@@ -113,7 +113,7 @@ fn server_write_target() -> SqliteWriteTarget {
 /// Pump the client until it observes an event matching `pred`, applying every
 /// frame in between.
 async fn pump_until(
-    client: &mut SyncClient<WebSocketTransport<TcpStream>>,
+    client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
     pred: impl Fn(&ClientEvent) -> bool,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -168,7 +168,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
     };
-    let mut client = SyncClient::connect(transport, &db_path, SQLITE_DDL, &config, None)
+    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
         .expect("client connect");
 
@@ -239,6 +239,149 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
             order(9, 2.0, 1, "local"),
         ],
         "the local write is visible in the local replica",
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// Drive `next_event` until an event matches `pred`, accumulating every table
+/// name reported changed along the way.
+async fn step_until(
+    client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
+    pred: impl Fn(&ClientEvent) -> bool,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut changed = Vec::new();
+    loop {
+        let step = tokio::time::timeout_at(deadline, client.next_event())
+            .await
+            .expect("client step timed out")
+            .expect("client step failed");
+        assert_ne!(step.event, ClientEvent::Closed, "connection closed early");
+        changed.extend(step.changed_tables);
+        if pred(&step.event) {
+            return changed;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_autosubmits_writes_and_reports_changed_tables() {
+    // Same wiring as the primary test: orders is writable, the snapshot seeds one
+    // row.
+    let writable = RuntimeWritableCatalog::builder().writable("orders").build();
+    let materializer =
+        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target.clone(),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "client-a".to_owned(),
+        auth_token: "token".to_owned(),
+    };
+    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+
+    // The snapshot arrives through next_event, which reports the changed table.
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    let changed = step_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    assert!(
+        changed.iter().any(|t| t == "orders"),
+        "snapshot apply reports orders as changed",
+    );
+    assert_eq!(orders(client.conn()), vec![order(1, 1.0, 3, "seed")]);
+
+    // A live insert is applied and reported through next_event.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')")
+        .expect("insert 7");
+    while let Some(event) = source.next_event().await.expect("poll source") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+    let changed = step_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+    assert!(
+        changed.iter().any(|t| t == "orders"),
+        "live insert reports orders as changed",
+    );
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 5, "paid")],
+    );
+
+    // Auto-submit: write locally without an explicit push. The next loop step
+    // flushes it (uploading to the server) while applying the queued live patch.
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (9, 2.0, 1, 'local')")
+        .execute(client.conn())
+        .expect("local insert");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'more')")
+        .expect("insert 8");
+    while let Some(event) = source.next_event().await.expect("poll source") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+    step_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+
+    // Barrier: the pong proves the server handled the auto-submitted mutation.
+    client.ping(1).await.expect("ping");
+    step_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 1),
+    )
+    .await;
+
+    // The local write reached the server's write target without a push() call.
+    {
+        let mut conn = target.lock();
+        assert_eq!(
+            orders(&mut conn),
+            vec![order(9, 2.0, 1, "local")],
+            "the local write auto-submitted through next_event",
+        );
+    }
+    assert_eq!(
+        orders(client.conn()),
+        vec![
+            order(1, 1.0, 3, "seed"),
+            order(7, 9.5, 5, "paid"),
+            order(8, 4.0, 2, "more"),
+            order(9, 2.0, 1, "local"),
+        ],
     );
 
     client.close().await.expect("close");
