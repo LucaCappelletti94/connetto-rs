@@ -27,6 +27,12 @@ pub const DEFAULT_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// Header size for length-prefixed framing.
 pub const FRAME_HEADER_LEN: usize = 4;
 
+/// Wire tag prefixed to a control-plane frame on message-delimited
+/// transports (`WebSocket` binary frames, browser or native alike).
+pub const TAG_CONTROL: u8 = 0;
+/// Wire tag prefixed to a bulk-plane frame on message-delimited transports.
+pub const TAG_BULK: u8 = 1;
+
 // ---------- MessagePack payload encoders ----------
 
 /// Encode a control-plane message as a raw `MessagePack` payload (no framing).

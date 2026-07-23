@@ -9,12 +9,13 @@
 //!   that session into a changeset (which carries the old row image, so the
 //!   server's conflict check works), compresses it, and uploads it as a
 //!   `MutationHeader` plus `MutationPatch`.
-//! * **Server patches** (the initial snapshot and live updates) apply to a
-//!   sibling connection to the same database file. A session tracks only writes
-//!   made on the connection it is attached to, so applying on the sibling
-//!   bypasses the capture session and server-originated changes are never
-//!   re-uploaded (no echo loop). The application's connection sees them through
-//!   SQLite WAL.
+//! * **Server patches** (the initial snapshot and live updates) apply on the
+//!   same connection with capture suspended: the session's recording is
+//!   switched off around the apply (`sqlite3session_enable`), so
+//!   server-originated changes are never re-uploaded (no echo loop). One
+//!   connection serves both directions, which is also the only topology
+//!   `sqlite-wasm-rs` supports on wasm (no multiple connections per
+//!   database), so native and wasm share it.
 //!
 //! The server produces its patches with `sqlite-diff-rs`, whose output is the
 //! native SQLite session patchset format, so the client applies them directly
@@ -232,6 +233,27 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
     ConflictAction::Omit
 }
 
+/// Suspends the capture session for the duration of a server-originated
+/// apply (a patch or a rollback), so the session never records what the
+/// server already knows. Re-enables on drop, so no exit path can leave
+/// capture switched off. `set_enabled` is a plain setter and cannot panic.
+struct SuspendedCapture<'s> {
+    session: &'s mut Session,
+}
+
+impl<'s> SuspendedCapture<'s> {
+    fn new(session: &'s mut Session) -> Self {
+        session.set_enabled(false);
+        Self { session }
+    }
+}
+
+impl Drop for SuspendedCapture<'_> {
+    fn drop(&mut self) {
+        self.session.set_enabled(true);
+    }
+}
+
 /// Decode a pushed changeset into the rows it touched, each as its table and
 /// primary key, for reporting on a rejected or conflicting mutation.
 fn affected_rows(changeset: &[u8]) -> Result<Vec<AffectedRow>, ClientError> {
@@ -286,22 +308,22 @@ fn install_change_tracker(conn: &mut SqliteConnection, changed: &Arc<Mutex<HashS
 /// A native sync client bound to one transport and one local SQLite database.
 pub struct ConnettoConnection<T: Transport> {
     transport: T,
-    // `session` is declared before `dev` so it drops first: it holds a raw
+    // `session` is declared before `db` so it drops first: it holds a raw
     // pointer into the connection's SQLite handle and must not outlive it.
     session: Session,
-    dev: SqliteConnection,
-    apply: SqliteConnection,
+    db: SqliteConnection,
     last_cursor: Option<Cursor>,
     next_seq: u64,
     session_id: String,
-    /// Set by the commit hook on `dev` whenever a local write commits, so the
-    /// driver knows there is a captured mutation to flush.
+    /// Set by the commit hook whenever a write commits, so the driver knows
+    /// to look for a captured mutation to flush. Server patch applies trip it
+    /// too, harmlessly: an empty capture session never uploads.
     dirty: Arc<AtomicBool>,
-    /// Names of tables whose rows changed since the last drain, from the update
-    /// hooks on both `dev` (local writes) and `apply` (server patches).
+    /// Names of tables whose rows changed since the last drain, from the
+    /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
     /// Transaction bookkeeping for the diesel `Connection` impl. The manager
-    /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `dev`.
+    /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `db`.
     transaction_state: AnsiTransactionManager,
     /// Changesets of pushed mutations awaiting resolution, keyed by `client_seq`,
     /// so a server rejection can be inverted and rolled back locally. Bounded by
@@ -317,9 +339,10 @@ where
     /// Connect: open the local database, hook the capture session, and run the
     /// handshake.
     ///
-    /// `db_path` must be a real file path (not `:memory:`) so the capture and
-    /// apply connections share it. `sqlite_ddl` creates the local schema. Pass
-    /// `resume` to continue from a persisted cursor on reconnect.
+    /// `db_path` is the local replica. A file path persists it across runs,
+    /// `:memory:` works for throwaway replicas now that a single connection
+    /// serves capture and apply alike. `sqlite_ddl` creates the local schema.
+    /// Pass `resume` to continue from a persisted cursor on reconnect.
     ///
     /// # Errors
     ///
@@ -361,8 +384,8 @@ where
         Self::connect_inner(transport, db_path, None, config, resume).await
     }
 
-    /// Shared connect body: open the two connections, apply the schema when
-    /// it arrives as DDL, hook the capture session, and run the handshake.
+    /// Shared connect body: open the connection, apply the schema when it
+    /// arrives as DDL, hook the capture session, and run the handshake.
     async fn connect_inner(
         mut transport: T,
         db_path: &str,
@@ -370,28 +393,23 @@ where
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        let mut apply = SqliteConnection::establish(db_path)
+        let mut db = SqliteConnection::establish(db_path)
             .map_err(|e| ClientError::Connect(e.to_string()))?;
-        apply.batch_execute("PRAGMA journal_mode=WAL")?;
+        db.batch_execute("PRAGMA journal_mode=WAL")?;
         if let Some(ddl) = sqlite_ddl {
-            apply.batch_execute(ddl)?;
+            db.batch_execute(ddl)?;
         }
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        install_change_tracker(&mut apply, &changed);
-
-        let mut dev = SqliteConnection::establish(db_path)
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
-        dev.batch_execute("PRAGMA journal_mode=WAL")?;
         let dirty = Arc::new(AtomicBool::new(false));
-        install_change_tracker(&mut dev, &changed);
+        install_change_tracker(&mut db, &changed);
         {
             let dirty = Arc::clone(&dirty);
-            dev.on_commit(move || {
+            db.on_commit(move || {
                 dirty.store(true, Ordering::Relaxed);
                 CommitDecision::Proceed
             });
         }
-        let mut session = dev
+        let mut session = db
             .create_session()
             .map_err(|e| ClientError::Session(e.to_string()))?;
         session
@@ -423,8 +441,7 @@ where
         Ok(Self {
             transport,
             session,
-            dev,
-            apply,
+            db,
             last_cursor: resume,
             next_seq: 0,
             session_id,
@@ -444,7 +461,7 @@ where
     /// The application's local connection, for ordinary diesel reads and writes.
     /// Writes here are captured for upload on the next [`push`](Self::push).
     pub const fn conn(&mut self) -> &mut SqliteConnection {
-        &mut self.dev
+        &mut self.db
     }
 
     /// The highest resume cursor applied so far, if any.
@@ -631,7 +648,7 @@ where
         }
         // Reset capture: a fresh session records only writes after this push.
         let mut fresh = self
-            .dev
+            .db
             .create_session()
             .map_err(|e| ClientError::Session(e.to_string()))?;
         fresh
@@ -643,10 +660,10 @@ where
 
     /// Roll back the optimistic local write for `client_seq` after the server
     /// rejected or conflicted it: decode the touched rows for the event, invert
-    /// the captured changeset, and apply the inverse on the apply connection,
-    /// which the capture session does not observe, so the rollback is never
-    /// re-uploaded. A row a concurrent server patch already changed is left
-    /// alone. Returns the touched rows, empty when the changeset is gone.
+    /// the captured changeset, and apply the inverse with capture suspended,
+    /// so the rollback is never re-uploaded. A row a concurrent server patch
+    /// already changed is left alone. Returns the touched rows, empty when
+    /// the changeset is gone.
     fn rollback(&mut self, client_seq: u64) -> Result<Vec<AffectedRow>, ClientError> {
         let Some(changeset) = self.pending.remove(&client_seq) else {
             return Ok(Vec::new());
@@ -654,7 +671,8 @@ where
         let rows = affected_rows(&changeset)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
-        self.apply
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        self.db
             .apply_changeset(&inverse, rollback_omit)
             .map_err(|err| ClientError::Apply(err.to_string()))?;
         Ok(rows)
@@ -763,7 +781,8 @@ where
 
     fn apply_patch(&mut self, payload_zstd: &[u8]) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
-        self.apply
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        self.db
             .apply_patchset(&bytes, server_wins)
             .map_err(|e| ClientError::Apply(e.to_string()))
     }
@@ -778,7 +797,7 @@ where
 
 impl<T: Transport> SimpleConnection for ConnettoConnection<T> {
     fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
-        self.dev.batch_execute(query)
+        self.db.batch_execute(query)
     }
 }
 
@@ -786,7 +805,7 @@ impl<T: Transport> ConnectionSealed for ConnettoConnection<T> {}
 
 /// `ConnettoConnection` is a diesel `Connection` over the managed local SQLite,
 /// so applications run ordinary diesel queries on `&mut conn`. Execution
-/// delegates to the capture connection `dev`, so local writes are recorded and
+/// delegates to the captured connection `db`, so local writes are recorded and
 /// auto-submitted by the driver. `establish` is unsupported: build the
 /// connection with [`ConnettoConnection::connect`], which owns the transport and
 /// handshake. diesel's query methods never call `establish`.
@@ -805,7 +824,7 @@ impl<T: Transport + Send> Connection for ConnettoConnection<T> {
     where
         Q: QueryFragment<Self::Backend> + QueryId,
     {
-        self.dev.execute_returning_count(source)
+        self.db.execute_returning_count(source)
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
@@ -813,15 +832,15 @@ impl<T: Transport + Send> Connection for ConnettoConnection<T> {
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
-        self.dev.instrumentation()
+        self.db.instrumentation()
     }
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
-        self.dev.set_instrumentation(instrumentation);
+        self.db.set_instrumentation(instrumentation);
     }
 
     fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
-        self.dev.set_prepared_statement_cache_size(size);
+        self.db.set_prepared_statement_cache_size(size);
     }
 }
 
@@ -843,6 +862,6 @@ impl<T: Transport + Send> LoadConnection<DefaultLoadingMode> for ConnettoConnect
         Q: Query + QueryFragment<Self::Backend> + QueryId + 'query,
         Self::Backend: QueryMetadata<Q::SqlType>,
     {
-        self.dev.load(source)
+        self.db.load(source)
     }
 }

@@ -20,12 +20,14 @@
 //! releases the connection: RAII end to end, matching the drop-unsubscribe
 //! contract of the handles themselves.
 
+use core::future::Future;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use connetto_core::messages::{BindValue, SubscriptionSpec};
-use connetto_core::traits::Transport;
+use connetto_core::traits::{MaybeSend, Transport};
+use diesel::SqliteConnection;
 use diesel::query_builder::QueryFragment;
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sqlite::Sqlite;
@@ -411,13 +413,32 @@ impl<T: Transport> Clone for ConnettoClient<T> {
 
 impl<T> ConnettoClient<T>
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
     /// Take ownership of a connected [`ConnettoConnection`] and start the
-    /// background pump that drives it.
+    /// background pump that drives it on the ambient tokio runtime.
+    ///
+    /// Native convenience over [`with_pump`](Self::with_pump), gated on the
+    /// `native-transport` feature that carries the tokio runtime. Wasm builds
+    /// leave the feature off and drive the pump future with `spawn_local`.
+    #[cfg(feature = "native-transport")]
     #[must_use]
     pub fn start(conn: ConnettoConnection<T>) -> Self {
+        let (client, pump) = Self::with_pump(conn);
+        tokio::spawn(pump);
+        client
+    }
+
+    /// Take ownership of a connected [`ConnettoConnection`] and return the
+    /// client together with its pump future, which the caller must drive to
+    /// completion (`tokio::spawn` on native, `spawn_local` on wasm).
+    ///
+    /// The pump exits when the last client clone drops or the transport
+    /// closes. The future is the single place the platform's driving mode
+    /// touches the client, so every other behavior stays identical across
+    /// native and wasm.
+    pub fn with_pump(conn: ConnettoConnection<T>) -> (Self, impl Future<Output = ()>) {
         let wake = Arc::new(Notify::new());
         let (events, _) = broadcast::channel(256);
         let shared = Arc::new(Shared {
@@ -435,8 +456,8 @@ where
             next_live: AtomicU64::new(1),
         });
         let token = Arc::new(ClientToken { wake });
-        tokio::spawn(pump(Arc::clone(&shared), Arc::downgrade(&token)));
-        Self { shared, token }
+        let driver = pump(Arc::clone(&shared), Arc::downgrade(&token));
+        (Self { shared, token }, driver)
     }
 
     /// Run a typed diesel query and keep its result fresh.
@@ -454,7 +475,7 @@ where
     pub async fn watch<Q, R>(&self, query: Q) -> Result<LiveQuery<R>, ClientError>
     where
         Q: QueryFragment<Sqlite> + Clone + Send + 'static,
-        Q: for<'query> LoadQuery<'query, ConnettoConnection<T>, R>,
+        Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
         let (sql, binds) = render_query(&query)?;
@@ -475,7 +496,7 @@ where
 
         let initial: Vec<R> = query
             .clone()
-            .load(&mut state.conn)
+            .load(state.conn.conn())
             .map_err(|e| ClientError::Session(e.to_string()))?;
         let rows = Arc::new(RwLock::new(initial));
         let (tx, rx) = watch::channel(0_u64);
@@ -484,7 +505,7 @@ where
         let refresh = Box::new(move |conn: &mut ConnettoConnection<T>| {
             let fresh: Vec<R> = query
                 .clone()
-                .load(conn)
+                .load(conn.conn())
                 .map_err(|e| ClientError::Session(e.to_string()))?;
             let unchanged = refresh_rows.read().is_ok_and(|current| *current == fresh);
             if !unchanged {
@@ -665,7 +686,7 @@ where
 /// It also exits when the transport closes or fails.
 async fn pump<T>(shared: Arc<Shared<T>>, alive: Weak<ClientToken>)
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
     loop {

@@ -32,15 +32,15 @@
 
 use core::future::Future;
 
-use connetto_core::traits::Transport;
+use connetto_core::traits::{MaybeSend, Transport};
 use diesel::expression::{Expression, ValidGrouping, is_aggregate};
 use diesel::query_builder::{AsQuery, QueryFragment, SelectClauseExpression, SelectStatement};
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sql_types;
 use diesel::sqlite::Sqlite;
 
+use crate::ClientError;
 use crate::live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue};
-use crate::{ClientError, ConnettoConnection};
 
 /// The selection expression and aggregation marker of a built select
 /// statement, projected purely at the type level.
@@ -224,17 +224,17 @@ pub trait WatchDispatch<T: Transport, M, R>: Sized {
     fn dispatch<'a>(
         self,
         client: &'a ConnettoClient<T>,
-    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + Send + 'a
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
     where
         Self: 'a;
 }
 
 impl<T, Q, R> WatchDispatch<T, is_aggregate::No, R> for Q
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
     Q: QueryFragment<Sqlite> + Clone + Send + 'static,
-    Q: for<'query> LoadQuery<'query, ConnettoConnection<T>, R>,
+    Q: for<'query> LoadQuery<'query, diesel::SqliteConnection, R>,
     R: Clone + PartialEq + Send + Sync + 'static,
 {
     type Handle = LiveQuery<R>;
@@ -242,7 +242,7 @@ where
     fn dispatch<'a>(
         self,
         client: &'a ConnettoClient<T>,
-    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + Send + 'a
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
     where
         Self: 'a,
     {
@@ -252,7 +252,7 @@ where
 
 impl<T, Q, V> WatchDispatch<T, is_aggregate::Yes, V> for Q
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
     Q: AsQuery + QueryFragment<Sqlite> + Send + 'static,
     Q::Query: SelectionMarker,
@@ -265,7 +265,7 @@ where
     fn dispatch<'a>(
         self,
         client: &'a ConnettoClient<T>,
-    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + Send + 'a
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
     where
         Self: 'a,
     {
@@ -294,14 +294,14 @@ pub trait Watchable<T: Transport, R>: Sized {
     fn live<'a>(
         self,
         client: &'a ConnettoClient<T>,
-    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + Send + 'a
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
     where
         Self: 'a;
 }
 
 impl<T, Q, R> Watchable<T, R> for Q
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
     Q: AsQuery,
     Q::Query: SelectionMarker,
@@ -312,7 +312,7 @@ where
     fn live<'a>(
         self,
         client: &'a ConnettoClient<T>,
-    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + Send + 'a
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
     where
         Self: 'a,
     {

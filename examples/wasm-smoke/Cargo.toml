@@ -1,0 +1,41 @@
+[package]
+name = "connetto-wasm-smoke"
+description = "Browser smoke for the connetto client on wasm32: a web_sys WebSocket transport and a dedicated worker test driving the full sync loop against a real connetto-server."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+connetto-client = { path = "../../crates/connetto-client", default-features = false }
+connetto-core = { path = "../../crates/connetto-core" }
+diesel = { version = "2", features = ["sqlite"] }
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+thiserror = "2"
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Standalone workspace: wasm-only spike, never enters the root gate.
+[workspace]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so the spike needs the same routing or the diesel backed
+# graph will not resolve. The sources must match the root ones exactly.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

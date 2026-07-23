@@ -14,9 +14,28 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["native-transport"]
+# The native WebSocket transport plus the tokio conveniences built on it:
+# ConnettoClient::start and the client binary. Wasm builds leave this off,
+# inject their own transport, and drive the pump with spawn_local.
+native-transport = [
+    "connetto-core/native-transport",
+    "tokio/rt",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+    "tokio/time",
+    "tokio/io-util",
+]
+
+[[bin]]
+name = "connetto-client"
+path = "src/bin/connetto-client.rs"
+required-features = ["native-transport"]
+
 [dependencies]
-# Wire types, framing, and the native WebSocket/loopback transports.
-connetto-core = { workspace = true, features = ["native-transport"] }
+# Wire types and framing. The native transports ride the feature above.
+connetto-core.workspace = true
 # Local store plus the SQLite session extension: the capture hook for local
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
@@ -40,7 +59,9 @@ subql = { workspace = true, features = ["diesel-typed-sqlite"] }
 # LiveValue.
 serde.workspace = true
 serde_json = "1"
-tokio.workspace = true
+# The library core needs only the runtime-agnostic pieces, which compile on
+# wasm32. The runtime, net, and time features arrive with native-transport.
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
 thiserror.workspace = true
 # Binary error handling (connetto-client bin).
 anyhow.workspace = true

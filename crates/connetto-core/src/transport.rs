@@ -18,7 +18,9 @@
 //! (`TAG_CONTROL` or `TAG_BULK`) followed by the `MessagePack` payload.
 //! `MessagePack` payloads are not valid UTF-8, so text frames are never used.
 
-use crate::codec::{decode_bulk, decode_control, encode_bulk, encode_control};
+use crate::codec::{
+    TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
+};
 use crate::error::CodecError;
 use crate::messages::{BulkMessage, ControlMessage};
 use crate::traits::{IncomingFrame, Transport};
@@ -28,11 +30,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async, client_async};
-
-/// Wire tag for a control-plane frame.
-const TAG_CONTROL: u8 = 0;
-/// Wire tag for a bulk-plane frame.
-const TAG_BULK: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // Loopback

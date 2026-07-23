@@ -6,15 +6,36 @@
 //! above `connetto-core`, not inside it.
 //!
 //! The `#[allow(async_fn_in_trait)]` lint suppression matches upstream guidance.
-//! Auto-`Send` is intentionally not required so browser worker impls (which are
-//! single-threaded) can implement the trait without unnecessary bounds. Consumer
-//! crates that need `Send` should add it at their own trait bound.
+//! [`Transport`] futures are bound by [`MaybeSend`]: `Send` on native targets,
+//! unconstrained on wasm, where the runtime is single threaded and transport
+//! futures hold JS values that cannot be `Send`. Native consumers keep spawning
+//! sessions onto multi-threaded runtimes with no change, since on native
+//! `MaybeSend` IS `Send`.
 
 use crate::{
     auth::AuthContext,
     cursor::Cursor,
     messages::{BulkMessage, ControlMessage},
 };
+
+/// `Send` on native targets, nothing on wasm.
+///
+/// The single seam through which the two platforms disagree about transport
+/// futures: a browser WebSocket future holds `JsValue`s and cannot be `Send`,
+/// while native drivers spawn onto multi-threaded runtimes and need it. On
+/// native this trait has `Send` as a supertrait with a blanket impl, so a
+/// `+ MaybeSend` bound is exactly `+ Send` there. On wasm it is a blanket
+/// no-op. Never implement it by hand.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub trait MaybeSend: Send {}
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl<T: Send> MaybeSend for T {}
+
+/// `Send` on native targets, nothing on wasm. See the native docs.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub trait MaybeSend {}
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl<T> MaybeSend for T {}
 
 /// Incoming frame delivered by [`Transport::recv`].
 ///
@@ -36,11 +57,12 @@ pub enum IncomingFrame {
 /// client. Implementations own their sink/stream state, and `send_*` and `recv`
 /// may be called concurrently by the same task via `&mut self`.
 ///
-/// The methods return `impl Future + Send` explicitly (rather than `async fn`)
-/// so a generic driver holding a `T: Transport` can be spawned onto a
-/// multi-threaded runtime. Implementations still write plain `async fn`
-/// bodies. A future single-threaded WASM transport gets its own driving mode,
-/// not a weakening of this bound.
+/// The methods return `impl Future + MaybeSend` explicitly (rather than
+/// `async fn`) so a generic driver holding a `T: Transport` can be spawned
+/// onto a multi-threaded runtime on native, where [`MaybeSend`] is `Send`.
+/// Implementations still write plain `async fn` bodies. On wasm the bound is
+/// vacuous and single threaded browser transports implement the trait
+/// directly.
 pub trait Transport {
     /// Transport-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
@@ -49,21 +71,21 @@ pub trait Transport {
     fn send_control(
         &mut self,
         message: ControlMessage,
-    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Send a bulk-plane message.
     fn send_bulk(
         &mut self,
         message: BulkMessage,
-    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Receive the next frame from the peer. Returns `Ok(None)` on clean close.
     fn recv(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<IncomingFrame>, Self::Error>> + Send;
+    ) -> impl core::future::Future<Output = Result<Option<IncomingFrame>, Self::Error>> + MaybeSend;
 
     /// Close the underlying connection cleanly.
-    fn close(&mut self) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
+    fn close(&mut self) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
 /// Client-side pending mutation record surfaced by [`Store::pending_mutations`].
