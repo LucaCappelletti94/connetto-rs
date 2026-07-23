@@ -326,6 +326,8 @@ dependencies = [
  "connetto-server",
  "diesel",
  "diesel-sqlite-session",
+ "serde",
+ "serde_json",
  "sqlite-diff-rs",
  "sqlparser",
  "subql",

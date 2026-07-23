@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use connetto_client::{
     AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, KeyValue,
+    LiveQuery, Watchable,
 };
 use connetto_core::Cursor;
 use connetto_server::{
@@ -1597,11 +1598,14 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     let client = ConnettoClient::start(conn);
     let mut events = client.events();
 
-    // An ordinary typed diesel query, no SQL strings in sight.
-    let query = orders::table
+    // An ordinary typed diesel query, no SQL strings in sight: the postfix
+    // live() dispatches to a row LiveQuery at compile time.
+    let mut live: LiveQuery<Order> = orders::table
         .filter(orders::quantity.gt(0))
-        .order(orders::id);
-    let mut live = client.watch::<_, Order>(query).await.expect("watch");
+        .order(orders::id)
+        .live(&client)
+        .await
+        .expect("watch");
     assert!(
         live.rows().is_empty(),
         "the replica is empty before the snapshot lands",
@@ -1671,6 +1675,123 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     assert_eq!(replica_rows, 2, "the replica never saw the third insert");
 
     // Dropping the last client handle ends the pump and closes the transport.
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_value_tracks_a_server_aggregate() {
+    // A typed aggregate query becomes a LiveValue fed exclusively by server
+    // pushes: the replica's subset must never answer it. The bootstrap comes
+    // through the connector seed, CDC folds arrive as AggregateUpdate, and
+    // dropping the handle unsubscribes. The shape guards route misuse to the
+    // right method with a clear error.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    // COUNT(*) seed over the backend at subscribe time: 1 (the snapshot row).
+    let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    // The shape guards: an aggregate query is refused by watch, a row query by
+    // watch_value, each pointing at the right method.
+    let misrouted_row = client.watch::<_, i64>(orders::table.count()).await;
+    assert!(
+        matches!(&misrouted_row, Err(e) if e.to_string().contains("watch_value")),
+        "watch must refuse an aggregate query",
+    );
+    let misrouted_value = client
+        .watch_value::<_, i64>(orders::table.select(orders::id))
+        .await;
+    assert!(
+        matches!(&misrouted_value, Err(e) if e.to_string().contains("use watch")),
+        "watch_value must refuse a row query",
+    );
+
+    // The real thing: COUNT(*) as a typed diesel query. The postfix live()
+    // dispatches to a LiveValue and infers the value type (i64) from the
+    // query itself, no annotation anywhere.
+    let mut count = orders::table.count().live(&client).await.expect("live");
+
+    // The bootstrap arrives as a server push (the connector seed), never from
+    // the subset replica.
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), count.changed()) => {
+            changed.expect("bootstrap timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("aggregate subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(
+        count.value(),
+        Some(1),
+        "the bootstrap value is the server's"
+    );
+
+    // A CDC insert folds server-side and the new value is pushed.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), count.changed())
+        .await
+        .expect("fold timed out")
+        .expect("driver alive");
+    assert_eq!(count.value(), Some(2), "the folded value is the server's");
+
+    // Dropping the handle unsubscribes. Fence, insert, fence: no aggregate
+    // push may arrive in between.
+    drop(count);
+    client.ping(1).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 1 })).await;
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (3, 3.0, 9, 'x')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    client.ping(2).await.expect("ping");
+    let mut saw_aggregate = false;
+    loop {
+        let event = wait_broadcast(&mut events, |e| {
+            matches!(e, ClientEvent::Pong { .. } | ClientEvent::Aggregate { .. })
+        })
+        .await;
+        match event {
+            ClientEvent::Pong { nonce: 2 } => break,
+            ClientEvent::Aggregate { .. } => saw_aggregate = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_aggregate,
+        "no aggregate push may arrive after the unsubscribe",
+    );
+
     drop(client);
     server.await.expect("join server");
 }

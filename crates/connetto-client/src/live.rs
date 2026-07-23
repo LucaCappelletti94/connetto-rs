@@ -29,7 +29,8 @@ use connetto_core::traits::Transport;
 use diesel::query_builder::{MoveableBindCollector, QueryBuilder, QueryFragment};
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sqlite::{OwnedSqliteBindValue, Sqlite, SqliteBindCollector, SqliteQueryBuilder};
-use sqlparser::ast::visit_relations;
+use serde::de::DeserializeOwned;
+use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement, visit_relations};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
@@ -70,8 +71,38 @@ pub fn render_query<Q: QueryFragment<Sqlite>>(
     Ok((sql, binds))
 }
 
-/// The lowercased names of every table `sql` reads, for targeted refresh.
-fn query_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
+/// Which answer path a subscription query rides client-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryShape {
+    /// A row projection: answered from the replica, refreshed on table changes.
+    Rows,
+    /// A single ungrouped scalar aggregate: answered by server pushes.
+    Aggregate,
+}
+
+/// What the client needs from a rendered subscription query: the tables it
+/// reads (for targeted refresh) and its shape (for answer-path routing).
+struct ParsedSubscription {
+    tables: HashSet<String>,
+    shape: QueryShape,
+}
+
+/// The scalar aggregate functions the server maintains, lowercased.
+const AGGREGATE_FUNCTIONS: &[&str] = &[
+    "avg",
+    "count",
+    "max",
+    "min",
+    "stddev_pop",
+    "stddev_samp",
+    "sum",
+    "total",
+    "var_pop",
+    "var_samp",
+];
+
+/// Parse a rendered subscription query into its table set and shape.
+fn parse_subscription(sql: &str) -> Result<ParsedSubscription, ClientError> {
     let statements = Parser::parse_sql(&SQLiteDialect {}, sql)
         .map_err(|e| ClientError::Session(e.to_string()))?;
     let mut tables = HashSet::new();
@@ -84,7 +115,46 @@ fn query_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
         }
         core::ops::ControlFlow::<()>::Continue(())
     });
-    Ok(tables)
+    let shape = match statements.as_slice() {
+        [Statement::Query(query)] => query_shape(query),
+        _ => QueryShape::Rows,
+    };
+    Ok(ParsedSubscription { tables, shape })
+}
+
+/// A query is aggregate-shaped when it projects exactly one ungrouped call to
+/// a known scalar aggregate, mirroring the server's classification closely
+/// enough to route the client's answer path.
+fn query_shape(query: &sqlparser::ast::Query) -> QueryShape {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return QueryShape::Rows;
+    };
+    let ungrouped = matches!(
+        &select.group_by,
+        GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty()
+    );
+    if !ungrouped || select.projection.len() != 1 {
+        return QueryShape::Rows;
+    }
+    let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) =
+        &select.projection[0]
+    else {
+        return QueryShape::Rows;
+    };
+    let Expr::Function(function) = expr else {
+        return QueryShape::Rows;
+    };
+    let is_aggregate = function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .is_some_and(|ident| AGGREGATE_FUNCTIONS.contains(&ident.value.to_lowercase().as_str()));
+    if is_aggregate {
+        QueryShape::Aggregate
+    } else {
+        QueryShape::Rows
+    }
 }
 
 /// Subscription ids and the wake signal shared with every [`LiveQuery`], so a
@@ -106,11 +176,22 @@ struct LiveEntry<T: Transport> {
     refresh: Refresh<T>,
 }
 
-/// The connection and the live-query registry, guarded together so a refresh
+/// Driver-side apply callback of one live value: decode the pushed JSON and
+/// publish it when it differs from the current value.
+type ApplyValue = Box<dyn FnMut(&str) -> Result<(), ClientError> + Send>;
+
+/// One live value handle's driver-side state.
+struct ValueEntry {
+    sub_id: String,
+    apply: ApplyValue,
+}
+
+/// The connection and the live registries, guarded together so a refresh
 /// always sees the replica state the pump just produced.
 struct State<T: Transport> {
     conn: ConnettoConnection<T>,
     registry: Vec<LiveEntry<T>>,
+    values: Vec<ValueEntry>,
 }
 
 /// Everything the client handles and the pump task share.
@@ -120,6 +201,29 @@ struct Shared<T: Transport> {
     reaper: Arc<Reaper>,
     events: broadcast::Sender<ClientEvent>,
     next_live: AtomicU64,
+}
+
+/// The shared surface of every live handle: a current snapshot, an awaitable
+/// change signal, the backing subscription id, and drop-unsubscribe. Framework
+/// adapters build on this so a single hook serves row and scalar handles
+/// alike.
+pub trait LiveHandle {
+    /// The snapshot type: `Vec<R>` for a row query, `Option<V>` for a scalar.
+    type Snapshot;
+
+    /// The current snapshot.
+    fn snapshot(&self) -> Self::Snapshot;
+
+    /// Wait until the snapshot changes. Resolves once per real change,
+    /// coalescing bursts.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send;
+
+    /// The subscription id backing this handle.
+    fn sub_id(&self) -> &str;
 }
 
 /// A typed diesel query kept fresh by the client's pump.
@@ -133,6 +237,22 @@ pub struct LiveQuery<R> {
     rows: Arc<RwLock<Vec<R>>>,
     changed: watch::Receiver<u64>,
     reaper: Arc<Reaper>,
+}
+
+impl<R: Clone + Send + Sync> LiveHandle for LiveQuery<R> {
+    type Snapshot = Vec<R>;
+
+    fn snapshot(&self) -> Vec<R> {
+        self.rows()
+    }
+
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send {
+        LiveQuery::changed(self)
+    }
+
+    fn sub_id(&self) -> &str {
+        LiveQuery::sub_id(self)
+    }
 }
 
 impl<R: Clone> LiveQuery<R> {
@@ -168,6 +288,81 @@ impl<R> LiveQuery<R> {
 }
 
 impl<R> Drop for LiveQuery<R> {
+    fn drop(&mut self) {
+        let sub_id = core::mem::take(&mut self.sub_id);
+        let mut pending = match self.reaper.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.push(sub_id);
+        drop(pending);
+        self.reaper.wake.notify_one();
+    }
+}
+
+/// A server-maintained scalar aggregate kept fresh by the client's pump.
+///
+/// Created by [`ConnettoClient::watch_value`] for aggregate queries. The
+/// replica holds only this client's authorized rows, so it cannot answer a
+/// global statistic: the value comes exclusively from server pushes, and
+/// [`value`](Self::value) is `None` until the server's bootstrap arrives.
+/// Dropping the handle queues the server unsubscribe, exactly like
+/// [`LiveQuery`].
+pub struct LiveValue<V> {
+    sub_id: String,
+    value: Arc<RwLock<Option<V>>>,
+    changed: watch::Receiver<u64>,
+    reaper: Arc<Reaper>,
+}
+
+impl<V: Clone + Send + Sync> LiveHandle for LiveValue<V> {
+    type Snapshot = Option<V>;
+
+    fn snapshot(&self) -> Option<V> {
+        self.value()
+    }
+
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send {
+        LiveValue::changed(self)
+    }
+
+    fn sub_id(&self) -> &str {
+        LiveValue::sub_id(self)
+    }
+}
+
+impl<V: Clone> LiveValue<V> {
+    /// The current value, or `None` before the server's bootstrap arrives.
+    #[must_use]
+    pub fn value(&self) -> Option<V> {
+        self.value.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |value| value.clone(),
+        )
+    }
+}
+
+impl<V> LiveValue<V> {
+    /// The subscription id backing this handle.
+    #[must_use]
+    pub fn sub_id(&self) -> &str {
+        &self.sub_id
+    }
+
+    /// Wait until the value changes, the initial bootstrap included.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
+    pub async fn changed(&mut self) -> Result<(), ClientError> {
+        self.changed
+            .changed()
+            .await
+            .map_err(|_| ClientError::Transport("live query driver stopped".to_owned()))
+    }
+}
+
+impl<V> Drop for LiveValue<V> {
     fn drop(&mut self) {
         let sub_id = core::mem::take(&mut self.sub_id);
         let mut pending = match self.reaper.pending.lock() {
@@ -230,6 +425,7 @@ where
             state: Mutex::new(State {
                 conn,
                 registry: Vec::new(),
+                values: Vec::new(),
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -263,7 +459,14 @@ where
         R: Clone + PartialEq + Send + Sync + 'static,
     {
         let (sql, binds) = render_query(&query)?;
-        let tables = query_tables(&sql)?;
+        let parsed = parse_subscription(&sql)?;
+        if parsed.shape == QueryShape::Aggregate {
+            return Err(ClientError::Session(
+                "aggregate query: use watch_value, the replica cannot answer a global statistic"
+                    .to_owned(),
+            ));
+        }
+        let tables = parsed.tables;
         let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("live-{seq}");
 
@@ -313,6 +516,94 @@ where
         })
     }
 
+    /// Watch a server-maintained scalar aggregate.
+    ///
+    /// The query must be a single ungrouped aggregate (`COUNT`, `SUM`, `AVG`,
+    /// `MIN`, `MAX`, or the variance and stddev family). It registers like any
+    /// subscription, but the answer path is inverted: no local read happens
+    /// (the replica holds only this client's authorized subset), and every
+    /// value, the bootstrap included, arrives as a server push decoded from
+    /// JSON into `V`. Use an `Option` value type (for example `Option<f64>`)
+    /// for aggregates that are `null` over an empty set, such as `AVG`,
+    /// `MIN`, and `MAX`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the query cannot be rendered, is not
+    /// aggregate-shaped, or the subscribe frame cannot be sent. A server-side
+    /// refusal (for example an aggregate on an RLS table) arrives later as
+    /// [`ClientEvent::NonFatal`] on [`events`](Self::events).
+    pub async fn watch_value<Q, V>(&self, query: Q) -> Result<LiveValue<V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        V: DeserializeOwned + Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_value_decoded(query, |json| {
+            serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()))
+        })
+        .await
+    }
+
+    /// The decoder-parameterized core of [`watch_value`](Self::watch_value).
+    /// The typed `live()` dispatch supplies a per-SQL-type decoder that
+    /// follows the wire's aggregate rendering rules instead of plain serde.
+    pub(crate) async fn watch_value_decoded<Q, V>(
+        &self,
+        query: Q,
+        decode: fn(&str) -> Result<V, ClientError>,
+    ) -> Result<LiveValue<V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
+        let (sql, binds) = render_query(&query)?;
+        let parsed = parse_subscription(&sql)?;
+        if parsed.shape != QueryShape::Aggregate {
+            return Err(ClientError::Session(
+                "row query: use watch, a row projection is answered from the replica".to_owned(),
+            ));
+        }
+        let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let sub_id = format!("live-{seq}");
+
+        let value = Arc::new(RwLock::new(None::<V>));
+        let (tx, rx) = watch::channel(0_u64);
+        let apply_value = Arc::clone(&value);
+        let apply: ApplyValue = Box::new(move |json: &str| {
+            let fresh: V = decode(json)?;
+            let unchanged = apply_value
+                .read()
+                .is_ok_and(|current| current.as_ref() == Some(&fresh));
+            if !unchanged {
+                match apply_value.write() {
+                    Ok(mut value) => *value = Some(fresh),
+                    Err(poisoned) => *poisoned.into_inner() = Some(fresh),
+                }
+                tx.send_modify(|generation| *generation += 1);
+            }
+            Ok(())
+        });
+
+        // Interrupt the pump's idle wait so the FIFO lock admits us promptly.
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        state
+            .conn
+            .subscribe_spec(&sub_id, SubscriptionSpec::new(sql).with_binds(binds))
+            .await?;
+        state.values.push(ValueEntry {
+            sub_id: sub_id.clone(),
+            apply,
+        });
+
+        Ok(LiveValue {
+            sub_id,
+            value,
+            changed: rx,
+            reaper: Arc::clone(&self.shared.reaper),
+        })
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
@@ -351,6 +642,21 @@ where
     pub fn events(&self) -> broadcast::Receiver<ClientEvent> {
         self.shared.events.subscribe()
     }
+
+    /// Postfix-free spelling of the [`Watchable`](crate::dsl::Watchable)
+    /// verb: `client.live(query)` is `query.live(&client)`, with the handle
+    /// type chosen at compile time from the query's shape. The `R` parameter
+    /// is turbofish-friendly for row queries: `client.live::<_, Order>(q)`.
+    ///
+    /// # Errors
+    ///
+    /// See [`watch`](Self::watch) and [`watch_value`](Self::watch_value).
+    pub async fn live<Q, R>(&self, query: Q) -> Result<Q::Handle, ClientError>
+    where
+        Q: crate::dsl::Watchable<T, R>,
+    {
+        query.live(self).await
+    }
 }
 
 /// The background pump: drains queued unsubscribes, flushes local writes,
@@ -381,6 +687,7 @@ where
         };
         for sub_id in pending {
             state.registry.retain(|entry| entry.sub_id != sub_id);
+            state.values.retain(|entry| entry.sub_id != sub_id);
             if state.conn.unsubscribe(&sub_id).await.is_err() {
                 return;
             }
@@ -396,6 +703,25 @@ where
         let wake = Arc::clone(&shared.wake);
         match state.conn.pump_one_or(wake.notified()).await {
             Ok(Some(event)) => {
+                // Route an aggregate push to its live value handle before the
+                // broadcast, so observers of both see the same order.
+                if let ClientEvent::Aggregate {
+                    sub_id,
+                    result_json,
+                } = &event
+                {
+                    let outcome = state
+                        .values
+                        .iter_mut()
+                        .find(|entry| entry.sub_id == *sub_id)
+                        .map(|entry| (entry.apply)(result_json));
+                    if let Some(Err(err)) = outcome {
+                        let _ = shared.events.send(ClientEvent::NonFatal {
+                            related_to: Some(sub_id.clone()),
+                            detail: format!("live value update failed: {err}"),
+                        });
+                    }
+                }
                 let closed = matches!(event, ClientEvent::Closed);
                 let _ = shared.events.send(event);
                 if closed {
@@ -411,7 +737,11 @@ where
         let changed = state.conn.take_changed();
         if !changed.is_empty() {
             let changed: HashSet<String> = changed.into_iter().map(|t| t.to_lowercase()).collect();
-            let State { conn, registry } = &mut *state;
+            let State {
+                conn,
+                registry,
+                values: _,
+            } = &mut *state;
             for entry in registry.iter_mut() {
                 if entry.tables.is_disjoint(&changed) {
                     continue;
@@ -456,9 +786,23 @@ mod tests {
     // intersects the change tracker's plain table names.
     #[test]
     fn query_tables_unquotes_identifiers() {
-        let tables =
-            query_tables("SELECT `orders`.`id` FROM `orders` WHERE (`orders`.`quantity` > ?1)")
-                .expect("parse");
-        assert_eq!(tables, HashSet::from(["orders".to_owned()]));
+        let parsed = parse_subscription(
+            "SELECT `orders`.`id` FROM `orders` WHERE (`orders`.`quantity` > ?1)",
+        )
+        .expect("parse");
+        assert_eq!(parsed.tables, HashSet::from(["orders".to_owned()]));
+        assert_eq!(parsed.shape, QueryShape::Rows);
+    }
+
+    // Shape classification routes aggregates to watch_value and rows to watch.
+    #[test]
+    fn shape_classifies_aggregates_and_rows() {
+        let agg = parse_subscription("SELECT COUNT(*) FROM `orders`").expect("parse");
+        assert_eq!(agg.shape, QueryShape::Aggregate);
+        let rows = parse_subscription("SELECT * FROM orders WHERE quantity > 0").expect("parse");
+        assert_eq!(rows.shape, QueryShape::Rows);
+        let grouped = parse_subscription("SELECT status, COUNT(*) FROM orders GROUP BY status")
+            .expect("parse");
+        assert_eq!(grouped.shape, QueryShape::Rows);
     }
 }

@@ -50,9 +50,11 @@ use sqlite_diff_rs::{ParsedDiffSet, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+pub mod dsl;
 pub mod live;
 
-pub use live::{ConnettoClient, LiveQuery};
+pub use dsl::Watchable;
+pub use live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
