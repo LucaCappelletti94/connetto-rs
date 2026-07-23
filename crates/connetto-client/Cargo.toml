@@ -32,6 +32,10 @@ zstd = "0.13"
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
 sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
+# Rendering typed diesel queries to placeholder SQL plus bind values through
+# subql's diesel-typed API, the same machinery the engine's typed registration
+# uses server-side.
+subql = { workspace = true, features = ["diesel-typed-sqlite"] }
 # Decoding server-pushed aggregate values (JSON scalars) into the app's typed
 # LiveValue.
 serde.workspace = true
@@ -45,5 +49,5 @@ anyhow.workspace = true
 # The Docker-free loop test runs the real server in-process against the SQLite
 # emulator, so the client is exercised over a real socket without Postgres.
 connetto-server.path = "../connetto-server"
-subql.workspace = true
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"

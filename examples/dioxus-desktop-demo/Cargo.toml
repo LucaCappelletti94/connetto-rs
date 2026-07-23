@@ -1,0 +1,44 @@
+[package]
+name = "connetto-dioxus-desktop-demo"
+description = "Windowed Dioxus desktop demo of connetto live queries against a real connetto-server and Postgres."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[dependencies]
+connetto-client = { path = "../../crates/connetto-client" }
+connetto-core = { path = "../../crates/connetto-core" }
+connetto-dioxus = { path = "../../crates/connetto-dioxus" }
+diesel = { version = "2", features = ["sqlite"] }
+# Backend writer buttons: direct Postgres DML over tokio-postgres, no libpq.
+diesel-async = { version = "0.7", default-features = false, features = ["postgres"] }
+dioxus = { version = "0.7.9", features = ["desktop"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+
+# The build script translates schema.sql through pg2sqlite and applies the
+# result to the shipped replica template database, so the schema pipeline
+# runs at build time, never at startup.
+[build-dependencies]
+diesel = { version = "2", features = ["sqlite"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "ee65e3095f608e10dd9b97c2459c0d0f240573a3", default-features = false, features = ["std"] }
+
+# Standalone workspace: the demo needs the webkit system libraries, so it must
+# never enter the root gate, which stays buildable on headless machines.
+[workspace]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so the demo needs the same routing or the diesel backed
+# graph will not resolve. The sources must match the root ones exactly,
+# branch refs included: a rev pinned patch would be a distinct source id,
+# duplicating crates in the graph. The demo lockfile does the pinning.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

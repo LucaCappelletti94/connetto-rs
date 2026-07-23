@@ -110,7 +110,11 @@ fn json_to_wire(value: &serde_json::Value) -> WireValue<String, Vec<u8>> {
     }
 }
 
-/// Extract the single table a `SELECT` reads from.
+/// Extract the single table a `SELECT` reads from, as its bare catalog name.
+///
+/// The translated SQL quotes identifiers, so this takes the ident value,
+/// never its rendering, and the last dotted segment so a schema-qualified
+/// table resolves to the name the catalog knows.
 #[cfg(feature = "pg-async")]
 fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
@@ -125,7 +129,12 @@ fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
         return Err(SnapshotError::Sql("SELECT has no FROM clause".into()));
     };
     match &from.relation {
-        TableFactor::Table { name, .. } => Ok(name.to_string()),
+        TableFactor::Table { name, .. } => name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| SnapshotError::Sql("unsupported FROM relation".into())),
         _ => Err(SnapshotError::Sql("unsupported FROM relation".into())),
     }
 }
@@ -135,7 +144,7 @@ pub use pg::PgSnapshotSource;
 
 #[cfg(feature = "pg-async")]
 mod pg {
-    use diesel::sql_types::{Jsonb, Text};
+    use diesel::sql_types::{BigInt, Binary, Double, Jsonb, Nullable, Text};
     use diesel::{QueryableByName, sql_query};
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
@@ -143,6 +152,7 @@ mod pg {
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::{DatabaseLike, ParserDB, PgLsn};
 
+    use connetto_core::messages::BindValue;
     use connetto_core::{AuthContext, Cursor};
 
     use super::{SnapshotError, encode_json_rows, table_from_select};
@@ -196,11 +206,13 @@ mod pg {
         async fn snapshot(
             &self,
             select_sql: &str,
+            binds: &[BindValue],
             auth: &AuthContext,
         ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
             let wrapped = format!("SELECT to_jsonb(_snap) AS row FROM ({select_sql}) AS _snap");
             let user_id = auth.user_id.clone();
+            let binds = binds.to_vec();
             let mut conn = self
                 .pool
                 .get()
@@ -219,7 +231,22 @@ mod pg {
                             .bind::<Text, _>(user_id)
                             .execute(c)
                             .await?;
-                        let rows: Vec<JsonRow> = sql_query(&wrapped).load(c).await?;
+                        // The translated query carries `$N` placeholders. Attach
+                        // the wire binds in order, each with its natural Postgres
+                        // type. A NULL bind has no inherent type and rides as
+                        // nullable text, which diesel-rendered queries never
+                        // produce (they render IS NULL instead of binding NULL).
+                        let mut query = sql_query(wrapped).into_boxed::<diesel::pg::Pg>();
+                        for bind in binds {
+                            query = match bind {
+                                BindValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
+                                BindValue::Integer(value) => query.bind::<BigInt, _>(value),
+                                BindValue::Real(value) => query.bind::<Double, _>(value),
+                                BindValue::Text(value) => query.bind::<Text, _>(value),
+                                BindValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
+                            };
+                        }
+                        let rows: Vec<JsonRow> = query.load(c).await?;
                         let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
                             .get_result(c)
                             .await?;

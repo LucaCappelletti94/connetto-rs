@@ -37,6 +37,7 @@ pub use materializer::{
     AggregateCapture, AggregateChange, DeltaAggregateCapture, DeltaAggregateChange, Dispatched,
     MatchedPatch, Materializer, MaterializerError, PendingReExec, Registration,
     RuntimeVersionColumn, RuntimeWritableCatalog, RuntimeWritableCatalogBuilder,
+    SqliteRegistration,
 };
 pub use oplog::{
     CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, OplogConfig, catchup_decision,

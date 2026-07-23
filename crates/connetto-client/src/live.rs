@@ -26,13 +26,14 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use connetto_core::messages::{BindValue, SubscriptionSpec};
 use connetto_core::traits::Transport;
-use diesel::query_builder::{MoveableBindCollector, QueryBuilder, QueryFragment};
+use diesel::query_builder::QueryFragment;
 use diesel::query_dsl::methods::LoadQuery;
-use diesel::sqlite::{OwnedSqliteBindValue, Sqlite, SqliteBindCollector, SqliteQueryBuilder};
+use diesel::sqlite::Sqlite;
 use serde::de::DeserializeOwned;
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement, visit_relations};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
+use subql::backend::Value as SqliteValue;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::{ClientError, ClientEvent, ConnettoConnection};
@@ -40,34 +41,32 @@ use crate::{ClientError, ClientEvent, ConnettoConnection};
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
 /// the bind values the placeholders stand for, in placeholder order.
 ///
+/// Rendering rides `subql`'s diesel-typed API, the same machinery the
+/// engine's own typed registration uses, so the SQL skeleton and bind
+/// decoding stay identical on both ends of the wire.
+///
 /// # Errors
 ///
-/// [`ClientError::Session`] when diesel cannot render the query.
+/// [`ClientError::Session`] when diesel cannot render the query or a bind
+/// uses a type outside the wire's scalar set.
 pub fn render_query<Q: QueryFragment<Sqlite>>(
     query: &Q,
 ) -> Result<(String, Vec<BindValue>), ClientError> {
-    let mut builder = SqliteQueryBuilder::new();
-    query
-        .to_sql(&mut builder, &Sqlite)
+    let (sql, values) = subql::diesel_api::render_typed::<Sqlite, _>(query)
         .map_err(|e| ClientError::Session(e.to_string()))?;
-    let sql = builder.finish();
-
-    let mut collector = SqliteBindCollector::new();
-    query
-        .collect_binds(&mut collector, &mut (), &Sqlite)
-        .map_err(|e| ClientError::Session(e.to_string()))?;
-    let binds = collector
-        .moveable()
-        .binds()
-        .map(|(value, _)| match value {
-            OwnedSqliteBindValue::String(s) => BindValue::Text(s.to_string()),
-            OwnedSqliteBindValue::Binary(b) => BindValue::Blob(b.to_vec()),
-            OwnedSqliteBindValue::I32(i) => BindValue::Integer(i64::from(*i)),
-            OwnedSqliteBindValue::I64(i) => BindValue::Integer(*i),
-            OwnedSqliteBindValue::F64(f) => BindValue::Real(*f),
-            OwnedSqliteBindValue::Null => BindValue::Null,
+    let binds = values
+        .into_iter()
+        .map(|value| match value {
+            SqliteValue::Null => Ok(BindValue::Null),
+            SqliteValue::Int(i) => Ok(BindValue::Integer(i)),
+            SqliteValue::Float(f) => Ok(BindValue::Real(f)),
+            SqliteValue::String(s) => Ok(BindValue::Text(s)),
+            SqliteValue::Bytes(b) => Ok(BindValue::Blob(b)),
+            other => Err(ClientError::Session(format!(
+                "unsupported bind value shape {other:?}"
+            ))),
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((sql, binds))
 }
 

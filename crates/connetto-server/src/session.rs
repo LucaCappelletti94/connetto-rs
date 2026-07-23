@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason, FullResyncReason,
-    FullResyncRequired, HandshakeAck, LivePatch, MutationConflict, MutationHeader, MutationPatch,
-    MutationReject, MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe,
+    AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
+    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationConflict,
+    MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, Pong,
+    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
@@ -39,8 +39,8 @@ use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::materializer::{
-    DeltaAggregateCapture, Materializer, MaterializerError, Registration, agg_value_to_json,
-    compress, value_to_json,
+    DeltaAggregateCapture, Materializer, MaterializerError, Registration, SqliteRegistration,
+    agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::write_target::{WriteError, WriteOutcome, WriteTarget};
@@ -69,11 +69,31 @@ pub trait SnapshotSource: Send + Sync {
 
     /// Produce the initial snapshot for `select_sql`, authorized as `auth`.
     ///
+    /// `select_sql` is the Postgres translation of the subscription query,
+    /// never the client dialect, with `$N` placeholders paired to `binds` in
+    /// order.
+    ///
     /// # Errors
     ///
     /// Implementation-defined: a backend read or encoding failure.
-    async fn snapshot(&self, select_sql: &str, auth: &AuthContext)
-    -> Result<Snapshot, Self::Error>;
+    async fn snapshot(
+        &self,
+        select_sql: &str,
+        binds: &[BindValue],
+        auth: &AuthContext,
+    ) -> Result<Snapshot, Self::Error>;
+}
+
+/// The products of registering one row subscription, as its delivery needs
+/// them: the engine ids plus the Postgres translation of the query, which
+/// the snapshot read uses instead of the client dialect.
+struct RowRegistration {
+    /// The engine consumer bound to this subscription.
+    consumer_id: u64,
+    /// The engine subscription id.
+    sub_id: SubscriptionId,
+    /// The subscription query reverse translated to Postgres.
+    pg_sql: String,
 }
 
 /// Per-session server configuration.
@@ -1045,7 +1065,10 @@ where
         session_num: u64,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
-        let registration = match self.materializer.lock().await.register_sqlite(
+        let SqliteRegistration {
+            registration,
+            pg_sql,
+        } = match self.materializer.lock().await.register_sqlite(
             consumer_id,
             &sub.spec.query,
             &sub.spec.binds,
@@ -1065,7 +1088,12 @@ where
 
         match registration {
             Registration::Row(sub_id) => {
-                self.subscribe_row(transport, sub, state, session_num, consumer_id, sub_id)
+                let reg = RowRegistration {
+                    consumer_id,
+                    sub_id,
+                    pg_sql,
+                };
+                self.subscribe_row(transport, sub, state, session_num, reg)
                     .await
             }
             Registration::Aggregate(capture) => {
@@ -1091,8 +1119,7 @@ where
         sub: Subscribe,
         state: &mut SessionState,
         session_num: u64,
-        consumer_id: u64,
-        sub_id: SubscriptionId,
+        reg: RowRegistration,
     ) -> Result<(), SessionError> {
         if state.resume_lsn != 0 {
             let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
@@ -1100,7 +1127,7 @@ where
             match catchup_decision(state.resume_lsn, min, current) {
                 CatchupDecision::Catchup => {
                     return self
-                        .catch_up_row(transport, sub, state, session_num, consumer_id, sub_id)
+                        .catch_up_row(transport, sub, state, session_num, &reg)
                         .await;
                 }
                 CatchupDecision::FullResync => {
@@ -1114,7 +1141,7 @@ where
                 }
             }
         }
-        self.snapshot_row(transport, sub, state, session_num, consumer_id, sub_id)
+        self.snapshot_row(transport, sub, state, session_num, &reg)
             .await
     }
 
@@ -1125,8 +1152,7 @@ where
         sub: Subscribe,
         state: &mut SessionState,
         session_num: u64,
-        consumer_id: u64,
-        sub_id: SubscriptionId,
+        reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         transport
             .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
@@ -1137,7 +1163,7 @@ where
             .map_err(transport_err)?;
         let snapshot = self
             .snapshot_source
-            .snapshot(&sub.spec.query, &state.auth_ctx)
+            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.auth_ctx)
             .await
             .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let payload = compress(&snapshot.patchset)?;
@@ -1158,17 +1184,17 @@ where
             .map_err(transport_err)?;
 
         self.add_route(
-            consumer_id,
+            reg.consumer_id,
             Route {
                 session_id: session_num,
-                sub_id,
+                sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
                 auth_ctx: state.auth_ctx.clone(),
             },
         )
         .await;
-        state.subs.insert(sub.sub_id, (consumer_id, sub_id));
+        state.subs.insert(sub.sub_id, (reg.consumer_id, reg.sub_id));
         Ok(())
     }
 
@@ -1189,21 +1215,22 @@ where
         sub: Subscribe,
         state: &mut SessionState,
         session_num: u64,
-        consumer_id: u64,
-        sub_id: SubscriptionId,
+        reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         self.add_route(
-            consumer_id,
+            reg.consumer_id,
             Route {
                 session_id: session_num,
-                sub_id,
+                sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
                 auth_ctx: state.auth_ctx.clone(),
             },
         )
         .await;
-        state.subs.insert(sub.sub_id.clone(), (consumer_id, sub_id));
+        state
+            .subs
+            .insert(sub.sub_id.clone(), (reg.consumer_id, reg.sub_id));
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
@@ -1228,7 +1255,7 @@ where
                     .lock()
                     .await
                     .match_row_consumers(record.event())?
-                    .contains(&consumer_id)
+                    .contains(&reg.consumer_id)
             };
             if !matched {
                 continue;
@@ -1254,7 +1281,7 @@ where
                 self.materializer
                     .lock()
                     .await
-                    .advance_cursor(session_num, sub_id, &cursor)?;
+                    .advance_cursor(session_num, reg.sub_id, &cursor)?;
             }
             let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
             enqueue_and_flush(

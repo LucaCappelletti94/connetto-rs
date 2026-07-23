@@ -26,6 +26,6 @@ connetto-server = { path = "../connetto-server" }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "0.7.9"
-subql.workspace = true
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3.27.0"
 tokio.workspace = true

@@ -37,10 +37,11 @@ pg-async = [
 
 [dependencies]
 connetto-core = { workspace = true, features = ["native-transport"] }
-subql.workspace = true
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
 # Reverse translation of the client's SQLite-dialect subscription query into the
-# Postgres SQL subql parses. Follows subql's rev/branch via the shared graph.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+# Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).
+# Pinned to the rev on reverse-translate-placeholders that adds that mapping.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "ee65e3095f608e10dd9b97c2459c0d0f240573a3", default-features = false, features = ["std"] }
 tokio.workspace = true
 thiserror.workspace = true
 diesel.workspace = true

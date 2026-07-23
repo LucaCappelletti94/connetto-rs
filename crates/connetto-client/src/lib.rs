@@ -325,16 +325,57 @@ where
     ///
     /// [`ClientError`] on a database, session, transport, or handshake failure.
     pub async fn connect(
-        mut transport: T,
+        transport: T,
         db_path: &str,
         sqlite_ddl: &str,
+        config: &ClientConfig,
+        resume: Option<Cursor>,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(transport, db_path, Some(sqlite_ddl), config, resume).await
+    }
+
+    /// Connect like [`connect`](Self::connect), but seed a fresh replica from
+    /// a template database instead of executing DDL.
+    ///
+    /// `template` is the complete byte image of a SQLite database with the
+    /// replica schema already applied, the build-time product of translating
+    /// the backend schema (SQLite's file format is its own deployable
+    /// artifact). When nothing exists at `db_path` the template bytes are
+    /// written there and no DDL ever runs. An existing replica is reused
+    /// untouched, which is the resume path.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a filesystem, database, session, transport, or
+    /// handshake failure.
+    pub async fn connect_with_replica_template(
+        transport: T,
+        db_path: &str,
+        template: &[u8],
+        config: &ClientConfig,
+        resume: Option<Cursor>,
+    ) -> Result<Self, ClientError> {
+        if !std::path::Path::new(db_path).exists() {
+            std::fs::write(db_path, template).map_err(|e| ClientError::Connect(e.to_string()))?;
+        }
+        Self::connect_inner(transport, db_path, None, config, resume).await
+    }
+
+    /// Shared connect body: open the two connections, apply the schema when
+    /// it arrives as DDL, hook the capture session, and run the handshake.
+    async fn connect_inner(
+        mut transport: T,
+        db_path: &str,
+        sqlite_ddl: Option<&str>,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
         let mut apply = SqliteConnection::establish(db_path)
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         apply.batch_execute("PRAGMA journal_mode=WAL")?;
-        apply.batch_execute(sqlite_ddl)?;
+        if let Some(ddl) = sqlite_ddl {
+            apply.batch_execute(ddl)?;
+        }
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         install_change_tracker(&mut apply, &changed);
 

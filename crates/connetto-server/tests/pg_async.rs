@@ -161,6 +161,7 @@ async fn async_pg_snapshot_reads_rows() {
     let snapshot = source
         .snapshot(
             "SELECT * FROM orders WHERE quantity > 0",
+            &[],
             &connetto_core::AuthContext::new("test-user"),
         )
         .await
@@ -216,6 +217,7 @@ impl SnapshotSource for NoSnapshot {
     async fn snapshot(
         &self,
         _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::AuthContext,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
@@ -498,4 +500,107 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
+}
+
+const TRANSLATED_PG_DDL: &str = "CREATE TABLE translated (id INT PRIMARY KEY, quantity INT);";
+const TRANSLATED_SQLITE_DDL: &str =
+    "CREATE TABLE translated (id INTEGER PRIMARY KEY, quantity INTEGER);";
+
+diesel::table! {
+    translated (id) {
+        id -> diesel::sql_types::BigInt,
+        quantity -> diesel::sql_types::BigInt,
+    }
+}
+
+#[derive(Queryable, Selectable, Debug, PartialEq)]
+#[diesel(table_name = translated)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct TranslatedRow {
+    id: i64,
+    quantity: i64,
+}
+
+/// The coverage cell the desktop e2e caught missing: the exact wire shape a
+/// typed live query produces (backticked SQLite rendering with a `?` bind),
+/// registered through the materializer and snapshotted through the real
+/// [`PgSnapshotSource`] with the bind attached. The registration's
+/// translation is the snapshot's input, never the client dialect.
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    {
+        let mut conn = pool.get().await.expect("get connection");
+        sql_query("DROP TABLE IF EXISTS translated")
+            .execute(&mut *conn)
+            .await
+            .expect("drop table");
+        sql_query(TRANSLATED_PG_DDL)
+            .execute(&mut *conn)
+            .await
+            .expect("create table");
+        sql_query("INSERT INTO translated VALUES (1, 5), (2, 0), (3, 9)")
+            .execute(&mut *conn)
+            .await
+            .expect("seed rows");
+    }
+
+    // Register the diesel-rendered SQLite shape with a typed bind and keep
+    // the translation the registration used.
+    let mut materializer = Materializer::new(TRANSLATED_PG_DDL).expect("build materializer");
+    let binds = vec![connetto_core::messages::BindValue::Integer(0)];
+    let reg = materializer
+        .register_sqlite(
+            1,
+            "SELECT `translated`.`id`, `translated`.`quantity` FROM `translated` \
+             WHERE (`translated`.`quantity` > ?) ORDER BY `translated`.`id`",
+            &binds,
+        )
+        .expect("register the diesel shape");
+    assert!(
+        reg.pg_sql.contains("$1"),
+        "the translation is parameterized, got {}",
+        reg.pg_sql
+    );
+
+    // Snapshot with the translated SQL plus the same binds, on real Postgres.
+    let source = PgSnapshotSource::from_ddl(pool, TRANSLATED_PG_DDL).expect("build source");
+    let snapshot = source
+        .snapshot(
+            &reg.pg_sql,
+            &binds,
+            &connetto_core::AuthContext::new("test-user"),
+        )
+        .await
+        .expect("snapshot the translated query");
+
+    // The snapshot applies onto a SQLite replica and carries only the rows
+    // the bound predicate admits.
+    let mut replica = SqliteConnection::establish(":memory:").expect("open sqlite");
+    diesel::RunQueryDsl::execute(sql_query(TRANSLATED_SQLITE_DDL), &mut replica)
+        .expect("create replica");
+    let applier = Materializer::new(TRANSLATED_PG_DDL).expect("build applier");
+    let compressed = zstd::encode_all(snapshot.patchset.as_slice(), 3).expect("compress");
+    applier
+        .apply_diffset(&compressed, &mut replica)
+        .expect("apply snapshot");
+    let rows: Vec<TranslatedRow> = diesel::RunQueryDsl::load(
+        translated::table
+            .order(translated::id)
+            .select(TranslatedRow::as_select()),
+        &mut replica,
+    )
+    .expect("read replica");
+    assert_eq!(
+        rows,
+        vec![
+            TranslatedRow { id: 1, quantity: 5 },
+            TranslatedRow { id: 3, quantity: 9 },
+        ],
+        "the bound predicate filtered on the backend"
+    );
 }

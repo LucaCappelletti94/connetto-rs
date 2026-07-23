@@ -69,6 +69,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot(
         &self,
         _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::AuthContext,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {

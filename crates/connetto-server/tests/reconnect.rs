@@ -51,6 +51,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn snapshot(
         &self,
         _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::AuthContext,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
