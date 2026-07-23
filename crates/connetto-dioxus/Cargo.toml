@@ -1,0 +1,31 @@
+[package]
+name = "connetto-dioxus"
+description = "Dioxus adapter for connetto live queries: one hook serving row and scalar handles alike."
+categories = ["database", "gui"]
+keywords = ["sync", "dioxus", "sqlite", "offline", "live-query"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", version = "0.0.0" }
+connetto-core.workspace = true
+dioxus-core = "0.7.9"
+dioxus-hooks = "0.7.9"
+dioxus-signals = "0.7.9"
+
+[dev-dependencies]
+connetto-server = { path = "../connetto-server" }
+diesel.workspace = true
+dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
+dioxus-ssr = "0.7.9"
+subql.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true

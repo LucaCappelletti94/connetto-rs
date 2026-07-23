@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/connetto-core", "crates/connetto-server", "crates/connetto-client"]
+members = [
+    "crates/connetto-core",
+    "crates/connetto-server",
+    "crates/connetto-client",
+    "crates/connetto-dioxus",
+]
 
 # Additional crates land here as their real content is ready:
 #   - crates/connetto-server         # session manager + subscription materializer
