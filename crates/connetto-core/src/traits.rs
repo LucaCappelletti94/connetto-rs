@@ -22,7 +22,7 @@ use crate::{
 /// (`WebSocket` binary vs. text frames, or the caller's own discipline over raw
 /// byte streams). Higher layers pattern-match on this enum instead of the raw
 /// message types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum IncomingFrame {
     /// A control-plane frame.
     Control(ControlMessage),
@@ -35,22 +35,35 @@ pub enum IncomingFrame {
 /// One instance per session on the server. One per open connection on the
 /// client. Implementations own their sink/stream state, and `send_*` and `recv`
 /// may be called concurrently by the same task via `&mut self`.
-#[allow(async_fn_in_trait)]
+///
+/// The methods return `impl Future + Send` explicitly (rather than `async fn`)
+/// so a generic driver holding a `T: Transport` can be spawned onto a
+/// multi-threaded runtime. Implementations still write plain `async fn`
+/// bodies. A future single-threaded WASM transport gets its own driving mode,
+/// not a weakening of this bound.
 pub trait Transport {
     /// Transport-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
     /// Send a control-plane message.
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error>;
+    fn send_control(
+        &mut self,
+        message: ControlMessage,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 
     /// Send a bulk-plane message.
-    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error>;
+    fn send_bulk(
+        &mut self,
+        message: BulkMessage,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 
     /// Receive the next frame from the peer. Returns `Ok(None)` on clean close.
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error>;
+    fn recv(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<Option<IncomingFrame>, Self::Error>> + Send;
 
     /// Close the underlying connection cleanly.
-    async fn close(&mut self) -> Result<(), Self::Error>;
+    fn close(&mut self) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Client-side pending mutation record surfaced by [`Store::pending_mutations`].

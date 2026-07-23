@@ -17,7 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use connetto_client::{AffectedRow, ClientConfig, ClientEvent, ConnettoConnection, KeyValue};
+use connetto_client::{
+    AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, KeyValue,
+};
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -79,7 +81,7 @@ diesel::table! {
     }
 }
 
-#[derive(Queryable, Selectable, Debug, PartialEq)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
@@ -1542,5 +1544,133 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
     );
 
     client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// Pump the broadcast stream until an event matches `pred`, with a deadline.
+async fn wait_broadcast(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    pred: impl Fn(&ClientEvent) -> bool,
+) -> ClientEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("event stream timed out")
+            .expect("event stream closed");
+        if pred(&event) {
+            return event;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
+    // The full live-query loop: a typed diesel query becomes a LiveQuery whose
+    // rows refresh as the snapshot and CDC patches land, and dropping the
+    // handle tears the server subscription down.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    // An ordinary typed diesel query, no SQL strings in sight.
+    let query = orders::table
+        .filter(orders::quantity.gt(0))
+        .order(orders::id);
+    let mut live = client.watch::<_, Order>(query).await.expect("watch");
+    assert!(
+        live.rows().is_empty(),
+        "the replica is empty before the snapshot lands",
+    );
+
+    // The server snapshot (one seed row) applies, and the handle refreshes.
+    // Race the refresh against a rejection so a refused subscription names its
+    // reason instead of timing out.
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
+            changed.expect("snapshot refresh timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(live.rows(), vec![order(1, 1.0, 3, "seed")]);
+
+    // A CDC insert fans out as a live patch, and the handle refreshes again.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), live.changed())
+        .await
+        .expect("live refresh timed out")
+        .expect("driver alive");
+    assert_eq!(
+        live.rows(),
+        vec![order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")],
+    );
+
+    // Dropping the handle queues the unsubscribe. Fence with a ping: control
+    // frames are ordered, so the pong proves the server handled it.
+    drop(live);
+    client.ping(1).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 1 })).await;
+
+    // A further insert must reach neither the dropped handle nor the replica.
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (3, 3.0, 9, 'x')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    client.ping(2).await.expect("ping");
+    let mut saw_patch = false;
+    loop {
+        let event = wait_broadcast(&mut events, |e| {
+            matches!(
+                e,
+                ClientEvent::Pong { .. }
+                    | ClientEvent::LivePatch { .. }
+                    | ClientEvent::SnapshotApplied { .. }
+            )
+        })
+        .await;
+        match event {
+            ClientEvent::Pong { nonce: 2 } => break,
+            ClientEvent::LivePatch { .. } | ClientEvent::SnapshotApplied { .. } => {
+                saw_patch = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(!saw_patch, "no patch may arrive after the unsubscribe");
+    let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
+    assert_eq!(replica_rows, 2, "the replica never saw the third insert");
+
+    // Dropping the last client handle ends the pump and closes the transport.
+    drop(client);
     server.await.expect("join server");
 }

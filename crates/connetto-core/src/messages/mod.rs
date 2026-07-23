@@ -26,5 +26,6 @@ pub use mutation::{MutationConflict, MutationHeader, MutationReject, MutationRej
 pub use reconnect::{FullResyncReason, FullResyncRequired};
 pub use schema::SchemaUpdate;
 pub use subscription::{
-    SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+    BindValue, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority, SubscriptionSpec,
+    Unsubscribe,
 };

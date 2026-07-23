@@ -1045,12 +1045,11 @@ where
         session_num: u64,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
-        let registration = match self
-            .materializer
-            .lock()
-            .await
-            .register(consumer_id, &sub.spec.query)
-        {
+        let registration = match self.materializer.lock().await.register_sqlite(
+            consumer_id,
+            &sub.spec.query,
+            &sub.spec.binds,
+        ) {
             Ok(registration) => registration,
             Err(err) => {
                 transport

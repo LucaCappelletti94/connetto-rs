@@ -50,6 +50,10 @@ use sqlite_diff_rs::{ParsedDiffSet, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+pub mod live;
+
+pub use live::{ConnettoClient, LiveQuery};
+
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
 
@@ -406,12 +410,14 @@ where
         self.last_cursor.as_ref()
     }
 
-    /// Declare a subscription from a `SELECT`. The server classifies it from the
-    /// SQL: a row projection streams patchsets into the local replica (observe
-    /// [`ClientEvent::LivePatch`] and read rows with diesel), while a single
-    /// scalar aggregate pushes each value as a [`ClientEvent::Aggregate`] and
-    /// leaves the replica untouched. `subql` rejects unsupported syntax, which
-    /// surfaces as a [`ClientEvent::NonFatal`] with the session intact.
+    /// Declare a subscription from a SQLite-dialect `SELECT`, the same dialect
+    /// used against the local replica. The server reverse-translates it to
+    /// Postgres and classifies it: a row projection streams patchsets into the
+    /// local replica (observe [`ClientEvent::LivePatch`] and read rows with
+    /// diesel), while a single scalar aggregate pushes each value as a
+    /// [`ClientEvent::Aggregate`] and leaves the replica untouched. A query that
+    /// cannot be translated or that `subql` rejects surfaces as a
+    /// [`ClientEvent::NonFatal`] with the session intact.
     ///
     /// # Errors
     ///
@@ -421,6 +427,27 @@ where
             .send_control(ControlMessage::Subscribe(Subscribe {
                 sub_id: sub_id.to_owned(),
                 spec: SubscriptionSpec::new(query),
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// Declare a subscription from a full [`SubscriptionSpec`], carrying the
+    /// query's `?` placeholder bind values alongside the SQLite-dialect SQL.
+    /// [`subscribe`](Self::subscribe) is the plain-string form of this.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the subscribe frame cannot be sent.
+    pub async fn subscribe_spec(
+        &mut self,
+        sub_id: &str,
+        spec: SubscriptionSpec,
+    ) -> Result<(), ClientError> {
+        self.transport
+            .send_control(ControlMessage::Subscribe(Subscribe {
+                sub_id: sub_id.to_owned(),
+                spec,
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -448,12 +475,44 @@ where
     ///
     /// [`ClientError`] on a transport, apply, or protocol failure.
     pub async fn pump_one(&mut self) -> Result<ClientEvent, ClientError> {
-        match self
+        let frame = self
             .transport
             .recv()
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?
-        {
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.handle_frame(frame).await
+    }
+
+    /// Like [`pump_one`](Self::pump_one), but abandons the idle wait when
+    /// `cancel` resolves first, returning `None`. The underlying receive is
+    /// cancel-safe, so an abandoned wait loses no frame. This is the pump step
+    /// a shared driver uses so it never parks on the transport while holding
+    /// the connection lock.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`pump_one`](Self::pump_one).
+    pub async fn pump_one_or(
+        &mut self,
+        cancel: impl core::future::Future<Output = ()>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        let frame = tokio::select! {
+            biased;
+            () = cancel => return Ok(None),
+            frame = self.transport.recv() => {
+                frame.map_err(|e| ClientError::Transport(e.to_string()))?
+            }
+        };
+        self.handle_frame(frame).await.map(Some)
+    }
+
+    /// Apply one received frame: bulk patches mutate the replica and advance
+    /// flow control, control frames map onto their [`ClientEvent`]s.
+    async fn handle_frame(
+        &mut self,
+        frame: Option<IncomingFrame>,
+    ) -> Result<ClientEvent, ClientError> {
+        match frame {
             None => Ok(ClientEvent::Closed),
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
                 self.apply_patch(&patch.patchset_zstd)?;

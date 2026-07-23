@@ -24,7 +24,7 @@ use super::{
 /// endpoints, not by the type system, so the same enum represents both halves
 /// of the conversation. A server-side dispatcher that receives a
 /// [`ControlMessage::HandshakeAck`] treats it as a protocol violation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Client opens a session.
     Handshake(Handshake),

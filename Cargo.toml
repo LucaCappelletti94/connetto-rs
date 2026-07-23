@@ -21,12 +21,11 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main for reproducibility (main HEAD 5459584: adds connector
-# execute_scalar_row plus RegisterResult::aggregate_bootstrap_kinds so the full
-# delta aggregate family can be seeded through the connector, on top of the
-# RLS-guarded in-process delta aggregators and aggregate_bootstrap_sql /
-# AggAccumulator::seed_from_row bootstrap path).
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "5459584dae2f66243dd35f8303165c0ce04caf28", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
+# on main for reproducibility (main HEAD 1a22eca: tracks sqlparser from apache
+# datafusion-sqlparser-rs main, on top of the connector execute_scalar_row plus
+# RegisterResult::aggregate_bootstrap_kinds seed path and the RLS-guarded
+# in-process delta aggregators).
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "1a22ecaeab835f996c702e653f45453a7fc7188e", default-features = false, features = ["std", "sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"
@@ -45,8 +44,8 @@ anyhow = "1"
 # these same patches here or the diesel-backed graph will not resolve.
 [patch.crates-io]
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
-sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
-sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 
 # diesel-sqlite-session depends on diesel via git (not crates.io), so the

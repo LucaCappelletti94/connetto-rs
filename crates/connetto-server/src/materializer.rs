@@ -27,17 +27,22 @@
 //!
 //! See `docs/architecture/10-subscription-materializer.md`.
 
+use core::ops::ControlFlow;
 use std::collections::{HashMap, HashSet};
 
 use connetto_core::MutationOp;
-use connetto_core::messages::MutationPatch;
+use connetto_core::messages::{BindValue, MutationPatch};
 use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, sql_query};
+use pg2sqlite::options::Pg2SqliteOptions;
+use pg2sqlite::prelude::ReverseTranslator;
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, SchemaWithPK, TableSchema, Value};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::ast::{Expr, Statement, Value as SqlLiteral, visit_expressions_mut};
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::parser::Parser;
 use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
 use subql::emit::pgoutput_patchset;
 use subql::patchset::SqliteAdapter;
@@ -100,6 +105,10 @@ pub enum MaterializerError {
     /// Zstd compression or decompression of a bulk payload failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
+    /// The client's SQLite-dialect subscription query could not be reverse
+    /// translated to Postgres for `subql`.
+    #[error("subscription query translation failed: {0}")]
+    Translate(String),
 }
 
 /// One matched, folded patch produced by [`Materializer::dispatch`].
@@ -409,6 +418,236 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
             deltas: HashMap::new(),
         })
     }
+    /// Register a subscription from the client's SQLite-dialect `SELECT` and
+    /// its bind values.
+    ///
+    /// The query's `?` placeholders are substituted with `binds` in the parsed
+    /// statement, the result is reverse translated to Postgres against this
+    /// materializer's catalog, then registered through
+    /// [`register`](Self::register). The client speaks its native SQLite
+    /// dialect, the same one it runs against its local replica, and the server
+    /// owns substitution and translation because it owns the schema.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Translate`] when the SQLite query does not parse,
+    /// the binds do not match its placeholders, or it cannot be translated,
+    /// plus any error [`register`](Self::register) raises.
+    pub fn register_sqlite(
+        &mut self,
+        consumer_id: u64,
+        sqlite_sql: &str,
+        binds: &[BindValue],
+    ) -> Result<Registration, MaterializerError> {
+        let pg_sql = self.translate_subscription_sql(sqlite_sql, binds)?;
+        self.register(consumer_id, &pg_sql)
+    }
+
+    /// Substitute `binds` into one SQLite-dialect `SELECT` and reverse
+    /// translate it into the Postgres SQL that `subql` parses, using this
+    /// materializer's catalog for schema-aware translation.
+    ///
+    /// Plain `?` placeholders pair with `binds` in textual order (SQLite's own
+    /// positional semantics); explicit `?N` placeholders pair by index and may
+    /// repeat. Substitution happens on the parsed statement, never by string
+    /// splicing, so bind values cannot alter the query's structure.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Translate`] when the query does not parse as a
+    /// single SQLite statement, the binds and placeholders do not pair
+    /// exactly, or the statement cannot be reverse translated.
+    pub fn translate_subscription_sql(
+        &self,
+        sqlite_sql: &str,
+        binds: &[BindValue],
+    ) -> Result<String, MaterializerError> {
+        let numbered = number_placeholders(sqlite_sql)?;
+        let mut statements = Parser::parse_sql(&SQLiteDialect {}, &numbered)
+            .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+        if statements.len() != 1 {
+            return Err(MaterializerError::Translate(
+                "expected exactly one SQL statement".to_owned(),
+            ));
+        }
+        let mut statement = statements.remove(0);
+        substitute_binds(&mut statement, binds)?;
+        let pg = statement
+            .reverse_translate(self.engine.inner().database(), &Pg2SqliteOptions::default())
+            .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+        Ok(pg.to_string())
+    }
+}
+
+/// Number every plain `?` placeholder in textual order (`?1`, `?2`, ...) so
+/// bind pairing is independent of AST traversal order, leaving string
+/// literals, quoted identifiers, and comments untouched. A query that already
+/// uses explicit `?N` placeholders passes through unchanged. Mixing plain and
+/// numbered placeholders is rejected as ambiguous.
+fn number_placeholders(sql: &str) -> Result<String, MaterializerError> {
+    /// Lexical region the scanner is inside.
+    #[derive(Clone, Copy)]
+    enum Lex {
+        Normal,
+        /// Inside a quoted region ending at `end`. When `doubles`, a doubled
+        /// `end` character is an escape rather than the terminator.
+        Quoted {
+            end: char,
+            doubles: bool,
+        },
+        LineComment,
+        BlockComment,
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut state = Lex::Normal;
+    let mut numbered = 0_usize;
+    let mut saw_explicit = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            Lex::Normal => match c {
+                '\'' | '"' | '`' => {
+                    state = Lex::Quoted {
+                        end: c,
+                        doubles: true,
+                    };
+                    out.push(c);
+                }
+                '[' => {
+                    state = Lex::Quoted {
+                        end: ']',
+                        doubles: false,
+                    };
+                    out.push(c);
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    state = Lex::LineComment;
+                    out.push(c);
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    state = Lex::BlockComment;
+                    out.push(c);
+                }
+                '?' => {
+                    if chars.peek().is_some_and(char::is_ascii_digit) {
+                        saw_explicit = true;
+                        out.push(c);
+                    } else {
+                        numbered += 1;
+                        out.push('?');
+                        out.push_str(&numbered.to_string());
+                    }
+                }
+                _ => out.push(c),
+            },
+            Lex::Quoted { end, doubles } => {
+                out.push(c);
+                if c == end {
+                    if doubles && chars.peek() == Some(&end) {
+                        out.push(end);
+                        chars.next();
+                    } else {
+                        state = Lex::Normal;
+                    }
+                }
+            }
+            Lex::LineComment => {
+                out.push(c);
+                if c == '\n' {
+                    state = Lex::Normal;
+                }
+            }
+            Lex::BlockComment => {
+                out.push(c);
+                if c == '*' && chars.peek() == Some(&'/') {
+                    out.push('/');
+                    chars.next();
+                    state = Lex::Normal;
+                }
+            }
+        }
+    }
+    if saw_explicit && numbered > 0 {
+        return Err(MaterializerError::Translate(
+            "mixed plain `?` and numbered `?N` placeholders are ambiguous".to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Replace every `?N` placeholder in the parsed statement with the literal for
+/// `binds[N - 1]`. Every bind must be referenced at least once and every
+/// placeholder must resolve to a bind, so a count mismatch is an error rather
+/// than a silently wrong query.
+fn substitute_binds(
+    statement: &mut Statement,
+    binds: &[BindValue],
+) -> Result<(), MaterializerError> {
+    let mut used = vec![false; binds.len()];
+    let flow = visit_expressions_mut(statement, |expr| {
+        if let Expr::Value(value) = expr
+            && let SqlLiteral::Placeholder(marker) = &value.value
+        {
+            let index = match marker
+                .strip_prefix('?')
+                .and_then(|digits| digits.parse::<usize>().ok())
+            {
+                Some(index) if index >= 1 && index <= binds.len() => index,
+                _ => {
+                    return ControlFlow::Break(MaterializerError::Translate(format!(
+                        "placeholder `{marker}` has no matching bind",
+                    )));
+                }
+            };
+            used[index - 1] = true;
+            *expr = match bind_literal(&binds[index - 1]) {
+                Ok(literal) => literal,
+                Err(err) => return ControlFlow::Break(err),
+            };
+        }
+        ControlFlow::Continue(())
+    });
+    if let ControlFlow::Break(err) = flow {
+        return Err(err);
+    }
+    if let Some(unused) = used.iter().position(|used| !used) {
+        return Err(MaterializerError::Translate(format!(
+            "bind {} is not referenced by any placeholder",
+            unused + 1,
+        )));
+    }
+    Ok(())
+}
+
+/// Render one bind value as a SQL literal expression.
+///
+/// Blobs render as `X'..'` hex literals, the SQLite spelling. Reverse
+/// translation decides whether the Postgres side can carry them, so an
+/// unsupported blob comparison fails registration cleanly instead of
+/// producing a silently wrong query.
+fn bind_literal(bind: &BindValue) -> Result<Expr, MaterializerError> {
+    use std::fmt::Write as _;
+    let literal = match bind {
+        BindValue::Null => SqlLiteral::Null,
+        BindValue::Integer(value) => SqlLiteral::Number(value.to_string(), false),
+        BindValue::Real(value) if value.is_finite() => {
+            SqlLiteral::Number(format!("{value:?}"), false)
+        }
+        BindValue::Real(_) => {
+            return Err(MaterializerError::Translate(
+                "non-finite REAL bind has no SQL literal".to_owned(),
+            ));
+        }
+        BindValue::Text(value) => SqlLiteral::SingleQuotedString(value.clone()),
+        BindValue::Blob(bytes) => {
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                let _ = write!(hex, "{byte:02X}");
+            }
+            SqlLiteral::HexStringLiteral(hex)
+        }
+    };
+    Ok(Expr::Value(literal.with_empty_span()))
 }
 
 impl<DB, W> Materializer<DB, W>

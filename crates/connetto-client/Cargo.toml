@@ -28,6 +28,10 @@ diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sql
 sqlite-diff-rs = { version = "0.7.1", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
+# Extracting the table set of a live query from its rendered SQL, so the pump
+# refreshes only the handles a changed table affects. Version and rev follow
+# subql via the root [patch] blocks.
+sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
 tokio.workspace = true
 thiserror.workspace = true
 # Binary error handling (connetto-client bin).

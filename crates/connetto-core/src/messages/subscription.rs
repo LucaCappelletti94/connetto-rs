@@ -1,10 +1,13 @@
 //! Subscription registration, cancellation, and snapshot delimiters.
 //!
-//! The subscription language is SQL `WHERE` clause text handed to `subql` for
-//! parsing (Q4.1). Priority tiers control delivery ordering (Q4.3): tier 0
-//! completes before tier 1 begins. Row-level and aggregate subscriptions share
-//! this envelope. The server classifies each subscription from its SQL, so the
-//! envelope carries no kind discriminant.
+//! The subscription language is a SQLite-dialect `SELECT`, the same dialect the
+//! client runs against its local replica, with `?` placeholders accompanied by
+//! typed [`BindValue`]s in placeholder order. The server substitutes the binds
+//! into the parsed statement, reverse-translates it to Postgres, and hands that
+//! to `subql` for parsing (Q4.1). Priority tiers control delivery ordering
+//! (Q4.3): tier 0 completes before tier 1 begins. Row-level and aggregate
+//! subscriptions share this envelope. The server classifies each subscription
+//! from its SQL, so the envelope carries no kind discriminant.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,16 +49,38 @@ impl Default for SubscriptionPriority {
     }
 }
 
+/// One value bound to a `?` placeholder in a subscription query, in placeholder
+/// order. The five SQLite storage classes, which is exactly what a diesel query
+/// rendered against the client's replica can produce.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BindValue {
+    /// SQL `NULL`.
+    Null,
+    /// An `INTEGER` value.
+    Integer(i64),
+    /// A `REAL` value.
+    Real(f64),
+    /// A `TEXT` value.
+    Text(String),
+    /// A `BLOB` value.
+    Blob(#[serde(with = "serde_bytes")] Vec<u8>),
+}
+
 /// The observation contract handed to `subql` at registration time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
     /// Delivery priority tier.
     #[serde(default)]
     pub priority: SubscriptionPriority,
-    /// Full `SELECT` handed to `subql`, either a row projection or a single
-    /// scalar aggregate. The server classifies which from the SQL and rejects
-    /// unsupported syntax at registration time.
+    /// Full `SELECT` in the client's SQLite dialect, either a row projection or
+    /// a single scalar aggregate. The server reverse-translates it to Postgres,
+    /// classifies it from the SQL, and rejects untranslatable or unsupported
+    /// syntax at registration time.
     pub query: String,
+    /// Values for the `?` placeholders in `query`, in placeholder order. Empty
+    /// when the query has no placeholders.
+    #[serde(default)]
+    pub binds: Vec<BindValue>,
 }
 
 impl SubscriptionSpec {
@@ -65,6 +90,7 @@ impl SubscriptionSpec {
         Self {
             priority: SubscriptionPriority::default(),
             query: query.into(),
+            binds: Vec::new(),
         }
     }
 
@@ -74,10 +100,17 @@ impl SubscriptionSpec {
         self.priority = priority;
         self
     }
+
+    /// Attach the values for the query's `?` placeholders, in placeholder order.
+    #[must_use]
+    pub fn with_binds(mut self, binds: Vec<BindValue>) -> Self {
+        self.binds = binds;
+        self
+    }
 }
 
 /// Client registers a new subscription.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscribe {
     /// Client-chosen id, unique per session. Correlates snapshot and update messages.
     pub sub_id: String,
