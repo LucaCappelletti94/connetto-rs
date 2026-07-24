@@ -1,34 +1,38 @@
-//! Native [`Transport`] implementations shared by the server and the native
-//! client.
+//! In-process and native [`Transport`] implementations.
 //!
 //! Two backings are provided:
 //!
 //! * [`LoopbackTransport`]: an in-memory pair connected by channels, for
-//!   single-process wiring and fast tests.
+//!   single-process wiring, fast tests, and the browser relay's tab side. It
+//!   rides only the sync primitives, so it compiles on wasm (feature
+//!   `loopback`).
 //! * [`WebSocketTransport`]: the native `tokio-tungstenite` transport per
-//!   `docs/architecture/09-wasm.md`.
-//!
-//! This module is gated behind the `native-transport` feature so the default
-//! `connetto-core` build stays dependency-light and `WASM`-friendly. The server
-//! and the native client enable it; the browser client provides its own
-//! `web-sys`-backed transport instead.
+//!   `docs/architecture/09-wasm.md` (feature `native-transport`). The browser
+//!   client provides its own `web-sys` backed transport instead.
 //!
 //! Over a raw byte transport a control and a bulk frame must be told apart.
 //! Each `WebSocket` message is a binary frame whose first byte is a kind tag
 //! (`TAG_CONTROL` or `TAG_BULK`) followed by the `MessagePack` payload.
 //! `MessagePack` payloads are not valid UTF-8, so text frames are never used.
 
+#[cfg(feature = "native-transport")]
 use crate::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
 };
+#[cfg(feature = "native-transport")]
 use crate::error::CodecError;
 use crate::messages::{BulkMessage, ControlMessage};
 use crate::traits::{IncomingFrame, Transport};
+#[cfg(feature = "native-transport")]
 use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "native-transport")]
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "native-transport")]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+#[cfg(feature = "native-transport")]
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "native-transport")]
 use tokio_tungstenite::{WebSocketStream, accept_async, client_async};
 
 // ---------------------------------------------------------------------------
@@ -109,6 +113,7 @@ impl Transport for LoopbackTransport {
 // ---------------------------------------------------------------------------
 
 /// Error from the native [`WebSocketTransport`].
+#[cfg(feature = "native-transport")]
 #[derive(Debug, thiserror::Error)]
 pub enum WebSocketError {
     /// The underlying `tungstenite` stream failed.
@@ -125,6 +130,7 @@ pub enum WebSocketError {
     UnknownTag(u8),
 }
 
+#[cfg(feature = "native-transport")]
 impl From<tokio_tungstenite::tungstenite::Error> for WebSocketError {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
         Self::Ws(Box::new(err))
@@ -135,10 +141,12 @@ impl From<tokio_tungstenite::tungstenite::Error> for WebSocketError {
 ///
 /// Construct one with [`WebSocketTransport::accept`] (server side) or
 /// [`WebSocketTransport::connect`] (client side) over a [`TcpStream`].
+#[cfg(feature = "native-transport")]
 pub struct WebSocketTransport<S> {
     stream: WebSocketStream<S>,
 }
 
+#[cfg(feature = "native-transport")]
 impl WebSocketTransport<TcpStream> {
     /// Complete the server-side WebSocket handshake over an accepted TCP stream.
     ///
@@ -165,6 +173,7 @@ impl WebSocketTransport<TcpStream> {
     }
 }
 
+#[cfg(feature = "native-transport")]
 impl<S> Transport for WebSocketTransport<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,

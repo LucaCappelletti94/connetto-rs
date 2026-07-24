@@ -16,18 +16,24 @@ homepage.workspace = true
 workspace = true
 
 [features]
-# Native async WebSocket and loopback transports. Off by default so the core
-# stays dependency-light and WASM-friendly; enabled by the server and the
-# native client, never by the browser client.
-native-transport = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:thiserror"]
+# The in-memory loopback transport pair: channel based, no I/O, works on
+# wasm. The browser relay uses it between the tab client and the worker
+# relay before the MessagePort glue exists, and native tests wire sessions
+# with it.
+loopback = ["dep:tokio", "dep:thiserror"]
+# Native async WebSocket transport. Off by default so the core stays
+# dependency-light and WASM-friendly; enabled by the server and the native
+# client, never by the browser client.
+native-transport = ["loopback", "dep:tokio-tungstenite", "dep:futures-util", "tokio/net"]
 
 [dependencies]
 serde.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
 thiserror = { workspace = true, optional = true }
-# Native transport (feature native-transport). Plaintext WebSocket only, no TLS.
-tokio = { workspace = true, optional = true }
+# The loopback pair needs only the sync primitives, which compile on wasm.
+# The native transport feature adds the net stack on top.
+tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"], optional = true }
 

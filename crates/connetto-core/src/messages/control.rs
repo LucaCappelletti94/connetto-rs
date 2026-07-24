@@ -12,7 +12,7 @@ use super::{
     error::{FatalError, NonFatalError},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
-    mutation::{MutationConflict, MutationHeader, MutationReject},
+    mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
     schema::SchemaUpdate,
     subscription::{SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
@@ -43,6 +43,9 @@ pub enum ControlMessage {
     /// Client announces a mutation upload. The matching bulk frame carries
     /// the patchset bytes.
     MutationHeader(MutationHeader),
+    /// Server confirms a mutation is durably applied, retiring the client's
+    /// pending record.
+    MutationApplied(MutationApplied),
     /// Server rejects a mutation before applying it.
     MutationReject(MutationReject),
     /// Server reports that a mutation collided with a newer server-side row.

@@ -19,7 +19,7 @@
 //! SQLite connection; the async Postgres apply lives on the materializer behind
 //! the `pg-async` feature.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationConflict,
-    MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, Pong,
-    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
+    MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
+    NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
@@ -201,6 +201,10 @@ pub enum SessionError {
     /// Compressing a bulk payload failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
+    /// The write target failed outside a mutation commit (the watermark read
+    /// at handshake).
+    #[error("write target error: {0}")]
+    WriteTarget(String),
 }
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
@@ -272,6 +276,15 @@ struct AggRoute {
     tx: mpsc::UnboundedSender<Outbound>,
 }
 
+/// What a completed handshake establishes for the run loop.
+struct HandshakeOutcome {
+    session_num: u64,
+    auth_ctx: AuthContext,
+    resume_lsn: u64,
+    client_id: String,
+    applied_watermark: Option<u64>,
+}
+
 /// Mutable per-session state carried through the run loop.
 struct SessionState {
     credits: u32,
@@ -286,8 +299,13 @@ struct SessionState {
     auth_ctx: AuthContext,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// Sequence numbers already applied, so a replayed upload applies once.
-    applied_seqs: HashSet<u64>,
+    /// The client id from the handshake, keying the durable mutation
+    /// watermark together with the auth identity.
+    client_id: String,
+    /// Highest `client_seq` durably applied for this client identity, from
+    /// the write target at handshake and advanced per commit. A replayed
+    /// sequence at or below it is re-acknowledged, never re-applied.
+    applied_watermark: Option<u64>,
     /// Resume LSN decoded from the handshake cursor. 0 means a fresh session, so
     /// every re-declared subscription replays from here on reconnect.
     resume_lsn: u64,
@@ -716,15 +734,16 @@ where
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
 
-    /// Receive and validate the handshake, decode the resume cursor, and reply
-    /// with the ack carrying the server's current watermark.
+    /// Receive and validate the handshake, decode the resume cursor, read the
+    /// client's durable mutation watermark, and reply with the ack carrying
+    /// both the server's current cursor and that watermark.
     ///
-    /// Returns the session number, the auth context, and the resume LSN, or
-    /// `None` when the peer closed before sending a handshake.
+    /// Returns the session identity, or `None` when the peer closed before
+    /// sending a handshake.
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
-    ) -> Result<Option<(u64, AuthContext, u64)>, SessionError> {
+    ) -> Result<Option<HandshakeOutcome>, SessionError> {
         let handshake = match transport.recv().await.map_err(transport_err)? {
             Some(IncomingFrame::Control(ControlMessage::Handshake(hs))) => hs,
             Some(_) => return Err(SessionError::Protocol("expected handshake first".into())),
@@ -758,6 +777,13 @@ where
             Some(lsn) => Cursor::new(lsn.to_be_bytes().to_vec()),
             None => Cursor::new(Vec::new()),
         };
+        // The durable mutation watermark: the client retires pending records
+        // at or below it and replays the rest.
+        let applied_watermark = self
+            .target
+            .last_applied(&auth_ctx, &handshake.client_id)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
 
         let session_num = self.next_session_id();
         transport
@@ -767,10 +793,17 @@ where
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
+                last_applied_seq: applied_watermark,
             }))
             .await
             .map_err(transport_err)?;
-        Ok(Some((session_num, auth_ctx, resume_lsn)))
+        Ok(Some(HandshakeOutcome {
+            session_num,
+            auth_ctx,
+            resume_lsn,
+            client_id: handshake.client_id,
+            applied_watermark,
+        }))
     }
 
     /// Serve one connection to completion: handshake, then the run loop, then
@@ -784,7 +817,13 @@ where
         self: Arc<Self>,
         mut transport: T,
     ) -> Result<(), SessionError> {
-        let Some((session_num, auth_ctx, resume_lsn)) = self.run_handshake(&mut transport).await?
+        let Some(HandshakeOutcome {
+            session_num,
+            auth_ctx,
+            resume_lsn,
+            client_id,
+            applied_watermark,
+        }) = self.run_handshake(&mut transport).await?
         else {
             return Ok(());
         };
@@ -799,7 +838,8 @@ where
             outbound: outbound_tx,
             auth_ctx,
             pending_header: None,
-            applied_seqs: HashSet::new(),
+            client_id,
+            applied_watermark,
             resume_lsn,
         };
 
@@ -931,7 +971,9 @@ where
     }
 
     /// Pair a `MutationPatch` with its header, authorize, conflict-check, and
-    /// apply. Replies only on failure; success is the CDC echo.
+    /// apply. A durable apply (and any replay of one) is confirmed with
+    /// [`MutationApplied`], failures reply with their dedicated messages, and
+    /// the data itself flows back as the CDC echo.
     async fn handle_mutation<T: Transport>(
         &self,
         transport: &mut T,
@@ -955,10 +997,14 @@ where
                 )
                 .await;
         }
-        // Idempotency: a replayed sequence is acknowledged silently, not
-        // reapplied.
-        if state.applied_seqs.contains(&client_seq) {
-            return Ok(());
+        // Exactly-once: a sequence at or below the durable watermark was
+        // already applied (this session or an earlier one). Re-acknowledge
+        // so the replaying client retires its pending record.
+        if state
+            .applied_watermark
+            .is_some_and(|watermark| client_seq <= watermark)
+        {
+            return self.ack(transport, client_seq).await;
         }
 
         // Parse and classify against the catalog.
@@ -1000,12 +1046,14 @@ where
                 &state.auth_ctx,
                 &plan,
                 &patch.patchset_zstd,
+                &state.client_id,
+                client_seq,
             )
             .await
         {
             Ok(WriteOutcome::Applied) => {
-                state.applied_seqs.insert(client_seq);
-                Ok(())
+                state.applied_watermark = Some(client_seq);
+                self.ack(transport, client_seq).await
             }
             Ok(WriteOutcome::Conflict {
                 table,
@@ -1057,6 +1105,21 @@ where
             .map_err(transport_err)
     }
 
+    /// Confirm a durably applied sequence, so the client retires the pending
+    /// record it would otherwise replay on the next resume.
+    async fn ack<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+    ) -> Result<(), SessionError> {
+        transport
+            .send_control(ControlMessage::MutationApplied(MutationApplied {
+                client_seq,
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
     async fn handle_subscribe<T: Transport>(
         &self,
         transport: &mut T,
@@ -1088,13 +1151,34 @@ where
 
         match registration {
             Registration::Row(sub_id) => {
+                let sub_label = sub.sub_id.clone();
                 let reg = RowRegistration {
                     consumer_id,
                     sub_id,
                     pg_sql,
                 };
-                self.subscribe_row(transport, sub, state, session_num, reg)
+                match self
+                    .subscribe_row(transport, sub, state, session_num, reg)
                     .await
+                {
+                    // A snapshot failure is scoped to this one subscription:
+                    // the registration is rolled back and the session (with
+                    // every sibling subscription) stays alive. Transport and
+                    // oplog failures stay fatal.
+                    Err(SessionError::Snapshot(detail)) => {
+                        self.remove_route(consumer_id).await;
+                        self.materializer.lock().await.unregister(sub_id);
+                        transport
+                            .send_control(ControlMessage::NonFatalError(NonFatalError {
+                                related_to: Some(sub_label),
+                                detail: format!("snapshot failed: {detail}"),
+                            }))
+                            .await
+                            .map_err(transport_err)?;
+                        Ok(())
+                    }
+                    other => other,
+                }
             }
             Registration::Aggregate(capture) => {
                 self.subscribe_aggregate(transport, sub, state, capture)

@@ -38,6 +38,7 @@ use sqlparser::parser::Parser;
 use subql::backend::Value as SqliteValue;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
+use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::{ClientError, ClientEvent, ConnettoConnection};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
@@ -86,6 +87,19 @@ enum QueryShape {
 struct ParsedSubscription {
     tables: HashSet<String>,
     shape: QueryShape,
+}
+
+/// The lowercased names of every table a subscription query reads.
+///
+/// The same extraction the pump uses to route refreshes, exposed so a relay
+/// serving the wire protocol from a worker-held replica can route snapshots
+/// and live patches by table.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the SQL cannot be parsed.
+pub fn subscription_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
+    Ok(parse_subscription(sql)?.tables)
 }
 
 /// The scalar aggregate functions the server maintains, lowercased.
@@ -169,22 +183,26 @@ struct Reaper {
 /// against the shared connection and publish fresh rows.
 type Refresh<T> = Box<dyn FnMut(&mut ConnettoConnection<T>) -> Result<(), ClientError> + Send>;
 
-/// One live handle's driver-side state: which tables it reads and how to
-/// re-run its query and publish fresh rows.
+/// One live handle's driver-side state: which tables it reads, how to re-run
+/// its query and publish fresh rows, and the wire spec to re-declare it on
+/// reconnect.
 struct LiveEntry<T: Transport> {
     sub_id: String,
     tables: HashSet<String>,
     refresh: Refresh<T>,
+    spec: SubscriptionSpec,
 }
 
 /// Driver-side apply callback of one live value: decode the pushed JSON and
 /// publish it when it differs from the current value.
 type ApplyValue = Box<dyn FnMut(&str) -> Result<(), ClientError> + Send>;
 
-/// One live value handle's driver-side state.
+/// One live value handle's driver-side state, with the wire spec to
+/// re-declare it on reconnect.
 struct ValueEntry {
     sub_id: String,
     apply: ApplyValue,
+    spec: SubscriptionSpec,
 }
 
 /// The connection and the live registries, guarded together so a refresh
@@ -439,6 +457,51 @@ where
     /// touches the client, so every other behavior stays identical across
     /// native and wasm.
     pub fn with_pump(conn: ConnettoConnection<T>) -> (Self, impl Future<Output = ()>) {
+        Self::build(conn, None::<ReconnectDriver<NoReconnect<T>, NoSleep>>)
+    }
+
+    /// Like [`with_pump`](Self::with_pump), but the pump survives transport
+    /// drops: it backs off per `policy`, obtains a fresh connection from
+    /// `factory`, resumes the session with the highest applied cursor, and
+    /// re-declares every live subscription, without dropping any handle.
+    /// The server replays retained changes as ordinary live patches or
+    /// orders a full resync. Observers see [`ClientEvent::Reconnecting`] per
+    /// attempt and [`ClientEvent::Reconnected`] on success. Exhausting the
+    /// policy broadcasts [`ClientEvent::Closed`] and ends the pump.
+    ///
+    /// A mutation that was fully sent but not yet processed when the
+    /// transport died is NOT replayed (acceptance has no reply, so a resend
+    /// could double-apply). Writes captured but never sent re-flush after
+    /// the resume.
+    pub fn with_reconnect<F, S>(
+        conn: ConnettoConnection<T>,
+        factory: F,
+        sleeper: S,
+        policy: ReconnectPolicy,
+    ) -> (Self, impl Future<Output = ()>)
+    where
+        F: TransportFactory<Transport = T> + MaybeSend + 'static,
+        S: Sleeper + MaybeSend + 'static,
+    {
+        Self::build(
+            conn,
+            Some(ReconnectDriver {
+                factory,
+                sleeper,
+                policy,
+            }),
+        )
+    }
+
+    /// Shared constructor body behind the two pump flavors.
+    fn build<F, S>(
+        conn: ConnettoConnection<T>,
+        reconnect: Option<ReconnectDriver<F, S>>,
+    ) -> (Self, impl Future<Output = ()>)
+    where
+        F: TransportFactory<Transport = T> + MaybeSend + 'static,
+        S: Sleeper + MaybeSend + 'static,
+    {
         let wake = Arc::new(Notify::new());
         let (events, _) = broadcast::channel(256);
         let shared = Arc::new(Shared {
@@ -456,7 +519,7 @@ where
             next_live: AtomicU64::new(1),
         });
         let token = Arc::new(ClientToken { wake });
-        let driver = pump(Arc::clone(&shared), Arc::downgrade(&token));
+        let driver = pump(Arc::clone(&shared), Arc::downgrade(&token), reconnect);
         (Self { shared, token }, driver)
     }
 
@@ -518,14 +581,13 @@ where
             Ok(())
         });
 
-        state
-            .conn
-            .subscribe_spec(&sub_id, SubscriptionSpec::new(sql).with_binds(binds))
-            .await?;
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        state.conn.subscribe_spec(&sub_id, spec.clone()).await?;
         state.registry.push(LiveEntry {
             sub_id: sub_id.clone(),
             tables,
             refresh,
+            spec,
         });
 
         Ok(LiveQuery {
@@ -607,13 +669,12 @@ where
         // Interrupt the pump's idle wait so the FIFO lock admits us promptly.
         self.shared.wake.notify_one();
         let mut state = self.shared.state.lock().await;
-        state
-            .conn
-            .subscribe_spec(&sub_id, SubscriptionSpec::new(sql).with_binds(binds))
-            .await?;
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        state.conn.subscribe_spec(&sub_id, spec.clone()).await?;
         state.values.push(ValueEntry {
             sub_id: sub_id.clone(),
             apply,
+            spec,
         });
 
         Ok(LiveValue {
@@ -679,25 +740,67 @@ where
     }
 }
 
+/// A configured reconnect driver: the factory, the sleeper, and the policy.
+struct ReconnectDriver<F, S> {
+    factory: F,
+    sleeper: S,
+    policy: ReconnectPolicy,
+}
+
+/// Whether a pump-step failure means the transport is gone (and a reconnect
+/// driver should take over) rather than a local fault.
+fn is_disconnect(err: &ClientError) -> bool {
+    matches!(err, ClientError::Transport(_))
+}
+
 /// The background pump: drains queued unsubscribes, flushes local writes,
 /// takes one cancellable pump step, then refreshes every live query whose
 /// tables changed. When the last [`ConnettoClient`] clone drops, the pump
 /// closes the connection gracefully (transport close handshake) and exits.
-/// It also exits when the transport closes or fails.
-async fn pump<T>(shared: Arc<Shared<T>>, alive: Weak<ClientToken>)
-where
+///
+/// A transport drop ends the pump, unless a reconnect driver is present, in
+/// which case the pump recovers: backoff, fresh transport, session resume,
+/// re-declared subscriptions. Local faults (session, apply, protocol) stay
+/// terminal either way.
+async fn pump<T, F, S>(
+    shared: Arc<Shared<T>>,
+    alive: Weak<ClientToken>,
+    mut reconnect: Option<ReconnectDriver<F, S>>,
+) where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
+    F: TransportFactory<Transport = T> + MaybeSend + 'static,
+    S: Sleeper + MaybeSend + 'static,
 {
+    let mut needs_recovery = false;
     loop {
         if alive.upgrade().is_none() {
             let mut state = shared.state.lock().await;
             let _ = state.conn.close().await;
             return;
         }
+
+        // The previous iteration lost the transport. Recover here, outside
+        // the state lock, so watch and with_conn callers are only blocked
+        // during the brief resume itself, never during backoff sleeps.
+        if needs_recovery {
+            let recovered = match reconnect.as_mut() {
+                Some(driver) => recover(&shared, driver).await,
+                None => false,
+            };
+            if !recovered {
+                let _ = shared.events.send(ClientEvent::Closed);
+                return;
+            }
+            needs_recovery = false;
+        }
+
         let mut state = shared.state.lock().await;
 
-        // 1. Unsubscribes queued by dropped handles.
+        // 1. Unsubscribes queued by dropped handles. A send failure only
+        //    marks the transport for recovery: the server-side subscription
+        //    dies with the session either way, and the entry is already out
+        //    of the registry, so nothing re-declares it.
         let pending = {
             let mut queue = match shared.reaper.pending.lock() {
                 Ok(guard) => guard,
@@ -708,13 +811,24 @@ where
         for sub_id in pending {
             state.registry.retain(|entry| entry.sub_id != sub_id);
             state.values.retain(|entry| entry.sub_id != sub_id);
-            if state.conn.unsubscribe(&sub_id).await.is_err() {
-                return;
+            if let Err(err) = state.conn.unsubscribe(&sub_id).await {
+                if is_disconnect(&err) {
+                    needs_recovery = true;
+                } else {
+                    return;
+                }
             }
+        }
+        if needs_recovery {
+            continue;
         }
 
         // 2. Auto-submit local writes committed since the last step.
-        if state.conn.flush().await.is_err() {
+        if let Err(err) = state.conn.flush().await {
+            if is_disconnect(&err) {
+                needs_recovery = true;
+                continue;
+            }
             return;
         }
 
@@ -722,34 +836,26 @@ where
         //    lock waiters (watch, with_conn, drops) get in promptly.
         let wake = Arc::clone(&shared.wake);
         match state.conn.pump_one_or(wake.notified()).await {
+            Ok(Some(ClientEvent::Closed)) => {
+                if reconnect.is_some() {
+                    needs_recovery = true;
+                    continue;
+                }
+                let _ = shared.events.send(ClientEvent::Closed);
+                return;
+            }
             Ok(Some(event)) => {
-                // Route an aggregate push to its live value handle before the
-                // broadcast, so observers of both see the same order.
-                if let ClientEvent::Aggregate {
-                    sub_id,
-                    result_json,
-                } = &event
-                {
-                    let outcome = state
-                        .values
-                        .iter_mut()
-                        .find(|entry| entry.sub_id == *sub_id)
-                        .map(|entry| (entry.apply)(result_json));
-                    if let Some(Err(err)) = outcome {
-                        let _ = shared.events.send(ClientEvent::NonFatal {
-                            related_to: Some(sub_id.clone()),
-                            detail: format!("live value update failed: {err}"),
-                        });
-                    }
-                }
-                let closed = matches!(event, ClientEvent::Closed);
+                route_aggregate(&mut state, shared.as_ref(), &event);
                 let _ = shared.events.send(event);
-                if closed {
-                    return;
-                }
             }
             Ok(None) => {}
-            Err(_) => return,
+            Err(err) => {
+                if is_disconnect(&err) {
+                    needs_recovery = true;
+                    continue;
+                }
+                return;
+            }
         }
 
         // 4. Refresh live queries whose tables changed, from server patches
@@ -774,6 +880,94 @@ where
                 }
             }
         }
+    }
+}
+
+/// Route an aggregate push to its live value handle before the broadcast,
+/// so observers of both see the same order.
+fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
+where
+    T: Transport,
+{
+    let ClientEvent::Aggregate {
+        sub_id,
+        result_json,
+    } = event
+    else {
+        return;
+    };
+    let outcome = state
+        .values
+        .iter_mut()
+        .find(|entry| entry.sub_id == *sub_id)
+        .map(|entry| (entry.apply)(result_json));
+    if let Some(Err(err)) = outcome {
+        let _ = shared.events.send(ClientEvent::NonFatal {
+            related_to: Some(sub_id.clone()),
+            detail: format!("live value update failed: {err}"),
+        });
+    }
+}
+
+/// Run the reconnect sequence to completion: backoff, fresh transport,
+/// session resume, re-declared subscriptions. Returns whether the session
+/// is live again, `false` meaning the policy is exhausted.
+///
+/// Sleeps and connect attempts run WITHOUT the state lock. Only the resume
+/// handshake and the re-subscribes hold it, so application reads and writes
+/// against the replica proceed during an outage.
+async fn recover<T, F, S>(shared: &Shared<T>, driver: &mut ReconnectDriver<F, S>) -> bool
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+    F: TransportFactory<Transport = T>,
+    S: Sleeper,
+{
+    let mut backoff = driver.policy.initial_backoff;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if driver.policy.max_attempts.is_some_and(|max| attempt > max) {
+            return false;
+        }
+        let _ = shared.events.send(ClientEvent::Reconnecting { attempt });
+        driver.sleeper.sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff);
+
+        let Ok(transport) = driver.factory.connect().await else {
+            continue;
+        };
+        let mut state = shared.state.lock().await;
+        if state.conn.resume(transport).await.is_err() {
+            continue;
+        }
+        // Re-declare every live subscription under its original id, so the
+        // server streams retained changes (or a full resync) into the same
+        // handles. A send failure here means the fresh transport died
+        // already: try again from the top.
+        let specs: Vec<(String, SubscriptionSpec)> = state
+            .registry
+            .iter()
+            .map(|entry| (entry.sub_id.clone(), entry.spec.clone()))
+            .chain(
+                state
+                    .values
+                    .iter()
+                    .map(|entry| (entry.sub_id.clone(), entry.spec.clone())),
+            )
+            .collect();
+        let mut redeclared = true;
+        for (sub_id, spec) in specs {
+            if state.conn.subscribe_spec(&sub_id, spec).await.is_err() {
+                redeclared = false;
+                break;
+            }
+        }
+        if !redeclared {
+            continue;
+        }
+        let _ = shared.events.send(ClientEvent::Reconnected);
+        return true;
     }
 }
 

@@ -160,6 +160,7 @@ mod tests {
             current_cursor: Cursor::new(vec![9, 8, 7]),
             schema_version: SchemaVersion::new("v1", vec![0xab, 0xcd]),
             initial_credits: 64,
+            last_applied_seq: Some(7),
         })
     }
 

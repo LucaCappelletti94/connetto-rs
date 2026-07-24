@@ -1,11 +1,14 @@
-//! Mutation header and mutation error responses.
+//! Mutation header, acknowledgement, and mutation error responses.
 //!
 //! The client uploads writes as `SQLite` patchsets tagged with a monotonically
 //! increasing `client_seq` (Q2.2). The header travels on the control channel.
 //! The patchset itself rides on the bulk channel as
-//! [`crate::messages::bulk::BulkMessage::MutationPatch`]. The server responds
-//! with dedicated messages only on error. Success is echoed back via the CDC
-//! path per Q3.5, not via a synthetic ack.
+//! [`crate::messages::bulk::BulkMessage::MutationPatch`]. The data flows back
+//! via the CDC path per Q3.5, but a durable apply is additionally confirmed
+//! with a [`MutationApplied`] acknowledgement, so the client can retire the
+//! pending record it would otherwise replay on reconnect, and so application
+//! flows can await the server verdict. The server deduplicates replays with a
+//! durable per-client watermark, which makes the upload path exactly-once.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +19,9 @@ use serde::{Deserialize, Serialize};
 /// first, bulk immediately after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationHeader {
-    /// Per-session monotonically increasing sequence number.
+    /// Per-client monotonically increasing sequence number. Survives
+    /// reconnects and process restarts: replayed uploads reuse the original
+    /// number, and the server's watermark makes the replay idempotent.
     pub client_seq: u64,
     /// Number of ops packaged into the corresponding bulk patchset.
     ///
@@ -33,6 +38,18 @@ impl MutationHeader {
             op_count,
         }
     }
+}
+
+/// Server confirms a mutation is durably applied (or was already applied by
+/// an earlier delivery of the same sequence).
+///
+/// This is the retire signal for the client's pending record: an unretired
+/// mutation is replayed on the next resume, and the server's watermark
+/// swallows any duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MutationApplied {
+    /// Sequence number of the applied mutation.
+    pub client_seq: u64,
 }
 
 /// Reason the server rejected a mutation before applying it.

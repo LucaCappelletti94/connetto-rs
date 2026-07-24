@@ -79,6 +79,12 @@ pub struct HandshakeAck {
     pub schema_version: SchemaVersion,
     /// Initial flow-control credit granted to the server for delivery.
     pub initial_credits: u32,
+    /// The server's durable per-client mutation watermark: the highest
+    /// `client_seq` it has applied for this client identity, `None` when it
+    /// never applied one. The client retires every pending mutation at or
+    /// below it and replays the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_seq: Option<u64>,
 }
 
 #[cfg(test)]

@@ -247,8 +247,13 @@ async fn write_path_applies_conflicts_and_dedups() {
 
     handshake(&mut client).await;
 
-    // Happy insert: a new versioned row lands on the target.
+    // Happy insert: a new versioned row lands on the target and the durable
+    // apply is acknowledged.
     upload(&mut client, 1, insert_changeset(2, "new", "t1")).await;
+    let ControlMessage::MutationApplied(ack) = next_control(&mut client).await else {
+        panic!("expected the durable-apply acknowledgement");
+    };
+    assert_eq!(ack.client_seq, 1);
     let ControlMessage::Pong(_) = barrier(&mut client, 1).await else {
         panic!("expected pong after insert");
     };
@@ -264,6 +269,10 @@ async fn write_path_applies_conflicts_and_dedups() {
         update_changeset(1, "hello", "updated", "t0", "t2"),
     )
     .await;
+    let ControlMessage::MutationApplied(ack) = next_control(&mut client).await else {
+        panic!("expected the durable-apply acknowledgement");
+    };
+    assert_eq!(ack.client_seq, 2);
     let ControlMessage::Pong(_) = barrier(&mut client, 2).await else {
         panic!("expected pong after update");
     };
@@ -295,12 +304,21 @@ async fn write_path_applies_conflicts_and_dedups() {
         vec![note(1, "updated", "t2"), note(2, "new", "t1")]
     );
 
-    // Idempotency: the same client_seq applied twice inserts once. Without
-    // dedup the second apply would collide on the primary key and reject.
+    // Exactly-once: the same client_seq applied twice inserts once, and the
+    // replay is re-acknowledged from the durable watermark instead of
+    // colliding on the primary key.
     upload(&mut client, 4, insert_changeset(3, "three", "t4")).await;
     upload(&mut client, 4, insert_changeset(3, "three", "t4")).await;
+    let ControlMessage::MutationApplied(first) = next_control(&mut client).await else {
+        panic!("expected the durable-apply acknowledgement");
+    };
+    assert_eq!(first.client_seq, 4);
+    let ControlMessage::MutationApplied(replayed) = next_control(&mut client).await else {
+        panic!("a replayed mutation is re-acknowledged, not rejected");
+    };
+    assert_eq!(replayed.client_seq, 4);
     let ControlMessage::Pong(_) = barrier(&mut client, 9).await else {
-        panic!("replayed mutation must be a silent no-op, not a reject");
+        panic!("expected pong after the replay");
     };
     assert_eq!(
         notes(&target),

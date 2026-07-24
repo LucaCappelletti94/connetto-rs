@@ -22,7 +22,9 @@ pub use control::ControlMessage;
 pub use error::{FatalError, FatalErrorReason, NonFatalError};
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Handshake, HandshakeAck};
-pub use mutation::{MutationConflict, MutationHeader, MutationReject, MutationRejectReason};
+pub use mutation::{
+    MutationApplied, MutationConflict, MutationHeader, MutationReject, MutationRejectReason,
+};
 pub use reconnect::{FullResyncReason, FullResyncRequired};
 pub use schema::SchemaUpdate;
 pub use subscription::{

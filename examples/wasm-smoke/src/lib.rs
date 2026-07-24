@@ -5,6 +5,26 @@
 //! is a wire tag from `connetto_core::codec`, followed by the MessagePack
 //! payload. The futures are not `Send` (they hold JS values), which is
 //! exactly what the `MaybeSend` seam in `connetto-core` exists for.
+//!
+//! The [`relay`] module builds on it: a [`RelayHub`] re-serves the wire
+//! protocol from a worker-held connection to any number of tabs, [`port`]
+//! and [`broadcast`] carry that protocol over a `MessagePort` and a named
+//! `BroadcastChannel`, [`locks`] provides Web Locks liveness for dead-tab
+//! reaping and leader election, [`workers`] holds the DB worker entry point
+//! and the page-side glue of the leader topology, and [`leader`] runs the
+//! multi-page election that decides which page owns the DB worker.
+
+pub mod broadcast;
+pub mod leader;
+pub mod locks;
+pub mod port;
+pub mod relay;
+pub mod workers;
+
+pub use broadcast::{BroadcastTransport, BroadcastTransportError};
+pub use leader::{Membership, join};
+pub use port::{PortTransport, PortTransportError};
+pub use relay::{HubNotice, RelayError, RelayHub, TabId};
 
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,

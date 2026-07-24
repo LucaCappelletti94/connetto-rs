@@ -17,7 +17,9 @@
 use std::sync::Arc;
 
 use connetto_core::auth::AuthContext;
+use diesel::connection::SimpleConnection;
 use diesel::sqlite::SqliteConnection;
+use diesel::{Connection, RunQueryDsl};
 use parking_lot::Mutex as SyncMutex;
 use tokio::sync::Mutex;
 
@@ -76,28 +78,114 @@ pub(crate) enum WriteError {
     Unauthorized,
     /// The changeset failed to parse or apply.
     Materializer(MaterializerError),
-    /// A pool or transaction failure. Only the Postgres path produces this.
-    #[cfg_attr(not(feature = "pg-async"), allow(dead_code))]
+    /// A pool, transaction, or watermark storage failure.
     Backend(String),
 }
 
+impl WriteError {
+    /// Human-readable detail for logging and error mapping.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Unauthorized => "unauthorized".to_owned(),
+            Self::Materializer(err) => err.to_string(),
+            Self::Backend(detail) => detail.clone(),
+        }
+    }
+}
+
+impl From<diesel::result::Error> for WriteError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Backend(err.to_string())
+    }
+}
+
+/// DDL for the durable per-client mutation watermark. It lives in the write
+/// target's own database, so advancing it commits atomically with the apply
+/// it belongs to. Valid SQLite and Postgres alike.
+const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
+    (user_id TEXT NOT NULL, client_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+    PRIMARY KEY (user_id, client_id))";
+
+/// Watermark row shape shared by both backends.
+#[derive(diesel::QueryableByName)]
+pub(crate) struct WatermarkRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub(crate) last_seq: i64,
+}
+
+/// Decode a loaded watermark row set into the watermark value.
+pub(crate) fn watermark_value(rows: Vec<WatermarkRow>) -> Option<u64> {
+    rows.into_iter()
+        .next()
+        .and_then(|row| u64::try_from(row.last_seq).ok())
+}
+
+/// The client sequence as the storage integer.
+pub(crate) fn seq_storage(client_seq: u64) -> Result<i64, WriteError> {
+    i64::try_from(client_seq)
+        .map_err(|_| WriteError::Backend("client sequence overflows storage".to_owned()))
+}
+
 impl WriteTarget {
-    /// Probe conflicts and apply one upload, reporting the outcome.
+    /// Probe conflicts, apply one upload, and advance the client's durable
+    /// watermark in the same transaction, reporting the outcome.
     ///
-    /// The SQLite path ignores `ctx` (it has no RLS); the Postgres path applies
-    /// under `ctx.user_id`.
-    #[cfg_attr(not(feature = "pg-async"), allow(unused_variables))]
+    /// The SQLite path ignores `ctx` for authorization (it has no RLS), the
+    /// Postgres path applies under `ctx.user_id`. Both key the watermark by
+    /// `(user id, client id)`.
     pub(crate) async fn commit(
         &self,
         materializer: &Mutex<Materializer>,
         ctx: &AuthContext,
         plan: &WritePlan,
         payload_zstd: &[u8],
+        client_id: &str,
+        client_seq: u64,
     ) -> Result<WriteOutcome, WriteError> {
         match self {
-            Self::Sqlite(target) => commit_sqlite(target, materializer, plan, payload_zstd).await,
+            Self::Sqlite(target) => {
+                commit_sqlite(
+                    target,
+                    materializer,
+                    plan,
+                    payload_zstd,
+                    ctx,
+                    client_id,
+                    client_seq,
+                )
+                .await
+            }
             #[cfg(feature = "pg-async")]
-            Self::Postgres(target) => target.commit(ctx, plan, payload_zstd).await,
+            Self::Postgres(target) => {
+                target
+                    .commit(ctx, plan, payload_zstd, client_id, client_seq)
+                    .await
+            }
+        }
+    }
+
+    /// The highest `client_seq` durably applied for `(ctx, client_id)`, read
+    /// at handshake so the ack can carry it. Ensures the watermark table
+    /// exists, so every later upsert runs against a known schema.
+    pub(crate) async fn last_applied(
+        &self,
+        ctx: &AuthContext,
+        client_id: &str,
+    ) -> Result<Option<u64>, WriteError> {
+        match self {
+            Self::Sqlite(target) => {
+                let mut conn = target.lock();
+                conn.batch_execute(WATERMARK_DDL)?;
+                let rows: Vec<WatermarkRow> = diesel::sql_query(
+                    "SELECT last_seq FROM _connetto_mutations WHERE user_id = ? AND client_id = ?",
+                )
+                .bind::<diesel::sql_types::Text, _>(&ctx.user_id)
+                .bind::<diesel::sql_types::Text, _>(client_id)
+                .load(&mut *conn)?;
+                Ok(watermark_value(rows))
+            }
+            #[cfg(feature = "pg-async")]
+            Self::Postgres(target) => target.last_applied(ctx, client_id).await,
         }
     }
 }
@@ -120,6 +208,9 @@ async fn commit_sqlite(
     materializer: &Mutex<Materializer>,
     plan: &WritePlan,
     payload_zstd: &[u8],
+    ctx: &AuthContext,
+    client_id: &str,
+    client_seq: u64,
 ) -> Result<WriteOutcome, WriteError> {
     for op in &plan.ops {
         let Some(conflict) = &op.conflict else {
@@ -133,11 +224,24 @@ async fn commit_sqlite(
             return Ok(conflict_outcome(conflict, row));
         }
     }
+    let seq = seq_storage(client_seq)?;
     let materializer = materializer.lock().await;
     let mut conn = target.lock();
-    materializer
-        .apply_diffset(payload_zstd, &mut conn)
-        .map_err(WriteError::Materializer)?;
+    conn.transaction::<_, WriteError, _>(|conn| {
+        materializer
+            .apply_diffset(payload_zstd, conn)
+            .map_err(WriteError::Materializer)?;
+        diesel::sql_query(
+            "INSERT INTO _connetto_mutations (user_id, client_id, last_seq) VALUES (?, ?, ?) \
+             ON CONFLICT (user_id, client_id) DO UPDATE SET \
+             last_seq = MAX(last_seq, excluded.last_seq)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&ctx.user_id)
+        .bind::<diesel::sql_types::Text, _>(client_id)
+        .bind::<diesel::sql_types::BigInt, _>(seq)
+        .execute(conn)?;
+        Ok(())
+    })?;
     Ok(WriteOutcome::Applied)
 }
 
@@ -147,7 +251,7 @@ pub use pg::{PgWriteTarget, pg_write_target};
 #[cfg(feature = "pg-async")]
 mod pg {
     use diesel::sql_query;
-    use diesel::sql_types::Text;
+    use diesel::sql_types::{BigInt, Text};
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -155,7 +259,10 @@ mod pg {
     use subql::ParserDB;
     use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
-    use super::{WriteError, WriteOutcome, conflict_outcome};
+    use super::{
+        WATERMARK_DDL, WatermarkRow, WriteError, WriteOutcome, conflict_outcome, seq_storage,
+        watermark_value,
+    };
     use crate::materializer::{ConflictProbe, MaterializerError, WritePlan, probe_conflict_pg};
     use connetto_core::auth::AuthContext;
 
@@ -216,7 +323,10 @@ mod pg {
             ctx: &AuthContext,
             plan: &WritePlan,
             payload_zstd: &[u8],
+            client_id: &str,
+            client_seq: u64,
         ) -> Result<WriteOutcome, WriteError> {
+            let seq = seq_storage(client_seq)?;
             let bytes = zstd::decode_all(payload_zstd)
                 .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
             let mut conn = self
@@ -225,6 +335,7 @@ mod pg {
                 .await
                 .map_err(|err| WriteError::Backend(err.to_string()))?;
             let user_id = ctx.user_id.clone();
+            let watermark_user = ctx.user_id.clone();
             let expected = plan.ops.len();
             let catalog = &self.catalog;
             let outcome = conn
@@ -252,6 +363,20 @@ mod pg {
                         if affected < expected {
                             return Err(CommitError::Denied);
                         }
+                        // Advance the durable watermark in the SAME
+                        // transaction: the apply and its dedupe record are
+                        // one atomic step.
+                        sql_query(
+                            "INSERT INTO _connetto_mutations (user_id, client_id, last_seq) \
+                             VALUES ($1, $2, $3) \
+                             ON CONFLICT (user_id, client_id) DO UPDATE SET last_seq = \
+                             GREATEST(_connetto_mutations.last_seq, EXCLUDED.last_seq)",
+                        )
+                        .bind::<Text, _>(watermark_user)
+                        .bind::<Text, _>(client_id)
+                        .bind::<BigInt, _>(seq)
+                        .execute(c)
+                        .await?;
                         Ok(WriteOutcome::Applied)
                     }
                     .scope_boxed()
@@ -266,6 +391,31 @@ mod pg {
                 Err(CommitError::Db(err)) => Err(WriteError::Backend(err.to_string())),
                 Err(CommitError::Probe(err)) => Err(WriteError::Materializer(err)),
             }
+        }
+
+        pub(crate) async fn last_applied(
+            &self,
+            ctx: &AuthContext,
+            client_id: &str,
+        ) -> Result<Option<u64>, WriteError> {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|err| WriteError::Backend(err.to_string()))?;
+            sql_query(WATERMARK_DDL)
+                .execute(&mut conn)
+                .await
+                .map_err(|err| WriteError::Backend(err.to_string()))?;
+            let rows: Vec<WatermarkRow> = sql_query(
+                "SELECT last_seq FROM _connetto_mutations WHERE user_id = $1 AND client_id = $2",
+            )
+            .bind::<Text, _>(&ctx.user_id)
+            .bind::<Text, _>(client_id)
+            .load(&mut conn)
+            .await
+            .map_err(|err| WriteError::Backend(err.to_string()))?;
+            Ok(watermark_value(rows))
         }
     }
 }

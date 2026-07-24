@@ -69,6 +69,7 @@ fn handshake_and_ack_round_trip() {
         current_cursor: Cursor::new(vec![1, 2, 3, 4]),
         schema_version: SchemaVersion::new("v42", vec![0xab, 0xcd]),
         initial_credits: 128,
+        last_applied_seq: Some(41),
     }));
 }
 

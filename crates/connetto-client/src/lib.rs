@@ -43,7 +43,7 @@ use diesel::expression::QueryMetadata;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
 use diesel::sqlite::{CommitDecision, Sqlite, SqliteChangeOps, SqliteUpdateRouter};
-use diesel::{Connection, SqliteConnection};
+use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
@@ -53,9 +53,13 @@ use std::sync::{Arc, Mutex};
 
 pub mod dsl;
 pub mod live;
+pub mod reconnect;
 
 pub use dsl::Watchable;
-pub use live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue};
+pub use live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_tables};
+#[cfg(feature = "native-transport")]
+pub use reconnect::TokioSleeper;
+pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -119,6 +123,10 @@ pub enum ClientEvent {
         sub_id: String,
         /// New resume cursor persisted after applying this patch.
         cursor: Cursor,
+        /// The compressed patchset exactly as applied, shared cheaply so a
+        /// relay can forward it to downstream replicas (the browser tab
+        /// mirrors) without re-encoding.
+        patchset_zstd: Arc<[u8]>,
     },
     /// An aggregate result update.
     Aggregate {
@@ -141,6 +149,12 @@ pub enum ClientEvent {
         /// Human-readable detail.
         detail: String,
     },
+    /// The server confirmed a mutation as durably applied. Its pending
+    /// record is retired, so it will never replay.
+    MutationApplied {
+        /// The applied mutation's sequence number.
+        client_seq: u64,
+    },
     /// The server rejected a prior mutation.
     MutationRejected {
         /// The rejected mutation's sequence number.
@@ -160,6 +174,15 @@ pub enum ClientEvent {
         /// Echoed nonce.
         nonce: u64,
     },
+    /// The reconnect driver lost the transport and is about to try again.
+    Reconnecting {
+        /// 1-based attempt counter since the drop.
+        attempt: u32,
+    },
+    /// The reconnect driver resumed the session and re-declared every live
+    /// subscription. Missed changes stream in as ordinary live patches (or a
+    /// full resync when the cursor fell out of the server's retention).
+    Reconnected,
     /// The connection closed.
     Closed,
 }
@@ -291,6 +314,126 @@ fn count_ops(changeset: &[u8]) -> u32 {
     }
 }
 
+/// DDL for the replica-local metadata: the persisted resume cursor and the
+/// pending mutation records awaiting a durable-apply acknowledgement. Both
+/// written only under capture suspension, so they never ride a mutation
+/// upload.
+const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
+    (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_pending \
+    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL)";
+
+/// Record `cursor` in the replica's metadata table. Callers wrap this in the
+/// same transaction as the patch apply it belongs to, so a crash never
+/// separates a row change from its resume point.
+fn persist_cursor(db: &mut SqliteConnection, cursor: &Cursor) -> Result<(), ClientError> {
+    diesel::sql_query(
+        "INSERT INTO _connetto_meta (id, cursor) VALUES (1, ?) \
+         ON CONFLICT (id) DO UPDATE SET cursor = excluded.cursor",
+    )
+    .bind::<diesel::sql_types::Binary, _>(cursor.as_bytes())
+    .execute(db)?;
+    Ok(())
+}
+
+/// The cursor persisted by a previous run against this replica, if any.
+fn load_cursor(db: &mut SqliteConnection) -> Option<Cursor> {
+    #[derive(diesel::QueryableByName)]
+    struct MetaRow {
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        cursor: Vec<u8>,
+    }
+    let rows: Vec<MetaRow> = diesel::sql_query("SELECT cursor FROM _connetto_meta WHERE id = 1")
+        .load(db)
+        .ok()?;
+    rows.into_iter()
+        .next()
+        .map(|row| Cursor::new(row.cursor))
+        .filter(|cursor| !cursor.is_empty())
+}
+
+/// The client sequence as the storage integer.
+fn seq_storage(seq: u64) -> Result<i64, ClientError> {
+    i64::try_from(seq).map_err(|_| ClientError::Session("sequence overflows storage".to_owned()))
+}
+
+/// Record a pushed mutation's changeset durably, so a restart can replay it
+/// until the server acknowledges the durable apply.
+fn persist_pending(
+    db: &mut SqliteConnection,
+    seq: u64,
+    changeset: &[u8],
+) -> Result<(), ClientError> {
+    diesel::sql_query("INSERT OR REPLACE INTO _connetto_pending (seq, changeset) VALUES (?, ?)")
+        .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
+        .bind::<diesel::sql_types::Binary, _>(changeset)
+        .execute(db)?;
+    Ok(())
+}
+
+/// Retire a pending mutation record: acknowledged, rejected, or rolled back.
+fn delete_pending(db: &mut SqliteConnection, seq: u64) -> Result<(), ClientError> {
+    diesel::sql_query("DELETE FROM _connetto_pending WHERE seq = ?")
+        .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
+        .execute(db)?;
+    Ok(())
+}
+
+/// The pending mutations persisted by a previous run against this replica.
+fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct PendingRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        seq: i64,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        changeset: Vec<u8>,
+    }
+    let rows: Vec<PendingRow> =
+        diesel::sql_query("SELECT seq, changeset FROM _connetto_pending ORDER BY seq").load(db)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| u64::try_from(row.seq).ok().map(|seq| (seq, row.changeset)))
+        .collect())
+}
+
+/// Run the opening handshake over `transport`: send the hello (carrying the
+/// resume cursor when one exists) and read the ack. Returns the
+/// server-assigned session id and the server's durable mutation watermark.
+/// Shared by the first connect and every resume.
+async fn exchange_handshake<T>(
+    transport: &mut T,
+    config: &ClientConfig,
+    resume: Option<&Cursor>,
+) -> Result<(String, Option<u64>), ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let mut handshake = Handshake::new(
+        PROTOCOL_VERSION,
+        config.client_id.clone(),
+        config.auth_token.clone(),
+    );
+    if let Some(cursor) = resume {
+        handshake = handshake.with_cursor(cursor.clone());
+    }
+    transport
+        .send_control(ControlMessage::Handshake(handshake))
+        .await
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    match transport
+        .recv()
+        .await
+        .map_err(|e| ClientError::Transport(e.to_string()))?
+    {
+        Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) => {
+            Ok((ack.session_id, ack.last_applied_seq))
+        }
+        Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
+        None => Err(ClientError::Protocol("connection closed before ack".into())),
+    }
+}
+
 /// Install an update hook recording the name of every table whose rows change on
 /// `conn` into the shared `changed` set. Feeds the reactivity signal that tells
 /// the app which tables to re-query.
@@ -329,6 +472,8 @@ pub struct ConnettoConnection<T: Transport> {
     /// so a server rejection can be inverted and rolled back locally. Bounded by
     /// `PENDING_CAP`.
     pending: BTreeMap<u64, Vec<u8>>,
+    /// Identity presented at handshake, kept for re-handshakes on resume.
+    config: ClientConfig,
 }
 
 impl<T> ConnettoConnection<T>
@@ -367,10 +512,15 @@ where
     /// written there and no DDL ever runs. An existing replica is reused
     /// untouched, which is the resume path.
     ///
+    /// Native only: it writes through the filesystem. On wasm, import the
+    /// template through the VFS (OPFS utilities) and use
+    /// [`connect_existing`](Self::connect_existing).
+    ///
     /// # Errors
     ///
     /// [`ClientError`] on a filesystem, database, session, transport, or
     /// handshake failure.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     pub async fn connect_with_replica_template(
         transport: T,
         db_path: &str,
@@ -381,6 +531,24 @@ where
         if !std::path::Path::new(db_path).exists() {
             std::fs::write(db_path, template).map_err(|e| ClientError::Connect(e.to_string()))?;
         }
+        Self::connect_existing(transport, db_path, config, resume).await
+    }
+
+    /// Connect to a replica that already carries its schema, executing no
+    /// DDL: a template imported through a VFS (the wasm OPFS path), a file
+    /// seeded by the native template constructor, or a previous run's replica
+    /// on reconnect.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a database, session, transport, or handshake
+    /// failure.
+    pub async fn connect_existing(
+        transport: T,
+        db_path: &str,
+        config: &ClientConfig,
+        resume: Option<Cursor>,
+    ) -> Result<Self, ClientError> {
         Self::connect_inner(transport, db_path, None, config, resume).await
     }
 
@@ -399,6 +567,13 @@ where
         if let Some(ddl) = sqlite_ddl {
             db.batch_execute(ddl)?;
         }
+        db.batch_execute(META_DDL)?;
+        // An explicit resume cursor wins. Otherwise the replica remembers
+        // its own resume point, so reopening a persisted replica (a file, an
+        // OPFS import) continues where the previous run stopped. Pending
+        // mutations persisted by a previous run come along for replay.
+        let resume = resume.or_else(|| load_cursor(&mut db));
+        let pending = load_pending(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let dirty = Arc::new(AtomicBool::new(false));
         install_change_tracker(&mut db, &changed);
@@ -416,40 +591,83 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let mut handshake = Handshake::new(
-            PROTOCOL_VERSION,
-            config.client_id.clone(),
-            config.auth_token.clone(),
-        );
-        if let Some(cursor) = resume.clone() {
-            handshake = handshake.with_cursor(cursor);
-        }
-        transport
-            .send_control(ControlMessage::Handshake(handshake))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        let session_id = match transport
-            .recv()
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?
-        {
-            Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) => ack.session_id,
-            Some(_) => return Err(ClientError::Protocol("expected handshake ack".into())),
-            None => return Err(ClientError::Protocol("connection closed before ack".into())),
-        };
+        let (session_id, watermark) =
+            exchange_handshake(&mut transport, config, resume.as_ref()).await?;
 
-        Ok(Self {
+        let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
+        let mut conn = Self {
             transport,
             session,
             db,
             last_cursor: resume,
-            next_seq: 0,
+            next_seq,
             session_id,
             dirty,
             changed,
             transaction_state: AnsiTransactionManager::default(),
-            pending: BTreeMap::new(),
-        })
+            pending,
+            config: config.clone(),
+        };
+        conn.reconcile_pending(watermark).await?;
+        Ok(conn)
+    }
+
+    /// Swap in a fresh transport after a drop: re-handshake with the highest
+    /// applied cursor and keep every piece of local state (replica, capture
+    /// session, pending mutations, sequence counter).
+    ///
+    /// The ack's durable watermark retires every pending mutation the server
+    /// already applied and the rest are replayed, so the upload path stays
+    /// exactly-once across the drop. The dirty flag is forced so writes that
+    /// were captured but never pushed re-flush. A re-declared subscription
+    /// replays what the server retained past the cursor, or full-resyncs.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a transport or handshake failure. The connection
+    /// keeps its previous (dead) transport in that case, so a caller can try
+    /// again with another one.
+    pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
+        let (session_id, watermark) =
+            exchange_handshake(&mut transport, &self.config, self.last_cursor.as_ref()).await?;
+        self.transport = transport;
+        self.session_id = session_id;
+        // Relaxed: same-task flag, no ordering dependency.
+        self.dirty.store(true, Ordering::Relaxed);
+        self.reconcile_pending(watermark).await?;
+        Ok(())
+    }
+
+    /// Bring the pending mutations in line with the server's durable
+    /// watermark after a handshake: retire everything at or below it (those
+    /// applied, so the optimistic local rows are correct), replay the rest
+    /// in order, and keep the sequence counter above every number the server
+    /// has seen. The server's watermark makes a duplicated replay idempotent.
+    async fn reconcile_pending(&mut self, watermark: Option<u64>) -> Result<(), ClientError> {
+        if let Some(watermark) = watermark {
+            let retired: Vec<u64> = self
+                .pending
+                .range(..=watermark)
+                .map(|(seq, _)| *seq)
+                .collect();
+            if !retired.is_empty() {
+                let _suspended = SuspendedCapture::new(&mut self.session);
+                for seq in retired {
+                    self.pending.remove(&seq);
+                    delete_pending(&mut self.db, seq)?;
+                }
+            }
+            self.next_seq = self.next_seq.max(watermark.saturating_add(1));
+        }
+        let replays: Vec<(u64, Vec<u8>)> = self
+            .pending
+            .iter()
+            .map(|(seq, changeset)| (*seq, changeset.clone()))
+            .collect();
+        for (seq, changeset) in replays {
+            self.send_mutation(seq, &changeset).await?;
+        }
+        Ok(())
     }
 
     /// The server-assigned session id from the handshake ack.
@@ -575,19 +793,20 @@ where
         match frame {
             None => Ok(ClientEvent::Closed),
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd)?;
+                self.apply_patch(&patch.patchset_zstd, None)?;
                 self.ack_one().await?;
                 Ok(ClientEvent::SnapshotApplied {
                     sub_id: patch.sub_id,
                 })
             }
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd)?;
+                self.apply_patch(&patch.patchset_zstd, Some(&patch.cursor))?;
                 self.last_cursor = Some(patch.cursor.clone());
                 self.ack_one().await?;
                 Ok(ClientEvent::LivePatch {
                     sub_id: patch.sub_id,
                     cursor: patch.cursor,
+                    patchset_zstd: patch.patchset_zstd.into(),
                 })
             }
             Some(IncomingFrame::Bulk(_)) => Err(ClientError::Protocol(
@@ -614,8 +833,11 @@ where
     /// Upload local writes captured since the last push as one mutation.
     ///
     /// Returns the assigned `client_seq`, or `None` when there was nothing to
-    /// send. The capture session is reset afterward so the next push sees only
-    /// subsequent writes.
+    /// send. The pending record is persisted and the capture session reset
+    /// BEFORE the frames leave, so from that point the pending table is the
+    /// single owner of this mutation: a send failure replays it on the next
+    /// resume instead of re-capturing it, and a process death replays it on
+    /// the next boot of the same replica.
     ///
     /// # Errors
     ///
@@ -628,23 +850,19 @@ where
         if changeset.is_empty() {
             return Ok(None);
         }
-        let op_count = count_ops(&changeset);
         let seq = self.next_seq;
         self.next_seq += 1;
-        let payload = zstd::encode_all(changeset.as_slice(), ZSTD_LEVEL)?;
-        self.transport
-            .send_control(ControlMessage::MutationHeader(MutationHeader::new(
-                seq, op_count,
-            )))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.transport
-            .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.pending.insert(seq, changeset);
-        if self.pending.len() > PENDING_CAP {
-            self.pending.pop_first();
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session);
+            persist_pending(&mut self.db, seq, &changeset)?;
+            // The cap is a safety valve against a server that never
+            // acknowledges: evicting a record gives up its replay.
+            if self.pending.len() >= PENDING_CAP
+                && let Some((&oldest, _)) = self.pending.first_key_value()
+            {
+                self.pending.pop_first();
+                delete_pending(&mut self.db, oldest)?;
+            }
         }
         // Reset capture: a fresh session records only writes after this push.
         let mut fresh = self
@@ -655,7 +873,28 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
         self.session = fresh;
+        self.pending.insert(seq, changeset.clone());
+        self.send_mutation(seq, &changeset).await?;
         Ok(Some(seq))
+    }
+
+    /// Send one mutation as its header and patchset frame pair. Shared by
+    /// [`push`](Self::push) and the replay in
+    /// [`reconcile_pending`](Self::reconcile_pending).
+    async fn send_mutation(&mut self, seq: u64, changeset: &[u8]) -> Result<(), ClientError> {
+        let op_count = count_ops(changeset);
+        let payload = zstd::encode_all(changeset, ZSTD_LEVEL)?;
+        self.transport
+            .send_control(ControlMessage::MutationHeader(MutationHeader::new(
+                seq, op_count,
+            )))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.transport
+            .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(())
     }
 
     /// Roll back the optimistic local write for `client_seq` after the server
@@ -672,6 +911,7 @@ where
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let _suspended = SuspendedCapture::new(&mut self.session);
+        delete_pending(&mut self.db, client_seq)?;
         self.db
             .apply_changeset(&inverse, rollback_omit)
             .map_err(|err| ClientError::Apply(err.to_string()))?;
@@ -744,7 +984,13 @@ where
                 sub_id: begin.sub_id,
             }),
             ControlMessage::SnapshotEnd(end) => {
-                self.last_cursor = Some(end.cursor);
+                // An empty cursor carries no resume information: never let
+                // it regress a real one, in memory or in the replica.
+                if !end.cursor.is_empty() {
+                    let _suspended = SuspendedCapture::new(&mut self.session);
+                    persist_cursor(&mut self.db, &end.cursor)?;
+                    self.last_cursor = Some(end.cursor);
+                }
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
             ControlMessage::AggregateUpdate(update) => Ok(ClientEvent::Aggregate {
@@ -754,6 +1000,15 @@ where
             ControlMessage::FullResyncRequired(resync) => Ok(ClientEvent::FullResync {
                 sub_id: resync.sub_id,
             }),
+            ControlMessage::MutationApplied(ack) => {
+                if self.pending.remove(&ack.client_seq).is_some() {
+                    let _suspended = SuspendedCapture::new(&mut self.session);
+                    delete_pending(&mut self.db, ack.client_seq)?;
+                }
+                Ok(ClientEvent::MutationApplied {
+                    client_seq: ack.client_seq,
+                })
+            }
             ControlMessage::MutationReject(reject) => {
                 let rows = self.rollback(reject.client_seq)?;
                 Ok(ClientEvent::MutationRejected {
@@ -779,12 +1034,26 @@ where
         }
     }
 
-    fn apply_patch(&mut self, payload_zstd: &[u8]) -> Result<(), ClientError> {
+    /// Apply one compressed server patchset to the replica, recording
+    /// `cursor` in the same transaction when one accompanies it, so a crash
+    /// never separates an applied change from its resume point. Capture is
+    /// suspended throughout: the session never records what the server
+    /// already knows.
+    fn apply_patch(
+        &mut self,
+        payload_zstd: &[u8],
+        cursor: Option<&Cursor>,
+    ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
         let _suspended = SuspendedCapture::new(&mut self.session);
-        self.db
-            .apply_patchset(&bytes, server_wins)
-            .map_err(|e| ClientError::Apply(e.to_string()))
+        self.db.transaction::<_, ClientError, _>(|conn| {
+            conn.apply_patchset(&bytes, server_wins)
+                .map_err(|e| ClientError::Apply(e.to_string()))?;
+            if let Some(cursor) = cursor {
+                persist_cursor(conn, cursor)?;
+            }
+            Ok(())
+        })
     }
 
     async fn ack_one(&mut self) -> Result<(), ClientError> {
