@@ -358,7 +358,7 @@ dependencies = [
  "connetto-server",
  "diesel",
  "diesel-sqlite-session",
- "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e)",
+ "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=d0247132b7a571f70601fb389f119863b32ba94d)",
  "serde",
  "serde_json",
  "sqlite-diff-rs",
@@ -412,7 +412,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "parking_lot",
- "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e)",
+ "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=d0247132b7a571f70601fb389f119863b32ba94d)",
  "rmp-serde",
  "serde_json",
  "sqlite-diff-rs",
@@ -663,7 +663,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 [[package]]
 name = "diesel"
 version = "2.3.11"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -722,7 +722,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -735,7 +735,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "syn 2.0.119",
 ]
@@ -1097,7 +1097,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "darling 0.23.0",
  "either",
@@ -1165,7 +1165,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2188,7 +2188,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#f122e7c25fbb46c654108a0357b1a5f70128b43e"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#d0247132b7a571f70601fb389f119863b32ba94d"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -2198,7 +2198,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e#f122e7c25fbb46c654108a0357b1a5f70128b43e"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?rev=d0247132b7a571f70601fb389f119863b32ba94d#d0247132b7a571f70601fb389f119863b32ba94d"
 dependencies = [
  "git2",
  "sql-traits",
@@ -2670,7 +2670,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3167,10 +3167,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3749,7 +3749,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -74,5 +74,6 @@ subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
 # The RLS name-mapping characterization test translates a policy-bearing
 # Postgres schema at test time and reads the logical to physical table map
-# through `translation_manifest`. Rev pinned to the manifest merge.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "f122e7c25fbb46c654108a0357b1a5f70128b43e", default-features = false, features = ["std"] }
+# through `translation_manifest`. Rev pinned to the reference-closed FK
+# validation merge (PR #46).
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }

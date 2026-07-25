@@ -276,7 +276,7 @@ dependencies = [
  "diesel-sqlite-session",
  "serde",
  "serde_json",
- "sqlite-diff-rs",
+ "sqlite-diff-rs 0.8.0",
  "sqlparser",
  "subql",
  "thiserror",
@@ -308,7 +308,7 @@ dependencies = [
  "js-sys",
  "libsqlite3-sys",
  "pg2sqlite",
- "sqlite-diff-rs",
+ "sqlite-diff-rs 0.7.1",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "thiserror",
@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.11"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -477,7 +477,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -500,7 +500,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "syn 2.0.119",
 ]
@@ -535,7 +535,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#c1aa2e9bcc15ee2518b076aa5febcd69cf94157f"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
 dependencies = [
  "darling",
  "either",
@@ -1732,6 +1732,17 @@ checksum = "d15c51e159cdbeb2398a1ab18bd977684518f77af325a7b0051356f7ee12e42d"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
+ "thiserror",
+]
+
+[[package]]
+name = "sqlite-diff-rs"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee509dca2ae4b843913bd7581916bb1f6c679ab06c068186b2c71ae1fd467037"
+dependencies = [
+ "hashbrown 0.17.1",
+ "indexmap",
  "serde",
  "serde_json",
  "thiserror",
@@ -1819,7 +1830,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=d999fbd7b70e5e33af39a59aee8398caadc31bd7#d999fbd7b70e5e33af39a59aee8398caadc31bd7"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=5858f50707995e288639a666cd301eb7b082dd65#5858f50707995e288639a666cd301eb7b082dd65"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -1838,7 +1849,7 @@ dependencies = [
  "serde_json",
  "slab",
  "sql-traits",
- "sqlite-diff-rs",
+ "sqlite-diff-rs 0.8.0",
  "sqlparser",
  "thiserror",
  "toml",
