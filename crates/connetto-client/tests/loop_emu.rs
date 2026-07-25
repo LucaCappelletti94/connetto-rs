@@ -956,6 +956,7 @@ fn aggregate_result(event: ClientEvent) -> String {
         ClientEvent::Aggregate {
             sub_id,
             result_json,
+            ..
         } => {
             assert_eq!(sub_id, "cheapest");
             result_json
@@ -1141,6 +1142,7 @@ async fn collect_aggregates(
         if let ClientEvent::Aggregate {
             sub_id,
             result_json,
+            ..
         } = event
         {
             seen.insert(sub_id, result_json);
@@ -1453,6 +1455,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
             ClientEvent::Aggregate {
                 sub_id,
                 result_json,
+                ..
             } if sub_id == "count" => {
                 count_val = Some(result_json);
             }

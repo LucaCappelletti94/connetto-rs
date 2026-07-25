@@ -86,10 +86,12 @@ impl PortTransport {
 impl Transport for PortTransport {
     type Error = PortTransportError;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
         self.send_frame(TAG_CONTROL, &encode_control(&message)?)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
         self.send_frame(TAG_BULK, &encode_bulk(&message)?)
     }
@@ -115,6 +117,7 @@ impl Transport for PortTransport {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn close(&mut self) -> Result<(), Self::Error> {
         // Best effort: the peer may already be gone.
         let _ = self.send_frame(TAG_CLOSE, &[]);

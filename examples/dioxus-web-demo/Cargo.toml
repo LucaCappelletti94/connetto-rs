@@ -1,0 +1,51 @@
+[package]
+name = "connetto-dioxus-web-demo"
+description = "Dioxus web demo of the connetto browser topology: three windows converging a synced orders list through Postgres and a device-private notes list through the DB worker."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The browser platform: transports, leader election, locks, the relay hub,
+# and the DB worker orchestration. The demo supplies its schema and baked
+# template through DbWorkerConfig.
+connetto-web = { path = "../../crates/connetto-web" }
+# The client types the window drives (connection, client, config, events).
+# Default features off: this is a wasm build with a browser transport.
+connetto-client = { path = "../../crates/connetto-client", default-features = false }
+connetto-core = { path = "../../crates/connetto-core" }
+# The one live-query hook, bound to the component lifecycle.
+connetto-dioxus = { path = "../../crates/connetto-dioxus" }
+diesel = { version = "2", features = ["sqlite"] }
+dioxus = { version = "0.7.9", features = ["web"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "console"] }
+
+# The build script translates schema.sql and frontend.sql through pg2sqlite and
+# bakes a template per tier, so the app ships every tier's schema pre-applied
+# and never executes DDL at startup. Same pipeline as the smoke crate.
+[build-dependencies]
+diesel = { version = "2", features = ["sqlite"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
+
+# Standalone workspace: a wasm app built by dx, never entering the root gate.
+[workspace]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so the demo needs the same routing or the diesel backed
+# graph will not resolve. The sources must match the root ones exactly, branch
+# refs included: a rev pinned patch would be a distinct source id, duplicating
+# crates in the graph. The demo lockfile does the pinning.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

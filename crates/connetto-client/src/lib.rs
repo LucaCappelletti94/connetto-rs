@@ -48,7 +48,7 @@ use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
 use sqlite_diff_rs::{ParsedDiffSet, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub mod dsl;
@@ -56,7 +56,10 @@ pub mod live;
 pub mod reconnect;
 
 pub use dsl::Watchable;
-pub use live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_tables};
+pub use live::{
+    ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_is_aggregate,
+    subscription_tables,
+};
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
@@ -128,12 +131,19 @@ pub enum ClientEvent {
         /// mirrors) without re-encoding.
         patchset_zstd: Arc<[u8]>,
     },
-    /// An aggregate result update.
+    /// An aggregate result update, mirroring the wire
+    /// [`AggregateUpdate`](connetto_core::messages::AggregateUpdate) field for
+    /// field so a relay can rebuild a faithful frame for a downstream tab.
     Aggregate {
         /// Subscription id.
         sub_id: String,
         /// JSON-encoded aggregate value.
         result_json: String,
+        /// Opaque group key, or `None` for a single-group aggregate.
+        group_key: Option<Vec<u8>>,
+        /// Whether this update replaces the entire result set or upserts a
+        /// single group.
+        is_full_result: bool,
     },
     /// The server requires a full resync for this subscription.
     FullResync {
@@ -529,6 +539,11 @@ pub struct ConnettoConnection<T: Transport> {
     /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl) runs. Live
     /// queries dispatch on it: a local table never reaches the wire.
     local_tables: HashSet<String>,
+    /// Lowercased tables backing each row subscription, keyed by sub id, so a
+    /// `FullResyncRequired` can drop the subscription's stale replica rows
+    /// before the fresh snapshot repopulates. Aggregate subscriptions hold no
+    /// replica rows, so they are never recorded here.
+    sub_tables: HashMap<String, HashSet<String>>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -663,6 +678,7 @@ where
             pending,
             config: config.clone(),
             local_tables: HashSet::new(),
+            sub_tables: HashMap::new(),
         };
         conn.reconcile_pending(watermark).await?;
         Ok(conn)
@@ -823,7 +839,9 @@ where
                 spec: SubscriptionSpec::new(query),
             }))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.record_row_subscription(sub_id, query);
+        Ok(())
     }
 
     /// Declare a subscription from a full [`SubscriptionSpec`], carrying the
@@ -838,13 +856,16 @@ where
         sub_id: &str,
         spec: SubscriptionSpec,
     ) -> Result<(), ClientError> {
+        let query = spec.query.clone();
         self.transport
             .send_control(ControlMessage::Subscribe(Subscribe {
                 sub_id: sub_id.to_owned(),
                 spec,
             }))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.record_row_subscription(sub_id, &query);
+        Ok(())
     }
 
     /// Cancel a subscription (row or aggregate) by its client-assigned id. The
@@ -859,7 +880,24 @@ where
                 sub_id: sub_id.to_owned(),
             }))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.sub_tables.remove(sub_id);
+        Ok(())
+    }
+
+    /// Record the lowercased replica tables a row subscription reads, so a
+    /// later `FullResyncRequired` drops its stale rows before the fresh
+    /// snapshot repopulates. Best-effort: an aggregate or an unparsable query
+    /// records nothing (and clears any prior mapping under this id), because it
+    /// holds no replica rows to reset.
+    fn record_row_subscription(&mut self, sub_id: &str, query: &str) {
+        if let Ok(false) = subscription_is_aggregate(query)
+            && let Ok(tables) = subscription_tables(query)
+        {
+            self.sub_tables.insert(sub_id.to_owned(), tables);
+        } else {
+            self.sub_tables.remove(sub_id);
+        }
     }
 
     /// Read one inbound frame, apply it if it is a patch, and report what
@@ -1112,10 +1150,15 @@ where
             ControlMessage::AggregateUpdate(update) => Ok(ClientEvent::Aggregate {
                 sub_id: update.sub_id,
                 result_json: update.result_json,
+                group_key: update.group_key,
+                is_full_result: update.is_full_result,
             }),
-            ControlMessage::FullResyncRequired(resync) => Ok(ClientEvent::FullResync {
-                sub_id: resync.sub_id,
-            }),
+            ControlMessage::FullResyncRequired(resync) => {
+                self.clear_subscription_rows(&resync.sub_id)?;
+                Ok(ClientEvent::FullResync {
+                    sub_id: resync.sub_id,
+                })
+            }
             ControlMessage::MutationApplied(ack) => {
                 if self.pending.remove(&ack.client_seq).is_some() {
                     let _suspended = SuspendedCapture::new(&mut self.session);
@@ -1148,6 +1191,28 @@ where
                 "unexpected control frame from server: {other:?}"
             ))),
         }
+    }
+
+    /// Drop every replica row of a row subscription's tables ahead of a
+    /// full-resync snapshot. The fresh snapshot carries only the currently
+    /// authorized rows, so the insert-only apply would leave rows deleted
+    /// during the outage behind. Capture is suspended so the deletes are never
+    /// re-uploaded as a local mutation. An unknown or aggregate sub id (no
+    /// recorded tables) is a no-op.
+    fn clear_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        let Some(tables) = self.sub_tables.get(sub_id).cloned() else {
+            return Ok(());
+        };
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        self.db.transaction::<_, ClientError, _>(|conn| {
+            for table in &tables {
+                // The table is chosen at runtime from the subscription's parsed
+                // query, so diesel's compile-time table DSL cannot name it: a
+                // quoted-identifier DELETE is the one raw statement here.
+                diesel::sql_query(format!("DELETE FROM \"{table}\"")).execute(conn)?;
+            }
+            Ok(())
+        })
     }
 
     /// Apply one compressed server patchset to the replica, recording

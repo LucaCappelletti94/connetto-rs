@@ -103,6 +103,21 @@ pub fn subscription_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
     Ok(parse_subscription(sql)?.tables)
 }
 
+/// Whether a rendered subscription query is answered by server-pushed
+/// aggregates rather than from the replica.
+///
+/// The same shape classification the pump uses to route a query to
+/// [`ConnettoClient::watch_value`], exposed so a relay serving the wire
+/// protocol from a worker-held connection can route a tab `Subscribe` to the
+/// aggregate path instead of a row snapshot, matching the direct client.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the SQL cannot be parsed.
+pub fn subscription_is_aggregate(sql: &str) -> Result<bool, ClientError> {
+    Ok(parse_subscription(sql)?.shape == QueryShape::Aggregate)
+}
+
 /// The scalar aggregate functions the server maintains, lowercased.
 const AGGREGATE_FUNCTIONS: &[&str] = &[
     "avg",
@@ -1100,6 +1115,7 @@ where
     let ClientEvent::Aggregate {
         sub_id,
         result_json,
+        ..
     } = event
     else {
         return;
@@ -1226,5 +1242,22 @@ mod tests {
         let grouped = parse_subscription("SELECT status, COUNT(*) FROM orders GROUP BY status")
             .expect("parse");
         assert_eq!(grouped.shape, QueryShape::Rows);
+    }
+
+    // The public aggregate-shape classifier mirrors subscription_tables: it is
+    // the relay's way to route a tab Subscribe to the aggregate path instead of
+    // a row snapshot, matching the client's own routing.
+    #[test]
+    fn subscription_is_aggregate_classifies_shape() {
+        assert!(subscription_is_aggregate("SELECT COUNT(*) FROM `orders`").expect("parse"));
+        assert!(subscription_is_aggregate("SELECT MIN(quantity) FROM orders").expect("parse"));
+        assert!(
+            !subscription_is_aggregate("SELECT * FROM orders WHERE quantity > 0").expect("parse")
+        );
+        assert!(
+            !subscription_is_aggregate("SELECT status, COUNT(*) FROM orders GROUP BY status")
+                .expect("parse")
+        );
+        assert!(subscription_is_aggregate("NOT SQL AT ALL (").is_err());
     }
 }

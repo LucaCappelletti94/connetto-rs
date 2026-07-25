@@ -1,9 +1,6 @@
 # Plan: build connetto-server (the Subscription Materializer)
 
-> Status (updated): Phases 0, 1, and 2 are landed and green. The authoritative
-> current state and the Phase 3 plan live in `docs/handoff-connetto-server-phase3.md`.
-> subql is now consumed at rev `2b90db1` (main HEAD, diesel-async shipped) and
-> sqlite-diff-rs is `0.7.0`. The strategic plan below is kept for context.
+> Status (updated): Phases 0 through 5 are landed and green, and the Phase 6 CDC-reconnect leg (resilient ingest with backoff, slot-based resume, and a reconnect observer) is landed. The authoritative current state, the remaining work, and the gotchas live in `docs/handoff-connetto-server-phase6.md`. subql is consumed at rev `f331aced` (main HEAD, catalog-only diffset apply). The strategic plan below is kept for context.
 
 ## Handoff (read this first)
 

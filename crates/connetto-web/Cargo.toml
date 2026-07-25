@@ -1,0 +1,106 @@
+[package]
+name = "connetto-web"
+description = "Browser platform for connetto-rs: a web_sys WebSocket transport, per-tab BroadcastChannel and MessagePort transports, Web Locks liveness and leader election, and the dedicated DB worker relay hub."
+categories = ["database", "wasm", "web-programming"]
+keywords = ["sync", "cdc", "sqlite", "offline", "wasm"]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", default-features = false }
+connetto-core = { path = "../connetto-core" }
+diesel = { version = "2", features = ["sqlite"] }
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# OPFS persistence: the sahpool VFS install and the template import utility.
+sqlite-wasm-vfs = "0.2"
+sqlite-wasm-rs = { version = "0.5", default-features = false }
+thiserror = "2"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "BroadcastChannel",
+    "CloseEvent",
+    "Event",
+    "ErrorEvent",
+    "Lock",
+    "LockManager",
+    "LockOptions",
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
+    "Navigator",
+    "Url",
+    "WebSocket",
+    "Window",
+    "Worker",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+    "WorkerOptions",
+    "WorkerType",
+    "console",
+] }
+# The relay builds generic snapshots with a throwaway capture session
+# (Session::diff against an attached blank schema twin) and applies forwarded
+# tab changesets to the worker replica. The dependency line mirrors
+# connetto-client's verbatim so both resolve to one git source.
+diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
+# Routing live patches by table needs the patchset parser, and snapshot
+# payloads ride the wire zstd compressed like the server's snapshot leg.
+sqlite-diff-rs = { version = "0.8.0", default-features = false }
+zstd = "0.13"
+# tokio::select! races the hub's channels against the upstream pump, and the
+# tokio mpsc channels carry frames between the hub core and its tab shovels.
+tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
+
+# Standalone workspace: a wasm-only platform crate consumed by path from the
+# smoke tests and the dioxus-web demo, never entering the root headless gate.
+[workspace]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so this crate needs the same routing or the diesel backed
+# graph will not resolve. The sources must match the root ones exactly.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
+# The same deny-level lint discipline the root workspace carries: this is
+# product code, proven by the smoke browser suite, not test scaffolding.
+[workspace.lints.rust]
+missing_docs = "forbid"
+unused_macro_rules = "forbid"
+unconditional_recursion = "forbid"
+unreachable_patterns = "forbid"
+unused_import_braces = "forbid"
+unused_must_use = "forbid"
+unsafe_code = "forbid"
+deprecated = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
+bare_urls = "forbid"
+invalid_codeblock_attributes = "forbid"
+invalid_html_tags = "forbid"
+missing_crate_level_docs = "forbid"
+unescaped_backticks = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

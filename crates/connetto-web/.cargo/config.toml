@@ -1,0 +1,5 @@
+# The Web Locks bindings in web-sys (Navigator.locks, LockManager) are still
+# cfg-gated as unstable. The dead-tab liveness reaper needs them, and this
+# flag is the documented opt-in.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

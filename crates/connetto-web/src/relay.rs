@@ -14,9 +14,11 @@
 //! every storage class survive verbatim with no per-schema code. Live
 //! patches are routed by table and forwarded at most once per tab. Tab
 //! writes are applied to the worker replica with capture active, re-uploaded
-//! by the worker connection, and an upstream rejection maps back to the
-//! owning tab's own sequence number. A tab-level protocol violation closes
-//! that tab alone, the hub and its other tabs keep running.
+//! by the worker connection, and an upstream verdict maps back to the owning
+//! tab's own sequence number: a rejection as a `MutationReject` and a
+//! conflict as a `MutationConflict`, so the tab draws the same distinction a
+//! direct client would. A tab-level protocol violation closes that tab
+//! alone, the hub and its other tabs keep running.
 //!
 //! A hub can also serve a device-local tier: tables living in their own
 //! database file, never in the worker replica or on the server. A tab
@@ -27,21 +29,45 @@
 //! touched table. A mutation spanning both tiers is rejected, because the
 //! local half could not ride the rollback of an upstream rejection.
 //!
-//! Remaining limits, lifted by later increments: aggregate subscriptions are
-//! not served, flow control credits are ignored, and an upstream conflict
-//! reaches the tab as a plain rejection, because the worker client surfaces
-//! only the sequence number of a conflicted mutation.
+//! Aggregate subscriptions are served by multiplexing a private upstream
+//! subscription onto the worker connection per tab aggregate and demuxing the
+//! server's pushes back to the owning tab, so a tab `watch_value` resolves
+//! through the hub exactly as on a direct socket.
+//!
+//! A full resync propagates too. When the upstream cannot resume a subscription
+//! incrementally it sends `FullResyncRequired` and a fresh snapshot, which the
+//! worker's own client applies after clearing its stale replica rows. Once that
+//! snapshot lands the hub fans a `FullResyncRequired` plus a fresh snapshot out
+//! to every tab subscription reading the affected tables, so a tab drops rows
+//! deleted during the outage exactly as a direct client would.
+//!
+//! Non-fatal errors stay scoped, so the relay never turns a recoverable per
+//! request failure into a teardown. A tab subscription the hub cannot serve (an
+//! unparsable or unservable query, a failed snapshot) draws a `NonFatalError`
+//! correlated to that sub id, leaving the tab and its sibling subscriptions
+//! alive, and the worker's own `NonFatal` for an aggregate or row upstream maps
+//! back to the owning tab subscriptions the same way. Only a genuine protocol
+//! violation closes a tab.
+//!
+//! Flow control matches the server: each tab has a delivery-credit window, so
+//! bulk frames (`LivePatch`, `SnapshotPatch`) queue once credits reach zero and
+//! drain on `AckCredits`. Control frames are never gated, so keepalive and
+//! acknowledgements cannot deadlock behind a full window.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
-use connetto_client::{ClientError, ClientEvent, ConnettoConnection, subscription_tables};
+use connetto_client::{
+    AffectedRow, ClientError, ClientEvent, ConnettoConnection, subscription_is_aggregate,
+    subscription_tables,
+};
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, LivePatch, MutationApplied, MutationReject,
-    MutationRejectReason, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-    SubscriptionSpec,
+    AggregateUpdate, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired,
+    HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
+    MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+    Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, SchemaVersion, Transport};
@@ -60,6 +86,12 @@ const ZSTD_LEVEL: i32 = 3;
 /// A rejection arrives well within this window, mirroring the client's own
 /// pending cap.
 const SEQ_MAP_CAP: usize = 256;
+
+/// The delivery-credit window the hub advertises and enforces per tab,
+/// matching the server's `initial_credits`. Only bulk frames (`LivePatch`,
+/// `SnapshotPatch`) consume credits; control frames are never gated, so
+/// keepalive and acknowledgements cannot deadlock behind a full window.
+const INITIAL_CREDITS: u32 = 64;
 
 /// Identifies one attached tab for the hub's lifetime.
 pub type TabId = u64;
@@ -155,6 +187,13 @@ struct TabState {
     /// Highest tab sequence applied to the local tier for this client id,
     /// the tier side sibling of `applied_watermark`.
     local_watermark: Option<u64>,
+    /// Delivery credits remaining for this tab's bulk frames. A bulk send
+    /// decrements it, an `AckCredits` frame replenishes it. Starts at
+    /// `INITIAL_CREDITS`, mirroring the server's per-session window.
+    credits: u32,
+    /// Bulk frames queued while `credits` was zero, drained in FIFO order as
+    /// credits return.
+    pending: VecDeque<BulkMessage>,
 }
 
 /// A failure inside the tab-mutation apply transaction.
@@ -187,6 +226,22 @@ const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_tab_mutations
 struct TabSub {
     sub_id: String,
     tables: HashSet<String>,
+    /// Delivery tier from the tab's Subscribe, replayed on a resync
+    /// re-snapshot so the tab's `SnapshotBegin` matches the original.
+    priority: SubscriptionPriority,
+}
+
+/// One aggregate subscription multiplexed onto the worker connection.
+///
+/// The worker replica holds only authorized rows, so a global aggregate
+/// cannot be computed from it: the hub registers a private upstream
+/// subscription on the worker connection and demultiplexes each pushed
+/// [`AggregateUpdate`] back to the owning tab under its own sub id. The spec
+/// is retained so [`hub_recover`] re-declares the upstream after a resume.
+struct AggRoute {
+    tab: TabId,
+    tab_sub: String,
+    spec: SubscriptionSpec,
 }
 
 /// The blank twin database used for generic snapshots.
@@ -220,12 +275,12 @@ impl LocalTier {
     /// [`RelayError::Replica`] when the watermark DDL or the catalog read
     /// fails.
     pub fn new(mut conn: SqliteConnection) -> Result<Self, RelayError> {
-        conn.batch_execute(LOCAL_META_DDL)?;
         #[derive(QueryableByName)]
         struct NameRow {
             #[diesel(sql_type = diesel::sql_types::Text)]
             name: String,
         }
+        conn.batch_execute(LOCAL_META_DDL)?;
         let rows: Vec<NameRow> = sql_query(
             "SELECT name FROM sqlite_schema WHERE type = 'table' \
              AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_connetto*'",
@@ -254,6 +309,19 @@ struct HubState {
     blank: BlankState,
     /// The device-local tier, when the hub serves one.
     local: Option<LocalTier>,
+    /// Aggregate subscriptions multiplexed onto the worker connection,
+    /// keyed by the private upstream sub id the hub registered
+    /// (`agg-{tab}-{sub}`). Each entry demuxes the worker's
+    /// [`AggregateUpdate`] back to the owning tab.
+    agg_routes: HashMap<String, AggRoute>,
+    /// Tables backing each row upstream subscription, keyed by the worker's
+    /// upstream sub id, from the reconnect specs. Used to fan an upstream
+    /// [`ClientEvent::FullResync`] out to the tab subscriptions reading those
+    /// tables.
+    resync_tables: HashMap<String, HashSet<String>>,
+    /// Worker upstream subs currently between an upstream `FullResync` and the
+    /// fresh snapshot's end. Their `SnapshotEnd` triggers the tab re-snapshot.
+    resyncing: HashSet<String>,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -516,6 +584,17 @@ where
         local,
         ..HubState::default()
     };
+    // Row upstream subs the hub can re-snapshot after a full resync. Aggregate
+    // upstreams hold no replica rows, so they never enter this map.
+    if let Some(driver) = reconnect.as_ref() {
+        for (sub_id, spec) in &driver.upstream {
+            if let Ok(false) = subscription_is_aggregate(&spec.query)
+                && let Ok(tables) = subscription_tables(&spec.query)
+            {
+                state.resync_tables.insert(sub_id.clone(), tables);
+            }
+        }
+    }
     loop {
         // Cancel safety: the events leg is an mpsc receive, and the worker
         // leg completes in one poll once its frame lands (browser socket
@@ -534,6 +613,8 @@ where
                         client_id: String::new(),
                         applied_watermark: None,
                         local_watermark: None,
+                        credits: INITIAL_CREDITS,
+                        pending: VecDeque::new(),
                     });
                 }
                 Some(HubEvent::Frame(id, frame)) => {
@@ -543,6 +624,19 @@ where
                 // answers the closed channel by closing the transport.
                 Some(HubEvent::Gone(id) | HubEvent::Kill(id)) => {
                     state.tabs.remove(&id);
+                    // Tear down any aggregate upstreams this tab owned, so the
+                    // server stops maintaining them and hub_recover does not
+                    // re-declare a dead route.
+                    let upstreams: Vec<String> = state
+                        .agg_routes
+                        .iter()
+                        .filter(|(_, route)| route.tab == id)
+                        .map(|(upstream_id, _)| upstream_id.clone())
+                        .collect();
+                    for upstream_id in upstreams {
+                        state.agg_routes.remove(&upstream_id);
+                        let _ = worker.unsubscribe(&upstream_id).await;
+                    }
                 }
             },
             event = worker.pump_one() => match event {
@@ -550,11 +644,11 @@ where
                     let Some(driver) = reconnect.as_mut() else {
                         break;
                     };
-                    if !hub_recover(&mut worker, driver).await {
+                    if !hub_recover(&mut worker, driver, &state.agg_routes).await {
                         break;
                     }
                 }
-                Ok(event) => handle_worker_event(&mut state, event)?,
+                Ok(event) => handle_worker_event(&mut worker, &mut state, event)?,
                 Err(err) => return Err(err.into()),
             },
         }
@@ -568,6 +662,7 @@ where
 async fn hub_recover<U, F, S>(
     worker: &mut ConnettoConnection<U>,
     driver: &mut HubReconnect<F, S>,
+    agg_routes: &HashMap<String, AggRoute>,
 ) -> bool
 where
     U: Transport + MaybeSend + 'static,
@@ -599,6 +694,21 @@ where
                 break;
             }
         }
+        // The dynamic per-tab aggregate upstreams are upstream subscriptions
+        // too, so a resume must re-declare them or a tab's LiveValue would go
+        // silent after an outage.
+        if redeclared {
+            for (upstream_id, route) in agg_routes {
+                if worker
+                    .subscribe_spec(upstream_id, route.spec.clone())
+                    .await
+                    .is_err()
+                {
+                    redeclared = false;
+                    break;
+                }
+            }
+        }
         if redeclared {
             return true;
         }
@@ -619,7 +729,9 @@ where
     U::Error: core::fmt::Display,
 {
     let outcome = match frame {
-        IncomingFrame::Control(message) => handle_tab_control(worker, state, notices, id, message),
+        IncomingFrame::Control(message) => {
+            handle_tab_control(worker, state, notices, id, message).await
+        }
         IncomingFrame::Bulk(bulk) => handle_tab_bulk(worker, state, id, bulk).await,
     };
     match outcome {
@@ -633,8 +745,130 @@ where
     }
 }
 
+/// Multiplex a tab aggregate subscription onto the worker connection.
+///
+/// The replica holds only this device's authorized rows and cannot answer a
+/// global aggregate, so the hub registers a private upstream subscription
+/// (`agg-{tab}-{sub}`) and records the route so [`handle_worker_event`]
+/// demuxes the server's pushes back to this tab. No row snapshot is served.
+async fn register_tab_aggregate<U>(
+    worker: &mut ConnettoConnection<U>,
+    agg_routes: &mut HashMap<String, AggRoute>,
+    id: TabId,
+    subscribe: Subscribe,
+) -> Result<(), TabFault>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let upstream_id = format!("agg-{id}-{}", subscribe.sub_id);
+    worker
+        .subscribe_spec(&upstream_id, subscribe.spec.clone())
+        .await
+        .map_err(RelayError::from)?;
+    agg_routes.insert(
+        upstream_id,
+        AggRoute {
+            tab: id,
+            tab_sub: subscribe.sub_id,
+            spec: subscribe.spec,
+        },
+    );
+    Ok(())
+}
+
+/// Tear down a tab's multiplexed aggregate upstream by its tab sub id, if this
+/// sub was an aggregate. A row unsubscribe finds no route and is a no-op.
+async fn drop_tab_aggregate<U>(
+    worker: &mut ConnettoConnection<U>,
+    agg_routes: &mut HashMap<String, AggRoute>,
+    id: TabId,
+    tab_sub: &str,
+) -> Result<(), TabFault>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let upstream = agg_routes
+        .iter()
+        .find(|(_, route)| route.tab == id && route.tab_sub == tab_sub)
+        .map(|(upstream_id, _)| upstream_id.clone());
+    if let Some(upstream_id) = upstream {
+        agg_routes.remove(&upstream_id);
+        worker
+            .unsubscribe(&upstream_id)
+            .await
+            .map_err(RelayError::from)?;
+    }
+    Ok(())
+}
+
+/// Serve one tab row or aggregate subscription, or scope its failure.
+///
+/// A query the hub cannot parse or serve draws a `NonFatalError` correlated to
+/// its sub id, leaving the tab and its siblings alive, mirroring the direct
+/// server. An aggregate registers a private upstream sub. A row subscription is
+/// answered from the worker replica and its tables recorded for later routing.
+async fn handle_tab_subscribe<U>(
+    worker: &mut ConnettoConnection<U>,
+    agg_routes: &mut HashMap<String, AggRoute>,
+    blank: &mut BlankState,
+    local: &mut Option<LocalTier>,
+    tab: &mut TabState,
+    id: TabId,
+    subscribe: Subscribe,
+) -> Result<(), TabFault>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match subscription_is_aggregate(&subscribe.spec.query) {
+        Err(err) => {
+            send_tab_nonfatal(
+                tab,
+                &subscribe.sub_id,
+                &format!("subscription rejected: {err}"),
+            );
+            Ok(())
+        }
+        Ok(true) => register_tab_aggregate(worker, agg_routes, id, subscribe).await,
+        Ok(false) => {
+            let tables = match subscription_tables(&subscribe.spec.query) {
+                Ok(tables) => tables,
+                Err(err) => {
+                    send_tab_nonfatal(
+                        tab,
+                        &subscribe.sub_id,
+                        &format!("subscription rejected: {err}"),
+                    );
+                    return Ok(());
+                }
+            };
+            if let Err(err) = serve_snapshot(
+                worker,
+                blank,
+                local,
+                tab,
+                &subscribe.sub_id,
+                subscribe.spec.priority,
+                &tables,
+            ) {
+                send_tab_nonfatal(tab, &subscribe.sub_id, &format!("snapshot failed: {err}"));
+                return Ok(());
+            }
+            tab.subs.retain(|sub| sub.sub_id != subscribe.sub_id);
+            tab.subs.push(TabSub {
+                sub_id: subscribe.sub_id,
+                tables,
+                priority: subscribe.spec.priority,
+            });
+            Ok(())
+        }
+    }
+}
+
 /// Handle one control frame from a tab.
-fn handle_tab_control<U>(
+async fn handle_tab_control<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     notices: &UnboundedSender<HubNotice>,
@@ -654,7 +888,7 @@ where
                 return Err(TabFault::Close("second handshake".to_owned()));
             }
             tab.handshaken = true;
-            tab.client_id = handshake.client_id.clone();
+            tab.client_id.clone_from(&handshake.client_id);
             tab.applied_watermark = tab_watermark(worker, &handshake.client_id)?;
             tab.local_watermark = match state.local.as_mut() {
                 Some(local) => local_tab_watermark(local, &handshake.client_id)?,
@@ -676,7 +910,7 @@ where
                     session_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
                     schema_version: SchemaVersion::new("relay", Vec::new()),
-                    initial_credits: 64,
+                    initial_credits: INITIAL_CREDITS,
                     last_applied_seq: last_applied,
                 },
             )));
@@ -687,26 +921,20 @@ where
             Ok(())
         }
         ControlMessage::Subscribe(subscribe) if tab.handshaken => {
-            let tables = subscription_tables(&subscribe.spec.query)
-                .map_err(|err| TabFault::Close(format!("unparsable subscription query: {err}")))?;
-            serve_snapshot(
+            handle_tab_subscribe(
                 worker,
+                &mut state.agg_routes,
                 &mut state.blank,
                 &mut state.local,
                 tab,
-                &subscribe,
-                &tables,
-            )?;
-            tab.subs.retain(|sub| sub.sub_id != subscribe.sub_id);
-            tab.subs.push(TabSub {
-                sub_id: subscribe.sub_id,
-                tables,
-            });
-            Ok(())
+                id,
+                subscribe,
+            )
+            .await
         }
         ControlMessage::Unsubscribe(unsubscribe) if tab.handshaken => {
             tab.subs.retain(|sub| sub.sub_id != unsubscribe.sub_id);
-            Ok(())
+            drop_tab_aggregate(worker, &mut state.agg_routes, id, &unsubscribe.sub_id).await
         }
         ControlMessage::Ping(ping) if tab.handshaken => {
             let _ = tab.out.send(TabOut::Control(ControlMessage::Pong(Pong {
@@ -722,9 +950,11 @@ where
             }
             Ok(())
         }
-        // Flow control is not enforced here: patches are pushed as they
-        // arrive and the credit window is ignored.
-        ControlMessage::AckCredits(_) if tab.handshaken => Ok(()),
+        ControlMessage::AckCredits(ack) if tab.handshaken => {
+            tab.credits = tab.credits.saturating_add(ack.credits);
+            flush_tab_bulk(tab);
+            Ok(())
+        }
         other => Err(TabFault::Close(format!(
             "unsupported tab frame in this increment: {other:?}"
         ))),
@@ -803,7 +1033,7 @@ where
             tab_seq,
             &changeset,
             &tables,
-            cursor,
+            &cursor,
             &patch.patchset_zstd,
         );
     }
@@ -825,7 +1055,7 @@ fn handle_local_mutation(
     tab_seq: u64,
     changeset: &[u8],
     tables: &HashSet<String>,
-    cursor: Cursor,
+    cursor: &Cursor,
     payload: &[u8],
 ) -> Result<(), TabFault> {
     let (client_id, out, watermark) = {
@@ -886,17 +1116,16 @@ fn handle_local_mutation(
             client_seq: tab_seq,
         },
     )));
-    for tab in state.tabs.values() {
+    for tab in state.tabs.values_mut() {
         let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(tables)) else {
             continue;
         };
-        let _ = tab
-            .out
-            .send(TabOut::Bulk(BulkMessage::LivePatch(LivePatch::new(
-                sub.sub_id.clone(),
-                cursor.clone(),
-                payload.to_vec(),
-            ))));
+        let msg = BulkMessage::LivePatch(LivePatch::new(
+            sub.sub_id.clone(),
+            cursor.clone(),
+            payload.to_vec(),
+        ));
+        enqueue_tab_bulk(tab, msg);
     }
     Ok(())
 }
@@ -988,7 +1217,15 @@ where
 }
 
 /// Handle one upstream event from the worker connection.
-fn handle_worker_event(state: &mut HubState, event: ClientEvent) -> Result<(), RelayError> {
+fn handle_worker_event<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    event: ClientEvent,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
     match event {
         ClientEvent::LivePatch {
             cursor,
@@ -1000,17 +1237,16 @@ fn handle_worker_event(state: &mut HubState, event: ClientEvent) -> Result<(), R
             // once per tab, under the first subscription reading a touched
             // table. The tab's own update hook refreshes every affected
             // handle.
-            for tab in state.tabs.values() {
+            for tab in state.tabs.values_mut() {
                 let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables)) else {
                     continue;
                 };
-                let _ = tab
-                    .out
-                    .send(TabOut::Bulk(BulkMessage::LivePatch(LivePatch::new(
-                        sub.sub_id.clone(),
-                        cursor.clone(),
-                        patchset_zstd.to_vec(),
-                    ))));
+                let msg = BulkMessage::LivePatch(LivePatch::new(
+                    sub.sub_id.clone(),
+                    cursor.clone(),
+                    patchset_zstd.to_vec(),
+                ));
+                enqueue_tab_bulk(tab, msg);
             }
             Ok(())
         }
@@ -1036,19 +1272,114 @@ fn handle_worker_event(state: &mut HubState, event: ClientEvent) -> Result<(), R
             client_seq,
             "the upstream server rejected the forwarded mutation",
         ),
-        ClientEvent::MutationConflict { client_seq, .. } => reject_tab_mutation(
-            state,
-            client_seq,
-            "the upstream server conflicted the forwarded mutation",
-        ),
+        ClientEvent::MutationConflict { client_seq, rows } => {
+            conflict_tab_mutation(state, client_seq, &rows)
+        }
+        ClientEvent::Aggregate {
+            sub_id,
+            result_json,
+            group_key,
+            is_full_result,
+        } => {
+            // Demux the worker's aggregate push back to the tab that owns the
+            // multiplexed upstream subscription, rebuilding a faithful
+            // AggregateUpdate under the tab's own sub id.
+            let Some(route) = state.agg_routes.get(&sub_id) else {
+                return Ok(());
+            };
+            if let Some(tab) = state.tabs.get(&route.tab) {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::AggregateUpdate(
+                        AggregateUpdate {
+                            sub_id: route.tab_sub.clone(),
+                            group_key,
+                            result_json,
+                            is_full_result,
+                        },
+                    )));
+            }
+            Ok(())
+        }
+        ClientEvent::FullResync { sub_id } => {
+            // The worker's own client clears its replica on this frame and
+            // repopulates from the fresh snapshot that follows. Defer the tab
+            // fan-out to the matching SnapshotEnd, when that replica is whole.
+            state.resyncing.insert(sub_id);
+            Ok(())
+        }
+        ClientEvent::SnapshotEnd { sub_id } => {
+            if state.resyncing.remove(&sub_id) {
+                resnapshot_after_resync(worker, state, &sub_id)?;
+            }
+            Ok(())
+        }
+        ClientEvent::NonFatal { related_to, detail } => {
+            forward_worker_nonfatal(state, related_to.as_deref(), &detail);
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Re-snapshot every tab subscription reading a table of a just-resynced
+/// upstream sub. The worker replica has already applied the fresh snapshot
+/// (its own client cleared the stale rows on `FullResyncRequired`), so each
+/// tab receives its own `FullResyncRequired` followed by a fresh snapshot: it
+/// clears its mirror and repopulates it exactly as a direct client would,
+/// dropping rows deleted during the outage.
+fn resnapshot_after_resync<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    worker_sub: &str,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(worker_tables) = state.resync_tables.get(worker_sub).cloned() else {
+        return Ok(());
+    };
+    let targets: Vec<(TabId, String, SubscriptionPriority, HashSet<String>)> = state
+        .tabs
+        .iter()
+        .flat_map(|(id, tab)| {
+            tab.subs
+                .iter()
+                .filter(|sub| !sub.tables.is_disjoint(&worker_tables))
+                .map(move |sub| (*id, sub.sub_id.clone(), sub.priority, sub.tables.clone()))
+        })
+        .collect();
+    for (tab_id, tab_sub, priority, tab_tables) in targets {
+        let Some(tab) = state.tabs.get_mut(&tab_id) else {
+            continue;
+        };
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::FullResyncRequired(
+                FullResyncRequired {
+                    sub_id: tab_sub.clone(),
+                    reason: FullResyncReason::CursorOutsideRetention,
+                },
+            )));
+        serve_snapshot(
+            worker,
+            &mut state.blank,
+            &mut state.local,
+            tab,
+            &tab_sub,
+            priority,
+            &tab_tables,
+        )?;
+    }
+    Ok(())
 }
 
 /// Map an upstream rejection back to the owning tab's sequence number.
 ///
 /// The worker client already rolled the change back out of its replica. The
 /// reject tells the tab to do the same to its mirror, so both converge.
+#[allow(clippy::unnecessary_wraps)]
 fn reject_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,
@@ -1070,6 +1401,86 @@ fn reject_tab_mutation(
     Ok(())
 }
 
+/// Map an upstream conflict back to the owning tab's sequence number, as a
+/// `MutationConflict` rather than a plain reject, so a relay tab draws the
+/// same distinction a direct client does.
+///
+/// The worker client already rolled the change back out of its replica and
+/// surfaces only the sequence number plus the locally rolled-back rows, so the
+/// server's own conflicting-row snapshot is not available to re-send. That is
+/// no fidelity loss over a direct client: `ClientEvent::MutationConflict`
+/// exposes only the sequence number and the tab's own rolled-back rows either
+/// way. The tab reconstructs those rows from its pending changeset when it
+/// decodes this frame, so the informational fields are left empty, save the
+/// table name carried by the rolled-back rows when present.
+#[allow(clippy::unnecessary_wraps)]
+fn conflict_tab_mutation(
+    state: &mut HubState,
+    worker_seq: u64,
+    rows: &[AffectedRow],
+) -> Result<(), RelayError> {
+    let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
+        return Ok(());
+    };
+    if let Some(tab) = state.tabs.get(&tab_id) {
+        let table = rows
+            .first()
+            .map(|row| row.table.clone())
+            .unwrap_or_default();
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::MutationConflict(
+                MutationConflict {
+                    client_seq: tab_seq,
+                    table,
+                    server_updated_at: String::new(),
+                    server_row_json: String::new(),
+                },
+            )));
+    }
+    Ok(())
+}
+
+/// Send a scoped non-fatal error to one tab, leaving its session and every
+/// sibling subscription intact, exactly as the direct server does for a
+/// rejected or unservable request.
+fn send_tab_nonfatal(tab: &TabState, related_to: &str, detail: &str) {
+    let _ = tab.out.send(TabOut::Control(ControlMessage::NonFatalError(
+        NonFatalError {
+            related_to: Some(related_to.to_owned()),
+            detail: detail.to_owned(),
+        },
+    )));
+}
+
+/// Forward the worker's own non-fatal error to the tab subscriptions it
+/// concerns. An aggregate upstream (`agg-{tab}-{sub}`) maps to its one owning
+/// tab subscription. A row upstream maps to every tab subscription reading one
+/// of its tables, mirroring the resync fan-out, so a rejected replica feed
+/// surfaces on each affected tab rather than vanishing. An error the hub cannot
+/// correlate to a tab is dropped.
+fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &str) {
+    let Some(upstream) = related_to else {
+        return;
+    };
+    if let Some(route) = state.agg_routes.get(upstream) {
+        if let Some(tab) = state.tabs.get(&route.tab) {
+            send_tab_nonfatal(tab, &route.tab_sub, detail);
+        }
+        return;
+    }
+    let Some(tables) = state.resync_tables.get(upstream) else {
+        return;
+    };
+    for tab in state.tabs.values() {
+        for sub in &tab.subs {
+            if !sub.tables.is_disjoint(tables) {
+                send_tab_nonfatal(tab, &sub.sub_id, detail);
+            }
+        }
+    }
+}
+
 /// Answer one tab subscription: a snapshot from the worker replica for
 /// synced tables, from the tier database for local tables, both between
 /// one begin and end pair.
@@ -1077,8 +1488,9 @@ fn serve_snapshot<U>(
     worker: &mut ConnettoConnection<U>,
     blank: &mut BlankState,
     local: &mut Option<LocalTier>,
-    tab: &TabState,
-    subscribe: &Subscribe,
+    tab: &mut TabState,
+    sub_id: &str,
+    priority: SubscriptionPriority,
     tables: &HashSet<String>,
 ) -> Result<(), RelayError>
 where
@@ -1087,8 +1499,8 @@ where
 {
     let _ = tab.out.send(TabOut::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
-            sub_id: subscribe.sub_id.clone(),
-            priority: subscribe.spec.priority,
+            sub_id: sub_id.to_owned(),
+            priority,
         },
     )));
     let local_tables: HashSet<String> = local.as_ref().map_or_else(HashSet::new, |tier| {
@@ -1097,18 +1509,18 @@ where
     let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
     if !synced.is_empty() {
         let patchset = snapshot_patchset(worker.conn(), &synced, blank)?;
-        send_snapshot_patch(tab, &subscribe.sub_id, &patchset)?;
+        send_snapshot_patch(tab, sub_id, &patchset)?;
     }
     if !local_tables.is_empty()
         && let Some(tier) = local.as_mut()
     {
         let patchset = snapshot_patchset(&mut tier.conn, &local_tables, &mut tier.blank)?;
-        send_snapshot_patch(tab, &subscribe.sub_id, &patchset)?;
+        send_snapshot_patch(tab, sub_id, &patchset)?;
     }
     let _ = tab
         .out
         .send(TabOut::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
-            sub_id: subscribe.sub_id.clone(),
+            sub_id: sub_id.to_owned(),
             cursor: relay_cursor(worker),
         })));
     Ok(())
@@ -1116,15 +1528,39 @@ where
 
 /// Compress and send one snapshot patchset toward a tab, skipping empty
 /// payloads.
-fn send_snapshot_patch(tab: &TabState, sub_id: &str, patchset: &[u8]) -> Result<(), RelayError> {
+fn send_snapshot_patch(
+    tab: &mut TabState,
+    sub_id: &str,
+    patchset: &[u8],
+) -> Result<(), RelayError> {
     if patchset.is_empty() {
         return Ok(());
     }
     let payload = zstd::encode_all(patchset, ZSTD_LEVEL)?;
-    let _ = tab.out.send(TabOut::Bulk(BulkMessage::SnapshotPatch(
-        SnapshotPatch::new(sub_id.to_owned(), payload),
-    )));
+    enqueue_tab_bulk(
+        tab,
+        BulkMessage::SnapshotPatch(SnapshotPatch::new(sub_id.to_owned(), payload)),
+    );
     Ok(())
+}
+
+/// Queue one bulk frame toward a tab under its credit window, then drain what
+/// the credits allow in FIFO order. Mirrors the server's `enqueue_and_flush`.
+fn enqueue_tab_bulk(tab: &mut TabState, msg: BulkMessage) {
+    tab.pending.push_back(msg);
+    flush_tab_bulk(tab);
+}
+
+/// Drain a tab's queued bulk frames while credits remain, one credit per
+/// frame. A dropped `out` means the tab is gone, so sends stay best effort.
+fn flush_tab_bulk(tab: &mut TabState) {
+    while tab.credits > 0 {
+        let Some(msg) = tab.pending.pop_front() else {
+            break;
+        };
+        let _ = tab.out.send(TabOut::Bulk(msg));
+        tab.credits -= 1;
+    }
 }
 
 /// Build one insert patchset holding every current row of the requested

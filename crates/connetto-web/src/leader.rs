@@ -81,15 +81,17 @@ impl Drop for Membership {
 /// Join the topology as a leadership candidate. Returns at once, the election
 /// runs in the background.
 ///
-/// `leader_lock` MUST be identical across every page of one app instance, and
-/// `glue_url` names the wasm-bindgen glue module `db-worker.js` imports (see
+/// `leader_lock` MUST be identical across every page of one app instance,
+/// `worker_url` is the served URL of the `db-worker.js` bootstrap script, and
+/// `glue_url` names the wasm-bindgen glue module that script imports (see
 /// [`spawn_db_worker`]).
 #[must_use]
-pub fn join(leader_lock: &str, glue_url: &str) -> Membership {
+pub fn join(leader_lock: &str, worker_url: &str, glue_url: &str) -> Membership {
     let resigned = Rc::new(Cell::new(false));
     let leadership = Rc::new(RefCell::new(None));
     spawn_local(run_election(
         leader_lock.to_owned(),
+        worker_url.to_owned(),
         glue_url.to_owned(),
         Rc::clone(&resigned),
         Rc::clone(&leadership),
@@ -104,6 +106,7 @@ pub fn join(leader_lock: &str, glue_url: &str) -> Membership {
 /// hand leadership to the [`Membership`].
 async fn run_election(
     leader_lock: String,
+    worker_url: String,
     glue_url: String,
     resigned: Rc<Cell<bool>>,
     leadership: Rc<RefCell<Option<Leadership>>>,
@@ -116,7 +119,7 @@ async fn run_election(
         held.release();
         return;
     }
-    match spawn_db_worker(&glue_url) {
+    match spawn_db_worker(&worker_url, &glue_url) {
         Ok(worker) => {
             log_worker_errors(&worker);
             leadership.borrow_mut().replace(Leadership { held, worker });

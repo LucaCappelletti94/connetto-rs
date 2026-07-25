@@ -341,6 +341,40 @@ Unsupported entirely: Chrome Android, WebView Android (no SharedWorker — these
 
 ---
 
+## 10 · Local-only tables
+
+Full contract with verified-facts appendix: `docs/upstream-synql-tier-generation-contract.md`.
+
+**Q10.1** ~~How does an author declare a table as local-only (device-private, never synced)?~~
+
+**Decision: by document membership, two Postgres-dialect source files.** One file per tier (`schema.sql` shared, `frontend.sql` local in the demo), bare table names, no schema prefix. The only knob is the path of the second file. Postgres dialect is kept for both documents, including the one that never touches a real Postgres, because its type system (`uuid`, `timestamptz`, `jsonb`) carries what synql needs to generate faithful Rust types.
+
+**Q10.2** ~~Where does a local-only table live in the replica?~~
+
+**Decision: a second attached SQLite file, capture session on `main` only.** The pinned diesel-sqlite-session hardcodes the session to `main`, so writes to attached tables are physically incapable of being captured, uploaded, rejected, or rolled back, which fixes the destroy-on-reject bug by placement alone. The second file ships as a second baked template (one pg2sqlite invocation per document in `build.rs`), attached via the diesel attach API with `set_attach_create_enabled(false)`. The attach name is an internal constant, never in authored SQL. No sync state lives in the frontend file, so cross-file WAL non-atomicity never spans an invariant.
+
+**Q10.3** ~~Can foreign keys or table names cross the tier boundary?~~
+
+**Decision: no, both are generation-time hard errors, defined as cross-document resolution failures.** The two documents are separate reference universes, so a `REFERENCES` crossing the boundary is a dangling reference, not a policy violation. Frontend-to-shared is enforced by sql-traits `validate_foreign_key_targets` called by pg2sqlite (see `docs/upstream-sql-traits-fk-target-validation.md`), shared-to-frontend by the real Postgres natively. Semantically correct, not just physically forced: the synced replica is a moving window, so an enforced FK from private data into it would block eviction or cascade-destroy private data. Duplicate table names across documents are also a hard error (SQLite bare-name resolution would silently shadow the frontend table), checked by synql, the only layer seeing both documents. No advisory-link metadata is generated.
+
+**Q10.4** ~~How does generation express tiers (the roadmap's cfg-features sketch)?~~
+
+**Decision: no cfg features, documents map to modules.** The cfg sketch is dead twice over: one compiled wasm binary hosts multiple tiers, and Cargo feature unification makes any gate additive across the build graph. It is also unnecessary: the server's generated schema comes from the shared document alone (existence-by-absence holds trivially), and no client code region needs table-hiding since both tiers are legitimately readable, joins included. synql emits one client crate with a module per document (`schema::shared`, `schema::local`) plus `allow_tables_to_appear_in_same_query` across the boundary, and two baked templates.
+
+**Q10.5** ~~How is writability enforced across the two "cannot write" cases?~~
+
+**Decision: two distinct mechanisms, deliberately not unified.** Local-only tables are enforced by placement (the write is welcome, there is nothing to deny). Read-only synced tables are enforced by pg2sqlite role translation: the RLS branch denies via a view without `INSTEAD OF` triggers, the non-RLS branch gets `RAISE(ABORT)` deny triggers (see `docs/upstream-pg2sqlite-readonly-deny-triggers.md`) under the contract that authoritative applies run with triggers disabled. The server catalog's `NotWritable` stays as the version-skew backstop only, never primary enforcement.
+
+**Q10.6** ~~How do live queries work over local and mixed-tier tables?~~
+
+**Decision: runtime tier dispatch, four cases.** The replica itself knows which file every table lives in, so dispatch is a lookup, no generated constants. Local rows: skip the server `Subscribe`, the existing local refresh path serves the handle. Local aggregates: transparent at the API, served by local re-execution on change (correct because a local table is complete by definition), recorded as re-executed, not incrementally maintained. Mixed rows: auto-subscribe the whole synced table per synced table in the query, tied to the handle lifetime (requirement: the synced side stays live and covering, whole-table subscribe is the disposable v1 mechanism, predicate pushdown a later refinement). Mixed aggregates: hard error at registration, rationale on record as a cost cliff, not impossibility.
+
+**Q10.7** ~~Do retention, eviction, and resume collide with the local tier?~~
+
+**Decision: no, structurally.** No `SubscriptionSpec` can ever carry a frontend table, so eviction has no path to a frontend row. The FK closure rule removes cascade paths. The resume cursor lives in `main._connetto_meta` in the same transaction as patch application, and the frontend file carries zero sync state.
+
+---
+
 ## Cross-cutting / From the Overview
 
 These were called out in the original plan as the most consequential open decisions:

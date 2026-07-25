@@ -2,8 +2,8 @@
 //! of the leader topology.
 //!
 //! Independent browsing contexts cannot exchange `MessagePort`s without a
-//! broker, which is the one irreplaceable thing a SharedWorker provides, and
-//! Chrome cannot host the DB tier in a SharedWorker (no nested workers, no
+//! broker, which is the one irreplaceable thing a `SharedWorker` provides, and
+//! Chrome cannot host the DB tier in a `SharedWorker` (no nested workers, no
 //! OPFS sync access handles there). A `BroadcastChannel` with a per-tab name
 //! is the port replacement: it reaches across unrelated same-origin contexts
 //! with in-order delivery, and with exactly one context on each end of a
@@ -138,10 +138,12 @@ impl BroadcastTransport {
 impl Transport for BroadcastTransport {
     type Error = BroadcastTransportError;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
         self.send_frame(TAG_CONTROL, &encode_control(&message)?)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
         self.send_frame(TAG_BULK, &encode_bulk(&message)?)
     }
@@ -169,6 +171,7 @@ impl Transport for BroadcastTransport {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn close(&mut self) -> Result<(), Self::Error> {
         // Best effort: the peer may already be gone.
         let _ = self.send_frame(TAG_CLOSE, &[]);

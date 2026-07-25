@@ -10,7 +10,7 @@
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{ConnettoClient, LiveHandle};
-use connetto_core::traits::Transport;
+use connetto_core::traits::{MaybeSend, Transport};
 use dioxus_core::{spawn, use_hook};
 use dioxus_hooks::use_signal;
 use dioxus_signals::{ReadSignal, WritableExt};
@@ -66,7 +66,7 @@ pub fn use_live<T, Q, R>(
     query: Q,
 ) -> UseLive<<Q::Handle as LiveHandle>::Snapshot>
 where
-    T: Transport + Send + 'static,
+    T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
     Q: Watchable<T, R> + 'static,
     Q::Handle: 'static,

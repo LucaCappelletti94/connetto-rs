@@ -11,53 +11,28 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# The browser platform crate: transports, locks, leader election, the relay
+# hub, and the DB worker orchestration. This crate is its thin consumer,
+# supplying the demo schema and the baked template through DbWorkerConfig.
+connetto-web = { path = "../../crates/connetto-web" }
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
 connetto-core = { path = "../../crates/connetto-core", features = ["loopback"] }
 diesel = { version = "2", features = ["sqlite"] }
 futures-channel = "0.3"
-futures-util = { version = "0.3", default-features = false }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# OPFS persistence: the sahpool VFS install and the template import utility.
+# The tier tests import baked templates directly through the sahpool VFS.
 sqlite-wasm-vfs = "0.2"
-thiserror = "2"
+sqlite-wasm-rs = { version = "0.5", default-features = false }
 web-sys = { version = "0.3", features = [
-    "BinaryType",
     "BroadcastChannel",
-    "CloseEvent",
-    "Event",
-    "ErrorEvent",
-    "Lock",
-    "LockManager",
-    "LockOptions",
-    "MessageChannel",
     "MessageEvent",
-    "MessagePort",
-    "Navigator",
     "Url",
-    "WebSocket",
     "Window",
     "Worker",
-    "WorkerGlobalScope",
-    "WorkerNavigator",
-    "WorkerOptions",
-    "WorkerType",
     "console",
 ] }
-sqlite-wasm-rs = { version = "0.5", default-features = false }
-# The relay builds generic snapshots with a throwaway capture session
-# (Session::diff against an attached blank schema twin) and applies forwarded
-# tab changesets to the worker replica. The dependency line mirrors
-# connetto-client's verbatim so both resolve to one git source.
-diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
-# Routing live patches by table needs the patchset parser, and snapshot
-# payloads ride the wire zstd compressed like the server's snapshot leg.
-sqlite-diff-rs = { version = "0.7.1", default-features = false }
-zstd = "0.13"
-# tokio::select! races the hub's channels against the upstream pump, and the
-# tokio mpsc channels carry frames between the hub core and its tab shovels.
-tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
 
 # The build script translates schema.sql through pg2sqlite and applies the
 # result to the replica template database shipped into the OPFS test.
@@ -68,6 +43,10 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "ee6
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# The full-resync parity test hand-builds snapshot patchsets to feed a fake
+# upstream through the relay hub, the same native encoding the wire carries.
+sqlite-diff-rs = { version = "0.8.0", default-features = false }
+zstd = "0.13"
 
 # Standalone workspace: wasm-only spike, never enters the root gate.
 [workspace]

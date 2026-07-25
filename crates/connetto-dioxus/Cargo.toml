@@ -15,13 +15,18 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-connetto-client = { path = "../connetto-client", version = "0.0.0" }
+connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false }
 connetto-core.workspace = true
 dioxus-core = "0.7.9"
 dioxus-hooks = "0.7.9"
 dioxus-signals = "0.7.9"
 
 [dev-dependencies]
+# The hook integration test drives a real native client (ConnettoClient::start
+# over a WebSocket), so the test build needs the native transport. A dev
+# dependency keeps it out of the normal graph, so wasm consumers of the adapter
+# never inherit the native runtime.
+connetto-client = { path = "../connetto-client", features = ["native-transport"] }
 connetto-server = { path = "../connetto-server" }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }

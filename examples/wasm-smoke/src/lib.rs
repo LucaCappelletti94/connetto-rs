@@ -1,205 +1,103 @@
-//! Browser WebSocket transport for the connetto client on wasm32.
+//! Browser smoke tests for the `connetto-web` platform crate.
 //!
-//! Implements [`Transport`] over `web_sys::WebSocket` with the same framing
-//! as the native transport: every message is a binary frame whose first byte
-//! is a wire tag from `connetto_core::codec`, followed by the MessagePack
-//! payload. The futures are not `Send` (they hold JS values), which is
-//! exactly what the `MaybeSend` seam in `connetto-core` exists for.
-//!
-//! The [`relay`] module builds on it: a [`RelayHub`] re-serves the wire
-//! protocol from a worker-held connection to any number of tabs, [`port`]
-//! and [`broadcast`] carry that protocol over a `MessagePort` and a named
-//! `BroadcastChannel`, [`locks`] provides Web Locks liveness for dead-tab
-//! reaping and leader election, [`workers`] holds the DB worker entry point
-//! and the page-side glue of the leader topology, and [`leader`] runs the
-//! multi-page election that decides which page owns the DB worker.
+//! The platform machinery (the WebSocket, `BroadcastChannel`, and
+//! `MessagePort` transports, Web Locks liveness, leader election, the relay
+//! hub, and the DB worker orchestration) lives in `connetto-web`. This crate
+//! supplies the demo schema constants and the baked local tier template, wraps
+//! the leader and worker-spawn entry points to load the co-located
+//! `db-worker.js`, and exposes the `db_worker_boot` wasm-bindgen entry point
+//! that the worker bootstrap calls. The `tests` directory drives the whole
+//! topology in headless Chrome against a real `connetto-server` and Postgres.
 
-pub mod broadcast;
-pub mod leader;
-pub mod locks;
-pub mod port;
-pub mod relay;
-pub mod workers;
-
-pub use broadcast::{BroadcastTransport, BroadcastTransportError};
-pub use leader::{Membership, join};
-pub use port::{PortTransport, PortTransportError};
-pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
-
-use connetto_core::codec::{
-    TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
+pub use connetto_web::{
+    BroadcastTransport, BroadcastTransportError, BrowserSocket, BrowserSocketError, HubNotice,
+    LocalTier, PortTransport, PortTransportError, RelayError, RelayHub, TabId, locks,
 };
-use connetto_core::error::CodecError;
-use connetto_core::messages::{BulkMessage, ControlMessage};
-use connetto_core::traits::{IncomingFrame, Transport};
-use futures_channel::mpsc;
-use futures_util::StreamExt;
-use js_sys::{ArrayBuffer, Uint8Array};
-use wasm_bindgen::JsCast;
-use wasm_bindgen::closure::Closure;
-use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
-/// Failure surfaced by [`BrowserSocket`].
-#[derive(Debug, thiserror::Error)]
-pub enum BrowserSocketError {
-    /// The browser WebSocket reported an error or refused the operation.
-    #[error("websocket error: {0}")]
-    Socket(String),
-    /// A frame could not be encoded or decoded.
-    #[error(transparent)]
-    Codec(#[from] CodecError),
-    /// The peer sent an empty binary frame.
-    #[error("empty frame")]
-    EmptyFrame,
-    /// The peer sent a frame with an unknown wire tag.
-    #[error("unknown frame tag {0}")]
-    UnknownTag(u8),
+/// Resolve the co-located `db-worker.js` bootstrap script beside the
+/// wasm-bindgen glue module the smoke harness serves.
+fn worker_url(glue_url: &str) -> String {
+    web_sys::Url::new_with_base("db-worker.js", glue_url)
+        .expect("resolve db-worker.js beside the glue")
+        .href()
 }
 
-/// What the JS event handlers feed into the receive queue.
-enum Inbound {
-    /// The socket finished its opening handshake.
-    Opened,
-    /// One binary frame arrived.
-    Frame(Vec<u8>),
-    /// The socket closed or errored. Carries the close reason when known.
-    Closed(Option<String>),
+/// Multi-page leader election, spawning the smoke harness's co-located worker.
+pub mod leader {
+    pub use connetto_web::leader::Membership;
+
+    /// Join the topology, spawning `db-worker.js` from beside `glue_url`.
+    #[must_use]
+    pub fn join(leader_lock: &str, glue_url: &str) -> Membership {
+        connetto_web::leader::join(leader_lock, &super::worker_url(glue_url), glue_url)
+    }
 }
 
-/// A [`Transport`] over the browser's `WebSocket`.
-///
-/// The closures stay alive as long as the socket: dropping them would
-/// unregister the JS event handlers mid-session.
-pub struct BrowserSocket {
-    ws: WebSocket,
-    inbound: mpsc::UnboundedReceiver<Inbound>,
-    _on_message: Closure<dyn FnMut(MessageEvent)>,
-    _on_open: Closure<dyn FnMut(Event)>,
-    _on_error: Closure<dyn FnMut(Event)>,
-    _on_close: Closure<dyn FnMut(CloseEvent)>,
-}
+/// DB worker glue, demo schema constants, and the baked local tier template
+/// for the smoke topology.
+pub mod workers {
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen::prelude::wasm_bindgen;
+    use web_sys::Worker;
 
-impl BrowserSocket {
-    /// Open a WebSocket to `url` and complete the opening handshake.
+    pub use connetto_web::workers::{
+        DB_ALIVE_LOCK, HELLO_CHANNEL, announce_tab, await_db_worker_ready, sleep, tab_wire_factory,
+    };
+
+    /// The demo server every smoke context connects to.
+    pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+    /// The synced replica schema: `orders` is the server-synced table.
+    pub const DEMO_SQLITE_DDL: &str =
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+    /// The mirror schema for tab clients: both tiers live in the tab's main
+    /// schema, because every relayed patch (snapshot, upstream, and local
+    /// fan-out alike) applies to main. The hub, not the tab, keeps the tiers
+    /// apart.
+    pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT; \
+         CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+    /// The local tier schema: `notes` is device-private and never synced.
+    pub const DEMO_FRONTEND_DDL: &str =
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+    /// The upstream subscription the DB worker registers.
+    pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+    /// The OPFS file holding the DB worker's durable replica.
+    pub const DB_NAME: &str = "connetto-relay.sqlite";
+    /// The OPFS file holding the DB worker's durable local tier (device-private
+    /// tables, never synced).
+    pub const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
+    /// The baked local tier template, translated from `frontend.sql` by
+    /// build.rs.
+    pub const FRONTEND_TEMPLATE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
+
+    /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
     ///
     /// # Errors
     ///
-    /// [`BrowserSocketError::Socket`] when the URL is refused or the socket
-    /// closes before it opens.
-    pub async fn connect(url: &str) -> Result<Self, BrowserSocketError> {
-        let ws =
-            WebSocket::new(url).map_err(|err| BrowserSocketError::Socket(format!("{err:?}")))?;
-        ws.set_binary_type(BinaryType::Arraybuffer);
-
-        let (tx, inbound) = mpsc::unbounded::<Inbound>();
-
-        let on_message = {
-            let tx = tx.clone();
-            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                if let Ok(buffer) = event.data().dyn_into::<ArrayBuffer>() {
-                    let bytes = Uint8Array::new(&buffer).to_vec();
-                    let _ = tx.unbounded_send(Inbound::Frame(bytes));
-                }
-            })
-        };
-        let on_open = {
-            let tx = tx.clone();
-            Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-                let _ = tx.unbounded_send(Inbound::Opened);
-            })
-        };
-        let on_error = {
-            let tx = tx.clone();
-            Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-                let _ = tx.unbounded_send(Inbound::Closed(Some("websocket error".to_owned())));
-            })
-        };
-        let on_close = {
-            let tx = tx.clone();
-            Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
-                let reason = event.reason();
-                let reason = (!reason.is_empty()).then_some(reason);
-                let _ = tx.unbounded_send(Inbound::Closed(reason));
-            })
-        };
-        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-
-        let mut socket = Self {
-            ws,
-            inbound,
-            _on_message: on_message,
-            _on_open: on_open,
-            _on_error: on_error,
-            _on_close: on_close,
-        };
-        match socket.inbound.next().await {
-            Some(Inbound::Opened) => Ok(socket),
-            Some(Inbound::Closed(reason)) => Err(BrowserSocketError::Socket(
-                reason.unwrap_or_else(|| "closed before open".to_owned()),
-            )),
-            Some(Inbound::Frame(_)) | None => Err(BrowserSocketError::Socket(
-                "socket gone before open".to_owned(),
-            )),
-        }
+    /// The `Worker` constructor's error when the worker cannot be created.
+    pub fn spawn_db_worker(glue_url: &str) -> Result<Worker, JsValue> {
+        connetto_web::workers::spawn_db_worker(&super::worker_url(glue_url), glue_url)
     }
 
-    fn send_frame(&self, tag: u8, payload: &[u8]) -> Result<(), BrowserSocketError> {
-        let mut framed = Vec::with_capacity(1 + payload.len());
-        framed.push(tag);
-        framed.extend_from_slice(payload);
-        self.ws
-            .send_with_u8_array(&framed)
-            .map_err(|err| BrowserSocketError::Socket(format!("{err:?}")))
-    }
-}
-
-impl Transport for BrowserSocket {
-    type Error = BrowserSocketError;
-
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
-        self.send_frame(TAG_CONTROL, &encode_control(&message)?)
-    }
-
-    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
-        self.send_frame(TAG_BULK, &encode_bulk(&message)?)
-    }
-
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
-        loop {
-            match self.inbound.next().await {
-                Some(Inbound::Frame(buf)) => {
-                    let (tag, payload) = buf.split_first().ok_or(BrowserSocketError::EmptyFrame)?;
-                    return match *tag {
-                        TAG_CONTROL => Ok(Some(IncomingFrame::Control(decode_control(payload)?))),
-                        TAG_BULK => Ok(Some(IncomingFrame::Bulk(decode_bulk(payload)?))),
-                        other => Err(BrowserSocketError::UnknownTag(other)),
-                    };
-                }
-                // A second Opened cannot happen, tolerate it as a no-op.
-                Some(Inbound::Opened) => {}
-                Some(Inbound::Closed(_)) | None => return Ok(None),
-            }
-        }
-    }
-
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        self.ws
-            .close_with_code(1000)
-            .map_err(|err| BrowserSocketError::Socket(format!("{err:?}")))
-    }
-}
-
-impl Drop for BrowserSocket {
-    fn drop(&mut self) {
-        // Unregister the JS handlers before the closures drop, so a late
-        // event (the server's close acknowledgement after `close`) never
-        // fires into a dropped closure. Plain setter calls, nothing panics.
-        self.ws.set_onmessage(None);
-        self.ws.set_onopen(None);
-        self.ws.set_onerror(None);
-        self.ws.set_onclose(None);
+    /// DB worker entry point: boot the connetto DB tier with the smoke config.
+    /// The `db-worker.js` bootstrap imports the crate glue and awaits this.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, upstream connect, or subscribe failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_boot() -> Result<(), JsValue> {
+        connetto_web::workers::boot_db_worker(&connetto_web::workers::DbWorkerConfig {
+            ws_url: DEMO_WS_URL,
+            replica_db_name: DB_NAME,
+            replica_ddl: DEMO_SQLITE_DDL,
+            frontend_db_name: FRONTEND_DB_NAME,
+            frontend_template: FRONTEND_TEMPLATE,
+            upstream_sub_id: "db-upstream",
+            upstream_query: DEMO_QUERY,
+            hub_meta_name: "connetto-hub-meta.sqlite",
+            client_id_prefix: "db-worker",
+        })
+        .await
     }
 }

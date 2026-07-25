@@ -1,4 +1,4 @@
-//! Entry points and page-side glue for the leader topology.
+//! DB worker orchestration and page-side glue for the leader topology.
 //!
 //! One tab wins the leader lock and spawns the dedicated DB worker, the
 //! only browsing context kind with OPFS sync access handles. The worker
@@ -20,13 +20,18 @@
 //! tab's factory finds the replacement worker through the same ready
 //! handshake. Multi-page leader election lives in [`crate::leader`]: a page
 //! that wins the leader lock spawns the worker through [`spawn_db_worker`].
+//!
+//! The application supplies the demo-specific pieces (server URL, replica
+//! and tier schema, upstream query, database names, baked tier template)
+//! through [`DbWorkerConfig`], so this crate bakes nothing application
+//! specific: the consumer's `#[wasm_bindgen]` entry point calls
+//! [`boot_db_worker`] with its own config.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use js_sys::Promise;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType};
@@ -38,33 +43,6 @@ use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::messages::SubscriptionSpec;
 use diesel::{Connection, SqliteConnection};
 
-/// The demo server every smoke context connects to.
-pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
-/// The shared tier replica schema: `orders` is the server-synced table.
-pub const DEMO_SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
-/// The mirror schema for tab clients in the relay topology: both tiers
-/// live in the tab's main schema, because every relayed patch (snapshot,
-/// upstream, and local fan-out alike) applies to main. The hub, not the
-/// tab, keeps the tiers apart.
-pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT; \
-     CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
-/// The local tier schema: `notes` is device-private and never synced.
-/// Single context tests attach it as an ephemeral in-memory tier
-/// (`attach_local_tier_ddl`). In the relay topology the DB worker imports
-/// the baked template and serves it to tabs through the hub.
-pub const DEMO_FRONTEND_DDL: &str =
-    "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
-/// The baked local tier template, translated from `frontend.sql` by build.rs.
-pub const FRONTEND_TEMPLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
-/// The upstream subscription the DB worker registers.
-pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-/// The OPFS file holding the DB worker's durable replica.
-pub const DB_NAME: &str = "connetto-relay.sqlite";
-/// The OPFS file holding the DB worker's durable local tier (device-private
-/// tables, never synced).
-pub const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The shared rendezvous channel for worker readiness and tab announcements.
 pub const HELLO_CHANNEL: &str = "connetto-hello";
 /// The web lock the DB worker holds for its whole life. Tab transports
@@ -76,22 +54,51 @@ thread_local! {
     static DB_ALIVE: RefCell<Option<locks::HeldLock>> = const { RefCell::new(None) };
 }
 
+/// The application-specific inputs [`boot_db_worker`] needs: this crate ships
+/// no demo schema, server URL, or baked template, so the consumer passes them
+/// here. The consumer's `#[wasm_bindgen] db_worker_boot` builds one of these
+/// from its own constants and awaits [`boot_db_worker`].
+pub struct DbWorkerConfig {
+    /// The server WebSocket URL the worker connects upstream to.
+    pub ws_url: &'static str,
+    /// The OPFS file holding the durable synced replica.
+    pub replica_db_name: &'static str,
+    /// The synced replica DDL, applied only on a first boot (a resumed
+    /// replica keeps its schema and its persisted cursor).
+    pub replica_ddl: &'static str,
+    /// The OPFS file holding the durable local tier (device-private tables,
+    /// never synced).
+    pub frontend_db_name: &'static str,
+    /// The baked local tier template, imported on a first boot.
+    pub frontend_template: &'static [u8],
+    /// The subscription id the worker registers upstream.
+    pub upstream_sub_id: &'static str,
+    /// The subscription query the worker registers upstream.
+    pub upstream_query: &'static str,
+    /// The attached database file holding the hub's own durable state.
+    pub hub_meta_name: &'static str,
+    /// The prefix of the worker's client id (a timestamp is appended).
+    pub client_id_prefix: &'static str,
+}
+
 /// Page side, leader only: spawn the dedicated DB worker.
 ///
-/// The worker URL resolves against the glue URL, never the page location,
-/// so it also works when a harness runs the page under a wrapper URL.
+/// `worker_url` is the served URL of the `db-worker.js` bootstrap script, and
+/// `glue_url` names the wasm-bindgen glue module that script imports. They are
+/// separate because the bootstrap script and the wasm-bindgen glue need not be
+/// co-located (a bundler may hash and relocate assets independently of the
+/// wasm output).
 ///
 /// # Errors
 ///
-/// The URL or `Worker` constructor's error when the worker cannot be
-/// created.
-pub fn spawn_db_worker(glue_url: &str) -> Result<Worker, JsValue> {
+/// The `Worker` constructor's error when the worker cannot be created.
+pub fn spawn_db_worker(worker_url: &str, glue_url: &str) -> Result<Worker, JsValue> {
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");
-    let base = web_sys::Url::new_with_base("db-worker.js", glue_url)?;
     let encoded = String::from(js_sys::encode_uri_component(glue_url));
-    Worker::new_with_options(&format!("{}?glue={encoded}", base.href()), &options)
+    let separator = if worker_url.contains('?') { '&' } else { '?' };
+    Worker::new_with_options(&format!("{worker_url}{separator}glue={encoded}"), &options)
 }
 
 /// Page side: resolve once the DB worker's intake answers on the hello
@@ -145,13 +152,14 @@ pub async fn announce_tab(wire: &str) {
 /// (resuming an existing one from its persisted cursor), connect upstream,
 /// wait for the subscription to be fully served, hold the alive lock,
 /// start the relay hub with upstream reconnect, wire dead-tab reaping, and
-/// open the hello channel intake. `db-worker.js` awaits this.
+/// open the hello channel intake. The consumer's `db-worker.js` awaits the
+/// `#[wasm_bindgen]` wrapper that calls this.
 ///
 /// # Errors
 ///
 /// A string describing the VFS, upstream connect, or subscribe failure.
-#[wasm_bindgen]
-pub async fn db_worker_boot() -> Result<(), JsValue> {
+#[allow(clippy::too_many_lines)]
+pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     let util = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
         &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
         true,
@@ -159,23 +167,34 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
     .await
     .map_err(|err| JsValue::from_str(&format!("install sahpool: {err:?}")))?;
 
-    let transport = BrowserSocket::connect(DEMO_WS_URL).await.map_err(to_js)?;
-    let config = ClientConfig {
-        client_id: format!("db-worker-{}", js_sys::Date::now()),
+    let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
+    let client_config = ClientConfig {
+        client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
         auth_token: "token".to_owned(),
     };
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from
     // the server oplog instead of re-snapshotting.
-    let existing = util.exists(DB_NAME).unwrap_or(false);
+    let existing = util.exists(config.replica_db_name).unwrap_or(false);
     let mut worker = if existing {
-        ConnettoConnection::connect_existing(transport, DB_NAME, &config, None)
-            .await
-            .map_err(to_js)?
+        ConnettoConnection::connect_existing(
+            transport,
+            config.replica_db_name,
+            &client_config,
+            None,
+        )
+        .await
+        .map_err(to_js)?
     } else {
-        ConnettoConnection::connect(transport, DB_NAME, DEMO_SQLITE_DDL, &config, None)
-            .await
-            .map_err(to_js)?
+        ConnettoConnection::connect(
+            transport,
+            config.replica_db_name,
+            config.replica_ddl,
+            &client_config,
+            None,
+        )
+        .await
+        .map_err(to_js)?
     };
     web_sys::console::log_1(
         &format!(
@@ -193,15 +212,15 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
     // IS the tier file, because a changeset apply always targets main.
     // The worker replica never contains them, so a note can never ride an
     // upstream mutation.
-    if !util.exists(FRONTEND_DB_NAME).unwrap_or(false) {
-        util.import_db(FRONTEND_DB_NAME, FRONTEND_TEMPLATE)
+    if !util.exists(config.frontend_db_name).unwrap_or(false) {
+        util.import_db(config.frontend_db_name, config.frontend_template)
             .map_err(|err| JsValue::from_str(&format!("import frontend template: {err:?}")))?;
     }
-    let frontend = SqliteConnection::establish(FRONTEND_DB_NAME)
+    let frontend = SqliteConnection::establish(config.frontend_db_name)
         .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
     let local = LocalTier::new(frontend).map_err(to_js)?;
     worker
-        .subscribe("db-upstream", DEMO_QUERY)
+        .subscribe(config.upstream_sub_id, config.upstream_query)
         .await
         .map_err(to_js)?;
     // Ping fence instead of waiting for a snapshot end: a resumed
@@ -224,18 +243,22 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
     let alive = locks::hold_lock(DB_ALIVE_LOCK).await;
     DB_ALIVE.with(|cell| cell.borrow_mut().replace(alive));
 
+    let ws_url = config.ws_url;
     let reconnect = HubReconnect {
-        factory: || async {
-            BrowserSocket::connect(DEMO_WS_URL)
+        factory: move || async move {
+            BrowserSocket::connect(ws_url)
                 .await
                 .map_err(|err| err.to_string())
         },
         sleeper: sleep,
         policy: ReconnectPolicy::default(),
-        upstream: vec![("db-upstream".to_owned(), SubscriptionSpec::new(DEMO_QUERY))],
+        upstream: vec![(
+            config.upstream_sub_id.to_owned(),
+            SubscriptionSpec::new(config.upstream_query),
+        )],
     };
     let (hub, pump, mut notices) =
-        RelayHub::with_reconnect(worker, "connetto-hub-meta.sqlite", Some(local), reconnect)
+        RelayHub::with_reconnect(worker, config.hub_meta_name, Some(local), reconnect)
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
     spawn_local(async move {
         if let Err(err) = pump.await {
