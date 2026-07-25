@@ -83,7 +83,7 @@ De-risked so far: `sqlite-wasm-rs` compiles and links SQLite 3.53 with `SQLITE_E
 ## Smaller deferred items
 
 - `watch_fn(|| build_query())` closure variant for boxed and dynamic queries, which cannot carry the compile time dispatch markers.
-- Subscription dedup by SQL hash, so identical queries from many components share one server subscription.
+- Subscription dedup by SQL hash, so identical queries from many components share one server subscription. Done: `connetto-client` collapses identical `(query, binds)` specs onto one ref-counted wire subscription in `live.rs`, with aggregate fan-out and late-joiner bootstrap caching, proven in `tests/loop_emu.rs`.
 - `LiveValue` decode support for custom user-declared aggregates beyond the built-in family.
 - The demo id scheme (pid banded integers) stands in for a real distributed key strategy, UUIDs or server issued ranges.
 - Document and configure the SQLite hardening surface on replica connections (defensive mode, `set_attach_create_enabled`, `set_attach_write_enabled`, limits). The knobs exist in the pinned diesel fork and the upstream proposal is open as `diesel-rs/diesel#5128`. A vague security guarantee on its own, so it is a deliberate documentation and configuration pass, not enforcement.

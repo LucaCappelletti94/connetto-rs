@@ -188,20 +188,20 @@ fn query_shape(query: &sqlparser::ast::Query) -> QueryShape {
     }
 }
 
-/// The wire subscriptions backing a row handle, by tier. All tables synced:
-/// the query itself rides the wire (server-side predicate pushdown). All
-/// tables local: no subscription at all. Mixed: one whole-table subscription
-/// per synced table, sorted for deterministic ids, so the synced side stays
-/// live and covering for the handle's lifetime.
+/// The wire subscription specs backing a row handle, by tier. All tables
+/// synced: the query itself rides the wire (server-side predicate pushdown).
+/// All tables local: no subscription at all. Mixed: one whole-table
+/// subscription per synced table, sorted for a deterministic order, so the
+/// synced side stays live and covering for the handle's lifetime. The caller
+/// maps each spec to a shared, ref-counted wire subscription.
 fn wire_subscriptions(
     local: &HashSet<String>,
     tables: &HashSet<String>,
-    sub_id: &str,
     query_spec: impl FnOnce() -> SubscriptionSpec,
-) -> Vec<(String, SubscriptionSpec)> {
+) -> Vec<SubscriptionSpec> {
     let local_count = tables.intersection(local).count();
     if local_count == 0 {
-        return vec![(sub_id.to_owned(), query_spec())];
+        return vec![query_spec()];
     }
     if local_count == tables.len() {
         return Vec::new();
@@ -214,13 +214,7 @@ fn wire_subscriptions(
     synced.sort_unstable();
     synced
         .into_iter()
-        .enumerate()
-        .map(|(index, table)| {
-            (
-                format!("{sub_id}-{index}"),
-                SubscriptionSpec::new(format!("SELECT * FROM \"{table}\"")),
-            )
-        })
+        .map(|table| SubscriptionSpec::new(format!("SELECT * FROM \"{table}\"")))
         .collect()
 }
 
@@ -329,35 +323,51 @@ struct Reaper {
 type Refresh<T> = Box<dyn FnMut(&mut ConnettoConnection<T>) -> Result<(), ClientError> + Send>;
 
 /// One live handle's driver-side state: which tables it reads, how to re-run
-/// its query and publish fresh results, and the wire subscriptions backing it
-/// (empty for a handle served purely from the local tier, one carrying the
-/// query itself for a synced query, one whole-table subscription per synced
-/// table for a mixed-tier query).
+/// its query and publish fresh results, and the ids of the shared wire
+/// subscriptions backing it (empty for a handle served purely from the local
+/// tier, one carrying the query itself for a synced query, one whole-table
+/// subscription per synced table for a mixed-tier query).
 struct LiveEntry<T: Transport> {
     sub_id: String,
     tables: HashSet<String>,
     refresh: Refresh<T>,
-    subs: Vec<(String, SubscriptionSpec)>,
+    wire_ids: Vec<String>,
 }
 
 /// Driver-side apply callback of one live value: decode the pushed JSON and
 /// publish it when it differs from the current value.
 type ApplyValue = Box<dyn FnMut(&str) -> Result<(), ClientError> + Send>;
 
-/// One live value handle's driver-side state, with the wire spec to
-/// re-declare it on reconnect.
+/// One live value handle's driver-side state, with the id of the shared wire
+/// subscription that feeds it (the target of aggregate pushes and what a drop
+/// releases a reference on).
 struct ValueEntry {
     sub_id: String,
+    wire_id: String,
     apply: ApplyValue,
+}
+
+/// One shared wire subscription: declared once on the wire under `wire_id`,
+/// reference counted across every row and value handle that resolved to the
+/// same `spec`. `last_agg` caches the most recent aggregate result so a
+/// late-joining value handle resolves immediately, since the server sends the
+/// bootstrap only at subscribe time.
+struct WireSub {
+    wire_id: String,
     spec: SubscriptionSpec,
+    refs: usize,
+    last_agg: Option<String>,
 }
 
 /// The connection and the live registries, guarded together so a refresh
-/// always sees the replica state the pump just produced.
+/// always sees the replica state the pump just produced. `wire` is the
+/// ref-counted layer beneath the handles: identical queries share one entry,
+/// so the client opens one wire subscription per distinct query.
 struct State<T: Transport> {
     conn: ConnettoConnection<T>,
     registry: Vec<LiveEntry<T>>,
     values: Vec<ValueEntry>,
+    wire: Vec<WireSub>,
 }
 
 /// Everything the client handles and the pump task share.
@@ -367,6 +377,8 @@ struct Shared<T: Transport> {
     reaper: Arc<Reaper>,
     events: broadcast::Sender<ClientEvent>,
     next_live: AtomicU64,
+    // Distinct id spaces: handle ids (`live-N`) and shared wire ids (`wire-N`).
+    next_wire: AtomicU64,
 }
 
 /// The shared surface of every live handle: a current snapshot, an awaitable
@@ -656,6 +668,7 @@ where
                 conn,
                 registry: Vec::new(),
                 values: Vec::new(),
+                wire: Vec::new(),
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -664,6 +677,7 @@ where
             }),
             events,
             next_live: AtomicU64::new(1),
+            next_wire: AtomicU64::new(1),
         });
         let token = Arc::new(ClientToken { wake });
         let driver = pump(Arc::clone(&shared), Arc::downgrade(&token), reconnect);
@@ -734,17 +748,19 @@ where
         // handle: the requirement is that the synced side stays live and
         // covering while the handle exists, and whole-table subscribe is the
         // disposable v1 mechanism (predicate pushdown is a later refinement).
-        let subs = wire_subscriptions(state.conn.local_tables(), &tables, &sub_id, || {
+        let specs = wire_subscriptions(state.conn.local_tables(), &tables, || {
             SubscriptionSpec::new(sql).with_binds(binds)
         });
-        for (wire_id, spec) in &subs {
-            state.conn.subscribe_spec(wire_id, spec.clone()).await?;
+        let mut wire_ids = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec).await?;
+            wire_ids.push(wire_id);
         }
         state.registry.push(LiveEntry {
             sub_id: sub_id.clone(),
             tables,
             refresh,
-            subs,
+            wire_ids,
         });
 
         Ok(LiveQuery {
@@ -860,7 +876,7 @@ where
                 sub_id: sub_id.clone(),
                 tables: parsed.tables,
                 refresh,
-                subs: Vec::new(),
+                wire_ids: Vec::new(),
             });
             return Ok(LiveValue {
                 sub_id,
@@ -871,11 +887,22 @@ where
         }
 
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
-        state.conn.subscribe_spec(&sub_id, spec.clone()).await?;
+        let (wire_id, cached) = attach_wire(&mut state, &self.shared.next_wire, spec).await?;
+        if let Some(json) = cached {
+            // Late joiner: the server sends the bootstrap only at the first
+            // subscribe, so resolve from the cached last result now. Set the
+            // slot directly, without a generation bump, so the first changed()
+            // still waits for a real change (like a bootstrap).
+            let bootstrap = decode(&json)?;
+            match value.write() {
+                Ok(mut slot) => *slot = Some(bootstrap),
+                Err(poisoned) => *poisoned.into_inner() = Some(bootstrap),
+            }
+        }
         state.values.push(ValueEntry {
             sub_id: sub_id.clone(),
+            wire_id,
             apply,
-            spec,
         });
 
         Ok(LiveValue {
@@ -954,6 +981,46 @@ fn is_disconnect(err: &ClientError) -> bool {
     matches!(err, ClientError::Transport(_))
 }
 
+/// Decrement one reference on the wire subscription `wire_id`. When the last
+/// sharer drops, remove the entry and record its id for a single Unsubscribe.
+fn release_wire(wire: &mut Vec<WireSub>, wire_id: &str, released: &mut Vec<String>) {
+    if let Some(pos) = wire.iter().position(|w| w.wire_id == wire_id) {
+        wire[pos].refs -= 1;
+        if wire[pos].refs == 0 {
+            released.push(wire.remove(pos).wire_id);
+        }
+    }
+}
+
+/// Attach a handle to the wire subscription for `spec`, sharing an existing
+/// one (increment its ref count) or declaring a new one (subscribe once, ref
+/// count 1). Returns the wire id and, for an aggregate handle joining an
+/// existing sub, the cached last aggregate result to resolve from at once.
+async fn attach_wire<T>(
+    state: &mut State<T>,
+    next_wire: &AtomicU64,
+    spec: SubscriptionSpec,
+) -> Result<(String, Option<String>), ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    if let Some(existing) = state.wire.iter_mut().find(|w| w.spec == spec) {
+        existing.refs += 1;
+        return Ok((existing.wire_id.clone(), existing.last_agg.clone()));
+    }
+    let seq = next_wire.fetch_add(1, Ordering::Relaxed);
+    let wire_id = format!("wire-{seq}");
+    state.conn.subscribe_spec(&wire_id, spec.clone()).await?;
+    state.wire.push(WireSub {
+        wire_id: wire_id.clone(),
+        spec,
+        refs: 1,
+        last_agg: None,
+    });
+    Ok((wire_id, None))
+}
+
 /// Drain the reaper queue: remove each dropped handle's driver-side entry,
 /// then cancel the wire subscriptions that backed it. A local tier handle has
 /// none, so its retirement is purely local. Entries are removed before any
@@ -970,18 +1037,20 @@ where
         };
         core::mem::take(&mut *queue)
     };
-    let mut wire_ids: Vec<String> = Vec::new();
+    let mut released: Vec<String> = Vec::new();
     for sub_id in pending {
         if let Some(pos) = state.registry.iter().position(|e| e.sub_id == sub_id) {
             let entry = state.registry.remove(pos);
-            wire_ids.extend(entry.subs.into_iter().map(|(wire_id, _)| wire_id));
+            for wire_id in entry.wire_ids {
+                release_wire(&mut state.wire, &wire_id, &mut released);
+            }
         }
         if let Some(pos) = state.values.iter().position(|e| e.sub_id == sub_id) {
-            state.values.remove(pos);
-            wire_ids.push(sub_id);
+            let entry = state.values.remove(pos);
+            release_wire(&mut state.wire, &entry.wire_id, &mut released);
         }
     }
-    for wire_id in wire_ids {
+    for wire_id in released {
         state.conn.unsubscribe(&wire_id).await?;
     }
     Ok(())
@@ -1090,6 +1159,7 @@ async fn pump<T, F, S>(
                 conn,
                 registry,
                 values: _,
+                wire: _,
             } = &mut *state;
             for entry in registry.iter_mut() {
                 if entry.tables.is_disjoint(&changed) {
@@ -1120,16 +1190,20 @@ where
     else {
         return;
     };
-    let outcome = state
-        .values
-        .iter_mut()
-        .find(|entry| entry.sub_id == *sub_id)
-        .map(|entry| (entry.apply)(result_json));
-    if let Some(Err(err)) = outcome {
-        let _ = shared.events.send(ClientEvent::NonFatal {
-            related_to: Some(sub_id.clone()),
-            detail: format!("live value update failed: {err}"),
-        });
+    // Cache the last result on the wire sub so a value handle joining later
+    // resolves immediately, since the server pushes the bootstrap only once.
+    if let Some(wire) = state.wire.iter_mut().find(|w| w.wire_id == *sub_id) {
+        wire.last_agg = Some(result_json.clone());
+    }
+    // Fan out to every value handle sharing this wire sub, each with its own
+    // decoder and typed value, not just the first.
+    for entry in state.values.iter_mut().filter(|e| e.wire_id == *sub_id) {
+        if let Err(err) = (entry.apply)(result_json) {
+            let _ = shared.events.send(ClientEvent::NonFatal {
+                related_to: Some(entry.sub_id.clone()),
+                detail: format!("live value update failed: {err}"),
+            });
+        }
     }
 }
 
@@ -1170,15 +1244,9 @@ where
         // handles. A send failure here means the fresh transport died
         // already: try again from the top.
         let specs: Vec<(String, SubscriptionSpec)> = state
-            .registry
+            .wire
             .iter()
-            .flat_map(|entry| entry.subs.iter().cloned())
-            .chain(
-                state
-                    .values
-                    .iter()
-                    .map(|entry| (entry.sub_id.clone(), entry.spec.clone())),
-            )
+            .map(|wire| (wire.wire_id.clone(), wire.spec.clone()))
             .collect();
         let mut redeclared = true;
         for (sub_id, spec) in specs {

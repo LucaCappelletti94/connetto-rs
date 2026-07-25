@@ -14,7 +14,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use connetto_client::{
@@ -40,6 +40,28 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
+/// The one-row `orders` seed snapshot both snapshot sources serve, so a
+/// recording source and the plain seed stay byte-identical.
+fn seed_snapshot() -> Snapshot {
+    let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+    let insert = Insert::<_, String, Vec<u8>>::from(table)
+        .set(0, Value::Integer(1))
+        .expect("set id")
+        .set(1, Value::Real(1.0))
+        .expect("set price")
+        .set(2, Value::Integer(3))
+        .expect("set quantity")
+        .set(3, Value::Text("seed".to_owned()))
+        .expect("set status");
+    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(insert)
+        .build();
+    Snapshot {
+        patchset,
+        cursor: Cursor::new(Vec::new()),
+    }
+}
+
 /// A snapshot source returning one seed row, standing in for the rows a real
 /// Connector would read from Postgres at snapshot time.
 struct SeedSnapshot;
@@ -54,23 +76,32 @@ impl SnapshotSource for SeedSnapshot {
         _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::AuthContext,
     ) -> Result<Snapshot, Self::Error> {
-        let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Integer(1))
-            .expect("set id")
-            .set(1, Value::Real(1.0))
-            .expect("set price")
-            .set(2, Value::Integer(3))
-            .expect("set quantity")
-            .set(3, Value::Text("seed".to_owned()))
-            .expect("set status");
-        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
-            .insert(insert)
-            .build();
-        Ok(Snapshot {
-            patchset,
-            cursor: Cursor::new(Vec::new()),
-        })
+        Ok(seed_snapshot())
+    }
+}
+
+/// A snapshot source that serves the one-row seed and records every
+/// subscription's `select_sql`, so a test can count how many distinct wire
+/// subscriptions actually reached the server.
+#[derive(Clone)]
+struct RecordingSeed {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl SnapshotSource for RecordingSeed {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(select_sql.to_owned());
+        }
+        Ok(seed_snapshot())
     }
 }
 
@@ -1118,10 +1149,11 @@ async fn unsupported_subscription_is_rejected_without_closing() {
 
 /// Drive the emulator to completion, dispatching every produced CDC event
 /// through the manager so delta aggregates fold in-process.
-async fn drain_events<C, O>(
-    manager: &SessionManager<SeedSnapshot, PermissiveAuth, C, O>,
+async fn drain_events<S, C, O>(
+    manager: &SessionManager<S, PermissiveAuth, C, O>,
     source: &mut PgSqliteEmuSource,
 ) where
+    S: SnapshotSource,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
@@ -1800,6 +1832,361 @@ async fn live_value_tracks_a_server_aggregate() {
     assert!(
         !saw_aggregate,
         "no aggregate push may arrive after the unsubscribe",
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_row_watches_share_one_subscription() {
+    // Two components rendering the same query must collapse to ONE wire
+    // subscription. The recording snapshot source counts how many subscribes
+    // reached the server, and both handles must follow a CDC patch, survive
+    // one drop, and unsubscribe only when the last sharer is gone.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let manager = SessionManager::new(
+        materializer,
+        RecordingSeed {
+            seen: Arc::clone(&seen),
+        },
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    let build = || {
+        orders::table
+            .filter(orders::quantity.gt(0))
+            .order(orders::id)
+    };
+    let mut live_a: LiveQuery<Order> = build().live(&client).await.expect("watch a");
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), live_a.changed()) => {
+            changed.expect("snapshot refresh timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(live_a.rows(), vec![order(1, 1.0, 3, "seed")]);
+
+    // The second identical watch shares the wire sub: no new subscribe, and it
+    // reads its initial rows from the replica the first subscription filled.
+    let mut live_b: LiveQuery<Order> = build().live(&client).await.expect("watch b");
+    assert_eq!(
+        live_b.rows(),
+        vec![order(1, 1.0, 3, "seed")],
+        "the late handle reads the shared replica",
+    );
+
+    // Fence: any subscribe sent before the ping is processed before the pong.
+    client.ping(1).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 1 })).await;
+    assert_eq!(
+        seen.lock().expect("seen poisoned").len(),
+        1,
+        "two identical watches collapse to one wire subscription",
+    );
+
+    // A CDC insert fans one shared patch out to both handles.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), live_a.changed())
+        .await
+        .expect("live a refresh timed out")
+        .expect("driver alive");
+    tokio::time::timeout(Duration::from_secs(5), live_b.changed())
+        .await
+        .expect("live b refresh timed out")
+        .expect("driver alive");
+    let both = vec![order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")];
+    assert_eq!(live_a.rows(), both);
+    assert_eq!(live_b.rows(), both);
+
+    // Dropping one sharer keeps the shared sub live for the other.
+    drop(live_a);
+    client.ping(2).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 2 })).await;
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (3, 3.0, 9, 'more')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), live_b.changed())
+        .await
+        .expect("survivor refresh timed out")
+        .expect("driver alive");
+    assert_eq!(
+        live_b.rows().len(),
+        3,
+        "the survivor keeps following the sub"
+    );
+
+    // Dropping the last sharer sends the one Unsubscribe: no further patch may
+    // reach the replica.
+    drop(live_b);
+    client.ping(3).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 3 })).await;
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (4, 4.0, 1, 'gone')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    client.ping(4).await.expect("ping");
+    let mut saw_patch = false;
+    loop {
+        let event = wait_broadcast(&mut events, |e| {
+            matches!(
+                e,
+                ClientEvent::Pong { .. }
+                    | ClientEvent::LivePatch { .. }
+                    | ClientEvent::SnapshotApplied { .. }
+            )
+        })
+        .await;
+        match event {
+            ClientEvent::Pong { nonce: 4 } => break,
+            ClientEvent::LivePatch { .. } | ClientEvent::SnapshotApplied { .. } => saw_patch = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_patch,
+        "no patch may arrive after the last sharer drops"
+    );
+    let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
+    assert_eq!(replica_rows, 3, "the replica never saw the fourth insert");
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_row_queries_do_not_collapse() {
+    // Dedup must key on the query: two different predicates each open their own
+    // wire subscription, so the recorder sees two distinct select_sql.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let manager = SessionManager::new(
+        materializer,
+        RecordingSeed {
+            seen: Arc::clone(&seen),
+        },
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    let mut live_a: LiveQuery<Order> = orders::table
+        .filter(orders::quantity.gt(0))
+        .order(orders::id)
+        .live(&client)
+        .await
+        .expect("watch a");
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), live_a.changed()) => {
+            changed.expect("snapshot refresh timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("subscription rejected: {rejected:?}");
+        }
+    }
+
+    // A distinct bind value: same SQL skeleton, different spec. Its own
+    // subscribe reaches the server, proving the dedup key includes the binds.
+    let _live_b: LiveQuery<Order> = orders::table
+        .filter(orders::quantity.gt(5))
+        .order(orders::id)
+        .live(&client)
+        .await
+        .expect("watch b");
+    client.ping(1).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 1 })).await;
+
+    let recorded = seen.lock().expect("seen poisoned").clone();
+    // The two specs share a SQL skeleton and differ only in the placeholder
+    // bind, so two subscribes prove dedup keys on the full spec, not the SQL
+    // text alone.
+    assert_eq!(
+        recorded.len(),
+        2,
+        "distinct queries each open their own subscription",
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cache() {
+    // Two identical aggregate watches share one wire sub. The connector holds
+    // exactly one bootstrap seed, so a second independent subscribe would
+    // starve it: the late joiner instead resolves immediately from the cached
+    // last value, and both handles fold a CDC update.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    let mut count_a = orders::table.count().live(&client).await.expect("live a");
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), count_a.changed()) => {
+            changed.expect("bootstrap timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("aggregate subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(
+        count_a.value(),
+        Some(1),
+        "the bootstrap value is the server's"
+    );
+
+    // The second identical watch_value shares the wire sub and resolves at once
+    // from the cached bootstrap, without a second server subscribe (which would
+    // starve the connector's single seed).
+    let mut count_b = orders::table.count().live(&client).await.expect("live b");
+    assert_eq!(
+        count_b.value(),
+        Some(1),
+        "the late joiner resolves from the cached bootstrap",
+    );
+    client.ping(1).await.expect("ping");
+    loop {
+        let event = wait_broadcast(&mut events, |e| {
+            matches!(e, ClientEvent::Pong { .. } | ClientEvent::NonFatal { .. })
+        })
+        .await;
+        if let ClientEvent::NonFatal { .. } = event {
+            panic!("a shared value watch must not trigger a second subscribe: {event:?}");
+        }
+        if matches!(event, ClientEvent::Pong { nonce: 1 }) {
+            break;
+        }
+    }
+
+    // A CDC insert folds once server-side and fans to both handles.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), count_a.changed())
+        .await
+        .expect("count a fold timed out")
+        .expect("driver alive");
+    tokio::time::timeout(Duration::from_secs(5), count_b.changed())
+        .await
+        .expect("count b fold timed out")
+        .expect("driver alive");
+    assert_eq!(count_a.value(), Some(2));
+    assert_eq!(count_b.value(), Some(2));
+
+    // Dropping one sharer keeps the shared sub live for the other.
+    drop(count_a);
+    client.ping(2).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 2 })).await;
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (3, 3.0, 9, 'more')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), count_b.changed())
+        .await
+        .expect("survivor fold timed out")
+        .expect("driver alive");
+    assert_eq!(count_b.value(), Some(3), "the survivor keeps folding");
+
+    // Dropping the last sharer unsubscribes: no aggregate push may follow.
+    drop(count_b);
+    client.ping(3).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 3 })).await;
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (4, 4.0, 1, 'gone')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    client.ping(4).await.expect("ping");
+    let mut saw_aggregate = false;
+    loop {
+        let event = wait_broadcast(&mut events, |e| {
+            matches!(e, ClientEvent::Pong { .. } | ClientEvent::Aggregate { .. })
+        })
+        .await;
+        match event {
+            ClientEvent::Pong { nonce: 4 } => break,
+            ClientEvent::Aggregate { .. } => saw_aggregate = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_aggregate,
+        "no aggregate push may arrive after the last sharer drops",
     );
 
     drop(client);
