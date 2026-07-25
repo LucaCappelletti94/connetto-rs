@@ -323,6 +323,56 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
     (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL)";
 
+/// The attach name of the local tier database. An internal constant: authored
+/// SQL never names it, since bare table names resolve across attached
+/// databases and duplicate names across tiers are a generation-time error.
+const LOCAL_SCHEMA: &str = "connetto_local";
+
+/// A table name row from an attached schema's catalog.
+#[derive(diesel::QueryableByName)]
+struct SchemaTableRow {
+    /// The table name.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
+/// The lowercased names of every table in the attached local tier.
+fn local_tier_tables(db: &mut SqliteConnection) -> Result<HashSet<String>, ClientError> {
+    let rows: Vec<SchemaTableRow> = diesel::sql_query(format!(
+        "SELECT name FROM {LOCAL_SCHEMA}.sqlite_schema WHERE type = 'table'"
+    ))
+    .load(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.name.to_lowercase())
+        .collect())
+}
+
+/// `s` without `prefix`, matched case-insensitively, or `None`. Byte-indexed
+/// through `get` so a multibyte character at the boundary cannot panic.
+fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
+}
+
+/// Requalify one `CREATE TABLE` statement into the local tier schema, so an
+/// unqualified DDL document lands in the attached database instead of `main`.
+fn qualify_create_table(statement: &str) -> Result<String, ClientError> {
+    let rest = strip_ci(statement, "CREATE TABLE").ok_or_else(|| {
+        ClientError::Session(format!(
+            "local tier DDL supports only CREATE TABLE statements, got: {statement}"
+        ))
+    })?;
+    let (if_not_exists, name_part) = match strip_ci(rest.trim_start(), "IF NOT EXISTS") {
+        Some(after) => ("IF NOT EXISTS ", after.trim_start()),
+        None => ("", rest.trim_start()),
+    };
+    Ok(format!(
+        "CREATE TABLE {if_not_exists}{LOCAL_SCHEMA}.{name_part}"
+    ))
+}
+
 /// Record `cursor` in the replica's metadata table. Callers wrap this in the
 /// same transaction as the patch apply it belongs to, so a crash never
 /// separates a row change from its resume point.
@@ -474,6 +524,11 @@ pub struct ConnettoConnection<T: Transport> {
     pending: BTreeMap<u64, Vec<u8>>,
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
+    /// Lowercased names of the tables in the attached local tier, empty until
+    /// [`attach_local_tier`](Self::attach_local_tier) or
+    /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl) runs. Live
+    /// queries dispatch on it: a local table never reaches the wire.
+    local_tables: HashSet<String>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -607,6 +662,7 @@ where
             transaction_state: AnsiTransactionManager::default(),
             pending,
             config: config.clone(),
+            local_tables: HashSet::new(),
         };
         conn.reconcile_pending(watermark).await?;
         Ok(conn)
@@ -686,6 +742,66 @@ where
     #[must_use]
     pub const fn cursor(&self) -> Option<&Cursor> {
         self.last_cursor.as_ref()
+    }
+
+    /// Attach the local tier database at `path`: device-private tables that
+    /// never sync. The capture session is bound to `main`, so writes to these
+    /// tables are physically incapable of being uploaded, rejected, or rolled
+    /// back, and live queries over them are served locally without a server
+    /// subscription.
+    ///
+    /// The file must already exist (a baked template written by the app or
+    /// imported through the VFS): attach-create is disabled around the
+    /// attach, so a missing file fails loudly instead of materializing as an
+    /// empty database. Attach before creating live queries, since tier
+    /// dispatch happens at registration.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Db`] when the file is missing, is not a database, or a
+    /// tier is already attached.
+    pub fn attach_local_tier(&mut self, path: &str) -> Result<(), ClientError> {
+        let create_was_enabled = self.db.is_attach_create_enabled()?;
+        if create_was_enabled {
+            self.db.set_attach_create_enabled(false)?;
+        }
+        let attached = self.db.attach_database(path, LOCAL_SCHEMA);
+        if create_was_enabled {
+            self.db.set_attach_create_enabled(true)?;
+        }
+        attached?;
+        self.local_tables = local_tier_tables(&mut self.db)?;
+        Ok(())
+    }
+
+    /// Attach an ephemeral in-memory local tier and create its schema from
+    /// `ddl`, for replicas that are themselves ephemeral (a tab's `:memory:`
+    /// mirror, tests). The durable flavor is
+    /// [`attach_local_tier`](Self::attach_local_tier).
+    ///
+    /// `ddl` must consist of `CREATE TABLE` statements only: each is
+    /// requalified into the attached schema, since an unqualified `CREATE
+    /// TABLE` would land in `main` and sync.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] on a non-`CREATE TABLE` statement,
+    /// [`ClientError::Db`] when a statement fails or a tier is already
+    /// attached.
+    pub fn attach_local_tier_ddl(&mut self, ddl: &str) -> Result<(), ClientError> {
+        self.db.attach_database(":memory:", LOCAL_SCHEMA)?;
+        for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            self.db.batch_execute(&qualify_create_table(statement)?)?;
+        }
+        self.local_tables = local_tier_tables(&mut self.db)?;
+        Ok(())
+    }
+
+    /// The lowercased names of the tables in the attached local tier, empty
+    /// when no tier is attached.
+    #[must_use]
+    pub const fn local_tables(&self) -> &HashSet<String> {
+        &self.local_tables
     }
 
     /// Declare a subscription from a SQLite-dialect `SELECT`, the same dialect

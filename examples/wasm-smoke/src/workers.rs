@@ -2,8 +2,9 @@
 //!
 //! One tab wins the leader lock and spawns the dedicated DB worker, the
 //! only browsing context kind with OPFS sync access handles. The worker
-//! owns the durable replica (sahpool), the server connection, and the relay
-//! hub, and reaps dead tabs through their liveness locks. Every tab,
+//! owns the durable replica and the local tier file (sahpool), the server
+//! connection, and the relay hub, and reaps dead tabs through their
+//! liveness locks. Every tab,
 //! leader included, speaks the wire protocol to it over its own uniquely
 //! named `BroadcastChannel`, which crosses unrelated same-origin contexts
 //! with no broker.
@@ -30,23 +31,40 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType};
 
-use crate::relay::HubReconnect;
+use crate::relay::{HubReconnect, LocalTier};
 use crate::{BroadcastTransport, BrowserSocket, HubNotice, RelayHub, locks};
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::messages::SubscriptionSpec;
+use diesel::{Connection, SqliteConnection};
 
 /// The demo server every smoke context connects to.
 pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
-/// The replica schema: `orders` is the server-synced table, `notes` exists
-/// only in the replica tiers.
-pub const DEMO_SQLITE_DDL: &str = "\
-CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;\
-CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+/// The shared tier replica schema: `orders` is the server-synced table.
+pub const DEMO_SQLITE_DDL: &str =
+    "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+/// The mirror schema for tab clients in the relay topology: both tiers
+/// live in the tab's main schema, because every relayed patch (snapshot,
+/// upstream, and local fan-out alike) applies to main. The hub, not the
+/// tab, keeps the tiers apart.
+pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT; \
+     CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+/// The local tier schema: `notes` is device-private and never synced.
+/// Single context tests attach it as an ephemeral in-memory tier
+/// (`attach_local_tier_ddl`). In the relay topology the DB worker imports
+/// the baked template and serves it to tabs through the hub.
+pub const DEMO_FRONTEND_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+/// The baked local tier template, translated from `frontend.sql` by build.rs.
+pub const FRONTEND_TEMPLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
 /// The upstream subscription the DB worker registers.
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The OPFS file holding the DB worker's durable replica.
 pub const DB_NAME: &str = "connetto-relay.sqlite";
+/// The OPFS file holding the DB worker's durable local tier (device-private
+/// tables, never synced).
+pub const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The shared rendezvous channel for worker readiness and tab announcements.
 pub const HELLO_CHANNEL: &str = "connetto-hello";
 /// The web lock the DB worker holds for its whole life. Tab transports
@@ -170,6 +188,18 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
         )
         .into(),
     );
+    // The local tier: first boot imports the baked frontend template. The
+    // hub serves these tables from a second connection whose main schema
+    // IS the tier file, because a changeset apply always targets main.
+    // The worker replica never contains them, so a note can never ride an
+    // upstream mutation.
+    if !util.exists(FRONTEND_DB_NAME).unwrap_or(false) {
+        util.import_db(FRONTEND_DB_NAME, FRONTEND_TEMPLATE)
+            .map_err(|err| JsValue::from_str(&format!("import frontend template: {err:?}")))?;
+    }
+    let frontend = SqliteConnection::establish(FRONTEND_DB_NAME)
+        .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
+    let local = LocalTier::new(frontend).map_err(to_js)?;
     worker
         .subscribe("db-upstream", DEMO_QUERY)
         .await
@@ -205,7 +235,7 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
         upstream: vec![("db-upstream".to_owned(), SubscriptionSpec::new(DEMO_QUERY))],
     };
     let (hub, pump, mut notices) =
-        RelayHub::with_reconnect(worker, "connetto-hub-meta.sqlite", reconnect)
+        RelayHub::with_reconnect(worker, "connetto-hub-meta.sqlite", Some(local), reconnect)
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
     spawn_local(async move {
         if let Err(err) = pump.await {

@@ -24,7 +24,7 @@ pub mod workers;
 pub use broadcast::{BroadcastTransport, BroadcastTransportError};
 pub use leader::{Membership, join};
 pub use port::{PortTransport, PortTransportError};
-pub use relay::{HubNotice, RelayError, RelayHub, TabId};
+pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
 
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,

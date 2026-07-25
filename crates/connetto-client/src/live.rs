@@ -29,6 +29,7 @@ use connetto_core::messages::{BindValue, SubscriptionSpec};
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::SqliteConnection;
 use diesel::query_builder::QueryFragment;
+use diesel::query_dsl::RunQueryDsl;
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sqlite::Sqlite;
 use serde::de::DeserializeOwned;
@@ -172,6 +173,135 @@ fn query_shape(query: &sqlparser::ast::Query) -> QueryShape {
     }
 }
 
+/// The wire subscriptions backing a row handle, by tier. All tables synced:
+/// the query itself rides the wire (server-side predicate pushdown). All
+/// tables local: no subscription at all. Mixed: one whole-table subscription
+/// per synced table, sorted for deterministic ids, so the synced side stays
+/// live and covering for the handle's lifetime.
+fn wire_subscriptions(
+    local: &HashSet<String>,
+    tables: &HashSet<String>,
+    sub_id: &str,
+    query_spec: impl FnOnce() -> SubscriptionSpec,
+) -> Vec<(String, SubscriptionSpec)> {
+    let local_count = tables.intersection(local).count();
+    if local_count == 0 {
+        return vec![(sub_id.to_owned(), query_spec())];
+    }
+    if local_count == tables.len() {
+        return Vec::new();
+    }
+    let mut synced: Vec<&str> = tables
+        .iter()
+        .filter(|table| !local.contains(*table))
+        .map(String::as_str)
+        .collect();
+    synced.sort_unstable();
+    synced
+        .into_iter()
+        .enumerate()
+        .map(|(index, table)| {
+            (
+                format!("{sub_id}-{index}"),
+                SubscriptionSpec::new(format!("SELECT * FROM \"{table}\"")),
+            )
+        })
+        .collect()
+}
+
+/// One SQL literal for a bound value, for local re-execution of a rendered
+/// aggregate. Text doubles its quotes, blobs render as `X'..'` hex.
+fn bind_literal(bind: &BindValue) -> Result<String, ClientError> {
+    Ok(match bind {
+        BindValue::Null => "NULL".to_owned(),
+        BindValue::Integer(value) => value.to_string(),
+        BindValue::Real(value) if value.is_finite() => format!("{value:?}"),
+        BindValue::Real(_) => {
+            return Err(ClientError::Session(
+                "non-finite float bind has no SQL literal".to_owned(),
+            ));
+        }
+        BindValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
+        BindValue::Blob(bytes) => {
+            use core::fmt::Write;
+            let mut literal = String::with_capacity(bytes.len() * 2 + 3);
+            literal.push_str("X'");
+            for byte in bytes {
+                let _ = write!(literal, "{byte:02X}");
+            }
+            literal.push('\'');
+            literal
+        }
+    })
+}
+
+/// The rendered SQL with every `?` placeholder replaced by its bind value as
+/// a literal, skipping quoted regions. Local re-execution has no bind API for
+/// a raw SQL string with a dynamic bind list, and the values are the client's
+/// own typed data, escaped per storage class.
+fn inline_binds(sql: &str, binds: &[BindValue]) -> Result<String, ClientError> {
+    let mut out = String::with_capacity(sql.len());
+    let mut remaining = binds.iter();
+    let mut in_quote: Option<char> = None;
+    for c in sql.chars() {
+        if let Some(quote) = in_quote {
+            out.push(c);
+            if c == quote {
+                in_quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' | '`' => {
+                    in_quote = Some(c);
+                    out.push(c);
+                }
+                '?' => {
+                    let bind = remaining.next().ok_or_else(|| {
+                        ClientError::Session("more placeholders than binds".to_owned())
+                    })?;
+                    out.push_str(&bind_literal(bind)?);
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+    if remaining.next().is_some() {
+        return Err(ClientError::Session(
+            "more binds than placeholders".to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Wrap a rendered aggregate query so its scalar answer comes back as the
+/// JSON text the wire decoders expect: `json_quote` renders integers and
+/// floats as JSON numbers, text as a JSON string, and `NULL` as `null`,
+/// matching the server's aggregate push rendering.
+fn local_aggregate_probe(sql: &str, binds: &[BindValue]) -> Result<String, ClientError> {
+    let inlined = inline_binds(sql, binds)?;
+    Ok(format!("SELECT json_quote(({inlined})) AS value"))
+}
+
+/// The JSON text a local aggregate probe produced.
+#[derive(diesel::QueryableByName)]
+struct ProbeRow {
+    /// The `json_quote` rendering of the scalar.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+/// Run a local aggregate probe: a single ungrouped aggregate returns exactly
+/// one row.
+fn run_probe(conn: &mut SqliteConnection, probe: &str) -> Result<String, ClientError> {
+    let rows: Vec<ProbeRow> = diesel::sql_query(probe)
+        .load(conn)
+        .map_err(|e| ClientError::Session(e.to_string()))?;
+    rows.into_iter()
+        .next()
+        .map(|row| row.value)
+        .ok_or_else(|| ClientError::Session("aggregate probe returned no row".to_owned()))
+}
+
 /// Subscription ids and the wake signal shared with every [`LiveQuery`], so a
 /// synchronous `Drop` can queue its unsubscribe for the async pump.
 struct Reaper {
@@ -184,13 +314,15 @@ struct Reaper {
 type Refresh<T> = Box<dyn FnMut(&mut ConnettoConnection<T>) -> Result<(), ClientError> + Send>;
 
 /// One live handle's driver-side state: which tables it reads, how to re-run
-/// its query and publish fresh rows, and the wire spec to re-declare it on
-/// reconnect.
+/// its query and publish fresh results, and the wire subscriptions backing it
+/// (empty for a handle served purely from the local tier, one carrying the
+/// query itself for a synced query, one whole-table subscription per synced
+/// table for a mixed-tier query).
 struct LiveEntry<T: Transport> {
     sub_id: String,
     tables: HashSet<String>,
     refresh: Refresh<T>,
-    spec: SubscriptionSpec,
+    subs: Vec<(String, SubscriptionSpec)>,
 }
 
 /// Driver-side apply callback of one live value: decode the pushed JSON and
@@ -581,13 +713,23 @@ where
             Ok(())
         });
 
-        let spec = SubscriptionSpec::new(sql).with_binds(binds);
-        state.conn.subscribe_spec(&sub_id, spec.clone()).await?;
+        // Tier dispatch. A query over local tier tables alone registers no
+        // server subscription: the update hook refreshes it on local writes.
+        // A mixed query subscribes each synced table whole, tied to the
+        // handle: the requirement is that the synced side stays live and
+        // covering while the handle exists, and whole-table subscribe is the
+        // disposable v1 mechanism (predicate pushdown is a later refinement).
+        let subs = wire_subscriptions(state.conn.local_tables(), &tables, &sub_id, || {
+            SubscriptionSpec::new(sql).with_binds(binds)
+        });
+        for (wire_id, spec) in &subs {
+            state.conn.subscribe_spec(wire_id, spec.clone()).await?;
+        }
         state.registry.push(LiveEntry {
             sub_id: sub_id.clone(),
             tables,
             refresh,
-            spec,
+            subs,
         });
 
         Ok(LiveQuery {
@@ -651,7 +793,7 @@ where
         let value = Arc::new(RwLock::new(None::<V>));
         let (tx, rx) = watch::channel(0_u64);
         let apply_value = Arc::clone(&value);
-        let apply: ApplyValue = Box::new(move |json: &str| {
+        let mut apply: ApplyValue = Box::new(move |json: &str| {
             let fresh: V = decode(json)?;
             let unchanged = apply_value
                 .read()
@@ -669,6 +811,50 @@ where
         // Interrupt the pump's idle wait so the FIFO lock admits us promptly.
         self.shared.wake.notify_one();
         let mut state = self.shared.state.lock().await;
+
+        // Tier dispatch. A local tier table is complete by definition, so a
+        // local aggregate is served by exact local re-execution on change,
+        // through the same wire decoder the server path uses (`json_quote`
+        // renders the scalar as the JSON the decoder expects). A mixed
+        // aggregate is refused: the local side cannot be pushed to the server
+        // and the synced side's replica subset cannot answer globally.
+        let local_count = parsed
+            .tables
+            .intersection(state.conn.local_tables())
+            .count();
+        if local_count > 0 {
+            if local_count != parsed.tables.len() {
+                return Err(ClientError::Session(
+                    "mixed-tier aggregate: a statistic cannot span local and synced tables"
+                        .to_owned(),
+                ));
+            }
+            let probe = local_aggregate_probe(&sql, &binds)?;
+            // The bootstrap sets the value without a generation bump, like
+            // the initial rows of a row handle: the first `changed()` must
+            // wait for a real change, not report the registration itself.
+            let bootstrap = decode(&run_probe(state.conn.conn(), &probe)?)?;
+            match value.write() {
+                Ok(mut slot) => *slot = Some(bootstrap),
+                Err(poisoned) => *poisoned.into_inner() = Some(bootstrap),
+            }
+            let refresh = Box::new(move |conn: &mut ConnettoConnection<T>| {
+                apply(&run_probe(conn.conn(), &probe)?)
+            });
+            state.registry.push(LiveEntry {
+                sub_id: sub_id.clone(),
+                tables: parsed.tables,
+                refresh,
+                subs: Vec::new(),
+            });
+            return Ok(LiveValue {
+                sub_id,
+                value,
+                changed: rx,
+                reaper: Arc::clone(&self.shared.reaper),
+            });
+        }
+
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
         state.conn.subscribe_spec(&sub_id, spec.clone()).await?;
         state.values.push(ValueEntry {
@@ -753,6 +939,39 @@ fn is_disconnect(err: &ClientError) -> bool {
     matches!(err, ClientError::Transport(_))
 }
 
+/// Drain the reaper queue: remove each dropped handle's driver-side entry,
+/// then cancel the wire subscriptions that backed it. A local tier handle has
+/// none, so its retirement is purely local. Entries are removed before any
+/// send, so a transport failure can never resurrect a dropped handle.
+async fn drain_dropped<T>(state: &mut State<T>, reaper: &Reaper) -> Result<(), ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let pending = {
+        let mut queue = match reaper.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        core::mem::take(&mut *queue)
+    };
+    let mut wire_ids: Vec<String> = Vec::new();
+    for sub_id in pending {
+        if let Some(pos) = state.registry.iter().position(|e| e.sub_id == sub_id) {
+            let entry = state.registry.remove(pos);
+            wire_ids.extend(entry.subs.into_iter().map(|(wire_id, _)| wire_id));
+        }
+        if let Some(pos) = state.values.iter().position(|e| e.sub_id == sub_id) {
+            state.values.remove(pos);
+            wire_ids.push(sub_id);
+        }
+    }
+    for wire_id in wire_ids {
+        state.conn.unsubscribe(&wire_id).await?;
+    }
+    Ok(())
+}
+
 /// The background pump: drains queued unsubscribes, flushes local writes,
 /// takes one cancellable pump step, then refreshes every live query whose
 /// tables changed. When the last [`ConnettoClient`] clone drops, the pump
@@ -801,22 +1020,11 @@ async fn pump<T, F, S>(
         //    marks the transport for recovery: the server-side subscription
         //    dies with the session either way, and the entry is already out
         //    of the registry, so nothing re-declares it.
-        let pending = {
-            let mut queue = match shared.reaper.pending.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            core::mem::take(&mut *queue)
-        };
-        for sub_id in pending {
-            state.registry.retain(|entry| entry.sub_id != sub_id);
-            state.values.retain(|entry| entry.sub_id != sub_id);
-            if let Err(err) = state.conn.unsubscribe(&sub_id).await {
-                if is_disconnect(&err) {
-                    needs_recovery = true;
-                } else {
-                    return;
-                }
+        if let Err(err) = drain_dropped(&mut state, &shared.reaper).await {
+            if is_disconnect(&err) {
+                needs_recovery = true;
+            } else {
+                return;
             }
         }
         if needs_recovery {
@@ -948,7 +1156,7 @@ where
         let specs: Vec<(String, SubscriptionSpec)> = state
             .registry
             .iter()
-            .map(|entry| (entry.sub_id.clone(), entry.spec.clone()))
+            .flat_map(|entry| entry.subs.iter().cloned())
             .chain(
                 state
                     .values

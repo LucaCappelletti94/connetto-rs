@@ -154,7 +154,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     // The relay owns the worker connection and one loopback end. The tab
     // speaks the ordinary wire protocol over the other end.
     let (tab_end, relay_end) = loopback();
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub meta");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("relay hub");
     });
@@ -241,7 +241,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     // tab client and the relay.
     let channel = web_sys::MessageChannel::new().expect("message channel");
     let relay_end = PortTransport::new(channel.port1());
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub meta");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("relay hub");
     });

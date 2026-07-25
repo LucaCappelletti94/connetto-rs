@@ -18,6 +18,15 @@
 //! owning tab's own sequence number. A tab-level protocol violation closes
 //! that tab alone, the hub and its other tabs keep running.
 //!
+//! A hub can also serve a device-local tier: tables living in their own
+//! database file, never in the worker replica or on the server. A tab
+//! mutation touching only those tables commits into the tier connection
+//! (whose main schema IS the tier file, because a changeset apply always
+//! targets main), is acknowledged by the hub itself as the terminal
+//! authority, and fans out to every tab with a subscription reading a
+//! touched table. A mutation spanning both tiers is rejected, because the
+//! local half could not ride the rollback of an upstream rejection.
+//!
 //! Remaining limits, lifted by later increments: aggregate subscriptions are
 //! not served, flow control credits are ignored, and an upstream conflict
 //! reaches the tab as a plain rejection, because the worker client surfaces
@@ -36,6 +45,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, SchemaVersion, Transport};
+use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -142,6 +152,9 @@ struct TabState {
     /// replayed sequence at or below it is re-acknowledged, never
     /// re-applied.
     applied_watermark: Option<u64>,
+    /// Highest tab sequence applied to the local tier for this client id,
+    /// the tier side sibling of `applied_watermark`.
+    local_watermark: Option<u64>,
 }
 
 /// A failure inside the tab-mutation apply transaction.
@@ -164,6 +177,12 @@ impl From<diesel::result::Error> for TabApplyError {
 const HUB_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_hub._tab_mutations \
     (client_id TEXT NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
+/// DDL for the local tier's durable per-tab mutation watermark. It lives
+/// in the tier database itself so it advances in the same transaction as
+/// the apply, mirroring the server's `_connetto_mutations` design.
+const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_tab_mutations \
+    (client_id TEXT NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
+
 /// One registered tab subscription and the tables its query reads.
 struct TabSub {
     sub_id: String,
@@ -179,6 +198,50 @@ struct BlankState {
     tables: HashSet<String>,
 }
 
+/// The device-local tier a hub can serve alongside the worker replica: a
+/// connection whose MAIN schema is the durable tier database, because
+/// `sqlite3changeset_apply` only ever targets main. Tab writes to these
+/// tables commit here, fan out to the other tabs, and can never reach the
+/// server: the worker replica does not even contain them.
+pub struct LocalTier {
+    conn: SqliteConnection,
+    /// Lowercased table names of the tier, from its own schema catalog.
+    tables: HashSet<String>,
+    /// The tier connection's own blank twin database for snapshots.
+    blank: BlankState,
+}
+
+impl LocalTier {
+    /// Wrap an open connection to the local tier database: ensure the
+    /// watermark table and load the table catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Replica`] when the watermark DDL or the catalog read
+    /// fails.
+    pub fn new(mut conn: SqliteConnection) -> Result<Self, RelayError> {
+        conn.batch_execute(LOCAL_META_DDL)?;
+        #[derive(QueryableByName)]
+        struct NameRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+        let rows: Vec<NameRow> = sql_query(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_connetto*'",
+        )
+        .load(&mut conn)?;
+        Ok(Self {
+            conn,
+            tables: rows
+                .into_iter()
+                .map(|row| row.name.to_lowercase())
+                .collect(),
+            blank: BlankState::default(),
+        })
+    }
+}
+
 /// Core state threaded through the hub loop.
 #[derive(Default)]
 struct HubState {
@@ -189,6 +252,8 @@ struct HubState {
     /// [`SEQ_MAP_CAP`].
     seq_map: BTreeMap<u64, (TabId, u64)>,
     blank: BlankState,
+    /// The device-local tier, when the hub serves one.
+    local: Option<LocalTier>,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -245,11 +310,12 @@ impl RelayHub {
     ///
     /// `hub_meta` is the database attached for the hub's own durable state
     /// (the per-tab mutation watermarks): a sahpool-backed file name in the
-    /// DB worker, `:memory:` in tests. Returns the handle, the pump future
-    /// to spawn (it runs until the upstream session closes, the upstream
-    /// fails, or every handle and shovel is gone), and the notice stream.
-    /// Dropping the notice receiver is fine when the owner has no platform
-    /// glue to run.
+    /// DB worker, `:memory:` in tests. `local` is the device-local tier the
+    /// hub serves alongside the worker replica, `None` when there are no
+    /// local tables. Returns the handle, the pump future to spawn (it runs
+    /// until the upstream session closes, the upstream fails, or every
+    /// handle and shovel is gone), and the notice stream. Dropping the
+    /// notice receiver is fine when the owner has no platform glue to run.
     ///
     /// # Errors
     ///
@@ -261,6 +327,7 @@ impl RelayHub {
     pub fn new<U>(
         worker: ConnettoConnection<U>,
         hub_meta: &str,
+        local: Option<LocalTier>,
     ) -> Result<
         (
             Self,
@@ -276,6 +343,7 @@ impl RelayHub {
         Self::build(
             worker,
             hub_meta,
+            local,
             None::<HubReconnect<NoFactory<U>, NoSleep>>,
         )
     }
@@ -296,6 +364,7 @@ impl RelayHub {
     pub fn with_reconnect<U, F, S>(
         worker: ConnettoConnection<U>,
         hub_meta: &str,
+        local: Option<LocalTier>,
         reconnect: HubReconnect<F, S>,
     ) -> Result<
         (
@@ -311,7 +380,7 @@ impl RelayHub {
         F: TransportFactory<Transport = U>,
         S: Sleeper,
     {
-        Self::build(worker, hub_meta, Some(reconnect))
+        Self::build(worker, hub_meta, local, Some(reconnect))
     }
 
     /// Shared constructor body behind the two hub flavors: attach the hub
@@ -323,6 +392,7 @@ impl RelayHub {
     fn build<U, F, S>(
         mut worker: ConnettoConnection<U>,
         hub_meta: &str,
+        local: Option<LocalTier>,
         reconnect: Option<HubReconnect<F, S>>,
     ) -> Result<
         (
@@ -350,7 +420,7 @@ impl RelayHub {
         };
         Ok((
             hub,
-            run_hub(worker, events_rx, notices_tx, reconnect),
+            run_hub(worker, local, events_rx, notices_tx, reconnect),
             notices_rx,
         ))
     }
@@ -431,6 +501,7 @@ async fn shovel<D>(
 /// queued frames are served after the resume.
 async fn run_hub<U, F, S>(
     mut worker: ConnettoConnection<U>,
+    local: Option<LocalTier>,
     mut events: UnboundedReceiver<HubEvent>,
     notices: UnboundedSender<HubNotice>,
     mut reconnect: Option<HubReconnect<F, S>>,
@@ -441,7 +512,10 @@ where
     F: TransportFactory<Transport = U>,
     S: Sleeper,
 {
-    let mut state = HubState::default();
+    let mut state = HubState {
+        local,
+        ..HubState::default()
+    };
     loop {
         // Cancel safety: the events leg is an mpsc receive, and the worker
         // leg completes in one poll once its frame lands (browser socket
@@ -459,6 +533,7 @@ where
                         pending_write: None,
                         client_id: String::new(),
                         applied_watermark: None,
+                        local_watermark: None,
                     });
                 }
                 Some(HubEvent::Frame(id, frame)) => {
@@ -581,6 +656,17 @@ where
             tab.handshaken = true;
             tab.client_id = handshake.client_id.clone();
             tab.applied_watermark = tab_watermark(worker, &handshake.client_id)?;
+            tab.local_watermark = match state.local.as_mut() {
+                Some(local) => local_tab_watermark(local, &handshake.client_id)?,
+                None => None,
+            };
+            // The hub handles a tab's mutations in order and each lands in
+            // exactly one tier, so every sequence at or below the higher of
+            // the two watermarks was already applied or rejected.
+            let last_applied = match (tab.applied_watermark, tab.local_watermark) {
+                (Some(synced), Some(local)) => Some(synced.max(local)),
+                (synced, local) => synced.or(local),
+            };
             // The session naming is a placeholder the client does not act
             // on today. The watermark is load-bearing: the tab retires
             // pending mutations at or below it and replays the rest.
@@ -591,7 +677,7 @@ where
                     current_cursor: relay_cursor(worker),
                     schema_version: SchemaVersion::new("relay", Vec::new()),
                     initial_credits: 64,
-                    last_applied_seq: tab.applied_watermark,
+                    last_applied_seq: last_applied,
                 },
             )));
             let _ = notices.send(HubNotice::Handshake {
@@ -603,7 +689,14 @@ where
         ControlMessage::Subscribe(subscribe) if tab.handshaken => {
             let tables = subscription_tables(&subscribe.spec.query)
                 .map_err(|err| TabFault::Close(format!("unparsable subscription query: {err}")))?;
-            serve_snapshot(worker, &mut state.blank, tab, &subscribe, &tables)?;
+            serve_snapshot(
+                worker,
+                &mut state.blank,
+                &mut state.local,
+                tab,
+                &subscribe,
+                &tables,
+            )?;
             tab.subs.retain(|sub| sub.sub_id != subscribe.sub_id);
             tab.subs.push(TabSub {
                 sub_id: subscribe.sub_id,
@@ -638,17 +731,12 @@ where
     }
 }
 
-/// Handle one bulk frame from a tab: the patchset of an announced mutation.
-///
-/// The changeset is applied to the worker replica with capture ACTIVE (so
-/// the worker's own session records it and the following push re-uploads
-/// it), and the tab's durable watermark advances in the same transaction. A
-/// replayed sequence at or below the watermark is re-acknowledged, never
-/// re-applied. The end-to-end acknowledgement the tab retires its pending
-/// record on arrives separately, when the SERVER confirms the forwarded
-/// mutation. An apply failure rejects the mutation back to the tab and
-/// leaves the replica untouched, since the abort policy rolls the whole
-/// apply back.
+/// Handle one bulk frame from a tab: the patchset of an announced
+/// mutation. The changeset is decoded, classified by the tables it
+/// touches, and dispatched to its tier. A mutation spanning both tiers is
+/// rejected: applying it would tear on an upstream rejection, because the
+/// rollback inverts the tab's whole changeset while the local half stays
+/// committed everywhere else.
 async fn handle_tab_bulk<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
@@ -667,7 +755,7 @@ where
             )));
         }
     };
-    let (tab_seq, client_id, out, watermark) = {
+    let (tab_seq, out) = {
         let Some(tab) = state.tabs.get_mut(&id) else {
             return Ok(());
         };
@@ -682,8 +770,164 @@ where
                 patch.client_seq
             )));
         }
-        (
+        (tab_seq, tab.out.clone())
+    };
+    let Ok(changeset) = zstd::decode_all(patch.patchset_zstd.as_slice()) else {
+        return Err(TabFault::Close("undecodable mutation patchset".to_owned()));
+    };
+    let Ok(tables) = changeset_tables(&changeset) else {
+        return Err(TabFault::Close("unparsable mutation changeset".to_owned()));
+    };
+    let local_hit = state
+        .local
+        .as_ref()
+        .map_or(0, |local| tables.intersection(&local.tables).count());
+    if local_hit > 0 && local_hit < tables.len() {
+        let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
+            MutationReject {
+                client_seq: tab_seq,
+                reason: MutationRejectReason::Other {
+                    detail: "a mutation must not span the synced and local tiers, \
+                             commit each tier in its own transaction"
+                        .to_owned(),
+                },
+            },
+        )));
+        return Ok(());
+    }
+    if local_hit > 0 {
+        let cursor = relay_cursor(worker);
+        return handle_local_mutation(
+            state,
+            id,
             tab_seq,
+            &changeset,
+            &tables,
+            cursor,
+            &patch.patchset_zstd,
+        );
+    }
+    handle_synced_mutation(worker, state, id, tab_seq, &changeset).await
+}
+
+/// Apply one pure local tier mutation and fan it out.
+///
+/// The changeset commits into the tier database together with the tab's
+/// durable watermark, in one transaction. The hub is the terminal
+/// authority for this tier (there is no upstream leg), so its own durable
+/// apply is the acknowledgement. The payload then fans out to every tab
+/// with a subscription reading a touched table, the originator included:
+/// its re-apply is idempotent under the client's conflict policy and
+/// converges every mirror on the hub's serialization order.
+fn handle_local_mutation(
+    state: &mut HubState,
+    id: TabId,
+    tab_seq: u64,
+    changeset: &[u8],
+    tables: &HashSet<String>,
+    cursor: Cursor,
+    payload: &[u8],
+) -> Result<(), TabFault> {
+    let (client_id, out, watermark) = {
+        let Some(tab) = state.tabs.get(&id) else {
+            return Ok(());
+        };
+        (tab.client_id.clone(), tab.out.clone(), tab.local_watermark)
+    };
+    if watermark.is_some_and(|watermark| tab_seq <= watermark) {
+        // Already applied to the tier by an earlier delivery. The hub is
+        // the authority, so a plain re-acknowledgement is complete here.
+        let _ = out.send(TabOut::Control(ControlMessage::MutationApplied(
+            MutationApplied {
+                client_seq: tab_seq,
+            },
+        )));
+        return Ok(());
+    }
+    let Ok(seq) = i64::try_from(tab_seq) else {
+        return Err(TabFault::Close("sequence overflows storage".to_owned()));
+    };
+    let Some(local) = state.local.as_mut() else {
+        return Ok(());
+    };
+    let applied = local.conn.transaction::<_, TabApplyError, _>(|conn| {
+        conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
+            .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+        diesel::sql_query(
+            "INSERT INTO _connetto_tab_mutations (client_id, last_seq) VALUES (?, ?) \
+             ON CONFLICT (client_id) DO UPDATE SET \
+             last_seq = MAX(last_seq, excluded.last_seq)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&client_id)
+        .bind::<diesel::sql_types::BigInt, _>(seq)
+        .execute(conn)?;
+        Ok(())
+    });
+    match applied {
+        Ok(()) => {}
+        Err(TabApplyError::Apply(detail)) => {
+            let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
+                MutationReject {
+                    client_seq: tab_seq,
+                    reason: MutationRejectReason::Other {
+                        detail: format!("local tier apply failed: {detail}"),
+                    },
+                },
+            )));
+            return Ok(());
+        }
+        Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
+    }
+    if let Some(tab) = state.tabs.get_mut(&id) {
+        tab.local_watermark = Some(tab_seq);
+    }
+    let _ = out.send(TabOut::Control(ControlMessage::MutationApplied(
+        MutationApplied {
+            client_seq: tab_seq,
+        },
+    )));
+    for tab in state.tabs.values() {
+        let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(tables)) else {
+            continue;
+        };
+        let _ = tab
+            .out
+            .send(TabOut::Bulk(BulkMessage::LivePatch(LivePatch::new(
+                sub.sub_id.clone(),
+                cursor.clone(),
+                payload.to_vec(),
+            ))));
+    }
+    Ok(())
+}
+
+/// Apply one synced tier mutation to the worker replica.
+///
+/// The changeset is applied with capture ACTIVE (so the worker's own
+/// session records it and the following push re-uploads it), and the
+/// tab's durable watermark advances in the same transaction. A replayed
+/// sequence at or below the watermark is re-acknowledged, never
+/// re-applied. The end-to-end acknowledgement the tab retires its pending
+/// record on arrives separately, when the SERVER confirms the forwarded
+/// mutation. An apply failure rejects the mutation back to the tab and
+/// leaves the replica untouched, since the abort policy rolls the whole
+/// apply back.
+async fn handle_synced_mutation<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    id: TabId,
+    tab_seq: u64,
+    changeset: &[u8],
+) -> Result<(), TabFault>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let (client_id, out, watermark) = {
+        let Some(tab) = state.tabs.get(&id) else {
+            return Ok(());
+        };
+        (
             tab.client_id.clone(),
             tab.out.clone(),
             tab.applied_watermark,
@@ -700,14 +944,11 @@ where
         )));
         return Ok(());
     }
-    let Ok(changeset) = zstd::decode_all(patch.patchset_zstd.as_slice()) else {
-        return Err(TabFault::Close("undecodable mutation patchset".to_owned()));
-    };
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
     let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
-        conn.apply_changeset(&changeset, |_conflict| ConflictAction::Abort)
+        conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
             .map_err(|err| TabApplyError::Apply(err.to_string()))?;
         diesel::sql_query(
             "INSERT INTO connetto_hub._tab_mutations (client_id, last_seq) VALUES (?, ?) \
@@ -829,10 +1070,13 @@ fn reject_tab_mutation(
     Ok(())
 }
 
-/// Answer one tab subscription from the worker replica.
+/// Answer one tab subscription: a snapshot from the worker replica for
+/// synced tables, from the tier database for local tables, both between
+/// one begin and end pair.
 fn serve_snapshot<U>(
     worker: &mut ConnettoConnection<U>,
     blank: &mut BlankState,
+    local: &mut Option<LocalTier>,
     tab: &TabState,
     subscribe: &Subscribe,
     tables: &HashSet<String>,
@@ -847,12 +1091,19 @@ where
             priority: subscribe.spec.priority,
         },
     )));
-    let patchset = snapshot_patchset(worker, tables, blank)?;
-    if !patchset.is_empty() {
-        let payload = zstd::encode_all(patchset.as_slice(), ZSTD_LEVEL)?;
-        let _ = tab.out.send(TabOut::Bulk(BulkMessage::SnapshotPatch(
-            SnapshotPatch::new(subscribe.sub_id.clone(), payload),
-        )));
+    let local_tables: HashSet<String> = local.as_ref().map_or_else(HashSet::new, |tier| {
+        tables.intersection(&tier.tables).cloned().collect()
+    });
+    let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
+    if !synced.is_empty() {
+        let patchset = snapshot_patchset(worker.conn(), &synced, blank)?;
+        send_snapshot_patch(tab, &subscribe.sub_id, &patchset)?;
+    }
+    if !local_tables.is_empty()
+        && let Some(tier) = local.as_mut()
+    {
+        let patchset = snapshot_patchset(&mut tier.conn, &local_tables, &mut tier.blank)?;
+        send_snapshot_patch(tab, &subscribe.sub_id, &patchset)?;
     }
     let _ = tab
         .out
@@ -863,24 +1114,34 @@ where
     Ok(())
 }
 
-/// Build one insert patchset holding every current row of the subscribed
-/// tables, by diffing the worker replica against empty twins in an attached
-/// blank database.
+/// Compress and send one snapshot patchset toward a tab, skipping empty
+/// payloads.
+fn send_snapshot_patch(tab: &TabState, sub_id: &str, patchset: &[u8]) -> Result<(), RelayError> {
+    if patchset.is_empty() {
+        return Ok(());
+    }
+    let payload = zstd::encode_all(patchset, ZSTD_LEVEL)?;
+    let _ = tab.out.send(TabOut::Bulk(BulkMessage::SnapshotPatch(
+        SnapshotPatch::new(sub_id.to_owned(), payload),
+    )));
+    Ok(())
+}
+
+/// Build one insert patchset holding every current row of the requested
+/// tables, by diffing the connection's main schema against empty twins in
+/// an attached blank database.
 ///
 /// `sqlite3session_diff` requires the twin to live on the same connection
 /// under the same table name and schema, so the blank database is attached
-/// once and each subscribed table's stored DDL is replayed into it with a
+/// once and each requested table's stored DDL is replayed into it with a
 /// schema qualifier spliced in. The throwaway session never sees a write, it
-/// only loads the diff, so the worker's own capture session is unaffected.
-fn snapshot_patchset<U>(
-    worker: &mut ConnettoConnection<U>,
+/// only loads the diff, so any capture session on the connection is
+/// unaffected.
+fn snapshot_patchset(
+    conn: &mut SqliteConnection,
     tables: &HashSet<String>,
     blank: &mut BlankState,
-) -> Result<Vec<u8>, RelayError>
-where
-    U: Transport,
-    U::Error: core::fmt::Display,
-{
+) -> Result<Vec<u8>, RelayError> {
     #[derive(QueryableByName)]
     struct SchemaRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -891,7 +1152,7 @@ where
     let rows: Vec<SchemaRow> = sql_query(
         "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
     )
-    .load(worker.conn())?;
+    .load(&mut *conn)?;
     let matching: Vec<SchemaRow> = rows
         .into_iter()
         .filter(|row| tables.contains(&row.name.to_lowercase()))
@@ -900,9 +1161,7 @@ where
         return Ok(Vec::new());
     }
     if !blank.attached {
-        worker
-            .conn()
-            .batch_execute("ATTACH DATABASE ':memory:' AS blank")?;
+        conn.batch_execute("ATTACH DATABASE ':memory:' AS blank")?;
         blank.attached = true;
     }
     for row in &matching {
@@ -916,10 +1175,10 @@ where
         let twin = qualify_ddl(ddl, &row.name).ok_or_else(|| {
             RelayError::Snapshot(format!("cannot qualify the DDL of table {}", row.name))
         })?;
-        worker.conn().batch_execute(&twin)?;
+        conn.batch_execute(&twin)?;
         blank.tables.insert(row.name.clone());
     }
-    let mut session = worker.conn().create_session().map_err(session_err)?;
+    let mut session = conn.create_session().map_err(session_err)?;
     for row in &matching {
         session.attach_by_name(&row.name).map_err(session_err)?;
         session.diff("blank", &row.name).map_err(session_err)?;
@@ -964,8 +1223,14 @@ fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 /// The lowercased set of tables a compressed patchset touches.
 fn patch_tables(patchset_zstd: &[u8]) -> Result<HashSet<String>, RelayError> {
     let bytes = zstd::decode_all(patchset_zstd)?;
+    changeset_tables(&bytes)
+}
+
+/// The lowercased set of tables an uncompressed changeset or patchset
+/// touches.
+fn changeset_tables(bytes: &[u8]) -> Result<HashSet<String>, RelayError> {
     let parsed =
-        ParsedDiffSet::parse(&bytes).map_err(|err| RelayError::Patch(format!("{err:?}")))?;
+        ParsedDiffSet::parse(bytes).map_err(|err| RelayError::Patch(format!("{err:?}")))?;
     let mut tables = HashSet::new();
     match parsed {
         ParsedDiffSet::Changeset(diff) => {
@@ -1001,6 +1266,23 @@ where
         diesel::sql_query("SELECT last_seq FROM connetto_hub._tab_mutations WHERE client_id = ?")
             .bind::<diesel::sql_types::Text, _>(client_id)
             .load(worker.conn())?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| u64::try_from(row.last_seq).ok()))
+}
+
+/// The local tier's durable watermark for one tab client id, if any.
+fn local_tab_watermark(local: &mut LocalTier, client_id: &str) -> Result<Option<u64>, RelayError> {
+    #[derive(diesel::QueryableByName)]
+    struct WatermarkRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        last_seq: i64,
+    }
+    let rows: Vec<WatermarkRow> =
+        diesel::sql_query("SELECT last_seq FROM _connetto_tab_mutations WHERE client_id = ?")
+            .bind::<diesel::sql_types::Text, _>(client_id)
+            .load(&mut local.conn)?;
     Ok(rows
         .into_iter()
         .next()
