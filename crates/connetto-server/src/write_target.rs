@@ -169,6 +169,13 @@ impl WriteTarget {
     /// watermark table exists inline (one privileged connection, no
     /// concurrency); the Postgres path requires it provisioned up front, see
     /// [`provision_watermark_table`].
+    // Without `pg-async` the Postgres arm is compiled out and the remaining
+    // SQLite arm never awaits, so clippy sees an async fn with no await. The
+    // async is load-bearing under `pg-async`, so only silence it otherwise.
+    #[cfg_attr(
+        not(feature = "pg-async"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub(crate) async fn last_applied(
         &self,
         ctx: &AuthContext,

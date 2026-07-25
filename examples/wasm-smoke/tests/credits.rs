@@ -119,7 +119,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             session_id: "credits-upstream".to_owned(),
             session_token: "credits".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::new("test", Vec::new()),
+            schema_version: SchemaVersion::default(),
             initial_credits: INITIAL_CREDITS,
             last_applied_seq: None,
         }))
@@ -197,6 +197,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
     let worker_config = ClientConfig {
         client_id: format!("credits-worker-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await

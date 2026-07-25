@@ -104,7 +104,7 @@ fn resync_server() -> LoopbackTransport {
                 session_id: "resync".to_owned(),
                 session_token: "resync".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
-                schema_version: SchemaVersion::new("test", Vec::new()),
+                schema_version: SchemaVersion::default(),
                 initial_credits: 64,
                 last_applied_seq: None,
             }))
@@ -163,6 +163,7 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
     let config = ClientConfig {
         client_id: "resync".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut conn =
         ConnettoConnection::connect(resync_server(), ":memory:", SQLITE_DDL, &config, None)

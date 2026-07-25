@@ -39,6 +39,10 @@ type Tab = BroadcastTransport;
 
 /// The demo server the DB worker connects upstream to.
 const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+/// The Postgres schema source the demo server is launched with. Hashing it
+/// yields the version the server advertises, so this build presents a matching
+/// version at handshake and is not rejected as stale.
+const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// The synced replica schema (worker first boot). Matches `schema.sql`.
 const DEMO_SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
@@ -55,7 +59,8 @@ const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The shared leader lock every window of this app races.
 const LEADER_LOCK: &str = "connetto-demo-leader";
 /// The baked local tier template, translated from `frontend.sql` by build.rs.
-const FRONTEND_TEMPLATE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
+const FRONTEND_TEMPLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
 /// The DB worker bootstrap script, shipped as a dioxus asset.
 const DB_WORKER_JS: Asset = asset!("/assets/db-worker.js");
 
@@ -141,6 +146,7 @@ pub async fn db_worker_boot() -> Result<(), JsValue> {
         upstream_query: DEMO_QUERY,
         hub_meta_name: "connetto-hub-meta.sqlite",
         client_id_prefix: "db-worker",
+        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
     })
     .await
 }
@@ -192,6 +198,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let config = ClientConfig {
         client_id: client_id.clone(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
         .await
@@ -201,8 +208,12 @@ async fn boot_window() -> Result<Boot, JsValue> {
         max_backoff: core::time::Duration::from_secs(2),
         max_attempts: None,
     };
-    let (client, pump) =
-        ConnettoClient::with_reconnect(conn, workers::tab_wire_factory(client_id), workers::sleep, policy);
+    let (client, pump) = ConnettoClient::with_reconnect(
+        conn,
+        workers::tab_wire_factory(client_id),
+        workers::sleep,
+        policy,
+    );
     spawn_local(pump);
     Ok(Boot {
         client,
@@ -216,7 +227,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
     match event {
         ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
         ClientEvent::Reconnected => Some("reconnected".to_owned()),
-        ClientEvent::MutationApplied { client_seq } => Some(format!("mutation {client_seq} applied")),
+        ClientEvent::MutationApplied { client_seq } => {
+            Some(format!("mutation {client_seq} applied"))
+        }
         ClientEvent::MutationRejected { client_seq, .. } => {
             Some(format!("mutation {client_seq} rejected"))
         }

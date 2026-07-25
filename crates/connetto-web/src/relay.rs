@@ -70,7 +70,7 @@ use connetto_core::messages::{
     Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::MaybeSend;
-use connetto_core::{Cursor, IncomingFrame, SchemaVersion, Transport};
+use connetto_core::{Cursor, IncomingFrame, Transport};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -909,7 +909,7 @@ where
                     session_id: format!("relay-{}", handshake.client_id),
                     session_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
-                    schema_version: SchemaVersion::new("relay", Vec::new()),
+                    schema_version: worker.schema_version().clone(),
                     initial_credits: INITIAL_CREDITS,
                     last_applied_seq: last_applied,
                 },

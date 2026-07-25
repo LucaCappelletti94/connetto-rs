@@ -43,7 +43,7 @@ pub use auth::AuthContext;
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
-pub use schema::SchemaVersion;
+pub use schema::{SchemaVersion, schema_hash};
 pub use traits::{
     AuthPolicy, FileStore, IncomingFrame, MutationOp, PendingMutation, Store, Transport,
 };

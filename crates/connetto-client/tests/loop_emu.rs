@@ -194,6 +194,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -330,6 +331,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -452,6 +454,7 @@ async fn connection_is_a_diesel_connection() {
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -545,6 +548,7 @@ async fn rejected_write_rolls_back_locally() {
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -648,6 +652,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -718,6 +723,7 @@ async fn connect_client(
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     ConnettoConnection::connect(transport, db_path, SQLITE_DDL, &config, None)
         .await

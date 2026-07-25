@@ -33,7 +33,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
                 session_id: "agg".to_owned(),
                 session_token: "agg".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
-                schema_version: SchemaVersion::new("test", Vec::new()),
+                schema_version: SchemaVersion::default(),
                 initial_credits: 64,
                 last_applied_seq: None,
             }))
@@ -50,6 +50,7 @@ fn config(client_id: &str) -> ClientConfig {
     ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     }
 }
 

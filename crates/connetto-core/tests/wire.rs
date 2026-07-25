@@ -16,8 +16,8 @@ use connetto_core::{
         AckCredits, AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
         FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, Ping,
-        Pong, SchemaBlob, SchemaUpdate, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
+        SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -67,7 +67,7 @@ fn handshake_and_ack_round_trip() {
         session_id: "sess-1".into(),
         session_token: "opaque".into(),
         current_cursor: Cursor::new(vec![1, 2, 3, 4]),
-        schema_version: SchemaVersion::new("v42", vec![0xab, 0xcd]),
+        schema_version: SchemaVersion::from_hash(vec![0xab, 0xcd]),
         initial_credits: 128,
         last_applied_seq: Some(41),
     }));
@@ -128,14 +128,6 @@ fn aggregate_update_round_trip() {
         group_key: None,
         result_json: r#"{"total":9001}"#.into(),
         is_full_result: true,
-    }));
-}
-
-#[test]
-fn schema_update_round_trip() {
-    round_trip_control(&ControlMessage::SchemaUpdate(SchemaUpdate {
-        version: SchemaVersion::new("v3", vec![0x11, 0x22]),
-        payload_follows: true,
     }));
 }
 
@@ -202,9 +194,5 @@ fn bulk_frames_round_trip() {
     round_trip_bulk(&BulkMessage::MutationPatch(MutationPatch::new(
         99,
         vec![0x77, 0x88],
-    )));
-    round_trip_bulk(&BulkMessage::SchemaBlob(SchemaBlob::new(
-        SchemaVersion::new("v4", vec![0xaa]),
-        vec![0x00; 32],
     )));
 }

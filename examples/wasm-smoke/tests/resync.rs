@@ -119,7 +119,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             session_id: "resync-upstream".to_owned(),
             session_token: "resync".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::new("test", Vec::new()),
+            schema_version: SchemaVersion::default(),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -198,6 +198,7 @@ async fn full_resync_is_relay_transparent() {
     let worker_config = ClientConfig {
         client_id: format!("resync-worker-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
@@ -232,6 +233,7 @@ async fn full_resync_is_relay_transparent() {
     let tab_config = ClientConfig {
         client_id: format!("resync-tab-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut tab = ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config, None)
         .await

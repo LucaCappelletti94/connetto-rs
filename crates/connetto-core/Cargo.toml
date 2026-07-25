@@ -30,6 +30,7 @@ native-transport = ["loopback", "dep:tokio-tungstenite", "dep:futures-util", "to
 serde.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
+sha2 = { version = "0.10", default-features = false }
 thiserror = { workspace = true, optional = true }
 # The loopback pair needs only the sync primitives, which compile on wasm.
 # The native transport feature adds the net stack on top.

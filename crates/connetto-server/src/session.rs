@@ -109,7 +109,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             initial_credits: 64,
-            schema_version: SchemaVersion::new("v0", Vec::new()),
+            schema_version: SchemaVersion::default(),
         }
     }
 }

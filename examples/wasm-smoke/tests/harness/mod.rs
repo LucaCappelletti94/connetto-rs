@@ -116,6 +116,7 @@ pub async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTranspo
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_wasm_smoke::demo_schema_version(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -130,6 +131,7 @@ pub async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserS
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_wasm_smoke::demo_schema_version(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await

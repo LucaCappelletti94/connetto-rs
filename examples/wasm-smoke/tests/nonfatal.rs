@@ -54,7 +54,7 @@ async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
             session_id: session.to_owned(),
             session_token: "nonfatal".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::new("test", Vec::new()),
+            schema_version: SchemaVersion::default(),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -135,6 +135,7 @@ fn tab_config(base: i64, tag: &str) -> ClientConfig {
     ClientConfig {
         client_id: format!("nonfatal-{tag}-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     }
 }
 

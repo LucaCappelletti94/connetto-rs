@@ -79,6 +79,10 @@ pub struct DbWorkerConfig {
     pub hub_meta_name: &'static str,
     /// The prefix of the worker's client id (a timestamp is appended).
     pub client_id_prefix: &'static str,
+    /// The schema version this app build was compiled against. The worker
+    /// presents it to the server at handshake (a mismatch is a stale build)
+    /// and the hub forwards the server's version to tabs for the same check.
+    pub schema_version: connetto_core::SchemaVersion,
 }
 
 /// Page side, leader only: spawn the dedicated DB worker.
@@ -171,6 +175,7 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     let client_config = ClientConfig {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
         auth_token: "token".to_owned(),
+        schema_version: config.schema_version.clone(),
     };
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from

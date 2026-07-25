@@ -13,11 +13,10 @@ pub mod flow;
 pub mod handshake;
 pub mod mutation;
 pub mod reconnect;
-pub mod schema;
 pub mod subscription;
 
 pub use aggregate::AggregateUpdate;
-pub use bulk::{BulkMessage, LivePatch, MutationPatch, SchemaBlob, SnapshotPatch};
+pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use control::ControlMessage;
 pub use error::{FatalError, FatalErrorReason, NonFatalError};
 pub use flow::{AckCredits, Ping, Pong};
@@ -26,7 +25,6 @@ pub use mutation::{
     MutationApplied, MutationConflict, MutationHeader, MutationReject, MutationRejectReason,
 };
 pub use reconnect::{FullResyncReason, FullResyncRequired};
-pub use schema::SchemaUpdate;
 pub use subscription::{
     BindValue, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority, SubscriptionSpec,
     Unsubscribe,

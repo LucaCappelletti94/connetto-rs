@@ -115,13 +115,7 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 
 ### Case 3: Schema changed while offline
 
-If `HandshakeAck.schema_version` differs from the client's stored schema version:
-
-1. Server sends a `SchemaUpdate` message before subscription catchup begins.
-2. Client applies the schema migration to local SQLite.
-3. Subscription catchup proceeds against the new schema.
-
-If the schema change is incompatible with the oplog entries in the catchup window, the server may be forced to trigger a full re-sync for affected subscriptions.
+If `HandshakeAck.schema_version` differs from the version the client was built with, the client build is stale. connetto bakes the schema into the app at build time and runs no DDL at runtime, so there is no runtime migration. The client surfaces a terminal stale-build condition at the handshake, before any subscription catchup or pending replay, and the app reloads. The reload boots a fresh baked template and full-resyncs the data under the new schema (Case 2's full-replacement path) rather than migrating in place.
 
 ---
 

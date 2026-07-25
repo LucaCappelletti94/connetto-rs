@@ -32,7 +32,7 @@ use connetto_core::messages::{
     Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION};
+use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
 use core::sync::atomic::{AtomicBool, Ordering};
 use diesel::connection::SimpleConnection;
 use diesel::connection::{
@@ -91,6 +91,16 @@ pub enum ClientError {
     /// Zstd compression or decompression failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
+    /// The server's advertised schema version differs from the version this
+    /// client build was compiled against, so this build is stale and the app
+    /// must reload. connetto never migrates schemas at runtime.
+    #[error("schema outdated: client built for {client}, server advertises {server}")]
+    SchemaOutdated {
+        /// The version this client build was compiled against.
+        client: SchemaVersion,
+        /// The version the server advertised in the handshake ack.
+        server: SchemaVersion,
+    },
 }
 
 /// Client identity presented at handshake.
@@ -100,6 +110,12 @@ pub struct ClientConfig {
     pub client_id: String,
     /// Opaque auth token validated by the server at connect.
     pub auth_token: String,
+    /// The schema version this client build was compiled against, for staleness
+    /// detection. When both this and the server's ack carry a non-empty hash and
+    /// they differ, [`ConnettoConnection::connect`] fails with
+    /// [`ClientError::SchemaOutdated`] so the app can reload. Leave it
+    /// [`SchemaVersion::default`] (empty) to opt out of the check.
+    pub schema_version: SchemaVersion,
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].
@@ -458,13 +474,14 @@ fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, Cli
 
 /// Run the opening handshake over `transport`: send the hello (carrying the
 /// resume cursor when one exists) and read the ack. Returns the
-/// server-assigned session id and the server's durable mutation watermark.
+/// server-assigned session id, the server's durable mutation watermark, and
+/// the server's schema version.
 /// Shared by the first connect and every resume.
 async fn exchange_handshake<T>(
     transport: &mut T,
     config: &ClientConfig,
     resume: Option<&Cursor>,
-) -> Result<(String, Option<u64>), ClientError>
+) -> Result<(String, Option<u64>, SchemaVersion), ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -487,7 +504,23 @@ where
         .map_err(|e| ClientError::Transport(e.to_string()))?
     {
         Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) => {
-            Ok((ack.session_id, ack.last_applied_seq))
+            // Server-gated staleness detection: when the server advertises a
+            // schema version, the client must present the same one. A client
+            // that declares none (empty) counts as stale against a versioned
+            // server, so a build that forgot to bake its version fails loudly
+            // instead of mis-parsing. An empty server version (a server that
+            // opts out) skips the check. This runs before any pending replay,
+            // so a stale build never pushes old-schema changesets to a
+            // new-schema server.
+            if !ack.schema_version.hash().is_empty()
+                && config.schema_version.hash() != ack.schema_version.hash()
+            {
+                return Err(ClientError::SchemaOutdated {
+                    client: config.schema_version.clone(),
+                    server: ack.schema_version,
+                });
+            }
+            Ok((ack.session_id, ack.last_applied_seq, ack.schema_version))
         }
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
@@ -518,6 +551,10 @@ pub struct ConnettoConnection<T: Transport> {
     last_cursor: Option<Cursor>,
     next_seq: u64,
     session_id: String,
+    /// The server's schema version from the handshake ack, kept so a relay can
+    /// forward it verbatim to its tabs and (Phase 7) a stale build can be
+    /// detected against the baked schema.
+    schema_version: SchemaVersion,
     /// Set by the commit hook whenever a write commits, so the driver knows
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
@@ -661,7 +698,7 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let (session_id, watermark) =
+        let (session_id, watermark, schema_version) =
             exchange_handshake(&mut transport, config, resume.as_ref()).await?;
 
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
@@ -672,6 +709,7 @@ where
             last_cursor: resume,
             next_seq,
             session_id,
+            schema_version,
             dirty,
             changed,
             transaction_state: AnsiTransactionManager::default(),
@@ -700,10 +738,11 @@ where
     /// keeps its previous (dead) transport in that case, so a caller can try
     /// again with another one.
     pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
-        let (session_id, watermark) =
+        let (session_id, watermark, schema_version) =
             exchange_handshake(&mut transport, &self.config, self.last_cursor.as_ref()).await?;
         self.transport = transport;
         self.session_id = session_id;
+        self.schema_version = schema_version;
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
         self.reconcile_pending(watermark).await?;
@@ -746,6 +785,12 @@ where
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The server's schema version from the handshake ack.
+    #[must_use]
+    pub fn schema_version(&self) -> &SchemaVersion {
+        &self.schema_version
     }
 
     /// The application's local connection, for ordinary diesel reads and writes.

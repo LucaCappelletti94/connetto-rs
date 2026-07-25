@@ -82,6 +82,7 @@ async fn full_sync_loop_in_a_dedicated_worker() {
     let config = ClientConfig {
         client_id: format!("wasm-smoke-{}", unique_id()),
         auth_token: "token".to_owned(),
+        schema_version: connetto_wasm_smoke::demo_schema_version(),
     };
     let mut conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await

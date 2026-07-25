@@ -14,7 +14,6 @@ use super::{
     handshake::{Handshake, HandshakeAck},
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
-    schema::SchemaUpdate,
     subscription::{SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
 };
 
@@ -53,10 +52,6 @@ pub enum ControlMessage {
 
     /// Server pushes an aggregate result update (JSON payload).
     AggregateUpdate(AggregateUpdate),
-
-    /// Server announces a schema change. The matching bulk frame (when
-    /// [`SchemaUpdate::payload_follows`] is true) carries the schema blob.
-    SchemaUpdate(SchemaUpdate),
 
     /// Server tells the client the subscription cannot resume incrementally.
     FullResyncRequired(FullResyncRequired),

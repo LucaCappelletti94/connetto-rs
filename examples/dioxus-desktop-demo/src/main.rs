@@ -32,6 +32,10 @@ use tokio::sync::mpsc;
 /// in CONNETTO_PG_DDL.
 const REPLICA_TEMPLATE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/replica-template.sqlite"));
+/// The Postgres schema source the demo server must be started with
+/// (`CONNETTO_PG_DDL`). Hashing it yields the version the server advertises, so
+/// this build presents a matching version at handshake.
+const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
 diesel::table! {
     orders (id) {
@@ -125,6 +129,7 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
     let config = ClientConfig {
         client_id: format!("desktop-demo-{}", std::process::id()),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
     };
     let conn = ConnettoConnection::connect_with_replica_template(
         transport,

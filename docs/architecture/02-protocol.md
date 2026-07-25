@@ -70,7 +70,6 @@ Open question — see below. Candidates:
 | Message | Purpose |
 |---|---|
 | `HandshakeAck` | Session accepted: assigned session ID, current server LSN, schema version |
-| `SchemaUpdate` | New schema version: full schema payload |
 | `SnapshotBegin` | Start of initial snapshot for a subscription |
 | `SnapshotRows` | Batch of rows for the ongoing snapshot |
 | `SnapshotEnd` | Snapshot complete for a subscription; includes the LSN at which snapshot was taken |

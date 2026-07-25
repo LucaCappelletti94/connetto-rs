@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::SchemaVersion;
 use connetto_core::auth::AuthContext;
 use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
@@ -169,7 +170,10 @@ async fn main() -> Result<()> {
         auth,
         connector,
         write,
-        SessionConfig::default(),
+        SessionConfig {
+            schema_version: SchemaVersion::from_source(&pg_ddl),
+            ..SessionConfig::default()
+        },
     );
     run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
 }

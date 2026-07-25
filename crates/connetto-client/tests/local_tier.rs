@@ -142,6 +142,7 @@ async fn connect_with_tier(
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut client = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await

@@ -197,6 +197,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let config = ClientConfig {
         client_id: "reconnect-live".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -298,6 +299,7 @@ async fn offline_write_reflushes_after_resume() {
     let config = ClientConfig {
         client_id: "reconnect-write".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -386,6 +388,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let config = ClientConfig {
         client_id: "restart-first".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let conn = ConnettoConnection::connect(transport, &replica_path, SQLITE_DDL, &config, None)
         .await
@@ -429,6 +432,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let config = ClientConfig {
         client_id: "restart-second".to_owned(),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let conn = ConnettoConnection::connect_existing(transport, &replica_path, &config, None)
         .await

@@ -76,6 +76,7 @@ async fn opfs_template_boot_live_query_and_persistence() {
     let config = ClientConfig {
         client_id: format!("wasm-opfs-{}", unique_id()),
         auth_token: "token".to_owned(),
+        schema_version: connetto_wasm_smoke::demo_schema_version(),
     };
     let conn = connect(&config).await;
 

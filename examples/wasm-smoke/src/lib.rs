@@ -14,6 +14,20 @@ pub use connetto_web::{
     LocalTier, PortTransport, PortTransportError, RelayError, RelayHub, TabId, locks,
 };
 
+/// The Postgres schema source the demo server is launched with
+/// (`CONNETTO_PG_DDL_FILE`). Hashing it yields the version the server
+/// advertises, so a client that bakes the same source presents a matching
+/// version at handshake.
+pub const DEMO_SCHEMA_SQL: &str = include_str!("../schema.sql");
+
+/// The schema version this build was compiled against, for staleness detection.
+/// Every client that reaches the real demo server (directly or through the
+/// relay) presents this so its handshake is not rejected as stale.
+#[must_use]
+pub fn demo_schema_version() -> connetto_core::SchemaVersion {
+    connetto_core::SchemaVersion::from_source(DEMO_SCHEMA_SQL)
+}
+
 /// Resolve the co-located `db-worker.js` bootstrap script beside the
 /// wasm-bindgen glue module the smoke harness serves.
 fn worker_url(glue_url: &str) -> String {
@@ -97,6 +111,7 @@ pub mod workers {
             upstream_query: DEMO_QUERY,
             hub_meta_name: "connetto-hub-meta.sqlite",
             client_id_prefix: "db-worker",
+            schema_version: crate::demo_schema_version(),
         })
         .await
     }

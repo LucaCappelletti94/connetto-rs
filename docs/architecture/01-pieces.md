@@ -112,8 +112,8 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Schema extractor | Derives a client-facing schema from PostgreSQL catalog (tables, columns, types, PKs) filtered to tables the client can access. |
 | Schema version envelope | Wraps schema with a content hash / version number. |
-| Schema push | Server sends schema on connect and whenever it changes. |
-| Client schema applier | Receives schema, diffs against local SQLite schema, runs migrations. |
+| Schema version handshake | Server advertises the schema version in `HandshakeAck`. The client never fetches or applies a schema at runtime. |
+| Stale-build detection | The client compares the advertised version against the version it was baked with. A mismatch means this app build is stale and must reload, since the schema is compiled in and the client runs no DDL. Reload boots a fresh baked template and full-resyncs. |
 
 ---
 

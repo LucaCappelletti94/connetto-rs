@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{cursor::Cursor, schema::SchemaVersion};
+use crate::cursor::Cursor;
 
 /// Bulk-plane frames.
 ///
@@ -25,8 +25,6 @@ pub enum BulkMessage {
     /// [`crate::messages::mutation::MutationHeader`] control frame that
     /// immediately preceded it.
     MutationPatch(MutationPatch),
-    /// Schema payload accompanying a [`crate::messages::schema::SchemaUpdate`].
-    SchemaBlob(SchemaBlob),
 }
 
 /// Snapshot chunk for a subscription.
@@ -103,28 +101,6 @@ impl MutationPatch {
         Self {
             client_seq,
             patchset_zstd: patchset_zstd.into(),
-        }
-    }
-}
-
-/// Schema payload for the client to install.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchemaBlob {
-    /// Which schema version this payload realises.
-    pub version: SchemaVersion,
-    /// `Zstd`-compressed serialized schema payload. Encoding of the inner bytes
-    /// is a higher-layer concern (the server crate emits it, the client crate
-    /// consumes it). `connetto-core` just moves the bytes.
-    #[serde(with = "serde_bytes")]
-    pub blob_zstd: Vec<u8>,
-}
-
-impl SchemaBlob {
-    /// Build a schema blob from a version and already-compressed bytes.
-    pub fn new(version: SchemaVersion, blob_zstd: impl Into<Vec<u8>>) -> Self {
-        Self {
-            version,
-            blob_zstd: blob_zstd.into(),
         }
     }
 }

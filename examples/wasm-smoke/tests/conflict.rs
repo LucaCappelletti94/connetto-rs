@@ -111,7 +111,7 @@ async fn fake_upstream(mut server: LoopbackTransport, base: i64) {
             session_id: "conflict-upstream".to_owned(),
             session_token: "conflict".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::new("test", Vec::new()),
+            schema_version: SchemaVersion::default(),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -188,6 +188,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     let worker_config = ClientConfig {
         client_id: format!("conflict-worker-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
@@ -212,6 +213,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     let tab_config = ClientConfig {
         client_id: format!("conflict-tab-{base}"),
         auth_token: "token".to_owned(),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
     let mut tab = ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config, None)
         .await

@@ -32,7 +32,7 @@ Test-first, one functionality per session:
 
 | Frame | Direction | Direct server | Relay hub today | Parity phase |
 |---|---|---|---|---|
-| `Handshake` / `HandshakeAck` | both | full | served, but ack fields are placeholders (`session_id = "relay-..."`, `schema_version = "relay"`) | Phase 6 |
+| `Handshake` / `HandshakeAck` | both | full | served: the ack forwards the upstream server's real `schema_version` (the worker learned it at its own handshake), with a stable per-tab `session_id = "relay-{client_id}"` | done |
 | `Subscribe` / `Unsubscribe` (row) | client -> server | full | served from the worker replica and the tier | done |
 | `SnapshotBegin` / `SnapshotPatch` / `SnapshotEnd` | server -> client | full | sent by `serve_snapshot` | done |
 | `LivePatch` | server -> client | full | routed by table in `handle_worker_event` | done |
@@ -44,14 +44,14 @@ Test-first, one functionality per session:
 | `MutationConflict` | server -> client | full | served: an upstream `ClientEvent::MutationConflict` maps back to the owning tab as a `MutationConflict`, distinct from a reject | done |
 | `NonFatalError` | server -> client | full | served: a tab subscription the hub cannot serve draws a scoped `NonFatalError` and the worker's own `NonFatal` maps back to the owning tab subscriptions, instead of a tab teardown | done |
 | `AckCredits` and delivery credits | both | server enforces backpressure (`session.rs` `flush`/`credits`) | served: each tab has a credit window (`INITIAL_CREDITS`), bulk frames queue when it reaches zero and drain on `AckCredits`, control frames never gated | done |
-| `SchemaUpdate` / `SchemaBlob` | server -> client | dead: never sent or handled, contradicts the no-runtime-DDL model | not relayed | Remove, see schema section |
+| `SchemaUpdate` / `SchemaBlob` | server -> client | removed: contradicted the no-runtime-DDL model, never sent or handled | deleted from `connetto-core` | done |
 | `Ping` / `Pong` | both | full | served | done |
 
 ## Phases
 
 Ordered by user-facing severity. Each is a session.
 
-Progress: Phases 0 through 5 are landed and green (platform baseline, aggregates, full resync, conflict distinction, non-fatal errors, flow control). Phase 6 (handshake ack alignment) is next, then Phase 7 (schema-version detection plus the `SchemaUpdate`/`SchemaBlob` removal).
+Progress: Phases 0 through 7 are landed and green (platform baseline, aggregates, full resync, conflict distinction, non-fatal errors, flow control, handshake alignment, schema-version detection). The relay reaches protocol parity with the direct server, and the dead `SchemaUpdate`/`SchemaBlob` surface is removed.
 
 ### Phase 1: aggregate subscriptions through the relay
 
@@ -147,6 +147,8 @@ Acceptance. The hub honors the credit window per tab, matching the server's back
 
 ### Phase 6: handshake ack and schema-version alignment
 
+Status: landed. `ConnettoConnection` now records the server's `schema_version` from its own `HandshakeAck` (`exchange_handshake` returns it, stored and exposed via `schema_version()`), and the relay stamps `worker.schema_version()` into every tab's ack instead of the `SchemaVersion::new("relay", ...)` placeholder, so a tab behind the relay reads the same version a direct client would. This is the propagation Phase 7's staleness detection depends on. Covered by `examples/wasm-smoke/tests/handshake.rs`, a raw frame-level tab asserting its `HandshakeAck.schema_version` equals a distinctive upstream version and is not the placeholder.
+
 Functionality. The handshake ack advertises `session_id`, `session_token`, `schema_version`, and `initial_credits`. A tab should not be able to distinguish a relay ack from a server ack in any field the client acts on.
 
 Native reference. `connetto-server` sends a real `schema_version` (`SessionConfig`) and session identity.
@@ -162,6 +164,8 @@ TDD session. Failing test first: a browser or loopback test asserting the tab's 
 Acceptance. A tab's ack fields match the upstream server's for every field the client reads.
 
 ### Phase 7: schema-version mismatch detection and reload
+
+Status: landed. `SchemaVersion` is a content-hash newtype (the `id` label was dropped as it was never read; a short hex `Display` keeps errors legible). `connetto-core` gained `schema_hash` (SHA-256 over newline-normalized schema source) and `SchemaVersion::from_source`, the shared fingerprint both sides compute from the same Postgres source. The server derives its `schema_version` from `pg_ddl` instead of a placeholder. `ClientConfig` gained `schema_version` (the build's baked version), and `exchange_handshake` compares it against the ack before any pending replay, returning `ClientError::SchemaOutdated` so a stale build fails at the door and never pushes old-schema changesets. Detection is server-gated and mandatory: once the server advertises a version, a client must present a matching one (an undeclared, empty client is stale); only a server that advertises no version opts out. The demos and every real-server test bake their version from the same `schema.sql` the server reads, threaded to the DB worker through `DbWorkerConfig`. The dead `SchemaUpdate`/`SchemaBlob` surface is deleted. Covered by `connetto-client/tests/schema_detection.rs` (native) and `examples/wasm-smoke/tests/schema.rs` (relay transparency).
 
 Functionality. Schema evolution in connetto is not a runtime migration. The schema is baked into the app at build time (`build.rs` translates the source document through pg2sqlite into a template) and the client never runs DDL at runtime, which is exactly what makes the wasm and OPFS boot work (`connect_with_replica_template` writes bytes, it does not execute DDL). So a schema change is a new app build, that is a redeploy, that is a reload for the user. The right runtime behavior is detection, not migration: compare the client's baked schema version against the server's and, on a mismatch, signal that this app build is stale and must reload.
 
@@ -180,6 +184,8 @@ Acceptance. A client with a stale baked schema is told to reload rather than sil
 ## Removed protocol surface: `SchemaUpdate` and `SchemaBlob`
 
 `ControlMessage::SchemaUpdate` and `BulkMessage::SchemaBlob` are dead surface that contradicts the implemented model. They describe a runtime schema push plus a client "schema applier that runs migrations", which appears only in the early architecture docs (`docs/architecture/01-pieces.md`, `02-protocol.md`, `06-reconnect.md`), written before the build-time-baked-template decision. Grep confirms neither is ever sent or handled. Runtime DDL migration is incompatible with the baked-template, no-DDL client (and with the wasm build), so this is not a feature to build later, it is surface to delete. This plan removes `SchemaUpdate`/`SchemaBlob` from `connetto-core` and corrects the three stale architecture docs to describe detection plus reload (Phase 7) instead of runtime migration. There is nothing to relay.
+Status: done. `ControlMessage::SchemaUpdate`, `BulkMessage::SchemaBlob`, their structs, and re-exports are deleted from `connetto-core`, and the three architecture docs (`01-pieces.md`, `02-protocol.md`, `06-reconnect.md`) now describe detection plus reload.
+
 
 ## Sequencing
 

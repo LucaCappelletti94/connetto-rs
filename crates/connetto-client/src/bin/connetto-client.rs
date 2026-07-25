@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
     let config = ClientConfig {
         client_id: env_or("CONNETTO_CLIENT_ID", "anonymous"),
         auth_token: env_or("CONNETTO_TOKEN", ""),
+        schema_version: connetto_core::SchemaVersion::default(),
     };
 
     // The ws URL's authority is also the TCP target.
