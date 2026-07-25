@@ -52,5 +52,5 @@ pub use session::{
 pub use snapshot::PgSnapshotSource;
 pub use snapshot::{SnapshotError, encode_json_rows};
 #[cfg(feature = "pg-async")]
-pub use write_target::{PgWriteTarget, pg_write_target};
+pub use write_target::{PgWriteTarget, ProvisionError, pg_write_target, provision_watermark_table};
 pub use write_target::{SqliteWriteTarget, WriteTarget, sqlite_write_target};

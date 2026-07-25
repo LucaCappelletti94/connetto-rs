@@ -237,6 +237,9 @@ async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
 async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     drop_slot(pool).await;
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
+    // Stale per-client watermarks from a previous run would suppress
+    // replayed mutations (the server dedupes by them), so they reset too.
+    exec(pool, "DROP TABLE IF EXISTS _connetto_mutations").await;
     exec(pool, "DROP PUBLICATION IF EXISTS connetto_pub").await;
     exec(pool, PG_DDL).await;
     exec(pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
@@ -475,6 +478,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     drop_slot(&admin).await;
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
+        "DROP TABLE IF EXISTS _connetto_mutations",
         "DROP PUBLICATION IF EXISTS connetto_pub",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
          THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
@@ -482,8 +486,17 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         "ALTER TABLE owned REPLICA IDENTITY FULL",
         "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
+        // The exactly-once watermark table is provisioned by the admin, like
+        // any other DDL: the restricted writer role cannot CREATE in schema
+        // public on Postgres 15+, and must not need to. The server's own
+        // CREATE TABLE IF NOT EXISTS short-circuits on the existing table,
+        // and the writer only needs DML on it.
+        "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
+         client_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+         PRIMARY KEY (user_id, client_id))",
         "GRANT USAGE ON SCHEMA public TO app_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",
+        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
         "CREATE PUBLICATION connetto_pub FOR TABLE owned",
         "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')",
     ] {

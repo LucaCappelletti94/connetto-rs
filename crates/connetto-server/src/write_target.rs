@@ -165,8 +165,10 @@ impl WriteTarget {
     }
 
     /// The highest `client_seq` durably applied for `(ctx, client_id)`, read
-    /// at handshake so the ack can carry it. Ensures the watermark table
-    /// exists, so every later upsert runs against a known schema.
+    /// at handshake so the ack can carry it. The SQLite path ensures the
+    /// watermark table exists inline (one privileged connection, no
+    /// concurrency); the Postgres path requires it provisioned up front, see
+    /// [`provision_watermark_table`].
     pub(crate) async fn last_applied(
         &self,
         ctx: &AuthContext,
@@ -246,7 +248,7 @@ async fn commit_sqlite(
 }
 
 #[cfg(feature = "pg-async")]
-pub use pg::{PgWriteTarget, pg_write_target};
+pub use pg::{PgWriteTarget, ProvisionError, pg_write_target, provision_watermark_table};
 
 #[cfg(feature = "pg-async")]
 mod pg {
@@ -295,6 +297,38 @@ mod pg {
         fn from(target: PgWriteTarget) -> Self {
             Self::Postgres(Box::new(target))
         }
+    }
+
+    /// A failure while provisioning the watermark table.
+    #[derive(Debug, thiserror::Error)]
+    pub enum ProvisionError {
+        /// Checking a connection out of the pool failed.
+        #[error("pool checkout: {0}")]
+        Pool(#[from] diesel_async::pooled_connection::bb8::RunError),
+        /// The DDL failed.
+        #[error(transparent)]
+        Db(#[from] diesel::result::Error),
+    }
+
+    /// Create the exactly-once watermark table if missing, through a
+    /// connection with DDL privilege (the admin pool), once at startup.
+    ///
+    /// Deliberately kept out of the handshake path: a restricted writer role
+    /// cannot `CREATE` in schema `public` on Postgres 15 and later (the
+    /// check fires even when the table already exists), and concurrent
+    /// handshakes racing `CREATE TABLE IF NOT EXISTS` collide on
+    /// `pg_type_typname_nsp_index`. The writer role itself only needs
+    /// `SELECT, INSERT, UPDATE` on the table.
+    ///
+    /// # Errors
+    ///
+    /// [`ProvisionError`] when the pool checkout or the DDL fails.
+    pub async fn provision_watermark_table(
+        pool: &Pool<AsyncPgConnection>,
+    ) -> Result<(), ProvisionError> {
+        let mut conn = pool.get().await?;
+        sql_query(WATERMARK_DDL).execute(&mut conn).await?;
+        Ok(())
     }
 
     /// A failure inside the apply transaction, mapped to a [`WriteError`] after
@@ -401,10 +435,6 @@ mod pg {
             let mut conn = self
                 .pool
                 .get()
-                .await
-                .map_err(|err| WriteError::Backend(err.to_string()))?;
-            sql_query(WATERMARK_DDL)
-                .execute(&mut conn)
                 .await
                 .map_err(|err| WriteError::Backend(err.to_string()))?;
             let rows: Vec<WatermarkRow> = sql_query(

@@ -170,6 +170,8 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     let admin = pool_for(&url).await;
     let setup: Vec<String> = vec![
         "DROP TABLE IF EXISTS notes CASCADE".to_owned(),
+        // Stale per-client watermarks would suppress replayed uploads.
+        "DROP TABLE IF EXISTS _connetto_mutations".to_owned(),
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
          THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$"
             .to_owned(),
@@ -183,6 +185,17 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     for stmt in setup {
         exec(&admin, &stmt).await;
     }
+    // The watermark table is provisioned by the admin, like a deployment
+    // would: the restricted writer role cannot CREATE in schema public and
+    // only needs DML on it.
+    connetto_server::provision_watermark_table(&admin)
+        .await
+        .expect("provision watermark table");
+    exec(
+        &admin,
+        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
+    )
+    .await;
 
     let writer_pool = pool_for(&with_user(&url, "app_writer", "app_writer")).await;
     let materializer = Materializer::with_write_catalog(
@@ -207,12 +220,16 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     // The session's identity is the handshake client id, bound into app.user_id.
     handshake(&mut client, "alice").await;
 
-    // Alice may insert a row she owns: it lands, and the barrier pong (not a
-    // reject) confirms it applied.
+    // Alice may insert a row she owns: it lands, acknowledged by the durable
+    // apply ack, and the barrier pong confirms nothing else was in flight.
     upload(&mut client, 1, insert_changeset(1, "alice", "mine", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
+        other => panic!("owned insert should apply, got {other:?}"),
+    }
     match barrier(&mut client, 1).await {
         ControlMessage::Pong(_) => {}
-        other => panic!("owned insert should apply, got {other:?}"),
+        other => panic!("expected pong after the apply ack, got {other:?}"),
     }
 
     // Alice may not insert a row owned by someone else: the policy's WITH CHECK

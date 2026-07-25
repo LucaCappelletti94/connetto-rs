@@ -14,9 +14,13 @@
 //!   `connetto_slot`).
 //! - `CONNETTO_PUBLICATION`: publication the slot follows (default
 //!   `connetto_pub`).
-//! - `CONNETTO_READER_URL`: optional non-superuser conninfo. When set, snapshots
-//!   and read authorization run under Postgres Row-Level Security as that role.
-//!   Otherwise the server authorizes reads permissively.
+//! - `CONNETTO_READER_URL`: optional non-superuser conninfo. When set, snapshots,
+//!   read authorization, and mutation applies run under Postgres Row-Level
+//!   Security as that role. Otherwise the server authorizes reads permissively.
+//!   The role needs `SELECT, INSERT, UPDATE` on `_connetto_mutations` (the
+//!   exactly-once watermark table), provisioned by the admin like any other
+//!   DDL, since a restricted role cannot `CREATE` in schema `public` on
+//!   Postgres 15 and later.
 //!
 //! The publication and replication slot (with the `pgoutput` plugin) must
 //! already exist. The server does not create them.
@@ -128,6 +132,12 @@ async fn main() -> Result<()> {
     let slot = env_or("CONNETTO_SLOT", "connetto_slot");
     let publication = env_or("CONNETTO_PUBLICATION", "connetto_pub");
     let pool = build_pool(&database_url).await?;
+    // The exactly-once watermark table is provisioned here, under the admin
+    // role: the write pool may be a restricted RLS role that cannot (and
+    // must not need to) CREATE in schema public.
+    connetto_server::provision_watermark_table(&pool)
+        .await
+        .map_err(|err| anyhow!("provisioning the watermark table: {err}"))?;
     let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
