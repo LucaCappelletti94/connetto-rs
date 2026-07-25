@@ -2,7 +2,7 @@
 
 ## Status
 
-Resolved in the crates.io `0.7.1` release. `TableSchema<S>` implements `SchemaWithPK` (`parser.rs:177`, the header wraps across two lines), alongside the `SchemaWithPK::primary_key_columns()` default and the `ChangesetOp`/`PatchsetOp::primary_key()` op accessors from the companion PR. `op.primary_key()` works on parsed diffs, so both connetto crates consume `0.7.1` directly. Kept as the rationale for the change.
+Resolved in the crates.io `0.7.1` release. `TableSchema<S>` implements `SchemaWithPK` (`parser.rs:177`, the header wraps across two lines), alongside the `SchemaWithPK::primary_key_columns()` default and the `ChangesetOp`/`PatchsetOp::primary_key()` op accessors from the companion PR. `op.primary_key()` works on parsed diffs, so both connetto crates now consume `0.8.0` workspace-wide. Kept as the rationale for the change.
 
 ## The gap
 

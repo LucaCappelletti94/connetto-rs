@@ -44,7 +44,7 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.7.1", default-features = false }
+sqlite-diff-rs = { version = "0.8.0", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
@@ -72,3 +72,7 @@ anyhow.workspace = true
 connetto-server.path = "../connetto-server"
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
+# The RLS name-mapping characterization test translates a policy-bearing
+# Postgres schema at test time and reads the logical to physical table map
+# through `translation_manifest`. Rev pinned to the manifest merge.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "f122e7c25fbb46c654108a0357b1a5f70128b43e", default-features = false, features = ["std"] }

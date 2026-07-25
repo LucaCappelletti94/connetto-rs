@@ -40,8 +40,9 @@ connetto-core = { workspace = true, features = ["native-transport"] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
 # Reverse translation of the client's SQLite-dialect subscription query into the
 # Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).
-# Pinned to the rev on reverse-translate-placeholders that adds that mapping.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "ee65e3095f608e10dd9b97c2459c0d0f240573a3", default-features = false, features = ["std"] }
+# Pinned to the translation-manifest merge (PR #45), which also carries the
+# read-only deny triggers and the reverse-translate placeholder mapping.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "f122e7c25fbb46c654108a0357b1a5f70128b43e", default-features = false, features = ["std"] }
 tokio.workspace = true
 thiserror.workspace = true
 diesel.workspace = true
@@ -57,7 +58,7 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.7.1", default-features = false }
+sqlite-diff-rs = { version = "0.8.0", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # Synchronous lock guarding the SQLite write target (never held across .await).

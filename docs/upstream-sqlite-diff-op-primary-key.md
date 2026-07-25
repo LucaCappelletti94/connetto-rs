@@ -2,7 +2,7 @@
 
 ## Status
 
-Resolved in the crates.io `0.7.1` release. `ChangesetOp::primary_key()` and `PatchsetOp::primary_key()` shipped (`builders/view.rs`), with the old-first UPDATE rule below, and they compose with the companion PR's `impl SchemaWithPK for TableSchema`, so `op.primary_key()` works on parsed diffs. connetto consumes `0.7.1` directly. Kept as the rationale for the change.
+Resolved in the crates.io `0.7.1` release. `ChangesetOp::primary_key()` and `PatchsetOp::primary_key()` shipped (`builders/view.rs`), with the old-first UPDATE rule below, and they compose with the companion PR's `impl SchemaWithPK for TableSchema`, so `op.primary_key()` works on parsed diffs. connetto now consumes `0.8.0` workspace-wide. Kept as the rationale for the change.
 
 ## The gap
 

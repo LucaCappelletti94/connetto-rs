@@ -115,6 +115,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "barnes-hut-tree"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e722517096156bfb9854089d365d0066892b613ee79579b570e4585687bb52"
+dependencies = [
+ "num-traits",
+ "rayon",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +358,7 @@ dependencies = [
  "connetto-server",
  "diesel",
  "diesel-sqlite-session",
+ "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e)",
  "serde",
  "serde_json",
  "sqlite-diff-rs",
@@ -401,7 +412,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "parking_lot",
- "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=ee65e3095f608e10dd9b97c2459c0d0f240573a3)",
+ "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e)",
  "rmp-serde",
  "serde_json",
  "sqlite-diff-rs",
@@ -514,6 +525,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -1308,8 +1338,9 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#ccc7cba3c0301626406cf495c0f280d8e9c52fe3"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#59f580bcf10f357e81f606db693dfc49f20ee863"
 dependencies = [
+ "barnes-hut-tree",
  "bitvec",
  "hashbrown 0.17.1",
  "lender",
@@ -2157,7 +2188,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#e1351e528bc7d36ef991fefbd1fc6ee7a1fac85b"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#f122e7c25fbb46c654108a0357b1a5f70128b43e"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -2167,7 +2198,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?rev=ee65e3095f608e10dd9b97c2459c0d0f240573a3#ee65e3095f608e10dd9b97c2459c0d0f240573a3"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?rev=f122e7c25fbb46c654108a0357b1a5f70128b43e#f122e7c25fbb46c654108a0357b1a5f70128b43e"
 dependencies = [
  "git2",
  "sql-traits",
@@ -2479,6 +2510,26 @@ name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "recursive"
@@ -2894,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e9e31c3063f7e89bcea7afb00005bd34a3c46fa3"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7f3598add255a4559d7a5b9b6c4552d01cddd980"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -2914,9 +2965,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d15c51e159cdbeb2398a1ab18bd977684518f77af325a7b0051356f7ee12e42d"
+checksum = "ee509dca2ae4b843913bd7581916bb1f6c679ab06c068186b2c71ae1fd467037"
 dependencies = [
  "diesel",
  "diesel-async",
@@ -3005,7 +3056,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=d999fbd7b70e5e33af39a59aee8398caadc31bd7#d999fbd7b70e5e33af39a59aee8398caadc31bd7"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=5858f50707995e288639a666cd301eb7b082dd65#5858f50707995e288639a666cd301eb7b082dd65"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -3116,7 +3167,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
