@@ -43,7 +43,11 @@ pub mod leader {
     /// Join the topology, spawning `db-worker.js` from beside `glue_url`.
     #[must_use]
     pub fn join(leader_lock: &str, glue_url: &str) -> Membership {
-        connetto_web::leader::join(leader_lock, &super::worker_url(glue_url), glue_url)
+        connetto_web::leader::join(
+            leader_lock,
+            glue_url,
+            connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url)),
+        )
     }
 }
 
@@ -90,7 +94,10 @@ pub mod workers {
     ///
     /// The `Worker` constructor's error when the worker cannot be created.
     pub fn spawn_db_worker(glue_url: &str) -> Result<Worker, JsValue> {
-        connetto_web::workers::spawn_db_worker(&super::worker_url(glue_url), glue_url)
+        connetto_web::workers::spawn_db_worker(
+            glue_url,
+            &connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url)),
+        )
     }
 
     /// DB worker entry point: boot the connetto DB tier with the smoke config.

@@ -1,0 +1,7 @@
+[build]
+target = "index.html"
+
+[serve]
+# 8080 is taken on this machine, and trunk does not auto-increment, so pin a
+# free port. Watch the trunk banner for the served URL.
+port = 9911

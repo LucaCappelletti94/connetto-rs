@@ -1,4 +1,4 @@
-//! Dioxus web demo of the connetto browser topology, end to end.
+//! Yew web demo of the connetto browser topology, end to end.
 //!
 //! Every window runs the same app. One window wins the Web Locks leader
 //! election and spawns the dedicated DB worker, the only browsing context kind
@@ -17,21 +17,24 @@
 //! The DB worker shares this same wasm module: [`db_worker_boot`] is a
 //! `wasm_bindgen` export the worker bootstrap (`assets/db-worker.js`) calls.
 //! The app's [`main`] returns early in a worker context, where there is no
-//! `Window` and Dioxus cannot run.
+//! `Window` and Yew cannot run.
 //!
 //! Run against the demo stack (server on 7777, `connetto-demo-pg` on 55456):
-//! `dx serve` from this directory, then open the served URL in several windows.
+//! `trunk serve` from this directory, then open the served URL in several
+//! windows.
 
 use core::sync::atomic::{AtomicI64, Ordering};
+use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection};
-use connetto_dioxus::use_live;
 use connetto_web::{BroadcastTransport, leader, locks, workers};
+use connetto_yew::use_live;
 use diesel::prelude::*;
-use dioxus::prelude::*;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::HtmlInputElement;
+use yew::prelude::*;
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = BroadcastTransport;
@@ -115,10 +118,10 @@ fn window_band() -> i64 {
 }
 
 fn main() {
-    // The dedicated DB worker imports this same wasm module: the leader spawns
-    // it pointed straight at the dx glue, which auto-initializes and runs this
-    // `main`. A worker has no `Window`, so boot the DB tier there instead of
-    // launching the UI.
+    // The dedicated DB worker runs this same wasm module: connetto-web spawns
+    // it from a generated bootstrap that initializes the wasm, and init runs
+    // this `main`. A worker has no `Window`, so boot the DB tier there instead
+    // of rendering the UI.
     if web_sys::window().is_none() {
         spawn_local(async {
             if let Err(err) = run_db_worker().await {
@@ -127,7 +130,7 @@ fn main() {
         });
         return;
     }
-    dioxus::launch(App);
+    yew::Renderer::<App>::new().render();
 }
 
 /// Boot the connetto DB tier in the worker context with the demo config.
@@ -152,10 +155,10 @@ async fn run_db_worker() -> Result<(), JsValue> {
 }
 
 /// The served URL of this app's wasm-bindgen glue module, recovered from the
-/// wasm fetch the page already performed. Under `dx serve` the glue is
-/// `/wasm/<name>.js` beside `/wasm/<name>_bg.wasm`, so the wasm resource entry
-/// names the glue by suffix swap. Only the main thread can see these entries,
-/// which is why the worker receives the glue URL as a spawn parameter.
+/// wasm fetch the page already performed. Under trunk the glue is
+/// `/<name>-<hash>.js` beside `/<name>-<hash>_bg.wasm`, so the wasm resource
+/// entry names the glue by suffix swap. Only the main thread can see these
+/// entries, which is why the worker receives the glue URL as a spawn parameter.
 fn glue_url() -> String {
     let found = js_sys::eval(
         r#"performance.getEntriesByType("resource").map((e) => e.name).find((n) => n.endsWith("_bg.wasm"))"#,
@@ -186,9 +189,9 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let glue = glue_url();
     let client_id = format!("tab-{}", js_sys::Date::now());
 
-    // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
-    // import and `main` boots the tier, so no separate bootstrap is needed.
-    let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Glue);
+    // Trunk's glue does not self-initialize, so connetto-web spawns the worker
+    // from a generated bootstrap that imports the glue and runs init.
+    let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Generated);
     workers::await_db_worker_ready().await;
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
@@ -260,64 +263,87 @@ const CSS: &str = r"
     .row { display: flex; gap: 6px; margin-top: 8px; }
 ";
 
-fn App() -> Element {
-    let mut client_slot = use_signal(|| None::<ConnettoClient<Tab>>);
-    let mut status = use_signal(|| "connecting to the connetto stack".to_owned());
-    // Provided so the panes read the client and status without prop plumbing
-    // through non-`PartialEq` component boundaries.
-    use_context_provider(|| client_slot);
-    use_context_provider(|| status);
+/// A cheaply clonable, identity-compared client handle for props.
+///
+/// One window creates exactly one client and never replaces it, so pointer
+/// identity is the right equality: [`Dashboard`] mounts once with it and
+/// re-renders from its own live state, not from a prop change.
+#[derive(Clone)]
+struct ClientHandle(Rc<ConnettoClient<Tab>>);
 
-    // The boot tokens live as long as the app: dropping them on page close
-    // resigns leadership and frees the tab lock, which reaps this tab.
-    let boot_hold = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None::<Boot>)));
-    use_hook(move || {
-        let boot_hold = boot_hold.clone();
-        spawn(async move {
-            match boot_window().await {
-                Ok(boot) => {
-                    let mut events = boot.client.events();
-                    client_slot.set(Some(boot.client.clone()));
-                    status.set("connected".to_owned());
-                    *boot_hold.borrow_mut() = Some(boot);
-                    while let Ok(event) = events.recv().await {
-                        if let Some(label) = status_label(&event) {
-                            status.set(label);
-                        }
-                    }
-                }
-                Err(err) => status.set(format!("boot failed: {err:?}")),
-            }
-        });
-    });
-
-    let ready = client_slot.read().is_some();
-    rsx! {
-        style { {CSS} }
-        div { class: "wrap",
-            h1 { "connetto web demo" }
-            p { class: "status", "status: " {status} }
-            if ready {
-                Dashboard {}
-            } else {
-                p { "Connecting to the DB worker and the connetto stack..." }
-            }
-        }
+impl PartialEq for ClientHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
     }
 }
 
-#[component]
-fn Dashboard() -> Element {
-    let client = use_context::<Signal<Option<ConnettoClient<Tab>>>>()
-        .read()
-        .clone()
-        .expect("Dashboard mounts only once the client is ready");
+#[function_component(App)]
+fn app() -> Html {
+    let client = use_state(|| None::<ClientHandle>);
+    let status = use_state(|| "connecting to the connetto stack".to_owned());
+    // The boot tokens live as long as the app: dropping them on page close
+    // resigns leadership and frees the tab lock, which reaps this tab. The App
+    // is the root and never unmounts, so the event-listener task holding this
+    // ref for the page's life is intended.
+    let boot_hold = use_mut_ref(|| None::<Boot>);
+    {
+        let client = client.clone();
+        let status = status.clone();
+        let boot_hold = boot_hold.clone();
+        use_effect_with((), move |()| {
+            spawn_local(async move {
+                match boot_window().await {
+                    Ok(boot) => {
+                        let mut events = boot.client.events();
+                        client.set(Some(ClientHandle(Rc::new(boot.client.clone()))));
+                        status.set("connected".to_owned());
+                        *boot_hold.borrow_mut() = Some(boot);
+                        while let Ok(event) = events.recv().await {
+                            if let Some(label) = status_label(&event) {
+                                status.set(label);
+                            }
+                        }
+                    }
+                    Err(err) => status.set(format!("boot failed: {err:?}")),
+                }
+            });
+            || ()
+        });
+    }
+
+    let dashboard = if let Some(handle) = &*client {
+        html! { <Dashboard client={handle.clone()} /> }
+    } else {
+        html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
+    };
+
+    html! {
+        <>
+            <style>{ CSS }</style>
+            <div class="wrap">
+                <h1>{ "connetto web demo (Yew)" }</h1>
+                <p class="status">{ format!("status: {}", &*status) }</p>
+                { dashboard }
+            </div>
+        </>
+    }
+}
+
+/// The client the dashboard drives, passed once from [`App`] when it is ready.
+#[derive(Properties, PartialEq)]
+struct DashboardProps {
+    client: ClientHandle,
+}
+
+#[function_component(Dashboard)]
+fn dashboard(props: &DashboardProps) -> Html {
+    let client = (*props.client.0).clone();
 
     let orders = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
 
-    let order_rows = orders.value().read().clone();
-    let note_rows = notes.value().read().clone();
+    let order_rows = orders.value();
+    let note_rows = notes.value();
     // Aggregates are computed from the live rows: the relay hub does not serve
     // aggregate subscriptions, and the tab mirror already holds every row the
     // subscription covers, so the derived totals converge as the rows do.
@@ -325,109 +351,115 @@ fn Dashboard() -> Element {
     let order_sum: i64 = order_rows.iter().map(|row| row.quantity).sum();
     let note_count = note_rows.len();
 
-    let orders_error = orders.error().read().clone();
-    let notes_error = notes.error().read().clone();
+    let note_text = use_state(String::new);
 
-    let mut note_text = use_signal(String::new);
+    let add_order = {
+        let client = client.clone();
+        Callback::from(move |_| {
+            let client = client.clone();
+            spawn_local(async move {
+                let id = fresh_id();
+                // Quantity in the subscription's window (> 0), varied for visibility.
+                let quantity = (id % 9 + 1).abs() * 5;
+                let result = client
+                    .with_conn(move |conn| {
+                        diesel::insert_into(orders::table)
+                            .values((orders::id.eq(id), orders::quantity.eq(quantity)))
+                            .execute(conn.conn())
+                    })
+                    .await;
+                if let Err(err) = result {
+                    web_sys::console::error_1(&format!("order insert failed: {err}").into());
+                }
+            });
+        })
+    };
 
-    let add_order_client = client.clone();
-    let save_note_client = client;
+    let on_note_input = {
+        let note_text = note_text.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            note_text.set(input.value());
+        })
+    };
 
-    rsx! {
-        div { class: "panes",
-            div { class: "pane",
-                h2 { "orders " span { class: "badge synced", "synced" } }
-                p { "count {order_count}, total quantity {order_sum}. Converges across every window through Postgres." }
-                div { class: "row",
-                    button {
-                        onclick: move |_| {
-                            let client = add_order_client.clone();
-                            spawn(async move {
-                                let id = fresh_id();
-                                // Quantity in the subscription's window (> 0), varied for visibility.
-                                let quantity = (id % 9 + 1).abs() * 5;
-                                let result = client
-                                    .with_conn(move |conn| {
-                                        diesel::insert_into(orders::table)
-                                            .values((orders::id.eq(id), orders::quantity.eq(quantity)))
-                                            .execute(conn.conn())
-                                    })
-                                    .await;
-                                if let Err(err) = result {
-                                    web_sys::console::error_1(&format!("order insert failed: {err}").into());
-                                }
-                            });
-                        },
-                        "Add order"
-                    }
-                }
-                if let Some(err) = orders_error {
-                    p { style: "color:#b00;", "orders error: {err}" }
-                }
-                table {
-                    thead { tr { th { "id" } th { "quantity" } } }
-                    tbody {
-                        for row in order_rows {
-                            tr { key: "{row.id}",
-                                td { "{row.id}" }
-                                td { "{row.quantity}" }
-                            }
-                        }
-                    }
-                }
+    let save_note = {
+        let client = client;
+        let note_text = note_text.clone();
+        Callback::from(move |_| {
+            let body = (*note_text).clone();
+            if body.is_empty() {
+                return;
             }
-            div { class: "pane",
-                h2 { "notes " span { class: "badge local", "device-only" } }
-                p { "count {note_count}. Converges across this device's windows through the DB worker, never the server." }
-                div { class: "row",
-                    input {
-                        r#type: "text",
-                        placeholder: "note body",
-                        value: "{note_text}",
-                        oninput: move |event| note_text.set(event.value()),
-                    }
-                    button {
-                        onclick: move |_| {
-                            let body = note_text.peek().clone();
-                            if body.is_empty() {
-                                return;
-                            }
-                            let client = save_note_client.clone();
-                            spawn(async move {
-                                let id = fresh_id();
-                                let result = client
-                                    .with_conn(move |conn| {
-                                        diesel::insert_into(notes::table)
-                                            .values((notes::id.eq(id), notes::body.eq(body)))
-                                            .execute(conn.conn())
-                                    })
-                                    .await;
-                                match result {
-                                    Ok(_) => note_text.set(String::new()),
-                                    Err(err) => {
-                                        web_sys::console::error_1(&format!("note save failed: {err}").into());
-                                    }
-                                }
-                            });
-                        },
-                        "Save note"
+            let client = client.clone();
+            let note_text = note_text.clone();
+            spawn_local(async move {
+                let id = fresh_id();
+                let result = client
+                    .with_conn(move |conn| {
+                        diesel::insert_into(notes::table)
+                            .values((notes::id.eq(id), notes::body.eq(body)))
+                            .execute(conn.conn())
+                    })
+                    .await;
+                match result {
+                    Ok(_) => note_text.set(String::new()),
+                    Err(err) => {
+                        web_sys::console::error_1(&format!("note save failed: {err}").into());
                     }
                 }
-                if let Some(err) = notes_error {
-                    p { style: "color:#b00;", "notes error: {err}" }
-                }
-                table {
-                    thead { tr { th { "id" } th { "body" } } }
-                    tbody {
-                        for row in note_rows {
-                            tr { key: "{row.id}",
-                                td { "{row.id}" }
-                                td { "{row.body}" }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+            });
+        })
+    };
+
+    let orders_error = orders.error().map(|err| {
+        html! { <p style="color:#b00;">{ format!("orders error: {err}") }</p> }
+    });
+    let notes_error = notes.error().map(|err| {
+        html! { <p style="color:#b00;">{ format!("notes error: {err}") }</p> }
+    });
+
+    html! {
+        <div class="panes">
+            <div class="pane">
+                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
+                <div class="row">
+                    <button onclick={add_order}>{ "Add order" }</button>
+                </div>
+                { orders_error.unwrap_or_default() }
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
+                    <tbody>
+                        { for order_rows.iter().map(|row| html! {
+                            <tr key={row.id.to_string()}>
+                                <td>{ row.id.to_string() }</td>
+                                <td>{ row.quantity.to_string() }</td>
+                            </tr>
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <p>{ format!("count {note_count}. Converges across this device's windows through the DB worker, never the server.") }</p>
+                <div class="row">
+                    <input type="text" placeholder="note body" value={(*note_text).clone()} oninput={on_note_input} />
+                    <button onclick={save_note}>{ "Save note" }</button>
+                </div>
+                { notes_error.unwrap_or_default() }
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
+                    <tbody>
+                        { for note_rows.iter().map(|row| html! {
+                            <tr key={row.id.to_string()}>
+                                <td>{ row.id.to_string() }</td>
+                                <td>{ row.body.clone() }</td>
+                            </tr>
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+        </div>
     }
 }

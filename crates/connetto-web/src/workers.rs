@@ -85,24 +85,147 @@ pub struct DbWorkerConfig {
     pub schema_version: connetto_core::SchemaVersion,
 }
 
-/// Page side, leader only: spawn the dedicated DB worker.
-///
-/// `worker_url` is the served URL of the `db-worker.js` bootstrap script, and
-/// `glue_url` names the wasm-bindgen glue module that script imports. They are
-/// separate because the bootstrap script and the wasm-bindgen glue need not be
-/// co-located (a bundler may hash and relocate assets independently of the
-/// wasm output).
+/// The worker's SQLite storage backend. OPFS through the sahpool VFS is the
+/// durable default. When OPFS is unavailable (a Firefox private window
+/// refuses `getDirectory` with a `SecurityError`, for one), the worker falls
+/// back to the in-memory VFS so the app still boots instead of dying: this
+/// session gets no persistence and no cross-window OPFS sharing, but the live
+/// topology over `BroadcastChannel` and Web Locks stays intact.
+enum WorkerStorage {
+    Opfs(sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil),
+    Memory(sqlite_wasm_rs::MemVfsUtil<sqlite_wasm_rs::WasmOsCallback>),
+}
+
+impl WorkerStorage {
+    /// Install OPFS if the browser allows it, otherwise the in-memory VFS
+    /// (already registered as the default VFS at SQLite init, so plain file
+    /// names resolve to it once sahpool declines to take over the default).
+    async fn install() -> Self {
+        match sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
+            &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
+            true,
+        )
+        .await
+        {
+            Ok(util) => Self::Opfs(util),
+            Err(err) => {
+                web_sys::console::warn_1(
+                    &format!(
+                        "db worker: OPFS unavailable ({err:?}), using an in-memory replica: no persistence and no cross-window OPFS sharing this session"
+                    )
+                    .into(),
+                );
+                Self::Memory(sqlite_wasm_rs::MemVfsUtil::new())
+            }
+        }
+    }
+
+    /// Whether a database file of this name already exists in the backend.
+    fn exists(&self, name: &str) -> bool {
+        match self {
+            Self::Opfs(util) => util.exists(name).unwrap_or(false),
+            Self::Memory(util) => util.exists(name),
+        }
+    }
+
+    /// Import baked template bytes as a new database file.
+    fn import_db(&self, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
+        let result = match self {
+            Self::Opfs(util) => util
+                .import_db(name, bytes)
+                .map_err(|err| format!("{err:?}")),
+            Self::Memory(util) => util
+                .import_db(name, bytes)
+                .map_err(|err| format!("{err:?}")),
+        };
+        result.map_err(|err| JsValue::from_str(&format!("import {name}: {err}")))
+    }
+}
+
+/// How the leader launches the dedicated DB worker, which differs only by how
+/// the app's wasm-bindgen glue initializes.
+pub enum WorkerBootstrap {
+    /// The glue auto-initializes on import and runs `main` (a bundler such as
+    /// dx). The worker is the glue module itself, so `main` boots the DB tier
+    /// in its no-`Window` branch with no extra script.
+    Glue,
+    /// A separately served bootstrap script that imports the glue named by an
+    /// appended `glue` query parameter. The `String` is that script's URL.
+    Script(String),
+    /// A connetto-generated bootstrap: a blob module that imports the glue and
+    /// initializes the wasm (URL derived from the glue URL by swapping the
+    /// `.js` suffix for `_bg.wasm`), letting `init` run `main`, which boots the
+    /// DB tier. For bundlers whose glue does not self-initialize (trunk), so
+    /// the consumer ships no worker JS of its own.
+    Generated,
+}
+
+/// Page side, leader only: spawn the dedicated DB worker from `glue_url`
+/// according to `bootstrap`.
 ///
 /// # Errors
 ///
-/// The `Worker` constructor's error when the worker cannot be created.
-pub fn spawn_db_worker(worker_url: &str, glue_url: &str) -> Result<Worker, JsValue> {
+/// The `Worker` constructor's error, or a blob-URL failure for
+/// [`WorkerBootstrap::Generated`].
+pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Worker, JsValue> {
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");
-    let encoded = String::from(js_sys::encode_uri_component(glue_url));
-    let separator = if worker_url.contains('?') { '&' } else { '?' };
-    Worker::new_with_options(&format!("{worker_url}{separator}glue={encoded}"), &options)
+    match bootstrap {
+        WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options),
+        WorkerBootstrap::Script(script_url) => {
+            let encoded = String::from(js_sys::encode_uri_component(glue_url));
+            let separator = if script_url.contains('?') { '&' } else { '?' };
+            Worker::new_with_options(&format!("{script_url}{separator}glue={encoded}"), &options)
+        }
+        WorkerBootstrap::Generated => {
+            let object_url = generated_bootstrap_url(glue_url)?;
+            let worker = Worker::new_with_options(&object_url, &options);
+            // The worker takes its reference to the blob during construction,
+            // so the object URL can be released regardless of the outcome.
+            let _ = web_sys::Url::revoke_object_url(&object_url);
+            worker
+        }
+    }
+}
+
+/// Build the blob-module bootstrap for [`WorkerBootstrap::Generated`] and
+/// return its object URL. The module imports the glue and initializes the wasm
+/// with the derived binary URL (the stock wasm-bindgen web glue does not
+/// self-initialize, and its built-in default fetches the un-hashed name);
+/// `init` runs `main`, which boots the DB tier in its no-`Window` branch.
+fn generated_bootstrap_url(glue_url: &str) -> Result<String, JsValue> {
+    let wasm_url = glue_url.strip_suffix(".js").map_or_else(
+        || format!("{glue_url}_bg.wasm"),
+        |base| format!("{base}_bg.wasm"),
+    );
+    let source = format!(
+        "try {{\n  const mod = await import({glue});\n  await mod.default({{ module_or_path: {wasm} }});\n}} catch (err) {{\n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker bootstrap FAILED: \" + err);\n  throw err;\n}}\n",
+        glue = js_string_literal(glue_url),
+        wasm = js_string_literal(&wasm_url),
+    );
+    let parts = js_sys::Array::of1(&JsValue::from_str(&source));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)?;
+    web_sys::Url::create_object_url_with_blob(&blob)
+}
+
+/// Encode a string as a JS double-quoted string literal for generated source.
+fn js_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Page side: resolve once the DB worker's intake answers on the hello
@@ -164,12 +287,7 @@ pub async fn announce_tab(wire: &str) {
 /// A string describing the VFS, upstream connect, or subscribe failure.
 #[allow(clippy::too_many_lines)]
 pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
-    let util = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
-        &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
-        true,
-    )
-    .await
-    .map_err(|err| JsValue::from_str(&format!("install sahpool: {err:?}")))?;
+    let storage = WorkerStorage::install().await;
 
     let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
     let client_config = ClientConfig {
@@ -180,7 +298,7 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from
     // the server oplog instead of re-snapshotting.
-    let existing = util.exists(config.replica_db_name).unwrap_or(false);
+    let existing = storage.exists(config.replica_db_name);
     let mut worker = if existing {
         ConnettoConnection::connect_existing(
             transport,
@@ -217,9 +335,8 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     // IS the tier file, because a changeset apply always targets main.
     // The worker replica never contains them, so a note can never ride an
     // upstream mutation.
-    if !util.exists(config.frontend_db_name).unwrap_or(false) {
-        util.import_db(config.frontend_db_name, config.frontend_template)
-            .map_err(|err| JsValue::from_str(&format!("import frontend template: {err:?}")))?;
+    if !storage.exists(config.frontend_db_name) {
+        storage.import_db(config.frontend_db_name, config.frontend_template)?;
     }
     let frontend = SqliteConnection::establish(config.frontend_db_name)
         .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;

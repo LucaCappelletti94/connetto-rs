@@ -1,47 +1,62 @@
-# Handoff: entering the dioxus-web demo session
+# Handoff: dioxus-web demo browser verification
 
 ## Where the repo is
 
-Branch `main`, HEAD `adf3943`. The last two sessions landed three commits on top of `efa75d0`:
+Branch `main`, HEAD `15d1f17` ("Add schema-version staleness detection and align the relay handshake ack"). The relay-parity plan (`docs/plan-relay-parity.md`, Phases 0 through 7) is fully landed and green: aggregates, full resync, conflict-versus-reject, non-fatal errors, per-tab delivery credits, handshake-ack schema-version forwarding, and server-gated schema-version staleness detection. A tab behind the relay is indistinguishable from a direct socket in every frame the client acts on.
 
-- `95c5fda` converged every upstream pin: subql `5858f50` (pins sqlite-diff-rs 0.8.0), diesel fork branch `future` at `2c114c6d` (carries `attach_database`/`detach_database`, `set_triggers_enabled`, and the attach hardening knobs), pg2sqlite `d024713` (reference-closed FK validation default on, PR #46), `sqlite-diff-rs = "0.8.0"` workspace wide. Both lockfiles updated.
-- `e82f594` moved `_connetto_mutations` provisioning from per-handshake writer-pool DDL to a startup call on the admin pool (`provision_watermark_table`), because Postgres 15+ checks schema CREATE privilege on `CREATE TABLE IF NOT EXISTS` even when the table exists, and handshake DDL races. Fixtures repaired to match.
-- `adf3943` is the whole local-only tables arc: client tier machinery (`attach_local_tier`, `attach_local_tier_ddl`, `local_tables`, tier-aware live dispatch with local aggregates through the `json_quote` probe), demo wiring (`frontend.sql`, per-document template bake, `DEMO_TAB_DDL`), the relay hub's local tier fan-out, and four test files pinning it all.
+Uncommitted on `main` right now: the `docs/roadmap.md` prune (the stale "relay limits still open" paragraph rewritten to say parity is complete) and these two verification docs. Historical docs from earlier arcs (`docs/handoff-frontend-only-tables.md`, the `docs/upstream-*` proposals, `docs/plan-connetto-server.md` which MUST never be staged) are unchanged.
 
-Dirty but intentionally uncommitted, all other arcs: `docs/plan-connetto-server.md` (permanently dirty, MUST never be staged), `docs/architecture/open-questions.md`, the physical-trimming paragraph in `docs/roadmap.md` (retention arc), `docs/handoff-frontend-only-tables.md`, `docs/prompt-frontend-only-tables.md`, the five `docs/upstream-diesel-*` maintenance proposals (auto-vacuum-mode, incremental-vacuum, page-counters, vacuum-into, wal-checkpoint), `docs/upstream-pg2sqlite-readonly-deny-triggers.md`, and `docs/upstream-synql-tier-generation-contract.md`. The retention arc is BLOCKED on the diesel maintenance uphill, which is why the dioxus-web demo is next despite the roadmap ordering.
+## The demo is already built. This session verifies it.
 
-## What the last session built (hub fan-out for local tables)
+`examples/dioxus-web-demo` is feature-complete in code and compiles for `wasm32-unknown-unknown` (`cargo check --target wasm32-unknown-unknown` clean, one pre-existing `non_snake_case` warning on `App`). It has never been run in a real browser. That run, end to end, is the entire task.
 
-The three-window notes behavior exists below the UI. Key architecture fact, verified against the SQLite session docs and load bearing for everything here: `sqlite3changeset_apply` only ever targets the `main` schema of a connection, so relayed changesets cannot be applied into an ATTACHed tier. Consequences:
+What the code already does (`src/main.rs`):
+- `main` runs Dioxus in a window context and returns early in a worker context. `db_worker_boot` is the `wasm_bindgen` export the worker bootstrap (`assets/db-worker.js`) awaits.
+- `boot_window` joins the Web Locks leader election (`LEADER_LOCK`), the winner spawns the dedicated DB worker, every window holds a tab liveness lock before connecting, connects a tab client over a `BroadcastChannel`, and wraps it in the reconnecting client.
+- `App` boots the window and shows a status line. `Dashboard` renders two panes: `orders` (synced, an "Add order" button) and `notes` (device-only, a text input plus "Save note"), both fed by `use_live` against the local mirror. Order totals are derived from the live rows.
+- Schema-version baking is wired: the tab config and the `DbWorkerConfig` carry `SchemaVersion::from_source(SCHEMA_SQL)` where `SCHEMA_SQL = include_str!("../schema.sql")`.
 
-- Tab mirrors hold BOTH tiers in `main` (`workers.rs` `DEMO_TAB_DDL`, orders plus notes) and the tab client is completely unmodified. With no attached tier its `local_tables` set is empty, so notes look synced to it and it subscribes and pushes over the wire like any table. The HUB keeps the tiers apart, not the tab.
-- The DB worker opens the frontend file as a second connection whose `main` IS `connetto-frontend.sqlite` (`LocalTier` in `examples/wasm-smoke/src/relay.rs`, passed as a new `Option<LocalTier>` parameter on `RelayHub::new`/`with_reconnect`). The worker replica never contains notes, so notes cannot reach the server even through a hub bug (a missing table is skipped by apply, documented semantics).
-- `handle_tab_bulk` classifies each tab mutation by the tables its changeset touches. Pure local: applied to the tier database with the per-tab watermark (`_connetto_tab_mutations`) in one transaction, acknowledged by the hub itself (`MutationApplied`, the hub is the tier's terminal authority), and the original compressed payload fanned out as a `LivePatch` to every tab with an intersecting subscription, originator included (idempotent under the client's `server_wins` Replace policy). Pure synced: the pre-existing path. Mixed tiers: rejected, the tab rolls the whole changeset back.
-- Immediate per-seq hub acks are safe because the client's `MutationApplied` arm retires the EXACT sequence, not a watermark. Only the handshake `last_applied_seq` is a retire-below bound, now the max of the two per-target watermarks, sound because the hub processes a tab's mutations in order and each lands in exactly one tier.
-- Snapshots partition per tier and each part is served from the owning connection (`snapshot_patchset` now takes `&mut SqliteConnection`).
+## Critical prerequisite (a direct consequence of Phase 7)
 
-## Verification state
+Detection is now server-gated and mandatory: if the server advertises a schema version, a client that does not present the matching one is rejected at handshake with `SchemaOutdated`. So the DB worker will fail to boot unless the server's advertised version matches the demo's baked version.
 
-All 10 browser suites green in headless Chrome against the real server and demo Postgres, including the new `tests/notes_fanout.rs` (tab write, hub ack, fan-out to sibling, late-tab snapshot leg, mixed-tier rejection and rollback) and every pre-existing suite (election, failover, local_tier, opfs, page, relay x2, smoke, topology). `cargo fmt` and nightly `cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings` clean on the smoke workspace. The root workspace was untouched by the fan-out session (its full native gate was green at the end of the prior session and its files are committed unchanged).
+The demo bakes `from_source(examples/dioxus-web-demo/schema.sql)`. That file is byte-identical to `examples/wasm-smoke/schema.sql` today (verified: both are `CREATE TABLE orders (id BIGINT PRIMARY KEY, quantity BIGINT);`), so the existing server recipe (`CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql`) already produces a matching hash. If the demo's `schema.sql` ever diverges, launch the server with the demo's `schema.sql` instead, or the worker connect is rejected as stale.
 
-## Running stack
+## Running the stack
 
-- `connetto-demo-pg`: docker `postgres:16` on port 55456, `wal_level=logical`, LONG LIVED, left running. Holds `orders`, `connetto_slot`, `connetto_pub`, `_connetto_mutations`.
-- No server process is running. Recipe: `cargo +stable build -p connetto-server --features pg-async --bin connetto-server`, then run `./target/debug/connetto-server` with env `CONNETTO_BIND=127.0.0.1:7777`, `DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55456/postgres`, `CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql`, `CONNETTO_WRITABLE=orders`, ready when port 7777 accepts.
-- Ports taken on this machine: 5432, 5433, 5459, 5462, 3306, 55456.
+- Docker `connetto-demo-pg`: `postgres:16` on port 55456, `wal_level=logical`, long-lived, holds `orders`, `connetto_slot`, `connetto_pub`, `_connetto_mutations`. Confirm it is up (`docker ps`) and provisioned before starting the server.
+- Server (needs rebuild each session): `cargo +stable build -p connetto-server --features pg-async --bin connetto-server`, then start via `hub` (`op:"start"`, name `connetto-server`, app `./target/debug/connetto-server`) with env `CONNETTO_BIND=127.0.0.1:7777`, `DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55456/postgres`, `CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql`, `CONNETTO_WRITABLE=orders`, ready log `listening on 127.0.0.1:7777` plus port 7777.
+- Demo dev server: `dx` is installed (dioxus 0.7.9). From `examples/dioxus-web-demo`, `dx serve` builds the wasm (picking up `--cfg=web_sys_unstable_apis` from `.cargo/config.toml`, needed for Web Locks) and serves at a localhost port (watch the `dx serve` banner for the URL, typically `http://127.0.0.1:8080`). `dx serve` is long-running, so launch it via `hub` (`op:"start"`) and wait for its served-URL banner. The first wasm build is slow.
+- Ports already taken on this machine: 5432, 5433, 5459, 5462, 3306, 55456.
 
-## Toolchain trap (unchanged)
+## Driving it with the browser tool
 
-Default rustup toolchain is a nightly that ICEs compiling tokio in release. Tests: `cargo +stable test --release`. Clippy: nightly (the repo allows `clippy::unused_async_trait_impl`, unknown to stable). fmt: `+stable` is fine.
+Use the `xd://browser` device (real Chromium via puppeteer, headless works, OPFS and Web Locks and Workers all supported).
 
-## Full gate recipe
+1. Single window: `open` the served URL as tab `w1`, `run` `tab.observe()` (or `tab.ariaSnapshot()`), confirm status becomes `connected` and both panes render. Click "Add order", re-observe, confirm a row appears and the count/total update. Type a note body into the input, click "Save note", confirm the note row appears.
+2. Two windows of one device: `open` a SECOND tab `w2` to the same URL. Same origin means it shares OPFS, the `BroadcastChannel`, and Web Locks, so `w1` is the leader owning the worker and `w2` is a follower. Add an order in `w1`, confirm it converges into `w2` (this proves the Postgres CDC round trip: tab to hub to worker to server to CDC back to every tab). Save a note in `w1`, confirm it converges into `w2` (hub fan-out, never the server).
+3. Proof that orders reach Postgres and notes do not: query `connetto-demo-pg` (`docker exec ... psql`), the new order id is in `orders`, and there is no `notes` table server side (the worker replica does not even contain it).
+4. Optional, leader failover: `close` the `w1` tab, confirm `w2` wins the lock, spawns a replacement worker that resumes the OPFS replica from its persisted cursor, and keeps serving. This reuses the failover path `tests/failover.rs` already pins.
 
-Root workspace: `cargo +stable fmt --all -- --check`, nightly `cargo clippy --all-targets --all-features -- -D warnings`, `cargo +stable test --release --all-features`, `RUSTDOCFLAGS="-D warnings" cargo +stable doc --workspace --all-features --no-deps`. Smoke workspace: `cargo +stable fmt`, `cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings`, and `wasm-pack test --headless --chrome examples/wasm-smoke` with the server on 7777. The dioxus desktop demo workspace gets `cargo fmt` only in the root gate (it needs webkit system libraries and stays out of headless gates).
+Capture evidence (a11y snapshots or screenshots) for each claim.
 
-## Standing rules
+## Gotchas
 
-No commit, push, PR, or deploy without an explicit per-time instruction. `dx bundle`, `pages deploy`, Wrangler, and deploy-pattern tags are deploys. Docker and heavy compute need per-time approval, and browser runs need fresh per-time approval each session. ASCII punctuation in all prose (no semicolons, no em or en dashes, no ` - ` as punctuation), including doc comments, panic strings, and design docs. Single-line commit messages, no conventional-commit prefixes, no `Co-Authored-By`. No shortcuts: pursue the long-term optimal design, record requirements separately from mechanisms, verify every tradeoff claim against source before presenting it. An interim step needs a named blocker, not a price tag.
+- Browser runs, Docker, and any dev server need FRESH per-time approval this session. Re-ask before `dx serve` and before the browser tool.
+- OPFS persists across runs in the same browser profile. A stale replica can mask a first-boot bug: if results look wrong, clear OPFS or use a fresh profile. The worker deliberately resumes from the persisted cursor, so "no snapshot on reboot" is expected, not a bug.
+- The demo id scheme is per-window random-banded so concurrent windows never collide on ids.
+- `dx serve` rebuilds on file change. Do not edit demo files mid-run unless intending a rebuild.
+- Known unrelated flake: the `wasm-pack` browser suite occasionally SIGKILLs chromedriver at the heavy `relay.rs` file. Not relevant to `dx serve`, but browser resource pressure is a recurring theme, so drive the demo tabs deliberately, not in a tight loop.
 
-## Next session
+## Toolchain and standing rules
 
-Goal: the dioxus-web demo, the roadmap's "wasm client, after the spike" remainder, which also delivers the save-button UI of the three-window notes demo. The framing, the decisions to make, and the grounding live in `docs/prompt-dioxus-web-demo.md`.
+- Toolchain trap: the default nightly ICEs compiling tokio in release. Tests: `cargo +stable test --release`. Clippy: `cargo +nightly clippy ... -D warnings` (the repo allows `clippy::unused_async_trait_impl`, unknown to stable). fmt: `+stable`.
+- No commit, push, PR, or deploy without an explicit per-time instruction. `dx bundle`, `pages deploy`, Wrangler, and deploy-pattern tags are deploys. ASCII punctuation only in all prose and comments (no semicolons, no em or en dashes, no ` - ` as punctuation). Single-line commit messages, no conventional-commit prefixes, no `Co-Authored-By`. Pursue the long-term optimal design, no shortcuts.
+
+## What "done" looks like
+
+Two browser windows converge on `orders` (through Postgres) and on `notes` (through the DB worker, device-only), writes work from both panes, and the evidence is captured. If verification surfaces a bug, fix it at the source and re-verify. When it is clean, prune the roadmap's "wasm client, after the spike" section to mark the dioxus-web demo verified, and the next browser-track item is the Yew adapter on top of `LiveHandle`.
+
+## Prompt
+
+The starting prompt for this session lives in `docs/prompt-dioxus-web-demo.md`.

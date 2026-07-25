@@ -1,0 +1,23 @@
+[package]
+name = "connetto-yew"
+description = "Yew adapter for connetto live queries: one hook serving row and scalar handles alike."
+categories = ["database", "gui"]
+keywords = ["sync", "yew", "sqlite", "offline", "live-query"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false }
+connetto-core.workspace = true
+yew = { version = "0.21", default-features = false }
+# AbortHandle drives drop-unsubscribe: Yew's spawn_local is detached, so the
+# hook aborts its driver task on unmount to drop the live handle.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

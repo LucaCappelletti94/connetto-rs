@@ -5,6 +5,7 @@ members = [
     "crates/connetto-server",
     "crates/connetto-client",
     "crates/connetto-dioxus",
+    "crates/connetto-yew",
 ]
 # The desktop demo is a standalone workspace: it needs the webkit system
 # libraries, so it must never enter the headless gate builds.
