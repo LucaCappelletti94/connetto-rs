@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection};
 use connetto_core::Cursor;
-use connetto_dioxus::use_live;
+use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     WebSocketTransport, sqlite_write_target,
@@ -17,6 +17,7 @@ use connetto_server::{
 use diesel::SqliteConnection;
 use diesel::prelude::*;
 use dioxus::prelude::*;
+use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
@@ -55,6 +56,37 @@ impl SnapshotSource for EmptySnapshot {
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
+            cursor: Cursor::new(Vec::new()),
+        })
+    }
+}
+
+/// Serves one `orders` row (id 1, quantity 3), so the boxed-query test starts
+/// from a non-empty replica and its first render proves the subscription is
+/// established before the CDC insert.
+struct SeedOneOrder;
+
+impl SnapshotSource for SeedOneOrder {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
+        let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(1))
+            .expect("set id")
+            .set(1, Value::Integer(3))
+            .expect("set quantity");
+        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+            .insert(insert)
+            .build();
+        Ok(Snapshot {
+            patchset,
             cursor: Cursor::new(Vec::new()),
         })
     }
@@ -131,6 +163,30 @@ fn app() -> Element {
     let c = *count.value().read();
     rsx! {
         div { "rows:{n} count:{c:?}" }
+    }
+}
+
+/// A dedicated client slot for the boxed-query test, so the two hook tests do
+/// not race over one global.
+static CLIENT_FN: StdMutex<Option<ConnettoClient<Ws>>> = StdMutex::new(None);
+
+fn app_fn() -> Element {
+    let client = CLIENT_FN
+        .lock()
+        .expect("client slot poisoned")
+        .clone()
+        .expect("client installed");
+    // A boxed row query: not Clone, so use_live cannot take it. use_live_fn
+    // rebuilds it from the closure on every refresh.
+    let rows = use_live_fn::<_, _, _, Order>(&client, || {
+        orders::table
+            .filter(orders::quantity.gt(0))
+            .order(orders::id)
+            .into_boxed()
+    });
+    let n = rows.value().read().len();
+    rsx! {
+        div { "boxed-rows:{n}" }
     }
 }
 
@@ -227,6 +283,74 @@ async fn use_live_renders_and_follows_cdc() {
     // the handles and queues the unsubscribes through the pump.
     drop(vdom);
     CLIENT.lock().expect("client slot poisoned").take();
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn use_live_fn_follows_a_boxed_row_query() {
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::new(
+        materializer,
+        SeedOneOrder,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "dioxus-fn-test".to_owned(),
+        auth_token: "token".to_owned(),
+        schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
+    };
+    let conn = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+    let client = ConnettoClient::start(conn);
+    *CLIENT_FN.lock().expect("client slot poisoned") = Some(client.clone());
+
+    let mut vdom = VirtualDom::new(app_fn);
+    vdom.rebuild(&mut dioxus_core::NoOpMutations);
+
+    // The snapshot seed row surfaces, which also proves the subscription is
+    // established before the CDC insert below.
+    render_until(&mut vdom, |html| html.contains("boxed-rows:1")).await;
+
+    // A second row via CDC refreshes the boxed query. The typed insert into the
+    // emulator binds the integer columns the wire carries.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(2_i64), orders::quantity.eq(5_i64)))
+        .execute(source.connection())
+        .expect("emu insert");
+    while let Some(event) = source.next_event().await.expect("poll source") {
+        manager.dispatch_event(&event).await.expect("dispatch");
+    }
+    render_until(&mut vdom, |html| html.contains("boxed-rows:2")).await;
+
+    // Unmount: dropping the vdom drops the hook task, the handle, and the sub.
+    drop(vdom);
+    CLIENT_FN.lock().expect("client slot poisoned").take();
     drop(client);
     server.await.expect("join server");
 }

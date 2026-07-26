@@ -21,3 +21,7 @@ yew = { version = "0.21", default-features = false }
 # AbortHandle drives drop-unsubscribe: Yew's spawn_local is detached, so the
 # hook aborts its driver task on unmount to drop the live handle.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# The bounds of `use_live_fn` restate `watch_fn`'s diesel query traits
+# (`QueryFragment`, `LoadQuery`, `Sqlite`, `SqliteConnection`), so the adapter
+# names diesel directly. It is already in the graph through connetto-client.
+diesel.workspace = true

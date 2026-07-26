@@ -421,6 +421,7 @@ dependencies = [
  "dioxus-hooks",
  "dioxus-signals",
  "dioxus-ssr",
+ "sqlite-diff-rs",
  "subql",
  "tempfile",
  "tokio",
@@ -455,6 +456,7 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
+ "diesel",
  "futures-util",
  "yew",
 ]

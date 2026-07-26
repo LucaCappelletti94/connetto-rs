@@ -20,6 +20,10 @@ connetto-core.workspace = true
 dioxus-core = "0.7.9"
 dioxus-hooks = "0.7.9"
 dioxus-signals = "0.7.9"
+# The bounds of `use_live_fn` restate `watch_fn`'s diesel query traits
+# (`QueryFragment`, `LoadQuery`, `Sqlite`, `SqliteConnection`), so the adapter
+# names diesel directly. It is already in the graph through connetto-client.
+diesel.workspace = true
 
 [dev-dependencies]
 # The hook integration test drives a real native client (ConnettoClient::start
@@ -31,6 +35,10 @@ connetto-server = { path = "../connetto-server" }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "0.7.9"
+# The use_live_fn test seeds one snapshot row (so the first render proves the
+# subscription is established before the CDC insert) by building a patchset the
+# same way the server snapshot path does.
+sqlite-diff-rs = { version = "0.9.0", default-features = false }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3.27.0"
 tokio.workspace = true
