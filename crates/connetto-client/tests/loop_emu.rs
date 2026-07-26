@@ -148,6 +148,87 @@ fn orders(conn: &mut SqliteConnection) -> Vec<Order> {
         .expect("read orders")
 }
 
+// A second synced table exercising strongly typed, non-trivial columns through
+// watch_fn: a `rosetta_uuid::Uuid` primary key (stored as a SQLite BLOB, the
+// same client-authored key strategy the demos use) and a `bool` flag. The
+// materializer and emulator see `BYTEA` (which pg2sqlite maps to BLOB, wire
+// identical to a real `uuid` column) and `BOOLEAN`; the client replica stores
+// BLOB and INTEGER.
+const GADGETS_PG_DDL: &str =
+    "CREATE TABLE gadgets (id BYTEA PRIMARY KEY, active BOOLEAN NOT NULL, label TEXT NOT NULL);";
+const GADGETS_SQLITE_DDL: &str = "CREATE TABLE gadgets (id BLOB PRIMARY KEY NOT NULL, active \
+                                  INTEGER NOT NULL, label TEXT NOT NULL);";
+
+diesel::table! {
+    gadgets (id) {
+        id -> rosetta_uuid::sql_types::Uuid,
+        active -> diesel::sql_types::Bool,
+        label -> diesel::sql_types::Text,
+    }
+}
+
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = gadgets)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct Gadget {
+    id: rosetta_uuid::Uuid,
+    active: bool,
+    label: String,
+}
+
+fn gadget(id: rosetta_uuid::Uuid, active: bool, label: &str) -> Gadget {
+    Gadget {
+        id,
+        active,
+        label: label.to_owned(),
+    }
+}
+
+/// A snapshot source serving a fixed set of typed `gadgets` rows, so the
+/// rich-type `watch_fn` test starts from a known replica. Each row's uuid key is
+/// encoded to its 16-byte blob and the bool to 0 or 1, the exact wire shapes a
+/// real Postgres `uuid` and `boolean` column emit.
+struct GadgetSeed {
+    rows: Vec<Gadget>,
+}
+
+impl SnapshotSource for GadgetSeed {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &connetto_core::AuthContext,
+    ) -> Result<Snapshot, Self::Error> {
+        let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+        for row in &self.rows {
+            let table = SimpleTable::new("gadgets", &["id", "active", "label"], &[0]);
+            let insert = Insert::<_, String, Vec<u8>>::from(table)
+                .set(0, Value::Blob(<[u8; 16]>::from(row.id).to_vec()))
+                .expect("set id")
+                .set(1, Value::Integer(i64::from(row.active)))
+                .expect("set active")
+                .set(2, Value::Text(row.label.clone()))
+                .expect("set label");
+            patchset = patchset.insert(insert);
+        }
+        Ok(Snapshot {
+            patchset: patchset.build(),
+            cursor: Cursor::new(Vec::new()),
+        })
+    }
+}
+
+fn gadgets_write_target() -> SqliteWriteTarget {
+    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
+    sql_query(GADGETS_SQLITE_DDL)
+        .execute(&mut conn)
+        .expect("create gadgets");
+    sqlite_write_target(conn)
+}
+
 fn server_write_target() -> SqliteWriteTarget {
     let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
     sql_query(SQLITE_DDL)
@@ -2297,6 +2378,253 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
     assert!(
         !saw_aggregate,
         "no aggregate push may arrive after the last sharer drops",
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_fn_drives_a_boxed_row_query() {
+    // The load-bearing case for watch_fn: a boxed (.into_boxed()) row query is
+    // not Clone, so plain watch cannot re-run it. Its row type carries a
+    // strongly typed `rosetta_uuid::Uuid` key and a `bool` flag, not raw bytes,
+    // so this proves watch_fn renders the boxed query (a bool bind included),
+    // decodes non-trivial column types from the replica, and refreshes on a CDC
+    // patch.
+    let alpha_id = rosetta_uuid::Uuid::utc_v7();
+    let inactive_id = rosetta_uuid::Uuid::utc_v7();
+    let beta_id = rosetta_uuid::Uuid::utc_v7();
+
+    let materializer = Materializer::new(GADGETS_PG_DDL).expect("build materializer");
+    let seed = GadgetSeed {
+        rows: vec![
+            gadget(alpha_id, true, "alpha"),
+            gadget(inactive_id, false, "zulu"),
+        ],
+    };
+    let manager = SessionManager::new(
+        materializer,
+        seed,
+        PermissiveAuth,
+        gadgets_write_target(),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    // The replica needs the gadgets schema, so connect with that DDL rather than
+    // the orders-shaped connect_client helper.
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let config = ClientConfig {
+        client_id: "client-gadgets".to_owned(),
+        auth_token: "token".to_owned(),
+        schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
+    };
+    let conn = ConnettoConnection::connect(transport, &db_path, GADGETS_SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    // A boxed whole-table query ordered by label. The same value handed to
+    // watch would not compile: BoxedSelectStatement is not Clone. No bool
+    // predicate rides the wire (subql types the column as Bool and refuses an
+    // integer bind against it), so the flag is exercised on decode, not filter.
+    let mut live: LiveQuery<Gadget> = client
+        .watch_fn(|| gadgets::table.order(gadgets::label).into_boxed())
+        .await
+        .expect("watch_fn");
+    assert!(
+        live.rows().is_empty(),
+        "the replica is empty before the snapshot lands",
+    );
+
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
+            changed.expect("snapshot refresh timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("subscription rejected: {rejected:?}");
+        }
+    }
+    // Both seed rows surface, decoded from the replica: the uuid keys and the
+    // bool flag in both its true and false forms.
+    assert_eq!(
+        live.rows(),
+        vec![
+            gadget(alpha_id, true, "alpha"),
+            gadget(inactive_id, false, "zulu"),
+        ],
+    );
+
+    // A CDC insert of a third gadget refreshes the boxed query. The typed
+    // insert binds the uuid key as a blob and the flag as an integer, the exact
+    // shapes the wire carries.
+    let mut source = PgSqliteEmuSource::open_in_memory(GADGETS_PG_DDL).expect("open emu source");
+    diesel::insert_into(gadgets::table)
+        .values((
+            gadgets::id.eq(beta_id),
+            gadgets::active.eq(true),
+            gadgets::label.eq("beta"),
+        ))
+        .execute(source.connection())
+        .expect("emu insert gadget");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), live.changed())
+        .await
+        .expect("live refresh timed out")
+        .expect("driver alive");
+    assert_eq!(
+        live.rows(),
+        vec![
+            gadget(alpha_id, true, "alpha"),
+            gadget(beta_id, true, "beta"),
+            gadget(inactive_id, false, "zulu"),
+        ],
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_fn_shares_a_subscription_with_watch() {
+    // A boxed watch_fn and a typed live() watch that render the same spec
+    // collapse onto one wire subscription through the shared attach_wire layer,
+    // so the recorder sees exactly one subscribe.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let manager = SessionManager::new(
+        materializer,
+        RecordingSeed {
+            seen: Arc::clone(&seen),
+        },
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    let mut live_a: LiveQuery<Order> = orders::table
+        .filter(orders::quantity.gt(0))
+        .order(orders::id)
+        .live(&client)
+        .await
+        .expect("watch a");
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), live_a.changed()) => {
+            changed.expect("snapshot refresh timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(live_a.rows(), vec![order(1, 1.0, 3, "seed")]);
+
+    // The boxed watch_fn renders the identical spec and reads its initial rows
+    // from the replica the first subscription filled, opening no new subscribe.
+    let live_b: LiveQuery<Order> = client
+        .watch_fn(|| {
+            orders::table
+                .filter(orders::quantity.gt(0))
+                .order(orders::id)
+                .into_boxed()
+        })
+        .await
+        .expect("watch_fn b");
+    assert_eq!(
+        live_b.rows(),
+        vec![order(1, 1.0, 3, "seed")],
+        "the late handle reads the shared replica",
+    );
+
+    client.ping(1).await.expect("ping");
+    wait_broadcast(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 1 })).await;
+    assert_eq!(
+        seen.lock().expect("seen poisoned").len(),
+        1,
+        "watch_fn and watch sharing a spec collapse to one wire subscription",
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_fn_rejects_an_aggregate_query() {
+    // watch_fn drives rows. A boxed aggregate shape is refused with the
+    // row-vs-value error, before any subscription is registered.
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let target = server_write_target();
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-a", &db_path).await;
+    let client = ConnettoClient::start(conn);
+
+    let result = client
+        .watch_fn::<_, _, i64>(|| orders::table.count().into_boxed())
+        .await;
+    let Err(err) = result else {
+        panic!("aggregate must be rejected on the row path");
+    };
+    assert!(
+        format!("{err}").contains("aggregate"),
+        "the error names the aggregate mismatch: {err}",
     );
 
     drop(client);

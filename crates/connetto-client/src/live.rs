@@ -730,7 +730,47 @@ where
         Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
-        let (sql, binds) = render_query(&query)?;
+        self.watch_fn(move || query.clone()).await
+    }
+
+    /// Run a diesel query produced by a factory closure and keep its result
+    /// fresh.
+    ///
+    /// The row live query for a boxed (`.into_boxed()`) or otherwise
+    /// dynamically built query. Such a query carries no compile-time
+    /// aggregation marker, so the typed [`live()`](crate::dsl::Watchable::live)
+    /// verb cannot dispatch on it, and it is not `Clone`, so
+    /// [`watch`](Self::watch), which clones a stored query on every refresh,
+    /// cannot re-run it. In place of a query value it takes `build`, a factory
+    /// that yields a fresh query instance on each call.
+    ///
+    /// `build` is invoked once to render the server subscription, once for the
+    /// initial local read, and again on every refresh. It MUST be pure and
+    /// stable: each call has to build an equivalent query, the same SQL,
+    /// tables, and binds. The wire subscription is fixed from the first
+    /// render, so a `build` that renders different SQL on a later call would
+    /// silently diverge from what refresh reads. A deliberately time-varying
+    /// window is a separate replica-retention feature, not this.
+    ///
+    /// Like [`watch`](Self::watch) it reads the local replica first for the
+    /// immediate, offline-capable answer, registers a server subscription
+    /// rendered from the query, and returns a [`LiveQuery`] whose rows the pump
+    /// refreshes whenever a table the query reads changes. Dropping the handle
+    /// unsubscribes. A boxed aggregate query has no row answer here: send it to
+    /// [`watch_value_with`](Self::watch_value_with) instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the query cannot be rendered, is aggregate-shaped,
+    /// the initial local read fails, or the subscribe frame cannot be sent.
+    pub async fn watch_fn<F, Q, R>(&self, build: F) -> Result<LiveQuery<R>, ClientError>
+    where
+        F: Fn() -> Q + Send + 'static,
+        Q: QueryFragment<Sqlite>,
+        Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
+        R: Clone + PartialEq + Send + Sync + 'static,
+    {
+        let (sql, binds) = render_query(&build())?;
         let parsed = parse_subscription(&sql)?;
         if parsed.shape == QueryShape::Aggregate {
             return Err(ClientError::Session(
@@ -746,8 +786,7 @@ where
         self.shared.wake.notify_one();
         let mut state = self.shared.state.lock().await;
 
-        let initial: Vec<R> = query
-            .clone()
+        let initial: Vec<R> = build()
             .load(state.conn.conn())
             .map_err(|e| ClientError::Session(e.to_string()))?;
         let rows = Arc::new(RwLock::new(initial));
@@ -755,8 +794,7 @@ where
 
         let refresh_rows = Arc::clone(&rows);
         let refresh = Box::new(move |conn: &mut ConnettoConnection<T>| {
-            let fresh: Vec<R> = query
-                .clone()
+            let fresh: Vec<R> = build()
                 .load(conn.conn())
                 .map_err(|e| ClientError::Session(e.to_string()))?;
             let unchanged = refresh_rows.read().is_ok_and(|current| *current == fresh);
