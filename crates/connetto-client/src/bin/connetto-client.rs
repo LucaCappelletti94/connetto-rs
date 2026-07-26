@@ -8,6 +8,11 @@
 //! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: local schema DDL.
 //! - `CONNETTO_CLIENT_ID`: identity presented at handshake (default `anonymous`).
 //! - `CONNETTO_TOKEN`: opaque auth token (default empty).
+//! - `CONNETTO_SCHEMA_SQL` or `CONNETTO_SCHEMA_SQL_FILE`: the shared canonical
+//!   schema source this build is compiled against, hashed into the handshake
+//!   schema version for staleness detection. It must be the SAME source the
+//!   server hashes (`CONNETTO_PG_DDL`), not the local SQLite DDL. Unset means
+//!   the client declares no version and a versioned server rejects it.
 //! - `CONNETTO_SUB_ID`: subscription id (default `default`).
 //! - `CONNETTO_QUERY`: the row subscription `SELECT` (required).
 //! - `CONNETTO_WRITE`: optional SQL run on the managed local connection after
@@ -47,10 +52,16 @@ async fn main() -> Result<()> {
     let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
     let sub_id = env_or("CONNETTO_SUB_ID", "default");
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
+    // Declared only when a shared canonical source is provided, matching the
+    // server's version. Absent, the client declares nothing and a versioned
+    // server rejects it.
+    let schema_version = read_ddl("CONNETTO_SCHEMA_SQL")
+        .ok()
+        .map(|source| connetto_core::SchemaVersion::from_source(&source));
     let config = ClientConfig {
         client_id: env_or("CONNETTO_CLIENT_ID", "anonymous"),
         auth_token: env_or("CONNETTO_TOKEN", ""),
-        schema_version: connetto_core::SchemaVersion::default(),
+        schema_version,
     };
 
     // The ws URL's authority is also the TCP target.

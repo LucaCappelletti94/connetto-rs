@@ -101,15 +101,16 @@ struct RowRegistration {
 pub struct SessionConfig {
     /// Delivery credits granted to the server at handshake.
     pub initial_credits: u32,
-    /// Schema version advertised in the handshake ack.
-    pub schema_version: SchemaVersion,
+    /// Schema version advertised in the handshake ack, or `None` to declare no
+    /// version (staleness detection off for every client).
+    pub schema_version: Option<SchemaVersion>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             initial_credits: 64,
-            schema_version: SchemaVersion::default(),
+            schema_version: None,
         }
     }
 }

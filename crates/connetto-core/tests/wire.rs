@@ -67,7 +67,7 @@ fn handshake_and_ack_round_trip() {
         session_id: "sess-1".into(),
         session_token: "opaque".into(),
         current_cursor: Cursor::new(vec![1, 2, 3, 4]),
-        schema_version: SchemaVersion::from_hash(vec![0xab, 0xcd]),
+        schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
         initial_credits: 128,
         last_applied_seq: Some(41),
     }));

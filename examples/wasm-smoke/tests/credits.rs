@@ -31,9 +31,7 @@ use connetto_core::messages::{
     SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{
-    Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, SchemaVersion, loopback,
-};
+use connetto_core::{Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, loopback};
 use connetto_wasm_smoke::RelayHub;
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
@@ -119,7 +117,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             session_id: "credits-upstream".to_owned(),
             session_token: "credits".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::default(),
+            schema_version: None,
             initial_credits: INITIAL_CREDITS,
             last_applied_seq: None,
         }))
@@ -197,7 +195,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
     let worker_config = ClientConfig {
         client_id: format!("credits-worker-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::default(),
+        schema_version: None,
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await

@@ -43,7 +43,7 @@ async fn schema_upstream(mut server: LoopbackTransport, server_version: SchemaVe
             session_id: "upstream-session".to_owned(),
             session_token: "upstream".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: server_version,
+            schema_version: Some(server_version),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -62,7 +62,7 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
         auth_token: "token".to_owned(),
         // The worker presents the same version the upstream advertises, so it
         // connects and then forwards that version to tabs.
-        schema_version: server_version,
+        schema_version: Some(server_version),
     };
     let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
@@ -86,7 +86,7 @@ async fn stale_tab_is_rejected_through_the_relay() {
     let stale = ClientConfig {
         client_id: format!("schema-tab-stale-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: SchemaVersion::from_source("CREATE TABLE orders (id INT);"),
+        schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
     };
     let result = ConnettoConnection::connect(tab_end, ":memory:", DDL, &stale, None).await;
     match result {
@@ -113,7 +113,7 @@ async fn matching_tab_connects_through_the_relay() {
     let fresh = ClientConfig {
         client_id: format!("schema-tab-fresh-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: version,
+        schema_version: Some(version),
     };
     let conn = ConnettoConnection::connect(tab_end, ":memory:", DDL, &fresh, None).await;
     assert!(

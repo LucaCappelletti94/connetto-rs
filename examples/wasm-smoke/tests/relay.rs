@@ -80,7 +80,7 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -164,7 +164,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     let config = ClientConfig {
         client_id: format!("relay-tab-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     let tab = ConnettoConnection::connect(tab_end, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -253,7 +253,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     let config = ClientConfig {
         client_id: format!("port-tab-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     let mut tab = ConnettoConnection::connect(
         PortTransport::new(channel.port2()),

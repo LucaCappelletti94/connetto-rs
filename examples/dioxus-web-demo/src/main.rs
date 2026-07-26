@@ -216,7 +216,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let config = ClientConfig {
         client_id: client_id.clone(),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
+        schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
         .await

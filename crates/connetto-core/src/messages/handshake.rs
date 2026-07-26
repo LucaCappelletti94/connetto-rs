@@ -75,8 +75,9 @@ pub struct HandshakeAck {
     pub session_token: String,
     /// Server's current cursor. Clients replay from here on a clean start.
     pub current_cursor: Cursor,
-    /// Schema version currently in force server-side.
-    pub schema_version: SchemaVersion,
+    /// Schema version in force server-side, or `None` when the server declares
+    /// no version (staleness detection off).
+    pub schema_version: Option<SchemaVersion>,
     /// Initial flow-control credit granted to the server for delivery.
     pub initial_credits: u32,
     /// The server's durable per-client mutation watermark: the highest

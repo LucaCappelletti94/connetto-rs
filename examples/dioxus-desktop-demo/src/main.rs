@@ -129,7 +129,7 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
     let config = ClientConfig {
         client_id: format!("desktop-demo-{}", std::process::id()),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
+        schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
     };
     let conn = ConnettoConnection::connect_with_replica_template(
         transport,

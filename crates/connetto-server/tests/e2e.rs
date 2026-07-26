@@ -163,14 +163,20 @@ fn spawn_server_cfg(
 }
 
 fn spawn_client(ws: &str, db_path: &Path, client_id: &str, write: Option<&str>) -> ChildGuard {
-    spawn_client_env(ws, db_path, client_id, SQLITE_DDL, "orders", QUERY, write)
+    spawn_client_env(
+        ws, db_path, client_id, SQLITE_DDL, PG_DDL, "orders", QUERY, write,
+    )
 }
 
+// A test spawn helper mirroring the client binary's env surface, so its
+// argument list tracks that surface rather than a smaller abstraction.
+#[allow(clippy::too_many_arguments)]
 fn spawn_client_env(
     ws: &str,
     db_path: &Path,
     client_id: &str,
     sqlite_ddl: &str,
+    schema_sql: &str,
     sub_id: &str,
     query: &str,
     write: Option<&str>,
@@ -180,6 +186,9 @@ fn spawn_client_env(
         .env("CONNETTO_SERVER", ws)
         .env("CONNETTO_DB", db_path)
         .env("CONNETTO_SQLITE_DDL", sqlite_ddl)
+        // The client hashes the SAME canonical source the server does, so the
+        // handshake schema versions match. Distinct from the SQLite replica DDL.
+        .env("CONNETTO_SCHEMA_SQL", schema_sql)
         .env("CONNETTO_CLIENT_ID", client_id)
         .env("CONNETTO_SUB_ID", sub_id)
         .env("CONNETTO_QUERY", query)
@@ -532,6 +541,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         &db,
         "alice",
         OWNED_SQLITE_DDL,
+        OWNED_PG_DDL,
         "owned",
         OWNED_QUERY,
         Some(writes),

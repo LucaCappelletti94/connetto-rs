@@ -20,7 +20,7 @@ use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{ControlMessage, HandshakeAck, NonFatalError, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, LoopbackError, LoopbackTransport, SchemaVersion, loopback};
+use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
 use connetto_wasm_smoke::RelayHub;
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
@@ -54,7 +54,7 @@ async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
             session_id: session.to_owned(),
             session_token: "nonfatal".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::default(),
+            schema_version: None,
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -135,7 +135,7 @@ fn tab_config(base: i64, tag: &str) -> ClientConfig {
     ClientConfig {
         client_id: format!("nonfatal-{tag}-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::default(),
+        schema_version: None,
     }
 }
 

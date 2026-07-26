@@ -48,7 +48,7 @@ async fn schema_upstream(mut server: LoopbackTransport) {
             session_id: "upstream-session".to_owned(),
             session_token: "upstream".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: SchemaVersion::from_hash(SCHEMA_HASH.to_vec()),
+            schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -68,14 +68,14 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     let worker_config = ClientConfig {
         client_id: format!("handshake-worker-{base}"),
         auth_token: "token".to_owned(),
-        schema_version: SchemaVersion::from_hash(SCHEMA_HASH.to_vec()),
+        schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
     };
     let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
         .expect("worker connect");
     assert_eq!(
         worker.schema_version(),
-        &upstream_version,
+        &Some(upstream_version.clone()),
         "the worker records the upstream server's schema version at handshake",
     );
 
@@ -100,12 +100,12 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     };
 
     assert_eq!(
-        ack.schema_version, upstream_version,
+        ack.schema_version,
+        Some(upstream_version),
         "the relay ack carries the upstream server's schema version, not a placeholder",
     );
-    assert_ne!(
-        ack.schema_version,
-        SchemaVersion::default(),
+    assert!(
+        ack.schema_version.is_some(),
         "the relay forwards the upstream version, never an empty placeholder",
     );
 }

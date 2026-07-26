@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
         connector,
         write,
         SessionConfig {
-            schema_version: SchemaVersion::from_source(&pg_ddl),
+            schema_version: Some(SchemaVersion::from_source(&pg_ddl)),
             ..SessionConfig::default()
         },
     );

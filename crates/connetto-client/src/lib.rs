@@ -91,13 +91,17 @@ pub enum ClientError {
     /// Zstd compression or decompression failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
-    /// The server's advertised schema version differs from the version this
-    /// client build was compiled against, so this build is stale and the app
-    /// must reload. connetto never migrates schemas at runtime.
-    #[error("schema outdated: client built for {client}, server advertises {server}")]
+    /// The server advertised a schema version this client build does not match
+    /// (either a different version or none at all), so this build is stale and
+    /// the app must reload. connetto never migrates schemas at runtime.
+    #[error(
+        "schema outdated: client built for {}, server advertises {server}",
+        .client.as_ref().map_or_else(|| "none".to_owned(), ToString::to_string)
+    )]
     SchemaOutdated {
-        /// The version this client build was compiled against.
-        client: SchemaVersion,
+        /// The version this client build was compiled against, or `None` when
+        /// it declared none.
+        client: Option<SchemaVersion>,
         /// The version the server advertised in the handshake ack.
         server: SchemaVersion,
     },
@@ -111,11 +115,11 @@ pub struct ClientConfig {
     /// Opaque auth token validated by the server at connect.
     pub auth_token: String,
     /// The schema version this client build was compiled against, for staleness
-    /// detection. When both this and the server's ack carry a non-empty hash and
-    /// they differ, [`ConnettoConnection::connect`] fails with
-    /// [`ClientError::SchemaOutdated`] so the app can reload. Leave it
-    /// [`SchemaVersion::default`] (empty) to opt out of the check.
-    pub schema_version: SchemaVersion,
+    /// detection, or `None` to opt out. When both this and the server's ack
+    /// carry a version and they differ, [`ConnettoConnection::connect`] fails
+    /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
+    /// being `None` skips the check.
+    pub schema_version: Option<SchemaVersion>,
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].
@@ -481,7 +485,7 @@ async fn exchange_handshake<T>(
     transport: &mut T,
     config: &ClientConfig,
     resume: Option<&Cursor>,
-) -> Result<(String, Option<u64>, SchemaVersion), ClientError>
+) -> Result<(String, Option<u64>, Option<SchemaVersion>), ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -505,20 +509,20 @@ where
     {
         Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) => {
             // Server-gated staleness detection: when the server advertises a
-            // schema version, the client must present the same one. A client
-            // that declares none (empty) counts as stale against a versioned
-            // server, so a build that forgot to bake its version fails loudly
-            // instead of mis-parsing. An empty server version (a server that
-            // opts out) skips the check. This runs before any pending replay,
-            // so a stale build never pushes old-schema changesets to a
-            // new-schema server.
-            if !ack.schema_version.hash().is_empty()
-                && config.schema_version.hash() != ack.schema_version.hash()
-            {
-                return Err(ClientError::SchemaOutdated {
-                    client: config.schema_version.clone(),
-                    server: ack.schema_version,
-                });
+            // schema version, the client must declare the same one. A client
+            // that declares none is stale against a versioned server, so a
+            // build that forgot to bake its version fails loudly instead of
+            // mis-parsing. A server that declares none opts out and skips the
+            // check. This runs before any pending replay, so a stale build
+            // never pushes old-schema changesets to a new-schema server.
+            match ack.schema_version.as_ref() {
+                Some(server) if config.schema_version.as_ref() != Some(server) => {
+                    return Err(ClientError::SchemaOutdated {
+                        client: config.schema_version.clone(),
+                        server: server.clone(),
+                    });
+                }
+                _ => {}
             }
             Ok((ack.session_id, ack.last_applied_seq, ack.schema_version))
         }
@@ -554,7 +558,7 @@ pub struct ConnettoConnection<T: Transport> {
     /// The server's schema version from the handshake ack, kept so a relay can
     /// forward it verbatim to its tabs and (Phase 7) a stale build can be
     /// detected against the baked schema.
-    schema_version: SchemaVersion,
+    schema_version: Option<SchemaVersion>,
     /// Set by the commit hook whenever a write commits, so the driver knows
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
@@ -787,9 +791,10 @@ where
         &self.session_id
     }
 
-    /// The server's schema version from the handshake ack.
+    /// The server's schema version from the handshake ack, or `None` when the
+    /// server declared none.
     #[must_use]
-    pub fn schema_version(&self) -> &SchemaVersion {
+    pub fn schema_version(&self) -> &Option<SchemaVersion> {
         &self.schema_version
     }
 

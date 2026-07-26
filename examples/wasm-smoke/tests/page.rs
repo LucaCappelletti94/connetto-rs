@@ -56,7 +56,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
     let config = ClientConfig {
         client_id: format!("{name}-{}", unique_id()),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await

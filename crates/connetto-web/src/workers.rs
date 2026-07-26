@@ -293,7 +293,7 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     let client_config = ClientConfig {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
         auth_token: "token".to_owned(),
-        schema_version: config.schema_version.clone(),
+        schema_version: Some(config.schema_version.clone()),
     };
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from

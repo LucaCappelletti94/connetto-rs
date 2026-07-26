@@ -158,7 +158,7 @@ mod tests {
             session_id: "sess-abc".into(),
             session_token: "tok-abc".into(),
             current_cursor: Cursor::new(vec![9, 8, 7]),
-            schema_version: SchemaVersion::from_hash(vec![0xab, 0xcd]),
+            schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             initial_credits: 64,
             last_applied_seq: Some(7),
         })

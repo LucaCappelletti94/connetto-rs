@@ -11,9 +11,9 @@
 //! test drives the client's decode with exactly that frame over a loopback.
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_core::Cursor;
 use connetto_core::messages::{AggregateUpdate, ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
 use connetto_server::{LoopbackTransport, loopback};
 
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
@@ -33,7 +33,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
                 session_id: "agg".to_owned(),
                 session_token: "agg".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
-                schema_version: SchemaVersion::default(),
+                schema_version: None,
                 initial_credits: 64,
                 last_applied_seq: None,
             }))
@@ -50,7 +50,7 @@ fn config(client_id: &str) -> ClientConfig {
     ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::default(),
+        schema_version: None,
     }
 }
 

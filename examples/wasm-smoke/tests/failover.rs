@@ -97,7 +97,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -170,7 +170,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let config = ClientConfig {
         client_id: client_id.clone(),
         auth_token: "token".to_owned(),
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
+        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await

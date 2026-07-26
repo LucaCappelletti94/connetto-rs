@@ -3,9 +3,18 @@
 //! The client compares the [`SchemaVersion`] it was built against with the one
 //! the server advertises in `HandshakeAck`. connetto does not migrate schemas at
 //! runtime (the client never runs DDL), so a mismatch means this app build is
-//! stale and must reload, not that a migration should run. A version is just a
+//! stale and must reload, not that a migration should run. A version is a
 //! content hash of the schema source: two schemas are interchangeable iff their
-//! hashes match, and an empty hash means no version was declared.
+//! hashes match.
+//!
+//! A [`SchemaVersion`] always holds a real content hash. The absence of a
+//! declared version is modeled out of band, as `Option<SchemaVersion>` on the
+//! config and ack boundaries, never as an empty hash. There is deliberately no
+//! `Default`: a fabricated empty hash is not a hash, and an in-band sentinel is
+//! exactly what let a stale-check bug slip through. Staleness is checked only
+//! when both sides declare a version (both `Some`).
+//!
+//! [`HandshakeAck`]: crate::messages::HandshakeAck
 
 use core::fmt;
 
@@ -13,9 +22,10 @@ use serde::{Deserialize, Serialize};
 
 /// Content hash identifying a schema, the authoritative equality signal shared
 /// between client and server. Two schemas are interchangeable iff their hashes
-/// match. An empty hash means no version is declared. It renders as a short hex
-/// prefix for humans, since the hash itself is the identity.
-#[derive(Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// match. It renders as a short hex prefix for humans, since the hash itself is
+/// the identity. Absence of a version is `Option::None` at the boundaries, not
+/// a value of this type.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SchemaVersion(#[serde(with = "serde_bytes")] Vec<u8>);
 
@@ -32,7 +42,7 @@ impl SchemaVersion {
         Self(schema_hash(source))
     }
 
-    /// The content hash bytes. Empty when no version is declared.
+    /// The content hash bytes.
     #[inline]
     pub fn hash(&self) -> &[u8] {
         &self.0
@@ -40,8 +50,7 @@ impl SchemaVersion {
 }
 
 impl fmt::Display for SchemaVersion {
-    /// A short hex prefix, enough to identify a build in a log or error. An
-    /// empty version renders as `none`.
+    /// A short hex prefix, enough to identify a build in a log or error.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_empty() {
             return f.write_str("none");

@@ -10,12 +10,12 @@
 //! pins the client contract without an oplog or a retention window.
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -104,7 +104,7 @@ fn resync_server() -> LoopbackTransport {
                 session_id: "resync".to_owned(),
                 session_token: "resync".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
-                schema_version: SchemaVersion::default(),
+                schema_version: None,
                 initial_credits: 64,
                 last_applied_seq: None,
             }))
@@ -163,7 +163,7 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
     let config = ClientConfig {
         client_id: "resync".to_owned(),
         auth_token: "token".to_owned(),
-        schema_version: connetto_core::SchemaVersion::default(),
+        schema_version: None,
     };
     let mut conn =
         ConnettoConnection::connect(resync_server(), ":memory:", SQLITE_DDL, &config, None)
