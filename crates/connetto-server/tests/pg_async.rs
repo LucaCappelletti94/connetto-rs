@@ -21,7 +21,7 @@ use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
 use subql::reexec::PgAsyncDieselConnector;
 use subql::{CdcSource, PgSqliteEmuSource};
 
@@ -44,6 +44,12 @@ diesel::table! {
     aggs (id) {
         id -> diesel::sql_types::BigInt,
         amount -> diesel::sql_types::BigInt,
+    }
+}
+diesel::table! {
+    things (id) {
+        id -> diesel::sql_types::Uuid,
+        n -> diesel::sql_types::BigInt,
     }
 }
 
@@ -202,6 +208,70 @@ async fn async_pg_snapshot_reads_rows() {
             },
         ],
         "only quantity > 0 rows, void row excluded by the SELECT"
+    );
+}
+
+const THINGS_PG_DDL: &str = "CREATE TABLE things (id UUID PRIMARY KEY, n BIGINT);";
+
+/// The uuid identity guard at the connetto seam: a `uuid` primary key must
+/// snapshot as the same 16-byte [`Value::Blob`] the CDC path emits, or a row
+/// present in both a snapshot and a later CDC patch would carry two identities
+/// and duplicate. Reads a real uuid row in Postgres binary through
+/// [`PgSnapshotSource`] and asserts the produced insert carries the raw 16 uuid
+/// bytes as a blob and the bigint as an integer.
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn async_pg_snapshot_uuid_is_blob16() {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let id = uuid::Uuid::from_bytes([
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ]);
+    {
+        let mut conn = pool.get().await.expect("get connection");
+        sql_query("DROP TABLE IF EXISTS things")
+            .execute(&mut *conn)
+            .await
+            .expect("drop table");
+        sql_query(THINGS_PG_DDL)
+            .execute(&mut *conn)
+            .await
+            .expect("create table");
+        diesel::insert_into(things::table)
+            .values((things::id.eq(id), things::n.eq(42_i64)))
+            .execute(&mut *conn)
+            .await
+            .expect("seed row");
+    }
+
+    let source = PgSnapshotSource::from_ddl(pool, THINGS_PG_DDL).expect("build source");
+    let snapshot = source
+        .snapshot(
+            "SELECT * FROM things",
+            &[],
+            &connetto_core::AuthContext::new("test-user"),
+        )
+        .await
+        .expect("produce snapshot");
+
+    let ParsedDiffSet::Patchset(diff) =
+        ParsedDiffSet::parse(snapshot.patchset.as_slice()).expect("parse patchset")
+    else {
+        panic!("snapshot is not a patchset");
+    };
+    let ops: Vec<_> = diff.iter().collect();
+    assert_eq!(ops.len(), 1, "one inserted row");
+    let PatchsetOp::Insert { table, values, .. } = &ops[0] else {
+        panic!("expected an insert op, got {:?}", ops[0]);
+    };
+    assert_eq!(table.name(), "things");
+    assert_eq!(
+        values.to_vec(),
+        vec![Value::Blob(id.as_bytes().to_vec()), Value::Integer(42),],
+        "uuid lands as the raw 16-byte blob, bigint as an integer"
     );
 }
 

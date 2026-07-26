@@ -23,7 +23,6 @@
 //! `trunk serve` from this directory, then open the served URL in several
 //! windows.
 
-use core::sync::atomic::{AtomicI64, Ordering};
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
@@ -46,12 +45,11 @@ const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
 /// version at handshake and is not rejected as stale.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// The synced replica schema (worker first boot). Matches `schema.sql`.
-const DEMO_SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 /// The tab mirror schema: both tiers in the tab's main schema, because every
 /// relayed patch applies to main. The hub, not the tab, keeps the tiers apart.
-const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT; \
-     CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT; \
+     CREATE TABLE notes (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The OPFS file holding the worker's durable synced replica.
@@ -66,14 +64,14 @@ const FRONTEND_TEMPLATE: &[u8] =
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> diesel::sql_types::Binary,
         quantity -> diesel::sql_types::BigInt,
     }
 }
 
 diesel::table! {
     notes (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> diesel::sql_types::Binary,
         body -> diesel::sql_types::Text,
     }
 }
@@ -82,7 +80,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: Vec<u8>,
     quantity: i64,
 }
 
@@ -90,31 +88,51 @@ struct Order {
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Note {
-    id: i64,
+    id: Vec<u8>,
     body: String,
 }
 
-/// Per-window sequence for locally written rows, combined with a random band
-/// so concurrent windows never collide. Relaxed suffices: the atomic only
-/// hands out distinct values, it synchronizes nothing else.
-static LOCAL_SEQ: AtomicI64 = AtomicI64::new(0);
-
-/// A fresh row id unique across the demo's windows: a per-window random band
-/// (chosen once) times a wide multiplier, plus a per-window sequence.
-fn fresh_id() -> i64 {
-    thread_local! {
-        static BAND: i64 = window_band();
+/// A fresh 16-byte row id: a uuid v7 built from the wall clock and random
+/// counter bytes, so ids sort by creation time and never collide across the
+/// demo's windows. Stored as the raw 16 bytes to match the pg2sqlite
+/// `BLOB CHECK (length(id) = 16)` column and the CDC echo, never a 36-char
+/// string. No ambient clock or `getrandom`: `Date::now` gives the millisecond
+/// timestamp and `Math::random` the counter bytes, both wasm-safe.
+fn fresh_id() -> Vec<u8> {
+    let now = js_sys::Date::now();
+    // Date::now is a finite, positive epoch-millisecond count, far below u64::MAX.
+    debug_assert!(now.is_finite() && now >= 0.0);
+    let millis = now as u64;
+    let mut counter = [0u8; 10];
+    for byte in &mut counter {
+        let scaled = js_sys::Math::random() * 256.0;
+        // Math::random is [0, 1); scale to a byte. Deliberate quantization.
+        debug_assert!(scaled.is_finite() && (0.0..256.0).contains(&scaled));
+        *byte = scaled as u8;
     }
-    BAND.with(|band| band * 1_000_000 + LOCAL_SEQ.fetch_add(1, Ordering::Relaxed))
+    uuid::Builder::from_unix_timestamp_millis(millis, &counter)
+        .into_uuid()
+        .into_bytes()
+        .to_vec()
 }
 
-/// A random per-window id band in `[0, 2^31)`.
-fn window_band() -> i64 {
-    // `Math::random` is in `[0, 1)`; scale to a 31-bit band. The float-to-int
-    // is intended truncation of a finite value provably inside the i64 range.
-    let scaled = js_sys::Math::random() * f64::from(1u32 << 31);
-    debug_assert!(scaled.is_finite() && (0.0..f64::from(1u32 << 31)).contains(&scaled));
-    scaled as i64
+/// A visible order quantity inside the subscription's `quantity > 0` window.
+///
+/// The id is opaque bytes now, so quantity can no longer key off it. A random
+/// `1..=9` times five gives spread while staying strictly positive.
+fn fresh_quantity() -> i64 {
+    let scaled = js_sys::Math::random() * 9.0;
+    // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
+    debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
+    (scaled as i64 + 1) * 5
+}
+
+/// Render a 16-byte id as a hyphenated uuid string for the dashboard, with a
+/// hex fallback if the bytes are not a uuid width.
+fn id_display(bytes: &[u8]) -> String {
+    uuid::Uuid::from_slice(bytes)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn main() {
@@ -360,7 +378,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             spawn_local(async move {
                 let id = fresh_id();
                 // Quantity in the subscription's window (> 0), varied for visibility.
-                let quantity = (id % 9 + 1).abs() * 5;
+                let quantity = fresh_quantity();
                 let result = client
                     .with_conn(move |conn| {
                         diesel::insert_into(orders::table)
@@ -431,11 +449,14 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody>
-                        { for order_rows.iter().map(|row| html! {
-                            <tr key={row.id.to_string()}>
-                                <td>{ row.id.to_string() }</td>
-                                <td>{ row.quantity.to_string() }</td>
-                            </tr>
+                        { for order_rows.iter().map(|row| {
+                            let id = id_display(&row.id);
+                            html! {
+                                <tr key={id.clone()}>
+                                    <td>{ id }</td>
+                                    <td>{ row.quantity.to_string() }</td>
+                                </tr>
+                            }
                         }) }
                     </tbody>
                 </table>
@@ -451,11 +472,14 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
                     <tbody>
-                        { for note_rows.iter().map(|row| html! {
-                            <tr key={row.id.to_string()}>
-                                <td>{ row.id.to_string() }</td>
-                                <td>{ row.body.clone() }</td>
-                            </tr>
+                        { for note_rows.iter().map(|row| {
+                            let id = id_display(&row.id);
+                            html! {
+                                <tr key={id.clone()}>
+                                    <td>{ id }</td>
+                                    <td>{ row.body.clone() }</td>
+                                </tr>
+                            }
                         }) }
                     </tbody>
                 </table>

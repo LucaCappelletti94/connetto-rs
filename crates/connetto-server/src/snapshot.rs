@@ -1,27 +1,33 @@
 //! Backend-read initial snapshots.
 //!
 //! Fills the [`SnapshotSource`](crate::session::SnapshotSource) seam with a real
-//! Postgres read: run the
-//! subscription's `SELECT` on the backend, take each result row as a single
-//! `jsonb` value, and encode the rows into an insert-patchset with
-//! `sqlite-diff-rs`. The rows and the LSN are read in one read-only
-//! repeatable-read transaction, so the snapshot cursor names a consistent WAL
-//! position. The client applies the patchset, then live patches with a greater
-//! cursor land on top.
+//! Postgres read: run the subscription's `SELECT` on the backend, take each
+//! result column as its raw Postgres binary bytes, and encode the rows into an
+//! insert-patchset with [`subql::emit::pgbinary_patchset`]. The rows and the LSN
+//! are read in one read-only repeatable-read transaction, so the snapshot cursor
+//! names a consistent WAL position. The client applies the patchset, then live
+//! patches with a greater cursor land on top.
+//!
+//! Reading binary and lowering it through the same encoder the CDC path uses
+//! (`pgbinary_patchset` shares the catalog wire-type source with
+//! `pgoutput_patchset`) makes the snapshot and the live stream agree on every
+//! value by construction: a `uuid` snapshots as the same 16-byte
+//! [`Value::Blob`](sqlite_diff_rs::Value) the replication path emits, so a row
+//! present in both a snapshot and a later CDC patch has one identity, not two.
+//! connetto carries no per-type wire knowledge of its own: both the catalog walk
+//! and the per-column decode live in `subql`.
 //!
 //! `subql`'s async connector does not implement row reads (`execute_rows` is
 //! reserved for total row re-execution), so the materializer owns this read, as
 //! the boundary intends. No SQLite lives on the backend: the catalog supplies
 //! the column order and primary key for the patchset shape.
 
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value as WireValue};
 #[cfg(feature = "pg-async")]
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 #[cfg(feature = "pg-async")]
 use sqlparser::dialect::PostgreSqlDialect;
 #[cfg(feature = "pg-async")]
 use sqlparser::parser::Parser;
-use subql::{DatabaseLike, catalog_helpers};
 
 /// Failure surfaced while producing a snapshot.
 #[derive(Debug, thiserror::Error)]
@@ -32,82 +38,12 @@ pub enum SnapshotError {
     /// The subscription SQL could not be parsed to find its table.
     #[error("could not read the subscription table: {0}")]
     Sql(String),
-    /// The subscription targets a table absent from the catalog.
-    #[error("unknown table `{0}`")]
-    UnknownTable(String),
-    /// A returned row was not a JSON object.
-    #[error("snapshot row was not a JSON object")]
-    Row,
-    /// Building the insert-patchset failed.
+    /// Building the insert-patchset from the binary rows failed.
     #[error("patchset build failed: {0}")]
     Encode(String),
     /// The backend read failed.
     #[error("backend read failed: {0}")]
     Backend(String),
-}
-
-/// Encode backend rows (each a JSON object keyed by column name) for `table`
-/// into an insert-patchset.
-///
-/// Column order and primary key come from the catalog. A column absent from a
-/// row's object is stored as NULL. The value's JSON shape already reflects its
-/// column type (Postgres `to_jsonb` encodes per column), so numbers become
-/// integer or real values, booleans become `0`/`1`, and everything else rides
-/// as text.
-///
-/// # Errors
-///
-/// [`SnapshotError::UnknownTable`] when the table is absent from the catalog,
-/// [`SnapshotError::Row`] when a row is not a JSON object, and
-/// [`SnapshotError::Encode`] when a value cannot be set.
-pub fn encode_json_rows<DB: DatabaseLike>(
-    db: &DB,
-    table: &str,
-    rows: &[serde_json::Value],
-) -> Result<Vec<u8>, SnapshotError> {
-    let table_id = catalog_helpers::table_id(db, table)
-        .ok_or_else(|| SnapshotError::UnknownTable(table.to_owned()))?;
-    let simple = catalog_helpers::simple_table(db, table_id)
-        .ok_or_else(|| SnapshotError::UnknownTable(table.to_owned()))?;
-    let arity = catalog_helpers::table_arity(db, table_id)
-        .ok_or_else(|| SnapshotError::UnknownTable(table.to_owned()))?;
-
-    let mut columns: Vec<String> = Vec::with_capacity(arity);
-    for ordinal in 0..arity {
-        let column_id =
-            u16::try_from(ordinal).map_err(|_| SnapshotError::UnknownTable(table.to_owned()))?;
-        let name = catalog_helpers::column_name(db, table_id, column_id)
-            .ok_or_else(|| SnapshotError::UnknownTable(table.to_owned()))?;
-        columns.push(name);
-    }
-
-    let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for row in rows {
-        let object = row.as_object().ok_or(SnapshotError::Row)?;
-        let mut insert = Insert::<_, String, Vec<u8>>::from(simple.clone());
-        for (index, name) in columns.iter().enumerate() {
-            let wire = object.get(name).map_or(WireValue::Null, json_to_wire);
-            insert = insert
-                .set(index, wire)
-                .map_err(|err| SnapshotError::Encode(format!("{err:?}")))?;
-        }
-        patchset = patchset.insert(insert);
-    }
-    Ok(patchset.build())
-}
-
-/// Convert one JSON scalar into its `sqlite-diff-rs` wire value.
-fn json_to_wire(value: &serde_json::Value) -> WireValue<String, Vec<u8>> {
-    match value {
-        serde_json::Value::Null => WireValue::Null,
-        serde_json::Value::Bool(b) => WireValue::Integer(i64::from(*b)),
-        serde_json::Value::Number(n) => n.as_i64().map_or_else(
-            || WireValue::Real(n.as_f64().unwrap_or(0.0)),
-            WireValue::Integer,
-        ),
-        serde_json::Value::String(s) => WireValue::Text(s.clone()),
-        other => WireValue::Text(other.to_string()),
-    }
 }
 
 /// Extract the single table a `SELECT` reads from, as its bare catalog name.
@@ -144,7 +80,8 @@ pub use pg::PgSnapshotSource;
 
 #[cfg(feature = "pg-async")]
 mod pg {
-    use diesel::sql_types::{BigInt, Binary, Double, Jsonb, Nullable, Text};
+    use diesel::row::{Field, NamedRow, Row};
+    use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
     use diesel::{QueryableByName, sql_query};
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
@@ -155,7 +92,7 @@ mod pg {
     use connetto_core::messages::BindValue;
     use connetto_core::{AuthContext, Cursor};
 
-    use super::{SnapshotError, encode_json_rows, table_from_select};
+    use super::{SnapshotError, table_from_select};
     use crate::session::{Snapshot, SnapshotSource};
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a
@@ -188,10 +125,31 @@ mod pg {
         }
     }
 
-    #[derive(QueryableByName)]
-    struct JsonRow {
-        #[diesel(sql_type = Jsonb)]
-        row: serde_json::Value,
+    /// One backend result row read in Postgres binary: the result column names
+    /// and the raw wire bytes per column, `None` for a SQL NULL.
+    ///
+    /// The read is dynamic (the subscription's projection is not known at
+    /// compile time), so this walks the diesel [`Row`] API by ordinal rather
+    /// than deriving a typed row. `field.value()` hands back the exact bytes
+    /// tokio-postgres received in binary format, which is what
+    /// [`subql::emit::pgbinary_patchset`] decodes.
+    struct BinaryRow {
+        names: Vec<String>,
+        cells: Vec<Option<Vec<u8>>>,
+    }
+
+    impl QueryableByName<diesel::pg::Pg> for BinaryRow {
+        fn build<'a>(row: &impl NamedRow<'a, diesel::pg::Pg>) -> diesel::deserialize::Result<Self> {
+            let arity = row.field_count();
+            let mut names = Vec::with_capacity(arity);
+            let mut cells = Vec::with_capacity(arity);
+            for ordinal in 0..arity {
+                let field = Row::get(row, ordinal).ok_or(diesel::result::UnexpectedEndOfRow)?;
+                names.push(field.field_name().unwrap_or_default().to_owned());
+                cells.push(field.value().map(|value| value.as_bytes().to_vec()));
+            }
+            Ok(Self { names, cells })
+        }
     }
 
     #[derive(QueryableByName)]
@@ -210,16 +168,16 @@ mod pg {
             auth: &AuthContext,
         ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
-            let wrapped = format!("SELECT to_jsonb(_snap) AS row FROM ({select_sql}) AS _snap");
             let user_id = auth.user_id.clone();
             let binds = binds.to_vec();
+            let select_sql = select_sql.to_owned();
             let mut conn = self
                 .pool
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let (rows, lsn) = conn
-                .transaction::<(Vec<JsonRow>, String), diesel::result::Error, _>(|c| {
+                .transaction::<(Vec<BinaryRow>, String), diesel::result::Error, _>(|c| {
                     async move {
                         // Pin one MVCC snapshot so the rows and the LSN agree.
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
@@ -231,12 +189,14 @@ mod pg {
                             .bind::<Text, _>(user_id)
                             .execute(c)
                             .await?;
-                        // The translated query carries `$N` placeholders. Attach
-                        // the wire binds in order, each with its natural Postgres
-                        // type. A NULL bind has no inherent type and rides as
-                        // nullable text, which diesel-rendered queries never
-                        // produce (they render IS NULL instead of binding NULL).
-                        let mut query = sql_query(wrapped).into_boxed::<diesel::pg::Pg>();
+                        // Read the subscription SELECT verbatim (no jsonb wrap) so
+                        // every column comes back in Postgres binary. The
+                        // translated query carries `$N` placeholders. Attach the
+                        // wire binds in order, each with its natural Postgres type.
+                        // A NULL bind has no inherent type and rides as nullable
+                        // text, which diesel-rendered queries never produce (they
+                        // render IS NULL instead of binding NULL).
+                        let mut query = sql_query(select_sql).into_boxed::<diesel::pg::Pg>();
                         for bind in binds {
                             query = match bind {
                                 BindValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
@@ -246,7 +206,7 @@ mod pg {
                                 BindValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
                             };
                         }
-                        let rows: Vec<JsonRow> = query.load(c).await?;
+                        let rows: Vec<BinaryRow> = query.load(c).await?;
                         let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
                             .get_result(c)
                             .await?;
@@ -257,8 +217,21 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
 
-            let rows: Vec<serde_json::Value> = rows.into_iter().map(|r| r.row).collect();
-            let patchset = encode_json_rows(&self.catalog, &table, &rows)?;
+            // Column names come from the first row; a zero-row snapshot has none,
+            // and `pgbinary_patchset` returns an empty patchset for that, which is
+            // correct (nothing to insert).
+            let column_names: Vec<&str> = rows
+                .as_slice()
+                .first()
+                .map(|r| r.names.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let row_cells: Vec<Vec<Option<&[u8]>>> = rows
+                .iter()
+                .map(|r| r.cells.iter().map(|c| c.as_deref()).collect())
+                .collect();
+            let patchset =
+                subql::emit::pgbinary_patchset(&self.catalog, &table, &column_names, &row_cells)
+                    .map_err(|err| SnapshotError::Encode(err.to_string()))?;
             let cursor = PgLsn::parse(&lsn)
                 .map(|lsn| lsn.0.to_be_bytes().to_vec())
                 .unwrap_or_default();

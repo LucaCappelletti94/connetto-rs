@@ -30,11 +30,12 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main (5858f50 bumps sqlite-diff-rs to 0.8.0, on top of d999fbd's blob
+# on main (95f7005 bumps sqlite-diff-rs to 0.9.0 and adds the PgBinary wire
+# source plus subql::emit::pgbinary_patchset, on top of 5858f50's 0.8.0 blob
 # render): native SQL-plus-binds registration with Value::Bytes placeholder
 # resolution, and the diesel-typed SQLite render accepting blob binds. The base
 # features stay minimal here, each crate states the feature set it consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "5858f50707995e288639a666cd301eb7b082dd65", default-features = false, features = ["std"] }
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "95f7005560e6db0c53a5616bba07ba35ad428fb5", default-features = false, features = ["std"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"

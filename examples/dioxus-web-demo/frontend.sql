@@ -3,4 +3,4 @@
 -- boundary fails the template bake (pg2sqlite validates reference closure per
 -- document). Postgres dialect is kept for the type system, even though this
 -- document never touches a real Postgres.
-CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT);
+CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT);

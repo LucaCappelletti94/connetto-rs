@@ -1746,9 +1746,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee509dca2ae4b843913bd7581916bb1f6c679ab06c068186b2c71ae1fd467037"
+checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -1839,7 +1839,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=5858f50707995e288639a666cd301eb7b082dd65#5858f50707995e288639a666cd301eb7b082dd65"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=95f7005560e6db0c53a5616bba07ba35ad428fb5#95f7005560e6db0c53a5616bba07ba35ad428fb5"
 dependencies = [
  "arc-swap",
  "async-lock",

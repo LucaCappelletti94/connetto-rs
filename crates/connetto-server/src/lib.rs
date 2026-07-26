@@ -13,8 +13,8 @@
 //!   `connetto-core` behind its `native-transport` feature.
 //! * [`session`] holds the [`SessionManager`], the per-session state machine,
 //!   and the [`SnapshotSource`] seam.
-//! * [`snapshot`] holds [`encode_json_rows`] and the Postgres-backed fill of
-//!   that seam.
+//! * [`snapshot`] holds the Postgres-backed binary fill of that seam through
+//!   `subql::emit::pgbinary_patchset`.
 //!
 //! See `docs/architecture/10-subscription-materializer.md` for the normative
 //! boundary and `docs/architecture/subql.md` for the shipped `subql` surface.
@@ -50,7 +50,7 @@ pub use session::{
 };
 #[cfg(feature = "pg-async")]
 pub use snapshot::PgSnapshotSource;
-pub use snapshot::{SnapshotError, encode_json_rows};
+pub use snapshot::SnapshotError;
 #[cfg(feature = "pg-async")]
 pub use write_target::{PgWriteTarget, ProvisionError, pg_write_target, provision_watermark_table};
 pub use write_target::{SqliteWriteTarget, WriteTarget, sqlite_write_target};
