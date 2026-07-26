@@ -58,6 +58,39 @@ struct Note {
     body: String,
 }
 
+/// A downstream-style application SQL type: the comma-joined result of a
+/// `group_concat`. Only this test crate owns it, so the orphan rule lets it
+/// carry its own [`AggregateWire`](connetto_client::dsl::AggregateWire) impl,
+/// which is the whole point of the extension seam.
+#[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
+#[diesel(sqlite_type(name = "Text"))]
+pub struct CsvList;
+
+diesel::define_sql_function! {
+    /// The SQLite built-in `group_concat` aggregate, returning the custom
+    /// [`CsvList`] type. Its name is absent from connetto's built-in
+    /// `AGGREGATE_FUNCTIONS`, so only the typed `live()` path (which reads
+    /// diesel's `IsAggregate` marker) classifies it as an aggregate. The
+    /// `#[aggregate]` attribute is what sets that marker.
+    #[aggregate]
+    fn group_concat(body: diesel::sql_types::Text) -> CsvList;
+}
+
+impl connetto_client::dsl::AggregateWire for CsvList {
+    type Value = Option<String>;
+
+    fn decode(json: &str) -> Result<Option<String>, connetto_client::ClientError> {
+        use connetto_client::dsl::wire;
+        match wire::json_value(json)? {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => Ok(Some(s)),
+            other => Err(connetto_client::ClientError::Session(format!(
+                "expected a csv string, got {other}"
+            ))),
+        }
+    }
+}
+
 /// A snapshot source that records every subscription's `select_sql`, so the
 /// tests can assert exactly which queries reached the wire. Serves empty
 /// snapshots: the tests drive rows through CDC dispatch instead.
@@ -301,6 +334,99 @@ async fn local_aggregate_recomputes_locally() {
     );
 
     drop(count);
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_custom_aggregate_decodes_via_extension_seam() {
+    // A custom aggregate (group_concat, absent from the built-in
+    // AGGREGATE_FUNCTIONS) returning an application-defined SQL type
+    // (CsvList). It proves two facets at once: the typed live() path
+    // classifies it as an aggregate from diesel's IsAggregate marker rather
+    // than the SQL-text name list (a text classifier would misread it as a
+    // row query and reject it), and a downstream AggregateWire impl over the
+    // app's own SQL type drives live() end to end through the public wire
+    // primitives. It runs on the local tier, so the client recomputes it with
+    // json_quote and no subscription reaches the server.
+    let (_manager, seen, addr, server) = spawn_server(1).await;
+    let conn = connect_with_tier(addr, "tier-custom-agg").await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    let mut joined = notes::table
+        .select(group_concat(notes::body))
+        .live(&client)
+        .await
+        .expect("local live custom aggregate");
+    // The empty set: group_concat is NULL, json_quote renders "null", the
+    // app's decoder maps it to None.
+    assert_eq!(
+        joined.value(),
+        Some(None),
+        "empty bootstrap decodes to None"
+    );
+
+    // First live update: two rows appear, the aggregate recomputes locally and
+    // decodes through the seam.
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(notes::table)
+                .values(&vec![
+                    (notes::id.eq(1_i64), notes::body.eq("a")),
+                    (notes::id.eq(2_i64), notes::body.eq("b")),
+                ])
+                .execute(conn.conn())
+        })
+        .await
+        .expect("insert notes");
+    joined.changed().await.expect("local recompute");
+    assert_eq!(
+        joined.value(),
+        Some(Some("a,b".to_owned())),
+        "the custom aggregate recomputed locally and decoded through the seam",
+    );
+
+    // Second live update: an added row changes the value again, so a live
+    // handle tracks more than the first transition.
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(notes::table)
+                .values((notes::id.eq(3_i64), notes::body.eq("c")))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("insert third note");
+    joined.changed().await.expect("second local recompute");
+    assert_eq!(
+        joined.value(),
+        Some(Some("a,b,c".to_owned())),
+        "a further change updates the custom aggregate",
+    );
+
+    // The nullable round-trip: deleting every row empties the set, group_concat
+    // is NULL again, and the seam decoder maps it back to None. This is the
+    // corner a nullable custom decoder most often gets wrong.
+    client
+        .with_conn(|conn| diesel::delete(notes::table).execute(conn.conn()))
+        .await
+        .expect("delete all notes");
+    joined.changed().await.expect("empty recompute");
+    assert_eq!(
+        joined.value(),
+        Some(None),
+        "emptying the set returns the custom aggregate to None",
+    );
+
+    // Wire silence, fenced like the built-in local aggregate case.
+    client.ping(9).await.expect("ping");
+    wait_broadcast_strict(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 9 })).await;
+    assert!(
+        seen.lock().expect("recorder lock").is_empty(),
+        "no subscription may reach the server for a local custom aggregate"
+    );
+
+    drop(joined);
     drop(client);
     server.await.expect("join server");
 }

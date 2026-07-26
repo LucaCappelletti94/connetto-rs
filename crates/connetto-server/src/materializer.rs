@@ -1318,3 +1318,88 @@ pub(crate) fn compress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
 pub(crate) fn decompress(payload_zstd: &[u8]) -> std::io::Result<Vec<u8>> {
     zstd::decode_all(payload_zstd)
 }
+
+#[cfg(test)]
+mod wire_contract {
+    //! Pin the exact JSON string [`value_to_json`] emits for each
+    //! [`PgValue`] variant. The client aggregate decoders in
+    //! `connetto-client` are written against these bytes, so a change here
+    //! that is not mirrored there is a wire break, and this test is the
+    //! canary.
+
+    use super::{PgValue, Postgres, value_to_json};
+
+    #[test]
+    fn value_to_json_renders_each_scalar_variant() {
+        // Absent and explicit null both collapse to JSON null.
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Missing), "null");
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Null), "null");
+
+        // Bool is a JSON bool, not the SQLite 0/1 integer.
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Bool(true)), "true");
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Bool(false)), "false");
+
+        // Integers are JSON integers, floats are JSON numbers.
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Int(42)), "42");
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Float(1.5)), "1.5");
+
+        // Text is a JSON string.
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::String("hi".to_owned())),
+            "\"hi\"",
+        );
+
+        // Bytes render through String::from_utf8_lossy, not base64. Valid
+        // UTF-8 rides through verbatim, and an invalid byte becomes the
+        // replacement character (this is lossy by design, see Trap 3).
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Bytes(b"hi".to_vec())),
+            "\"hi\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Bytes(vec![0xff, b'a'])),
+            "\"\u{fffd}a\"",
+        );
+
+        // Uuid, the temporal types, and decimals render as their to_string,
+        // wrapped as JSON strings, never as numbers.
+        let uuid =
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Uuid(uuid)),
+            "\"550e8400-e29b-41d4-a716-446655440000\"",
+        );
+        let stamp = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
+            .expect("valid date")
+            .and_hms_opt(3, 4, 5)
+            .expect("valid time");
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Timestamp(stamp)),
+            "\"2020-01-02 03:04:05\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::TimestampTz(stamp.and_utc())),
+            "\"2020-01-02 03:04:05 UTC\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Date(
+                chrono::NaiveDate::from_ymd_opt(2020, 1, 2).expect("valid date"),
+            )),
+            "\"2020-01-02\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Time(
+                chrono::NaiveTime::from_hms_opt(3, 4, 5).expect("valid time"),
+            )),
+            "\"03:04:05\"",
+        );
+
+        // Json and Jsonb pass the raw JSON value through unquoted.
+        let doc = serde_json::json!({ "k": 1 });
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Json(doc.clone())),
+            "{\"k\":1}",
+        );
+        assert_eq!(value_to_json(&PgValue::<Postgres>::Jsonb(doc)), "{\"k\":1}");
+    }
+}

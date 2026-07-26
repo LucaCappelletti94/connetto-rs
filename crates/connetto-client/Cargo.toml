@@ -27,6 +27,11 @@ native-transport = [
     "tokio/time",
     "tokio/io-util",
 ]
+# Aggregate decode support for the Postgres-only diesel SQL types `Uuid` and
+# `Timestamptz`. Their diesel markers live behind diesel's postgres_backend
+# (no libpq), which the orphan rule forbids a downstream crate from mapping, so
+# they are opt-in here rather than forced on every SQLite-only client.
+postgres-types = ["diesel/postgres_backend"]
 
 [[bin]]
 name = "connetto-client"
@@ -72,6 +77,12 @@ anyhow.workspace = true
 connetto-server.path = "../connetto-server"
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
+# Building a NaiveDateTime the emulator connector returns as a re-executed
+# timestamp aggregate, so the typed live() path decodes a temporal scalar.
+chrono = "0.4"
+# The extension-seam test decodes a custom aggregate through the public wire
+# primitives, which hand back a serde_json::Value the impl matches on.
+serde_json = "1"
 # The RLS name-mapping characterization test translates a policy-bearing
 # Postgres schema at test time and reads the logical to physical table map
 # through `translation_manifest`. Rev pinned to the reference-closed FK

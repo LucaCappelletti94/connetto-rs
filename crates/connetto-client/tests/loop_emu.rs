@@ -114,6 +114,13 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    metrics (id) {
+        id -> diesel::sql_types::BigInt,
+        seen -> diesel::sql_types::Timestamp,
+    }
+}
+
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -908,16 +915,26 @@ async fn conflicting_write_converges_to_server_after_rollback() {
 }
 
 /// An [`AsyncConnector`] that answers `execute_scalar` from a queue of canned
-/// integers (the MIN/MAX re-execution path) and `execute_scalar_row` from a
+/// scalars (the MIN/MAX re-execution path) and `execute_scalar_row` from a
 /// queue of canned component rows (the delta aggregate seed path), standing in
 /// for the Postgres backend in the Docker-free aggregate loop.
 struct QueuedConnector {
-    responses: Mutex<VecDeque<i64>>,
+    responses: Mutex<VecDeque<PgValue<Postgres>>>,
     rows: Mutex<VecDeque<Vec<PgValue<Postgres>>>>,
 }
 
 impl QueuedConnector {
     fn new(responses: impl IntoIterator<Item = i64>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into_iter().map(PgValue::Int).collect()),
+            rows: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// A connector serving canned scalar re-execution values of any type, one
+    /// per `execute_scalar` call, in order. Drives a typed `live()` over a
+    /// column whose SQL type is outside the integer family.
+    fn with_scalars(responses: impl IntoIterator<Item = PgValue<Postgres>>) -> Self {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
             rows: Mutex::new(VecDeque::new()),
@@ -951,7 +968,7 @@ impl AsyncConnector for QueuedConnector {
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|n| (PgValue::Int(n), Some(PgLsn(1))))
+            next.map(|value| (value, Some(PgLsn(1))))
                 .ok_or_else(|| std::io::Error::other("no more canned responses"))
         }
     }
@@ -1832,6 +1849,93 @@ async fn live_value_tracks_a_server_aggregate() {
     assert!(
         !saw_aggregate,
         "no aggregate push may arrive after the unsubscribe",
+    );
+
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_value_decodes_a_temporal_aggregate() {
+    // A typed live() over MAX of a TIMESTAMP column. subql re-executes MIN/MAX
+    // on any orderable type, so a scalar outside the old numeric and text
+    // family rides the re-execution wire, where value_to_json renders it as a
+    // JSON string. The broadened AggregateWire family decodes it into
+    // Option<String>, proving the new type resolves through the real server on
+    // both the bootstrap and a later CDC-driven push.
+    const METRICS_PG_DDL: &str = "CREATE TABLE metrics (id INT PRIMARY KEY, seen TIMESTAMP);";
+    let materializer = Materializer::new(METRICS_PG_DDL).expect("build materializer");
+    let seen = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
+        .expect("valid date")
+        .and_hms_opt(3, 4, 5)
+        .expect("valid time");
+    let connector = QueuedConnector::with_scalars([PgValue::Timestamp(seen)]);
+    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        connector,
+        target,
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let conn = connect_client(addr, "client-ts", &db_path).await;
+    let client = ConnettoClient::start(conn);
+    let mut events = client.events();
+
+    // MAX(seen) is Nullable<Timestamp>, so the typed live() infers a
+    // LiveValue<Option<String>> with no annotation.
+    let mut latest = metrics::table
+        .select(diesel::dsl::max(metrics::seen))
+        .live(&client)
+        .await
+        .expect("live temporal aggregate");
+
+    tokio::select! {
+        changed = tokio::time::timeout(Duration::from_secs(5), latest.changed()) => {
+            changed.expect("bootstrap timed out").expect("driver alive");
+        }
+        rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
+            panic!("temporal aggregate subscription rejected: {rejected:?}");
+        }
+    }
+    assert_eq!(
+        latest.value(),
+        Some(Some("2020-01-02 03:04:05".to_owned())),
+        "the timestamp bootstrap decodes to its wire string",
+    );
+
+    // A CDC insert raises the maximum. The re-execution family folds the new
+    // extreme in process and pushes it through value_to_json, and the typed
+    // LiveValue decodes the updated timestamp string.
+    let mut source = PgSqliteEmuSource::open_in_memory(METRICS_PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO metrics (id, seen) VALUES (1, '2021-06-07 08:09:10')")
+        .expect("emu insert");
+    drain_events(&manager, &mut source).await;
+    tokio::time::timeout(Duration::from_secs(5), latest.changed())
+        .await
+        .expect("update timed out")
+        .expect("driver alive");
+    assert_eq!(
+        latest.value(),
+        Some(Some("2021-06-07 08:09:10".to_owned())),
+        "a CDC change pushes the new maximum, decoded as a timestamp string",
     );
 
     drop(client);

@@ -111,6 +111,16 @@ pub fn subscription_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
 /// protocol from a worker-held connection can route a tab `Subscribe` to the
 /// aggregate path instead of a row snapshot, matching the direct client.
 ///
+/// This classifies from the rendered SQL by function name, so it recognizes
+/// only the built-in scalar aggregate family (`COUNT`, `SUM`, `AVG`, the
+/// extremes, and the variance and stddev functions). It cannot recognize a
+/// custom aggregate: a text classifier cannot tell a user aggregate
+/// `my_agg(x)` from a user scalar function `my_func(x)` without a name
+/// registry, which would misclassify the scalar. Custom aggregates are
+/// supported only through the typed [`live()`](crate::dsl::Watchable::live)
+/// path, which classifies by diesel's `IsAggregate` type marker. A relay
+/// forwarding raw tab SQL therefore serves the built-in family only.
+///
 /// # Errors
 ///
 /// [`ClientError::Session`] when the SQL cannot be parsed.
@@ -119,6 +129,11 @@ pub fn subscription_is_aggregate(sql: &str) -> Result<bool, ClientError> {
 }
 
 /// The scalar aggregate functions the server maintains, lowercased.
+///
+/// This is the built-in family the SQL-text classification recognizes. It is
+/// deliberately a fixed set, not a registry of arbitrary user aggregate
+/// names: see [`subscription_is_aggregate`] for why a name-based classifier
+/// cannot admit custom aggregates without misclassifying scalar functions.
 const AGGREGATE_FUNCTIONS: &[&str] = &[
     "avg",
     "count",
@@ -131,6 +146,19 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "var_pop",
     "var_samp",
 ];
+
+/// Whether a value watch already knows it faces an aggregate.
+#[derive(Clone, Copy)]
+enum ShapeSource {
+    /// The typed [`live()`](crate::dsl::Watchable::live) dispatch proved the
+    /// aggregate shape through diesel's `IsAggregate` marker, so the SQL-text
+    /// classification is bypassed. This is the only path that admits a custom
+    /// aggregate, whose function name is absent from [`AGGREGATE_FUNCTIONS`].
+    Marker,
+    /// A dynamic caller with no type-level marker, classified from the
+    /// rendered SQL by function name against the built-in family.
+    Sql,
+}
 
 /// Parse a rendered subscription query into its table set and shape.
 fn parse_subscription(sql: &str) -> Result<ParsedSubscription, ClientError> {
@@ -771,16 +799,25 @@ where
         })
     }
 
-    /// Watch a server-maintained scalar aggregate.
+    /// Watch a server-maintained scalar aggregate, decoding each push with
+    /// plain serde.
     ///
-    /// The query must be a single ungrouped aggregate (`COUNT`, `SUM`, `AVG`,
-    /// `MIN`, `MAX`, or the variance and stddev family). It registers like any
-    /// subscription, but the answer path is inverted: no local read happens
-    /// (the replica holds only this client's authorized subset), and every
-    /// value, the bootstrap included, arrives as a server push decoded from
-    /// JSON into `V`. Use an `Option` value type (for example `Option<f64>`)
-    /// for aggregates that are `null` over an empty set, such as `AVG`,
-    /// `MIN`, and `MAX`.
+    /// The query must be a single ungrouped aggregate of the built-in family
+    /// (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, or the variance and stddev
+    /// family), classified from the rendered SQL by function name. It
+    /// registers like any subscription, but the answer path is inverted: no
+    /// local read happens (the replica holds only this client's authorized
+    /// subset), and every value, the bootstrap included, arrives as a server
+    /// push decoded from JSON into `V`. Use an `Option` value type (for
+    /// example `Option<f64>`) for aggregates that are `null` over an empty
+    /// set, such as `AVG`, `MIN`, and `MAX`.
+    ///
+    /// This decode is plain serde and does NOT apply the wire-lenient numeric
+    /// rules the typed [`live()`](crate::dsl::Watchable::live) path applies
+    /// (for example an integer `SUM` the server renders as `"3.0"` fails
+    /// `V = i64` here). For a numeric aggregate prefer the typed path, or
+    /// [`watch_value_with`](Self::watch_value_with) supplying a wire-aware
+    /// decoder such as the [`AggregateWire`](crate::dsl::AggregateWire) family.
     ///
     /// # Errors
     ///
@@ -793,16 +830,36 @@ where
         Q: QueryFragment<Sqlite>,
         V: DeserializeOwned + Clone + PartialEq + Send + Sync + 'static,
     {
-        self.watch_value_decoded(query, |json| {
+        self.watch_value_with(query, |json| {
             serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()))
         })
         .await
     }
 
-    /// The decoder-parameterized core of [`watch_value`](Self::watch_value).
-    /// The typed `live()` dispatch supplies a per-SQL-type decoder that
-    /// follows the wire's aggregate rendering rules instead of plain serde.
-    pub(crate) async fn watch_value_decoded<Q, V>(
+    /// Watch a scalar aggregate, decoding each push with a caller-supplied
+    /// decoder.
+    ///
+    /// The decoder-parameterized peer of [`watch_value`](Self::watch_value),
+    /// for a value type whose wire decode is not plain serde: pass a
+    /// [`AggregateWire`](crate::dsl::AggregateWire) decoder, or one built from
+    /// the reusable primitives in [`dsl::wire`](crate::dsl::wire). This is the
+    /// runtime path a boxed (`.into_boxed()`) or otherwise dynamic query takes,
+    /// since such a query carries no type-level aggregation marker.
+    ///
+    /// Like [`watch_value`](Self::watch_value), the query is classified as an
+    /// aggregate from its rendered SQL by function name, so it recognizes only
+    /// the built-in family. A custom aggregate (a name absent from the
+    /// built-in set) must be driven through the typed
+    /// [`live()`](crate::dsl::Watchable::live) path, which classifies by
+    /// diesel's `IsAggregate` marker instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the query cannot be rendered, is not
+    /// aggregate-shaped, or the subscribe frame cannot be sent. A server-side
+    /// refusal arrives later as [`ClientEvent::NonFatal`] on
+    /// [`events`](Self::events).
+    pub async fn watch_value_with<Q, V>(
         &self,
         query: Q,
         decode: fn(&str) -> Result<V, ClientError>,
@@ -811,9 +868,41 @@ where
         Q: QueryFragment<Sqlite>,
         V: Clone + PartialEq + Send + Sync + 'static,
     {
+        self.watch_value_core(query, decode, ShapeSource::Sql).await
+    }
+
+    /// The typed `live()` entry: the aggregate shape is already proven by
+    /// diesel's `IsAggregate` marker, so the SQL-text classification is
+    /// bypassed and a custom aggregate name is accepted.
+    pub(crate) async fn watch_value_typed<Q, V>(
+        &self,
+        query: Q,
+        decode: fn(&str) -> Result<V, ClientError>,
+    ) -> Result<LiveValue<V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_value_core(query, decode, ShapeSource::Marker)
+            .await
+    }
+
+    /// The decoder-parameterized core behind every value watch. `shape` says
+    /// whether the aggregate shape is trusted from a type-level marker or must
+    /// be classified from the rendered SQL.
+    async fn watch_value_core<Q, V>(
+        &self,
+        query: Q,
+        decode: fn(&str) -> Result<V, ClientError>,
+        shape: ShapeSource,
+    ) -> Result<LiveValue<V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
         let (sql, binds) = render_query(&query)?;
         let parsed = parse_subscription(&sql)?;
-        if parsed.shape != QueryShape::Aggregate {
+        if matches!(shape, ShapeSource::Sql) && parsed.shape != QueryShape::Aggregate {
             return Err(ClientError::Session(
                 "row query: use watch, a row projection is answered from the replica".to_owned(),
             ));
