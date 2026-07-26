@@ -24,7 +24,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
-use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::{RelayHub, uuidv7_functions};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use wasm_bindgen_futures::spawn_local;
@@ -32,14 +32,14 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id.
 const UPSTREAM_SUB: &str = "db-upstream";
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -48,27 +48,31 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
 /// Ids unique across smoke runs, in this test's own band. The test never
 /// touches the server, but it shares the wasm binary's id conventions.
 fn unique_base() -> i64 {
+    let millis = js_sys::Date::now();
+    debug_assert!(millis.is_finite(), "Date::now returned non-finite value");
+    // Date::now() returns milliseconds since epoch as f64; fits i64 until year 285428751.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let millis = js_sys::Date::now() as i64;
-    91_000_000_000 + millis
+    (millis as i64)
 }
 
 /// Build the compressed insert-patchset the wire carries for one snapshot.
-fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
+fn snapshot_payload(rows: &[(rosetta_uuid::Uuid, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for &(id, quantity) in rows {
+    for (id, quantity) in rows {
         let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
+        // Encode the 16-byte UUID as a SQLite BLOB: <[u8; 16]>::from extracts
+        // the raw bytes, matching what the server and changeset apply expect.
         let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Integer(id))
+            .set(0, Value::Blob(<[u8; 16]>::from(*id).to_vec()))
             .expect("set id")
-            .set(1, Value::Integer(quantity))
+            .set(1, Value::Integer(*quantity))
             .expect("set quantity");
         patchset = patchset.insert(insert);
     }
@@ -76,7 +80,7 @@ fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
 }
 
 /// Send one begin, patch, end triple for `UPSTREAM_SUB`.
-async fn send_snapshot(server: &mut LoopbackTransport, rows: &[(i64, i64)]) {
+async fn send_snapshot(server: &mut LoopbackTransport, rows: &[(rosetta_uuid::Uuid, i64)]) {
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: UPSTREAM_SUB.to_owned(),
@@ -94,15 +98,16 @@ async fn send_snapshot(server: &mut LoopbackTransport, rows: &[(i64, i64)]) {
     server
         .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
             sub_id: UPSTREAM_SUB.to_owned(),
-            cursor: Cursor::new(vec![0, 0, 0, 0, 0, 0, 0, 1]),
+            cursor: Cursor::new(Vec::new()),
         }))
         .await
         .expect("snapshot end");
 }
 
-/// The fake upstream: snapshot one row, then conflict the first mutation the
-/// worker forwards, echoing its sequence number so the worker can roll back.
-async fn fake_upstream(mut server: LoopbackTransport, base: i64) {
+/// The fake upstream: snapshot one row using `seeded_id`, then conflict the
+/// first mutation the worker forwards, echoing its sequence number so the
+/// worker can roll back.
+async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::Uuid) {
     let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await else {
         return;
     };
@@ -124,7 +129,7 @@ async fn fake_upstream(mut server: LoopbackTransport, base: i64) {
             _ => return,
         }
     }
-    send_snapshot(&mut server, &[(base, 5)]).await;
+    send_snapshot(&mut server, &[(seeded_id, 5)]).await;
     // Conflict the first forwarded mutation, then drain the rest so the
     // loopback never backs up.
     loop {
@@ -178,17 +183,22 @@ where
 #[wasm_bindgen_test]
 async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     let base = unique_base();
-    let seeded = base;
-    let written = base + 1;
+
+    // Generate the seeded row id up front so both the fake upstream and the
+    // conflicting tab write reference the exact same 16 bytes. The conflict
+    // requires an identical PK on both sides.
+    let seeded_id = rosetta_uuid::Uuid::utc_v7();
 
     // The worker's upstream is a fake server driven frame by frame.
     let (worker_up, fake_up) = loopback();
-    spawn_local(fake_upstream(fake_up, base));
+    // rosetta_uuid::Uuid is Copy; no clone needed.
+    spawn_local(fake_upstream(fake_up, seeded_id));
 
     let worker_config = ClientConfig {
         client_id: format!("conflict-worker-{base}"),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: uuidv7_functions(),
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
@@ -214,6 +224,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
         client_id: format!("conflict-tab-{base}"),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: uuidv7_functions(),
     };
     let mut tab = ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config, None)
         .await
@@ -230,21 +241,24 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
             .iter()
             .map(|order| order.id)
             .collect::<Vec<_>>(),
-        vec![seeded],
-        "the tab mirror seeds the upstream row",
+        vec![seeded_id],
+        "the tab mirror seeds the upstream row {seeded_id:?}",
     );
 
-    // The tab writes optimistically and pushes: the hub applies it to the
-    // worker replica, the worker re-uploads it, and the fake upstream conflicts
-    // it back.
-    diesel::insert_into(orders::table)
-        .values((orders::id.eq(written), orders::quantity.eq(7_i64)))
+    // The tab writes an optimistic UPDATE targeting the seeded row by its exact
+    // blob id (the same bytes the server has), then pushes. The hub forwards it
+    // to the fake upstream, which conflicts it back. Using UPDATE rather than
+    // INSERT avoids a local UNIQUE constraint violation: the snapshot already
+    // planted the row in the tab's in-memory replica.
+    diesel::update(orders::table)
+        .filter(orders::id.eq(seeded_id))
+        .set(orders::quantity.eq(7_i64))
         .execute(tab.conn())
-        .expect("tab insert");
+        .expect("tab optimistic update");
     tab.push().await.expect("tab push").expect("mutation sent");
 
     // The tab must observe MutationConflict, never a plain rejection, and roll
-    // the optimistic row back exactly as a direct client would.
+    // the optimistic write back exactly as a direct client would.
     let rows = loop {
         match tab.pump_one().await.expect("tab pump") {
             ClientEvent::MutationConflict { rows, .. } => break rows,
@@ -264,7 +278,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
             .iter()
             .map(|order| order.id)
             .collect::<Vec<_>>(),
-        vec![seeded],
-        "the tab rolled the conflicted optimistic write back off its mirror",
+        vec![seeded_id],
+        "the tab rolled the conflicted optimistic write back off its mirror {seeded_id:?}",
     );
 }

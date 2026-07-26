@@ -55,7 +55,7 @@ fn relay_worker_breadcrumbs() {
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -64,7 +64,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -98,6 +98,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -123,12 +124,29 @@ where
     }
 }
 
-/// Insert one row through `writer` and fence on a pong.
-async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonce: u64) {
+/// Insert one row through `writer`, minting its id from the `orders` DEFAULT,
+/// and fence on a pong. Returns the minted 16-byte id.
+async fn write_row(
+    writer: &mut ConnettoConnection<BrowserSocket>,
+    nonce: u64,
+) -> rosetta_uuid::Uuid {
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(5_i64)))
+        .values(orders::quantity.eq(5_i64))
         .execute(writer.conn())
         .expect("writer insert");
+    let id = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("the newly minted id");
     writer.push().await.expect("push").expect("mutation sent");
     writer.ping(nonce).await.expect("ping");
     pump_until(
@@ -136,18 +154,17 @@ async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonc
         |event| matches!(event, ClientEvent::Pong { nonce: n } if *n == nonce),
     )
     .await;
+    id
 }
 
 #[wasm_bindgen_test]
 async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let base = unique_base();
     relay_worker_breadcrumbs();
-    let before_id = base;
-    let missed_id = base + 1;
 
     // A row that exists before anything boots.
     let mut writer = connect_server("failover-writer", base).await;
-    write_row(&mut writer, before_id, 1).await;
+    let before_id = write_row(&mut writer, 1).await;
     stage("writer seeded the first row");
 
     // This page is the leader for the whole test: it holds the leader lock
@@ -171,6 +188,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
         client_id: client_id.clone(),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -202,7 +220,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
 
     // Written while NO worker exists: only the replacement's cursor resume
     // and oplog catchup can ever deliver this row.
-    write_row(&mut writer, missed_id, 2).await;
+    let missed_id = write_row(&mut writer, 2).await;
     writer.close().await.expect("close writer");
     stage("missed row written");
 

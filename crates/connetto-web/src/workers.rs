@@ -83,6 +83,11 @@ pub struct DbWorkerConfig {
     /// presents it to the server at handshake (a mismatch is a stale build)
     /// and the hub forwards the server's version to tabs for the same check.
     pub schema_version: connetto_core::SchemaVersion,
+    /// Custom SQLite functions connetto registers on every connection the
+    /// worker opens (the synced replica and the local tier alike), before any
+    /// DDL or insert. Empty by default. A synced schema whose key column has a
+    /// function-backed `DEFAULT` supplies the matching installer here.
+    pub sql_functions: connetto_client::SqlFunctions,
 }
 
 /// The worker's SQLite storage backend. OPFS through the sahpool VFS is the
@@ -294,6 +299,7 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
         auth_token: "token".to_owned(),
         schema_version: Some(config.schema_version.clone()),
+        sql_functions: config.sql_functions.clone(),
     };
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from
@@ -338,8 +344,15 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     if !storage.exists(config.frontend_db_name) {
         storage.import_db(config.frontend_db_name, config.frontend_template)?;
     }
-    let frontend = SqliteConnection::establish(config.frontend_db_name)
+    let mut frontend = SqliteConnection::establish(config.frontend_db_name)
         .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
+    // Same registrar set as the replica: connetto installs it on every
+    // connection it opens, before any DDL or insert, even where the tier
+    // schema does not call a registered function.
+    config
+        .sql_functions
+        .install(&mut frontend)
+        .map_err(|err| JsValue::from_str(&format!("register sql functions on the tier: {err}")))?;
     let local = LocalTier::new(frontend).map_err(to_js)?;
     worker
         .subscribe(config.upstream_sub_id, config.upstream_query)

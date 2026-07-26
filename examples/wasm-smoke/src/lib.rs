@@ -28,6 +28,30 @@ pub fn demo_schema_version() -> connetto_core::SchemaVersion {
     connetto_core::SchemaVersion::from_source(DEMO_SCHEMA_SQL)
 }
 
+// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
+// client write omits the id and this registered function mints it. connetto
+// installs the registrar on every connection it opens (the DB worker replica,
+// the local tier, and each tab mirror) through the `sql_functions` config. The
+// impl is `rosetta_uuid::Uuid::utc_v7`, the same strongly typed uuid the
+// `orders` schema uses on both SQLite and Postgres.
+#[diesel::declare_sql_function]
+extern "SQL" {
+    /// Client-authored primary key: a 16-byte UUID v7, stored as a BLOB.
+    fn uuidv7() -> diesel::sql_types::Binary;
+}
+
+/// The registrar connetto installs on every connection it opens for the smoke
+/// topology. Nondeterministic, so SQLite calls `uuidv7()` per row instead of
+/// folding the DEFAULT to a constant.
+#[must_use]
+pub fn uuidv7_functions() -> connetto_client::SqlFunctions {
+    connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
+        |conn: &mut diesel::SqliteConnection| {
+            uuidv7_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::utc_v7)
+        },
+    ))
+}
+
 /// Resolve the co-located `db-worker.js` bootstrap script beside the
 /// wasm-bindgen glue module the smoke harness serves.
 fn worker_url(glue_url: &str) -> String {
@@ -65,13 +89,12 @@ pub mod workers {
     /// The demo server every smoke context connects to.
     pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
     /// The synced replica schema: `orders` is the server-synced table.
-    pub const DEMO_SQLITE_DDL: &str =
-        "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+    pub const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
     /// The mirror schema for tab clients: both tiers live in the tab's main
     /// schema, because every relayed patch (snapshot, upstream, and local
     /// fan-out alike) applies to main. The hub, not the tab, keeps the tiers
     /// apart.
-    pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT; \
+    pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT; \
          CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
     /// The local tier schema: `notes` is device-private and never synced.
     pub const DEMO_FRONTEND_DDL: &str =
@@ -119,6 +142,7 @@ pub mod workers {
             hub_meta_name: "connetto-hub-meta.sqlite",
             client_id_prefix: "db-worker",
             schema_version: crate::demo_schema_version(),
+            sql_functions: crate::uuidv7_functions(),
         })
         .await
     }

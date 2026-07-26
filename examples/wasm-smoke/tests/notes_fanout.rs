@@ -17,7 +17,7 @@
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
-use connetto_wasm_smoke::{BroadcastTransport, leader, locks};
+use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv7_functions};
 use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -58,7 +58,7 @@ diesel::table! {
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -105,6 +105,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
         .await
@@ -170,7 +171,6 @@ async fn local_tier_notes_fan_out_across_tabs() {
     relay_worker_breadcrumbs();
     let note_id = base;
     let mixed_note_id = base + 1;
-    let mixed_order_id = base + 2;
 
     // This page wins the leader election and owns the DB worker.
     let membership = leader::join(&format!("connetto-notes-leader-{base}"), &glue_url());
@@ -238,7 +238,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
                 .values((notes::id.eq(mixed_note_id), notes::body.eq("mixed")))
                 .execute(conn)?;
             diesel::insert_into(orders::table)
-                .values((orders::id.eq(mixed_order_id), orders::quantity.eq(1_i64)))
+                .values(orders::quantity.eq(1_i64))
                 .execute(conn)?;
             Ok(())
         })
@@ -258,7 +258,6 @@ async fn local_tier_notes_fan_out_across_tabs() {
         .get_result(tab_a.conn())
         .expect("count mixed notes");
     let leftover_orders: i64 = orders::table
-        .filter(orders::id.eq(mixed_order_id))
         .count()
         .get_result(tab_a.conn())
         .expect("count mixed orders");

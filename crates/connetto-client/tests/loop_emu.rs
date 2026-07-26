@@ -233,6 +233,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -370,6 +371,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -493,6 +495,7 @@ async fn connection_is_a_diesel_connection() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -587,6 +590,7 @@ async fn rejected_write_rolls_back_locally() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -691,6 +695,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         client_id: "client-a".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await
@@ -762,6 +767,7 @@ async fn connect_client(
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     ConnettoConnection::connect(transport, db_path, SQLITE_DDL, &config, None)
         .await

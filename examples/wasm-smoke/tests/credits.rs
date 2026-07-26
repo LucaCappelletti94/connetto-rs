@@ -32,7 +32,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, loopback};
-use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::{RelayHub, uuidv7_functions};
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -41,7 +41,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id: it must match the hub's reconnect
 /// spec so the upstream `NonFatalError` maps to the tab subscriptions reading
@@ -62,10 +62,10 @@ fn unique_base() -> i64 {
 }
 
 /// Build the compressed insert-patchset the wire carries for one row.
-fn insert_payload(id: i64, quantity: i64) -> Vec<u8> {
+fn insert_payload(id: rosetta_uuid::Uuid, quantity: i64) -> Vec<u8> {
     let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
     let insert = Insert::<_, String, Vec<u8>>::from(table)
-        .set(0, Value::Integer(id))
+        .set(0, Value::Blob(<[u8; 16]>::from(id).to_vec()))
         .expect("set id")
         .set(1, Value::Integer(quantity))
         .expect("set quantity");
@@ -81,7 +81,12 @@ fn cursor_index(cursor: &Cursor) -> u64 {
 }
 
 /// Send one begin, patch, end snapshot triple for `UPSTREAM_SUB`.
-async fn send_snapshot(server: &mut LoopbackTransport, id: i64, quantity: i64, cursor: u64) {
+async fn send_snapshot(
+    server: &mut LoopbackTransport,
+    id: rosetta_uuid::Uuid,
+    quantity: i64,
+    cursor: u64,
+) {
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: UPSTREAM_SUB.to_owned(),
@@ -108,7 +113,7 @@ async fn send_snapshot(server: &mut LoopbackTransport, id: i64, quantity: i64, c
 /// The fake upstream: seed one row, then on `trigger` flood `FLOOD` live patches
 /// (cursors `1..=FLOOD`, ascending), and finally an ungated `NonFatalError` on
 /// the upstream sub as the credit barrier.
-async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver<()>, base: i64) {
+async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver<()>) {
     let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await else {
         return;
     };
@@ -132,17 +137,16 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
     }
     // Seed one row so the worker replica is non-empty: the tab's own snapshot
     // patch then consumes exactly one credit.
-    send_snapshot(&mut server, base, 5, 0).await;
+    send_snapshot(&mut server, rosetta_uuid::Uuid::utc_v7(), 5, 0).await;
     if trigger.await.is_err() {
         return;
     }
     for i in 1..=FLOOD {
-        let id = base + 100 + i64::try_from(i).expect("flood id fits");
         server
             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
                 UPSTREAM_SUB.to_owned(),
                 Cursor::new(i.to_be_bytes().to_vec()),
-                insert_payload(id, 5),
+                insert_payload(rosetta_uuid::Uuid::utc_v7(), 5),
             )))
             .await
             .expect("live patch");
@@ -190,12 +194,13 @@ async fn hub_enforces_the_per_tab_credit_window() {
     // one row up front, so the worker replica is non-empty before the hub runs.
     let (worker_up, fake_up) = loopback();
     let (trigger_tx, trigger_rx) = oneshot::channel();
-    spawn_local(fake_upstream(fake_up, trigger_rx, base));
+    spawn_local(fake_upstream(fake_up, trigger_rx));
 
     let worker_config = ClientConfig {
         client_id: format!("credits-worker-{base}"),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: uuidv7_functions(),
     };
     let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await

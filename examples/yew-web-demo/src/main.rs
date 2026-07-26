@@ -45,11 +45,11 @@ const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
 /// version at handshake and is not rejected as stale.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// The synced replica schema (worker first boot). Matches `schema.sql`.
-const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 /// The tab mirror schema: both tiers in the tab's main schema, because every
 /// relayed patch applies to main. The hub, not the tab, keeps the tiers apart.
-const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT; \
-     CREATE TABLE notes (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, body TEXT) STRICT;";
+const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT; \
+     CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The OPFS file holding the worker's durable synced replica.
@@ -64,14 +64,14 @@ const FRONTEND_TEMPLATE: &[u8] =
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::Binary,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
 
 diesel::table! {
     notes (id) {
-        id -> diesel::sql_types::Binary,
+        id -> diesel::sql_types::BigInt,
         body -> diesel::sql_types::Text,
     }
 }
@@ -80,7 +80,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: Vec<u8>,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -88,51 +88,55 @@ struct Order {
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Note {
-    id: Vec<u8>,
+    id: i64,
     body: String,
 }
 
-/// A fresh 16-byte row id: a uuid v7 built from the wall clock and random
-/// counter bytes, so ids sort by creation time and never collide across the
-/// demo's windows. Stored as the raw 16 bytes to match the pg2sqlite
-/// `BLOB CHECK (length(id) = 16)` column and the CDC echo, never a 36-char
-/// string. No ambient clock or `getrandom`: `Date::now` gives the millisecond
-/// timestamp and `Math::random` the counter bytes, both wasm-safe.
-fn fresh_id() -> Vec<u8> {
+// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
+// tab write omits the id and this registered function mints it. The impl is
+// `rosetta_uuid::Uuid::utc_v7`, the same strongly typed key the `orders` schema
+// uses on SQLite and Postgres.
+#[diesel::declare_sql_function]
+extern "SQL" {
+    /// Client-authored primary key: a 16-byte UUID v7, stored as a BLOB.
+    fn uuidv7() -> diesel::sql_types::Binary;
+}
+
+/// The registrar connetto installs on every connection it opens for this app.
+/// Nondeterministic, so SQLite calls `uuidv7()` per row instead of folding the
+/// DEFAULT to a constant.
+fn uuidv7_functions() -> connetto_client::SqlFunctions {
+    connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
+        |conn: &mut diesel::SqliteConnection| {
+            uuidv7_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::utc_v7)
+        },
+    ))
+}
+
+/// A device-unique integer id for a local-only `notes` row. `notes` stays on
+/// integer keys (device-private, never synced), so the client authors the id.
+/// The millisecond clock plus a random low tag keeps two windows of one device
+/// from colliding within the same millisecond.
+fn fresh_note_id() -> i64 {
     let now = js_sys::Date::now();
-    // Date::now is a finite, positive epoch-millisecond count, far below u64::MAX.
     debug_assert!(now.is_finite() && now >= 0.0);
-    let millis = now as u64;
-    let mut counter = [0u8; 10];
-    for byte in &mut counter {
-        let scaled = js_sys::Math::random() * 256.0;
-        // Math::random is [0, 1); scale to a byte. Deliberate quantization.
-        debug_assert!(scaled.is_finite() && (0.0..256.0).contains(&scaled));
-        *byte = scaled as u8;
-    }
-    uuid::Builder::from_unix_timestamp_millis(millis, &counter)
-        .into_uuid()
-        .into_bytes()
-        .to_vec()
+    // Intended truncation: whole milliseconds since the epoch.
+    let millis = now as i64;
+    let tag = js_sys::Math::random() * 1000.0;
+    // Math::random is [0, 1); scale to a 0..=999 tag. Deliberate quantization.
+    debug_assert!(tag.is_finite() && (0.0..1000.0).contains(&tag));
+    millis * 1000 + tag as i64
 }
 
 /// A visible order quantity inside the subscription's `quantity > 0` window.
 ///
-/// The id is opaque bytes now, so quantity can no longer key off it. A random
+/// The id is minted by the DEFAULT now, so quantity cannot key off it. A random
 /// `1..=9` times five gives spread while staying strictly positive.
 fn fresh_quantity() -> i64 {
     let scaled = js_sys::Math::random() * 9.0;
     // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
     debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
     (scaled as i64 + 1) * 5
-}
-
-/// Render a 16-byte id as a hyphenated uuid string for the dashboard, with a
-/// hex fallback if the bytes are not a uuid width.
-fn id_display(bytes: &[u8]) -> String {
-    uuid::Uuid::from_slice(bytes)
-        .map(|id| id.to_string())
-        .unwrap_or_else(|_| bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn main() {
@@ -168,6 +172,7 @@ async fn run_db_worker() -> Result<(), JsValue> {
         hub_meta_name: "connetto-hub-meta.sqlite",
         client_id_prefix: "db-worker",
         schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
+        sql_functions: uuidv7_functions(),
     })
     .await
 }
@@ -221,6 +226,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
         client_id: client_id.clone(),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
+        sql_functions: uuidv7_functions(),
     };
     let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
         .await
@@ -376,13 +382,12 @@ fn dashboard(props: &DashboardProps) -> Html {
         Callback::from(move |_| {
             let client = client.clone();
             spawn_local(async move {
-                let id = fresh_id();
-                // Quantity in the subscription's window (> 0), varied for visibility.
+                // The DEFAULT mints the id, so the insert omits it.
                 let quantity = fresh_quantity();
                 let result = client
                     .with_conn(move |conn| {
                         diesel::insert_into(orders::table)
-                            .values((orders::id.eq(id), orders::quantity.eq(quantity)))
+                            .values(orders::quantity.eq(quantity))
                             .execute(conn.conn())
                     })
                     .await;
@@ -412,7 +417,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             let client = client.clone();
             let note_text = note_text.clone();
             spawn_local(async move {
-                let id = fresh_id();
+                let id = fresh_note_id();
                 let result = client
                     .with_conn(move |conn| {
                         diesel::insert_into(notes::table)
@@ -450,7 +455,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody>
                         { for order_rows.iter().map(|row| {
-                            let id = id_display(&row.id);
+                            let id = row.id.to_string();
                             html! {
                                 <tr key={id.clone()}>
                                     <td>{ id }</td>
@@ -473,7 +478,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                     <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
                     <tbody>
                         { for note_rows.iter().map(|row| {
-                            let id = id_display(&row.id);
+                            let id = row.id.to_string();
                             html! {
                                 <tr key={id.clone()}>
                                     <td>{ id }</td>

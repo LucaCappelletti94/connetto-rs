@@ -21,13 +21,12 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -36,7 +35,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -83,6 +82,7 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         client_id: format!("wasm-smoke-{}", unique_id()),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let mut conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -95,11 +95,23 @@ async fn full_sync_loop_in_a_dedicated_worker() {
 
     // A local diesel write: captured by the session, pushed, applied to
     // Postgres, echoed back over logical replication.
-    let id = unique_id();
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(conn.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(7_i64)))
+        .values(orders::quantity.eq(7_i64))
         .execute(conn.conn())
         .expect("local insert");
+    let id: rosetta_uuid::Uuid = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(conn.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("minted id");
     let seq = conn.push().await.expect("push").expect("mutation sent");
 
     // The echo arrives as a live patch and applies under capture suspension.

@@ -136,6 +136,7 @@ fn tab_config(base: i64, tag: &str) -> ClientConfig {
         client_id: format!("nonfatal-{tag}-{base}"),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     }
 }
 

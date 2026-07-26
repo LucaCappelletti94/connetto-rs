@@ -21,12 +21,11 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-const SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -35,7 +34,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -57,6 +56,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
         client_id: format!("{name}-{}", unique_id()),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -77,12 +77,24 @@ async fn page_live_query_reloads_on_another_clients_write() {
     // A second, independent client writes: the change must reach the page
     // through the server (apply to Postgres, replication echo, live patch),
     // never through anything local to the observer.
-    let id = unique_id();
     let mut writer = connect("page-writer").await;
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(5_i64)))
+        .values(orders::quantity.eq(5_i64))
         .execute(writer.conn())
         .expect("writer insert");
+    let id: rosetta_uuid::Uuid = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("minted id");
     writer.push().await.expect("push").expect("mutation sent");
     // The writer has no subscription, and an applied mutation gets no
     // dedicated reply (the CDC echo is the ack, and it goes to subscribers).

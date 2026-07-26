@@ -63,6 +63,7 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
         // The worker presents the same version the upstream advertises, so it
         // connects and then forwards that version to tabs.
         schema_version: Some(server_version),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
@@ -87,6 +88,7 @@ async fn stale_tab_is_rejected_through_the_relay() {
         client_id: format!("schema-tab-stale-{base}"),
         auth_token: "token".to_owned(),
         schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let result = ConnettoConnection::connect(tab_end, ":memory:", DDL, &stale, None).await;
     match result {
@@ -114,6 +116,7 @@ async fn matching_tab_connects_through_the_relay() {
         client_id: format!("schema-tab-fresh-{base}"),
         auth_token: "token".to_owned(),
         schema_version: Some(version),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let conn = ConnettoConnection::connect(tab_end, ":memory:", DDL, &fresh, None).await;
     assert!(

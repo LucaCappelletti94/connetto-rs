@@ -184,6 +184,7 @@ fn config(client_id: &str) -> ClientConfig {
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     }
 }
 

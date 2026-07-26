@@ -29,13 +29,13 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// only in the worker replica and the tab mirrors, giving the routing tests a
 /// second table the server never sees.
 const SQLITE_DDL: &str = "\
-CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;\
+CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;\
 CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -51,7 +51,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -81,6 +81,7 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -106,13 +107,30 @@ where
     }
 }
 
-/// Insert one row through `writer` and fence on a pong: control frames are
-/// processed in order, so the pong proves the server applied the mutation.
-async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonce: u64) {
+/// Insert one row through `writer`, minting its id from the `orders` DEFAULT,
+/// and fence on a pong: control frames are processed in order, so the pong
+/// proves the server applied the mutation. Returns the minted 16-byte id.
+async fn write_row(
+    writer: &mut ConnettoConnection<BrowserSocket>,
+    nonce: u64,
+) -> rosetta_uuid::Uuid {
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(5_i64)))
+        .values(orders::quantity.eq(5_i64))
         .execute(writer.conn())
         .expect("writer insert");
+    let id = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("the newly minted id");
     writer.push().await.expect("push").expect("mutation sent");
     writer.ping(nonce).await.expect("ping");
     pump_until(
@@ -120,18 +138,17 @@ async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonc
         |event| matches!(event, ClientEvent::Pong { nonce: n } if *n == nonce),
     )
     .await;
+    id
 }
 
 #[wasm_bindgen_test]
 async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     let base = unique_base();
-    let snapshot_id = base;
-    let live_id = base + 1;
 
     // A row that exists before the worker connects: it can only reach the
     // tab through the relay's snapshot leg.
     let mut writer = connect("relay-writer", base).await;
-    write_row(&mut writer, snapshot_id, 1).await;
+    let snapshot_id = write_row(&mut writer, 1).await;
 
     // The worker-held upstream connection: subscribe and drain to the
     // snapshot end, so its replica holds the current table.
@@ -165,6 +182,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
         client_id: format!("relay-tab-{base}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let tab = ConnettoConnection::connect(tab_end, ":memory:", SQLITE_DDL, &config, None)
         .await
@@ -209,7 +227,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
     // Live leg: a fresh external write reaches the tab only through server,
     // worker pump, and relay routing.
-    write_row(&mut writer, live_id, 2).await;
+    let live_id = write_row(&mut writer, 2).await;
     writer.close().await.expect("close writer");
     loop {
         if orders_live.rows().iter().any(|row| row.id == live_id) {
@@ -225,7 +243,6 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 #[wasm_bindgen_test]
 async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     let base = unique_base();
-    let write_id = base + 3;
     let stage = |message: &str| web_sys::console::log_1(&message.into());
 
     let mut worker = connect("port-worker", base).await;
@@ -254,6 +271,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
         client_id: format!("port-tab-{base}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let mut tab = ConnettoConnection::connect(
         PortTransport::new(channel.port2()),
@@ -276,10 +294,23 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     // The tab writes locally and pushes: the relay applies the changeset to
     // the worker replica with capture active and the worker re-uploads it.
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(tab.conn())
+        .expect("ids before tab insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(write_id), orders::quantity.eq(7_i64)))
+        .values(orders::quantity.eq(7_i64))
         .execute(tab.conn())
         .expect("tab insert");
+    let write_id: rosetta_uuid::Uuid = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(tab.conn())
+        .expect("ids after tab insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("newly minted tab write id");
     tab.push().await.expect("tab push").expect("mutation sent");
     stage("tab pushed");
 

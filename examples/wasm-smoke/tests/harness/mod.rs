@@ -40,7 +40,7 @@ use diesel::prelude::*;
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -50,7 +50,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Order {
-    pub id: i64,
+    pub id: rosetta_uuid::Uuid,
     pub quantity: i64,
 }
 
@@ -117,6 +117,7 @@ pub async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTranspo
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -132,6 +133,7 @@ pub async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserS
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -158,7 +160,7 @@ where
 }
 
 /// Pump `conn` until its local replica holds the order row `id`.
-pub async fn pump_until_row<T>(conn: &mut ConnettoConnection<T>, id: i64)
+pub async fn pump_until_row<T>(conn: &mut ConnettoConnection<T>, id: rosetta_uuid::Uuid)
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -184,13 +186,30 @@ where
         .expect("local read")
 }
 
-/// Insert one row through `writer` and fence on a pong: control frames are
-/// processed in order, so the pong proves the server applied the mutation.
-pub async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonce: u64) {
+/// Insert one row through `writer`, minting its id from the `orders` DEFAULT,
+/// and fence on a pong: control frames are processed in order, so the pong
+/// proves the server applied the mutation. Returns the minted 16-byte id.
+pub async fn write_row(
+    writer: &mut ConnettoConnection<BrowserSocket>,
+    nonce: u64,
+) -> rosetta_uuid::Uuid {
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(5_i64)))
+        .values(orders::quantity.eq(5_i64))
         .execute(writer.conn())
         .expect("writer insert");
+    let id = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("the newly minted id");
     writer.push().await.expect("push").expect("mutation sent");
     writer.ping(nonce).await.expect("ping");
     pump_until(
@@ -198,6 +217,7 @@ pub async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, 
         |event| matches!(event, ClientEvent::Pong { nonce: n } if *n == nonce),
     )
     .await;
+    id
 }
 
 /// Two clients subscribed to the same live query, one straight to the server
@@ -271,7 +291,7 @@ impl ParityFixture {
 
     /// Pump both clients until each holds the order row `id`, applying every
     /// frame in between. Returns once both have converged.
-    pub async fn converge_row(&mut self, id: i64) {
+    pub async fn converge_row(&mut self, id: rosetta_uuid::Uuid) {
         pump_until_row(&mut self.direct, id).await;
         pump_until_row(&mut self.relay, id).await;
     }
@@ -280,7 +300,7 @@ impl ParityFixture {
     /// holds the order row `id`. This asserts the live-patch leg reaches the
     /// relay tab exactly as it reaches the direct client, not merely that the
     /// row eventually appears.
-    pub async fn converge_live_patch(&mut self, id: i64) {
+    pub async fn converge_live_patch(&mut self, id: rosetta_uuid::Uuid) {
         for _ in 0..2 {
             pump_until(&mut self.direct, |event| {
                 matches!(event, ClientEvent::LivePatch { .. })
@@ -292,7 +312,7 @@ impl ParityFixture {
         }
         assert!(
             load_orders(&mut self.direct).iter().any(|row| row.id == id),
-            "direct client did not receive row {id} as a live patch"
+            "direct client did not receive row {id:?} as a live patch"
         );
         for _ in 0..2 {
             pump_until(&mut self.relay, |event| {
@@ -305,7 +325,7 @@ impl ParityFixture {
         }
         assert!(
             load_orders(&mut self.relay).iter().any(|row| row.id == id),
-            "relay tab did not receive row {id} as a live patch"
+            "relay tab did not receive row {id:?} as a live patch"
         );
     }
 

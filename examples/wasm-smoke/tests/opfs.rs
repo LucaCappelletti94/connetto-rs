@@ -28,7 +28,7 @@ const DB_NAME: &str = "opfs-smoke.sqlite";
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -37,7 +37,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -77,6 +77,7 @@ async fn opfs_template_boot_live_query_and_persistence() {
         client_id: format!("wasm-opfs-{}", unique_id()),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let conn = connect(&config).await;
 
@@ -99,12 +100,24 @@ async fn opfs_template_boot_live_query_and_persistence() {
 
     // A local write through the managed connection: captured, pushed by the
     // pump, and refreshed into the live handle.
-    let id = unique_id();
-    client
-        .with_conn(move |conn| {
+    let id: rosetta_uuid::Uuid = client
+        .with_conn(|conn| {
+            let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+                .select(orders::id)
+                .load::<rosetta_uuid::Uuid>(conn.conn())?
+                .into_iter()
+                .collect();
             diesel::insert_into(orders::table)
-                .values((orders::id.eq(id), orders::quantity.eq(3_i64)))
-                .execute(conn.conn())
+                .values(orders::quantity.eq(3_i64))
+                .execute(conn.conn())?;
+            Ok::<rosetta_uuid::Uuid, diesel::result::Error>(
+                orders::table
+                    .select(orders::id)
+                    .load::<rosetta_uuid::Uuid>(conn.conn())?
+                    .into_iter()
+                    .find(|id| !before.contains(id))
+                    .expect("minted id"),
+            )
         })
         .await
         .expect("local insert");

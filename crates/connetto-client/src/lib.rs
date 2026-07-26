@@ -107,6 +107,77 @@ pub enum ClientError {
     },
 }
 
+/// A closure that registers custom SQLite functions on a replica connection
+/// connetto opens. connetto runs every installer right after opening a
+/// connection and before any DDL or insert, so a column `DEFAULT` that calls a
+/// registered function fires on the very first write.
+///
+/// `Send + Sync` on every target, wasm included: [`ConnettoConnection`]
+/// embeds [`ClientConfig`] and implements `diesel::Connection`, whose `Send`
+/// supertrait forces the whole connection (so the whole config) to be `Send`
+/// even in the wasm build. `Arc<dyn Fn>` is `Send` only when the `dyn` is
+/// `Send + Sync`, hence both bounds. In practice a registrar closes over
+/// global clock and PRNG functions, never a `JsValue`, so the bound holds.
+pub type SqlFunctionInstaller = Arc<dyn Fn(&mut SqliteConnection) -> QueryResult<()> + Send + Sync>;
+
+/// The custom SQLite functions connetto registers on every replica connection
+/// it opens. Empty by default: connetto ships no built-in functions, so each
+/// app registers the functions its schema names (a `uuidv7` key generator, for
+/// instance) through [`with`](SqlFunctions::with).
+#[derive(Clone, Default)]
+pub struct SqlFunctions(Vec<SqlFunctionInstaller>);
+
+impl SqlFunctions {
+    /// An empty registrar list.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Add one installer, returning the extended list.
+    #[must_use]
+    pub fn with(mut self, installer: SqlFunctionInstaller) -> Self {
+        self.0.push(installer);
+        self
+    }
+
+    /// Run every installer against `conn`. connetto calls this at each
+    /// connection seam, right after `establish`, before DDL or the first
+    /// insert.
+    ///
+    /// # Errors
+    ///
+    /// The first installer's error, so a failed registration surfaces at
+    /// connect rather than as a "no such function" at insert time.
+    pub fn install(&self, conn: &mut SqliteConnection) -> QueryResult<()> {
+        for installer in &self.0 {
+            installer(conn)?;
+        }
+        Ok(())
+    }
+
+    /// The number of registered installers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no installer is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SqlFunctions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures are opaque, so report only how many are registered.
+        f.debug_struct("SqlFunctions")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 /// Client identity presented at handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -120,6 +191,11 @@ pub struct ClientConfig {
     /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
     /// being `None` skips the check.
     pub schema_version: Option<SchemaVersion>,
+    /// Custom SQLite functions connetto registers on the replica connection it
+    /// opens for this client, before any DDL or insert. Empty by default. A
+    /// schema whose column `DEFAULT` calls a function (a `uuidv7` key
+    /// generator, say) supplies the matching installer here.
+    pub sql_functions: SqlFunctions,
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].
@@ -675,6 +751,12 @@ where
         let mut db = SqliteConnection::establish(db_path)
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         db.batch_execute("PRAGMA journal_mode=WAL")?;
+        // Register app-supplied functions before any DDL or insert, so a
+        // column DEFAULT that calls one fires on the first write.
+        config
+            .sql_functions
+            .install(&mut db)
+            .map_err(|e| ClientError::Session(e.to_string()))?;
         if let Some(ddl) = sqlite_ddl {
             db.batch_execute(ddl)?;
         }

@@ -20,7 +20,9 @@ fn bake(document: &str, template: &std::path::Path) {
         .sql(&pg_sql)
         .expect("parse the Postgres schema")
         .translate_to_sql(
-            &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob),
+            &Pg2SqliteOptions::default()
+                .with_uuid_representation(UuidRepresentation::Blob)
+                .with_uuid_function_name("uuidv7"),
         )
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");

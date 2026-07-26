@@ -164,6 +164,7 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
         client_id: "resync".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut conn =
         ConnettoConnection::connect(resync_server(), ":memory:", SQLITE_DDL, &config, None)

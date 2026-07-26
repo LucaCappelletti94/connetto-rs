@@ -27,13 +27,12 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[wasm_bindgen_test]
 async fn row_live_query_is_relay_transparent() {
     let base = unique_base();
-    let snapshot_id = base + 1;
-    let live_id = base + 2;
 
     // Seed a row BEFORE the fixture brings up the worker and both clients, so
-    // it can only reach either client through the snapshot leg.
+    // it can only reach either client through the snapshot leg. The DEFAULT
+    // mints the id, which the writer reads back for the convergence assertion.
     let mut writer = connect_server("parity-writer", base).await;
-    write_row(&mut writer, snapshot_id, 1).await;
+    let snapshot_id = write_row(&mut writer, 1).await;
     stage("writer seeded the snapshot row");
 
     let mut fixture = ParityFixture::setup(base, "parity-orders").await;
@@ -46,7 +45,7 @@ async fn row_live_query_is_relay_transparent() {
 
     // Live-patch parity: a write after both subscribed reaches each client as
     // a live patch, not a re-snapshot, and the mirrors stay identical.
-    write_row(&mut writer, live_id, 2).await;
+    let live_id = write_row(&mut writer, 2).await;
     fixture.converge_live_patch(live_id).await;
     fixture.assert_mirrors_match();
     stage("live patch parity verified");
@@ -63,7 +62,6 @@ async fn row_live_query_is_relay_transparent() {
 #[wasm_bindgen_test]
 async fn aggregate_is_relay_transparent() {
     let base = unique_base();
-    let insert_id = base + 1;
 
     let mut writer = connect_server("parity-agg-writer", base).await;
     let mut fixture = ParityFixture::setup(base, "parity-agg").await;
@@ -76,7 +74,7 @@ async fn aggregate_is_relay_transparent() {
     stage("aggregate bootstrap parity verified");
 
     // A write after both subscribed bumps the count on both paths by one.
-    write_row(&mut writer, insert_id, 1).await;
+    write_row(&mut writer, 1).await;
     let after = fixture.converge_aggregate("agg-count").await;
     assert_eq!(
         after,

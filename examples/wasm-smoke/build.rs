@@ -11,7 +11,7 @@
 
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TranslationOptions, UuidRepresentation};
 
 /// Translate one source document and bake it into a template database file.
 fn bake(document: &str, template: &std::path::Path) {
@@ -19,7 +19,11 @@ fn bake(document: &str, template: &std::path::Path) {
     let statements = Pg2Sqlite::default()
         .sql(&pg_sql)
         .expect("parse the Postgres schema")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(
+            &Pg2SqliteOptions::default()
+                .with_uuid_representation(UuidRepresentation::Blob)
+                .with_uuid_function_name("uuidv7"),
+        )
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");
     ddl.push(';');

@@ -54,7 +54,7 @@ fn relay_worker_breadcrumbs() {
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -63,7 +63,7 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: rosetta_uuid::Uuid,
     quantity: i64,
 }
 
@@ -103,6 +103,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         client_id: client_id.to_owned(),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -117,6 +118,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         client_id: format!("{name}-{tag}"),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
         .await
@@ -143,7 +145,7 @@ where
 }
 
 /// Pump `conn` until its local replica holds the order row `id`.
-async fn pump_until_row<T>(conn: &mut ConnettoConnection<T>, id: i64)
+async fn pump_until_row<T>(conn: &mut ConnettoConnection<T>, id: rosetta_uuid::Uuid)
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -161,13 +163,30 @@ where
     }
 }
 
-/// Insert one row through `writer` and fence on a pong: control frames are
-/// processed in order, so the pong proves the server applied the mutation.
-async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonce: u64) {
+/// Insert one row through `writer`, minting its id from the `orders` DEFAULT,
+/// and fence on a pong: control frames are processed in order, so the pong
+/// proves the server applied the mutation. Returns the minted 16-byte id.
+async fn write_row(
+    writer: &mut ConnettoConnection<BrowserSocket>,
+    nonce: u64,
+) -> rosetta_uuid::Uuid {
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids before insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(id), orders::quantity.eq(5_i64)))
+        .values(orders::quantity.eq(5_i64))
         .execute(writer.conn())
         .expect("writer insert");
+    let id = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(writer.conn())
+        .expect("ids after insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("the newly minted id");
     writer.push().await.expect("push").expect("mutation sent");
     writer.ping(nonce).await.expect("ping");
     pump_until(
@@ -175,21 +194,18 @@ async fn write_row(writer: &mut ConnettoConnection<BrowserSocket>, id: i64, nonc
         |event| matches!(event, ClientEvent::Pong { nonce: n } if *n == nonce),
     )
     .await;
+    id
 }
 
 #[wasm_bindgen_test]
 async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     let base = unique_base();
     relay_worker_breadcrumbs();
-    let snapshot_id = base;
-    let fanout_id = base + 1;
-    let tab_write_id = base + 2;
-    let post_reap_id = base + 3;
 
     // A pre-existing row: it can only reach a tab through the DB worker's
     // snapshot leg.
     let mut writer = connect_server("topology-writer", base).await;
-    write_row(&mut writer, snapshot_id, 1).await;
+    let snapshot_id = write_row(&mut writer, 1).await;
     stage("writer seeded the snapshot row");
 
     // This page wins the leader election and owns the DB worker. A
@@ -231,7 +247,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
 
     // An external write fans out to both tabs through the one upstream
     // connection the DB worker holds.
-    write_row(&mut writer, fanout_id, 2).await;
+    let fanout_id = write_row(&mut writer, 2).await;
     pump_until_row(&mut tab_a, fanout_id).await;
     pump_until_row(&mut tab_b, fanout_id).await;
     stage("fanout verified");
@@ -239,10 +255,23 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     // A tab write rides up through hub, worker replica, and server into
     // Postgres. The sibling tab seeing it proves the full round trip: the
     // echo only exists for writes the server applied.
+    let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(tab_a.conn())
+        .expect("ids before tab insert")
+        .into_iter()
+        .collect();
     diesel::insert_into(orders::table)
-        .values((orders::id.eq(tab_write_id), orders::quantity.eq(7_i64)))
+        .values(orders::quantity.eq(7_i64))
         .execute(tab_a.conn())
         .expect("tab a insert");
+    let tab_write_id: rosetta_uuid::Uuid = orders::table
+        .select(orders::id)
+        .load::<rosetta_uuid::Uuid>(tab_a.conn())
+        .expect("ids after tab insert")
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("newly minted tab write id");
     tab_a
         .push()
         .await
@@ -266,7 +295,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     stage("tab b reaped");
 
     // The hub keeps serving the survivor after the reap.
-    write_row(&mut writer, post_reap_id, 3).await;
+    let post_reap_id = write_row(&mut writer, 3).await;
     pump_until_row(&mut tab_a, post_reap_id).await;
 
     writer.close().await.expect("close writer");

@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         client_id: env_or("CONNETTO_CLIENT_ID", "anonymous"),
         auth_token: env_or("CONNETTO_TOKEN", ""),
         schema_version,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
 
     // The ws URL's authority is also the TCP target.

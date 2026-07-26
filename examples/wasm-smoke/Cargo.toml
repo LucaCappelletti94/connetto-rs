@@ -25,6 +25,10 @@ wasm-bindgen-futures = "0.4"
 # The tier tests import baked templates directly through the sahpool VFS.
 sqlite-wasm-vfs = "0.2"
 sqlite-wasm-rs = { version = "0.5", default-features = false }
+# Client-authored uuid v7 keys for the synced orders table: one strongly typed
+# `rosetta_uuid::Uuid` that maps to SQLite BLOB and Postgres uuid from a single
+# schema, generated with the browser CSPRNG through getrandom's wasm_js backend.
+rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = [
     "BroadcastChannel",
     "MessageEvent",
@@ -39,7 +43,7 @@ web-sys = { version = "0.3", features = [
 [build-dependencies]
 diesel = { version = "2", features = ["sqlite"] }
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "ee65e3095f608e10dd9b97c2459c0d0f240573a3", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

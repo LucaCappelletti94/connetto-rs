@@ -23,10 +23,10 @@ yew = { version = "0.21", features = ["csr"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# Client-authored primary keys: uuid v7 built from Date::now and Math::random,
-# stored as the raw 16 bytes. default-features off keeps getrandom and the
-# ambient clock (neither wasm-safe here) out of the graph.
-uuid = { version = "1", default-features = false }
+# Client-authored primary keys: one strongly typed `rosetta_uuid::Uuid` that
+# maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
+# browser CSPRNG through getrandom's wasm_js backend.
+rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = ["Window", "console", "HtmlInputElement"] }
 
 # The build script translates schema.sql and frontend.sql through pg2sqlite and

@@ -48,6 +48,7 @@ fn config(schema_version: Option<SchemaVersion>) -> ClientConfig {
         client_id: "schema-detection".to_owned(),
         auth_token: "token".to_owned(),
         schema_version,
+        sql_functions: connetto_client::SqlFunctions::new(),
     }
 }
 

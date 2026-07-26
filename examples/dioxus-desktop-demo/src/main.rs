@@ -15,13 +15,14 @@
 //!   standing in for any non connetto process mutating the source database
 //!   (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection};
+use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, SqlFunctions};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
 use diesel::prelude::*;
 use dioxus::prelude::*;
+use rosetta_uuid::Uuid;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -39,7 +40,7 @@ const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
 diesel::table! {
     orders (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -48,21 +49,37 @@ diesel::table! {
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
-    id: i64,
+    id: Uuid,
     quantity: i64,
 }
 
-/// Per process sequence for locally written rows. The row id combines this
-/// with the process id, so concurrent windows never collide. Relaxed
-/// suffices: the atomic only allocates unique values, it synchronizes nothing
-/// else.
-static LOCAL_SEQ: AtomicI64 = AtomicI64::new(0);
+// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
+// local write omits the id and this registered function mints it.
+#[diesel::declare_sql_function]
+extern "SQL" {
+    /// Client-authored primary key: a 16-byte UUID v7 blob.
+    fn uuidv7() -> diesel::sql_types::Binary;
+}
 
-/// A locally written row id unique across demo instances: a distant base to
-/// stay clear of backend ids, plus a per process band, plus the sequence.
-fn next_local_id() -> i64 {
-    let seq = LOCAL_SEQ.fetch_add(1, Ordering::Relaxed);
-    1_000_000 + i64::from(std::process::id()) * 1_000 + seq
+/// The registrar connetto installs on the replica connection: `uuidv7()` mints
+/// a fresh `rosetta_uuid::Uuid` (the same strongly typed key the `orders`
+/// schema uses on SQLite and Postgres). Nondeterministic, so SQLite calls it
+/// per row instead of folding the DEFAULT to a constant.
+fn uuidv7_functions() -> SqlFunctions {
+    SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
+        uuidv7_utils::register_nondeterministic_impl(conn, Uuid::utc_v7)
+    }))
+}
+
+/// A positive demo quantity, varied by the wall clock so successive rows
+/// differ. The key is minted separately (the DEFAULT on a local write, an
+/// explicit v7 bind in the backend writer), so quantity is never keyed off
+/// the id.
+fn demo_quantity() -> i64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    i64::try_from(millis % 9).unwrap_or(0) * 5 + 5
 }
 
 type Ws = WebSocketTransport<TcpStream>;
@@ -130,6 +147,7 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
         client_id: format!("desktop-demo-{}", std::process::id()),
         auth_token: "token".to_owned(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
+        sql_functions: uuidv7_functions(),
     };
     let conn = ConnettoConnection::connect_with_replica_template(
         transport,
@@ -142,9 +160,12 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
     .expect("client connect");
     let client = ConnettoClient::start(conn);
 
-    // Backend writer: DML straight into Postgres, echoed to every window by
-    // the server's logical replication stream. Ids stay below the local write
-    // band and ON CONFLICT keeps concurrent button presses harmless.
+    // Backend writer: DML straight into Postgres through the SAME typed
+    // `orders` schema the frontend live query uses, echoed to every window by
+    // the server's logical replication stream. Postgres `gen_random_uuid()` is
+    // v4, which would break "delete newest via MAX(id)", so the insert mints an
+    // explicit v7 `rosetta_uuid::Uuid`. `on_conflict_do_nothing` keeps
+    // concurrent button presses harmless.
     let (tx, mut rx) = mpsc::unbounded_channel::<DemoCmd>();
     tokio::spawn(async move {
         use diesel_async::AsyncConnection;
@@ -152,19 +173,39 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
             .await
             .expect("connect to postgres");
         while let Some(cmd) = rx.recv().await {
-            let sql = match cmd {
-                DemoCmd::Insert => {
-                    "INSERT INTO orders (id, quantity) \
-                     SELECT COALESCE(MAX(id), 0) + 1, (COALESCE(MAX(id), 0) % 9 + 1) * 5 \
-                     FROM orders WHERE id < 1000000 \
-                     ON CONFLICT DO NOTHING"
-                }
+            // Fully qualified async RunQueryDsl: diesel's sync RunQueryDsl is
+            // also in scope through the prelude, so method syntax is ambiguous.
+            let run: diesel::QueryResult<()> = match cmd {
+                DemoCmd::Insert => diesel_async::RunQueryDsl::execute(
+                    diesel::insert_into(orders::table)
+                        .values((
+                            orders::id.eq(Uuid::utc_v7()),
+                            orders::quantity.eq(demo_quantity()),
+                        ))
+                        .on_conflict_do_nothing(),
+                    &mut pg,
+                )
+                .await
+                .map(|_| ()),
+                // The newest row is the one with the greatest v7 id (time-ordered).
                 DemoCmd::DeleteNewest => {
-                    "DELETE FROM orders \
-                     WHERE id = (SELECT MAX(id) FROM orders WHERE id < 1000000)"
+                    match diesel_async::RunQueryDsl::get_result::<Option<Uuid>>(
+                        orders::table.select(diesel::dsl::max(orders::id)),
+                        &mut pg,
+                    )
+                    .await
+                    {
+                        Ok(Some(newest)) => diesel_async::RunQueryDsl::execute(
+                            diesel::delete(orders::table.filter(orders::id.eq(newest))),
+                            &mut pg,
+                        )
+                        .await
+                        .map(|_| ()),
+                        Ok(None) => Ok(()),
+                        Err(err) => Err(err),
+                    }
                 }
             };
-            let run = diesel_async::RunQueryDsl::execute(diesel::sql_query(sql), &mut pg).await;
             if let Err(err) = run {
                 eprintln!("backend write failed: {err}");
             }
@@ -181,7 +222,12 @@ fn app() -> Element {
     let rows = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
     let count = use_live(&client, orders::table.count());
 
-    let all_rows = rows.value().read().clone();
+    let display_rows: Vec<(Uuid, i64)> = rows
+        .value()
+        .read()
+        .iter()
+        .map(|row| (row.id, row.quantity))
+        .collect();
     let count_text = count
         .value()
         .read()
@@ -204,7 +250,7 @@ fn app() -> Element {
             }
             p {
                 "COUNT(*) pushed by the server: "
-                strong { "{count_text}" }
+                strong { {count_text} }
             }
             div {
                 style: "display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;",
@@ -224,15 +270,11 @@ fn app() -> Element {
                     onclick: move |_| {
                         let client = write_client.clone();
                         spawn(async move {
-                            let id = next_local_id();
-                            let quantity = (id % 7 + 1) * 3;
+                            let quantity = demo_quantity();
                             let result = client
                                 .with_conn(move |conn| {
                                     diesel::insert_into(orders::table)
-                                        .values((
-                                            orders::id.eq(id),
-                                            orders::quantity.eq(quantity),
-                                        ))
+                                        .values(orders::quantity.eq(quantity))
                                         .execute(conn.conn())
                                 })
                                 .await;
@@ -264,10 +306,10 @@ fn app() -> Element {
                     }
                 }
                 tbody {
-                    for row in all_rows {
-                        tr { key: "{row.id}",
-                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{row.id}" }
-                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{row.quantity}" }
+                    for (id, quantity) in display_rows {
+                        tr { key: "{id}",
+                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{id}" }
+                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{quantity}" }
                         }
                     }
                 }

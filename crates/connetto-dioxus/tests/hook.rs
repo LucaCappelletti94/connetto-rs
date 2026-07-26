@@ -193,6 +193,7 @@ async fn use_live_renders_and_follows_cdc() {
         client_id: "dioxus-test".to_owned(),
         auth_token: "token".to_owned(),
         schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
     };
     let conn = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
         .await

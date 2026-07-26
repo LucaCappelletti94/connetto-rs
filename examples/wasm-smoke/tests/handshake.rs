@@ -69,6 +69,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
         client_id: format!("handshake-worker-{base}"),
         auth_token: "token".to_owned(),
         schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
+        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
         .await
