@@ -2,7 +2,7 @@
 
 ## Status
 
-Decided design for the connetto pipeline (sql-traits, pg2sqlite, synql, connetto-client), all seven decisions ruled in discussion. The three upstream prerequisites are complete: the diesel attach API (see `docs/upstream-diesel-attach-database-api.md`, landed on the fork's future branch), the pg2sqlite deny triggers for read-only non-RLS tables (`docs/upstream-pg2sqlite-readonly-deny-triggers.md`), and the sql-traits FK target validation (`docs/upstream-sql-traits-fk-target-validation.md`). Grounded facts are collected in the appendix with file and line citations, all source-verified at the named pins.
+Decided design for the connetto pipeline (sql-traits, pg2sqlite, synql, connetto-client), all seven decisions ruled in discussion. The three upstream prerequisites are complete and landed in the pinned forks: the diesel attach API (on the diesel fork's future branch), the pg2sqlite deny triggers for read-only non-RLS tables (pg2sqlite PR #44), and the sql-traits FK target validation (sql-traits PR #13, wired through pg2sqlite PR #46). Grounded facts are collected in the appendix with file and line citations, all source-verified at the named pins.
 
 ## The problem
 

@@ -355,7 +355,7 @@ Full contract with verified-facts appendix: `docs/upstream-synql-tier-generation
 
 **Q10.3** ~~Can foreign keys or table names cross the tier boundary?~~
 
-**Decision: no, both are generation-time hard errors, defined as cross-document resolution failures.** The two documents are separate reference universes, so a `REFERENCES` crossing the boundary is a dangling reference, not a policy violation. Frontend-to-shared is enforced by sql-traits `validate_foreign_key_targets` called by pg2sqlite (see `docs/upstream-sql-traits-fk-target-validation.md`), shared-to-frontend by the real Postgres natively. Semantically correct, not just physically forced: the synced replica is a moving window, so an enforced FK from private data into it would block eviction or cascade-destroy private data. Duplicate table names across documents are also a hard error (SQLite bare-name resolution would silently shadow the frontend table), checked by synql, the only layer seeing both documents. No advisory-link metadata is generated.
+**Decision: no, both are generation-time hard errors, defined as cross-document resolution failures.** The two documents are separate reference universes, so a `REFERENCES` crossing the boundary is a dangling reference, not a policy violation. Frontend-to-shared is enforced by sql-traits `validate_foreign_key_targets` called by pg2sqlite (landed in sql-traits), shared-to-frontend by the real Postgres natively. Semantically correct, not just physically forced: the synced replica is a moving window, so an enforced FK from private data into it would block eviction or cascade-destroy private data. Duplicate table names across documents are also a hard error (SQLite bare-name resolution would silently shadow the frontend table), and that check spans both documents so it belongs to synql.
 
 **Q10.4** ~~How does generation express tiers (the roadmap's cfg-features sketch)?~~
 
@@ -363,7 +363,7 @@ Full contract with verified-facts appendix: `docs/upstream-synql-tier-generation
 
 **Q10.5** ~~How is writability enforced across the two "cannot write" cases?~~
 
-**Decision: two distinct mechanisms, deliberately not unified.** Local-only tables are enforced by placement (the write is welcome, there is nothing to deny). Read-only synced tables are enforced by pg2sqlite role translation: the RLS branch denies via a view without `INSTEAD OF` triggers, the non-RLS branch gets `RAISE(ABORT)` deny triggers (see `docs/upstream-pg2sqlite-readonly-deny-triggers.md`) under the contract that authoritative applies run with triggers disabled. The server catalog's `NotWritable` stays as the version-skew backstop only, never primary enforcement.
+**Decision: two distinct mechanisms, deliberately not unified.** Local-only tables are enforced by placement (the write is welcome, there is nothing to deny). Read-only synced tables are enforced by pg2sqlite role translation: the RLS branch denies via a view without `INSTEAD OF` triggers, the non-RLS branch gets `RAISE(ABORT)` deny triggers (landed in pg2sqlite) under the contract that authoritative applies run with triggers disabled. The server catalog's `NotWritable` stays as the version-skew backstop only, never primary enforcement.
 
 **Q10.6** ~~How do live queries work over local and mixed-tier tables?~~
 
