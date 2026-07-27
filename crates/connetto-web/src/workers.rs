@@ -88,6 +88,14 @@ pub struct DbWorkerConfig {
     /// DDL or insert. Empty by default. A synced schema whose key column has a
     /// function-backed `DEFAULT` supplies the matching installer here.
     pub sql_functions: connetto_client::SqlFunctions,
+    /// Browser OAuth acquisition. `None` uses a placeholder token (dev and the
+    /// pre-auth loops). `Some` makes the worker acquire connetto's own token
+    /// before connecting: silently from the OPFS-stored refresh token on a cold
+    /// start or leader failover, or through an interactive tab login otherwise.
+    pub auth: Option<crate::auth::WorkerAuthConfig>,
+    /// The OPFS database holding the worker-only refresh token, used only when
+    /// `auth` is set.
+    pub auth_db_name: &'static str,
 }
 
 /// The worker's SQLite storage backend. OPFS through the sahpool VFS is the
@@ -144,6 +152,23 @@ impl WorkerStorage {
                 .map_err(|err| format!("{err:?}")),
         };
         result.map_err(|err| JsValue::from_str(&format!("import {name}: {err}")))
+    }
+
+    /// Delete a database file and its VFS sidecars. Used to purge a replica on
+    /// an account switch: a re-authentication to a different identity must not
+    /// resume onto the previous identity's data. A missing file is not an
+    /// error.
+    fn delete_db(&self, name: &str) -> Result<(), JsValue> {
+        match self {
+            Self::Opfs(util) => util
+                .delete_db(name)
+                .map(|_| ())
+                .map_err(|err| JsValue::from_str(&format!("delete {name}: {err:?}"))),
+            Self::Memory(util) => {
+                util.delete_db(name);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -280,6 +305,32 @@ pub async fn announce_tab(wire: &str) {
     channel.close();
 }
 
+/// Acquire connetto's own session in the worker: silently refresh from the
+/// OPFS-stored refresh token, or drive an interactive tab login when there is
+/// none. Returns the access token plus the identity and session deadline the
+/// worker needs for identity continuity and the offline-expiry warning. The
+/// worker holds the tokens throughout; a tab only ever sees the login URL and
+/// returns the authorization code.
+async fn acquire_session(
+    auth: &crate::auth::WorkerAuthConfig,
+    auth_db_name: &str,
+) -> Result<crate::auth::BrowserSession, JsValue> {
+    let store = crate::auth::RefreshStore::open(auth_db_name).map_err(to_js)?;
+    let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone());
+    match authenticator.acquire(&store).await.map_err(to_js)? {
+        crate::auth::Acquired::Access(session) => Ok(session),
+        crate::auth::Acquired::NeedLogin(pending) => {
+            let (code, state) = crate::auth::await_login_code(&pending.login_url)
+                .await
+                .map_err(to_js)?;
+            authenticator
+                .complete(&pending, &code, &state, &store)
+                .await
+                .map_err(to_js)
+        }
+    }
+}
+
 /// DB worker context: install the OPFS VFS, open the durable replica
 /// (resuming an existing one from its persisted cursor), connect upstream,
 /// wait for the subscription to be fully served, hold the alive lock,
@@ -295,16 +346,27 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
     let storage = WorkerStorage::install().await;
 
     let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
+    // Acquire connetto's own access token when auth is configured: a silent
+    // refresh from the OPFS-stored token on a cold start or leader failover,
+    // or an interactive tab login otherwise. The worker holds the tokens; the
+    // tab only ever sees the login URL and hands back the code.
+    let session = match &config.auth {
+        Some(auth_config) => Some(acquire_session(auth_config, config.auth_db_name).await?),
+        None => None,
+    };
+    let auth_token = session
+        .as_ref()
+        .map_or_else(|| "token".to_owned(), |s| s.access_token.clone());
     let client_config = ClientConfig {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
-        auth_token: "token".to_owned(),
+        auth_token,
         schema_version: Some(config.schema_version.clone()),
         sql_functions: config.sql_functions.clone(),
     };
     // A replica left by a previous worker generation resumes: the persisted
     // cursor rides the handshake and the subscription below catches up from
     // the server oplog instead of re-snapshotting.
-    let existing = storage.exists(config.replica_db_name);
+    let mut existing = storage.exists(config.replica_db_name);
     let mut worker = if existing {
         ConnettoConnection::connect_existing(
             transport,
@@ -325,6 +387,34 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
         .await
         .map_err(to_js)?
     };
+    // Identity continuity: bind the resident replica to the authenticated
+    // identity. A re-authentication that resolves to a different `user_id` is
+    // an account switch, so purge the previous identity's replica and rebuild
+    // a fresh one rather than resuming onto its data or uploading its pending
+    // mutations, which would misattribute writes and breach the RLS boundary.
+    if let Some(session) = &session {
+        match worker.bind_identity(&session.user_id) {
+            Ok(()) => {}
+            Err(connetto_client::ClientError::IdentityMismatch { .. }) => {
+                drop(worker);
+                storage.delete_db(config.replica_db_name)?;
+                let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
+                let mut fresh = ConnettoConnection::connect(
+                    transport,
+                    config.replica_db_name,
+                    config.replica_ddl,
+                    &client_config,
+                    None,
+                )
+                .await
+                .map_err(to_js)?;
+                fresh.bind_identity(&session.user_id).map_err(to_js)?;
+                worker = fresh;
+                existing = false;
+            }
+            Err(err) => return Err(to_js(err)),
+        }
+    }
     web_sys::console::log_1(
         &format!(
             "db worker: {} replica",

@@ -69,10 +69,44 @@ diesel-async = { version = "0.7", default-features = false, optional = true }
 rmp-serde.workspace = true
 # Binary error handling (connetto-server bin, behind pg-async via required-features).
 anyhow.workspace = true
+# Authentication (docs/architecture/11-authentication.md). connetto mints and
+# verifies its own asymmetrically signed session access token with jsonwebtoken
+# (EdDSA/Ed25519, ring-backed, native backend only, no wasm), generates the
+# Ed25519 keypair through ring directly, and serves the login and refresh HTTP
+# endpoints with axum. uuid mints session and user ids (v5 deterministic for
+# the in-memory store, v4 for the database store), sha2 hashes the rotating
+# refresh secret, serde derives the claim and request bodies.
+jsonwebtoken = "9"
+ring = "0.17"
+axum = "0.8"
+uuid = { version = "1", features = ["v4", "v5"] }
+sha2 = "0.10"
+serde.workspace = true
+# OIDC provider verification (docs/architecture/11-authentication.md phase 3).
+# connetto is the confidential OAuth client: openidconnect runs discovery, JWKS
+# fetch, Authorization Code + PKCE, and ID-token verification with pure-Rust
+# crypto. It pulls oauth2 5 and drives every request through reqwest (native,
+# rustls), the blocking client stripped. Backend only, no wasm (BFF).
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+# Verifying the client PKCE S256 challenge at the native loopback token
+# exchange: base64url-nopad(sha256(verifier)) compared to the stored challenge.
+base64 = "0.22"
+# Parsing client redirect URIs to authenticate the RFC 8252 loopback host
+# safely (a string match would admit `127.0.0.1.evil.example` and userinfo
+# tricks). Already in the tree through openidconnect, so no new resolution.
+url = "2"
+# Constant-time equality for refresh-secret hashes and the PKCE challenge, so a
+# comparison cannot leak a partial match through timing. ring's generic slice
+# compare is deprecated for external use, so subtle is the maintained primitive.
+subtle = "2"
 
 [dev-dependencies]
-# Constructing Uuid and Timestamp primary keys in the Docker-gated RLS test.
-uuid = "1"
+# Minting a local ID token to verify the provider path offline, and timestamp
+# primary keys in the Docker-gated RLS test (both are normal deps too).
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 chrono = "0.4"
+# Driving the axum auth router without a socket in the Docker-free auth test.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # Isolated per-client SQLite database directories in the multi-process e2e test.
 tempfile = "3"

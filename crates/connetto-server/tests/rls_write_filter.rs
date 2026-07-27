@@ -128,7 +128,9 @@ async fn handshake<T: Transport>(transport: &mut T, client_id: &str) {
         .send_control(ControlMessage::Handshake(Handshake::new(
             PROTOCOL_VERSION,
             client_id,
-            "token",
+            // Identity is resolved from the token, so the trusting verifier
+            // maps this to app.user_id under RLS.
+            client_id,
         )))
         .await
         .expect("send handshake");
@@ -217,7 +219,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
 
-    // The session's identity is the handshake client id, bound into app.user_id.
+    // The session's identity is the verified token, bound into app.user_id.
     handshake(&mut client, "alice").await;
 
     // Alice may insert a row she owns: it lands, acknowledged by the durable

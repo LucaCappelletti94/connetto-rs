@@ -166,7 +166,7 @@ fn error_control_round_trips() {
             expected: PROTOCOL_VERSION,
             got: 999,
         },
-        FatalErrorReason::AuthTokenInvalid,
+        FatalErrorReason::AuthenticationFailed,
         FatalErrorReason::SessionRevoked,
         FatalErrorReason::ProtocolViolation {
             detail: "unexpected control after fatal".into(),

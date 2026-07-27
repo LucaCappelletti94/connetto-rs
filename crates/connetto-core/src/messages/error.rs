@@ -33,8 +33,10 @@ pub enum FatalErrorReason {
         /// Version declared by the client.
         got: u32,
     },
-    /// Auth token failed validation.
-    AuthTokenInvalid,
+    /// Authentication failed at the handshake: the presented `auth_token` was
+    /// absent, failed verification, or names a session that is no longer live.
+    /// The client routes to re-login rather than a generic reconnect.
+    AuthenticationFailed,
     /// Session was administratively revoked mid-connection.
     SessionRevoked,
     /// Client sent a control frame the server could not parse.

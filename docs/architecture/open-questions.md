@@ -374,6 +374,27 @@ Full contract with verified-facts appendix: `docs/upstream-synql-tier-generation
 **Decision: no, structurally.** No `SubscriptionSpec` can ever carry a frontend table, so eviction has no path to a frontend row. The FK closure rule removes cascade paths. The resume cursor lives in `main._connetto_meta` in the same transaction as patch application, and the frontend file carries zero sync state.
 
 ---
+## 11 · Authentication
+
+See `11-authentication.md`. The architecture is decided (Backend-For-Frontend, connetto is the OAuth client, it mints its own signed access token plus a stored rotating refresh token, identity resolved once at login by a per-provider registry and held with the sessions and retained provider tokens in one of two auth stores). The questions below are now resolved.
+
+**Q11.1**: ~~Default token lifetimes. What are the shipped defaults for the access-token lifetime and the refresh-token sliding window and absolute ceiling?~~
+
+**Decision: lifetimes are server-side application configuration with a conservative, overridable default posture, and the architecture doc prescribes only the shape, not the numbers.** The shape is a short access token plus a refresh sliding window under an absolute ceiling. Exact defaults are an implementation-time choice, biased conservative, because connetto is a general-purpose tool and offline profiles differ per deployment. The access token is verified once at handshake, so a healthy long-lived connection is not force-expired, and the access-token lifetime is a re-auth cadence rather than the revocation bound (see Q11.4).
+
+**Q11.2**: ~~Provider token retention. In scope, or explicitly out?~~
+
+**Decision: retained, not discarded.** The chosen auth store (in-memory or database) holds the user's provider tokens alongside the identity mapping, so an application that configured the right scopes on the provider reuses them to call the provider's own APIs. connetto exposes a lazy refreshing accessor that refreshes a token inline when it is about to be used and persists the rotated refresh token, and it runs no background refresh job, which is fewer provider requests and no mesh-wide scheduler.
+
+**Q11.3**: ~~Client-side ID token verification. Is the client-as-OAuth-client alternative supported at all, or is BFF the only sanctioned model?~~
+
+**Decision: BFF is the only sanctioned model.** connetto always has a backend so BFF always applies, and the entire session and offline half of the design assumes connetto owns the session, so supporting a second model would mean maintaining a second session lifecycle for a strictly weaker option. Client-side ID-token verification therefore does not arise. The fork-3 verification remains as evidence the alternative is buildable, not as a supported path.
+
+**Q11.4**: ~~Mesh revocation propagation. What is the acceptable propagation latency, and is the access-token lifetime a tight enough bound on its own?~~
+
+**Decision: revocation is authoritative because the handshake checks session liveness, and its reach follows the store variant.** A revoked session is refused even with a time-valid access token, and a live connection is dropped when its node sees the invalidation. In the in-memory or single-server case this is an instant local operation, and in the database mesh case it propagates at replication lag on the same replication that carries the oplog. The access-token lifetime is a re-auth cadence, not the revocation bound, and connetto adds no separate revocation channel.
+
+---
 
 ## Cross-cutting / From the Overview
 

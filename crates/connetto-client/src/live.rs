@@ -1214,15 +1214,21 @@ async fn pump<T, F, S>(
         // the state lock, so watch and with_conn callers are only blocked
         // during the brief resume itself, never during backoff sleeps.
         if needs_recovery {
-            let recovered = match reconnect.as_mut() {
+            let outcome = match reconnect.as_mut() {
                 Some(driver) => recover(&shared, driver).await,
-                None => false,
+                None => Recovery::Exhausted,
             };
-            if !recovered {
-                let _ = shared.events.send(ClientEvent::Closed);
-                return;
+            match outcome {
+                Recovery::Live => needs_recovery = false,
+                Recovery::ReauthRequired => {
+                    let _ = shared.events.send(ClientEvent::AuthenticationRequired);
+                    return;
+                }
+                Recovery::Exhausted => {
+                    let _ = shared.events.send(ClientEvent::Closed);
+                    return;
+                }
             }
-            needs_recovery = false;
         }
 
         let mut state = shared.state.lock().await;
@@ -1334,14 +1340,25 @@ where
     }
 }
 
+/// The outcome of a reconnect sequence.
+enum Recovery {
+    /// The session resumed and every subscription was re-declared.
+    Live,
+    /// The backoff policy ran out of attempts.
+    Exhausted,
+    /// The credential was rejected (a refresh that could not recover it, or a
+    /// handshake `AuthenticationFailed`), so retrying is futile and the driver
+    /// routes to interactive re-login instead.
+    ReauthRequired,
+}
+
 /// Run the reconnect sequence to completion: backoff, fresh transport,
-/// session resume, re-declared subscriptions. Returns whether the session
-/// is live again, `false` meaning the policy is exhausted.
+/// session resume, re-declared subscriptions.
 ///
 /// Sleeps and connect attempts run WITHOUT the state lock. Only the resume
 /// handshake and the re-subscribes hold it, so application reads and writes
 /// against the replica proceed during an outage.
-async fn recover<T, F, S>(shared: &Shared<T>, driver: &mut ReconnectDriver<F, S>) -> bool
+async fn recover<T, F, S>(shared: &Shared<T>, driver: &mut ReconnectDriver<F, S>) -> Recovery
 where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
@@ -1353,7 +1370,7 @@ where
     loop {
         attempt = attempt.saturating_add(1);
         if driver.policy.max_attempts.is_some_and(|max| attempt > max) {
-            return false;
+            return Recovery::Exhausted;
         }
         let _ = shared.events.send(ClientEvent::Reconnecting { attempt });
         driver.sleeper.sleep(backoff).await;
@@ -1363,8 +1380,12 @@ where
             continue;
         };
         let mut state = shared.state.lock().await;
-        if state.conn.resume(transport).await.is_err() {
-            continue;
+        match state.conn.resume(transport).await {
+            Ok(()) => {}
+            // A rejected credential is not a transport blip: stop the backoff
+            // loop and let the pump surface a re-login requirement.
+            Err(ClientError::Auth(_)) => return Recovery::ReauthRequired,
+            Err(_) => continue,
         }
         // Re-declare every live subscription under its original id, so the
         // server streams retained changes (or a full resync) into the same
@@ -1386,7 +1407,7 @@ where
             continue;
         }
         let _ = shared.events.send(ClientEvent::Reconnected);
-        return true;
+        return Recovery::Live;
     }
 }
 

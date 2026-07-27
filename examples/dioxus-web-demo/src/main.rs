@@ -169,6 +169,8 @@ async fn run_db_worker() -> Result<(), JsValue> {
         client_id_prefix: "db-worker",
         schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
         sql_functions: uuidv7_functions(),
+        auth: None,
+        auth_db_name: "connetto-auth.sqlite",
     })
     .await
 }

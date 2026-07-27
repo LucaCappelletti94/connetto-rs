@@ -143,6 +143,8 @@ pub mod workers {
             client_id_prefix: "db-worker",
             schema_version: crate::demo_schema_version(),
             sql_functions: crate::uuidv7_functions(),
+            auth: None,
+            auth_db_name: "connetto-auth.sqlite",
         })
         .await
     }

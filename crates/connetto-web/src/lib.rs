@@ -19,6 +19,7 @@
 //! [`workers::DbWorkerConfig`], so this crate bakes nothing application
 //! specific.
 
+pub mod auth;
 pub mod broadcast;
 pub mod leader;
 pub mod locks;
@@ -26,6 +27,10 @@ pub mod port;
 pub mod relay;
 pub mod workers;
 
+pub use auth::{
+    Acquired, AuthError, BrowserAuthenticator, BrowserSession, LOGIN_CHANNEL, LoginMessage,
+    PendingLogin, RefreshStore, WorkerAuthConfig, await_login_code, deliver_login_code,
+};
 pub use broadcast::{BroadcastTransport, BroadcastTransportError};
 pub use leader::{Membership, join};
 pub use port::{PortTransport, PortTransportError};

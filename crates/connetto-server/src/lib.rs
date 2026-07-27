@@ -20,6 +20,7 @@
 //! boundary and `docs/architecture/subql.md` for the shipped `subql` surface.
 
 pub mod auth;
+pub mod authn;
 pub mod materializer;
 pub mod oplog;
 pub mod pk;
@@ -30,6 +31,17 @@ pub mod write_target;
 pub use auth::PermissiveAuth;
 #[cfg(feature = "pg-async")]
 pub use auth::{RlsAuth, RlsAuthError};
+pub use authn::http::{RedirectPolicy, auth_router};
+pub use authn::{
+    AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
+    ConnettoSessionVerifier, GenericOidcProvider, IdentityProvider, InMemoryAuthStore,
+    IssuedAuthCode, IssuedSession, LoginRedirect, OidcProviderConfig, PendingLogin, PendingLogins,
+    PermissiveProvider, ProviderError, ProviderRegistry, RefreshLifetimes, RefreshOutcome,
+    ResolvedIdentity, RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedLogin,
+    VerifiedSession,
+};
+#[cfg(feature = "pg-async")]
+pub use authn::{DbAuthStore, provision_auth_tables};
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };

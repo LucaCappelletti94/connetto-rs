@@ -58,9 +58,13 @@ async fn main() -> Result<()> {
     let schema_version = read_ddl("CONNETTO_SCHEMA_SQL")
         .ok()
         .map(|source| connetto_core::SchemaVersion::from_source(&source));
+    let client_id = env_or("CONNETTO_CLIENT_ID", "anonymous");
     let config = ClientConfig {
-        client_id: env_or("CONNETTO_CLIENT_ID", "anonymous"),
-        auth_token: env_or("CONNETTO_TOKEN", ""),
+        // The identity is carried in the token now, so a dev loop against the
+        // trusting verifier defaults the token to the client id when
+        // `CONNETTO_TOKEN` is unset.
+        auth_token: env_or("CONNETTO_TOKEN", &client_id),
+        client_id,
         schema_version,
         sql_functions: connetto_client::SqlFunctions::new(),
     };

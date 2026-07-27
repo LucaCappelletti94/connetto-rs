@@ -26,14 +26,19 @@
 //! already exist. The server does not create them.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::SchemaVersion;
 use connetto_core::auth::AuthContext;
-use connetto_core::traits::{AuthPolicy, MutationOp};
+use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
 use connetto_server::{
-    Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth, RlsAuthError,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
+    AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, GenericOidcProvider,
+    InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig, PermissiveAuth,
+    PermissiveProvider, PgSnapshotSource, ProviderRegistry, ReconnectPolicy, RedirectPolicy,
+    RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RlsAuthError,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, TokenAuthority, WebSocketTransport,
+    auth_router, pg_write_target, provision_auth_tables,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -84,6 +89,211 @@ impl AuthPolicy for ServerAuth {
                 .map_err(|e| match e {}),
             Self::Rls(auth) => auth.can_write(ctx, table, pk, op).await,
         }
+    }
+}
+
+/// The auth store chosen at startup. A single concrete type so the auth
+/// service and session-verifier futures stay `Send`, mirroring [`ServerAuth`].
+/// Each `async fn` erases the two arm future types through `.await`.
+enum ServerStore {
+    /// Single-server, ephemeral, deterministic identity mapping.
+    InMemory(InMemoryAuthStore),
+    /// Durable and mesh-capable, identity through the linking table.
+    Db(DbAuthStore),
+}
+
+impl AuthStore for ServerStore {
+    async fn create_session(
+        &self,
+        identity: &ResolvedIdentity,
+        now: SystemTime,
+    ) -> Result<IssuedSession, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.create_session(identity, now).await,
+            Self::Db(store) => store.create_session(identity, now).await,
+        }
+    }
+
+    async fn session_is_live(
+        &self,
+        session_id: &str,
+        now: SystemTime,
+    ) -> Result<bool, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.session_is_live(session_id, now).await,
+            Self::Db(store) => store.session_is_live(session_id, now).await,
+        }
+    }
+
+    async fn rotate_refresh(
+        &self,
+        refresh_token: &str,
+        now: SystemTime,
+    ) -> Result<RefreshOutcome, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.rotate_refresh(refresh_token, now).await,
+            Self::Db(store) => store.rotate_refresh(refresh_token, now).await,
+        }
+    }
+
+    async fn revoke_session(&self, session_id: &str) -> Result<(), AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.revoke_session(session_id).await,
+            Self::Db(store) => store.revoke_session(session_id).await,
+        }
+    }
+
+    async fn set_retained_provider_token(
+        &self,
+        session_id: &str,
+        token: &RetainedProviderToken,
+        now: SystemTime,
+    ) -> Result<(), AuthStoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .set_retained_provider_token(session_id, token, now)
+                    .await
+            }
+            Self::Db(store) => {
+                store
+                    .set_retained_provider_token(session_id, token, now)
+                    .await
+            }
+        }
+    }
+
+    async fn retained_provider_token(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.retained_provider_token(session_id).await,
+            Self::Db(store) => store.retained_provider_token(session_id).await,
+        }
+    }
+}
+
+/// Build the auth service and provider registry when `CONNETTO_AUTH` selects a
+/// store (`in-memory` or `database`). Unset leaves the trusting verifier and no
+/// auth endpoints, which suits dev and the pre-acquisition client loops until
+/// phases 4 and 5.
+async fn build_auth(
+    pool: &Pool<AsyncPgConnection>,
+) -> Result<Option<(Arc<AuthService<ServerStore>>, Arc<ProviderRegistry>)>> {
+    let mode = env_or("CONNETTO_AUTH", "");
+    if mode.is_empty() {
+        return Ok(None);
+    }
+    let config = AuthConfig::default();
+    let store = match mode.as_str() {
+        "in-memory" => ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes())),
+        "database" => {
+            provision_auth_tables(pool)
+                .await
+                .map_err(|err| anyhow!("provisioning auth tables: {err}"))?;
+            ServerStore::Db(DbAuthStore::new(pool.clone(), config.refresh_lifetimes()))
+        }
+        other => {
+            return Err(anyhow!(
+                "unknown CONNETTO_AUTH mode {other:?}, expected in-memory or database"
+            ));
+        }
+    };
+    let authority = build_token_authority(&config)?;
+    let registry = Arc::new(build_registry(&config).await?);
+    let service = Arc::new(
+        AuthService::new(Arc::new(authority), Arc::new(store)).with_registry(Arc::clone(&registry)),
+    );
+    Ok(Some((service, registry)))
+}
+
+/// Build the provider registry from `CONNETTO_OIDC_PROVIDER`.
+///
+/// `google` and `microsoft` discover the respective provider, `generic`
+/// discovers `CONNETTO_OIDC_ISSUER`, and anything else (or unset) registers a
+/// [`PermissiveProvider`] dev stand-in that verifies nothing. A real provider
+/// reads `CONNETTO_OIDC_CLIENT_ID`, `CONNETTO_OIDC_CLIENT_SECRET` (optional),
+/// `CONNETTO_OIDC_REDIRECT_URL`, and `CONNETTO_OIDC_SCOPES` (comma-separated).
+async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
+    let mut registry = ProviderRegistry::new();
+    let kind = env_or("CONNETTO_OIDC_PROVIDER", "");
+    match kind.as_str() {
+        "google" | "microsoft" | "generic" => {
+            let http = openidconnect::reqwest::ClientBuilder::new()
+                .redirect(openidconnect::reqwest::redirect::Policy::none())
+                .build()
+                .context("building the OIDC HTTP client")?;
+            let provider_config = oidc_config_from_env(config)?;
+            let provider = match kind.as_str() {
+                "google" => GenericOidcProvider::google(provider_config, http).await,
+                "microsoft" => GenericOidcProvider::microsoft(provider_config, http).await,
+                _ => GenericOidcProvider::discover(provider_config, http).await,
+            }
+            .map_err(|err| anyhow!("configuring the {kind} provider: {err}"))?;
+            registry.register(Arc::new(provider));
+        }
+        _ => {
+            eprintln!(
+                "connetto-server: no CONNETTO_OIDC_PROVIDER set, registering a permissive dev \
+                 provider that verifies nothing (do not use in production)"
+            );
+            let identity = ResolvedIdentity {
+                issuer: "connetto-dev".to_owned(),
+                subject: env_or("CONNETTO_DEV_SUBJECT", "dev-user"),
+                tenant_id: None,
+                roles: Vec::new(),
+                claims: std::collections::BTreeMap::new(),
+            };
+            registry.register(Arc::new(PermissiveProvider::new("permissive", identity)));
+        }
+    }
+    Ok(registry)
+}
+
+/// The generic provider configuration from the `CONNETTO_OIDC_*` environment.
+fn oidc_config_from_env(config: &AuthConfig) -> Result<OidcProviderConfig> {
+    let scopes = env_or("CONNETTO_OIDC_SCOPES", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(OidcProviderConfig {
+        name: env_or("CONNETTO_OIDC_NAME", "oidc"),
+        client_id: std::env::var("CONNETTO_OIDC_CLIENT_ID")
+            .context("set CONNETTO_OIDC_CLIENT_ID")?,
+        client_secret: std::env::var("CONNETTO_OIDC_CLIENT_SECRET").ok(),
+        issuer: env_or("CONNETTO_OIDC_ISSUER", &config.issuer),
+        redirect_url: std::env::var("CONNETTO_OIDC_REDIRECT_URL")
+            .context("set CONNETTO_OIDC_REDIRECT_URL")?,
+        scopes,
+        assurance: connetto_server::AssuranceRequirement::none(),
+        tenant_id: std::env::var("CONNETTO_OIDC_TENANT").ok(),
+    })
+}
+
+/// Load the Ed25519 signing keypair from `CONNETTO_JWT_PRIVATE_KEY_FILE` and
+/// `CONNETTO_JWT_PUBLIC_KEY_FILE` (PKCS#8 PEM), or generate an ephemeral one.
+/// An ephemeral key does not survive a restart, so a durable or mesh deployment
+/// supplies a stable key.
+fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
+    if let (Ok(private_path), Ok(public_path)) = (
+        std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
+        std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE"),
+    ) {
+        let private =
+            std::fs::read(&private_path).with_context(|| format!("reading {private_path}"))?;
+        let public =
+            std::fs::read(&public_path).with_context(|| format!("reading {public_path}"))?;
+        TokenAuthority::from_ed_pem(&private, &public, config)
+            .map_err(|err| anyhow!("loading JWT keypair: {err}"))
+    } else {
+        eprintln!(
+            "connetto-server: no CONNETTO_JWT_*_KEY_FILE set, generating an ephemeral \
+             Ed25519 keypair (tokens do not survive a restart)"
+        );
+        TokenAuthority::generate(config).map_err(|err| anyhow!("generating JWT keypair: {err}"))
     }
 }
 
@@ -175,6 +385,44 @@ async fn main() -> Result<()> {
             ..SessionConfig::default()
         },
     );
+    // When CONNETTO_AUTH is set, mint and verify connetto's own tokens: serve
+    // the login and refresh endpoints and inject the real session verifier so
+    // the handshake trusts only a token connetto signed. Injection happens here
+    // while the manager is still solely owned, before run clones it.
+    let manager = match build_auth(&pool).await? {
+        Some((service, registry)) => {
+            let auth_bind = env_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
+            let verifier: Arc<dyn SessionVerifier> = Arc::new(service.verifier());
+            // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
+            // non-loopback client redirect URIs the deployment permits (a browser
+            // deployment lists its own callback). Loopback redirects are always
+            // allowed, so a native client needs no entry.
+            let allowlist = env_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let router = auth_router(
+                Arc::clone(&service),
+                registry,
+                RedirectPolicy::new(allowlist),
+            );
+            tokio::spawn(async move {
+                match TcpListener::bind(&auth_bind).await {
+                    Ok(listener) => {
+                        eprintln!("connetto-server auth endpoints on {auth_bind}");
+                        if let Err(err) = axum::serve(listener, router).await {
+                            eprintln!("auth server stopped: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("binding auth endpoints {auth_bind}: {err}"),
+                }
+            });
+            manager.with_session_verifier(verifier)
+        }
+        None => manager,
+    };
     run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
 }
 

@@ -28,8 +28,8 @@
 //! writes.
 
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, Ping,
-    Subscribe, SubscriptionSpec, Unsubscribe,
+    AckCredits, BulkMessage, ControlMessage, FatalError, FatalErrorReason, Handshake,
+    MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
@@ -51,10 +51,18 @@ use sqlite_diff_rs::{ParsedDiffSet, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "native-auth")]
+pub mod auth;
 pub mod dsl;
 pub mod live;
 pub mod reconnect;
+pub mod teardown;
 
+#[cfg(feature = "native-auth")]
+pub use auth::{
+    AcquiredSession, BrowserOpener, KeyringStore, MemoryRefreshStore, NativeAuthenticator,
+    RefreshTokenStore, system_browser_opener,
+};
 pub use dsl::Watchable;
 pub use live::{
     ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_is_aggregate,
@@ -105,6 +113,62 @@ pub enum ClientError {
         /// The version the server advertised in the handshake ack.
         server: SchemaVersion,
     },
+    /// Acquiring or refreshing the access token failed.
+    #[error("authentication error: {0}")]
+    Auth(String),
+    /// The replica belongs to a different identity than the one presented. A
+    /// re-authentication that resolves to another `user_id` is an account
+    /// switch: the new identity gets a fresh replica rather than adopting this
+    /// one's data or uploading its pending mutations.
+    #[error("identity mismatch: replica owned by {stored}, presented {presented}")]
+    IdentityMismatch {
+        /// The `user_id` stamped on the replica at first bind.
+        stored: String,
+        /// The `user_id` presented on this bind.
+        presented: String,
+    },
+}
+
+/// The boxed future a token factory returns.
+type TokenFuture = std::pin::Pin<Box<dyn Future<Output = Result<String, ClientError>> + Send>>;
+
+/// The token factory behind an [`AccessTokenSource`].
+type TokenFactory = dyn Fn() -> TokenFuture + Send + Sync;
+
+/// A source of fresh connetto access tokens for the handshake.
+///
+/// A [`ConnettoConnection`] set with one (see
+/// [`with_token_source`](ConnettoConnection::with_token_source)) calls it on
+/// every resume, so a native client silently refreshes its access token on
+/// reconnect. Debug-opaque and `Clone` like [`SqlFunctions`], so it can live in
+/// a `Send + Sync` connection on every target.
+#[derive(Clone)]
+pub struct AccessTokenSource(Arc<TokenFactory>);
+
+impl AccessTokenSource {
+    /// Build a source from an async token factory.
+    pub fn new<F, Fut>(factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, ClientError>> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(factory())))
+    }
+
+    /// Obtain a fresh access token.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the factory returns, typically [`ClientError::Auth`].
+    pub async fn token(&self) -> Result<String, ClientError> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for AccessTokenSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AccessTokenSource(..)")
+    }
 }
 
 /// A closure that registers custom SQLite functions on a replica connection
@@ -291,6 +355,12 @@ pub enum ClientEvent {
     Reconnected,
     /// The connection closed.
     Closed,
+    /// The credential was rejected and refresh could not recover it, so the
+    /// local session is over. The reconnect driver stops rather than spinning:
+    /// the app must re-authenticate interactively, then either resume (same
+    /// `user_id`) or purge and start fresh (an account switch). Terminal, like
+    /// [`Closed`](Self::Closed).
+    AuthenticationRequired,
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -427,7 +497,9 @@ fn count_ops(changeset: &[u8]) -> u32 {
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
-    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL)";
+    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_identity \
+    (id INTEGER PRIMARY KEY CHECK (id = 1), user_id TEXT NOT NULL)";
 
 /// The attach name of the local tier database. An internal constant: authored
 /// SQL never names it, since bare table names resolve across attached
@@ -535,6 +607,26 @@ fn delete_pending(db: &mut SqliteConnection, seq: u64) -> Result<(), ClientError
     Ok(())
 }
 
+/// The `user_id` this replica was stamped with, if any.
+fn load_identity(db: &mut SqliteConnection) -> Result<Option<String>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct IdentityRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        user_id: String,
+    }
+    let rows: Vec<IdentityRow> =
+        diesel::sql_query("SELECT user_id FROM _connetto_identity WHERE id = 1").load(db)?;
+    Ok(rows.into_iter().next().map(|row| row.user_id))
+}
+
+/// Stamp this replica as belonging to `user_id`. Written once at first bind.
+fn stamp_identity(db: &mut SqliteConnection, user_id: &str) -> Result<(), ClientError> {
+    diesel::sql_query("INSERT INTO _connetto_identity (id, user_id) VALUES (1, ?)")
+        .bind::<diesel::sql_types::Text, _>(user_id)
+        .execute(db)?;
+    Ok(())
+}
+
 /// The pending mutations persisted by a previous run against this replica.
 fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, ClientError> {
     #[derive(diesel::QueryableByName)]
@@ -560,6 +652,7 @@ fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, Cli
 async fn exchange_handshake<T>(
     transport: &mut T,
     config: &ClientConfig,
+    token_source: Option<&AccessTokenSource>,
     resume: Option<&Cursor>,
 ) -> Result<(String, Option<u64>, Option<SchemaVersion>), ClientError>
 where
@@ -569,7 +662,10 @@ where
     let mut handshake = Handshake::new(
         PROTOCOL_VERSION,
         config.client_id.clone(),
-        config.auth_token.clone(),
+        match token_source {
+            Some(source) => source.token().await?,
+            None => config.auth_token.clone(),
+        },
     );
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
@@ -602,6 +698,11 @@ where
             }
             Ok((ack.session_id, ack.last_applied_seq, ack.schema_version))
         }
+        // A rejected credential is fatal for this attempt and routes to
+        // re-login, not a generic reconnect that would spin forever.
+        Some(IncomingFrame::Control(ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::AuthenticationFailed,
+        }))) => Err(ClientError::Auth("credential rejected at handshake".into())),
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
     }
@@ -651,6 +752,9 @@ pub struct ConnettoConnection<T: Transport> {
     pending: BTreeMap<u64, Vec<u8>>,
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
+    /// Optional source of fresh access tokens, consulted on every resume so a
+    /// reconnect silently refreshes. `None` reuses `config.auth_token`.
+    token_source: Option<AccessTokenSource>,
     /// Lowercased names of the tables in the attached local tier, empty until
     /// [`attach_local_tier`](Self::attach_local_tier) or
     /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl) runs. Live
@@ -785,7 +889,7 @@ where
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
         let (session_id, watermark, schema_version) =
-            exchange_handshake(&mut transport, config, resume.as_ref()).await?;
+            exchange_handshake(&mut transport, config, None, resume.as_ref()).await?;
 
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
         let mut conn = Self {
@@ -801,11 +905,23 @@ where
             transaction_state: AnsiTransactionManager::default(),
             pending,
             config: config.clone(),
+            token_source: None,
             local_tables: HashSet::new(),
             sub_tables: HashMap::new(),
         };
         conn.reconcile_pending(watermark).await?;
         Ok(conn)
+    }
+
+    /// Attach a source of fresh access tokens, consulted on every
+    /// [`resume`](Self::resume) so a reconnect silently refreshes the access
+    /// token from the stored refresh token with no user interaction. The first
+    /// connect used `config.auth_token`, so a native client sets that to a
+    /// token it acquired interactively and this to its silent-refresh source.
+    #[must_use]
+    pub fn with_token_source(mut self, source: AccessTokenSource) -> Self {
+        self.token_source = Some(source);
+        self
     }
 
     /// Swap in a fresh transport after a drop: re-handshake with the highest
@@ -824,8 +940,13 @@ where
     /// keeps its previous (dead) transport in that case, so a caller can try
     /// again with another one.
     pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
-        let (session_id, watermark, schema_version) =
-            exchange_handshake(&mut transport, &self.config, self.last_cursor.as_ref()).await?;
+        let (session_id, watermark, schema_version) = exchange_handshake(
+            &mut transport,
+            &self.config,
+            self.token_source.as_ref(),
+            self.last_cursor.as_ref(),
+        )
+        .await?;
         self.transport = transport;
         self.session_id = session_id;
         self.schema_version = schema_version;
@@ -890,6 +1011,48 @@ where
     #[must_use]
     pub const fn cursor(&self) -> Option<&Cursor> {
         self.last_cursor.as_ref()
+    }
+
+    /// Bind this replica to `user_id`, enforcing identity continuity.
+    ///
+    /// The first bind stamps the replica. A later bind with the same id is a
+    /// no-op resume. A bind with a different id is an account switch and
+    /// returns [`ClientError::IdentityMismatch`], so the caller purges this
+    /// replica and starts a fresh one for the new identity rather than
+    /// attributing one user's data or pending mutations to another. Call it
+    /// after learning the authenticated `user_id`, before connecting.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::IdentityMismatch`] when the replica is already owned by a
+    /// different identity, or [`ClientError::Db`] on a database failure.
+    pub fn bind_identity(&mut self, user_id: &str) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        match load_identity(&mut self.db)? {
+            Some(stored) if stored == user_id => Ok(()),
+            Some(stored) => Err(ClientError::IdentityMismatch {
+                stored,
+                presented: user_id.to_owned(),
+            }),
+            None => stamp_identity(&mut self.db, user_id),
+        }
+    }
+
+    /// The `user_id` this replica is bound to, or `None` when unbound.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Db`] on a database failure.
+    pub fn identity(&mut self) -> Result<Option<String>, ClientError> {
+        load_identity(&mut self.db)
+    }
+
+    /// The sequence numbers of mutations captured locally but not yet
+    /// confirmed durable by the server. Non-empty means a teardown would lose
+    /// data, so logout and expiry surface these before purging the replica.
+    #[must_use]
+    pub fn unsynced(&self) -> Vec<u64> {
+        self.pending.keys().copied().collect()
     }
 
     /// Attach the local tier database at `path`: device-private tables that

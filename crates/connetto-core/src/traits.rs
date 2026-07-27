@@ -202,3 +202,60 @@ pub trait AuthPolicy {
         op: MutationOp,
     ) -> Result<bool, Self::Error>;
 }
+
+/// Why a session credential was refused at the handshake.
+///
+/// [`run_handshake`](crate::traits::SessionVerifier::verify_session) collapses
+/// every refusal to a single wire reason
+/// ([`FatalErrorReason::AuthenticationFailed`](crate::messages::FatalErrorReason::AuthenticationFailed)),
+/// so the distinction here exists for server-side logging and audit rather than
+/// for the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionVerifyError {
+    /// The credential was absent, malformed, or failed its signature or expiry
+    /// checks, so nothing about the caller can be trusted.
+    Invalid(String),
+    /// The credential verified cryptographically, but its session is no longer
+    /// live in the auth store (revoked or expired), so it is refused.
+    Revoked,
+}
+
+impl core::fmt::Display for SessionVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Invalid(detail) => write!(f, "invalid session credential: {detail}"),
+            Self::Revoked => write!(f, "session is no longer live"),
+        }
+    }
+}
+
+impl std::error::Error for SessionVerifyError {}
+
+/// Boxed future produced by [`SessionVerifier::verify_session`].
+///
+/// A trait object cannot carry an `async fn` directly, so verification returns
+/// an explicitly boxed `Send` future. Verification fires once per connection
+/// off any hot path, so the box allocation is irrelevant.
+pub type SessionVerifyFuture<'a> =
+    core::pin::Pin<Box<dyn Future<Output = Result<AuthContext, SessionVerifyError>> + Send + 'a>>;
+
+/// Turns connetto's own session credential into a verified [`AuthContext`].
+///
+/// The handshake resolves identity only through this seam, never from the
+/// client-supplied `client_id`. A real implementation verifies the token's
+/// signature and expiry (self-contained, no store round-trip) and checks that
+/// the session is still live in the auth store, which is what makes revocation
+/// authoritative rather than bounded by the token lifetime. See
+/// `docs/architecture/11-authentication.md`.
+///
+/// It is held as a runtime trait object on the server (`Arc<dyn SessionVerifier>`)
+/// rather than a generic type parameter, because verification is off any hot
+/// path so static dispatch buys nothing, and a trait object keeps the server's
+/// public type signature stable no matter how a deployment configures identity.
+/// This mirrors the [`AuthPolicy`] pattern of a real implementation plus a
+/// permissive stand-in ([`TrustingSessionVerifier`](crate::auth::TrustingSessionVerifier)).
+pub trait SessionVerifier: Send + Sync {
+    /// Verify `auth_token` (connetto's own access token) and resolve the session
+    /// identity, or refuse it with a [`SessionVerifyError`].
+    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a>;
+}

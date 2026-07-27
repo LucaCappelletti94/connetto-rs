@@ -24,14 +24,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::{AuthContext, TrustingSessionVerifier};
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
     NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
-use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
+use connetto_core::traits::{AuthPolicy, IncomingFrame, SessionVerifier, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
@@ -206,6 +206,9 @@ pub enum SessionError {
     /// at handshake).
     #[error("write target error: {0}")]
     WriteTarget(String),
+    /// The session credential presented at handshake failed verification.
+    #[error("authentication failed: {0}")]
+    Authentication(String),
 }
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
@@ -373,6 +376,13 @@ where
     delta_agg_routes: Mutex<HashMap<u64, AggRoute>>,
     snapshot_source: Snap,
     auth: Auth,
+    /// Turns the handshake `auth_token` into the session [`AuthContext`]. A
+    /// runtime trait object so a deployment configures identity without
+    /// changing the manager's type. Defaults to
+    /// [`TrustingSessionVerifier`], which trusts the token and closes no
+    /// spoofing hole, so a production deployment injects a real verifier
+    /// through [`with_session_verifier`](Self::with_session_verifier).
+    verifier: Arc<dyn SessionVerifier>,
     connector: C,
     oplog: O,
     target: WriteTarget,
@@ -468,6 +478,7 @@ where
             delta_agg_routes: Mutex::new(HashMap::new()),
             snapshot_source,
             auth,
+            verifier: Arc::new(TrustingSessionVerifier),
             connector,
             oplog,
             target: target.into(),
@@ -475,6 +486,25 @@ where
             next_consumer: AtomicU64::new(1),
             config,
         })
+    }
+
+    /// Replace the session verifier that resolves identity at the handshake.
+    ///
+    /// The default is [`TrustingSessionVerifier`], which verifies nothing. A
+    /// production deployment injects a real verifier here. Call this
+    /// immediately after a constructor, while the manager is still solely
+    /// owned, before any clone or spawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the manager is already shared (its `Arc` has other owners),
+    /// because the verifier must be set before the manager is put to work.
+    #[must_use]
+    pub fn with_session_verifier(self: Arc<Self>, verifier: Arc<dyn SessionVerifier>) -> Arc<Self> {
+        let mut inner = Arc::into_inner(self)
+            .expect("with_session_verifier must run before the manager is shared");
+        inner.verifier = verifier;
+        Arc::new(inner)
     }
 
     fn next_session_id(&self) -> u64 {
@@ -765,10 +795,21 @@ where
             )));
         }
 
-        // Identity for this session. Token validation (JWT decode or session
-        // lookup) lands with `OpenFGA` and `rls2fga`; for now the client id is the
-        // identity carried into the auth policy.
-        let auth_ctx = AuthContext::new(handshake.client_id.clone());
+        // Resolve identity from the verified credential, never from the
+        // client-supplied id (that stays a logging label). On refusal, send a
+        // fatal frame and terminate before any subscription or catchup work, so
+        // an unverifiable caller reaches no session state.
+        let auth_ctx = match self.verifier.verify_session(&handshake.auth_token).await {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::AuthenticationFailed,
+                    )))
+                    .await;
+                return Err(SessionError::Authentication(err.to_string()));
+            }
+        };
 
         // Decode the resume cursor and read the server watermark for the ack. An
         // 8-byte cursor is the client's resume LSN; anything else is a fresh
