@@ -94,7 +94,7 @@ The `user_id` type is a placeholder the deployment fills for its `Id` (for examp
 
 ```sql
 CREATE TABLE connetto_sessions (
-    session_id           TEXT PRIMARY KEY,
+    session_id           UUID PRIMARY KEY,
     user_id              <IdSqlType> NOT NULL REFERENCES your_users (id),
     attrs                JSONB NOT NULL,
     current_refresh_hash BYTEA NOT NULL,
@@ -104,7 +104,7 @@ CREATE TABLE connetto_sessions (
 );
 
 CREATE TABLE connetto_provider_tokens (
-    session_id    TEXT PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
+    session_id    UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
     issuer        TEXT NOT NULL,
     access_token  TEXT NOT NULL,
     refresh_token TEXT,
@@ -113,13 +113,13 @@ CREATE TABLE connetto_provider_tokens (
 
 CREATE TABLE _connetto_mutations (
     user_id    <IdSqlType> NOT NULL REFERENCES your_users (id),
-    session_id TEXT NOT NULL REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
+    session_id UUID NOT NULL REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
     last_seq   BIGINT NOT NULL,
     PRIMARY KEY (user_id, session_id)
 );
 ```
 
-`session_id` is connetto-minted and connetto-owned (a `String` today, see the roadmap for making it a `Copy` uuid). `user_id` foreign-keys the deployment's own users table, the row the `IdentityResolver` produced. The `_connetto_mutations` table is the durable exactly-once watermark: the server keys it on `(user_id, session_id)` from the verified access token (never the client-fabricated `client_id`), so a worker restart or leader failover reusing the same session does not replay already-committed mutations. Its `ConnettoWatermarkSchema` impl and `diesel::table!` come from the `connetto_watermark_table!(Id, IdSqlType)` convenience macro, the watermark counterpart to `connetto_auth_tables!`; a deployment with a different shape implements the trait by hand. Row cleanup (deleting revoked and absolute-expired sessions) is the deployment's, since it owns the tables; a recommended cleanup is a periodic `DELETE FROM connetto_sessions WHERE revoked OR absolute_deadline_ms < <now_ms>`.
+`session_id` is connetto-minted and connetto-owned (a `Copy` uuid value type, stored in a native `uuid` column and rendered to text only at the JWT `sid` claim and the refresh token). `user_id` foreign-keys the deployment's own users table, the row the `IdentityResolver` produced. The `_connetto_mutations` table is the durable exactly-once watermark: the server keys it on `(user_id, session_id)` from the verified access token (never the client-fabricated `client_id`), so a worker restart or leader failover reusing the same session does not replay already-committed mutations. Its `ConnettoWatermarkSchema` impl and `diesel::table!` come from the `connetto_watermark_table!(Id, IdSqlType)` convenience macro, the watermark counterpart to `connetto_auth_tables!`; a deployment with a different shape implements the trait by hand. Row cleanup (deleting revoked and absolute-expired sessions) is the deployment's, since it owns the tables; a recommended cleanup is a periodic `DELETE FROM connetto_sessions WHERE revoked OR absolute_deadline_ms < <now_ms>`.
 
 ### Multi-factor assurance
 
@@ -153,6 +153,8 @@ The refresh-token and local-session lifetime is server-side configuration owned 
 
 The existing server-issued `session_token` field on the handshake stays distinct from the auth credential. The identity credential is the signed `auth_token`, and `session_token` remains the resume key for the operational session state that subql already tracks (subscriptions, cursors, pending patches). They do different jobs and are not the same value.
 
+The token endpoints hand the client its `user_id` as the deployment's own typed id, serialized by serde and deserialized straight back into that type, never as an opaque string the client re-parses. That keeps the identity path typed end to end. Text survives only at the two edges that are inherently textual: the JWT `sub` claim, and the `app.user_id` GUC the write path binds for RLS. Nothing else on the `user_id` path goes through `Display` or `FromStr`, which is why the client can name a replica file from an id it has never rendered.
+
 ---
 
 ## Client acquisition
@@ -181,7 +183,9 @@ On reconnect, the client refreshes before the handshake: it presents connetto's 
 
 The refresh-token lifetime defines the local session lifetime and therefore the replica lifetime. Access-token expiry is invisible and silently refreshed and never touches the replica lifecycle. When the refresh token is gone, the local session is over. Logout and refresh-token expiry are the same event, sharing one teardown path: surface any unsynced pending mutations, then purge the identity's replica, and require a fresh interactive login, which rebuilds the replica through the full-resync-from-template path that `06-reconnect.md` already defines.
 
-Resuming a replica requires the same identity. If a re-authentication yields a different `user_id`, that is account switching, and the new identity gets its own fresh replica and does not adopt the previous identity's data or upload its pending mutations, because attributing one user's writes to another both misattributes data and violates the RLS boundary. Account linking is what lets the same human re-authenticate through a different provider and still resolve to the same `user_id`, so a provider switch resumes rather than being seen as a different account.
+Resuming a replica requires the same identity, and that is enforced by which replica file the client opens rather than by any marker inside it. The client derives the replica's name from the authenticated `user_id` before it opens any transport, hashing the id's own serde encoding so the name is deterministic per identity, fixed length, and does not spell the id out in a directory listing. Deriving before connecting is what makes a cross-identity resume unrepresentable instead of merely detected: a re-authentication that yields a different `user_id` names a different file, so the new identity can neither adopt the previous one's rows nor upload its pending mutations, which would misattribute writes and violate the RLS boundary. The connection itself stores no identity and is not generic over it. Account linking is what lets the same human re-authenticate through a different provider and still resolve to the same `user_id`, so a provider switch resumes rather than being seen as a different account.
+
+Each identity keeps its own replica, so a device may hold several at once and switching back resumes from that replica's persisted cursor instead of re-snapshotting, with any mutation it never uploaded still queued to replay. Destroying a replica is therefore an explicit data wipe (logout with clear, or the key destruction the encryption plan defines), never a side effect of another identity signing in. That is deliberate and it is what the per-replica encryption key exists to support: the key survives logout so a returning user is fast, and at-rest protection comes from the key rather than from deleting the file. Until that encryption lands the resident replicas are plaintext, which is a known gap owned by `docs/handoff-auth-at-rest-encryption.md` and not something file selection was ever going to close.
 
 The one honest data-loss edge: a device that stays continuously offline past its entire session length ends the session with unsynced mutations still queued. This is handled by making it loud, a proactive warning as the session nears expiry when unsynced changes exist, and a purge that blocks on unsynced data rather than discarding it silently.
 
