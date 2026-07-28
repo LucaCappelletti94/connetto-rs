@@ -110,9 +110,16 @@ CREATE TABLE connetto_provider_tokens (
     refresh_token TEXT,
     expires_at_ms BIGINT
 );
+
+CREATE TABLE _connetto_mutations (
+    user_id    <IdSqlType> NOT NULL REFERENCES your_users (id),
+    session_id TEXT NOT NULL REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
+    last_seq   BIGINT NOT NULL,
+    PRIMARY KEY (user_id, session_id)
+);
 ```
 
-`session_id` is connetto-minted and connetto-owned (a `String` today, see the roadmap for making it a `Copy` uuid). `user_id` foreign-keys the deployment's own users table, the row the `IdentityResolver` produced. Row cleanup (deleting revoked and absolute-expired sessions) is the deployment's, since it owns the tables; a recommended cleanup is a periodic `DELETE FROM connetto_sessions WHERE revoked OR absolute_deadline_ms < <now_ms>`.
+`session_id` is connetto-minted and connetto-owned (a `String` today, see the roadmap for making it a `Copy` uuid). `user_id` foreign-keys the deployment's own users table, the row the `IdentityResolver` produced. The `_connetto_mutations` table is the durable exactly-once watermark: the server keys it on `(user_id, session_id)` from the verified access token (never the client-fabricated `client_id`), so a worker restart or leader failover reusing the same session does not replay already-committed mutations. Its `ConnettoWatermarkSchema` impl and `diesel::table!` come from the `connetto_watermark_table!(Id, IdSqlType)` convenience macro, the watermark counterpart to `connetto_auth_tables!`; a deployment with a different shape implements the trait by hand. Row cleanup (deleting revoked and absolute-expired sessions) is the deployment's, since it owns the tables; a recommended cleanup is a periodic `DELETE FROM connetto_sessions WHERE revoked OR absolute_deadline_ms < <now_ms>`.
 
 ### Multi-factor assurance
 
