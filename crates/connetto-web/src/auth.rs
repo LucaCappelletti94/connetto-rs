@@ -185,29 +185,31 @@ pub enum LoginMessage {
 /// The tokens plus session metadata connetto-server returns from its token and
 /// refresh endpoints.
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
+struct TokenResponse<Id> {
     access_token: String,
     refresh_token: String,
-    user_id: String,
+    user_id: Id,
     session_expires_at: u64,
 }
 
 /// A completed acquisition: the access token the worker sets on its handshake,
-/// plus the identity and session deadline the worker needs to enforce identity
-/// continuity (a re-auth to a different `user_id` is an account switch) and to
-/// warn before an offline session lapses with unsynced data.
+/// plus the identity and session deadline the worker needs to select the
+/// replica file this identity owns and to warn before an offline session
+/// lapses with unsynced data.
 #[derive(Debug, Clone)]
-pub struct BrowserSession {
+pub struct BrowserSession<Id> {
     /// connetto's short-lived access token, held only in the worker.
     pub access_token: String,
-    /// The `user_id` this session belongs to, bound onto the worker replica.
-    pub user_id: String,
+    /// The typed `user_id` this session belongs to. The worker names its
+    /// replica file from it before opening any transport, so an account switch
+    /// opens a different file rather than resuming the previous identity's.
+    pub user_id: Id,
     /// Unix seconds when the local session lapses if never refreshed again.
     pub session_expires_at: u64,
 }
 
-impl From<TokenResponse> for BrowserSession {
-    fn from(response: TokenResponse) -> Self {
+impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
+    fn from(response: TokenResponse<Id>) -> Self {
         Self {
             access_token: response.access_token,
             user_id: response.user_id,
@@ -217,9 +219,9 @@ impl From<TokenResponse> for BrowserSession {
 }
 
 /// The outcome of an acquisition attempt.
-pub enum Acquired {
+pub enum Acquired<Id> {
     /// A ready session (silent refresh succeeded).
-    Access(BrowserSession),
+    Access(BrowserSession<Id>),
     /// Interactive login is required. Drive it with
     /// [`await_login_code`] then [`BrowserAuthenticator::complete`].
     NeedLogin(PendingLogin),
@@ -252,7 +254,10 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError::Store`] if the store cannot be read.
-    pub async fn acquire(&self, store: &RefreshStore) -> Result<Acquired, AuthError> {
+    pub async fn acquire<Id: serde::de::DeserializeOwned>(
+        &self,
+        store: &RefreshStore,
+    ) -> Result<Acquired<Id>, AuthError> {
         if let Some(refresh) = store.load()? {
             match self.refresh_tokens(&refresh).await {
                 Ok(tokens) => {
@@ -290,13 +295,13 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError`] on a state mismatch, a failed exchange, or a store write.
-    pub async fn complete(
+    pub async fn complete<Id: serde::de::DeserializeOwned>(
         &self,
         pending: &PendingLogin,
         code: &str,
         state: &str,
         store: &RefreshStore,
-    ) -> Result<BrowserSession, AuthError> {
+    ) -> Result<BrowserSession<Id>, AuthError> {
         if state != pending.state {
             return Err(AuthError::StateMismatch);
         }
@@ -305,7 +310,10 @@ impl BrowserAuthenticator {
         Ok(tokens.into())
     }
 
-    async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenResponse, AuthError> {
+    async fn refresh_tokens<Id: serde::de::DeserializeOwned>(
+        &self,
+        refresh_token: &str,
+    ) -> Result<TokenResponse<Id>, AuthError> {
         let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
         let text = post_json(
             &format!("{}/auth/refresh", self.config.auth_base_url),
@@ -315,7 +323,11 @@ impl BrowserAuthenticator {
         serde_json::from_str(&text).map_err(|_| AuthError::Decode)
     }
 
-    async fn exchange_code(&self, code: &str, verifier: &str) -> Result<TokenResponse, AuthError> {
+    async fn exchange_code<Id: serde::de::DeserializeOwned>(
+        &self,
+        code: &str,
+        verifier: &str,
+    ) -> Result<TokenResponse<Id>, AuthError> {
         let body = serde_json::json!({ "code": code, "code_verifier": verifier }).to_string();
         let text = post_json(&format!("{}/auth/token", self.config.auth_base_url), &body).await?;
         serde_json::from_str(&text).map_err(|_| AuthError::Decode)

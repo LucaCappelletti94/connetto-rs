@@ -161,9 +161,12 @@ fn main() {
 ///
 /// A JS string describing the VFS, upstream connect, or subscribe failure.
 async fn run_db_worker() -> Result<(), JsValue> {
-    connetto_web::workers::boot_db_worker(&connetto_web::workers::DbWorkerConfig {
+    // `Id` names the user id the reference connetto-server mints, a `String`.
+    // This demo runs unauthenticated, so no identity is ever acquired and the
+    // replica keeps `DB_NAME` verbatim.
+    connetto_web::workers::boot_db_worker::<String>(&connetto_web::workers::DbWorkerConfig {
         ws_url: DEMO_WS_URL,
-        replica_db_name: DB_NAME,
+        replica_db_prefix: DB_NAME,
         replica_ddl: DEMO_SQLITE_DDL,
         frontend_db_name: FRONTEND_DB_NAME,
         frontend_template: FRONTEND_TEMPLATE,

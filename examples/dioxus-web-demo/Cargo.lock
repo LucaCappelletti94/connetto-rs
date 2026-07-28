@@ -451,6 +451,7 @@ dependencies = [
  "diesel-sqlite-session",
  "serde",
  "serde_json",
+ "sha2",
  "sqlite-diff-rs",
  "sqlparser",
  "subql",
@@ -475,6 +476,7 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
+ "diesel",
  "dioxus-core",
  "dioxus-hooks",
  "dioxus-signals",
@@ -503,13 +505,18 @@ dependencies = [
 name = "connetto-web"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "connetto-client",
  "connetto-core",
  "diesel",
  "diesel-sqlite-session",
  "futures-channel",
  "futures-util",
+ "getrandom 0.2.17",
  "js-sys",
+ "serde",
+ "serde_json",
+ "sha2",
  "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",

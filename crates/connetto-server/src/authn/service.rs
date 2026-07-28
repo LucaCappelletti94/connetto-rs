@@ -23,17 +23,18 @@ use crate::authn::token::{TokenAuthority, TokenError};
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
 #[derive(Debug, Clone)]
-pub struct TokenPair {
+pub struct TokenPair<Id> {
     /// The short-lived access token, carried in `Handshake.auth_token`.
     pub access_token: String,
     /// The rotating refresh token, presented back to the refresh endpoint.
     pub refresh_token: String,
     /// The access token's lifetime in seconds, echoed as `expires_in`.
     pub expires_in_secs: u64,
-    /// The `user_id` this session belongs to. The client keys its replica by
-    /// it and enforces identity continuity: a resume with a different id is an
-    /// account switch, not a resume.
-    pub user_id: String,
+    /// The typed `user_id` this session belongs to, carried to the client as
+    /// the deployment's own id rather than as text. The client selects its
+    /// replica file from it, so a re-authentication resolving to a different
+    /// identity opens a different file instead of resuming this one's.
+    pub user_id: Id,
     /// Unix-seconds instant the local session lapses if never refreshed again.
     /// The client warns before it passes with unsynced data queued.
     pub session_expires_at_secs: u64,
@@ -101,7 +102,7 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the store or the mint fails.
-    pub async fn login(&self, identity: &ResolvedIdentity) -> Result<TokenPair, AuthError> {
+    pub async fn login(&self, identity: &ResolvedIdentity) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let issued = self.store.create_session(identity, now).await?;
         let access_token = self
@@ -111,7 +112,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: issued.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: issued.context.user_id.to_string(),
+            user_id: issued.context.user_id,
             session_expires_at_secs: unix_secs(issued.session_expires_at),
         })
     }
@@ -124,7 +125,10 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the store or the mint fails.
-    pub async fn login_with_provider(&self, login: &VerifiedLogin) -> Result<TokenPair, AuthError> {
+    pub async fn login_with_provider(
+        &self,
+        login: &VerifiedLogin,
+    ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let issued = self.store.create_session(&login.identity, now).await?;
         self.store
@@ -137,7 +141,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: issued.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: issued.context.user_id.to_string(),
+            user_id: issued.context.user_id,
             session_expires_at_secs: unix_secs(issued.session_expires_at),
         })
     }
@@ -207,7 +211,7 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the token is invalid, expired, reused, or the mint fails.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let outcome = self.store.rotate_refresh(refresh_token, now).await?;
         let access_token =
@@ -217,7 +221,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: outcome.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: outcome.context.user_id.to_string(),
+            user_id: outcome.context.user_id,
             session_expires_at_secs: unix_secs(outcome.session_expires_at),
         })
     }

@@ -102,6 +102,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,6 +288,7 @@ dependencies = [
  "diesel-sqlite-session",
  "serde",
  "serde_json",
+ "sha2",
  "sqlite-diff-rs",
  "sqlparser",
  "subql",
@@ -304,13 +311,18 @@ dependencies = [
 name = "connetto-web"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "connetto-client",
  "connetto-core",
  "diesel",
  "diesel-sqlite-session",
  "futures-channel",
  "futures-util",
+ "getrandom 0.2.17",
  "js-sys",
+ "serde",
+ "serde_json",
+ "sha2",
  "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
@@ -328,6 +340,7 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
+ "diesel",
  "futures-util",
  "yew",
 ]

@@ -422,15 +422,15 @@ impl Default for PendingLogins {
 /// the minted token pair until the client redeems it at the token endpoint with
 /// its PKCE verifier.
 #[derive(Debug, Clone)]
-pub struct IssuedAuthCode {
+pub struct IssuedAuthCode<Id> {
     /// The access token to hand back on redemption.
     pub access_token: String,
     /// The refresh token to hand back on redemption.
     pub refresh_token: String,
     /// The access token lifetime in seconds.
     pub expires_in_secs: u64,
-    /// The `user_id` the redeemed pair belongs to.
-    pub user_id: String,
+    /// The typed `user_id` the redeemed pair belongs to.
+    pub user_id: Id,
     /// Unix-seconds instant the local session lapses without a further refresh.
     pub session_expires_at_secs: u64,
     /// The client's PKCE S256 challenge that the redeeming verifier must match.
@@ -438,8 +438,8 @@ pub struct IssuedAuthCode {
 }
 
 /// A one-time code with the instant it was issued, for TTL expiry.
-struct CodeEntry {
-    code: IssuedAuthCode,
+struct CodeEntry<Id> {
+    code: IssuedAuthCode<Id>,
     created_at: Instant,
 }
 
@@ -447,13 +447,13 @@ struct CodeEntry {
 /// single-use, and time-limited: a code is removed the moment it is redeemed,
 /// an entry past `AUTH_CODE_TTL` is refused and dropped, and when the cap is
 /// reached expired codes go first, then the oldest.
-pub struct AuthCodes {
-    inner: std::sync::Mutex<HashMap<String, CodeEntry>>,
+pub struct AuthCodes<Id> {
+    inner: std::sync::Mutex<HashMap<String, CodeEntry<Id>>>,
     cap: usize,
     ttl: Duration,
 }
 
-impl AuthCodes {
+impl<Id> AuthCodes<Id> {
     /// A store holding at most `cap` outstanding codes, each valid for `ttl`.
     #[must_use]
     pub fn new(cap: usize, ttl: Duration) -> Self {
@@ -465,7 +465,7 @@ impl AuthCodes {
     }
 
     /// Issue a code for `issued`, returning the opaque code string.
-    pub fn issue(&self, issued: IssuedAuthCode) -> String {
+    pub fn issue(&self, issued: IssuedAuthCode<Id>) -> String {
         let now = Instant::now();
         let code = format!(
             "{}{}",
@@ -487,14 +487,14 @@ impl AuthCodes {
     /// Remove and return the code, consuming it so it cannot be redeemed twice.
     /// A code past its TTL is dropped and treated as absent.
     #[must_use]
-    pub fn redeem(&self, code: &str) -> Option<IssuedAuthCode> {
+    pub fn redeem(&self, code: &str) -> Option<IssuedAuthCode<Id>> {
         let now = Instant::now();
         let entry = self.inner.lock().expect("auth codes lock").remove(code)?;
         (!is_expired(entry.created_at, now, self.ttl)).then_some(entry.code)
     }
 }
 
-impl Default for AuthCodes {
+impl<Id> Default for AuthCodes<Id> {
     fn default() -> Self {
         Self::new(4096, AUTH_CODE_TTL)
     }
@@ -626,7 +626,7 @@ mod tests {
         }
     }
 
-    fn sample_code() -> IssuedAuthCode {
+    fn sample_code() -> IssuedAuthCode<String> {
         IssuedAuthCode {
             access_token: "access".to_owned(),
             refresh_token: "refresh".to_owned(),

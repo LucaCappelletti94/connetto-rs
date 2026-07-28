@@ -129,23 +129,24 @@ pub struct RefreshRequest {
 
 /// The token pair returned by the callback, the token exchange, and refresh.
 #[derive(Debug, Serialize)]
-pub struct TokenResponse {
+pub struct TokenResponse<Id> {
     /// The short-lived access token for `Handshake.auth_token`.
     pub access_token: String,
     /// The rotating refresh token.
     pub refresh_token: String,
     /// The access token lifetime in seconds.
     pub expires_in: u64,
-    /// The `user_id` this session belongs to, so the client can key its
-    /// replica and enforce identity continuity across a re-authentication.
-    pub user_id: String,
+    /// The typed `user_id` this session belongs to, serialized as the
+    /// deployment's own id so the client deserializes it back into that type
+    /// and names its replica file from it, with no text on the identity path.
+    pub user_id: Id,
     /// Unix-seconds instant the local session lapses without a further
     /// refresh, for the client's proactive unsynced-data warning.
     pub session_expires_at: u64,
 }
 
-impl From<TokenPair> for TokenResponse {
-    fn from(pair: TokenPair) -> Self {
+impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
+    fn from(pair: TokenPair<Id>) -> Self {
         Self {
             access_token: pair.access_token,
             refresh_token: pair.refresh_token,
@@ -162,7 +163,7 @@ pub struct AuthState<S: AuthStore> {
     service: Arc<AuthService<S>>,
     registry: Arc<ProviderRegistry>,
     pending: Arc<PendingLogins>,
-    codes: Arc<AuthCodes>,
+    codes: Arc<AuthCodes<S::Id>>,
     redirect_policy: RedirectPolicy,
 }
 
@@ -332,7 +333,7 @@ async fn callback<S: AuthStore + 'static>(
 async fn token<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
     Json(request): Json<TokenExchangeRequest>,
-) -> Result<Json<TokenResponse>, AuthApiError> {
+) -> Result<Json<TokenResponse<S::Id>>, AuthApiError> {
     let issued = state
         .codes
         .redeem(&request.code)
@@ -352,7 +353,7 @@ async fn token<S: AuthStore + 'static>(
 async fn refresh<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
     Json(request): Json<RefreshRequest>,
-) -> Result<Json<TokenResponse>, AuthApiError> {
+) -> Result<Json<TokenResponse<S::Id>>, AuthApiError> {
     let pair = state
         .service
         .refresh(&request.refresh_token)

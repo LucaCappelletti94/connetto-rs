@@ -1,23 +1,32 @@
-//! Phase 6 client-side authentication (docs/architecture/11-authentication.md):
-//! a rejected credential at the handshake surfaces as [`ClientError::Auth`] so
-//! the driver routes to re-login, and the replica enforces identity continuity
-//! so a re-authentication to a different `user_id` is an account switch rather
-//! than a resume onto another identity's data.
+//! Client-side authentication (docs/architecture/11-authentication.md): a
+//! rejected credential at the handshake surfaces as [`ClientError::Auth`] so
+//! the driver routes to re-login, and identity continuity is enforced by which
+//! replica file the client opens, so a re-authentication to a different
+//! `user_id` is an account switch onto its own replica rather than a resume
+//! onto another identity's data.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    ReconnectPolicy, SqlFunctions, TokioSleeper,
+    ReconnectPolicy, SqlFunctions, TokioSleeper, replica_db_name,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, SchemaVersion};
+use diesel::prelude::*;
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+
+diesel::table! {
+    items (id) {
+        id -> Integer,
+        label -> Nullable<Text>,
+    }
+}
 
 /// The reply a [`FakeTransport`] sends back the moment it sees a handshake.
 #[derive(Clone, Copy)]
@@ -117,63 +126,79 @@ async fn handshake_rejection_surfaces_as_auth_error() {
 }
 
 #[tokio::test]
-async fn replica_enforces_identity_continuity() {
+async fn each_identity_opens_its_own_replica() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("replica.sqlite");
-    let path = path.to_str().expect("utf8 path");
+    let prefix = dir
+        .path()
+        .join("replica")
+        .to_str()
+        .expect("utf8")
+        .to_owned();
 
-    // First connect stamps nothing yet: a fresh replica has no owner and no
-    // unsynced work.
+    // The replica an identity owns is named from the id itself, so two
+    // identities on one device never name the same file.
+    let alice = replica_db_name(&prefix, "alice").expect("derive alice");
+    let bob = replica_db_name(&prefix, "bob").expect("derive bob");
+    assert_ne!(alice, bob, "distinct identities select distinct replicas");
+    assert_eq!(
+        alice,
+        replica_db_name(&prefix, "alice").expect("derive alice again"),
+        "one identity always returns to the same replica",
+    );
+
+    // Alice syncs a row into her replica.
     let mut conn = ConnettoConnection::connect(
         FakeTransport::new(HandshakeReply::Accept),
-        path,
+        &alice,
         SQLITE_DDL,
         &config(),
         None,
     )
     .await
-    .expect("connect");
-    assert_eq!(conn.identity().expect("identity"), None, "unbound at first");
+    .expect("connect alice");
     assert!(
         conn.unsynced().is_empty(),
         "no unsynced work on a fresh replica"
     );
-
-    // Binding stamps the replica, and a rebind to the same id is an idempotent
-    // resume.
-    conn.bind_identity("alice").expect("first bind stamps");
-    assert_eq!(conn.identity().expect("identity").as_deref(), Some("alice"));
-    conn.bind_identity("alice").expect("same-id rebind resumes");
-
-    // A different id is an account switch, refused so the caller purges rather
-    // than adopting another identity's replica.
-    match conn.bind_identity("bob") {
-        Err(ClientError::IdentityMismatch { stored, presented }) => {
-            assert_eq!(stored, "alice");
-            assert_eq!(presented, "bob");
-        }
-        other => panic!("expected IdentityMismatch, got {other:?}"),
-    }
-
-    // The stamp is durable: reopening the same replica file still refuses a
-    // different identity.
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq("alice-row")))
+        .execute(conn.conn())
+        .expect("insert");
     drop(conn);
-    let mut reopened = ConnettoConnection::connect_existing(
+
+    // Bob authenticates on the same device. His boot derives a different file,
+    // so he starts on an empty replica and can neither read Alice's rows nor
+    // inherit her pending mutations.
+    let mut conn = ConnettoConnection::connect(
         FakeTransport::new(HandshakeReply::Accept),
-        path,
+        &bob,
+        SQLITE_DDL,
         &config(),
         None,
     )
     .await
-    .expect("reconnect existing");
-    assert_eq!(
-        reopened.identity().expect("identity").as_deref(),
-        Some("alice")
-    );
-    assert!(matches!(
-        reopened.bind_identity("bob"),
-        Err(ClientError::IdentityMismatch { .. })
-    ));
+    .expect("connect bob");
+    let seen: Vec<Option<String>> = items::table
+        .select(items::label)
+        .load(conn.conn())
+        .expect("read bob");
+    assert!(seen.is_empty(), "bob's replica holds none of alice's rows");
+    drop(conn);
+
+    // Alice's own replica is untouched by the switch and resumes with her data.
+    let mut conn = ConnettoConnection::connect_existing(
+        FakeTransport::new(HandshakeReply::Accept),
+        &alice,
+        &config(),
+        None,
+    )
+    .await
+    .expect("reconnect alice");
+    let seen: Vec<Option<String>> = items::table
+        .select(items::label)
+        .load(conn.conn())
+        .expect("read alice");
+    assert_eq!(seen, vec![Some("alice-row".to_owned())]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -61,8 +61,11 @@ thread_local! {
 pub struct DbWorkerConfig {
     /// The server WebSocket URL the worker connects upstream to.
     pub ws_url: &'static str,
-    /// The OPFS file holding the durable synced replica.
-    pub replica_db_name: &'static str,
+    /// The base name of the OPFS file holding the durable synced replica.
+    /// With `auth` set the worker appends the authenticated identity, so each
+    /// identity owns its own replica file and an account switch opens a
+    /// different one. With `auth` unset this is the file name verbatim.
+    pub replica_db_prefix: &'static str,
     /// The synced replica DDL, applied only on a first boot (a resumed
     /// replica keeps its schema and its persisted cursor).
     pub replica_ddl: &'static str,
@@ -152,23 +155,6 @@ impl WorkerStorage {
                 .map_err(|err| format!("{err:?}")),
         };
         result.map_err(|err| JsValue::from_str(&format!("import {name}: {err}")))
-    }
-
-    /// Delete a database file and its VFS sidecars. Used to purge a replica on
-    /// an account switch: a re-authentication to a different identity must not
-    /// resume onto the previous identity's data. A missing file is not an
-    /// error.
-    fn delete_db(&self, name: &str) -> Result<(), JsValue> {
-        match self {
-            Self::Opfs(util) => util
-                .delete_db(name)
-                .map(|_| ())
-                .map_err(|err| JsValue::from_str(&format!("delete {name}: {err:?}"))),
-            Self::Memory(util) => {
-                util.delete_db(name);
-                Ok(())
-            }
-        }
     }
 }
 
@@ -307,14 +293,14 @@ pub async fn announce_tab(wire: &str) {
 
 /// Acquire connetto's own session in the worker: silently refresh from the
 /// OPFS-stored refresh token, or drive an interactive tab login when there is
-/// none. Returns the access token plus the identity and session deadline the
-/// worker needs for identity continuity and the offline-expiry warning. The
-/// worker holds the tokens throughout; a tab only ever sees the login URL and
-/// returns the authorization code.
-async fn acquire_session(
+/// none. Returns the access token plus the typed identity and session deadline
+/// the worker needs to select the replica file and to warn before an offline
+/// session lapses. The worker holds the tokens throughout; a tab only ever
+/// sees the login URL and returns the authorization code.
+async fn acquire_session<Id: serde::de::DeserializeOwned>(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
-) -> Result<crate::auth::BrowserSession, JsValue> {
+) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
     let store = crate::auth::RefreshStore::open(auth_db_name).map_err(to_js)?;
     let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone());
     match authenticator.acquire(&store).await.map_err(to_js)? {
@@ -331,29 +317,58 @@ async fn acquire_session(
     }
 }
 
-/// DB worker context: install the OPFS VFS, open the durable replica
-/// (resuming an existing one from its persisted cursor), connect upstream,
-/// wait for the subscription to be fully served, hold the alive lock,
-/// start the relay hub with upstream reconnect, wire dead-tab reaping, and
-/// open the hello channel intake. The consumer's `db-worker.js` awaits the
-/// `#[wasm_bindgen]` wrapper that calls this.
+/// DB worker context: install the OPFS VFS, acquire connetto's session, open
+/// the replica that identity owns (resuming an existing one from its persisted
+/// cursor), connect upstream, wait for the subscription to be fully served,
+/// hold the alive lock, start the relay hub with upstream reconnect, wire
+/// dead-tab reaping, and open the hello channel intake. The consumer's
+/// `db-worker.js` awaits the `#[wasm_bindgen]` wrapper that calls this.
+///
+/// `Id` is the deployment's typed user id, the one connetto-server mints into
+/// its token responses. It names the replica file, so it must be given even
+/// when `config.auth` is `None`, where no identity is ever acquired and the
+/// replica keeps `config.replica_db_prefix` verbatim.
 ///
 /// # Errors
 ///
-/// A string describing the VFS, upstream connect, or subscribe failure.
+/// A string describing the VFS, acquisition, upstream connect, or subscribe
+/// failure.
 #[allow(clippy::too_many_lines)]
-pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
+pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<(), JsValue>
+where
+    Id: serde::Serialize + serde::de::DeserializeOwned,
+{
     let storage = WorkerStorage::install().await;
 
-    let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
     // Acquire connetto's own access token when auth is configured: a silent
     // refresh from the OPFS-stored token on a cold start or leader failover,
     // or an interactive tab login otherwise. The worker holds the tokens; the
     // tab only ever sees the login URL and hands back the code.
+    //
+    // This runs before any transport exists, because the authenticated
+    // identity decides which replica file to open. Connecting first and
+    // checking identity afterwards would resume the previous identity's
+    // replica over the wire under the new user's token.
     let session = match &config.auth {
-        Some(auth_config) => Some(acquire_session(auth_config, config.auth_db_name).await?),
+        Some(auth_config) => Some(acquire_session::<Id>(auth_config, config.auth_db_name).await?),
         None => None,
     };
+    // Identity continuity by file selection: each identity owns the replica
+    // named from its own id, so an account switch opens a different file and
+    // can neither adopt the previous identity's rows nor upload its pending
+    // mutations. The identity that just left keeps its replica: switching back
+    // resumes from its persisted cursor instead of re-snapshotting, and any
+    // mutation it never got to upload is still there to replay. Destroying a
+    // replica is an explicit data wipe, never a side effect of someone else
+    // signing in.
+    let replica_db_name = match &session {
+        Some(session) => {
+            connetto_client::replica_db_name(config.replica_db_prefix, &session.user_id)
+                .map_err(to_js)?
+        }
+        None => config.replica_db_prefix.to_owned(),
+    };
+
     let auth_token = session
         .as_ref()
         .map_or_else(|| "token".to_owned(), |s| s.access_token.clone());
@@ -363,23 +378,19 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
         schema_version: Some(config.schema_version.clone()),
         sql_functions: config.sql_functions.clone(),
     };
-    // A replica left by a previous worker generation resumes: the persisted
-    // cursor rides the handshake and the subscription below catches up from
-    // the server oplog instead of re-snapshotting.
-    let mut existing = storage.exists(config.replica_db_name);
+    let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
+    // A replica left by a previous worker generation of the SAME identity
+    // resumes: the persisted cursor rides the handshake and the subscription
+    // below catches up from the server oplog instead of re-snapshotting.
+    let existing = storage.exists(&replica_db_name);
     let mut worker = if existing {
-        ConnettoConnection::connect_existing(
-            transport,
-            config.replica_db_name,
-            &client_config,
-            None,
-        )
-        .await
-        .map_err(to_js)?
+        ConnettoConnection::connect_existing(transport, &replica_db_name, &client_config, None)
+            .await
+            .map_err(to_js)?
     } else {
         ConnettoConnection::connect(
             transport,
-            config.replica_db_name,
+            &replica_db_name,
             config.replica_ddl,
             &client_config,
             None,
@@ -387,34 +398,6 @@ pub async fn boot_db_worker(config: &DbWorkerConfig) -> Result<(), JsValue> {
         .await
         .map_err(to_js)?
     };
-    // Identity continuity: bind the resident replica to the authenticated
-    // identity. A re-authentication that resolves to a different `user_id` is
-    // an account switch, so purge the previous identity's replica and rebuild
-    // a fresh one rather than resuming onto its data or uploading its pending
-    // mutations, which would misattribute writes and breach the RLS boundary.
-    if let Some(session) = &session {
-        match worker.bind_identity(&session.user_id) {
-            Ok(()) => {}
-            Err(connetto_client::ClientError::IdentityMismatch { .. }) => {
-                drop(worker);
-                storage.delete_db(config.replica_db_name)?;
-                let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
-                let mut fresh = ConnettoConnection::connect(
-                    transport,
-                    config.replica_db_name,
-                    config.replica_ddl,
-                    &client_config,
-                    None,
-                )
-                .await
-                .map_err(to_js)?;
-                fresh.bind_identity(&session.user_id).map_err(to_js)?;
-                worker = fresh;
-                existing = false;
-            }
-            Err(err) => return Err(to_js(err)),
-        }
-    }
     web_sys::console::log_1(
         &format!(
             "db worker: {} replica",

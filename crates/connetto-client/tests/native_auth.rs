@@ -1,4 +1,4 @@
-//! Phase 4 native acquisition test (Docker-free).
+//! Native acquisition (Docker-free).
 //!
 //! Serves connetto-server's auth router on a real loopback port with a
 //! permissive provider, then drives the full native flow: the authenticator
@@ -6,17 +6,61 @@
 //! provider round-trip and delivers the code to that listener, the authenticator
 //! exchanges the code with its PKCE verifier, stores the refresh token, and
 //! silently refreshes. No real browser, no live provider, no Postgres.
+//!
+//! It also proves the typed `user_id` boundary: a deployment whose id is a
+//! `rosetta_uuid::Uuid` gets that value back from the token endpoint as its own
+//! type, with no `Display` or `FromStr` anywhere on the path, and the replica
+//! file the client opens is named from it.
 
 #![cfg(feature = "native-auth")]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use connetto_client::{BrowserOpener, MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore};
-use connetto_server::{
-    AuthConfig, AuthService, InMemoryAuthStore, PermissiveProvider, ProviderRegistry,
-    RedirectPolicy, ResolvedIdentity, TokenAuthority, auth_router,
+use connetto_client::{
+    AcquiredSession, BrowserOpener, MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore,
+    replica_db_name,
 };
+use connetto_server::{
+    AuthConfig, AuthService, IdentityResolver, InMemoryAuthStore, PermissiveProvider,
+    ProviderRegistry, RedirectPolicy, ResolveFuture, ResolvedIdentity, TokenAuthority,
+    VerifiedClaims, auth_router,
+};
+use rosetta_uuid::Uuid;
+
+/// A fixed namespace for the deterministic `(issuer, subject)` to `Uuid`
+/// mapping, standing in for a deployment's own [`IdentityResolver`].
+const NS: uuid::Uuid = uuid::Uuid::from_u128(0x2b7e_1516_28ae_d2a6_abf7_1588_09cf_4f3c);
+
+/// The typed id the resolver below mints for `subject`.
+fn typed_id(subject: &str) -> Uuid {
+    uuid::Uuid::new_v5(&NS, format!("https://dev.example|{subject}").as_bytes()).into()
+}
+
+/// A deployment resolver mapping verified claims to its own typed id.
+struct TypedResolver;
+
+impl IdentityResolver for TypedResolver {
+    type Id = Uuid;
+
+    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
+        let id: Uuid = uuid::Uuid::new_v5(
+            &NS,
+            format!("{}|{}", claims.issuer, claims.subject).as_bytes(),
+        )
+        .into();
+        Box::pin(async move { Ok(id) })
+    }
+}
+
+/// The permissive provider `name` logs in as, resolving to its own subject so
+/// one server can mint two distinct identities.
+fn identity_named(subject: &str) -> ResolvedIdentity {
+    ResolvedIdentity {
+        subject: subject.to_owned(),
+        ..identity()
+    }
+}
 
 fn identity() -> ResolvedIdentity {
     ResolvedIdentity {
@@ -49,6 +93,46 @@ async fn spawn_auth_server() -> String {
         axum::serve(listener, router).await.expect("serve");
     });
     format!("http://127.0.0.1:{port}")
+}
+
+/// Serve an auth router whose store resolves identity to a typed
+/// `rosetta_uuid::Uuid`, with one permissive provider per identity so a single
+/// server can mint two distinct users.
+async fn spawn_typed_auth_server() -> String {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let store = Arc::new(InMemoryAuthStore::<Uuid>::with_resolver(
+        config.refresh_lifetimes(),
+        Arc::new(TypedResolver),
+    ));
+    let service = Arc::new(AuthService::new(authority, store));
+    let mut registry = ProviderRegistry::new();
+    for subject in ["alice", "bob"] {
+        registry.register(Arc::new(PermissiveProvider::new(
+            subject,
+            identity_named(subject),
+        )));
+    }
+    let router = auth_router(service, Arc::new(registry), RedirectPolicy::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind typed auth server");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Drive the full loopback login against `base` as the provider named
+/// `subject`, yielding the session with its typed id.
+async fn login_as(base: &str, subject: &str) -> AcquiredSession<Uuid> {
+    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
+    NativeAuthenticator::new(base.to_owned(), subject, store)
+        .with_browser_opener(fake_browser(base.to_owned()))
+        .login::<Uuid>()
+        .await
+        .expect("typed login")
 }
 
 /// A fake browser: given connetto's login URL, walk the provider round-trip the
@@ -113,7 +197,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
 
     // Interactive login over the loopback yields a session and stores a
     // refresh token.
-    let login = authenticator.login().await.expect("login");
+    let login = authenticator.login::<String>().await.expect("login");
     assert!(!login.access_token.is_empty(), "access token acquired");
     assert!(!login.user_id.is_empty(), "login carries a user_id");
     assert!(
@@ -123,7 +207,10 @@ async fn native_login_refreshes_and_silently_reacquires() {
     let first_refresh = store.load().expect("load").expect("refresh stored");
 
     // A silent refresh rotates the stored refresh token and keeps the identity.
-    let refreshed = authenticator.refresh_access().await.expect("refresh");
+    let refreshed = authenticator
+        .refresh_access::<String>()
+        .await
+        .expect("refresh");
     assert!(!refreshed.access_token.is_empty(), "refreshed access token");
     assert_eq!(refreshed.user_id, login.user_id, "identity is continuous");
     let second_refresh = store.load().expect("load").expect("refresh stored");
@@ -142,12 +229,42 @@ async fn native_login_refreshes_and_silently_reacquires() {
         Arc::new(|_url: &str| panic!("browser opened during silent reacquire"));
     let silent = NativeAuthenticator::new(base, "permissive", Arc::clone(&store))
         .with_browser_opener(panicking);
-    let session = silent.acquire().await.expect("silent acquire");
+    let session = silent.acquire::<String>().await.expect("silent acquire");
     assert!(
         !session.access_token.is_empty(),
         "silent acquire returns an access token"
     );
     assert_eq!(session.user_id, login.user_id, "same identity on reacquire");
+}
+
+/// A deployment whose `Id` is a typed uuid, not a string. The token endpoint
+/// serializes that id and the client deserializes it straight back into the
+/// same type, so nothing on the `user_id` path is text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_user_id_round_trips_and_names_the_replica() {
+    let base = spawn_typed_auth_server().await;
+
+    let alice = login_as(&base, "alice").await;
+    let bob = login_as(&base, "bob").await;
+
+    // The id arrives as the deployment's own type, carrying the exact value the
+    // resolver minted rather than a re-parsed rendering of it.
+    assert_eq!(alice.user_id, typed_id("alice"), "alice's typed id");
+    assert_eq!(bob.user_id, typed_id("bob"), "bob's typed id");
+    assert_ne!(alice.user_id, bob.user_id, "distinct identities");
+
+    // That typed id, not a Display rendering of it, names the replica file.
+    let alice_replica = replica_db_name("app.db", &alice.user_id).expect("alice replica");
+    let bob_replica = replica_db_name("app.db", &bob.user_id).expect("bob replica");
+    assert_ne!(
+        alice_replica, bob_replica,
+        "an account switch selects a different replica file",
+    );
+    assert_eq!(
+        alice_replica,
+        replica_db_name("app.db", &typed_id("alice")).expect("stable"),
+        "one identity always returns to the same replica",
+    );
 }
 
 #[test]

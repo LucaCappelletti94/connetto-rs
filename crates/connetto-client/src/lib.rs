@@ -56,6 +56,7 @@ pub mod auth;
 pub mod dsl;
 pub mod live;
 pub mod reconnect;
+pub mod replica;
 pub mod teardown;
 
 #[cfg(feature = "native-auth")]
@@ -71,6 +72,7 @@ pub use live::{
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
+pub use replica::replica_db_name;
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -116,17 +118,6 @@ pub enum ClientError {
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
-    /// The replica belongs to a different identity than the one presented. A
-    /// re-authentication that resolves to another `user_id` is an account
-    /// switch: the new identity gets a fresh replica rather than adopting this
-    /// one's data or uploading its pending mutations.
-    #[error("identity mismatch: replica owned by {stored}, presented {presented}")]
-    IdentityMismatch {
-        /// The `user_id` stamped on the replica at first bind.
-        stored: String,
-        /// The `user_id` presented on this bind.
-        presented: String,
-    },
 }
 
 /// The boxed future a token factory returns.
@@ -497,9 +488,7 @@ fn count_ops(changeset: &[u8]) -> u32 {
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
-    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL); \
-    CREATE TABLE IF NOT EXISTS _connetto_identity \
-    (id INTEGER PRIMARY KEY CHECK (id = 1), user_id TEXT NOT NULL)";
+    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL)";
 
 /// The attach name of the local tier database. An internal constant: authored
 /// SQL never names it, since bare table names resolve across attached
@@ -603,26 +592,6 @@ fn persist_pending(
 fn delete_pending(db: &mut SqliteConnection, seq: u64) -> Result<(), ClientError> {
     diesel::sql_query("DELETE FROM _connetto_pending WHERE seq = ?")
         .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
-        .execute(db)?;
-    Ok(())
-}
-
-/// The `user_id` this replica was stamped with, if any.
-fn load_identity(db: &mut SqliteConnection) -> Result<Option<String>, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct IdentityRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        user_id: String,
-    }
-    let rows: Vec<IdentityRow> =
-        diesel::sql_query("SELECT user_id FROM _connetto_identity WHERE id = 1").load(db)?;
-    Ok(rows.into_iter().next().map(|row| row.user_id))
-}
-
-/// Stamp this replica as belonging to `user_id`. Written once at first bind.
-fn stamp_identity(db: &mut SqliteConnection, user_id: &str) -> Result<(), ClientError> {
-    diesel::sql_query("INSERT INTO _connetto_identity (id, user_id) VALUES (1, ?)")
-        .bind::<diesel::sql_types::Text, _>(user_id)
         .execute(db)?;
     Ok(())
 }
@@ -1011,40 +980,6 @@ where
     #[must_use]
     pub const fn cursor(&self) -> Option<&Cursor> {
         self.last_cursor.as_ref()
-    }
-
-    /// Bind this replica to `user_id`, enforcing identity continuity.
-    ///
-    /// The first bind stamps the replica. A later bind with the same id is a
-    /// no-op resume. A bind with a different id is an account switch and
-    /// returns [`ClientError::IdentityMismatch`], so the caller purges this
-    /// replica and starts a fresh one for the new identity rather than
-    /// attributing one user's data or pending mutations to another. Call it
-    /// after learning the authenticated `user_id`, before connecting.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::IdentityMismatch`] when the replica is already owned by a
-    /// different identity, or [`ClientError::Db`] on a database failure.
-    pub fn bind_identity(&mut self, user_id: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session);
-        match load_identity(&mut self.db)? {
-            Some(stored) if stored == user_id => Ok(()),
-            Some(stored) => Err(ClientError::IdentityMismatch {
-                stored,
-                presented: user_id.to_owned(),
-            }),
-            None => stamp_identity(&mut self.db, user_id),
-        }
-    }
-
-    /// The `user_id` this replica is bound to, or `None` when unbound.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Db`] on a database failure.
-    pub fn identity(&mut self) -> Result<Option<String>, ClientError> {
-        load_identity(&mut self.db)
     }
 
     /// The sequence numbers of mutations captured locally but not yet

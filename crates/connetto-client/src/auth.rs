@@ -132,29 +132,32 @@ pub fn system_browser_opener() -> BrowserOpener {
 
 /// The token pair connetto-server returns from its token and refresh endpoints.
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
+struct TokenResponse<Id> {
     access_token: String,
     refresh_token: String,
-    user_id: String,
+    user_id: Id,
     session_expires_at: u64,
 }
 
 /// The outcome of an acquisition: the access token for the handshake plus the
-/// identity and session deadline the client needs to enforce identity
-/// continuity and to warn before an offline session lapses with unsynced data.
+/// identity and session deadline the client needs to select its replica file
+/// and to warn before an offline session lapses with unsynced data.
 #[derive(Debug, Clone)]
-pub struct AcquiredSession {
+pub struct AcquiredSession<Id> {
     /// connetto's short-lived access token, carried in `Handshake.auth_token`.
     pub access_token: String,
-    /// The `user_id` this session belongs to, for
-    /// [`bind_identity`](crate::ConnettoConnection::bind_identity).
-    pub user_id: String,
+    /// The typed `user_id` this session belongs to. It selects the replica
+    /// file through
+    /// [`replica_db_name`](crate::replica::replica_db_name), so a
+    /// re-authentication that resolves to a different identity opens a
+    /// different file instead of resuming onto this one's data.
+    pub user_id: Id,
     /// When the local session lapses if never refreshed again.
     pub session_expires_at: SystemTime,
 }
 
-impl From<TokenResponse> for AcquiredSession {
-    fn from(response: TokenResponse) -> Self {
+impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
+    fn from(response: TokenResponse<Id>) -> Self {
         Self {
             access_token: response.access_token,
             user_id: response.user_id,
@@ -202,10 +205,13 @@ impl NativeAuthenticator {
     /// Obtain an access token: silently refresh when a refresh token is stored,
     /// otherwise run the interactive loopback login.
     ///
+    /// `Id` is the deployment's typed user id, deserialized straight from the
+    /// token response. It never round-trips through text.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Auth`] if both refresh and login fail.
-    pub async fn acquire(&self) -> Result<AcquiredSession, ClientError> {
+    pub async fn acquire<Id: DeserializeOwned>(&self) -> Result<AcquiredSession<Id>, ClientError> {
         if self.store.load()?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
@@ -220,12 +226,14 @@ impl NativeAuthenticator {
     /// # Errors
     ///
     /// [`ClientError::Auth`] if no refresh token is stored or the refresh fails.
-    pub async fn refresh_access(&self) -> Result<AcquiredSession, ClientError> {
+    pub async fn refresh_access<Id: DeserializeOwned>(
+        &self,
+    ) -> Result<AcquiredSession<Id>, ClientError> {
         let refresh = self
             .store
             .load()?
             .ok_or_else(|| ClientError::Auth("no stored refresh token".to_owned()))?;
-        let response: TokenResponse = self
+        let response: TokenResponse<Id> = self
             .post_json(
                 &format!("{}/auth/refresh", self.server_base),
                 &serde_json::json!({ "refresh_token": refresh }),
@@ -242,7 +250,7 @@ impl NativeAuthenticator {
     /// # Errors
     ///
     /// [`ClientError::Auth`] on any loopback, browser, or exchange failure.
-    pub async fn login(&self) -> Result<AcquiredSession, ClientError> {
+    pub async fn login<Id: DeserializeOwned>(&self) -> Result<AcquiredSession<Id>, ClientError> {
         let verifier = random_token();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_token();
@@ -268,7 +276,7 @@ impl NativeAuthenticator {
         if returned_state != state {
             return Err(ClientError::Auth("loopback state mismatch".to_owned()));
         }
-        let response: TokenResponse = self
+        let response: TokenResponse<Id> = self
             .post_json(
                 &format!("{}/auth/token", self.server_base),
                 &serde_json::json!({ "code": code, "code_verifier": verifier }),
@@ -282,12 +290,22 @@ impl NativeAuthenticator {
     /// [`ConnettoConnection::with_token_source`](crate::ConnettoConnection::with_token_source).
     /// It only refreshes (never opens a browser), so a reconnect whose refresh
     /// token is gone surfaces an error rather than a surprise browser window.
+    ///
+    /// A resume needs only the access token, and the replica file was already
+    /// selected from the identity at acquisition, so the response's `user_id`
+    /// is discarded here rather than deserialized into a type this seam would
+    /// otherwise have to name.
     #[must_use]
     pub fn token_source(self: &Arc<Self>) -> AccessTokenSource {
         let authenticator = Arc::clone(self);
         AccessTokenSource::new(move || {
             let authenticator = Arc::clone(&authenticator);
-            async move { authenticator.refresh_access().await.map(|s| s.access_token) }
+            async move {
+                authenticator
+                    .refresh_access::<serde::de::IgnoredAny>()
+                    .await
+                    .map(|session| session.access_token)
+            }
         })
     }
 

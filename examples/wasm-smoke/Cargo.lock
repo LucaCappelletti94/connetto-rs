@@ -284,6 +284,7 @@ dependencies = [
  "diesel-sqlite-session",
  "serde",
  "serde_json",
+ "sha2",
  "sqlite-diff-rs",
  "sqlparser",
  "subql",
