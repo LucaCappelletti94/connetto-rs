@@ -256,7 +256,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "regex",
@@ -919,7 +919,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.11"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -957,7 +957,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#f6aba483a6a031c735a63639a7c13380b3b696ac"
+source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#6504251de04c0f647670d7ba2d7a8139d406d481"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -978,7 +978,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -991,7 +991,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "syn 2.0.119",
 ]
@@ -1355,7 +1355,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "darling 0.23.0",
  "either",
@@ -2535,15 +2535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2742,9 +2733,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
 dependencies = [
  "bindgen",
  "cc",
@@ -3203,7 +3194,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.12.1",
  "http 1.4.2",
- "itertools 0.10.5",
+ "itertools",
  "log",
  "oauth2",
  "p256",
@@ -4816,7 +4807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
