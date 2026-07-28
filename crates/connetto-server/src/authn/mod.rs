@@ -16,7 +16,6 @@ pub mod http;
 pub mod identity;
 pub mod provider;
 pub mod provider_oidc;
-#[cfg(feature = "pg-async")]
 pub mod schema;
 pub mod service;
 pub mod store;
@@ -37,7 +36,5 @@ pub use store::{
 };
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 
-#[cfg(feature = "pg-async")]
 pub use schema::{ConnettoStoreSchema, StoreColumn};
-#[cfg(feature = "pg-async")]
 pub use store::DbAuthStore;

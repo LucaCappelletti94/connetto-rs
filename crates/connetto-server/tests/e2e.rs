@@ -14,15 +14,12 @@
 //! and both binaries built in the same profile as the test. Run it with:
 //!
 //! ```text
-//! cargo build --release -p connetto-server --features pg-async --bin connetto-server
+//! cargo build --release -p connetto-server --bin connetto-server
 //! cargo build --release -p connetto-client --bin connetto-client
 //! DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-//!   cargo test --release -p connetto-server --features pg-async --test e2e -- --ignored
+//!   cargo test --release -p connetto-server --test e2e -- --ignored
 //! ```
 //!
-//! The whole file compiles only under the `pg-async` feature.
-
-#![cfg(feature = "pg-async")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

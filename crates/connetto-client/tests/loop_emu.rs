@@ -24,8 +24,9 @@ use connetto_client::{
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    Snapshot, SnapshotSource, SqliteWriteTarget, WebSocketTransport, sqlite_write_target,
+    Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -221,39 +222,79 @@ impl SnapshotSource for GadgetSeed {
     }
 }
 
-fn gadgets_write_target() -> SqliteWriteTarget {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(GADGETS_SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create gadgets");
-    sqlite_write_target(conn)
+fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget {
+    pg_write_target(fixture.admin().clone(), GADGETS_PG_DDL).expect("build write target")
 }
 
-fn server_write_target() -> SqliteWriteTarget {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    sqlite_write_target(conn)
+fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget {
+    pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target")
 }
 
-/// A SQLite write target seeded with one `orders` row at `status`, standing in
+/// A Postgres write target seeded with one `orders` row at `status`, standing in
 /// for a server whose version already moved past the client's snapshot basis.
-fn seeded_orders_target(status: &str) -> SqliteWriteTarget {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    diesel::insert_into(orders::table)
-        .values((
-            orders::id.eq(1_i64),
-            orders::price.eq(1.0_f64),
-            orders::quantity.eq(3_i64),
-            orders::status.eq(status),
-        ))
-        .execute(&mut conn)
-        .expect("seed order");
-    sqlite_write_target(conn)
+async fn seeded_orders_target(fixture: &Fixture, status: &str) -> connetto_server::PgWriteTarget {
+    reset_orders(fixture).await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel_async::RunQueryDsl::execute(
+        diesel::insert_into(pg_orders::orders::table).values((
+            pg_orders::orders::id.eq(1_i32),
+            pg_orders::orders::price.eq(1.0_f64),
+            pg_orders::orders::quantity.eq(3_i32),
+            pg_orders::orders::status.eq(status),
+        )),
+        &mut *conn,
+    )
+    .await
+    .expect("seed order");
+    pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target")
+}
+
+// The server write target schema (Postgres): INT maps to Integer (i32),
+// narrower than the client replica's BigInt.
+mod pg_orders {
+    diesel::table! {
+        orders (id) {
+            id -> diesel::sql_types::Integer,
+            price -> diesel::sql_types::Double,
+            quantity -> diesel::sql_types::Integer,
+            status -> diesel::sql_types::Text,
+        }
+    }
+}
+
+/// Reset the fixture to a fresh `orders` table with the watermark provisioned.
+async fn reset_orders(fixture: &Fixture) {
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS orders CASCADE",
+            "DROP TABLE IF EXISTS _connetto_mutations",
+            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
+        ])
+        .await;
+    connetto_server::provision_watermark_table(fixture.admin())
+        .await
+        .expect("provision watermark table");
+}
+
+/// The server target's orders, read as admin, mapped to the client `Order`.
+async fn server_orders(fixture: &Fixture) -> Vec<Order> {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let query = pg_orders::orders::table
+        .order(pg_orders::orders::id)
+        .select((
+            pg_orders::orders::id,
+            pg_orders::orders::price,
+            pg_orders::orders::quantity,
+            pg_orders::orders::status,
+        ));
+    let rows: Vec<(i32, f64, i32, String)> = diesel_async::RunQueryDsl::load(query, &mut *conn)
+        .await
+        .expect("read server orders");
+    rows.into_iter()
+        .map(|(id, price, quantity, status)| {
+            order(i64::from(id), price, i64::from(quantity), &status)
+        })
+        .collect()
 }
 
 /// Pump the client until it observes an event matching `pred`, applying every
@@ -276,17 +317,19 @@ async fn pump_until(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
     // Server: orders is writable so client mutations apply; snapshot seeds one row.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let target = server_write_target();
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        target.clone(),
+        server_write_target(&fixture),
         SessionConfig::default(),
     );
 
@@ -370,14 +413,11 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     .await;
 
     // The uploaded write landed on the server's write target.
-    {
-        let mut conn = target.lock();
-        assert_eq!(
-            orders(&mut conn),
-            vec![order(9, 2.0, 1, "local")],
-            "the client's local write was uploaded and applied on the server",
-        );
-    }
+    assert_eq!(
+        server_orders(&fixture).await,
+        vec![order(9, 2.0, 1, "local")],
+        "the client's local write was uploaded and applied on the server",
+    );
     // And it is present locally too.
     assert_eq!(
         orders(client.conn()),
@@ -415,18 +455,20 @@ async fn step_until(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn connection_autosubmits_writes_and_reports_changed_tables() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
     // Same wiring as the primary test: orders is writable, the snapshot seeds one
     // row.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let target = server_write_target();
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        target.clone(),
+        server_write_target(&fixture),
         SessionConfig::default(),
     );
 
@@ -516,14 +558,11 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     .await;
 
     // The local write reached the server's write target without a push() call.
-    {
-        let mut conn = target.lock();
-        assert_eq!(
-            orders(&mut conn),
-            vec![order(9, 2.0, 1, "local")],
-            "the local write auto-submitted through next_event",
-        );
-    }
+    assert_eq!(
+        server_orders(&fixture).await,
+        vec![order(9, 2.0, 1, "local")],
+        "the local write auto-submitted through next_event",
+    );
     assert_eq!(
         orders(client.conn()),
         vec![
@@ -539,18 +578,20 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn connection_is_a_diesel_connection() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
     // orders is writable so the client mutation applies. No subscription is
     // needed: this exercises the diesel Connection impl and auto-submit.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let target = server_write_target();
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        target.clone(),
+        server_write_target(&fixture),
         SessionConfig::default(),
     );
 
@@ -622,25 +663,24 @@ async fn connection_is_a_diesel_connection() {
     .await;
 
     // The write reached the server's write target through the diesel connection.
-    {
-        let mut conn = target.lock();
-        assert_eq!(
-            orders(&mut conn),
-            vec![order(15, 3.5, 2, "typed")],
-            "the typed write auto-submitted to the server",
-        );
-    }
+    assert_eq!(
+        server_orders(&fixture).await,
+        vec![order(15, 3.5, 2, "typed")],
+        "the typed write auto-submitted to the server",
+    );
 
     client.close().await.expect("close");
     server.await.expect("join server");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rejected_write_rolls_back_locally() {
+    let fixture = Fixture::acquire().await;
     // A materializer with no writable tables rejects every client mutation, so
     // the optimistic local write must be undone when the reject arrives.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -735,7 +775,9 @@ async fn rejected_write_rolls_back_locally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn conflicting_write_rolls_back_and_reports_keys() {
+    let fixture = Fixture::acquire().await;
     // orders.status is the declared version column. The snapshot seeds the
     // client at status "seed", but the server row already moved to "server", so
     // the client's update carries a stale basis and the server reports a
@@ -745,7 +787,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         .build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let target = seeded_orders_target("server");
+    let target = seeded_orders_target(&fixture, "server").await;
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -856,7 +898,9 @@ async fn connect_client(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn conflicting_write_converges_to_server_after_rollback() {
+    let fixture = Fixture::acquire().await;
     // Two clients share one server. Client B lands an update that moves the
     // server row past client A's basis, so A's stale update conflicts and rolls
     // back. The concurrent change then arrives on the sync stream as a live
@@ -866,7 +910,7 @@ async fn conflicting_write_converges_to_server_after_rollback() {
         .build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let target = seeded_orders_target("seed");
+    let target = seeded_orders_target(&fixture, "seed").await;
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -1107,7 +1151,9 @@ fn aggregate_result(event: ClientEvent) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
+    let fixture = Fixture::acquire().await;
     // The client subscribes to MIN(quantity). The server bootstraps the value
     // through the connector, folds a lower insert in-process, and re-executes
     // through the connector when the current extreme is deleted. Each value
@@ -1115,7 +1161,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Bootstrap answers 3; the re-execution after the delete answers 9.
     let connector = QueuedConnector::new([3, 9]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1193,11 +1239,13 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn unsupported_subscription_is_rejected_without_closing() {
+    let fixture = Fixture::acquire().await;
     // A query subql cannot register (a grouped aggregate) is refused at
     // registration and surfaces as a NonFatal event, not a dropped connection.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -1294,7 +1342,9 @@ async fn collect_aggregates(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
+    let fixture = Fixture::acquire().await;
     // The client subscribes to COUNT(*), SUM(quantity), and AVG(quantity) at
     // once. The server seeds each through the connector's multi-column row path,
     // then folds every CDC insert and delete in-process (no connector
@@ -1307,7 +1357,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         vec![PgValue::Null],
         vec![PgValue::Null, PgValue::Int(0)],
     ]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1392,13 +1442,15 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn aggregate_on_rls_table_is_rejected_without_closing() {
     // subql rejects an aggregator on an RLS-protected table at registration.
     // connetto surfaces that as a NonFatal event, leaving the session intact.
     const RLS_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, \
          status TEXT); ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(RLS_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -1454,14 +1506,16 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
+    let fixture = Fixture::acquire().await;
     // A valid COUNT(*) registers as a delta aggregate, but this manager has no
     // connector able to run the multi-column seed (NoConnector's
     // execute_scalar_row is the trait default that rejects every seed). The
     // failed bootstrap unregisters the subscription and surfaces as a NonFatal
     // event, leaving the session intact.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -1513,14 +1567,16 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn row_subscription_and_delta_aggregate_coexist() {
+    let fixture = Fixture::acquire().await;
     // One client holds a row subscription and a COUNT(*) delta aggregate on the
     // same table. A single insert must fan out on both paths at once: a row
     // LivePatch to the row route and a folded AggregateUpdate to the delta
     // route. The two delivery paths are independent in one dispatch.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1610,12 +1666,14 @@ async fn row_subscription_and_delta_aggregate_coexist() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn unsubscribing_a_delta_aggregate_stops_updates() {
+    let fixture = Fixture::acquire().await;
     // After an Unsubscribe, the server drops the accumulator and the route, so a
     // further CDC event produces no aggregate update for that consumer.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1712,12 +1770,14 @@ async fn wait_broadcast(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
+    let fixture = Fixture::acquire().await;
     // The full live-query loop: a typed diesel query becomes a LiveQuery whose
     // rows refresh as the snapshot and CDC patches land, and dropping the
     // handle tears the server subscription down.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
@@ -1826,7 +1886,9 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_value_tracks_a_server_aggregate() {
+    let fixture = Fixture::acquire().await;
     // A typed aggregate query becomes a LiveValue fed exclusively by server
     // pushes: the replica's subset must never answer it. The bootstrap comes
     // through the connector seed, CDC folds arrive as AggregateUpdate, and
@@ -1835,7 +1897,7 @@ async fn live_value_tracks_a_server_aggregate() {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // COUNT(*) seed over the backend at subscribe time: 1 (the snapshot row).
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1943,6 +2005,7 @@ async fn live_value_tracks_a_server_aggregate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_value_decodes_a_temporal_aggregate() {
     // A typed live() over MAX of a TIMESTAMP column. subql re-executes MIN/MAX
     // on any orderable type, so a scalar outside the old numeric and text
@@ -1951,13 +2014,14 @@ async fn live_value_decodes_a_temporal_aggregate() {
     // Option<String>, proving the new type resolves through the real server on
     // both the bootstrap and a later CDC-driven push.
     const METRICS_PG_DDL: &str = "CREATE TABLE metrics (id INT PRIMARY KEY, seen TIMESTAMP);";
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(METRICS_PG_DDL).expect("build materializer");
     let seen = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
         .expect("valid date")
         .and_hms_opt(3, 4, 5)
         .expect("valid time");
     let connector = QueuedConnector::with_scalars([PgValue::Timestamp(seen)]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -2030,13 +2094,15 @@ async fn live_value_decodes_a_temporal_aggregate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn identical_row_watches_share_one_subscription() {
+    let fixture = Fixture::acquire().await;
     // Two components rendering the same query must collapse to ONE wire
     // subscription. The recording snapshot source counts how many subscribes
     // reached the server, and both handles must follow a CDC patch, survive
     // one drop, and unsubscribe only when the last sharer is gone.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let manager = SessionManager::new(
         materializer,
@@ -2175,11 +2241,13 @@ async fn identical_row_watches_share_one_subscription() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn distinct_row_queries_do_not_collapse() {
+    let fixture = Fixture::acquire().await;
     // Dedup must key on the query: two different predicates each open their own
     // wire subscription, so the recorder sees two distinct select_sql.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let manager = SessionManager::new(
         materializer,
@@ -2250,14 +2318,16 @@ async fn distinct_row_queries_do_not_collapse() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cache() {
+    let fixture = Fixture::acquire().await;
     // Two identical aggregate watches share one wire sub. The connector holds
     // exactly one bootstrap seed, so a second independent subscribe would
     // starve it: the late joiner instead resolves immediately from the cached
     // last value, and both handles fold a CDC update.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -2385,7 +2455,9 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_drives_a_boxed_row_query() {
+    let fixture = Fixture::acquire().await;
     // The load-bearing case for watch_fn: a boxed (.into_boxed()) row query is
     // not Clone, so plain watch cannot re-run it. Its row type carries a
     // strongly typed `rosetta_uuid::Uuid` key and a `bool` flag, not raw bytes,
@@ -2407,7 +2479,7 @@ async fn watch_fn_drives_a_boxed_row_query() {
         materializer,
         seed,
         PermissiveAuth,
-        gadgets_write_target(),
+        gadgets_write_target(&fixture),
         SessionConfig::default(),
     );
 
@@ -2505,12 +2577,14 @@ async fn watch_fn_drives_a_boxed_row_query() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_shares_a_subscription_with_watch() {
+    let fixture = Fixture::acquire().await;
     // A boxed watch_fn and a typed live() watch that render the same spec
     // collapse onto one wire subscription through the shared attach_wire layer,
     // so the recorder sees exactly one subscribe.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let manager = SessionManager::new(
         materializer,
@@ -2586,11 +2660,13 @@ async fn watch_fn_shares_a_subscription_with_watch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_rejects_an_aggregate_query() {
+    let fixture = Fixture::acquire().await;
     // watch_fn drives rows. A boxed aggregate shape is refused with the
     // row-vs-value error, before any subscription is registered.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = server_write_target();
+    let target = server_write_target(&fixture);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,

@@ -1,0 +1,45 @@
+[package]
+name = "connetto-test-harness"
+description = "In-process CDC-loop test harness driving the real Postgres write and read paths for connetto-rs integration tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-core = { workspace = true, features = ["native-transport"] }
+# The harness exercises the real Postgres write and read paths, which
+# connetto-server now compiles unconditionally.
+connetto-server = { path = "../connetto-server" }
+# The CDC replication source, the async re-execution connector, and the catalog
+# parser used to build both. pg-streaming brings PgStreamingCdcSource and
+# PgStreamingConfig, executor-diesel-async-postgres brings PgAsyncDieselConnector.
+subql = { workspace = true, features = [
+    "pg-streaming",
+    "executor-diesel-async-postgres",
+] }
+tokio.workspace = true
+# The admin and role pools that reset the fixture and back the write, snapshot,
+# and connector paths.
+diesel = { workspace = true, features = ["postgres_backend"] }
+diesel-async = { version = "0.7", default-features = false, features = [
+    "postgres",
+    "bb8",
+] }
+# Building the mutation changeset a client uploads.
+sqlite-diff-rs = { version = "0.9.0", default-features = false }
+# Compressing the uploaded changeset, matching the wire format.
+zstd = "0.13"
+# Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
+sqlparser = { version = "0.62", default-features = false }
+
+[dev-dependencies]
+# The smoke test reads a table back through the admin pool with a typed row.
+diesel = { workspace = true, features = ["postgres_backend"] }

@@ -19,10 +19,10 @@ use connetto_client::{
 use connetto_core::Cursor;
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, sqlite_write_target,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
-use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::{CdcSource, PgSqliteEmuSource};
 use tokio::sync::Mutex;
@@ -75,6 +75,19 @@ diesel::table! {
     }
 }
 
+// The server write target schema (Postgres): INT maps to Integer (i32),
+// narrower than the replica's BigInt.
+mod pg_readback {
+    diesel::table! {
+        orders (id) {
+            id -> diesel::sql_types::Integer,
+            price -> diesel::sql_types::Nullable<diesel::sql_types::Double>,
+            quantity -> diesel::sql_types::Nullable<diesel::sql_types::Integer>,
+            status -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        }
+    }
+}
+
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -87,13 +100,31 @@ struct Order {
 
 type Manager = SessionManager<SeedSnapshot, PermissiveAuth>;
 
-/// A sqlite connection with the replica schema applied.
-fn replica_conn(path: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(path).expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    conn
+/// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
+type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
+
+/// Rows in the Postgres write target matching `id`, read as admin.
+async fn target_rows(fixture: &Fixture, id: i64) -> Vec<Order> {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let query = pg_readback::orders::table
+        .filter(pg_readback::orders::id.eq(i32::try_from(id).expect("id fits i32")))
+        .select((
+            pg_readback::orders::id,
+            pg_readback::orders::price,
+            pg_readback::orders::quantity,
+            pg_readback::orders::status,
+        ));
+    let rows: Vec<PgOrderRow> = diesel_async::RunQueryDsl::load(query, &mut *conn)
+        .await
+        .expect("read target");
+    rows.into_iter()
+        .map(|(id, price, quantity, status)| Order {
+            id: i64::from(id),
+            price,
+            quantity: quantity.map(i64::from),
+            status,
+        })
+        .collect()
 }
 
 /// Execute `sql` against the emulated backend and route every resulting CDC
@@ -180,13 +211,15 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(replica_conn(":memory:")),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -271,14 +304,22 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn offline_write_reflushes_after_resume() {
-    let target_file = tempfile::NamedTempFile::new().expect("target file");
-    let target_path = target_file
-        .path()
-        .to_str()
-        .expect("utf8 temp path")
-        .to_owned();
+    let fixture = Fixture::acquire().await;
 
+    // Create the server write target schema and provision the watermark so
+    // the write target can record applied sequence numbers.
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS orders CASCADE",
+            "DROP TABLE IF EXISTS _connetto_mutations",
+            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
+        ])
+        .await;
+    connetto_server::provision_watermark_table(fixture.admin())
+        .await
+        .expect("provision watermark table");
     // Writes need an explicitly writable table: a default materializer
     // rejects every client mutation.
     let materializer = Materializer::with_write_catalog(
@@ -290,7 +331,7 @@ async fn offline_write_reflushes_after_resume() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(replica_conn(&target_path)),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let slot: ServeSlot = Arc::new(Mutex::new(None));
@@ -339,14 +380,9 @@ async fn offline_write_reflushes_after_resume() {
     offline.store(false, Ordering::Relaxed);
 
     // After the resume the forced flush re-uploads the captured write, and
-    // the server applies it to its write target.
-    let mut verify = SqliteConnection::establish(&target_path).expect("open target");
+    // the server applies it to its Postgres write target.
     loop {
-        let rows: Vec<Order> = orders::table
-            .filter(orders::id.eq(30_i64))
-            .load(&mut verify)
-            .expect("read target");
-        if !rows.is_empty() {
+        if !target_rows(&fixture, 30).await.is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -365,7 +401,9 @@ async fn offline_write_reflushes_after_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
+    let fixture = Fixture::acquire().await;
     let replica_file = tempfile::NamedTempFile::new().expect("replica file");
     let replica_path = replica_file
         .path()
@@ -378,7 +416,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(replica_conn(":memory:")),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

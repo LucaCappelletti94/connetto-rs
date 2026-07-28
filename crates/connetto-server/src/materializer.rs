@@ -33,9 +33,8 @@ use connetto_core::MutationOp;
 use connetto_core::messages::{BindValue, MutationPatch};
 use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
-use diesel::sql_types::{BigInt, Binary, Double, Integer, Nullable, Text};
-use diesel::sqlite::Sqlite;
-use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, sql_query};
+use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
+use diesel::{QueryableByName, SqliteConnection, sql_query};
 use pg2sqlite::options::Pg2SqliteOptions;
 use pg2sqlite::prelude::ReverseTranslator;
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, SchemaWithPK, TableSchema, Value};
@@ -53,9 +52,7 @@ use subql::{
 
 use crate::oplog::ChangeRecord;
 
-#[cfg(feature = "pg-async")]
 use diesel_async::AsyncPgConnection;
-#[cfg(feature = "pg-async")]
 use subql::patchset::PgAdapter;
 
 /// The wire `Value` flavor a parsed upload carries: owned text and blobs.
@@ -234,8 +231,6 @@ pub(crate) struct PlannedConflict {
     pub pk_columns: Vec<String>,
     /// Primary-key values matching `pk_columns`.
     pub pk_values: Vec<WireValue>,
-    /// Every column of the table, for serializing the current row to JSON.
-    pub columns: Vec<String>,
 }
 
 /// The parsed, schema-resolved ops of one mutation upload.
@@ -926,11 +921,6 @@ where
             .into_iter()
             .map(|idx| column_name_at(db, table_id, idx))
             .collect::<Result<Vec<_>, _>>()?;
-        let arity = catalog_helpers::table_arity(db, table_id)
-            .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
-        let columns = (0..arity)
-            .map(|idx| column_name_at(db, table_id, idx))
-            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Some(PlannedConflict {
             table: table.to_owned(),
@@ -938,7 +928,6 @@ where
             basis,
             pk_columns,
             pk_values: pk_values.to_vec(),
-            columns,
         }))
     }
 
@@ -992,7 +981,6 @@ where
     ///
     /// [`MaterializerError::Compression`] when the payload does not decompress,
     /// [`MaterializerError::Apply`] when the diffset fails to parse or apply.
-    #[cfg(feature = "pg-async")]
     pub async fn apply_mutation_async(
         &self,
         patch: &MutationPatch,
@@ -1012,7 +1000,6 @@ where
     ///
     /// [`MaterializerError::Compression`] when the payload does not decompress,
     /// [`MaterializerError::Apply`] when the diffset fails to parse or apply.
-    #[cfg(feature = "pg-async")]
     pub async fn apply_diffset_async(
         &self,
         payload_zstd: &[u8],
@@ -1061,101 +1048,20 @@ pub(crate) fn agg_value_to_json(value: AggValue) -> String {
     json.to_string()
 }
 
-/// Probe one op for a stale-version conflict against a SQLite target.
-///
-/// Runs `WHERE <pk> AND <version> = <basis>`: a matching row means the client's
-/// basis is current, so the write is safe. Otherwise the row is stale or gone,
-/// and the current row (when it still exists) is read back for the reply.
-///
-/// # Errors
-///
-/// [`MaterializerError::Apply`] on a query failure, [`MaterializerError::Parse`]
-/// when the read-back row is not valid JSON.
-pub(crate) fn probe_conflict_sqlite(
-    conflict: &PlannedConflict,
-    conn: &mut SqliteConnection,
-) -> Result<ConflictProbe, MaterializerError> {
-    let mut predicate: Vec<String> = conflict
-        .pk_columns
-        .iter()
-        .map(|col| format!("{} = ?", quote_ident(col)))
-        .collect();
-    predicate.push(format!("{} = ?", quote_ident(&conflict.version_column)));
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
-        quote_ident(&conflict.table),
-        predicate.join(" AND "),
-    );
-    let mut query = sql_query(sql).into_boxed::<Sqlite>();
-    for value in &conflict.pk_values {
-        query = bind_value(query, value);
-    }
-    query = bind_value(query, &conflict.basis);
-    let present: Present = query.get_result(conn)?;
-    if present.present != 0 {
-        return Ok(ConflictProbe::Clear);
-    }
-    Ok(ConflictProbe::Stale(read_current_row(conflict, conn)?))
-}
-
-/// Read the current row for a conflict reply, serialized to a JSON object.
-fn read_current_row(
-    conflict: &PlannedConflict,
-    conn: &mut SqliteConnection,
-) -> Result<Option<ServerRow>, MaterializerError> {
-    let json_args: Vec<String> = conflict
-        .columns
-        .iter()
-        .map(|col| format!("{}, {}", quote_str_literal(col), quote_ident(col)))
-        .collect();
-    let predicate: Vec<String> = conflict
-        .pk_columns
-        .iter()
-        .map(|col| format!("{} = ?", quote_ident(col)))
-        .collect();
-    let sql = format!(
-        "SELECT json_object({}) AS row_json FROM {} WHERE {} LIMIT 1",
-        json_args.join(", "),
-        quote_ident(&conflict.table),
-        predicate.join(" AND "),
-    );
-    let mut query = sql_query(sql).into_boxed::<Sqlite>();
-    for value in &conflict.pk_values {
-        query = bind_value(query, value);
-    }
-    let rows: Vec<RowJson> = query.load(conn)?;
-    let Some(row) = rows.into_iter().next() else {
-        return Ok(None);
-    };
-    let json: serde_json::Value = serde_json::from_str(&row.row_json)
-        .map_err(|err| MaterializerError::Parse(format!("{err}")))?;
-    let version = json
-        .get(&conflict.version_column)
-        .map(json_scalar_to_string)
-        .unwrap_or_default();
-    Ok(Some(ServerRow {
-        version,
-        row_json: row.row_json,
-    }))
-}
-
 /// `SELECT EXISTS(...)` row from Postgres, which yields a boolean.
-#[cfg(feature = "pg-async")]
 #[derive(QueryableByName)]
 struct PresentBool {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     present: bool,
 }
 
-/// Probe one op for a stale-version conflict against a Postgres target, the
-/// async peer of [`probe_conflict_sqlite`]. The read runs under whatever RLS
-/// context the caller has set on `conn`.
+/// Probe one op for a stale-version conflict against a Postgres target. The
+/// read runs under whatever RLS context the caller has set on `conn`.
 ///
 /// # Errors
 ///
 /// [`MaterializerError::Apply`] on a query failure, [`MaterializerError::Parse`]
 /// when the read-back row is not valid JSON.
-#[cfg(feature = "pg-async")]
 pub(crate) async fn probe_conflict_pg(
     conflict: &PlannedConflict,
     conn: &mut AsyncPgConnection,
@@ -1191,7 +1097,6 @@ pub(crate) async fn probe_conflict_pg(
 }
 
 /// Read the current row for a conflict reply from Postgres, as a JSON object.
-#[cfg(feature = "pg-async")]
 async fn read_current_row_pg(
     conflict: &PlannedConflict,
     conn: &mut AsyncPgConnection,
@@ -1228,7 +1133,6 @@ async fn read_current_row_pg(
 }
 
 /// Bind one wire value with the Postgres SQL type matching its variant.
-#[cfg(feature = "pg-async")]
 fn bind_value_pg<'a>(
     query: BoxedSqlQuery<'a, diesel::pg::Pg, SqlQuery>,
     value: &WireValue,
@@ -1242,32 +1146,11 @@ fn bind_value_pg<'a>(
     }
 }
 
-/// `SELECT EXISTS(...)` row.
-#[derive(QueryableByName)]
-struct Present {
-    #[diesel(sql_type = Integer)]
-    present: i32,
-}
-
 /// `SELECT json_object(...)` row.
 #[derive(QueryableByName)]
 struct RowJson {
     #[diesel(sql_type = Text)]
     row_json: String,
-}
-
-/// Bind one wire value with the diesel SQL type matching its variant.
-fn bind_value<'a>(
-    query: BoxedSqlQuery<'a, Sqlite, SqlQuery>,
-    value: &WireValue,
-) -> BoxedSqlQuery<'a, Sqlite, SqlQuery> {
-    match value {
-        Value::Integer(int) => query.bind::<BigInt, _>(*int),
-        Value::Real(real) => query.bind::<Double, _>(*real),
-        Value::Text(text) => query.bind::<Text, _>(text.clone()),
-        Value::Blob(blob) => query.bind::<Binary, _>(blob.clone()),
-        Value::Null => query.bind::<Nullable<Text>, _>(None::<String>),
-    }
 }
 
 /// Render a JSON scalar as the text the wire form expects.
@@ -1294,11 +1177,6 @@ fn column_name_at<DB: DatabaseLike>(
 /// Quote a SQL identifier, doubling embedded quotes.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Quote a SQL string literal, doubling embedded quotes.
-fn quote_str_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// Zstd-compress a raw bulk payload at the materializer's standard level.

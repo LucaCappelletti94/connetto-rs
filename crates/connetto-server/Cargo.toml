@@ -17,27 +17,10 @@ workspace = true
 [[bin]]
 name = "connetto-server"
 path = "src/bin/connetto-server.rs"
-required-features = ["pg-async"]
-
-[features]
-# Real-Postgres paths: subql's diesel-async apply and the async re-exec
-# connector, both over a bb8-pooled AsyncPgConnection. Off by default because
-# only Docker-gated tests exercise them.
-pg-async = [
-    "dep:diesel-async",
-    "diesel-async/postgres",
-    "diesel-async/bb8",
-    "diesel/postgres_backend",
-    "diesel/serde_json",
-    "diesel/uuid",
-    "subql/apply-patchset-postgres-async",
-    "subql/executor-diesel-async-postgres",
-    "subql/pg-streaming",
-]
 
 [dependencies]
 connetto-core = { workspace = true, features = ["native-transport"] }
-subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit"] }
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming"] }
 # Reverse translation of the client's SQLite-dialect subscription query into the
 # Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).
 # Pinned to the reference-closed FK validation merge (PR #46), which sits on
@@ -45,7 +28,7 @@ subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-pa
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
 tokio.workspace = true
 thiserror.workspace = true
-diesel.workspace = true
+diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid"] }
 # Naming the Postgres dialect when building subql's catalog and engine, and the
 # visitor pass that substitutes subscription bind placeholders in the parsed
 # statement. Version and rev follow subql via the root [patch] blocks.
@@ -63,11 +46,12 @@ sqlite-diff-rs = { version = "0.9.0", default-features = false }
 serde_json = "1"
 # Synchronous lock guarding the SQLite write target (never held across .await).
 parking_lot = "0.12"
-# Async Postgres write path (feature pg-async). tokio-postgres backed, no libpq.
-diesel-async = { version = "0.7", default-features = false, optional = true }
+# Async Postgres write path: the diesel-async apply and re-exec connector over a
+# bb8-pooled AsyncPgConnection. tokio-postgres backed, no libpq.
+diesel-async = { version = "0.7", default-features = false, features = ["postgres", "bb8"] }
 # Canonical primary-key codec: serialize the pk as Vec<subql Value<Postgres>>.
 rmp-serde.workspace = true
-# Binary error handling (connetto-server bin, behind pg-async via required-features).
+# Binary error handling (connetto-server bin).
 anyhow.workspace = true
 # Authentication (docs/architecture/11-authentication.md). connetto mints and
 # verifies its own asymmetrically signed session access token with jsonwebtoken
@@ -113,3 +97,7 @@ tempfile = "3"
 # The demo distributed id type, driving the generic in-memory auth store over a
 # typed user id (not a string) in authn_generic_id.rs.
 rosetta-uuid = { version = "0.1.3", features = ["serde"] }
+# The in-process CDC-loop test harness over real Postgres. It depends on this
+# crate, so the harness-backed tests are Docker-gated (a dev-dependency cycle
+# Cargo permits).
+connetto-test-harness = { path = "../connetto-test-harness" }

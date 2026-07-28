@@ -5,16 +5,13 @@
 //! `#[ignore]` by default because it needs a running Postgres. Point
 //! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
-//! The whole file compiles only under the `pg-async` feature.
-
-#![cfg(feature = "pg-async")]
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, sqlite_write_target,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
@@ -324,9 +321,9 @@ async fn async_pg_reexec_bootstraps_min() {
             .expect("seed rows");
     }
 
-    let connector = PgAsyncDieselConnector::new(pool);
+    let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::new(AGGS_PG_DDL).expect("build materializer");
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(pool, AGGS_PG_DDL).expect("build write target");
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,
@@ -514,11 +511,15 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
             .expect("seed rows");
     }
 
-    let connector = PgAsyncDieselConnector::new(pool);
+    let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer =
         Materializer::new("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
             .expect("build materializer");
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(
+        pool,
+        "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
+    )
+    .expect("build write target");
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,

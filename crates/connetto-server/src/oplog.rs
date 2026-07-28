@@ -8,8 +8,8 @@
 //!
 //! [`Oplog`] is the seam, shaped like
 //! [`SnapshotSource`](crate::session::SnapshotSource): an async, `Send + Sync`
-//! trait. [`InMemoryOplog`] is the ring-buffer test double; [`PgOplog`] (behind
-//! the `pg-async` feature) is the production target, a Postgres table so every
+//! trait. [`InMemoryOplog`] is the ring-buffer test double. [`PgOplog`] is the
+//! production target, a Postgres table so every
 //! node in the mesh sees the same log (`06-reconnect.md` line 163).
 //!
 //! # Pruning policy
@@ -355,10 +355,8 @@ impl Oplog for InMemoryOplog {
     }
 }
 
-#[cfg(feature = "pg-async")]
 pub use pg::{PgOplog, PgOplogError};
 
-#[cfg(feature = "pg-async")]
 mod pg {
     use diesel::sql_types::{BigInt, Binary, Bool, Text};
     use diesel::{QueryableByName, sql_query};

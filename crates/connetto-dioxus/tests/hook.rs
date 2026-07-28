@@ -12,9 +12,9 @@ use connetto_core::Cursor;
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, sqlite_write_target,
+    WebSocketTransport, pg_write_target,
 };
-use diesel::SqliteConnection;
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -211,13 +211,15 @@ async fn render_until(vdom: &mut VirtualDom, pred: impl Fn(&str) -> bool) -> Str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn use_live_renders_and_follows_cdc() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = SeedRows {
         // COUNT(*) seed over the empty backend.
         rows: StdMutex::new(vec![vec![PgValue::Int(0)]]),
     };
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         EmptySnapshot,
@@ -288,9 +290,11 @@ async fn use_live_renders_and_follows_cdc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn use_live_fn_follows_a_boxed_row_query() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::new(
         materializer,
         SeedOneOrder,

@@ -40,10 +40,8 @@ impl AuthPolicy for PermissiveAuth {
     }
 }
 
-#[cfg(feature = "pg-async")]
 pub use rls::{RlsAuth, RlsAuthError};
 
-#[cfg(feature = "pg-async")]
 mod rls {
     use connetto_core::auth::AuthContext;
     use connetto_core::traits::{AuthPolicy, MutationOp};

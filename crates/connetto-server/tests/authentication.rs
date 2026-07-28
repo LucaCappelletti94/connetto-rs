@@ -21,13 +21,11 @@ use connetto_core::{
 };
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionError, SessionManager, Snapshot,
-    SnapshotSource, loopback, sqlite_write_target,
+    SnapshotSource, loopback, pg_write_target,
 };
-use diesel::prelude::*;
-use diesel::sql_query;
+use connetto_test_harness::Fixture;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
-const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);";
 
 /// Records the identity the session presents to the snapshot read, so a test
 /// can inspect the [`AuthContext`] the verifier resolved. Returns no rows.
@@ -81,15 +79,6 @@ impl SessionVerifier for AlwaysReject {
     }
 }
 
-fn client_replica() -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    // Migration-style DDL, which the typed DSL does not express.
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    conn
-}
-
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
         Some(IncomingFrame::Control(msg)) => msg,
@@ -98,14 +87,16 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn absent_credential_is_rejected_with_authentication_failed() {
+    let fixture = Fixture::acquire().await;
     // The default TrustingSessionVerifier refuses an empty token as an absent
     // credential.
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();
@@ -133,12 +124,14 @@ async fn absent_credential_is_rejected_with_authentication_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn forged_credential_is_rejected_with_authentication_failed() {
+    let fixture = Fixture::acquire().await;
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(Arc::new(AlwaysReject));
@@ -167,7 +160,9 @@ async fn forged_credential_is_rejected_with_authentication_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn verified_identity_ignores_a_spoofed_client_id() {
+    let fixture = Fixture::acquire().await;
     // The verifier resolves the identity, and the client claims a different id.
     let resolved = AuthContext::new("resolved-user")
         .with_tenant("tenant-7")
@@ -178,7 +173,7 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(Arc::new(FixedVerifier(resolved.clone())));

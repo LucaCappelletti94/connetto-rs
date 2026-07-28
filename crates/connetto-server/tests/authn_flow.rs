@@ -20,15 +20,13 @@ use connetto_server::{
     AuthConfig, AuthService, InMemoryAuthStore, Materializer, PermissiveAuth, PermissiveProvider,
     ProviderRegistry, RedirectPolicy, ResolvedIdentity, SessionConfig, SessionError,
     SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
-    sqlite_write_target,
+    pg_write_target,
 };
-use diesel::prelude::*;
-use diesel::sql_query;
+use connetto_test_harness::Fixture;
 use serde_json::json;
 use tower::ServiceExt;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
-const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);";
 
 /// Records the identity the session presents to the snapshot read.
 #[derive(Clone, Default)]
@@ -52,15 +50,6 @@ impl SnapshotSource for CapturingSnapshot {
             cursor: connetto_core::Cursor::new(Vec::new()),
         })
     }
-}
-
-fn client_replica() -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    // Migration-style DDL, which the typed DSL does not express.
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    conn
 }
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
@@ -95,19 +84,22 @@ fn service() -> (Arc<TokenAuthority>, Arc<AuthService<InMemoryAuthStore>>) {
 fn manager_with(
     verifier: Arc<dyn SessionVerifier>,
     snapshot: CapturingSnapshot,
+    fixture: &Fixture,
 ) -> Arc<SessionManager<CapturingSnapshot, PermissiveAuth>> {
     SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(verifier)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
+    let fixture = Fixture::acquire().await;
     let (authority, svc) = service();
     let pair = svc.login(&identity("alice")).await.expect("login");
 
@@ -115,7 +107,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     // reaches the session is the verifier's, carrying the login's roles.
     let snapshot = CapturingSnapshot::default();
     let seen = Arc::clone(&snapshot.seen);
-    let manager = manager_with(Arc::new(svc.verifier()), snapshot);
+    let manager = manager_with(Arc::new(svc.verifier()), snapshot, &fixture);
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
     client
@@ -166,7 +158,11 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
         .session_id;
     svc.revoke(&session_id).await.expect("revoke");
 
-    let manager = manager_with(Arc::new(svc.verifier()), CapturingSnapshot::default());
+    let manager = manager_with(
+        Arc::new(svc.verifier()),
+        CapturingSnapshot::default(),
+        &fixture,
+    );
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
     client

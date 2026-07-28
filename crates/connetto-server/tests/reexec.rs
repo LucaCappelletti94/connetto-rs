@@ -15,9 +15,9 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, sqlite_write_target,
+    loopback, pg_write_target,
 };
-use diesel::{Connection, SqliteConnection};
+use connetto_test_harness::Fixture;
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
@@ -125,11 +125,13 @@ async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn reexec_bootstraps_folds_and_retriggers() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Bootstrap answers 10, the re-execution after the delete answers 20.
     let connector = QueuedConnector::new([10, 20]);
-    let target = sqlite_write_target(SqliteConnection::establish(":memory:").expect("open sqlite"));
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         NoSnapshot,

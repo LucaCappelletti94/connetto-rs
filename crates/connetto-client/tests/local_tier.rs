@@ -20,10 +20,10 @@ use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnect
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, WebSocketTransport, sqlite_write_target,
+    SnapshotSource, WebSocketTransport, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
-use diesel::sql_query;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
 use subql::{CdcSource, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
@@ -123,6 +123,7 @@ impl SnapshotSource for RecordingSnapshot {
 /// connections. Returns the manager (for CDC dispatch), the recorder's log,
 /// the address, and the join handle.
 async fn spawn_server(
+    fixture: &Fixture,
     sessions: usize,
 ) -> (
     Arc<SessionManager<RecordingSnapshot, PermissiveAuth>>,
@@ -133,17 +134,13 @@ async fn spawn_server(
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
     let recorder = RecordingSnapshot::default();
     let seen = Arc::clone(&recorder.seen);
     let manager = SessionManager::new(
         materializer,
         recorder,
         PermissiveAuth,
-        sqlite_write_target(conn),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -211,8 +208,10 @@ async fn wait_broadcast_strict(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_write_is_outside_the_capture_session() {
-    let (_manager, _seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
     let mut client = connect_with_tier(addr, "tier-capture").await;
     assert_eq!(
         client.local_tables(),
@@ -252,8 +251,10 @@ async fn local_write_is_outside_the_capture_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_row_watch_registers_no_subscription_and_refreshes() {
-    let (_manager, seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr, "tier-rows").await;
     let client = ConnettoClient::start(conn);
     let mut events = client.events();
@@ -295,8 +296,10 @@ async fn local_row_watch_registers_no_subscription_and_refreshes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_aggregate_recomputes_locally() {
-    let (_manager, seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr, "tier-agg").await;
     let client = ConnettoClient::start(conn);
     let mut events = client.events();
@@ -340,6 +343,7 @@ async fn local_aggregate_recomputes_locally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_custom_aggregate_decodes_via_extension_seam() {
     // A custom aggregate (group_concat, absent from the built-in
     // AGGREGATE_FUNCTIONS) returning an application-defined SQL type
@@ -350,7 +354,8 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     // app's own SQL type drives live() end to end through the public wire
     // primitives. It runs on the local tier, so the client recomputes it with
     // json_quote and no subscription reaches the server.
-    let (_manager, seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr, "tier-custom-agg").await;
     let client = ConnettoClient::start(conn);
     let mut events = client.events();
@@ -433,8 +438,10 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn mixed_tier_aggregate_is_refused_at_registration() {
-    let (_manager, _seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr, "tier-mixed-agg").await;
     let client = ConnettoClient::start(conn);
 
@@ -456,8 +463,10 @@ async fn mixed_tier_aggregate_is_refused_at_registration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn mixed_row_query_subscribes_synced_tables_whole() {
-    let (manager, seen, addr, server) = spawn_server(1).await;
+    let fixture = Fixture::acquire().await;
+    let (manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr, "tier-mixed-rows").await;
     let client = ConnettoClient::start(conn);
     let mut events = client.events();

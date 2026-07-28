@@ -9,9 +9,7 @@
 //! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`.
 //! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
-//! The whole file compiles only under the `pg-async` feature.
 
-#![cfg(feature = "pg-async")]
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
@@ -24,8 +22,9 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     Materializer, PermissiveAuth, ReconnectPolicy, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, sqlite_write_target,
+    SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
@@ -137,6 +136,7 @@ async fn drain_until<T: Transport>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a running Postgres with wal_level=logical (Docker); run after explicit approval"]
 async fn cdc_ingest_reconnects_after_walsender_drop() {
+    let fixture = Fixture::acquire().await;
     let admin = pool_for(&admin_url()).await;
     exec(&admin, "DROP TABLE IF EXISTS orders CASCADE").await;
     exec(
@@ -159,7 +159,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         Materializer::new(PG_DDL).expect("build materializer"),
         EmptySnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let applier = Materializer::new(PG_DDL).expect("build applier");

@@ -17,8 +17,9 @@ use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, loopback, sqlite_write_target,
+    WebSocketTransport, loopback, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -145,7 +146,9 @@ async fn drive_cdc<S: SnapshotSource, A: AuthPolicy + Send + Sync>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn loopback_session_full_lifecycle() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let config = SessionConfig {
         initial_credits: 1,
@@ -155,7 +158,7 @@ async fn loopback_session_full_lifecycle() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         config,
     );
 
@@ -274,13 +277,15 @@ async fn loopback_session_full_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn websocket_session_delivers_snapshot_and_live_patch() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
 

@@ -471,7 +471,9 @@ dependencies = [
  "chrono",
  "connetto-core",
  "connetto-server",
+ "connetto-test-harness",
  "diesel",
+ "diesel-async",
  "diesel-sqlite-session",
  "keyring",
  "open",
@@ -513,6 +515,7 @@ dependencies = [
  "connetto-client",
  "connetto-core",
  "connetto-server",
+ "connetto-test-harness",
  "diesel",
  "dioxus",
  "dioxus-core",
@@ -534,6 +537,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "connetto-core",
+ "connetto-test-harness",
  "diesel",
  "diesel-async",
  "http-body-util",
@@ -557,6 +561,21 @@ dependencies = [
  "tower",
  "url",
  "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "connetto-test-harness"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "connetto-server",
+ "diesel",
+ "diesel-async",
+ "sqlite-diff-rs",
+ "sqlparser",
+ "subql",
+ "tokio",
  "zstd",
 ]
 

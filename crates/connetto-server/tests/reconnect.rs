@@ -26,8 +26,9 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, sqlite_write_target,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -205,13 +206,15 @@ async fn subscribe<T: Transport>(client: &mut T) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn catchup_within_window_streams_missed_ops() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
 
@@ -305,7 +308,9 @@ async fn catchup_within_window_streams_missed_ops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn cursor_outside_window_forces_full_resync() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // A tiny window: after four inserts the oldest two are pruned.
     let oplog = InMemoryOplog::new(OplogConfig {
@@ -318,7 +323,7 @@ async fn cursor_outside_window_forces_full_resync() {
         PermissiveAuth,
         NoConnector,
         oplog,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
 
@@ -364,13 +369,15 @@ async fn cursor_outside_window_forces_full_resync() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn tombstone_replays_the_delete() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
 

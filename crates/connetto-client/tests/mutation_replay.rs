@@ -8,6 +8,9 @@
 //! swallows every frame (a connection that died with frames in flight), and
 //! a man-in-the-middle forwards frames into a real session but drops the
 //! acknowledgement (a connection that died just before the ack arrived).
+//!
+//! The server write target is the real Postgres path, so the exactly-once
+//! landing is read back from Postgres. `#[ignore]` by default: needs Docker.
 
 use std::sync::Arc;
 
@@ -17,8 +20,9 @@ use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, sqlite_write_target,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -62,6 +66,7 @@ impl SnapshotSource for SeedSnapshot {
     }
 }
 
+// The client replica schema (SQLite): local writes and the pending-record read.
 diesel::table! {
     orders (id) {
         id -> BigInt,
@@ -70,6 +75,22 @@ diesel::table! {
         status -> Nullable<Text>,
     }
 }
+
+// The server write target schema (Postgres): the exactly-once landing read-back.
+// `INT` maps to `Integer` (`i32`), narrower than the replica's `BigInt`.
+mod pg_readback {
+    diesel::table! {
+        orders (id) {
+            id -> diesel::sql_types::Integer,
+            price -> diesel::sql_types::Nullable<diesel::sql_types::Double>,
+            quantity -> diesel::sql_types::Nullable<diesel::sql_types::Integer>,
+            status -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        }
+    }
+}
+
+/// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
+type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
 
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
@@ -83,18 +104,23 @@ struct Order {
 
 type Manager = SessionManager<SeedSnapshot, PermissiveAuth>;
 
-/// A sqlite connection with the replica schema applied.
-fn replica_conn(path: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(path).expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    conn
+/// Reset the fixture to a fresh `orders` table with the watermark provisioned.
+async fn reset_orders(fixture: &Fixture) {
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS orders CASCADE",
+            "DROP TABLE IF EXISTS _connetto_mutations",
+            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
+        ])
+        .await;
+    connetto_server::provision_watermark_table(fixture.admin())
+        .await
+        .expect("provision watermark table");
 }
 
-/// A manager whose `orders` table accepts client writes into a file-backed
-/// target the test can inspect independently.
-fn writable_manager(target_path: &str) -> Arc<Manager> {
+/// A manager whose `orders` table accepts client writes into the real Postgres
+/// target the test reads back through the admin pool.
+fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
     let materializer = Materializer::with_write_catalog(
         PG_DDL,
         RuntimeWritableCatalog::builder().writable("orders").build(),
@@ -104,7 +130,7 @@ fn writable_manager(target_path: &str) -> Arc<Manager> {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        sqlite_write_target(replica_conn(target_path)),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     )
 }
@@ -153,13 +179,28 @@ async fn forward(from: &mut LoopbackTransport, to: &mut LoopbackTransport) {
     }
 }
 
-/// Rows in the write target matching `id`.
-fn target_rows(path: &str, id: i64) -> Vec<Order> {
-    let mut conn = SqliteConnection::establish(path).expect("open target");
-    orders::table
-        .filter(orders::id.eq(id))
-        .load(&mut conn)
-        .expect("read target")
+/// Rows in the Postgres write target matching `id`, read as admin.
+async fn target_rows(fixture: &Fixture, id: i64) -> Vec<Order> {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let query = pg_readback::orders::table
+        .filter(pg_readback::orders::id.eq(i32::try_from(id).expect("id fits i32")))
+        .select((
+            pg_readback::orders::id,
+            pg_readback::orders::price,
+            pg_readback::orders::quantity,
+            pg_readback::orders::status,
+        ));
+    let rows: Vec<PgOrderRow> = diesel_async::RunQueryDsl::load(query, &mut *conn)
+        .await
+        .expect("read target");
+    rows.into_iter()
+        .map(|(id, price, quantity, status)| Order {
+            id: i64::from(id),
+            price,
+            quantity: quantity.map(i64::from),
+            status,
+        })
+        .collect()
 }
 
 /// Rows still recorded in the replica's pending table.
@@ -206,10 +247,11 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn sent_but_unprocessed_mutation_replays_after_resume() {
-    let target = tempfile::NamedTempFile::new().expect("target file");
-    let target_path = target.path().to_str().expect("utf8 path").to_owned();
-    let manager = writable_manager(&target_path);
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let manager = writable_manager(&fixture);
 
     // Push into the black hole: both frames leave successfully and nothing
     // ever processes them.
@@ -239,15 +281,20 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
             _ => {}
         }
     }
-    assert_eq!(target_rows(&target_path, 60).len(), 1, "the replay applied");
+    assert_eq!(
+        target_rows(&fixture, 60).await.len(),
+        1,
+        "the replay applied"
+    );
     assert_eq!(pending_count(&mut conn), 0, "the ack retired the record");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn applied_but_unacked_mutation_dedupes_on_resume() {
-    let target = tempfile::NamedTempFile::new().expect("target file");
-    let target_path = target.path().to_str().expect("utf8 path").to_owned();
-    let manager = writable_manager(&target_path);
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let manager = writable_manager(&fixture);
 
     // A man in the middle forwards the handshake and the mutation into a
     // real session, reads the acknowledgement (the durable apply happened),
@@ -288,19 +335,20 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
         "the watermark retired the record at handshake"
     );
     assert_eq!(
-        target_rows(&target_path, 61).len(),
+        target_rows(&fixture, 61).await.len(),
         1,
         "exactly one apply, the dedupe swallowed the would-be replay"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn restart_replays_persisted_pending() {
-    let target = tempfile::NamedTempFile::new().expect("target file");
-    let target_path = target.path().to_str().expect("utf8 path").to_owned();
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
     let replica = tempfile::NamedTempFile::new().expect("replica file");
     let replica_path = replica.path().to_str().expect("utf8 path").to_owned();
-    let manager = writable_manager(&target_path);
+    let manager = writable_manager(&fixture);
 
     // First process: push into the black hole, then die outright.
     {
@@ -338,7 +386,7 @@ async fn restart_replays_persisted_pending() {
         }
     }
     assert_eq!(
-        target_rows(&target_path, 62).len(),
+        target_rows(&fixture, 62).await.len(),
         1,
         "the restart replay applied"
     );

@@ -19,8 +19,9 @@ use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     Materializer, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
-    sqlite_write_target,
+    pg_write_target,
 };
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::Value;
@@ -130,13 +131,15 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         EmptySnapshot,
         DenyId2,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
     let applier = Materializer::new(PG_DDL).expect("build applier");

@@ -15,9 +15,8 @@
 //! The write path pairs a `MutationHeader` with the `MutationPatch` that follows
 //! it, authorizes every op, detects stale-version conflicts, applies the whole
 //! changeset in one transaction, and replies only on failure. Success is the CDC
-//! echo, so there is no dedicated ack. The Docker-free target is a synchronous
-//! SQLite connection; the async Postgres apply lives on the materializer behind
-//! the `pg-async` feature.
+//! echo, so there is no dedicated ack. The write applies to the source Postgres
+//! under the caller's RLS context.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -43,7 +42,7 @@ use crate::materializer::{
     agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
-use crate::write_target::{WriteError, WriteOutcome, WriteTarget};
+use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
 /// Initial rows for a subscription, produced by a [`SnapshotSource`].
 pub struct Snapshot {
@@ -384,7 +383,7 @@ where
     verifier: Arc<dyn SessionVerifier<Id>>,
     connector: C,
     oplog: O,
-    target: WriteTarget,
+    target: PgWriteTarget,
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
@@ -406,7 +405,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        target: impl Into<WriteTarget>,
+        target: PgWriteTarget,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -436,7 +435,7 @@ where
         snapshot_source: Snap,
         auth: Auth,
         connector: C,
-        target: impl Into<WriteTarget>,
+        target: PgWriteTarget,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -467,7 +466,7 @@ where
         auth: Auth,
         connector: C,
         oplog: O,
-        target: impl Into<WriteTarget>,
+        target: PgWriteTarget,
         config: SessionConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -480,7 +479,7 @@ where
             verifier: Arc::new(TrustingSessionVerifier),
             connector,
             oplog,
-            target: target.into(),
+            target,
             next_session: AtomicU64::new(1),
             next_consumer: AtomicU64::new(1),
             config,
@@ -1096,7 +1095,6 @@ where
         match self
             .target
             .commit(
-                &self.materializer,
                 &state.auth_ctx,
                 &plan,
                 &patch.patchset_zstd,

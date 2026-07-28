@@ -29,7 +29,6 @@ pub mod snapshot;
 pub mod write_target;
 
 pub use auth::PermissiveAuth;
-#[cfg(feature = "pg-async")]
 pub use auth::{RlsAuth, RlsAuthError};
 pub use authn::http::{RedirectPolicy, auth_router};
 pub use authn::{
@@ -41,7 +40,6 @@ pub use authn::{
     ResolvedIdentity, RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
     VerifiedLogin, VerifiedSession,
 };
-#[cfg(feature = "pg-async")]
 pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
@@ -55,15 +53,11 @@ pub use materializer::{
 pub use oplog::{
     CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, OplogConfig, catchup_decision,
 };
-#[cfg(feature = "pg-async")]
 pub use oplog::{PgOplog, PgOplogError};
 pub use session::{
     NoConnector, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError, SessionManager,
     Snapshot, SnapshotSource,
 };
-#[cfg(feature = "pg-async")]
 pub use snapshot::PgSnapshotSource;
 pub use snapshot::SnapshotError;
-#[cfg(feature = "pg-async")]
 pub use write_target::{PgWriteTarget, ProvisionError, pg_write_target, provision_watermark_table};
-pub use write_target::{SqliteWriteTarget, WriteTarget, sqlite_write_target};

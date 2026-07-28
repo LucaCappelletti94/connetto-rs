@@ -32,6 +32,7 @@ diesel.workspace = true
 # never inherit the native runtime.
 connetto-client = { path = "../connetto-client", features = ["native-transport"] }
 connetto-server = { path = "../connetto-server" }
+connetto-test-harness = { path = "../connetto-test-harness" }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "0.7.9"

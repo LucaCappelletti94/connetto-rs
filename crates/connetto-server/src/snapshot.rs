@@ -22,11 +22,8 @@
 //! the boundary intends. No SQLite lives on the backend: the catalog supplies
 //! the column order and primary key for the patchset shape.
 
-#[cfg(feature = "pg-async")]
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
-#[cfg(feature = "pg-async")]
 use sqlparser::dialect::PostgreSqlDialect;
-#[cfg(feature = "pg-async")]
 use sqlparser::parser::Parser;
 
 /// Failure surfaced while producing a snapshot.
@@ -51,7 +48,6 @@ pub enum SnapshotError {
 /// The translated SQL quotes identifiers, so this takes the ident value,
 /// never its rendering, and the last dotted segment so a schema-qualified
 /// table resolves to the name the catalog knows.
-#[cfg(feature = "pg-async")]
 fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|err| SnapshotError::Sql(err.to_string()))?;
@@ -75,10 +71,8 @@ fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
     }
 }
 
-#[cfg(feature = "pg-async")]
 pub use pg::PgSnapshotSource;
 
-#[cfg(feature = "pg-async")]
 mod pg {
     use diesel::row::{Field, NamedRow, Row};
     use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};

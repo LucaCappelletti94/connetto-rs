@@ -5,9 +5,6 @@
 //! revocation. `#[ignore]` by default because it needs a running Postgres.
 //! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
-//! The whole file compiles only under the `pg-async` feature.
-
-#![cfg(feature = "pg-async")]
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;

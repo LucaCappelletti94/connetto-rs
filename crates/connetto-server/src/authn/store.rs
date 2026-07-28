@@ -3,7 +3,7 @@
 //!
 //! Two variants ship. [`InMemoryAuthStore`] holds everything in the process,
 //! resolves identity deterministically from `(issuer, subject)`, and is
-//! single-server and ephemeral. The database store (feature `pg-async`) holds
+//! single-server and ephemeral. The database store holds
 //! it in Postgres through typed diesel queries, resolves identity through a
 //! linking table so one human may hold several logins, and is durable and
 //! mesh-capable. See `docs/architecture/11-authentication.md`.
@@ -414,10 +414,8 @@ impl<
     }
 }
 
-#[cfg(feature = "pg-async")]
 pub use db::DbAuthStore;
 
-#[cfg(feature = "pg-async")]
 mod db {
     use std::collections::BTreeMap;
     use std::sync::Arc;

@@ -1,33 +1,35 @@
-//! Phase 3 write-path acceptance tests.
+//! Docker-gated write-path acceptance tests.
 //!
 //! Drives a `MutationHeader` plus `MutationPatch` through a session over the
-//! loopback transport and checks the four contracts: the happy path applies,
-//! a stale version yields `MutationConflict`, an unauthorized write yields
-//! `MutationReject`, and a replayed `client_seq` applies exactly once. The
-//! target is a Docker-free SQLite connection whose `notes` table carries its
-//! own version column (`edited_at`).
+//! loopback transport against the real Postgres write target and checks the
+//! four contracts: the happy path applies, a stale version yields
+//! `MutationConflict`, an unauthorized write yields `MutationReject`, and a
+//! replayed `client_seq` applies exactly once. The write lands in Postgres and
+//! is read back through the admin pool; the `notes` table carries its own
+//! version column (`edited_at`).
+//!
+//! `#[ignore]` by default: it needs a running Postgres. Point `DATABASE_URL` at
+//! one and run with `--ignored` under Docker.
 
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
 
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::auth::AuthContext;
-use connetto_core::messages::{
-    BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, MutationRejectReason,
-    Ping,
-};
-use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
+use connetto_core::messages::{ControlMessage, MutationRejectReason};
+use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, SqliteWriteTarget, loopback, sqlite_write_target,
+    SnapshotSource, loopback, pg_write_target, provision_watermark_table,
 };
-use diesel::prelude::*;
-use diesel::sql_query;
+use connetto_test_harness::{Client, Fixture};
+use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
-const SQLITE_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, edited_at TEXT);";
 
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
@@ -80,22 +82,22 @@ impl AuthPolicy for DenyAuth {
 
 diesel::table! {
     notes (id) {
-        id -> diesel::sql_types::BigInt,
+        id -> diesel::sql_types::Integer,
         body -> diesel::sql_types::Text,
         edited_at -> diesel::sql_types::Text,
     }
 }
 
-#[derive(Queryable, Selectable, Debug, PartialEq)]
+#[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
 #[diesel(table_name = notes)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 struct Note {
-    id: i64,
+    id: i32,
     body: String,
     edited_at: String,
 }
 
-fn note(id: i64, body: &str, edited_at: &str) -> Note {
+fn note(id: i32, body: &str, edited_at: &str) -> Note {
     Note {
         id,
         body: body.to_owned(),
@@ -103,30 +105,41 @@ fn note(id: i64, body: &str, edited_at: &str) -> Note {
     }
 }
 
-fn notes(target: &SqliteWriteTarget) -> Vec<Note> {
-    let mut conn = target.lock();
+/// The `notes` rows, read through the admin pool. Typed DSL against the `notes`
+/// `table!`, checked at compile time.
+async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
+    let mut conn = pool.get().await.expect("admin connection");
     notes::table
         .order(notes::id)
         .select(Note::as_select())
         .load(&mut *conn)
+        .await
         .expect("read notes")
 }
 
-/// A SQLite target seeded with one versioned row.
-fn seeded_target() -> SqliteWriteTarget {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
+/// Reset the fixture to a fresh `notes` table seeded with one versioned row and
+/// the watermark table provisioned by the admin.
+async fn seed_notes(fixture: &Fixture) {
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS notes CASCADE",
+            "DROP TABLE IF EXISTS _connetto_mutations",
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
+        ])
+        .await;
+    provision_watermark_table(fixture.admin())
+        .await
+        .expect("provision watermark table");
+    let mut conn = fixture.admin().get().await.expect("admin connection");
     diesel::insert_into(notes::table)
         .values((
-            notes::id.eq(1_i64),
+            notes::id.eq(1_i32),
             notes::body.eq("hello"),
             notes::edited_at.eq("t0"),
         ))
-        .execute(&mut conn)
+        .execute(&mut *conn)
+        .await
         .expect("seed row");
-    sqlite_write_target(conn)
 }
 
 fn writable_catalog() -> RuntimeWritableCatalog {
@@ -181,115 +194,66 @@ fn update_changeset(
         .build()
 }
 
-async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
-    match transport.recv().await.expect("recv frame") {
-        Some(IncomingFrame::Control(msg)) => msg,
-        other => panic!("expected control frame, got {other:?}"),
-    }
-}
-
-/// Send a `MutationHeader` then its paired `MutationPatch`.
-async fn upload<T: Transport>(transport: &mut T, client_seq: u64, changeset: Vec<u8>) {
-    let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress changeset");
-    transport
-        .send_control(ControlMessage::MutationHeader(MutationHeader::new(
-            client_seq, 1,
-        )))
-        .await
-        .expect("send header");
-    transport
-        .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(
-            client_seq, payload,
-        )))
-        .await
-        .expect("send patch");
-}
-
-/// Round-trip a ping. The server processes frames in order, so the returned
-/// pong proves every preceding upload was fully handled.
-async fn barrier<T: Transport>(transport: &mut T, nonce: u64) -> ControlMessage {
-    transport
-        .send_control(ControlMessage::Ping(Ping { nonce }))
-        .await
-        .expect("send ping");
-    next_control(transport).await
-}
-
-async fn handshake<T: Transport>(transport: &mut T) {
-    transport
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "writer",
-            "token",
-        )))
-        .await
-        .expect("send handshake");
-    let ControlMessage::HandshakeAck(_) = next_control(transport).await else {
-        panic!("expected handshake ack");
-    };
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn write_path_applies_conflicts_and_dedups() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer");
-    let target = seeded_target();
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        target.clone(),
+        target,
         SessionConfig::default(),
     );
 
-    let (server_transport, mut client) = loopback();
+    let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
 
-    handshake(&mut client).await;
+    client.handshake("writer").await;
 
-    // Happy insert: a new versioned row lands on the target and the durable
-    // apply is acknowledged.
-    upload(&mut client, 1, insert_changeset(2, "new", "t1")).await;
-    let ControlMessage::MutationApplied(ack) = next_control(&mut client).await else {
+    // Happy insert: a new versioned row lands in Postgres and the durable apply
+    // is acknowledged.
+    client.upload(1, insert_changeset(2, "new", "t1")).await;
+    let ControlMessage::MutationApplied(ack) = client.next_control().await else {
         panic!("expected the durable-apply acknowledgement");
     };
     assert_eq!(ack.client_seq, 1);
-    let ControlMessage::Pong(_) = barrier(&mut client, 1).await else {
+    let ControlMessage::Pong(_) = client.barrier(1).await else {
         panic!("expected pong after insert");
     };
     assert_eq!(
-        notes(&target),
+        notes(fixture.admin()).await,
         vec![note(1, "hello", "t0"), note(2, "new", "t1")]
     );
 
     // Happy update: basis edited_at t0 matches the server, so it applies.
-    upload(
-        &mut client,
-        2,
-        update_changeset(1, "hello", "updated", "t0", "t2"),
-    )
-    .await;
-    let ControlMessage::MutationApplied(ack) = next_control(&mut client).await else {
+    client
+        .upload(2, update_changeset(1, "hello", "updated", "t0", "t2"))
+        .await;
+    let ControlMessage::MutationApplied(ack) = client.next_control().await else {
         panic!("expected the durable-apply acknowledgement");
     };
     assert_eq!(ack.client_seq, 2);
-    let ControlMessage::Pong(_) = barrier(&mut client, 2).await else {
+    let ControlMessage::Pong(_) = client.barrier(2).await else {
         panic!("expected pong after update");
     };
     assert_eq!(
-        notes(&target),
+        notes(fixture.admin()).await,
         vec![note(1, "updated", "t2"), note(2, "new", "t1")]
     );
 
     // Stale update: basis edited_at t0 no longer matches (server is t2), so the
     // server reports a conflict carrying the current row and does not apply.
-    upload(
-        &mut client,
-        3,
-        update_changeset(1, "updated", "stale", "t0", "t3"),
-    )
-    .await;
-    let ControlMessage::MutationConflict(conflict) = next_control(&mut client).await else {
+    client
+        .upload(3, update_changeset(1, "updated", "stale", "t0", "t3"))
+        .await;
+    let ControlMessage::MutationConflict(conflict) = client.next_control().await else {
         panic!("expected mutation conflict");
     };
     assert_eq!(conflict.client_seq, 3);
@@ -300,28 +264,28 @@ async fn write_path_applies_conflicts_and_dedups() {
     assert_eq!(current["body"], "updated");
     assert_eq!(current["edited_at"], "t2");
     assert_eq!(
-        notes(&target),
+        notes(fixture.admin()).await,
         vec![note(1, "updated", "t2"), note(2, "new", "t1")]
     );
 
     // Exactly-once: the same client_seq applied twice inserts once, and the
-    // replay is re-acknowledged from the durable watermark instead of
-    // colliding on the primary key.
-    upload(&mut client, 4, insert_changeset(3, "three", "t4")).await;
-    upload(&mut client, 4, insert_changeset(3, "three", "t4")).await;
-    let ControlMessage::MutationApplied(first) = next_control(&mut client).await else {
+    // replay is re-acknowledged from the durable watermark instead of colliding
+    // on the primary key.
+    client.upload(4, insert_changeset(3, "three", "t4")).await;
+    client.upload(4, insert_changeset(3, "three", "t4")).await;
+    let ControlMessage::MutationApplied(first) = client.next_control().await else {
         panic!("expected the durable-apply acknowledgement");
     };
     assert_eq!(first.client_seq, 4);
-    let ControlMessage::MutationApplied(replayed) = next_control(&mut client).await else {
+    let ControlMessage::MutationApplied(replayed) = client.next_control().await else {
         panic!("a replayed mutation is re-acknowledged, not rejected");
     };
     assert_eq!(replayed.client_seq, 4);
-    let ControlMessage::Pong(_) = barrier(&mut client, 9).await else {
+    let ControlMessage::Pong(_) = client.barrier(9).await else {
         panic!("expected pong after the replay");
     };
     assert_eq!(
-        notes(&target),
+        notes(fixture.admin()).await,
         vec![
             note(1, "updated", "t2"),
             note(2, "new", "t1"),
@@ -329,37 +293,42 @@ async fn write_path_applies_conflicts_and_dedups() {
         ]
     );
 
-    client.close().await.expect("close client");
+    client.close().await;
     server.await.expect("join server").expect("session ok");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn write_path_rejects_unauthorized() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer");
-    let target = seeded_target();
+    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
         DenyAuth,
-        target.clone(),
+        target,
         SessionConfig::default(),
     );
 
-    let (server_transport, mut client) = loopback();
+    let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
 
-    handshake(&mut client).await;
+    client.handshake("writer").await;
 
-    upload(&mut client, 1, insert_changeset(2, "new", "t1")).await;
-    let ControlMessage::MutationReject(reject) = next_control(&mut client).await else {
+    client.upload(1, insert_changeset(2, "new", "t1")).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
         panic!("expected mutation reject");
     };
     assert_eq!(reject.client_seq, 1);
     assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
     // Nothing applied: the seed row is untouched and no new row appeared.
-    assert_eq!(notes(&target), vec![note(1, "hello", "t0")]);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
 
-    client.close().await.expect("close client");
+    client.close().await;
     server.await.expect("join server").expect("session ok");
 }

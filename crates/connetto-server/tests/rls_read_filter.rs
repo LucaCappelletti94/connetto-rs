@@ -14,7 +14,6 @@
 //! non-superuser role. The test creates `app_reader` for that and runs the
 //! policy checks through it, doing privileged setup as the admin role.
 
-#![cfg(feature = "pg-async")]
 #![allow(clippy::too_many_lines)]
 
 use connetto_core::auth::AuthContext;

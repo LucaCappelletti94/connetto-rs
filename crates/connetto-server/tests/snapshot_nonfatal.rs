@@ -10,15 +10,12 @@ use connetto_core::messages::{ControlMessage, Handshake, Ping, Subscribe, Subscr
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, sqlite_write_target,
+    loopback, pg_write_target,
 };
-use diesel::prelude::*;
-use diesel::sql_query;
+use connetto_test_harness::Fixture;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-const SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 /// A snapshot source that always fails, standing in for an unreachable or
@@ -39,14 +36,6 @@ impl SnapshotSource for BrokenSnapshot {
     }
 }
 
-fn client_replica() -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
-    sql_query(SQLITE_DDL)
-        .execute(&mut conn)
-        .expect("create table");
-    conn
-}
-
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     loop {
         match transport.recv().await.expect("recv") {
@@ -58,13 +47,15 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
+    let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
         BrokenSnapshot,
         PermissiveAuth,
-        sqlite_write_target(client_replica()),
+        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
         SessionConfig::default(),
     );
 

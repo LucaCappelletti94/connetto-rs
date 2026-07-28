@@ -97,9 +97,15 @@ base64 = { version = "0.22", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
-# The Docker-free loop test runs the real server in-process against the SQLite
-# emulator, so the client is exercised over a real socket without Postgres.
-connetto-server.path = "../connetto-server"
+# The loop tests run the real server in-process. Its write target is the real
+# Postgres path now (pg-async), so the harness supplies the fixture. The CDC
+# source stays the SQLite emulator, so reads are Docker-free and only the
+# write-path assertions need Postgres.
+connetto-server = { path = "../connetto-server" }
+connetto-test-harness = { path = "../connetto-test-harness" }
+# The write-path loop tests read the server's Postgres target back through a
+# typed diesel-async query, so the async DSL must be nameable directly.
+diesel-async = { version = "0.7", default-features = false, features = ["postgres", "bb8"] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
 # Building a NaiveDateTime the emulator connector returns as a re-executed

@@ -13,7 +13,6 @@
 //! superuser bypasses RLS. The test creates `app_writer` for the write target
 //! and does privileged setup as the admin role.
 
-#![cfg(feature = "pg-async")]
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
