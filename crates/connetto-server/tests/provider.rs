@@ -221,14 +221,14 @@ async fn accessor_refreshes_an_expired_provider_token() {
     // The stored token is expired, so the accessor refreshes it through the
     // permissive provider and persists the result.
     let refreshed = service
-        .provider_access_token(&session_id)
+        .provider_access_token(session_id)
         .await
         .expect("accessor");
     assert_eq!(refreshed.as_deref(), Some("permissive-access-token"));
 
     // The refreshed token has no expiry, so a second call returns it as-is.
     let again = service
-        .provider_access_token(&session_id)
+        .provider_access_token(session_id)
         .await
         .expect("accessor");
     assert_eq!(again.as_deref(), Some("permissive-access-token"));
@@ -253,7 +253,7 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
         .session_id;
 
     let token = service
-        .provider_access_token(&session_id)
+        .provider_access_token(session_id)
         .await
         .expect("accessor");
     assert_eq!(

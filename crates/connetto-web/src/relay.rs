@@ -906,7 +906,7 @@ where
             // pending mutations at or below it and replays the rest.
             let _ = tab.out.send(TabOut::Control(ControlMessage::HandshakeAck(
                 HandshakeAck {
-                    session_id: format!("relay-{}", handshake.client_id),
+                    connection_id: format!("relay-{}", handshake.client_id),
                     session_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
                     schema_version: worker.schema_version().clone(),

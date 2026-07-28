@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use connetto_core::SessionId;
 use connetto_core::traits::{SessionVerifier, SessionVerifyError, SessionVerifyFuture};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -75,7 +76,7 @@ pub struct AuthService<S: AuthStore> {
     /// Per-session async locks serializing retained-token refreshes so two
     /// concurrent callers on one node cannot double-refresh and trip the
     /// provider's rotation-reuse defense.
-    refresh_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    refresh_locks: Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>,
 }
 
 impl<S: AuthStore> AuthService<S> {
@@ -107,7 +108,7 @@ impl<S: AuthStore> AuthService<S> {
         let issued = self.store.create_session(identity, now).await?;
         let access_token = self
             .authority
-            .mint_access(&issued.context, &issued.session_id, now)?;
+            .mint_access(&issued.context, issued.session_id, now)?;
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -132,11 +133,11 @@ impl<S: AuthStore> AuthService<S> {
         let now = SystemTime::now();
         let issued = self.store.create_session(&login.identity, now).await?;
         self.store
-            .set_retained_provider_token(&issued.session_id, &login.retained, now)
+            .set_retained_provider_token(issued.session_id, &login.retained, now)
             .await?;
         let access_token = self
             .authority
-            .mint_access(&issued.context, &issued.session_id, now)?;
+            .mint_access(&issued.context, issued.session_id, now)?;
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -163,13 +164,13 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the store or the provider refresh fails.
     pub async fn provider_access_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
     ) -> Result<Option<String>, AuthError> {
         let lock = {
             let mut locks = self.refresh_locks.lock().expect("refresh locks");
             Arc::clone(
                 locks
-                    .entry(session_id.to_owned())
+                    .entry(session_id)
                     .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
             )
         };
@@ -214,9 +215,9 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let outcome = self.store.rotate_refresh(refresh_token, now).await?;
-        let access_token =
-            self.authority
-                .mint_access(&outcome.context, &outcome.session_id, now)?;
+        let access_token = self
+            .authority
+            .mint_access(&outcome.context, outcome.session_id, now)?;
         Ok(TokenPair {
             access_token,
             refresh_token: outcome.refresh_token,
@@ -231,7 +232,7 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the store fails.
-    pub async fn revoke(&self, session_id: &str) -> Result<(), AuthError> {
+    pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
         self.store.revoke_session(session_id).await?;
         Ok(())
     }
@@ -273,7 +274,7 @@ impl<S: AuthStore + 'static> SessionVerifier<S::Id> for ConnettoSessionVerifier<
                 .map_err(|err| SessionVerifyError::Invalid(err.to_string()))?;
             let live = self
                 .store
-                .session_is_live(&verified.session_id, SystemTime::now())
+                .session_is_live(verified.session_id, SystemTime::now())
                 .await
                 .map_err(|err| SessionVerifyError::Invalid(err.to_string()))?;
             if !live {

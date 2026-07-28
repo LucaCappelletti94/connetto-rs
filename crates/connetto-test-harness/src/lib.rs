@@ -135,7 +135,7 @@ pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
 /// `(user_id, session_id)`. connetto emits no DDL, so the harness owns this
 /// migration; the shape matches the `ConnettoWatermark` reference schema.
 pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
-    (user_id TEXT NOT NULL, session_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+    (user_id TEXT NOT NULL, session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
     PRIMARY KEY (user_id, session_id))";
 
 /// Create the reference watermark table if missing, as admin. A restricted

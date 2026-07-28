@@ -251,7 +251,7 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     exec(
         pool,
         "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-         session_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+         session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
          PRIMARY KEY (user_id, session_id))",
     )
     .await;
@@ -506,7 +506,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         // cannot CREATE in schema public on Postgres 15+ (and must not need
         // to), and the writer only needs DML on it.
         "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-         session_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+         session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
          PRIMARY KEY (user_id, session_id))",
         "GRANT USAGE ON SCHEMA public TO app_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",

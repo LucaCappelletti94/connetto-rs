@@ -63,7 +63,9 @@ impl SessionVerifier for FixedVerifier {
         Box::pin(async move {
             Ok(connetto_core::VerifiedSession {
                 context,
-                session_id: "fixed-session".to_owned(),
+                // A fixed id, so every connection this stub verifies shares one
+                // watermark key, which is what the exactly-once assertions rely on.
+                session_id: connetto_core::SessionId::from_token_hash("fixed-session"),
             })
         })
     }

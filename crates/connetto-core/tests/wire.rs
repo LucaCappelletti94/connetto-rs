@@ -64,7 +64,7 @@ fn handshake_and_ack_round_trip() {
             .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef])),
     ));
     round_trip_control(&ControlMessage::HandshakeAck(HandshakeAck {
-        session_id: "sess-1".into(),
+        connection_id: "connection-1".into(),
         session_token: "opaque".into(),
         current_cursor: Cursor::new(vec![1, 2, 3, 4]),
         schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),

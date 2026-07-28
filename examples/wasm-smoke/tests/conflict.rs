@@ -113,7 +113,7 @@ async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::U
     };
     server
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: "conflict-upstream".to_owned(),
+            connection_id: "conflict-upstream".to_owned(),
             session_token: "conflict".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,

@@ -33,11 +33,11 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
         "DROP TABLE IF EXISTS connetto_provider_tokens",
         "DROP TABLE IF EXISTS connetto_sessions",
         "CREATE TABLE connetto_sessions (\
-            session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attrs JSONB NOT NULL, \
+            session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, attrs JSONB NOT NULL, \
             current_refresh_hash BYTEA NOT NULL, idle_deadline_ms BIGINT NOT NULL, \
             absolute_deadline_ms BIGINT NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
         "CREATE TABLE connetto_provider_tokens (\
-            session_id TEXT PRIMARY KEY, issuer TEXT NOT NULL, access_token TEXT NOT NULL, \
+            session_id UUID PRIMARY KEY, issuer TEXT NOT NULL, access_token TEXT NOT NULL, \
             refresh_token TEXT, expires_at_ms BIGINT)",
     ] {
         sql_query(stmt).execute(&mut conn).await.expect("ddl");
@@ -107,7 +107,7 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
     assert_eq!(first.context.roles, vec!["member".to_owned()]);
     assert!(
         store
-            .session_is_live(&first.session_id, now)
+            .session_is_live(first.session_id, now)
             .await
             .expect("live"),
         "fresh session is live",
@@ -129,7 +129,7 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
     );
     assert!(
         !store
-            .session_is_live(&first.session_id, now)
+            .session_is_live(first.session_id, now)
             .await
             .expect("live"),
         "reuse revoked the session",
@@ -143,17 +143,17 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
     // Explicit revocation kills the still-live second session.
     assert!(
         store
-            .session_is_live(&second.session_id, now)
+            .session_is_live(second.session_id, now)
             .await
             .expect("live")
     );
     store
-        .revoke_session(&second.session_id)
+        .revoke_session(second.session_id)
         .await
         .expect("revoke");
     assert!(
         !store
-            .session_is_live(&second.session_id, now)
+            .session_is_live(second.session_id, now)
             .await
             .expect("live"),
         "revoked session is not live",
@@ -176,7 +176,7 @@ async fn db_store_retains_and_replaces_provider_tokens() {
     // No retained token yet.
     assert!(
         store
-            .retained_provider_token(&issued.session_id)
+            .retained_provider_token(issued.session_id)
             .await
             .expect("read")
             .is_none(),
@@ -190,11 +190,11 @@ async fn db_store_retains_and_replaces_provider_tokens() {
         expires_at: Some(now + std::time::Duration::from_secs(3600)),
     };
     store
-        .set_retained_provider_token(&issued.session_id, &first, now)
+        .set_retained_provider_token(issued.session_id, &first, now)
         .await
         .expect("store");
     let read = store
-        .retained_provider_token(&issued.session_id)
+        .retained_provider_token(issued.session_id)
         .await
         .expect("read")
         .expect("present");
@@ -210,11 +210,11 @@ async fn db_store_retains_and_replaces_provider_tokens() {
         expires_at: None,
     };
     store
-        .set_retained_provider_token(&issued.session_id, &second, now)
+        .set_retained_provider_token(issued.session_id, &second, now)
         .await
         .expect("store");
     let read = store
-        .retained_provider_token(&issued.session_id)
+        .retained_provider_token(issued.session_id)
         .await
         .expect("read")
         .expect("present");

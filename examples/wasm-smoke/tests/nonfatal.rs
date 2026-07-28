@@ -51,7 +51,7 @@ async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
     };
     server
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: session.to_owned(),
+            connection_id: session.to_owned(),
             session_token: "nonfatal".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,

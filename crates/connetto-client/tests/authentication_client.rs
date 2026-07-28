@@ -55,7 +55,7 @@ impl FakeTransport {
 
     fn ack() -> IncomingFrame {
         IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: "session-fake".to_owned(),
+            connection_id: "connection-fake".to_owned(),
             session_token: "token-fake".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None::<SchemaVersion>,

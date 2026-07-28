@@ -24,6 +24,7 @@
 //! is exactly what would have been inserted), so the statement never has to name
 //! the still-private `diesel::upsert::Excluded` type.
 
+use connetto_core::SessionId;
 use diesel::helper_types::{Filter, Limit, Select};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
 use diesel::sql_types::BigInt;
@@ -74,9 +75,9 @@ where
     type Upsert: ExecuteDsl<AsyncPgConnection> + Send;
 
     /// Build the monotone upsert for `(user_id, session_id)` at `last_seq`.
-    fn watermark_upsert(user_id: Self::Id, session_id: String, last_seq: i64) -> Self::Upsert;
+    fn watermark_upsert(user_id: Self::Id, session_id: SessionId, last_seq: i64) -> Self::Upsert;
     /// Build the `user_id = ? AND session_id = ?` predicate.
-    fn wm_pk(user_id: Self::Id, session_id: String) -> Self::WmPk;
+    fn wm_pk(user_id: Self::Id, session_id: SessionId) -> Self::WmPk;
 }
 
 /// Generate the default connetto watermark table and its
@@ -106,7 +107,7 @@ macro_rules! connetto_watermark_table {
             /// client sequence durably applied for that pair.
             _connetto_mutations (user_id, session_id) {
                 user_id -> $id_sql,
-                session_id -> diesel::sql_types::Text,
+                session_id -> diesel::sql_types::Uuid,
                 last_seq -> diesel::sql_types::BigInt,
             }
         }
@@ -116,7 +117,7 @@ macro_rules! connetto_watermark_table {
         #[diesel(table_name = _connetto_mutations)]
         pub struct ConnettoNewWatermark {
             user_id: $id,
-            session_id: String,
+            session_id: $crate::SessionId,
             last_seq: i64,
         }
 
@@ -130,7 +131,7 @@ macro_rules! connetto_watermark_table {
             type LastSeq = _connetto_mutations::last_seq;
             type WmPk = diesel::dsl::And<
                 diesel::dsl::Eq<_connetto_mutations::user_id, $id>,
-                diesel::dsl::Eq<_connetto_mutations::session_id, String>,
+                diesel::dsl::Eq<_connetto_mutations::session_id, $crate::SessionId>,
             >;
             type Upsert = diesel::helper_types::Set<
                 diesel::helper_types::DoUpdate<
@@ -153,7 +154,7 @@ macro_rules! connetto_watermark_table {
 
             fn watermark_upsert(
                 user_id: $id,
-                session_id: String,
+                session_id: $crate::SessionId,
                 last_seq: i64,
             ) -> Self::Upsert {
                 use diesel::ExpressionMethods as _;
@@ -172,7 +173,7 @@ macro_rules! connetto_watermark_table {
                         )),
                     )
             }
-            fn wm_pk(user_id: $id, session_id: String) -> Self::WmPk {
+            fn wm_pk(user_id: $id, session_id: $crate::SessionId) -> Self::WmPk {
                 use diesel::{BoolExpressionMethods as _, ExpressionMethods as _};
                 _connetto_mutations::user_id
                     .eq(user_id)

@@ -45,7 +45,7 @@ async fn schema_upstream(mut server: LoopbackTransport) {
     };
     server
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: "upstream-session".to_owned(),
+            connection_id: "upstream-session".to_owned(),
             session_token: "upstream".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),

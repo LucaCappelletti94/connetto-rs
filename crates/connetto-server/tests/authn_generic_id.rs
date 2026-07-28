@@ -101,7 +101,7 @@ async fn typed_id_survives_rotation_and_revocation() {
         .expect("create");
     assert!(
         store
-            .session_is_live(&issued.session_id, now)
+            .session_is_live(issued.session_id, now)
             .await
             .expect("live check")
     );
@@ -114,12 +114,12 @@ async fn typed_id_survives_rotation_and_revocation() {
     assert_ne!(rotated.refresh_token, issued.refresh_token, "token rotates");
 
     store
-        .revoke_session(&issued.session_id)
+        .revoke_session(issued.session_id)
         .await
         .expect("revoke");
     assert!(
         !store
-            .session_is_live(&issued.session_id, now)
+            .session_is_live(issued.session_id, now)
             .await
             .expect("post-revoke live check")
     );

@@ -101,7 +101,7 @@ fn resync_server() -> LoopbackTransport {
         };
         server
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                session_id: "resync".to_owned(),
+                connection_id: "resync".to_owned(),
                 session_token: "resync".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,

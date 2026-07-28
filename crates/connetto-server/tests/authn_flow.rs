@@ -157,7 +157,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
         .verify_access::<String>(&pair.access_token)
         .expect("verify")
         .session_id;
-    svc.revoke(&session_id).await.expect("revoke");
+    svc.revoke(session_id).await.expect("revoke");
 
     let manager = manager_with(
         Arc::new(svc.verifier()),
@@ -225,7 +225,7 @@ async fn expired_access_token_is_refused() {
     // Mint a token issued far enough in the past that it is already expired.
     let stale_issued = SystemTime::now() - (config.access_ttl + Duration::from_secs(120));
     let stale = authority
-        .mint_access(&verified.context, &verified.session_id, stale_issued)
+        .mint_access(&verified.context, verified.session_id, stale_issued)
         .expect("mint stale");
     let refused = svc.verifier().verify_session(&stale).await;
     assert!(
@@ -248,7 +248,7 @@ async fn a_token_from_another_key_is_refused() {
         .verify_access::<String>(&pair.access_token)
         .expect("verify");
     let forged = other
-        .mint_access(&verified.context, &verified.session_id, SystemTime::now())
+        .mint_access(&verified.context, verified.session_id, SystemTime::now())
         .expect("mint forged");
 
     let refused = svc.verifier().verify_session(&forged).await;

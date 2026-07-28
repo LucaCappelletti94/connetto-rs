@@ -30,7 +30,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
         };
         let _ = fake_server
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                session_id: "agg".to_owned(),
+                connection_id: "agg".to_owned(),
                 session_token: "agg".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,

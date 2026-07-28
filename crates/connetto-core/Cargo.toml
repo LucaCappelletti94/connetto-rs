@@ -25,18 +25,31 @@ loopback = ["dep:tokio", "dep:thiserror"]
 # dependency-light and WASM-friendly; enabled by the server and the native
 # client, never by the browser client.
 native-transport = ["loopback", "dep:tokio-tungstenite", "dep:futures-util", "tokio/net"]
+# Postgres diesel mappings for `SessionId` (the native `uuid` column). Off by
+# default: the session id is a plain value type everywhere else, and the
+# browser client links the core without ever touching a database backend. The
+# server enables it. Declared directly rather than inheriting the workspace
+# dependency, because that line carries the `sqlite` backend the core must not
+# require.
+diesel-pg = ["dep:diesel"]
 
 [dependencies]
 serde.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
 sha2 = { version = "0.10", default-features = false }
+# `SessionId` is a uuid: connetto-minted, fixed width, and stored in a native
+# Postgres `uuid` column. No `v4` here, so no `getrandom`: the core never mints
+# one, it only carries an id the server handed it, which keeps the browser wasm
+# build free of an entropy backend.
+uuid = { version = "1", default-features = false }
 thiserror = { workspace = true, optional = true }
 # The loopback pair needs only the sync primitives, which compile on wasm.
 # The native transport feature adds the net stack on top.
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"], optional = true }
+diesel = { version = "2", default-features = false, features = ["postgres_backend"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

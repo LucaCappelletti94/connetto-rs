@@ -31,7 +31,7 @@ use connetto_core::messages::{
     NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, SessionVerifier, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
+use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
@@ -263,7 +263,7 @@ enum Outbound {
 /// channel.
 #[derive(Clone)]
 struct Route<Id> {
-    session_id: u64,
+    connection_num: u64,
     sub_id: SubscriptionId,
     label: String,
     tx: mpsc::UnboundedSender<Outbound>,
@@ -282,12 +282,12 @@ struct AggRoute {
 
 /// What a completed handshake establishes for the run loop.
 struct HandshakeOutcome<Id> {
-    session_num: u64,
+    connection_num: u64,
     auth_ctx: AuthContext<Id>,
     resume_lsn: u64,
     /// The connetto-minted session id from the verified token, the durable
     /// watermark key.
-    session_id: String,
+    session_id: SessionId,
     applied_watermark: Option<u64>,
 }
 
@@ -307,7 +307,7 @@ struct SessionState<Id> {
     pending_header: Option<MutationHeader>,
     /// The connetto-minted session id from the verified token. The durable
     /// watermark keys on it, so a reconnect reusing the same session dedupes.
-    session_id: String,
+    session_id: SessionId,
     /// Highest `client_seq` durably applied for this client identity, from
     /// the write target at handshake and advanced per commit. A replayed
     /// sequence at or below it is re-acknowledged, never re-applied.
@@ -527,7 +527,7 @@ where
         Arc::new(inner)
     }
 
-    fn next_session_id(&self) -> u64 {
+    fn next_connection_num(&self) -> u64 {
         self.next_session.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -606,7 +606,7 @@ where
             }
             {
                 self.materializer.lock().await.advance_cursor(
-                    route.session_id,
+                    route.connection_num,
                     route.sub_id,
                     &patch.cursor,
                 )?;
@@ -845,15 +845,15 @@ where
         // at or below it and replays the rest.
         let applied_watermark = self
             .target
-            .last_applied(&auth_ctx, &token_session_id)
+            .last_applied(&auth_ctx, token_session_id)
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
 
-        let session_num = self.next_session_id();
+        let connection_num = self.next_connection_num();
         transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                session_id: format!("session-{session_num}"),
-                session_token: format!("token-{session_num}"),
+                connection_id: format!("connection-{connection_num}"),
+                session_token: format!("token-{connection_num}"),
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
@@ -862,7 +862,7 @@ where
             .await
             .map_err(transport_err)?;
         Ok(Some(HandshakeOutcome {
-            session_num,
+            connection_num,
             auth_ctx,
             resume_lsn,
             session_id: token_session_id,
@@ -882,7 +882,7 @@ where
         mut transport: T,
     ) -> Result<(), SessionError> {
         let Some(HandshakeOutcome {
-            session_num,
+            connection_num,
             auth_ctx,
             resume_lsn,
             session_id,
@@ -913,7 +913,7 @@ where
                     match incoming.map_err(transport_err)? {
                         None => break,
                         Some(IncomingFrame::Control(msg)) => {
-                            self.handle_control(&mut transport, msg, &mut state, session_num).await?;
+                            self.handle_control(&mut transport, msg, &mut state, connection_num).await?;
                         }
                         Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
                             self.handle_mutation(&mut transport, patch, &mut state).await?;
@@ -975,11 +975,11 @@ where
         transport: &mut T,
         msg: ControlMessage,
         state: &mut SessionState<Id>,
-        session_num: u64,
+        connection_num: u64,
     ) -> Result<(), SessionError> {
         match msg {
             ControlMessage::Subscribe(sub) => {
-                self.handle_subscribe(transport, sub, state, session_num)
+                self.handle_subscribe(transport, sub, state, connection_num)
                     .await
             }
             ControlMessage::Unsubscribe(unsub) => {
@@ -1109,7 +1109,7 @@ where
                 &state.auth_ctx,
                 &plan,
                 &patch.patchset_zstd,
-                &state.session_id,
+                state.session_id,
                 client_seq,
             )
             .await
@@ -1188,7 +1188,7 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        session_num: u64,
+        connection_num: u64,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
         let SqliteRegistration {
@@ -1221,7 +1221,7 @@ where
                     pg_sql,
                 };
                 match self
-                    .subscribe_row(transport, sub, state, session_num, reg)
+                    .subscribe_row(transport, sub, state, connection_num, reg)
                     .await
                 {
                     // A snapshot failure is scoped to this one subscription:
@@ -1265,7 +1265,7 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        session_num: u64,
+        connection_num: u64,
         reg: RowRegistration,
     ) -> Result<(), SessionError> {
         if state.resume_lsn != 0 {
@@ -1274,7 +1274,7 @@ where
             match catchup_decision(state.resume_lsn, min, current) {
                 CatchupDecision::Catchup => {
                     return self
-                        .catch_up_row(transport, sub, state, session_num, &reg)
+                        .catch_up_row(transport, sub, state, connection_num, &reg)
                         .await;
                 }
                 CatchupDecision::FullResync => {
@@ -1288,7 +1288,7 @@ where
                 }
             }
         }
-        self.snapshot_row(transport, sub, state, session_num, &reg)
+        self.snapshot_row(transport, sub, state, connection_num, &reg)
             .await
     }
 
@@ -1298,7 +1298,7 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        session_num: u64,
+        connection_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         transport
@@ -1333,7 +1333,7 @@ where
         self.add_route(
             reg.consumer_id,
             Route {
-                session_id: session_num,
+                connection_num,
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
@@ -1361,13 +1361,13 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        session_num: u64,
+        connection_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         self.add_route(
             reg.consumer_id,
             Route {
-                session_id: session_num,
+                connection_num,
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
@@ -1425,10 +1425,11 @@ where
             };
             let cursor = record.lsn().to_be_bytes().to_vec();
             {
-                self.materializer
-                    .lock()
-                    .await
-                    .advance_cursor(session_num, reg.sub_id, &cursor)?;
+                self.materializer.lock().await.advance_cursor(
+                    connection_num,
+                    reg.sub_id,
+                    &cursor,
+                )?;
             }
             let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
             enqueue_and_flush(

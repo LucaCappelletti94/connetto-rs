@@ -30,7 +30,7 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
         };
         let _ = server_end
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                session_id: "server".to_owned(),
+                connection_id: "server".to_owned(),
                 session_token: "server".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: server_version,

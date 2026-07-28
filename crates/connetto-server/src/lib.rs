@@ -31,6 +31,9 @@ pub mod write_target;
 
 pub use auth::PermissiveAuth;
 pub use auth::{RlsAuth, RlsAuthError};
+// Re-exported so the `connetto_auth_tables!` macro can name it as
+// `$crate::SessionId` in a consumer's crate, which need not depend on
+// connetto-core directly.
 pub use authn::http::{RedirectPolicy, auth_router};
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
@@ -42,6 +45,7 @@ pub use authn::{
     VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
+pub use connetto_core::SessionId;
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };

@@ -11,6 +11,7 @@
 
 use core::marker::PhantomData;
 
+use connetto_core::SessionId;
 use connetto_core::auth::AuthContext;
 use diesel::OptionalExtension;
 use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
@@ -156,7 +157,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         ctx: &AuthContext<W::Id>,
         plan: &WritePlan,
         payload_zstd: &[u8],
-        session_id: &str,
+        session_id: SessionId,
         client_seq: u64,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(client_seq)?;
@@ -171,7 +172,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         // boundary, distinct from the typed watermark column below.
         let guc_user = ctx.user_id.to_string();
         let watermark_user = ctx.user_id.clone();
-        let watermark_session = session_id.to_owned();
+        let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
@@ -230,7 +231,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     pub(crate) async fn last_applied(
         &self,
         ctx: &AuthContext<W::Id>,
-        session_id: &str,
+        session_id: SessionId,
     ) -> Result<Option<u64>, WriteError> {
         let mut conn = self
             .pool
@@ -239,7 +240,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .map_err(|err| WriteError::Backend(err.to_string()))?;
         let filtered = FilterDsl::filter(
             W::WatermarkQuery::default(),
-            W::wm_pk(ctx.user_id.clone(), session_id.to_owned()),
+            W::wm_pk(ctx.user_id.clone(), session_id),
         );
         let query = SelectDsl::select(filtered, W::LastSeq::default());
         let last_seq: Option<i64> = query

@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use connetto_core::SessionId;
 use connetto_core::auth::AuthContext;
 pub use connetto_core::auth::VerifiedSession;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -105,7 +106,7 @@ struct AccessClaims<Id> {
     sub: Id,
     iat: u64,
     exp: u64,
-    sid: String,
+    sid: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tid: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -195,7 +196,7 @@ impl TokenAuthority {
     pub fn mint_access<Id: Serialize + Clone>(
         &self,
         context: &AuthContext<Id>,
-        session_id: &str,
+        session_id: SessionId,
         issued_at: SystemTime,
     ) -> Result<String, TokenError> {
         let iat = unix_secs(issued_at)?;
@@ -206,7 +207,7 @@ impl TokenAuthority {
             sub: context.user_id.clone(),
             iat,
             exp,
-            sid: session_id.to_owned(),
+            sid: session_id,
             tid: context.tenant_id.clone(),
             roles: context.roles.clone(),
             claims: context.claims.clone(),

@@ -119,7 +119,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
     };
     server
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: "credits-upstream".to_owned(),
+            connection_id: "credits-upstream".to_owned(),
             session_token: "credits".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,

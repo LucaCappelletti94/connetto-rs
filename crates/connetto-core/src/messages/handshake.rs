@@ -71,9 +71,11 @@ impl Handshake {
 /// Server acknowledgement of a successful handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeAck {
-    /// Server-assigned session id. Distinct from `session_token`: the id is
-    /// human-readable and used for logging, the token is the resume credential.
-    pub session_id: String,
+    /// Per-connection routing label the server assigns at handshake. This is
+    /// not identity and must not be trusted as such: it is distinct from both
+    /// the durable auth session id (carried in the JWT `sid` claim) and from
+    /// `session_token` (the resume credential). Used for logging and routing.
+    pub connection_id: String,
     /// Fresh or reissued session token to persist and present on next connect.
     pub session_token: String,
     /// Server's current cursor. Clients replay from here on a clean start.

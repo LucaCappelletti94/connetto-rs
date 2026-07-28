@@ -33,6 +33,7 @@ pub mod cursor;
 pub mod error;
 pub mod messages;
 pub mod schema;
+pub mod session_id;
 pub mod traits;
 #[cfg(feature = "loopback")]
 pub mod transport;
@@ -44,6 +45,7 @@ pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
 pub use schema::{SchemaVersion, schema_hash};
+pub use session_id::{SessionId, SessionIdParseError};
 pub use traits::{
     AuthPolicy, FileStore, IncomingFrame, MutationOp, PendingMutation, SessionVerifier,
     SessionVerifyError, SessionVerifyFuture, Store, Transport,

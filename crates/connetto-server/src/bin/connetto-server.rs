@@ -30,9 +30,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_core::SchemaVersion;
 use connetto_core::auth::AuthContext;
 use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
+use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
     GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
@@ -127,7 +127,7 @@ impl AuthStore for ServerStore {
 
     async fn session_is_live(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         now: SystemTime,
     ) -> Result<bool, AuthStoreError> {
         match self {
@@ -147,7 +147,7 @@ impl AuthStore for ServerStore {
         }
     }
 
-    async fn revoke_session(&self, session_id: &str) -> Result<(), AuthStoreError> {
+    async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
         match self {
             Self::InMemory(store) => store.revoke_session(session_id).await,
             Self::Db(store) => store.revoke_session(session_id).await,
@@ -156,7 +156,7 @@ impl AuthStore for ServerStore {
 
     async fn set_retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         token: &RetainedProviderToken,
         now: SystemTime,
     ) -> Result<(), AuthStoreError> {
@@ -176,7 +176,7 @@ impl AuthStore for ServerStore {
 
     async fn retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
     ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
         match self {
             Self::InMemory(store) => store.retained_provider_token(session_id).await,

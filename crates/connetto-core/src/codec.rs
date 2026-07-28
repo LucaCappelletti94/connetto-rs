@@ -155,7 +155,7 @@ mod tests {
 
     fn sample_control() -> ControlMessage {
         ControlMessage::HandshakeAck(HandshakeAck {
-            session_id: "sess-abc".into(),
+            connection_id: "connection-abc".into(),
             session_token: "tok-abc".into(),
             current_cursor: Cursor::new(vec![9, 8, 7]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),

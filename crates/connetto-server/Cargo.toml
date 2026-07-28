@@ -19,7 +19,7 @@ name = "connetto-server"
 path = "src/bin/connetto-server.rs"
 
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport"] }
+connetto-core = { workspace = true, features = ["native-transport", "diesel-pg"] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming"] }
 # Reverse translation of the client's SQLite-dialect subscription query into the
 # Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).

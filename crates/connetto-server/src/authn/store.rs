@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use connetto_core::SessionId;
 use connetto_core::auth::AuthContext;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -79,8 +80,8 @@ impl ResolvedIdentity {
 /// refresh token to hand the client.
 #[derive(Debug, Clone)]
 pub struct IssuedSession<Id = String> {
-    /// The opaque session id, named by the access token's `sid`.
-    pub session_id: String,
+    /// The connetto-minted session id, named by the access token's `sid`.
+    pub session_id: SessionId,
     /// The identity the session's access tokens carry.
     pub context: AuthContext<Id>,
     /// The refresh token to hand the client. Presented back to rotate.
@@ -96,7 +97,7 @@ pub struct IssuedSession<Id = String> {
 #[derive(Debug, Clone)]
 pub struct RefreshOutcome<Id = String> {
     /// The session that was refreshed.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// The identity to mint the new access token from.
     pub context: AuthContext<Id>,
     /// The rotated refresh token, replacing the presented one.
@@ -165,7 +166,7 @@ pub trait AuthStore: Send + Sync {
     /// revocation authoritative.
     fn session_is_live(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         now: SystemTime,
     ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send;
 
@@ -181,13 +182,13 @@ pub trait AuthStore: Send + Sync {
     /// access token is still time-valid.
     fn revoke_session(
         &self,
-        session_id: &str,
+        session_id: SessionId,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
 
     /// Store the retained provider tokens for a session, replacing any existing.
     fn set_retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         token: &crate::authn::provider::RetainedProviderToken,
         now: SystemTime,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
@@ -195,7 +196,7 @@ pub trait AuthStore: Send + Sync {
     /// Read a session's retained provider tokens, if any were stored.
     fn retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
     ) -> impl Future<
         Output = Result<Option<crate::authn::provider::RetainedProviderToken>, AuthStoreError>,
     > + Send;
@@ -224,14 +225,27 @@ fn hashes_match(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// Mint a fresh session id. connetto-core carries no random number generator,
+/// so the randomness belongs here, at the login that owns the session.
+fn new_session_id() -> SessionId {
+    SessionId::from_uuid(Uuid::new_v4())
+}
+
 /// Assemble the wire refresh token from a session id and secret.
-fn format_refresh(session_id: &str, secret: &str) -> String {
+///
+/// One of the two sanctioned textual edges for a session id (the other is the
+/// JWT `sid` claim). Everywhere else it moves as bytes.
+fn format_refresh(session_id: SessionId, secret: &str) -> String {
     format!("{session_id}.{secret}")
 }
 
 /// Split a wire refresh token into its session id and secret.
-fn split_refresh(token: &str) -> Option<(&str, &str)> {
-    token.split_once('.')
+///
+/// A malformed id half is not found rather than an error shape of its own: a
+/// caller may present anything here, and an unparseable id names no session.
+fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
+    let (id, secret) = token.split_once('.')?;
+    Some((id.parse().ok()?, secret))
 }
 
 /// The in-memory auth store. Single-server and ephemeral: a restart drops every
@@ -239,7 +253,7 @@ fn split_refresh(token: &str) -> Option<(&str, &str)> {
 /// (deterministic UUID v5 by default), so no lookup and no linking table.
 pub struct InMemoryAuthStore<Id = String> {
     lifetimes: RefreshLifetimes,
-    sessions: std::sync::Mutex<std::collections::HashMap<String, SessionRecord<Id>>>,
+    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionRecord<Id>>>,
     resolver: std::sync::Arc<dyn IdentityResolver<Id = Id>>,
 }
 
@@ -300,7 +314,7 @@ impl<
     ) -> Result<IssuedSession<Id>, AuthStoreError> {
         let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
         let context = identity.clone().into_context(user_id);
-        let session_id = Uuid::new_v4().to_string();
+        let session_id = new_session_id();
         let secret = new_refresh_secret();
         let record = SessionRecord {
             context: context.clone(),
@@ -313,8 +327,8 @@ impl<
         self.sessions
             .lock()
             .expect("auth store lock")
-            .insert(session_id.clone(), record);
-        let refresh_token = format_refresh(&session_id, &secret);
+            .insert(session_id, record);
+        let refresh_token = format_refresh(session_id, &secret);
         Ok(IssuedSession {
             session_id,
             context,
@@ -327,12 +341,12 @@ impl<
     #[allow(clippy::unused_async_trait_impl)]
     async fn session_is_live(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         now: SystemTime,
     ) -> Result<bool, AuthStoreError> {
         let sessions = self.sessions.lock().expect("auth store lock");
         Ok(sessions
-            .get(session_id)
+            .get(&session_id)
             .is_some_and(|record| !record.revoked && now <= record.absolute_deadline))
     }
 
@@ -345,7 +359,7 @@ impl<
         let (session_id, secret) = split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
         let mut sessions = self.sessions.lock().expect("auth store lock");
         let record = sessions
-            .get_mut(session_id)
+            .get_mut(&session_id)
             .ok_or(AuthStoreError::NotFound)?;
         if record.revoked {
             return Err(AuthStoreError::NotFound);
@@ -362,7 +376,7 @@ impl<
         record.current_refresh_hash = hash_secret(&new_secret);
         record.idle_deadline = (now + self.lifetimes.idle_window).min(record.absolute_deadline);
         Ok(RefreshOutcome {
-            session_id: session_id.to_owned(),
+            session_id,
             context: record.context.clone(),
             refresh_token: format_refresh(session_id, &new_secret),
             session_expires_at: record.idle_deadline,
@@ -370,12 +384,12 @@ impl<
     }
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn revoke_session(&self, session_id: &str) -> Result<(), AuthStoreError> {
+    async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
         if let Some(record) = self
             .sessions
             .lock()
             .expect("auth store lock")
-            .get_mut(session_id)
+            .get_mut(&session_id)
         {
             record.revoked = true;
         }
@@ -385,7 +399,7 @@ impl<
     #[allow(clippy::unused_async_trait_impl)]
     async fn set_retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
         token: &crate::authn::provider::RetainedProviderToken,
         _now: SystemTime,
     ) -> Result<(), AuthStoreError> {
@@ -393,7 +407,7 @@ impl<
             .sessions
             .lock()
             .expect("auth store lock")
-            .get_mut(session_id)
+            .get_mut(&session_id)
         {
             record.retained = Some(token.clone());
         }
@@ -403,13 +417,13 @@ impl<
     #[allow(clippy::unused_async_trait_impl)]
     async fn retained_provider_token(
         &self,
-        session_id: &str,
+        session_id: SessionId,
     ) -> Result<Option<crate::authn::provider::RetainedProviderToken>, AuthStoreError> {
         Ok(self
             .sessions
             .lock()
             .expect("auth store lock")
-            .get(session_id)
+            .get(&session_id)
             .and_then(|record| record.retained.clone()))
     }
 }
@@ -421,6 +435,7 @@ mod db {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use connetto_core::SessionId;
     use connetto_core::auth::AuthContext;
     use diesel::prelude::*;
     use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
@@ -431,7 +446,7 @@ mod db {
 
     use super::{
         AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, format_refresh,
-        hash_secret, hashes_match, new_refresh_secret, split_refresh,
+        hash_secret, hashes_match, new_refresh_secret, new_session_id, split_refresh,
     };
     use crate::authn::identity::IdentityResolver;
     use crate::authn::provider::RetainedProviderToken;
@@ -530,7 +545,7 @@ mod db {
             let absolute = unix_ms(now + self.lifetimes.absolute_ceiling);
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
-            let session_id = uuid::Uuid::new_v4().to_string();
+            let session_id = new_session_id();
             let attrs = serde_json::to_value(SessionAttrs {
                 tenant_id: identity.tenant_id.clone(),
                 roles: identity.roles.clone(),
@@ -538,7 +553,7 @@ mod db {
             })
             .map_err(backend)?;
             let row = S::new_session(
-                session_id.clone(),
+                session_id,
                 user_id.clone(),
                 attrs,
                 refresh_hash,
@@ -559,24 +574,21 @@ mod db {
                 claims: identity.claims.clone(),
             };
             Ok(IssuedSession {
-                session_id: session_id.clone(),
+                session_id,
                 context,
-                refresh_token: format_refresh(&session_id, &secret),
+                refresh_token: format_refresh(session_id, &secret),
                 session_expires_at: time_from_ms(idle.min(absolute)),
             })
         }
 
         async fn session_is_live(
             &self,
-            session_id: &str,
+            session_id: SessionId,
             now: SystemTime,
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let now_ms = unix_ms(now);
-            let base = FilterDsl::filter(
-                S::SessionsQuery::default(),
-                S::session_pk(session_id.to_owned()),
-            );
+            let base = FilterDsl::filter(S::SessionsQuery::default(), S::session_pk(session_id));
             let query = SelectDsl::select(
                 base,
                 (S::Revoked::default(), S::AbsoluteDeadlineMs::default()),
@@ -593,7 +605,6 @@ mod db {
         ) -> Result<RefreshOutcome<S::Id>, AuthStoreError> {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
-            let session_id = session_id.to_owned();
             let presented_hash = hash_secret(secret).to_vec();
             let now_ms = unix_ms(now);
             let idle = unix_ms(now + self.lifetimes.idle_window);
@@ -601,17 +612,15 @@ mod db {
             let new_hash = hash_secret(&new_secret).to_vec();
             let mut conn = self.pool.get().await.map_err(backend)?;
             let outcome = {
-                let session_id = session_id.clone();
                 conn.transaction::<_, AuthStoreError, _>(|conn| {
                     async move {
                         // Lock the row so two concurrent refreshers cannot both
                         // rotate and trip the reuse defense.
-                        let row: Option<SessionRow<S>> =
-                            S::session_row_for_update(session_id.clone())
-                                .get_result(conn)
-                                .await
-                                .optional()
-                                .map_err(backend)?;
+                        let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
+                            .get_result(conn)
+                            .await
+                            .optional()
+                            .map_err(backend)?;
                         let (
                             user_id,
                             attrs,
@@ -634,15 +643,15 @@ mod db {
                             return Err(AuthStoreError::Reuse);
                         }
                         let capped_idle = idle.min(absolute_deadline);
-                        S::rotation_update(session_id.clone(), new_hash, capped_idle)
+                        S::rotation_update(session_id, new_hash, capped_idle)
                             .execute(conn)
                             .await
                             .map_err(backend)?;
                         let context = context_from_attrs(user_id, attrs)?;
                         Ok(RefreshOutcome {
-                            session_id: session_id.clone(),
+                            session_id,
                             context,
-                            refresh_token: format_refresh(&session_id, &new_secret),
+                            refresh_token: format_refresh(session_id, &new_secret),
                             session_expires_at: time_from_ms(capped_idle),
                         })
                     }
@@ -651,7 +660,7 @@ mod db {
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse)) {
-                S::revoke_update(session_id.clone())
+                S::revoke_update(session_id)
                     .execute(&mut conn)
                     .await
                     .map_err(backend)?;
@@ -659,9 +668,9 @@ mod db {
             outcome
         }
 
-        async fn revoke_session(&self, session_id: &str) -> Result<(), AuthStoreError> {
+        async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            S::revoke_update(session_id.to_owned())
+            S::revoke_update(session_id)
                 .execute(&mut conn)
                 .await
                 .map_err(backend)?;
@@ -670,14 +679,14 @@ mod db {
 
         async fn set_retained_provider_token(
             &self,
-            session_id: &str,
+            session_id: SessionId,
             token: &RetainedProviderToken,
             _now: SystemTime,
         ) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let expires_at_ms = token.expires_at.map(unix_ms);
             let row = S::new_provider_token(
-                session_id.to_owned(),
+                session_id,
                 token.issuer.clone(),
                 token.access_token.clone(),
                 token.refresh_token.clone(),
@@ -701,13 +710,10 @@ mod db {
 
         async fn retained_provider_token(
             &self,
-            session_id: &str,
+            session_id: SessionId,
         ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let base = FilterDsl::filter(
-                S::ProviderTokensQuery::default(),
-                S::pt_pk(session_id.to_owned()),
-            );
+            let base = FilterDsl::filter(S::ProviderTokensQuery::default(), S::pt_pk(session_id));
             let query = SelectDsl::select(
                 base,
                 (

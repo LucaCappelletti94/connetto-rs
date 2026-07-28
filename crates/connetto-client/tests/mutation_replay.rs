@@ -157,7 +157,7 @@ fn black_hole() -> LoopbackTransport {
         };
         let _ = fake_server
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                session_id: "black-hole".to_owned(),
+                connection_id: "black-hole".to_owned(),
                 session_token: "black-hole".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,

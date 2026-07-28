@@ -665,7 +665,7 @@ where
                 }
                 _ => {}
             }
-            Ok((ack.session_id, ack.last_applied_seq, ack.schema_version))
+            Ok((ack.connection_id, ack.last_applied_seq, ack.schema_version))
         }
         // A rejected credential is fatal for this attempt and routes to
         // re-login, not a generic reconnect that would spin forever.
@@ -700,7 +700,7 @@ pub struct ConnettoConnection<T: Transport> {
     db: SqliteConnection,
     last_cursor: Option<Cursor>,
     next_seq: u64,
-    session_id: String,
+    connection_id: String,
     /// The server's schema version from the handshake ack, kept so a relay can
     /// forward it verbatim to its tabs and (Phase 7) a stale build can be
     /// detected against the baked schema.
@@ -857,7 +857,7 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let (session_id, watermark, schema_version) =
+        let (connection_id, watermark, schema_version) =
             exchange_handshake(&mut transport, config, None, resume.as_ref()).await?;
 
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
@@ -867,7 +867,7 @@ where
             db,
             last_cursor: resume,
             next_seq,
-            session_id,
+            connection_id,
             schema_version,
             dirty,
             changed,
@@ -909,7 +909,7 @@ where
     /// keeps its previous (dead) transport in that case, so a caller can try
     /// again with another one.
     pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
-        let (session_id, watermark, schema_version) = exchange_handshake(
+        let (connection_id, watermark, schema_version) = exchange_handshake(
             &mut transport,
             &self.config,
             self.token_source.as_ref(),
@@ -917,7 +917,7 @@ where
         )
         .await?;
         self.transport = transport;
-        self.session_id = session_id;
+        self.connection_id = connection_id;
         self.schema_version = schema_version;
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
@@ -957,10 +957,11 @@ where
         Ok(())
     }
 
-    /// The server-assigned session id from the handshake ack.
+    /// The per-connection routing label from the handshake ack. This is not
+    /// identity and must not be treated as such.
     #[must_use]
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
     }
 
     /// The server's schema version from the handshake ack, or `None` when the

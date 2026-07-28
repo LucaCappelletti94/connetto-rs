@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     let mut client = ConnettoConnection::connect(transport, &db_path, &sqlite_ddl, &config, None)
         .await
         .map_err(|err| anyhow!("connecting sync client: {err}"))?;
-    eprintln!("connected, session {}", client.session_id());
+    eprintln!("connected, connection {}", client.connection_id());
     client
         .subscribe(&sub_id, &query)
         .await

@@ -80,7 +80,7 @@ pub struct VerifiedSession<Id = String> {
     /// The identity the session carries.
     pub context: AuthContext<Id>,
     /// The connetto-minted session id, keyed on by the durable watermark.
-    pub session_id: String,
+    pub session_id: crate::SessionId,
 }
 
 /// A [`SessionVerifier`](crate::traits::SessionVerifier) stand-in that trusts
@@ -90,10 +90,10 @@ pub struct VerifiedSession<Id = String> {
 /// It mirrors the permissive stand-in for
 /// [`AuthPolicy`](crate::traits::AuthPolicy): it lets tests and local loops run
 /// with no live identity provider. It refuses only an empty token (an absent
-/// credential) and otherwise resolves the token string itself as both the
-/// `user_id` and the session id, so a reconnect on the same token keeps its
-/// watermark. It MUST NOT front a production deployment, because it verifies
-/// nothing and so leaves the identity attacker-chosen.
+/// credential) and otherwise resolves the token string itself as the `user_id`
+/// and a deterministic hash of it as the session id, so a reconnect on the same
+/// token keeps its watermark. It MUST NOT front a production deployment,
+/// because it verifies nothing and so leaves the identity attacker-chosen.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrustingSessionVerifier;
 
@@ -110,7 +110,7 @@ impl crate::traits::SessionVerifier<String> for TrustingSessionVerifier {
             }
             Ok(VerifiedSession {
                 context: AuthContext::new(auth_token),
-                session_id: auth_token.to_owned(),
+                session_id: crate::SessionId::from_token_hash(auth_token),
             })
         })
     }
