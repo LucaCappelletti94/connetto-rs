@@ -80,11 +80,39 @@ The globally unique identifier for a user is the pair of the issuer claim and th
 The identity mapping, connetto's own sessions and refresh tokens, and the user's retained provider tokens all live in one pluggable store, and connetto ships two implementations. The choice is not only where this state lives, it is also the deployment topology, because a store that is not shared cannot back more than one server.
 
 1. **In-memory store.** Holds the state in the server process. Identity is resolved by a deterministic mapping from `(iss, sub)` with no lookup, for example a name-based (version 5) UUID over issuer and subject. Revocation and the handshake liveness check are instant local operations. This variant is single-server by nature, because in-memory state is not shared, and it is ephemeral, because a restart drops the sessions and tokens and forces clients to log in again. It suits development and simple single-server deployments.
-2. **Database store.** The struct generic over diesel column markers (the provider column, the subject column, the local user id column, the token columns), holding the state in the application database. Identity is resolved by looking `(provider, subject)` up in that table, which lets one human hold several linked logins and gives the deployment full ownership of its ids. It is durable across restart and is the only variant that supports a mesh, where its rows replicate like any other. Revocation is a row delete, instant on the local node and propagating to peers at replication speed.
+2. **Database store.** `DbAuthStore<S>` is generic over a `ConnettoStoreSchema` trait that carries the deployment's `sessions` and `provider_tokens` tables, their columns, and the typed distributed `Id` type, plus a handful of opaque pre-built statements (the `FOR UPDATE` rotate read and the two UPDATEs, which the diesel trait solver cannot name generically). connetto keeps every query and security decision (rotation, reuse-is-theft, liveness, deadline capping) and emits no schema. Identity is resolved by a deployment-supplied `IdentityResolver` that maps the verified claims to a typed `user_id` in the deployment's own users table (creating or linking the row so the `sessions.user_id` foreign-key target exists), which lets one human hold several linked logins and gives the deployment full ownership of its ids. The sessions row stores the typed `user_id` in its own column plus one opaque `attrs` JSONB blob holding the rest of the `AuthContext` (tenant, roles, claims) with no `user_id` duplicated. It is durable across restart and is the only variant that supports a mesh, where its rows replicate like any other. The resolver runs against the same Postgres as the store.
 
 Retained provider tokens live in whichever store, and connetto exposes a lazy refreshing accessor that returns a currently-valid provider access token, refreshing inline against the provider when the stored one has expired, persisting the rotated refresh token in the same store transaction, and serializing concurrent callers on that token row so two of them cannot double-refresh and trip the provider's rotation-reuse defense. connetto runs no background refresh job, a token is refreshed only when it is about to be used, which is fewer provider requests and avoids a mesh-wide scheduler.
 
 Mapping runs once, at the login callback, when connetto mints the session, not on the handshake hot path. Account linking (attaching a second provider identity to an existing user) uses the standard safe procedure: the user must be authenticated on both accounts at link time, and identities are never linked on a shared email address alone.
+
+### Migrations: the tables are the deployment's
+
+connetto emits zero server DDL. The tables below are the deployment's to create and migrate, and `ConnettoStoreSchema` is the real contract, implementable by hand against whatever tables (and column names, extra columns, foreign keys, or indexes) the deployment wants. The `connetto_auth_tables!(Id, IdSqlType)` macro is a convenience default only: it expands to these `diesel::table!` blocks and a `ConnettoStoreSchema` impl for the default shape, parameterized by the developer's `Id` type and its diesel SQL type. A deployment that wants a different shape skips the macro and implements the trait.
+
+The `user_id` type is a placeholder the deployment fills for its `Id` (for example `BYTEA` for a `uuid`, or `TEXT` for a string id as the reference binary uses). The reference SQL:
+
+```sql
+CREATE TABLE connetto_sessions (
+    session_id           TEXT PRIMARY KEY,
+    user_id              <IdSqlType> NOT NULL REFERENCES your_users (id),
+    attrs                JSONB NOT NULL,
+    current_refresh_hash BYTEA NOT NULL,
+    idle_deadline_ms     BIGINT NOT NULL,
+    absolute_deadline_ms BIGINT NOT NULL,
+    revoked              BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE connetto_provider_tokens (
+    session_id    TEXT PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE,
+    issuer        TEXT NOT NULL,
+    access_token  TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at_ms BIGINT
+);
+```
+
+`session_id` is connetto-minted and connetto-owned (a `String` today, see the roadmap for making it a `Copy` uuid). `user_id` foreign-keys the deployment's own users table, the row the `IdentityResolver` produced. Row cleanup (deleting revoked and absolute-expired sessions) is the deployment's, since it owns the tables; a recommended cleanup is a periodic `DELETE FROM connetto_sessions WHERE revoked OR absolute_deadline_ms < <now_ms>`.
 
 ### Multi-factor assurance
 
@@ -214,7 +242,7 @@ See `open-questions.md` section 11, where Q11.1 through Q11.4 are resolved: cons
 ## Decisions
 
 - **Backend-For-Frontend, and it is the only sanctioned model.** connetto-server is the OAuth client, provider tokens never reach the frontend, and connetto mints and verifies its own session credential. The client-as-OAuth-client alternative is documented as buildable but not supported.
-- **One pluggable auth store, two variants.** An in-memory store (single-server, ephemeral) and a database store (the struct generic over diesel columns, durable, mesh-capable). The store holds the identity mapping, connetto's sessions and refresh tokens, and the user's retained provider tokens. Identity resolves deterministically from `(iss, sub)` in the in-memory case and through the linking table in the database case, the latter supporting account linking.
+- **One pluggable auth store, two variants.** An in-memory store (single-server, ephemeral) and a database store (`DbAuthStore<S>` generic over a `ConnettoStoreSchema` trait, durable, mesh-capable, connetto emitting no schema). The store holds connetto's sessions and refresh tokens and the user's retained provider tokens. Identity resolves through an `IdentityResolver`: a deterministic `(iss, sub)` to UUID v5 mapping by default (the in-memory store), or the deployment's own users-table mapping (creating or linking rows) in the database case, the latter supporting account linking.
 - **Runtime provider registry, indexed by issuer**, with per-provider structs (client credentials, issuer, audience, tenant, scopes, assurance bar) added over time and no blessed default.
 - **Signed access token plus stored rotating refresh token.** The handshake checks the signature and expiry locally and checks session liveness in the store, so revocation is authoritative. Refresh and revocation live in the store.
 - **Provider tokens are retained in the store and reused through a lazy refreshing accessor**, with no background refresh job. An application calls provider APIs with the scopes it configured.
