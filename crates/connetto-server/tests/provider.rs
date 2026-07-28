@@ -180,6 +180,10 @@ fn dev_identity() -> ResolvedIdentity {
     ResolvedIdentity {
         issuer: "https://dev.example".to_owned(),
         subject: "alice".to_owned(),
+        email: None,
+        name: None,
+        amr: Vec::new(),
+        acr: None,
         tenant_id: None,
         roles: Vec::new(),
         claims: BTreeMap::new(),
@@ -210,7 +214,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
     };
     let pair = service.login_with_provider(&login).await.expect("login");
     let session_id = authority
-        .verify_access(&pair.access_token)
+        .verify_access::<String>(&pair.access_token)
         .expect("verify")
         .session_id;
 
@@ -244,7 +248,7 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
     };
     let pair = service.login_with_provider(&login).await.expect("login");
     let session_id = authority
-        .verify_access(&pair.access_token)
+        .verify_access::<String>(&pair.access_token)
         .expect("verify")
         .session_id;
 

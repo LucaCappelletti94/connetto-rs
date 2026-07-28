@@ -543,6 +543,7 @@ dependencies = [
  "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=d0247132b7a571f70601fb389f119863b32ba94d)",
  "ring",
  "rmp-serde",
+ "rosetta-uuid",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3990,6 +3991,7 @@ dependencies = [
  "chrono",
  "diesel",
  "getrandom 0.4.3",
+ "serde",
  "uuid",
 ]
 

@@ -33,12 +33,12 @@ use connetto_core::SchemaVersion;
 use connetto_core::auth::AuthContext;
 use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
 use connetto_server::{
-    AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, GenericOidcProvider,
-    InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig, PermissiveAuth,
-    PermissiveProvider, PgSnapshotSource, ProviderRegistry, ReconnectPolicy, RedirectPolicy,
-    RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RlsAuthError,
+    AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
+    GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
+    PermissiveAuth, PermissiveProvider, PgSnapshotSource, ProviderRegistry, ReconnectPolicy,
+    RedirectPolicy, RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RlsAuthError,
     RuntimeWritableCatalog, SessionConfig, SessionManager, TokenAuthority, WebSocketTransport,
-    auth_router, pg_write_target, provision_auth_tables,
+    auth_router, connetto_auth_tables, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -47,6 +47,11 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
+
+// The reference binary uses the default connetto auth tables over `Id = String`
+// (Text `user_id`), matching the `DefaultUuidResolver`. Generates the
+// `connetto_sessions`/`connetto_provider_tokens` tables and `ConnettoAuthSchema`.
+connetto_auth_tables!(String, diesel::sql_types::Text);
 
 /// The read-authorization policy chosen at startup.
 ///
@@ -98,11 +103,13 @@ impl AuthPolicy for ServerAuth {
 enum ServerStore {
     /// Single-server, ephemeral, deterministic identity mapping.
     InMemory(InMemoryAuthStore),
-    /// Durable and mesh-capable, identity through the linking table.
-    Db(DbAuthStore),
+    /// Durable and mesh-capable, identity resolved by the deployment.
+    Db(DbAuthStore<ConnettoAuthSchema>),
 }
 
 impl AuthStore for ServerStore {
+    type Id = String;
+
     async fn create_session(
         &self,
         identity: &ResolvedIdentity,
@@ -189,10 +196,14 @@ async fn build_auth(
     let store = match mode.as_str() {
         "in-memory" => ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes())),
         "database" => {
-            provision_auth_tables(pool)
-                .await
-                .map_err(|err| anyhow!("provisioning auth tables: {err}"))?;
-            ServerStore::Db(DbAuthStore::new(pool.clone(), config.refresh_lifetimes()))
+            // connetto emits no DDL: the deployment owns and migrates the
+            // `connetto_sessions`/`connetto_provider_tokens` tables. The
+            // reference binary resolves identity to a deterministic UUID v5.
+            ServerStore::Db(DbAuthStore::new(
+                pool.clone(),
+                config.refresh_lifetimes(),
+                Arc::new(DefaultUuidResolver),
+            ))
         }
         other => {
             return Err(anyhow!(
@@ -241,6 +252,10 @@ async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
             let identity = ResolvedIdentity {
                 issuer: "connetto-dev".to_owned(),
                 subject: env_or("CONNETTO_DEV_SUBJECT", "dev-user"),
+                email: None,
+                name: None,
+                amr: Vec::new(),
+                acr: None,
                 tenant_id: None,
                 roles: Vec::new(),
                 claims: std::collections::BTreeMap::new(),

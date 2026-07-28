@@ -61,8 +61,13 @@ struct FixedVerifier(AuthContext);
 
 impl SessionVerifier for FixedVerifier {
     fn verify_session<'a>(&'a self, _auth_token: &'a str) -> SessionVerifyFuture<'a> {
-        let ctx = self.0.clone();
-        Box::pin(async move { Ok(ctx) })
+        let context = self.0.clone();
+        Box::pin(async move {
+            Ok(connetto_core::VerifiedSession {
+                context,
+                session_id: "fixed-session".to_owned(),
+            })
+        })
     }
 }
 

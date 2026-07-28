@@ -361,7 +361,7 @@ struct PendingEntry {
 }
 
 /// The in-flight authorizations, keyed by `state`. Bounded and time-limited: an
-/// entry past [`PENDING_LOGIN_TTL`] is refused at the callback and dropped, and
+/// entry past `PENDING_LOGIN_TTL` is refused at the callback and dropped, and
 /// when the cap is reached expired entries go first, then the oldest.
 pub struct PendingLogins {
     inner: std::sync::Mutex<HashMap<String, PendingEntry>>,
@@ -445,7 +445,7 @@ struct CodeEntry {
 
 /// The outstanding one-time authorization codes, keyed by the code. Bounded,
 /// single-use, and time-limited: a code is removed the moment it is redeemed,
-/// an entry past [`AUTH_CODE_TTL`] is refused and dropped, and when the cap is
+/// an entry past `AUTH_CODE_TTL` is refused and dropped, and when the cap is
 /// reached expired codes go first, then the oldest.
 pub struct AuthCodes {
     inner: std::sync::Mutex<HashMap<String, CodeEntry>>,
@@ -512,6 +512,10 @@ mod tests {
         ResolvedIdentity {
             issuer: issuer.to_owned(),
             subject: subject.to_owned(),
+            email: None,
+            name: None,
+            amr: Vec::new(),
+            acr: None,
             tenant_id: None,
             roles: Vec::new(),
             claims: BTreeMap::new(),

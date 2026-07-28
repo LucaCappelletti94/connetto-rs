@@ -13,7 +13,7 @@
 //! `MaybeSend` IS `Send`.
 
 use crate::{
-    auth::AuthContext,
+    auth::{AuthContext, VerifiedSession},
     cursor::Cursor,
     messages::{BulkMessage, ControlMessage},
 };
@@ -181,14 +181,14 @@ pub enum MutationOp {
 /// batching profiles differ. Read checks fire per (row, subscription) on the
 /// CDC hot path. Write checks fire per client mutation.
 #[allow(async_fn_in_trait)]
-pub trait AuthPolicy {
+pub trait AuthPolicy<Id = String> {
     /// Policy-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
     /// Whether `ctx` may see the row identified by `(table, pk)`.
     async fn can_read(
         &self,
-        ctx: &AuthContext,
+        ctx: &AuthContext<Id>,
         table: &str,
         pk: &[u8],
     ) -> Result<bool, Self::Error>;
@@ -196,7 +196,7 @@ pub trait AuthPolicy {
     /// Whether `ctx` may perform `op` on the row identified by `(table, pk)`.
     async fn can_write(
         &self,
-        ctx: &AuthContext,
+        ctx: &AuthContext<Id>,
         table: &str,
         pk: &[u8],
         op: MutationOp,
@@ -236,10 +236,12 @@ impl std::error::Error for SessionVerifyError {}
 /// A trait object cannot carry an `async fn` directly, so verification returns
 /// an explicitly boxed `Send` future. Verification fires once per connection
 /// off any hot path, so the box allocation is irrelevant.
-pub type SessionVerifyFuture<'a> =
-    core::pin::Pin<Box<dyn Future<Output = Result<AuthContext, SessionVerifyError>> + Send + 'a>>;
+pub type SessionVerifyFuture<'a, Id = String> = core::pin::Pin<
+    Box<dyn Future<Output = Result<VerifiedSession<Id>, SessionVerifyError>> + Send + 'a>,
+>;
 
-/// Turns connetto's own session credential into a verified [`AuthContext`].
+/// Turns connetto's own session credential into a verified
+/// [`VerifiedSession`] (identity context plus the connetto-minted session id).
 ///
 /// The handshake resolves identity only through this seam, never from the
 /// client-supplied `client_id`. A real implementation verifies the token's
@@ -248,14 +250,14 @@ pub type SessionVerifyFuture<'a> =
 /// authoritative rather than bounded by the token lifetime. See
 /// `docs/architecture/11-authentication.md`.
 ///
-/// It is held as a runtime trait object on the server (`Arc<dyn SessionVerifier>`)
+/// It is held as a runtime trait object on the server (`Arc<dyn SessionVerifier<Id>>`)
 /// rather than a generic type parameter, because verification is off any hot
 /// path so static dispatch buys nothing, and a trait object keeps the server's
 /// public type signature stable no matter how a deployment configures identity.
 /// This mirrors the [`AuthPolicy`] pattern of a real implementation plus a
 /// permissive stand-in ([`TrustingSessionVerifier`](crate::auth::TrustingSessionVerifier)).
-pub trait SessionVerifier: Send + Sync {
+pub trait SessionVerifier<Id = String>: Send + Sync {
     /// Verify `auth_token` (connetto's own access token) and resolve the session
-    /// identity, or refuse it with a [`SessionVerifyError`].
-    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a>;
+    /// identity plus its session id, or refuse it with a [`SessionVerifyError`].
+    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a, Id>;
 }

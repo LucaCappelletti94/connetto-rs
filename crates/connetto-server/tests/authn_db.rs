@@ -1,6 +1,6 @@
 //! Docker-gated database auth store test.
 //!
-//! Exercises [`DbAuthStore`]: identity resolution through the linking table,
+//! Exercises [`DbAuthStore`]: identity resolution through the resolver,
 //! session creation and liveness, rotating refresh with reuse detection, and
 //! revocation. `#[ignore]` by default because it needs a running Postgres.
 //! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
@@ -13,18 +13,58 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use connetto_server::{
-    AuthConfig, AuthStore, AuthStoreError, DbAuthStore, ResolvedIdentity, RetainedProviderToken,
-    provision_auth_tables,
+    AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
+    RetainedProviderToken, connetto_auth_tables,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
+// The reference default schema over `Id = String` (Text `user_id`): generates
+// `ConnettoAuthSchema` plus the `connetto_sessions`/`connetto_provider_tokens`
+// diesel tables the store queries against.
+connetto_auth_tables!(String, diesel::sql_types::Text);
+
+/// Reset the deployment-owned auth tables. connetto emits no DDL, so the test
+/// owns the migration. `CREATE TABLE` and `DROP TABLE` are DDL the typed DSL
+/// cannot express, the documented `sql_query` exception; the reference SQL
+/// mirrors `docs/architecture/11-authentication.md`.
+async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
+    let mut conn = pool.get().await.expect("connection");
+    for stmt in [
+        "DROP TABLE IF EXISTS connetto_provider_tokens",
+        "DROP TABLE IF EXISTS connetto_sessions",
+        "CREATE TABLE connetto_sessions (\
+            session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attrs JSONB NOT NULL, \
+            current_refresh_hash BYTEA NOT NULL, idle_deadline_ms BIGINT NOT NULL, \
+            absolute_deadline_ms BIGINT NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+        "CREATE TABLE connetto_provider_tokens (\
+            session_id TEXT PRIMARY KEY, issuer TEXT NOT NULL, access_token TEXT NOT NULL, \
+            refresh_token TEXT, expires_at_ms BIGINT)",
+    ] {
+        sql_query(stmt).execute(&mut conn).await.expect("ddl");
+    }
+}
+
+/// Build the database store over the default schema, resolving identity to a
+/// deterministic UUID v5 (the in-memory default resolver, run against Postgres).
+fn build_store(pool: &Pool<AsyncPgConnection>) -> DbAuthStore<ConnettoAuthSchema> {
+    DbAuthStore::new(
+        pool.clone(),
+        AuthConfig::default().refresh_lifetimes(),
+        std::sync::Arc::new(DefaultUuidResolver),
+    )
+}
+
 fn identity(subject: &str) -> ResolvedIdentity {
     ResolvedIdentity {
         issuer: "https://issuer.example".to_owned(),
         subject: subject.to_owned(),
+        email: None,
+        name: None,
+        amr: Vec::new(),
+        acr: None,
         tenant_id: Some("tenant-db".to_owned()),
         roles: vec!["member".to_owned()],
         claims: BTreeMap::new(),
@@ -48,24 +88,12 @@ static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 async fn db_store_creates_resolves_rotates_and_revokes() {
     let _serial = PG_SERIAL.lock().await;
     let pool = pool().await;
-    {
-        let mut conn = pool.get().await.expect("connection");
-        sql_query("DROP TABLE IF EXISTS connetto_sessions")
-            .execute(&mut conn)
-            .await
-            .expect("drop sessions");
-        sql_query("DROP TABLE IF EXISTS connetto_identities")
-            .execute(&mut conn)
-            .await
-            .expect("drop identities");
-    }
-    provision_auth_tables(&pool).await.expect("provision");
-
-    let store = DbAuthStore::new(pool.clone(), AuthConfig::default().refresh_lifetimes());
+    reset_auth_tables(&pool).await;
+    let store = build_store(&pool);
     let now = SystemTime::now();
 
     // Two logins for the same (issuer, subject) resolve to one deployment-owned
-    // user id through the linking table, and each is its own live session.
+    // user id through the deterministic resolver, and each is its own live session.
     let first = store
         .create_session(&identity("frank"), now)
         .await
@@ -140,19 +168,8 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
 async fn db_store_retains_and_replaces_provider_tokens() {
     let _serial = PG_SERIAL.lock().await;
     let pool = pool().await;
-    {
-        let mut conn = pool.get().await.expect("connection");
-        for stmt in [
-            "DROP TABLE IF EXISTS connetto_provider_tokens",
-            "DROP TABLE IF EXISTS connetto_sessions",
-            "DROP TABLE IF EXISTS connetto_identities",
-        ] {
-            sql_query(stmt).execute(&mut conn).await.expect("drop");
-        }
-    }
-    provision_auth_tables(&pool).await.expect("provision");
-
-    let store = DbAuthStore::new(pool.clone(), AuthConfig::default().refresh_lifetimes());
+    reset_auth_tables(&pool).await;
+    let store = build_store(&pool);
     let now = SystemTime::now();
     let issued = store
         .create_session(&identity("grace"), now)

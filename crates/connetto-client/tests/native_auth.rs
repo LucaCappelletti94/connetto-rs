@@ -22,6 +22,10 @@ fn identity() -> ResolvedIdentity {
     ResolvedIdentity {
         issuer: "https://dev.example".to_owned(),
         subject: "native-user".to_owned(),
+        email: None,
+        name: None,
+        amr: Vec::new(),
+        acr: None,
         tenant_id: None,
         roles: Vec::new(),
         claims: BTreeMap::new(),

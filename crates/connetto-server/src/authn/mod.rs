@@ -13,12 +13,18 @@
 //! ([`service`]), and the HTTP endpoints ([`http`]).
 
 pub mod http;
+pub mod identity;
 pub mod provider;
 pub mod provider_oidc;
+#[cfg(feature = "pg-async")]
+pub mod schema;
 pub mod service;
 pub mod store;
 pub mod token;
 
+pub use identity::{
+    DefaultUuidResolver, IdentityResolver, ResolveError, ResolveFuture, VerifiedClaims,
+};
 pub use provider::{
     AssuranceRequirement, AuthCodes, IdentityProvider, IssuedAuthCode, LoginRedirect, PendingLogin,
     PendingLogins, PermissiveProvider, ProviderError, ProviderRegistry, RetainedProviderToken,
@@ -32,4 +38,6 @@ pub use store::{
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 
 #[cfg(feature = "pg-async")]
-pub use store::{DbAuthStore, provision_auth_tables};
+pub use schema::{ConnettoStoreSchema, StoreColumn};
+#[cfg(feature = "pg-async")]
+pub use store::DbAuthStore;

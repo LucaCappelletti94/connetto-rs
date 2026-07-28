@@ -133,10 +133,10 @@ impl WriteTarget {
     /// The SQLite path ignores `ctx` for authorization (it has no RLS), the
     /// Postgres path applies under `ctx.user_id`. Both key the watermark by
     /// `(user id, client id)`.
-    pub(crate) async fn commit(
+    pub(crate) async fn commit<Id: core::fmt::Display>(
         &self,
         materializer: &Mutex<Materializer>,
-        ctx: &AuthContext,
+        ctx: &AuthContext<Id>,
         plan: &WritePlan,
         payload_zstd: &[u8],
         client_id: &str,
@@ -176,9 +176,9 @@ impl WriteTarget {
         not(feature = "pg-async"),
         allow(clippy::unused_async, clippy::unused_async_trait_impl)
     )]
-    pub(crate) async fn last_applied(
+    pub(crate) async fn last_applied<Id: core::fmt::Display>(
         &self,
-        ctx: &AuthContext,
+        ctx: &AuthContext<Id>,
         client_id: &str,
     ) -> Result<Option<u64>, WriteError> {
         match self {
@@ -188,7 +188,7 @@ impl WriteTarget {
                 let rows: Vec<WatermarkRow> = diesel::sql_query(
                     "SELECT last_seq FROM _connetto_mutations WHERE user_id = ? AND client_id = ?",
                 )
-                .bind::<diesel::sql_types::Text, _>(&ctx.user_id)
+                .bind::<diesel::sql_types::Text, _>(ctx.user_id.to_string())
                 .bind::<diesel::sql_types::Text, _>(client_id)
                 .load(&mut *conn)?;
                 Ok(watermark_value(rows))
@@ -212,12 +212,12 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
     }
 }
 
-async fn commit_sqlite(
+async fn commit_sqlite<Id: core::fmt::Display>(
     target: &SqliteWriteTarget,
     materializer: &Mutex<Materializer>,
     plan: &WritePlan,
     payload_zstd: &[u8],
-    ctx: &AuthContext,
+    ctx: &AuthContext<Id>,
     client_id: &str,
     client_seq: u64,
 ) -> Result<WriteOutcome, WriteError> {
@@ -245,7 +245,7 @@ async fn commit_sqlite(
              ON CONFLICT (user_id, client_id) DO UPDATE SET \
              last_seq = MAX(last_seq, excluded.last_seq)",
         )
-        .bind::<diesel::sql_types::Text, _>(&ctx.user_id)
+        .bind::<diesel::sql_types::Text, _>(ctx.user_id.to_string())
         .bind::<diesel::sql_types::Text, _>(client_id)
         .bind::<diesel::sql_types::BigInt, _>(seq)
         .execute(conn)?;
@@ -359,9 +359,9 @@ mod pg {
     }
 
     impl PgWriteTarget {
-        pub(crate) async fn commit(
+        pub(crate) async fn commit<Id: core::fmt::Display>(
             &self,
-            ctx: &AuthContext,
+            ctx: &AuthContext<Id>,
             plan: &WritePlan,
             payload_zstd: &[u8],
             client_id: &str,
@@ -375,8 +375,8 @@ mod pg {
                 .get()
                 .await
                 .map_err(|err| WriteError::Backend(err.to_string()))?;
-            let user_id = ctx.user_id.clone();
-            let watermark_user = ctx.user_id.clone();
+            let user_id = ctx.user_id.to_string();
+            let watermark_user = ctx.user_id.to_string();
             let expected = plan.ops.len();
             let catalog = &self.catalog;
             let outcome = conn
@@ -434,9 +434,9 @@ mod pg {
             }
         }
 
-        pub(crate) async fn last_applied(
+        pub(crate) async fn last_applied<Id: core::fmt::Display>(
             &self,
-            ctx: &AuthContext,
+            ctx: &AuthContext<Id>,
             client_id: &str,
         ) -> Result<Option<u64>, WriteError> {
             let mut conn = self
@@ -447,7 +447,7 @@ mod pg {
             let rows: Vec<WatermarkRow> = sql_query(
                 "SELECT last_seq FROM _connetto_mutations WHERE user_id = $1 AND client_id = $2",
             )
-            .bind::<Text, _>(&ctx.user_id)
+            .bind::<Text, _>(ctx.user_id.to_string())
             .bind::<Text, _>(client_id)
             .load(&mut conn)
             .await

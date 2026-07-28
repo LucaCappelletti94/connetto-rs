@@ -74,6 +74,10 @@ fn identity(subject: &str) -> ResolvedIdentity {
     ResolvedIdentity {
         issuer: "https://issuer.example".to_owned(),
         subject: subject.to_owned(),
+        email: None,
+        name: None,
+        amr: Vec::new(),
+        acr: None,
         tenant_id: Some("tenant-1".to_owned()),
         roles: vec!["member".to_owned()],
         claims: BTreeMap::new(),
@@ -157,7 +161,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     // Revoke the session. Its access token is still time-valid, but the next
     // handshake is refused because liveness fails.
     let session_id = authority
-        .verify_access(&pair.access_token)
+        .verify_access::<String>(&pair.access_token)
         .expect("verify")
         .session_id;
     svc.revoke(&session_id).await.expect("revoke");
@@ -190,10 +194,10 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     assert_ne!(rotated.refresh_token, pair.refresh_token, "token rotates");
     // The rotated access token still verifies to the same session.
     let first = authority
-        .verify_access(&pair.access_token)
+        .verify_access::<String>(&pair.access_token)
         .expect("verify first");
     let second = authority
-        .verify_access(&rotated.access_token)
+        .verify_access::<String>(&rotated.access_token)
         .expect("verify rotated");
     assert_eq!(first.session_id, second.session_id);
 
@@ -217,7 +221,9 @@ async fn expired_access_token_is_refused() {
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let svc = AuthService::new(Arc::clone(&authority), Arc::clone(&store));
     let pair = svc.login(&identity("carol")).await.expect("login");
-    let verified = authority.verify_access(&pair.access_token).expect("verify");
+    let verified = authority
+        .verify_access::<String>(&pair.access_token)
+        .expect("verify");
 
     // Mint a token issued far enough in the past that it is already expired.
     let stale_issued = SystemTime::now() - (config.access_ttl + Duration::from_secs(120));
@@ -241,7 +247,9 @@ async fn a_token_from_another_key_is_refused() {
     // session id, simulating a forged credential.
     let other = TokenAuthority::generate(&config).expect("keypair b");
     let pair = svc.login(&identity("dave")).await.expect("login");
-    let verified = authority.verify_access(&pair.access_token).expect("verify");
+    let verified = authority
+        .verify_access::<String>(&pair.access_token)
+        .expect("verify");
     let forged = other
         .mint_access(&verified.context, &verified.session_id, SystemTime::now())
         .expect("mint forged");

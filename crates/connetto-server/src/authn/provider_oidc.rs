@@ -297,9 +297,14 @@ impl GenericOidcProvider {
             )));
         }
 
+        let email = claims.email().map(|email| email.as_str().to_owned());
+        let name = claims
+            .name()
+            .and_then(|localized| localized.get(None))
+            .map(|name| name.as_str().to_owned());
         let mut claims_map = BTreeMap::new();
-        if let Some(email) = claims.email() {
-            claims_map.insert("email".to_owned(), email.as_str().to_owned());
+        if let Some(email) = &email {
+            claims_map.insert("email".to_owned(), email.clone());
         }
         let tenant_id = self
             .issuer_match
@@ -308,6 +313,10 @@ impl GenericOidcProvider {
         Ok(ResolvedIdentity {
             issuer,
             subject: claims.subject().as_str().to_owned(),
+            email,
+            name,
+            amr: amr_owned,
+            acr: acr.map(str::to_owned),
             tenant_id,
             roles: Vec::new(),
             claims: claims_map,

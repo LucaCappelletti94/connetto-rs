@@ -111,7 +111,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: issued.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: issued.context.user_id.clone(),
+            user_id: issued.context.user_id.to_string(),
             session_expires_at_secs: unix_secs(issued.session_expires_at),
         })
     }
@@ -137,7 +137,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: issued.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: issued.context.user_id.clone(),
+            user_id: issued.context.user_id.to_string(),
             session_expires_at_secs: unix_secs(issued.session_expires_at),
         })
     }
@@ -217,7 +217,7 @@ impl<S: AuthStore> AuthService<S> {
             access_token,
             refresh_token: outcome.refresh_token,
             expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: outcome.context.user_id.clone(),
+            user_id: outcome.context.user_id.to_string(),
             session_expires_at_secs: unix_secs(outcome.session_expires_at),
         })
     }
@@ -260,12 +260,12 @@ impl<S: AuthStore> ConnettoSessionVerifier<S> {
     }
 }
 
-impl<S: AuthStore + 'static> SessionVerifier for ConnettoSessionVerifier<S> {
-    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a> {
+impl<S: AuthStore + 'static> SessionVerifier<S::Id> for ConnettoSessionVerifier<S> {
+    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a, S::Id> {
         Box::pin(async move {
             let verified = self
                 .authority
-                .verify_access(auth_token)
+                .verify_access::<S::Id>(auth_token)
                 .map_err(|err| SessionVerifyError::Invalid(err.to_string()))?;
             let live = self
                 .store
@@ -275,7 +275,7 @@ impl<S: AuthStore + 'static> SessionVerifier for ConnettoSessionVerifier<S> {
             if !live {
                 return Err(SessionVerifyError::Revoked);
             }
-            Ok(verified.context)
+            Ok(verified)
         })
     }
 }

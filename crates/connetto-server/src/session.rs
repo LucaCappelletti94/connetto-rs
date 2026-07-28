@@ -63,7 +63,7 @@ pub struct Snapshot {
 /// user's Row-Level Security so the snapshot already excludes rows the user
 /// cannot see.
 #[allow(async_fn_in_trait)]
-pub trait SnapshotSource: Send + Sync {
+pub trait SnapshotSource<Id = String>: Send + Sync {
     /// Snapshot-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
@@ -80,7 +80,7 @@ pub trait SnapshotSource: Send + Sync {
         &self,
         select_sql: &str,
         binds: &[BindValue],
-        auth: &AuthContext,
+        auth: &AuthContext<Id>,
     ) -> Result<Snapshot, Self::Error>;
 }
 
@@ -262,14 +262,14 @@ enum Outbound {
 /// Route from a `subql` consumer id back to the owning session's outbound
 /// channel.
 #[derive(Clone)]
-struct Route {
+struct Route<Id> {
     session_id: u64,
     sub_id: SubscriptionId,
     label: String,
     tx: mpsc::UnboundedSender<Outbound>,
     /// The subscribing session's identity, consulted per event for the read
     /// filter before a live patch is delivered.
-    auth_ctx: AuthContext,
+    auth_ctx: AuthContext<Id>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -281,16 +281,16 @@ struct AggRoute {
 }
 
 /// What a completed handshake establishes for the run loop.
-struct HandshakeOutcome {
+struct HandshakeOutcome<Id> {
     session_num: u64,
-    auth_ctx: AuthContext,
+    auth_ctx: AuthContext<Id>,
     resume_lsn: u64,
     client_id: String,
     applied_watermark: Option<u64>,
 }
 
 /// Mutable per-session state carried through the run loop.
-struct SessionState {
+struct SessionState<Id> {
     credits: u32,
     pending: VecDeque<BulkMessage>,
     subs: HashMap<String, (u64, SubscriptionId)>,
@@ -300,11 +300,10 @@ struct SessionState {
     delta_agg_subs: HashMap<String, (u64, SubscriptionId)>,
     outbound: mpsc::UnboundedSender<Outbound>,
     /// Session identity, established at handshake and consulted per write.
-    auth_ctx: AuthContext,
+    auth_ctx: AuthContext<Id>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// The client id from the handshake, keying the durable mutation
-    /// watermark together with the auth identity.
+    /// The client id from the handshake, a logging label carried on the wire.
     client_id: String,
     /// Highest `client_seq` durably applied for this client identity, from
     /// the write target at handshake and advanced per commit. A replayed
@@ -360,15 +359,15 @@ impl AsyncConnector for NoConnector {
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against an [`AuthPolicy`], a SQLite write target, and a
 /// re-execution connector for aggregate subscriptions.
-pub struct SessionManager<Snap, Auth, C = NoConnector, O = InMemoryOplog>
+pub struct SessionManager<Snap, Auth, C = NoConnector, O = InMemoryOplog, Id = String>
 where
-    Snap: SnapshotSource,
-    Auth: AuthPolicy + Send + Sync,
+    Snap: SnapshotSource<Id>,
+    Auth: AuthPolicy<Id> + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     O: Oplog,
 {
     materializer: Arc<Mutex<Materializer>>,
-    routes: Mutex<HashMap<u64, Route>>,
+    routes: Mutex<HashMap<u64, Route<Id>>>,
     agg_routes: Mutex<HashMap<u64, AggRoute>>,
     /// Delta aggregate routes keyed by consumer id. Kept separate from
     /// `agg_routes` (keyed by re-execution query id) because the two u64
@@ -382,7 +381,7 @@ where
     /// [`TrustingSessionVerifier`], which trusts the token and closes no
     /// spoofing hole, so a production deployment injects a real verifier
     /// through [`with_session_verifier`](Self::with_session_verifier).
-    verifier: Arc<dyn SessionVerifier>,
+    verifier: Arc<dyn SessionVerifier<Id>>,
     connector: C,
     oplog: O,
     target: WriteTarget,
@@ -487,7 +486,17 @@ where
             config,
         })
     }
+}
 
+impl<Snap, Auth, C, O, Id> SessionManager<Snap, Auth, C, O, Id>
+where
+    Snap: SnapshotSource<Id>,
+    Auth: AuthPolicy<Id> + Send + Sync,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
+    C::Error: core::fmt::Display,
+    O: Oplog,
+    Id: core::fmt::Display + Clone + Send + Sync + 'static,
+{
     /// Replace the session verifier that resolves identity at the handshake.
     ///
     /// The default is [`TrustingSessionVerifier`], which verifies nothing. A
@@ -500,7 +509,10 @@ where
     /// Panics if the manager is already shared (its `Arc` has other owners),
     /// because the verifier must be set before the manager is put to work.
     #[must_use]
-    pub fn with_session_verifier(self: Arc<Self>, verifier: Arc<dyn SessionVerifier>) -> Arc<Self> {
+    pub fn with_session_verifier(
+        self: Arc<Self>,
+        verifier: Arc<dyn SessionVerifier<Id>>,
+    ) -> Arc<Self> {
         let mut inner = Arc::into_inner(self)
             .expect("with_session_verifier must run before the manager is shared");
         inner.verifier = verifier;
@@ -515,7 +527,7 @@ where
         self.next_consumer.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn add_route(&self, consumer_id: u64, route: Route) {
+    async fn add_route(&self, consumer_id: u64, route: Route<Id>) {
         self.routes.lock().await.insert(consumer_id, route);
     }
 
@@ -774,7 +786,7 @@ where
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
-    ) -> Result<Option<HandshakeOutcome>, SessionError> {
+    ) -> Result<Option<HandshakeOutcome<Id>>, SessionError> {
         let handshake = match transport.recv().await.map_err(transport_err)? {
             Some(IncomingFrame::Control(ControlMessage::Handshake(hs))) => hs,
             Some(_) => return Err(SessionError::Protocol("expected handshake first".into())),
@@ -800,7 +812,7 @@ where
         // fatal frame and terminate before any subscription or catchup work, so
         // an unverifiable caller reaches no session state.
         let auth_ctx = match self.verifier.verify_session(&handshake.auth_token).await {
-            Ok(ctx) => ctx,
+            Ok(verified) => verified.context,
             Err(err) => {
                 let _ = transport
                     .send_control(ControlMessage::FatalError(FatalError::new(
@@ -952,7 +964,7 @@ where
         &self,
         transport: &mut T,
         msg: ControlMessage,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         session_num: u64,
     ) -> Result<(), SessionError> {
         match msg {
@@ -1020,7 +1032,7 @@ where
         &self,
         transport: &mut T,
         patch: MutationPatch,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
     ) -> Result<(), SessionError> {
         let client_seq = patch.client_seq;
         let Some(header) = state.pending_header.take() else {
@@ -1166,7 +1178,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         session_num: u64,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
@@ -1243,7 +1255,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         session_num: u64,
         reg: RowRegistration,
     ) -> Result<(), SessionError> {
@@ -1276,7 +1288,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         session_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
@@ -1339,7 +1351,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         session_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
@@ -1428,7 +1440,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         capture: crate::materializer::AggregateCapture,
     ) -> Result<(), SessionError> {
         let value = match self
@@ -1487,7 +1499,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState,
+        state: &mut SessionState<Id>,
         capture: DeltaAggregateCapture,
     ) -> Result<(), SessionError> {
         let row = match self

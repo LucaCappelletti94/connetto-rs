@@ -12,10 +12,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::auth::AuthContext;
+pub use connetto_core::auth::VerifiedSession;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Default access-token lifetime. Short by design: a re-auth cadence, not the
 /// revocation bound.
@@ -98,10 +99,10 @@ pub enum TokenError {
 /// `sid` names the session for the liveness check, and the identity fields
 /// rebuild the [`AuthContext`] at the handshake with no store round-trip.
 #[derive(Debug, Serialize, Deserialize)]
-struct AccessClaims {
+struct AccessClaims<Id> {
     iss: String,
     aud: String,
-    sub: String,
+    sub: Id,
     iat: u64,
     exp: u64,
     sid: String,
@@ -111,15 +112,6 @@ struct AccessClaims {
     roles: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claims: BTreeMap<String, String>,
-}
-
-/// A verified access token: the identity it carries and the session it names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedSession {
-    /// The identity the token asserts, trusted from the signature alone.
-    pub context: AuthContext,
-    /// The session id, checked for liveness against the auth store.
-    pub session_id: String,
 }
 
 /// Mints and verifies connetto's own asymmetrically signed access token.
@@ -200,9 +192,9 @@ impl TokenAuthority {
     ///
     /// [`TokenError::Clock`] if `issued_at` precedes the unix epoch, or
     /// [`TokenError::Mint`] if signing fails.
-    pub fn mint_access(
+    pub fn mint_access<Id: Serialize + Clone>(
         &self,
-        context: &AuthContext,
+        context: &AuthContext<Id>,
         session_id: &str,
         issued_at: SystemTime,
     ) -> Result<String, TokenError> {
@@ -233,12 +225,15 @@ impl TokenAuthority {
     /// # Errors
     ///
     /// [`TokenError::Verify`] if any check fails.
-    pub fn verify_access(&self, token: &str) -> Result<VerifiedSession, TokenError> {
+    pub fn verify_access<Id: DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<VerifiedSession<Id>, TokenError> {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.audience.as_str()]);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        let data = decode::<AccessClaims>(token, &self.decoding, &validation)
+        let data = decode::<AccessClaims<Id>>(token, &self.decoding, &validation)
             .map_err(|err| TokenError::Verify(err.to_string()))?;
         let claims = data.claims;
         let context = AuthContext {

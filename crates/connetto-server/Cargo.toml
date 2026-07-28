@@ -110,3 +110,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Isolated per-client SQLite database directories in the multi-process e2e test.
 tempfile = "3"
+# The demo distributed id type, driving the generic in-memory auth store over a
+# typed user id (not a string) in authn_generic_id.rs.
+rosetta-uuid = { version = "0.1.3", features = ["serde"] }

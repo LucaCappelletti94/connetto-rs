@@ -34,14 +34,15 @@ pub use auth::{RlsAuth, RlsAuthError};
 pub use authn::http::{RedirectPolicy, auth_router};
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
-    ConnettoSessionVerifier, GenericOidcProvider, IdentityProvider, InMemoryAuthStore,
-    IssuedAuthCode, IssuedSession, LoginRedirect, OidcProviderConfig, PendingLogin, PendingLogins,
-    PermissiveProvider, ProviderError, ProviderRegistry, RefreshLifetimes, RefreshOutcome,
-    ResolvedIdentity, RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedLogin,
-    VerifiedSession,
+    ConnettoSessionVerifier, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
+    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
+    OidcProviderConfig, PendingLogin, PendingLogins, PermissiveProvider, ProviderError,
+    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture,
+    ResolvedIdentity, RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
+    VerifiedLogin, VerifiedSession,
 };
 #[cfg(feature = "pg-async")]
-pub use authn::{DbAuthStore, provision_auth_tables};
+pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };

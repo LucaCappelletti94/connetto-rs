@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 /// keeps them opaque and forwards them into policy queries. Kept as a
 /// `BTreeMap` so serialization ordering is stable across encoders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthContext {
-    /// Stable user identifier resolved at handshake time.
-    pub user_id: String,
+pub struct AuthContext<Id = String> {
+    /// Stable user identifier resolved at handshake time. A developer-defined
+    /// distributed id type. Text appears only at the one Postgres GUC bind,
+    /// through [`Display`](std::fmt::Display).
+    pub user_id: Id,
     /// Optional tenant identifier for multi-tenant deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
@@ -29,9 +31,9 @@ pub struct AuthContext {
     pub claims: BTreeMap<String, String>,
 }
 
-impl AuthContext {
+impl<Id> AuthContext<Id> {
     /// Build an [`AuthContext`] from a user id, with no tenant, no roles, no extra claims.
-    pub fn new(user_id: impl Into<String>) -> Self {
+    pub fn new(user_id: impl Into<Id>) -> Self {
         Self {
             user_id: user_id.into(),
             tenant_id: None,
@@ -66,6 +68,21 @@ impl AuthContext {
     }
 }
 
+/// A verified session credential resolved by a
+/// [`SessionVerifier`](crate::traits::SessionVerifier): the identity context
+/// plus the connetto-minted session id the exactly-once watermark keys on.
+///
+/// The session id is connetto-owned (minted at login, carried in the signed
+/// access token's `sid` claim), never the client-fabricated `client_id`, so it
+/// survives a worker restart or a fresh transport on the same session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSession<Id = String> {
+    /// The identity the session carries.
+    pub context: AuthContext<Id>,
+    /// The connetto-minted session id, keyed on by the durable watermark.
+    pub session_id: String,
+}
+
 /// A [`SessionVerifier`](crate::traits::SessionVerifier) stand-in that trusts
 /// the presented token as the identity, performing no cryptographic
 /// verification.
@@ -73,21 +90,28 @@ impl AuthContext {
 /// It mirrors the permissive stand-in for
 /// [`AuthPolicy`](crate::traits::AuthPolicy): it lets tests and local loops run
 /// with no live identity provider. It refuses only an empty token (an absent
-/// credential) and otherwise resolves the token string itself as the `user_id`.
-/// It MUST NOT front a production deployment, because it verifies nothing and so
-/// leaves the identity attacker-chosen.
+/// credential) and otherwise resolves the token string itself as both the
+/// `user_id` and the session id, so a reconnect on the same token keeps its
+/// watermark. It MUST NOT front a production deployment, because it verifies
+/// nothing and so leaves the identity attacker-chosen.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrustingSessionVerifier;
 
-impl crate::traits::SessionVerifier for TrustingSessionVerifier {
-    fn verify_session<'a>(&'a self, auth_token: &'a str) -> crate::traits::SessionVerifyFuture<'a> {
+impl crate::traits::SessionVerifier<String> for TrustingSessionVerifier {
+    fn verify_session<'a>(
+        &'a self,
+        auth_token: &'a str,
+    ) -> crate::traits::SessionVerifyFuture<'a, String> {
         Box::pin(async move {
             if auth_token.trim().is_empty() {
                 return Err(crate::traits::SessionVerifyError::Invalid(
                     "no auth token presented at handshake".to_owned(),
                 ));
             }
-            Ok(AuthContext::new(auth_token))
+            Ok(VerifiedSession {
+                context: AuthContext::new(auth_token),
+                session_id: auth_token.to_owned(),
+            })
         })
     }
 }
