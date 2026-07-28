@@ -21,7 +21,7 @@ use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -98,7 +98,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, PermissiveAuth>;
+type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 
 /// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
 type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
@@ -219,7 +219,8 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -317,9 +318,7 @@ async fn offline_write_reflushes_after_resume() {
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_server::provision_watermark_table(fixture.admin())
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
     // Writes need an explicitly writable table: a default materializer
     // rejects every client mutation.
     let materializer = Materializer::with_write_catalog(
@@ -331,7 +330,8 @@ async fn offline_write_reflushes_after_resume() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let slot: ServeSlot = Arc::new(Mutex::new(None));
@@ -416,7 +416,8 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

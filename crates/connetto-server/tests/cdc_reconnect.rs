@@ -24,7 +24,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, ReconnectPolicy, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
@@ -159,7 +159,8 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         Materializer::new(PG_DDL).expect("build materializer"),
         EmptySnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let applier = Materializer::new(PG_DDL).expect("build applier");

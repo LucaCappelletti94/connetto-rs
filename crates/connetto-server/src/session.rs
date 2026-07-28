@@ -42,6 +42,7 @@ use crate::materializer::{
     agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
 /// Initial rows for a subscription, produced by a [`SnapshotSource`].
@@ -284,7 +285,9 @@ struct HandshakeOutcome<Id> {
     session_num: u64,
     auth_ctx: AuthContext<Id>,
     resume_lsn: u64,
-    client_id: String,
+    /// The connetto-minted session id from the verified token, the durable
+    /// watermark key.
+    session_id: String,
     applied_watermark: Option<u64>,
 }
 
@@ -302,8 +305,9 @@ struct SessionState<Id> {
     auth_ctx: AuthContext<Id>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// The client id from the handshake, a logging label carried on the wire.
-    client_id: String,
+    /// The connetto-minted session id from the verified token. The durable
+    /// watermark keys on it, so a reconnect reusing the same session dedupes.
+    session_id: String,
     /// Highest `client_seq` durably applied for this client identity, from
     /// the write target at handshake and advanced per commit. A replayed
     /// sequence at or below it is re-acknowledged, never re-applied.
@@ -358,12 +362,13 @@ impl AsyncConnector for NoConnector {
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against an [`AuthPolicy`], a SQLite write target, and a
 /// re-execution connector for aggregate subscriptions.
-pub struct SessionManager<Snap, Auth, C = NoConnector, O = InMemoryOplog, Id = String>
+pub struct SessionManager<Snap, Auth, W, C = NoConnector, O = InMemoryOplog, Id = String>
 where
     Snap: SnapshotSource<Id>,
     Auth: AuthPolicy<Id> + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     O: Oplog,
+    W: ConnettoWatermarkSchema<Id = Id>,
 {
     materializer: Arc<Mutex<Materializer>>,
     routes: Mutex<HashMap<u64, Route<Id>>>,
@@ -383,16 +388,17 @@ where
     verifier: Arc<dyn SessionVerifier<Id>>,
     connector: C,
     oplog: O,
-    target: PgWriteTarget,
+    target: PgWriteTarget<W>,
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
 }
 
-impl<Snap, Auth> SessionManager<Snap, Auth, NoConnector, InMemoryOplog>
+impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
+    W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with no re-execution connector and a default in-memory
     /// oplog.
@@ -405,7 +411,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        target: PgWriteTarget,
+        target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -420,12 +426,13 @@ where
     }
 }
 
-impl<Snap, Auth, C> SessionManager<Snap, Auth, C, InMemoryOplog>
+impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
+    W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with a re-execution connector and a default in-memory
     /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
@@ -435,7 +442,7 @@ where
         snapshot_source: Snap,
         auth: Auth,
         connector: C,
-        target: PgWriteTarget,
+        target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -450,13 +457,14 @@ where
     }
 }
 
-impl<Snap, Auth, C, O> SessionManager<Snap, Auth, C, O>
+impl<Snap, Auth, C, O, W> SessionManager<Snap, Auth, W, C, O>
 where
     Snap: SnapshotSource,
     Auth: AuthPolicy + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
+    W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with an explicit re-execution connector and oplog.
     #[must_use]
@@ -466,7 +474,7 @@ where
         auth: Auth,
         connector: C,
         oplog: O,
-        target: PgWriteTarget,
+        target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -487,7 +495,7 @@ where
     }
 }
 
-impl<Snap, Auth, C, O, Id> SessionManager<Snap, Auth, C, O, Id>
+impl<Snap, Auth, C, O, Id, W> SessionManager<Snap, Auth, W, C, O, Id>
 where
     Snap: SnapshotSource<Id>,
     Auth: AuthPolicy<Id> + Send + Sync,
@@ -495,6 +503,7 @@ where
     C::Error: core::fmt::Display,
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
+    W: ConnettoWatermarkSchema<Id = Id>,
 {
     /// Replace the session verifier that resolves identity at the handshake.
     ///
@@ -806,21 +815,23 @@ where
             )));
         }
 
-        // Resolve identity from the verified credential, never from the
-        // client-supplied id (that stays a logging label). On refusal, send a
-        // fatal frame and terminate before any subscription or catchup work, so
-        // an unverifiable caller reaches no session state.
-        let auth_ctx = match self.verifier.verify_session(&handshake.auth_token).await {
-            Ok(verified) => verified.context,
-            Err(err) => {
-                let _ = transport
-                    .send_control(ControlMessage::FatalError(FatalError::new(
-                        FatalErrorReason::AuthenticationFailed,
-                    )))
-                    .await;
-                return Err(SessionError::Authentication(err.to_string()));
-            }
-        };
+        // Resolve identity and the durable session id from the verified
+        // credential, never from the client-supplied `client_id` (that stays a
+        // pure logging label on the wire). On refusal, send a fatal frame and
+        // terminate before any subscription or catchup work, so an unverifiable
+        // caller reaches no session state.
+        let (auth_ctx, token_session_id) =
+            match self.verifier.verify_session(&handshake.auth_token).await {
+                Ok(verified) => (verified.context, verified.session_id),
+                Err(err) => {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::AuthenticationFailed,
+                        )))
+                        .await;
+                    return Err(SessionError::Authentication(err.to_string()));
+                }
+            };
 
         // Decode the resume cursor and read the server watermark for the ack. An
         // 8-byte cursor is the client's resume LSN; anything else is a fresh
@@ -834,7 +845,7 @@ where
         // at or below it and replays the rest.
         let applied_watermark = self
             .target
-            .last_applied(&auth_ctx, &handshake.client_id)
+            .last_applied(&auth_ctx, &token_session_id)
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
 
@@ -854,7 +865,7 @@ where
             session_num,
             auth_ctx,
             resume_lsn,
-            client_id: handshake.client_id,
+            session_id: token_session_id,
             applied_watermark,
         }))
     }
@@ -874,7 +885,7 @@ where
             session_num,
             auth_ctx,
             resume_lsn,
-            client_id,
+            session_id,
             applied_watermark,
         }) = self.run_handshake(&mut transport).await?
         else {
@@ -891,7 +902,7 @@ where
             outbound: outbound_tx,
             auth_ctx,
             pending_header: None,
-            client_id,
+            session_id,
             applied_watermark,
             resume_lsn,
         };
@@ -1098,7 +1109,7 @@ where
                 &state.auth_ctx,
                 &plan,
                 &patch.patchset_zstd,
-                &state.client_id,
+                &state.session_id,
                 client_seq,
             )
             .await

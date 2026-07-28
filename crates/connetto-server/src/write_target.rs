@@ -9,15 +9,21 @@
 //! [`PgWriteTarget`]'s commit path runs the conflict probe and the apply for one
 //! upload and reports the outcome, leaving the wire reply to the session layer.
 
+use core::marker::PhantomData;
+
 use connetto_core::auth::AuthContext;
+use diesel::OptionalExtension;
+use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Text};
+use diesel::sql_types::Text;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::ParserDB;
 use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
+
+use crate::watermark_schema::ConnettoWatermarkSchema;
 
 use crate::materializer::{
     ConflictProbe, MaterializerError, PlannedConflict, ServerRow, WritePlan, probe_conflict_pg,
@@ -67,27 +73,6 @@ impl From<diesel::result::Error> for WriteError {
     }
 }
 
-/// DDL for the durable per-client mutation watermark. It lives in the write
-/// target's own database, so advancing it commits atomically with the apply it
-/// belongs to.
-const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
-    (user_id TEXT NOT NULL, client_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
-    PRIMARY KEY (user_id, client_id))";
-
-/// Watermark row shape.
-#[derive(diesel::QueryableByName)]
-struct WatermarkRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    last_seq: i64,
-}
-
-/// Decode a loaded watermark row set into the watermark value.
-fn watermark_value(rows: Vec<WatermarkRow>) -> Option<u64> {
-    rows.into_iter()
-        .next()
-        .and_then(|row| u64::try_from(row.last_seq).ok())
-}
-
 /// The client sequence as the storage integer.
 fn seq_storage(client_seq: u64) -> Result<i64, WriteError> {
     i64::try_from(client_seq)
@@ -113,9 +98,13 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
 /// subql's catalog-only entry point, so the catalog is shared by reference
 /// across the apply `await` (`ParserDB` is `Sync`) with no per-write engine to
 /// build.
-pub struct PgWriteTarget {
+pub struct PgWriteTarget<W> {
     pool: Pool<AsyncPgConnection>,
     catalog: ParserDB,
+    /// The deployment's watermark schema, carried only in the type system so
+    /// `commit`/`last_applied` name its table. `fn() -> W` keeps the target
+    /// `Send`/`Sync` regardless of `W`.
+    _watermark: PhantomData<fn() -> W>,
 }
 
 /// Build a Postgres write target over a pool and the catalog DDL.
@@ -123,44 +112,17 @@ pub struct PgWriteTarget {
 /// # Errors
 ///
 /// [`MaterializerError::Catalog`] when the DDL does not parse.
-pub fn pg_write_target(
+pub fn pg_write_target<W: ConnettoWatermarkSchema>(
     pool: Pool<AsyncPgConnection>,
     pg_ddl: &str,
-) -> Result<PgWriteTarget, MaterializerError> {
+) -> Result<PgWriteTarget<W>, MaterializerError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
-    Ok(PgWriteTarget { pool, catalog })
-}
-
-/// A failure while provisioning the watermark table.
-#[derive(Debug, thiserror::Error)]
-pub enum ProvisionError {
-    /// Checking a connection out of the pool failed.
-    #[error("pool checkout: {0}")]
-    Pool(#[from] diesel_async::pooled_connection::bb8::RunError),
-    /// The DDL failed.
-    #[error(transparent)]
-    Db(#[from] diesel::result::Error),
-}
-
-/// Create the exactly-once watermark table if missing, through a connection with
-/// DDL privilege (the admin pool), once at startup.
-///
-/// Deliberately kept out of the handshake path: a restricted writer role cannot
-/// `CREATE` in schema `public` on Postgres 15 and later (the check fires even
-/// when the table already exists), and concurrent handshakes racing
-/// `CREATE TABLE IF NOT EXISTS` collide on `pg_type_typname_nsp_index`. The
-/// writer role itself only needs `SELECT, INSERT, UPDATE` on the table.
-///
-/// # Errors
-///
-/// [`ProvisionError`] when the pool checkout or the DDL fails.
-pub async fn provision_watermark_table(
-    pool: &Pool<AsyncPgConnection>,
-) -> Result<(), ProvisionError> {
-    let mut conn = pool.get().await?;
-    sql_query(WATERMARK_DDL).execute(&mut conn).await?;
-    Ok(())
+    Ok(PgWriteTarget {
+        pool,
+        catalog,
+        _watermark: PhantomData,
+    })
 }
 
 /// A failure inside the apply transaction, mapped to a [`WriteError`] after the
@@ -183,17 +145,18 @@ fn is_rls_violation(text: &str) -> bool {
     text.to_lowercase().contains("row-level security")
 }
 
-impl PgWriteTarget {
-    /// Probe conflicts, apply one upload, and advance the client's durable
-    /// watermark in the same transaction, reporting the outcome. The apply runs
-    /// under `ctx.user_id`, so Postgres RLS gates it, and the watermark is keyed
-    /// by `(user id, client id)`.
-    pub(crate) async fn commit<Id: core::fmt::Display>(
+impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
+    /// Probe conflicts, apply one upload, and advance the durable watermark in
+    /// the same transaction, reporting the outcome. The apply runs under
+    /// `ctx.user_id`, so Postgres RLS gates it, and the watermark is keyed by
+    /// `(user_id, session_id)`, both from the verified access token, so a
+    /// reconnect reusing the same session dedupes replayed uploads.
+    pub(crate) async fn commit(
         &self,
-        ctx: &AuthContext<Id>,
+        ctx: &AuthContext<W::Id>,
         plan: &WritePlan,
         payload_zstd: &[u8],
-        client_id: &str,
+        session_id: &str,
         client_seq: u64,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(client_seq)?;
@@ -204,15 +167,20 @@ impl PgWriteTarget {
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        let user_id = ctx.user_id.to_string();
-        let watermark_user = ctx.user_id.to_string();
+        // The RLS GUC binds `user_id` as text via `Display`; a genuine text
+        // boundary, distinct from the typed watermark column below.
+        let guc_user = ctx.user_id.to_string();
+        let watermark_user = ctx.user_id.clone();
+        let watermark_session = session_id.to_owned();
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(|c| {
                 async move {
+                    // set_config is a vendor function the query DSL cannot
+                    // express, so this one statement stays raw.
                     sql_query("SELECT set_config('app.user_id', $1, true)")
-                        .bind::<Text, _>(user_id)
+                        .bind::<Text, _>(guc_user)
                         .execute(c)
                         .await?;
                     for op in &plan.ops {
@@ -234,18 +202,12 @@ impl PgWriteTarget {
                         return Err(CommitError::Denied);
                     }
                     // Advance the durable watermark in the SAME transaction: the
-                    // apply and its dedupe record are one atomic step.
-                    sql_query(
-                        "INSERT INTO _connetto_mutations (user_id, client_id, last_seq) \
-                         VALUES ($1, $2, $3) \
-                         ON CONFLICT (user_id, client_id) DO UPDATE SET last_seq = \
-                         GREATEST(_connetto_mutations.last_seq, EXCLUDED.last_seq)",
-                    )
-                    .bind::<Text, _>(watermark_user)
-                    .bind::<Text, _>(client_id)
-                    .bind::<BigInt, _>(seq)
-                    .execute(c)
-                    .await?;
+                    // apply and its dedupe record are one atomic step. The
+                    // deployment owns the table; connetto keeps the monotone
+                    // GREATEST advance inside `watermark_upsert`.
+                    W::watermark_upsert(watermark_user, watermark_session, seq)
+                        .execute(c)
+                        .await?;
                     Ok(WriteOutcome::Applied)
                 }
                 .scope_boxed()
@@ -262,27 +224,29 @@ impl PgWriteTarget {
         }
     }
 
-    /// The highest `client_seq` durably applied for `(ctx, client_id)`, read at
-    /// handshake so the ack can carry it. Requires the watermark table
-    /// provisioned up front, see [`provision_watermark_table`].
-    pub(crate) async fn last_applied<Id: core::fmt::Display>(
+    /// The highest `client_seq` durably applied for `(user_id, session_id)`,
+    /// read at handshake so the ack can carry it. The deployment owns the
+    /// watermark table; connetto emits no DDL for it.
+    pub(crate) async fn last_applied(
         &self,
-        ctx: &AuthContext<Id>,
-        client_id: &str,
+        ctx: &AuthContext<W::Id>,
+        session_id: &str,
     ) -> Result<Option<u64>, WriteError> {
         let mut conn = self
             .pool
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        let rows: Vec<WatermarkRow> = sql_query(
-            "SELECT last_seq FROM _connetto_mutations WHERE user_id = $1 AND client_id = $2",
-        )
-        .bind::<Text, _>(ctx.user_id.to_string())
-        .bind::<Text, _>(client_id)
-        .load(&mut conn)
-        .await
-        .map_err(|err| WriteError::Backend(err.to_string()))?;
-        Ok(watermark_value(rows))
+        let filtered = FilterDsl::filter(
+            W::WatermarkQuery::default(),
+            W::wm_pk(ctx.user_id.clone(), session_id.to_owned()),
+        );
+        let query = SelectDsl::select(filtered, W::LastSeq::default());
+        let last_seq: Option<i64> = query
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(|err| WriteError::Backend(err.to_string()))?;
+        Ok(last_seq.and_then(|seq| u64::try_from(seq).ok()))
     }
 }

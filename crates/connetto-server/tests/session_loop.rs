@@ -19,7 +19,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     WebSocketTransport, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -133,7 +133,7 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// to the sessions through the manager.
 async fn drive_cdc<S: SnapshotSource, A: AuthPolicy + Send + Sync>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<S, A>,
+    manager: &SessionManager<S, A, ConnettoWatermark>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -158,7 +158,8 @@ async fn loopback_session_full_lifecycle() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         config,
     );
 
@@ -285,7 +286,8 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
 

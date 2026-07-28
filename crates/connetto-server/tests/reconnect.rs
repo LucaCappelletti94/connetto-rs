@@ -28,7 +28,7 @@ use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
     SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -144,7 +144,7 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// The emulator stamps monotonic LSNs, which the LSN-keyed oplog relies on.
 async fn drive(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<SeedSnapshot, PermissiveAuth>,
+    manager: &SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>,
     sql: &str,
 ) -> Vec<ChangeEvent> {
     source.execute_sql(sql).expect("execute dml");
@@ -171,7 +171,7 @@ fn cursor_of(event: &ChangeEvent) -> Cursor {
 /// Open a session on `manager`, send the handshake carrying `resume`, and read
 /// the ack. Returns the client half and the server task handle.
 async fn open_session(
-    manager: &Arc<SessionManager<SeedSnapshot, PermissiveAuth>>,
+    manager: &Arc<SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>>,
     client_id: &str,
     resume: Option<Cursor>,
 ) -> (LoopbackTransport, tokio::task::JoinHandle<()>) {
@@ -214,7 +214,8 @@ async fn catchup_within_window_streams_missed_ops() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
 
@@ -323,7 +324,8 @@ async fn cursor_outside_window_forces_full_resync() {
         PermissiveAuth,
         NoConnector,
         oplog,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
 
@@ -377,7 +379,8 @@ async fn tombstone_replays_the_delete() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
 

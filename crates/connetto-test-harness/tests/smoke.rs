@@ -79,9 +79,7 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
         .await;
     // The watermark table is provisioned by the admin, as a deployment would:
     // the restricted writer role cannot CREATE in schema public.
-    connetto_server::provision_watermark_table(fixture.admin())
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
         .await;

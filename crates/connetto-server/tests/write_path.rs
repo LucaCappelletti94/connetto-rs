@@ -20,9 +20,9 @@ use connetto_core::messages::{ControlMessage, MutationRejectReason};
 use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target, provision_watermark_table,
+    SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, Fixture};
+use connetto_test_harness::{Client, ConnettoWatermark, Fixture};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -127,9 +127,7 @@ async fn seed_notes(fixture: &Fixture) {
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
         .await;
-    provision_watermark_table(fixture.admin())
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
     diesel::insert_into(notes::table)
         .values((
@@ -202,7 +200,8 @@ async fn write_path_applies_conflicts_and_dedups() {
 
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer");
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
@@ -305,7 +304,8 @@ async fn write_path_rejects_unauthorized() {
 
     let materializer =
         Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer");
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
@@ -331,4 +331,119 @@ async fn write_path_rejects_unauthorized() {
 
     client.close().await;
     server.await.expect("join server").expect("session ok");
+}
+
+/// Exactly-once survives a transport reconnect that reuses the verified session.
+///
+/// This is the Phase 3 acceptance: the watermark keys on the connetto-minted
+/// session id from the verified token, not the client-fabricated `client_id`.
+/// A first connection commits mutations, the transport is torn down, and a
+/// second connection mints a DIFFERENT `client_id` (a worker restart or leader
+/// failover) but presents the SAME token. Its handshake reports the surviving
+/// watermark and the replayed uploads are re-acknowledged without re-applying,
+/// so no primary-key collision occurs. A genuinely different token is a new
+/// session and correctly starts fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn watermark_survives_reconnect_reusing_session() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+
+    let materializer =
+        Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
+    let manager = SessionManager::new(
+        materializer,
+        NoSnapshot,
+        PermissiveAuth,
+        target,
+        SessionConfig::default(),
+    );
+
+    // Connection 1: a fresh session for token "alice" commits two inserts.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("worker-boot-1", "alice").await;
+    assert_eq!(
+        ack.last_applied_seq, None,
+        "a fresh session has no watermark"
+    );
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    for expected in [1, 2] {
+        let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+            panic!("expected the durable-apply acknowledgement");
+        };
+        assert_eq!(applied.client_seq, expected);
+    }
+    let ControlMessage::Pong(_) = client.barrier(1).await else {
+        panic!("expected pong after the first session's writes");
+    };
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+        ]
+    );
+    client.close().await;
+    server.await.expect("join server 1").expect("session 1 ok");
+
+    // Connection 2: a NEW client id but the SAME token. The watermark survived
+    // the reconnect because it is keyed on the verified session, so the ack
+    // reports it and the replayed uploads are deduped, never re-applied (a
+    // re-applied INSERT would collide on the primary key and be rejected).
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("worker-boot-2", "alice").await;
+    assert_eq!(
+        ack.last_applied_seq,
+        Some(2),
+        "the same session's watermark survives a transport reconnect"
+    );
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    for expected in [1, 2] {
+        let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+            panic!("a replayed mutation is re-acknowledged, not rejected");
+        };
+        assert_eq!(applied.client_seq, expected);
+    }
+    // A genuinely new sequence still applies on the reused session.
+    client.upload(3, insert_changeset(4, "four", "t3")).await;
+    let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+        panic!("expected the durable-apply acknowledgement for the new sequence");
+    };
+    assert_eq!(applied.client_seq, 3);
+    let ControlMessage::Pong(_) = client.barrier(2).await else {
+        panic!("expected pong after the reconnect's writes");
+    };
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+            note(4, "four", "t3"),
+        ],
+        "the replay applied nothing new: exactly-once held across the reconnect"
+    );
+    client.close().await;
+    server.await.expect("join server 2").expect("session 2 ok");
+
+    // Connection 3: a different token is a different session and starts fresh.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("worker-boot-3", "bob").await;
+    assert_eq!(
+        ack.last_applied_seq, None,
+        "a different session carries its own watermark"
+    );
+    client.close().await;
+    server.await.expect("join server 3").expect("session 3 ok");
 }

@@ -26,6 +26,7 @@ pub mod oplog;
 pub mod pk;
 pub mod session;
 pub mod snapshot;
+pub mod watermark_schema;
 pub mod write_target;
 
 pub use auth::PermissiveAuth;
@@ -60,4 +61,5 @@ pub use session::{
 };
 pub use snapshot::PgSnapshotSource;
 pub use snapshot::SnapshotError;
-pub use write_target::{PgWriteTarget, ProvisionError, pg_write_target, provision_watermark_table};
+pub use watermark_schema::ConnettoWatermarkSchema;
+pub use write_target::{PgWriteTarget, pg_write_target};

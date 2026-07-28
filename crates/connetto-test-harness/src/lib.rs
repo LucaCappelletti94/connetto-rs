@@ -27,14 +27,13 @@ use std::time::Duration;
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, Handshake, LivePatch, MutationHeader, MutationPatch,
-    Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, MutationHeader,
+    MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth,
     RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
-    provision_watermark_table,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -49,6 +48,14 @@ use tokio::task::JoinHandle;
 /// The value type carried in an uploaded changeset: SQLite text keys and blob
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
 pub type RowValue = Value<String, Vec<u8>>;
+
+/// The reference watermark schema over `Id = String` (`TEXT user_id`), the shape
+/// every harness-backed test uses. connetto ships no schema, so the harness owns
+/// this reference via the macro, matching [`WATERMARK_DDL`].
+pub mod watermark {
+    connetto_server::connetto_watermark_table!(String, diesel::sql_types::Text);
+}
+pub use watermark::ConnettoWatermark;
 
 /// The logical replication slot the CDC source follows. Matches the server
 /// binary default.
@@ -124,6 +131,19 @@ pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
     panic!("replication slot {SLOT} could not be dropped");
 }
 
+/// Reference DDL for the deployment-owned exactly-once watermark, keyed on
+/// `(user_id, session_id)`. connetto emits no DDL, so the harness owns this
+/// migration; the shape matches the `ConnettoWatermark` reference schema.
+pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
+    (user_id TEXT NOT NULL, session_id TEXT NOT NULL, last_seq BIGINT NOT NULL, \
+    PRIMARY KEY (user_id, session_id))";
+
+/// Create the reference watermark table if missing, as admin. A restricted
+/// writer role only needs `SELECT, INSERT, UPDATE` on it, granted separately.
+pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
+    exec(pool, WATERMARK_DDL).await;
+}
+
 /// The shared Postgres, held under the process-wide serialization lock for the
 /// lifetime of one test. Dropping it releases the lock for the next test.
 pub struct Fixture {
@@ -148,9 +168,7 @@ impl Fixture {
         // client sequence. A write-path test that grants a role on it does so
         // in its own setup, after acquire.
         exec(&admin, "DROP TABLE IF EXISTS _connetto_mutations").await;
-        provision_watermark_table(&admin)
-            .await
-            .expect("provision watermark table");
+        provision_watermark(&admin).await;
         Self {
             admin_url,
             admin,
@@ -262,7 +280,8 @@ impl AuthPolicy for HarnessAuth {
 
 /// The concrete manager type the harness serves: real snapshot, the harness auth
 /// policy, and the async re-execution connector.
-type HarnessManager = SessionManager<PgSnapshotSource, HarnessAuth, PgAsyncDieselConnector>;
+type HarnessManager =
+    SessionManager<PgSnapshotSource, HarnessAuth, ConnettoWatermark, PgAsyncDieselConnector>;
 
 /// How to wire a harness server.
 pub struct ServerConfig {
@@ -335,7 +354,8 @@ pub fn spawn_server(
     } = config;
     let materializer =
         Materializer::with_write_catalog(&pg_ddl, writable).expect("build materializer");
-    let write = pg_write_target(write_pool, &pg_ddl).expect("build write target");
+    let write =
+        pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let connector = PgAsyncDieselConnector::new(connector_pool);
     let manager =
         SessionManager::with_connector(materializer, snapshot, auth, connector, write, session);
@@ -380,17 +400,26 @@ impl Client {
     /// Send the handshake and wait for its ack. The `client_id` doubles as the
     /// auth token, which the trusting verifier maps to `app.user_id` under RLS.
     pub async fn handshake(&mut self, client_id: &str) {
+        self.handshake_with(client_id, client_id).await;
+    }
+
+    /// Send a handshake with an explicit `client_id` and `auth_token`, returning
+    /// the ack. The verified token, not the client id, is the durable session id
+    /// the exactly-once watermark keys on, so a reconnect that mints a new
+    /// `client_id` but reuses the token (a worker restart) keeps its watermark.
+    pub async fn handshake_with(&mut self, client_id: &str, auth_token: &str) -> HandshakeAck {
         self.transport
             .send_control(ControlMessage::Handshake(Handshake::new(
                 PROTOCOL_VERSION,
                 client_id,
-                client_id,
+                auth_token,
             )))
             .await
             .expect("send handshake");
-        let ControlMessage::HandshakeAck(_) = self.next_control().await else {
+        let ControlMessage::HandshakeAck(ack) = self.next_control().await else {
             panic!("expected handshake ack");
         };
+        ack
     }
 
     /// Register a subscription. The snapshot and any live patches follow on the

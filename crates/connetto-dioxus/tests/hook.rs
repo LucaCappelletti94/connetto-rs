@@ -14,7 +14,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -219,7 +219,8 @@ async fn use_live_renders_and_follows_cdc() {
         // COUNT(*) seed over the empty backend.
         rows: StdMutex::new(vec![vec![PgValue::Int(0)]]),
     };
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         EmptySnapshot,
@@ -294,7 +295,8 @@ async fn use_live_renders_and_follows_cdc() {
 async fn use_live_fn_follows_a_boxed_row_query() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::new(
         materializer,
         SeedOneOrder,

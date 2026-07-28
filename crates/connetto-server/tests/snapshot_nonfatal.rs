@@ -12,7 +12,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -55,7 +55,8 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         materializer,
         BrokenSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
 

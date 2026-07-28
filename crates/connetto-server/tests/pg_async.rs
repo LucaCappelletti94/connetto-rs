@@ -13,6 +13,7 @@ use connetto_server::{
     Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::ConnettoWatermark;
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -323,7 +324,8 @@ async fn async_pg_reexec_bootstraps_min() {
 
     let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::new(AGGS_PG_DDL).expect("build materializer");
-    let target = pg_write_target(pool, AGGS_PG_DDL).expect("build write target");
+    let target =
+        pg_write_target::<ConnettoWatermark>(pool, AGGS_PG_DDL).expect("build write target");
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,
@@ -515,7 +517,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
     let materializer =
         Materializer::new("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
             .expect("build materializer");
-    let target = pg_write_target(
+    let target = pg_write_target::<ConnettoWatermark>(
         pool,
         "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
     )

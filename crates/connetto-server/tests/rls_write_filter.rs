@@ -26,6 +26,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
 };
+use connetto_test_harness::ConnettoWatermark;
 use diesel::QueryableByName;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -189,9 +190,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     // The watermark table is provisioned by the admin, like a deployment
     // would: the restricted writer role cannot CREATE in schema public and
     // only needs DML on it.
-    connetto_server::provision_watermark_table(&admin)
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(&admin).await;
     exec(
         &admin,
         "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
@@ -206,7 +205,8 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
             .build(),
     )
     .expect("build materializer");
-    let target = pg_write_target(writer_pool, PG_DDL).expect("build write target");
+    let target =
+        pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,

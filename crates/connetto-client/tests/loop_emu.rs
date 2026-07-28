@@ -26,7 +26,7 @@ use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
     Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -222,17 +222,22 @@ impl SnapshotSource for GadgetSeed {
     }
 }
 
-fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget {
-    pg_write_target(fixture.admin().clone(), GADGETS_PG_DDL).expect("build write target")
+fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
+    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), GADGETS_PG_DDL)
+        .expect("build write target")
 }
 
-fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget {
-    pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target")
+fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
+    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target")
 }
 
 /// A Postgres write target seeded with one `orders` row at `status`, standing in
 /// for a server whose version already moved past the client's snapshot basis.
-async fn seeded_orders_target(fixture: &Fixture, status: &str) -> connetto_server::PgWriteTarget {
+async fn seeded_orders_target(
+    fixture: &Fixture,
+    status: &str,
+) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
     reset_orders(fixture).await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
     diesel_async::RunQueryDsl::execute(
@@ -246,7 +251,8 @@ async fn seeded_orders_target(fixture: &Fixture, status: &str) -> connetto_serve
     )
     .await
     .expect("seed order");
-    pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target")
+    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target")
 }
 
 // The server write target schema (Postgres): INT maps to Integer (i32),
@@ -271,9 +277,7 @@ async fn reset_orders(fixture: &Fixture) {
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_server::provision_watermark_table(fixture.admin())
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
 }
 
 /// The server target's orders, read as admin, mapped to the client `Order`.
@@ -1161,7 +1165,8 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Bootstrap answers 3; the re-execution after the delete answers 9.
     let connector = QueuedConnector::new([3, 9]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1302,7 +1307,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
 /// Drive the emulator to completion, dispatching every produced CDC event
 /// through the manager so delta aggregates fold in-process.
 async fn drain_events<S, C, O>(
-    manager: &SessionManager<S, PermissiveAuth, C, O>,
+    manager: &SessionManager<S, PermissiveAuth, ConnettoWatermark, C, O>,
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
@@ -1357,7 +1362,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         vec![PgValue::Null],
         vec![PgValue::Null, PgValue::Int(0)],
     ]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1576,7 +1582,8 @@ async fn row_subscription_and_delta_aggregate_coexist() {
     // route. The two delivery paths are independent in one dispatch.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1673,7 +1680,8 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
     // further CDC event produces no aggregate update for that consumer.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -1897,7 +1905,8 @@ async fn live_value_tracks_a_server_aggregate() {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // COUNT(*) seed over the backend at subscribe time: 1 (the snapshot row).
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -2021,7 +2030,8 @@ async fn live_value_decodes_a_temporal_aggregate() {
         .and_hms_opt(3, 4, 5)
         .expect("valid time");
     let connector = QueuedConnector::with_scalars([PgValue::Timestamp(seen)]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
@@ -2327,7 +2337,8 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
     // last value, and both handles fold a CDC update.
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,

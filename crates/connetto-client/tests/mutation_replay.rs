@@ -22,7 +22,7 @@ use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -102,7 +102,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, PermissiveAuth>;
+type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 
 /// Reset the fixture to a fresh `orders` table with the watermark provisioned.
 async fn reset_orders(fixture: &Fixture) {
@@ -113,9 +113,7 @@ async fn reset_orders(fixture: &Fixture) {
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_server::provision_watermark_table(fixture.admin())
-        .await
-        .expect("provision watermark table");
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
 }
 
 /// A manager whose `orders` table accepts client writes into the real Postgres
@@ -130,7 +128,8 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     )
 }

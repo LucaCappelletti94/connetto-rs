@@ -17,7 +17,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
@@ -94,7 +94,7 @@ impl SnapshotSource for NoSnapshot {
     }
 }
 
-type Manager = SessionManager<NoSnapshot, PermissiveAuth, QueuedConnector>;
+type Manager = SessionManager<NoSnapshot, PermissiveAuth, ConnettoWatermark, QueuedConnector>;
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
@@ -131,7 +131,8 @@ async fn reexec_bootstraps_folds_and_retriggers() {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Bootstrap answers 10, the re-execution after the delete answers 20.
     let connector = QueuedConnector::new([10, 20]);
-    let target = pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
     let manager = SessionManager::with_connector(
         materializer,
         NoSnapshot,

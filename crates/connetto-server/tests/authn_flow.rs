@@ -22,7 +22,7 @@ use connetto_server::{
     SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
     pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -85,12 +85,13 @@ fn manager_with(
     verifier: Arc<dyn SessionVerifier>,
     snapshot: CapturingSnapshot,
     fixture: &Fixture,
-) -> Arc<SessionManager<CapturingSnapshot, PermissiveAuth>> {
+) -> Arc<SessionManager<CapturingSnapshot, PermissiveAuth, ConnettoWatermark>> {
     SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(verifier)

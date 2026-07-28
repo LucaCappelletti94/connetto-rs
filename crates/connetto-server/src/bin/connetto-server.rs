@@ -18,9 +18,10 @@
 //!   read authorization, and mutation applies run under Postgres Row-Level
 //!   Security as that role. Otherwise the server authorizes reads permissively.
 //!   The role needs `SELECT, INSERT, UPDATE` on `_connetto_mutations` (the
-//!   exactly-once watermark table), provisioned by the admin like any other
-//!   DDL, since a restricted role cannot `CREATE` in schema `public` on
-//!   Postgres 15 and later.
+//!   exactly-once watermark table). connetto emits no DDL, so the deployment
+//!   creates that table (see `docs/architecture/11-authentication.md`)
+//!   alongside the auth tables; a restricted role cannot `CREATE` in schema
+//!   `public` on Postgres 15 and later, so the admin runs the migration.
 //!
 //! The publication and replication slot (with the `pgoutput` plugin) must
 //! already exist. The server does not create them.
@@ -38,7 +39,7 @@ use connetto_server::{
     PermissiveAuth, PermissiveProvider, PgSnapshotSource, ProviderRegistry, ReconnectPolicy,
     RedirectPolicy, RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RlsAuthError,
     RuntimeWritableCatalog, SessionConfig, SessionManager, TokenAuthority, WebSocketTransport,
-    auth_router, connetto_auth_tables, pg_write_target,
+    auth_router, connetto_auth_tables, connetto_watermark_table, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -48,10 +49,13 @@ use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
 
-// The reference binary uses the default connetto auth tables over `Id = String`
-// (Text `user_id`), matching the `DefaultUuidResolver`. Generates the
-// `connetto_sessions`/`connetto_provider_tokens` tables and `ConnettoAuthSchema`.
+// The reference binary uses the default connetto auth and watermark tables over
+// `Id = String` (Text `user_id`), matching the `DefaultUuidResolver`. These
+// generate the `connetto_sessions`/`connetto_provider_tokens` tables plus
+// `ConnettoAuthSchema`, and the `_connetto_mutations` table plus
+// `ConnettoWatermark`. connetto emits no DDL; the deployment runs the migration.
 connetto_auth_tables!(String, diesel::sql_types::Text);
+connetto_watermark_table!(String, diesel::sql_types::Text);
 
 /// The read-authorization policy chosen at startup.
 ///
@@ -358,12 +362,10 @@ async fn main() -> Result<()> {
     let slot = env_or("CONNETTO_SLOT", "connetto_slot");
     let publication = env_or("CONNETTO_PUBLICATION", "connetto_pub");
     let pool = build_pool(&database_url).await?;
-    // The exactly-once watermark table is provisioned here, under the admin
-    // role: the write pool may be a restricted RLS role that cannot (and
-    // must not need to) CREATE in schema public.
-    connetto_server::provision_watermark_table(&pool)
-        .await
-        .map_err(|err| anyhow!("provisioning the watermark table: {err}"))?;
+    // connetto emits no DDL. The deployment owns the `_connetto_mutations`
+    // watermark table (see `docs/architecture/11-authentication.md`) and the
+    // `ConnettoWatermark` reference schema keys on it; the operator runs the
+    // migration alongside the auth tables.
     let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
@@ -378,13 +380,13 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow!("building snapshot source: {err}"))?;
         let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)
             .map_err(|err| anyhow!("building RLS auth: {err}"))?;
-        let write = pg_write_target(reader_pool, &pg_ddl)
+        let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
             .map_err(|err| anyhow!("building write target: {err}"))?;
         (snapshot, ServerAuth::Rls(Box::new(auth)), write)
     } else {
         let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &pg_ddl)
             .map_err(|err| anyhow!("building snapshot source: {err}"))?;
-        let write = pg_write_target(pool.clone(), &pg_ddl)
+        let write = pg_write_target::<ConnettoWatermark>(pool.clone(), &pg_ddl)
             .map_err(|err| anyhow!("building write target: {err}"))?;
         (snapshot, ServerAuth::Permissive(PermissiveAuth), write)
     };
@@ -443,7 +445,9 @@ async fn main() -> Result<()> {
 
 /// Start CDC ingestion and serve connections until the listener fails.
 async fn run(
-    manager: &Arc<SessionManager<PgSnapshotSource, ServerAuth, PgAsyncDieselConnector>>,
+    manager: &Arc<
+        SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgAsyncDieselConnector>,
+    >,
     database_url: &str,
     slot: &str,
     publication: &str,

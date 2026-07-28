@@ -21,7 +21,7 @@ use connetto_server::{
     Materializer, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
     pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::Value;
@@ -139,7 +139,8 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
         materializer,
         EmptySnapshot,
         DenyId2,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let applier = Materializer::new(PG_DDL).expect("build applier");

@@ -23,7 +23,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionError, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
 
@@ -96,7 +96,8 @@ async fn absent_credential_is_rejected_with_authentication_failed() {
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();
@@ -131,7 +132,8 @@ async fn forged_credential_is_rejected_with_authentication_failed() {
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(Arc::new(AlwaysReject));
@@ -173,7 +175,8 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     )
     .with_session_verifier(Arc::new(FixedVerifier(resolved.clone())));

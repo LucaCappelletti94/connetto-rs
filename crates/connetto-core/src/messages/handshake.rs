@@ -18,8 +18,11 @@ pub struct Handshake {
     /// the server or the session is terminated with
     /// [`crate::messages::FatalErrorReason::ProtocolVersionMismatch`].
     pub protocol_version: u32,
-    /// Client-chosen stable id. Used purely for logging and correlation. Server
-    /// identity resolution happens through `auth_token`.
+    /// Client-chosen stable id, purely a logging and correlation label. It is
+    /// NEVER a server trust input or a durable-state key: the server resolves
+    /// identity and the exactly-once watermark key from the verified
+    /// `auth_token`, never from this field. The browser relay reuses it as a
+    /// tab-local id for lock naming and hub routing, a client-side concern only.
     pub client_id: String,
     /// Opaque JWT or session token, validated once at handshake and used to
     /// build the session `AuthContext`. The server never returns this on the wire.

@@ -22,7 +22,7 @@ use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -126,7 +126,7 @@ async fn spawn_server(
     fixture: &Fixture,
     sessions: usize,
 ) -> (
-    Arc<SessionManager<RecordingSnapshot, PermissiveAuth>>,
+    Arc<SessionManager<RecordingSnapshot, PermissiveAuth, ConnettoWatermark>>,
     Arc<Mutex<Vec<String>>>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -140,7 +140,8 @@ async fn spawn_server(
         materializer,
         recorder,
         PermissiveAuth,
-        pg_write_target(fixture.admin().clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
         SessionConfig::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
