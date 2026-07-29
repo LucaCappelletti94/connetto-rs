@@ -120,6 +120,11 @@ pub enum RelayError {
     Compress(#[from] std::io::Error),
 }
 
+/// The hub core has ended, so it can no longer answer.
+#[derive(Debug, thiserror::Error)]
+#[error("the relay hub core has ended")]
+pub struct HubGone;
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -144,6 +149,9 @@ enum HubEvent {
     Gone(TabId),
     /// The owner wants this tab disconnected (a liveness watcher fired).
     Kill(TabId),
+    /// Report the worker's queued, unacknowledged mutations. The core owns the
+    /// connection, so a caller outside it can only ask and be answered.
+    Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
 }
 
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
@@ -519,6 +527,25 @@ impl RelayHub {
     pub fn kill(&self, tab: TabId) {
         let _ = self.events.send(HubEvent::Kill(tab));
     }
+
+    /// The seqs of mutations applied locally and queued for the server but not
+    /// yet acknowledged, which is what a logout has to warn about before
+    /// destroying a replica.
+    ///
+    /// The count is a snapshot. The core may acknowledge or accept writes right
+    /// after answering, so a caller showing it to a user is describing the past,
+    /// not promising the present.
+    ///
+    /// # Errors
+    ///
+    /// [`HubGone`] when the core has ended, so no answer will come.
+    pub async fn unsynced(&self) -> Result<Vec<u64>, HubGone> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events
+            .send(HubEvent::Unsynced(reply))
+            .map_err(|_| HubGone)?;
+        answer.await.map_err(|_| HubGone)
+    }
 }
 
 /// The per-tab I/O task: owns the transport, feeds inbound frames to the
@@ -624,6 +651,11 @@ where
                 }
                 Some(HubEvent::Frame(id, frame)) => {
                     handle_tab_frame(&mut worker, &mut state, &notices, id, frame).await?;
+                }
+                // A dropped receiver means the asker gave up, which is not the
+                // core's problem.
+                Some(HubEvent::Unsynced(reply)) => {
+                    let _ = reply.send(worker.unsynced());
                 }
                 // Removing the state drops the tab's sender, and the shovel
                 // answers the closed channel by closing the transport.

@@ -32,9 +32,16 @@ pub struct FakeClosed;
 /// Because it acknowledges nothing after the handshake, an uploaded mutation is
 /// never retired, which is how a test arranges a replica that still has unsynced
 /// work in it.
+///
+/// By default a drained inbox reads as end of stream, so the peer looks gone. That
+/// suits a test driving a connection directly, and not one behind a task that reads
+/// the upstream continuously, which would see the close and stop. For those,
+/// [`accepting_but_silent`](Self::accepting_but_silent) stays open instead.
 pub struct FakeTransport {
     reply: HandshakeReply,
     inbox: VecDeque<IncomingFrame>,
+    /// Park on a drained inbox rather than reporting end of stream.
+    silent: bool,
 }
 
 impl FakeTransport {
@@ -50,12 +57,26 @@ impl FakeTransport {
         Self::new(HandshakeReply::Reject)
     }
 
-    /// A transport answering with `reply`.
+    /// A transport whose handshake succeeds and which then stays open forever
+    /// without saying anything, so an uploaded mutation is neither acknowledged nor
+    /// failed. This is a client that is connected but offline, as opposed to one
+    /// whose peer has gone.
+    #[must_use]
+    pub fn accepting_but_silent() -> Self {
+        Self {
+            silent: true,
+            ..Self::new(HandshakeReply::Accept)
+        }
+    }
+
+    /// A transport answering with `reply`, whose peer looks gone once its inbox
+    /// drains.
     #[must_use]
     pub fn new(reply: HandshakeReply) -> Self {
         Self {
             reply,
             inbox: VecDeque::new(),
+            silent: false,
         }
     }
 
@@ -97,7 +118,13 @@ impl Transport for FakeTransport {
 
     #[allow(clippy::unused_async_trait_impl)]
     async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
-        Ok(self.inbox.pop_front())
+        if let Some(frame) = self.inbox.pop_front() {
+            return Ok(Some(frame));
+        }
+        if self.silent {
+            core::future::pending::<()>().await;
+        }
+        Ok(None)
     }
 
     #[allow(clippy::unused_async_trait_impl)]

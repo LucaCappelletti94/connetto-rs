@@ -558,6 +558,18 @@ where
         });
     }
 
+    // Logout service, installed whenever logins are, because a session a tab can
+    // start is a session it must be able to end. A tab holds no token, no replica
+    // handle, and no key, so it can only ask.
+    if let Some(auth_config) = &config.auth {
+        serve_logout_requests(
+            auth_config.clone(),
+            config.auth_db_name,
+            &replica_db_name,
+            hub.clone(),
+        )?;
+    }
+
     // The hello channel intake: answer readiness asks and attach a wire
     // transport per tab announcement, acking each attachment.
     let hello = BroadcastChannel::new(HELLO_CHANNEL)
@@ -590,6 +602,162 @@ where
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
     Ok(())
+}
+
+/// Serve [`LOGOUT_CHANNEL`](crate::auth::LOGOUT_CHANNEL) for this worker's life,
+/// answering unsynced-count questions and carrying out logouts a tab asks for.
+///
+/// [`boot_db_worker`] calls this itself whenever logins are configured, so an
+/// application built on it needs nothing here. Call it directly when assembling a
+/// worker by hand, since a [`RelayHub`](crate::relay::RelayHub) built without
+/// `boot_db_worker` would otherwise have no way to offer logout.
+///
+/// The storage and key-store handles are opened per request rather than captured:
+/// installing the VFS again hands back another handle over the same pool, and the
+/// refresh store is only needed for the moment it takes to revoke, so nothing here
+/// holds an encrypted database open waiting for a logout that may never come.
+///
+/// # Errors
+///
+/// The `BroadcastChannel` error when the channel cannot be opened.
+pub fn serve_logout_requests(
+    auth: crate::auth::WorkerAuthConfig,
+    auth_db_name: &str,
+    replica_db_name: &str,
+    hub: crate::relay::RelayHub,
+) -> Result<(), JsValue> {
+    let auth_db_name = auth_db_name.to_owned();
+    let replica_db_name = replica_db_name.to_owned();
+    let channel = BroadcastChannel::new(crate::auth::LOGOUT_CHANNEL)
+        .map_err(|err| JsValue::from_str(&format!("logout channel: {err:?}")))?;
+    let listener = {
+        let channel = channel.clone();
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some(text) = event.data().as_string() else {
+                return;
+            };
+            let Ok(request) = serde_json::from_str::<crate::auth::LogoutMessage>(&text) else {
+                return;
+            };
+            let channel = channel.clone();
+            let hub = hub.clone();
+            let auth = auth.clone();
+            let auth_db_name = auth_db_name.clone();
+            let replica_db_name = replica_db_name.clone();
+            spawn_local(async move {
+                if let Some(reply) =
+                    serve_logout(&request, &hub, &auth, &auth_db_name, &replica_db_name).await
+                {
+                    match serde_json::to_string(&reply) {
+                        Ok(encoded) => {
+                            let _ = channel.post_message(&JsValue::from_str(&encoded));
+                        }
+                        Err(err) => web_sys::console::error_1(
+                            &format!("db worker: encode a logout reply: {err}").into(),
+                        ),
+                    }
+                }
+            });
+        })
+    };
+    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+    // The listener lives for the worker's whole life, like the hello intake.
+    listener.forget();
+    Ok(())
+}
+
+/// The queued mutation seqs, or `None` when the hub core cannot answer.
+///
+/// An unanswerable count is never reported as zero. Zero is a licence to destroy
+/// the replica, so a dead core answering "nothing queued" would be the one lie in
+/// this protocol that loses data. Saying nothing instead leaves the asking tab with
+/// [`AuthError::Cancelled`](crate::auth::AuthError::Cancelled), which is already
+/// what it shows for a worker that cannot answer.
+async fn ask_unsynced(hub: &crate::relay::RelayHub) -> Option<Vec<u64>> {
+    match hub.unsynced().await {
+        Ok(seqs) => Some(seqs),
+        Err(err) => {
+            web_sys::console::error_1(
+                &format!("db worker: the hub cannot report unsynced work: {err}").into(),
+            );
+            None
+        }
+    }
+}
+
+/// Carry out one logout-channel request, returning the reply to broadcast, or
+/// `None` for traffic that is not a request (this worker's own replies).
+async fn serve_logout(
+    request: &crate::auth::LogoutMessage,
+    hub: &crate::relay::RelayHub,
+    auth: &crate::auth::WorkerAuthConfig,
+    auth_db_name: &str,
+    replica_db_name: &str,
+) -> Option<crate::auth::LogoutMessage> {
+    use crate::auth::LogoutMessage;
+
+    let (delete, force) = match request {
+        LogoutMessage::Unsynced => {
+            let seqs = ask_unsynced(hub).await?;
+            return Some(LogoutMessage::Pending { seqs });
+        }
+        LogoutMessage::Logout { delete, force } => (*delete, *force),
+        LogoutMessage::Pending { .. }
+        | LogoutMessage::Done { .. }
+        | LogoutMessage::Refused { .. } => {
+            return None;
+        }
+    };
+
+    // The guard runs before the revoke, so a refused delete leaves the session
+    // whole. Revoking first would answer a refusal to a tab that is already
+    // logged out, and the retry with `force` would then be a bare delete against
+    // a half-torn-down session.
+    //
+    // The replica is only marked here. It is destroyed at the next startup,
+    // because this worker holds it open for its whole life and OPFS cannot
+    // delete a live file.
+    if delete {
+        let unsynced = ask_unsynced(hub).await?;
+        if let Err(err) = crate::storage::mark_wipe_pending(replica_db_name, &unsynced, force).await
+        {
+            return match err {
+                crate::storage::WipeError::Unsynced(seqs) => Some(LogoutMessage::Refused { seqs }),
+                other => {
+                    web_sys::console::error_1(
+                        &format!("db worker: mark the replica for deletion: {other}").into(),
+                    );
+                    None
+                }
+            };
+        }
+    }
+
+    // The credential is gone locally either way. A failed revoke leaves the
+    // session alive on the server until it expires, which is worth logging but
+    // does not make this tab any less logged out.
+    match logout_locally(auth, auth_db_name).await {
+        Ok(()) => {}
+        Err(err) => web_sys::console::warn_1(
+            &format!("db worker: the session revoke failed, local state cleared anyway: {err}")
+                .into(),
+        ),
+    }
+    Some(LogoutMessage::Done { deleted: delete })
+}
+
+/// Revoke the session and clear the stored credential.
+async fn logout_locally(
+    auth: &crate::auth::WorkerAuthConfig,
+    auth_db_name: &str,
+) -> Result<(), crate::auth::AuthError> {
+    let storage = crate::storage::ReplicaStorage::install().await;
+    let keys = crate::auth::ReplicaKeyStore::open().await?;
+    let device = crate::storage::device_key(&keys).await?;
+    let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name, true), &device)?;
+    crate::auth::BrowserAuthenticator::new(auth.clone())
+        .logout(&store)
+        .await
 }
 
 /// A transport factory for a reconnecting tab client: every attempt waits

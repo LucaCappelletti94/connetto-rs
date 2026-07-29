@@ -41,6 +41,15 @@ use zeroize::Zeroize;
 /// login. It carries only [`LoginMessage`], which cannot hold a token.
 pub const LOGIN_CHANNEL: &str = "connetto-login";
 
+/// The `BroadcastChannel` a tab uses to ask the worker to log out, and to ask
+/// how much local work is still unsynced before offering to destroy it. It
+/// carries only [`LogoutMessage`], which cannot hold a token either.
+///
+/// The worker owns the refresh token, the replica, and its key, so a tab cannot
+/// log out by itself. What a tab owns is the button and the wording, which is
+/// why the destructive choice travels as a request rather than as an action.
+pub const LOGOUT_CHANNEL: &str = "connetto-logout";
+
 /// Failure of a browser acquisition step.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -220,6 +229,52 @@ pub enum LoginMessage {
         code: String,
         /// The CSRF state echoed by the callback.
         state: String,
+    },
+}
+
+/// A logout message on [`LOGOUT_CHANNEL`], tokenless for the same reason
+/// [`LoginMessage`] is: no variant can carry a credential, so a tab still cannot
+/// reach the worker's token custody by speaking on this channel.
+///
+/// A tab sends [`Unsynced`](LogoutMessage::Unsynced) or
+/// [`Logout`](LogoutMessage::Logout). The worker answers with
+/// [`Pending`](LogoutMessage::Pending), [`Done`](LogoutMessage::Done), or
+/// [`Refused`](LogoutMessage::Refused).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LogoutMessage {
+    /// Tab to worker: how much local work has not reached the server? Asking
+    /// changes nothing, so a tab can offer an honest prompt before the user
+    /// commits to anything.
+    Unsynced,
+    /// Worker to tabs: the seqs behind, whose length is the count to show. A
+    /// snapshot, since the worker keeps syncing after answering.
+    Pending {
+        /// Mutations applied locally and queued but not yet acknowledged.
+        seqs: Vec<u64>,
+    },
+    /// Tab to worker: revoke the session and clear the stored credential. With
+    /// `delete` set, also destroy the replica, which needs `force` when work is
+    /// still queued, because that work dies with the file.
+    Logout {
+        /// Destroy the replica rather than leaving it for the next login.
+        delete: bool,
+        /// Destroy it even though queued work would be lost with it.
+        force: bool,
+    },
+    /// Worker to tabs: the logout is done. A tab reacts by showing a signed-out
+    /// screen, since its own connection is about to be refused.
+    Done {
+        /// Whether the replica was marked for destruction.
+        deleted: bool,
+    },
+    /// Worker to tabs: the delete was refused because work is still queued and
+    /// `force` was not set. Reachable even after
+    /// [`Pending`](LogoutMessage::Pending) answered zero, because a write can
+    /// land between the question and the request.
+    Refused {
+        /// The queued seqs that would have been lost.
+        seqs: Vec<u64>,
     },
 }
 
@@ -773,6 +828,105 @@ pub fn deliver_login_code(code: &str, state: &str) -> Result<(), JsValue> {
     channel.post_message(&JsValue::from_str(&message))?;
     channel.close();
     Ok(())
+}
+
+/// What a [`request_logout`] call ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogoutOutcome {
+    /// Logged out, replica left in place for the next login by this identity.
+    Kept,
+    /// Logged out, replica marked for destruction at the next startup.
+    Deleted,
+    /// Still logged in: the delete would have destroyed queued work and `force`
+    /// was not set.
+    Refused {
+        /// The queued seqs that would have been lost.
+        seqs: Vec<u64>,
+    },
+}
+
+/// Ask the worker something on [`LOGOUT_CHANNEL`] and wait for the reply that
+/// `reply` recognises. Other traffic on the channel is ignored, including this
+/// tab's own request, which a `BroadcastChannel` never echoes to its sender.
+async fn ask<T: 'static>(
+    request: &LogoutMessage,
+    reply: impl Fn(LogoutMessage) -> Option<T> + 'static,
+) -> Result<T, AuthError> {
+    let channel = BroadcastChannel::new(LOGOUT_CHANNEL)
+        .map_err(|err| AuthError::Context(format!("logout channel: {err:?}")))?;
+    let (sender, receiver) = futures_channel::oneshot::channel::<T>();
+    let sender = Rc::new(RefCell::new(Some(sender)));
+    let on_message = Closure::<dyn FnMut(MessageEvent)>::new({
+        let sender = Rc::clone(&sender);
+        move |event: MessageEvent| {
+            let Some(text) = event.data().as_string() else {
+                return;
+            };
+            if let Ok(message) = serde_json::from_str::<LogoutMessage>(&text)
+                && let Some(value) = reply(message)
+                && let Some(sender) = sender.borrow_mut().take()
+            {
+                let _ = sender.send(value);
+            }
+        }
+    });
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    let encoded = serde_json::to_string(request).map_err(|_| AuthError::Decode)?;
+    channel
+        .post_message(&JsValue::from_str(&encoded))
+        .map_err(|err| js_error("broadcast logout request", &err))?;
+
+    let outcome = receiver.await.map_err(|_| AuthError::Cancelled);
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    outcome
+}
+
+/// Page-side: how many local writes have not reached the server yet.
+///
+/// Ask before offering to delete, so the prompt can name the number instead of
+/// warning vaguely. The answer is a snapshot: the worker keeps syncing, so by the
+/// time a user confirms, the true count may be lower, or higher if another tab
+/// wrote meanwhile.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers, which is what a dead or
+/// still-booting DB worker looks like from a tab.
+pub async fn request_unsynced() -> Result<Vec<u64>, AuthError> {
+    ask(&LogoutMessage::Unsynced, |message| match message {
+        LogoutMessage::Pending { seqs } => Some(seqs),
+        _ => None,
+    })
+    .await
+}
+
+/// Page-side: ask the worker to log out, optionally destroying the replica.
+///
+/// `delete` without `force` is refused while writes are queued, and the refusal
+/// carries them, so a tab that skipped [`request_unsynced`] still cannot destroy
+/// unsynced work by accident. The replica is destroyed at the next startup rather
+/// than now, because the worker holds it open for its whole life.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers.
+pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, AuthError> {
+    ask(
+        &LogoutMessage::Logout { delete, force },
+        |message| match message {
+            LogoutMessage::Done { deleted } => Some(if deleted {
+                LogoutOutcome::Deleted
+            } else {
+                LogoutOutcome::Kept
+            }),
+            LogoutMessage::Refused { seqs } => Some(LogoutOutcome::Refused { seqs }),
+            _ => None,
+        },
+    )
+    .await
 }
 
 /// A 256-bit random token as URL-safe base64, for the PKCE verifier and state.
