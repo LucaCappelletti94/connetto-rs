@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{AccessTokenSource, ClientError};
 
@@ -131,8 +131,9 @@ impl RefreshTokenStore for MemoryRefreshStore {
 /// and a wipe of one cannot reach the other.
 ///
 /// A name is only knowable once login has resolved the identity, which is why
-/// the store is not consulted during acquisition. Resolve afterwards with
-/// [`resolve_replica_key`].
+/// the store is not consulted during acquisition. Afterwards a fresh replica
+/// gets its key from [`provision_replica_key`] and an existing one reads
+/// [`load`](Self::load).
 pub trait ReplicaKeyStore: Send + Sync {
     /// The cached key for `name`, or `None` when none was ever stored here.
     ///
@@ -157,32 +158,55 @@ pub trait ReplicaKeyStore: Send + Sync {
     fn clear(&self, name: &str) -> Result<(), ClientError>;
 }
 
-/// The effective key for the replica `name`, given whatever the login response
-/// carried in `wire`.
+/// The effective key for the replica `name`, minting one when this device has
+/// none cached.
 ///
 /// Provision-once in one function: a key already cached on this device always
-/// wins and is never overwritten, so a re-login cannot silently re-key a
-/// replica and strand its contents. Only when nothing is cached is a freshly
-/// provisioned key adopted, and it is written through before it is returned.
+/// wins and is never overwritten, so a second login cannot silently re-key a
+/// replica and strand its contents. Only when nothing is cached is a fresh key
+/// minted, and it is written through before it is returned.
+///
+/// The key is minted here, on the device, from the same platform RNG that mints
+/// the PKCE verifier and the CSRF state. No key material crosses the wire and
+/// the server never holds any. The scope the plan locked is unchanged: one key
+/// per replica per device, cached locally, usable with no credential and no
+/// network.
+///
+/// **Call this only for a replica that does not exist yet.** For one already on
+/// disk, read the cache with [`ReplicaKeyStore::load`] and hand the result to
+/// [`Replica::encrypted_file`](crate::Replica::encrypted_file). Minting for an
+/// existing replica would return a key that decrypts nothing, and it would fill
+/// the record that restoring a backed-up key still could, where the refusal
+/// ([`ClientError::ReplicaKeyMissing`])
+/// leaves both the ciphertext and that recovery intact.
 ///
 /// # Errors
 ///
-/// [`ClientError::Auth`] if the store cannot be read or written.
-pub fn resolve_replica_key(
+/// [`ClientError::Auth`] if the store cannot be read or written, or if the
+/// platform RNG fails.
+pub fn provision_replica_key(
     store: &dyn ReplicaKeyStore,
     name: &str,
-    wire: Option<ReplicaKey>,
-) -> Result<Option<ReplicaKey>, ClientError> {
+) -> Result<ReplicaKey, ClientError> {
     if let Some(cached) = store.load(name)? {
-        return Ok(Some(cached));
+        return Ok(cached);
     }
-    match wire {
-        Some(fresh) => {
-            store.store(name, &fresh)?;
-            Ok(Some(fresh))
-        }
-        None => Ok(None),
-    }
+    let minted = mint_replica_key()?;
+    store.store(name, &minted)?;
+    Ok(minted)
+}
+
+/// A fresh key from the platform RNG.
+///
+/// The staging array is key material until it is wiped, and a plain fill would
+/// be elidable where `zeroize` is not.
+fn mint_replica_key() -> Result<ReplicaKey, ClientError> {
+    let mut bytes = [0u8; ReplicaKey::LEN];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| ClientError::Auth(format!("replica key mint: {err}")))?;
+    let key = ReplicaKey::from_bytes(bytes);
+    bytes.zeroize();
+    Ok(key)
 }
 
 /// OS secure storage for the per-replica encryption keys, using the same
@@ -289,13 +313,16 @@ struct TokenResponse<Id> {
     refresh_token: String,
     user_id: Id,
     session_expires_at: u64,
-    #[serde(default)]
-    replica_key: Option<ReplicaKey>,
 }
 
 /// The outcome of an acquisition: the access token for the handshake plus the
 /// identity and session deadline the client needs to select its replica file
 /// and to warn before an offline session lapses with unsynced data.
+///
+/// No key material rides this: the replica's encryption key is minted on the
+/// device. Derive the replica name from
+/// [`user_id`](Self::user_id) and pass it to [`provision_replica_key`] for a
+/// fresh replica, or to [`ReplicaKeyStore::load`] for one already on disk.
 #[derive(Debug, Clone)]
 pub struct AcquiredSession<Id> {
     /// connetto's short-lived access token, carried in `Handshake.auth_token`.
@@ -308,16 +335,6 @@ pub struct AcquiredSession<Id> {
     pub user_id: Id,
     /// When the local session lapses if never refreshed again.
     pub session_expires_at: SystemTime,
-    /// The freshly provisioned per-replica encryption key, exactly as the
-    /// login response carried it. `Some` on a login, `None` on a refresh.
-    ///
-    /// This is the raw wire value, not the key to use. The identity is only
-    /// known once this response arrives, and the key store is addressed per
-    /// identity, so pass this to
-    /// [`resolve_replica_key`] together with the replica name derived from
-    /// [`user_id`](Self::user_id) to get the effective key. A device that
-    /// already cached a key keeps it and discards this one.
-    pub replica_key: Option<ReplicaKey>,
 }
 
 impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
@@ -326,7 +343,6 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
             access_token: response.access_token,
             user_id: response.user_id,
             session_expires_at: UNIX_EPOCH + Duration::from_secs(response.session_expires_at),
-            replica_key: response.replica_key,
         }
     }
 }
@@ -475,11 +491,69 @@ impl NativeAuthenticator {
         })
     }
 
+    /// Credential teardown: revoke the session server-side and clear the stored
+    /// refresh token, so re-authentication is required.
+    ///
+    /// This is one half of the logout grid. It touches no data: the replica and
+    /// its key survive, which is what lets a returning user resume from their
+    /// persisted cursor instead of re-syncing. For the other half see
+    /// [`wipe_replica`](crate::teardown::wipe_replica), and for both under one
+    /// guard see [`forget_device`](crate::teardown::forget_device).
+    ///
+    /// The revoke is awaited, and **the local clear happens either way**. A
+    /// device with no connectivity must still be able to log out, so a failed
+    /// revoke is reported rather than allowed to keep the credential on disk.
+    /// The caller can therefore distinguish the two outcomes: `Ok` means the
+    /// session is refused at the next handshake, and an error means local state
+    /// is gone but the session stays live server-side until it expires on its
+    /// own. Queueing the revoke for later is not an option, since after the
+    /// clear there is no credential left to authenticate it with.
+    ///
+    /// Revocation is liveness, not expiry: any access token already minted stays
+    /// signature-valid until its own short TTL runs out.
+    ///
+    /// Idempotent. With no refresh token stored there is nothing to revoke and
+    /// nothing to clear, and it returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] or [`ClientError::Auth`] if the revoke fails,
+    /// after the local clear. [`ClientError::Auth`] if the store cannot be read
+    /// or cleared.
+    pub async fn logout(&self) -> Result<(), ClientError> {
+        let Some(refresh) = self.store.load()? else {
+            return Ok(());
+        };
+        let revoked = self
+            .post(
+                &format!("{}/auth/logout", self.server_base),
+                &serde_json::json!({ "refresh_token": refresh }),
+            )
+            .await;
+        self.store.clear()?;
+        revoked.map(drop)
+    }
+
     async fn post_json<R: DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> Result<R, ClientError> {
+        let response = self.post(url, body).await?;
+        // A decode failure on a success response is a protocol mismatch.
+        response
+            .json()
+            .await
+            .map_err(|err| ClientError::Protocol(format!("decoding {url}: {err}")))
+    }
+
+    /// POST `body` and classify the status, leaving the response body to the
+    /// caller (the logout endpoint answers `204` with none at all).
+    async fn post(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ClientError> {
         // A send failure is a transport condition, retryable on reconnect, not a
         // rejected credential, so it must not route to a terminal re-login.
         let response = self
@@ -499,11 +573,7 @@ impl NativeAuthenticator {
                 ClientError::Auth(format!("{url} returned {status}"))
             });
         }
-        // A decode failure on a success response is a protocol mismatch.
-        response
-            .json()
-            .await
-            .map_err(|err| ClientError::Protocol(format!("decoding {url}: {err}")))
+        Ok(response)
     }
 }
 
@@ -602,57 +672,67 @@ fn percent_decode(value: &str) -> String {
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{MemoryKeyStore, ReplicaKeyStore as _, resolve_replica_key};
+    use super::{MemoryKeyStore, ReplicaKeyStore as _, provision_replica_key};
 
     fn key_from_byte(b: u8) -> ReplicaKey {
         ReplicaKey::from_bytes([b; ReplicaKey::LEN])
     }
 
-    /// Provision-once: a key already cached for this replica wins over
-    /// whatever a later login response carries, and the cache is left alone.
-    /// Without this a re-login would silently re-key the replica and strand
-    /// everything already written under the old key.
+    /// Provision-once: a key already cached for this replica is handed straight
+    /// back and nothing is minted. Without this a second login would silently
+    /// re-key the replica and strand everything already written under the old
+    /// key.
     #[test]
-    fn a_cached_key_wins_over_a_freshly_provisioned_one() {
+    fn a_cached_key_wins_over_minting_a_fresh_one() {
         let store = MemoryKeyStore::default();
         store.store("replica-a", &key_from_byte(0xaa)).unwrap();
 
-        let effective = resolve_replica_key(&store, "replica-a", Some(key_from_byte(0xbb)))
-            .unwrap()
-            .expect("a cached key resolves");
+        let effective = provision_replica_key(&store, "replica-a").expect("a cached key resolves");
 
         assert_eq!(effective, key_from_byte(0xaa));
         assert_eq!(
             store.load("replica-a").unwrap(),
             Some(key_from_byte(0xaa)),
-            "the wire key must not overwrite the cache"
+            "provisioning must not overwrite the cache"
         );
     }
 
-    /// First login on a device: nothing is cached, so the provisioned key is
-    /// adopted and written through before it is handed back.
+    /// First sight of a replica on a device: nothing is cached, so a key is
+    /// minted locally and written through before it is handed back. Two
+    /// different replicas mint independently, which is what makes the key per
+    /// replica rather than per device.
     #[test]
-    fn a_provisioned_key_is_cached_when_nothing_is_stored() {
+    fn a_key_is_minted_and_cached_when_nothing_is_stored() {
         let store = MemoryKeyStore::default();
 
-        let effective = resolve_replica_key(&store, "replica-a", Some(key_from_byte(0xcc)))
-            .unwrap()
-            .expect("the wire key resolves");
-
-        assert_eq!(effective, key_from_byte(0xcc));
-        assert_eq!(store.load("replica-a").unwrap(), Some(key_from_byte(0xcc)));
-    }
-
-    /// A refresh response carries no key, and with nothing cached there is
-    /// nothing to resolve. Notably this must not invent or persist a key.
-    #[test]
-    fn no_cached_and_no_wire_key_resolves_to_nothing() {
-        let store = MemoryKeyStore::default();
+        let minted = provision_replica_key(&store, "replica-a").expect("a key is minted");
+        assert_eq!(store.load("replica-a").unwrap(), Some(minted.clone()));
         assert_eq!(
-            resolve_replica_key(&store, "replica-a", None).unwrap(),
-            None
+            provision_replica_key(&store, "replica-a").unwrap(),
+            minted,
+            "the minted key is stable across calls"
         );
-        assert_eq!(store.load("replica-a").unwrap(), None);
+
+        let other = provision_replica_key(&store, "replica-b").expect("a second key is minted");
+        assert_ne!(other, minted, "each replica mints its own key");
+    }
+
+    /// The mint draws on the platform RNG rather than any fixed or derived
+    /// value, so no two replicas and no two devices share a key.
+    #[test]
+    fn a_minted_key_is_neither_constant_nor_derived_from_the_name() {
+        let first = MemoryKeyStore::default();
+        let second = MemoryKeyStore::default();
+
+        let a = provision_replica_key(&first, "replica-a").unwrap();
+        let b = provision_replica_key(&second, "replica-a").unwrap();
+
+        assert_ne!(a, b, "the same name on two devices mints two keys");
+        assert_ne!(
+            a,
+            key_from_byte(0),
+            "an all-zero key would mean the fill never ran"
+        );
     }
 
     /// Two identities signed in on one device keep separate keys, which is

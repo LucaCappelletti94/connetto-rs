@@ -18,9 +18,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use connetto_client::{
-    AcquiredSession, BrowserOpener, MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator,
-    RefreshTokenStore, ReplicaKeyStore, replica_db_name, resolve_replica_key,
+    AcquiredSession, BrowserOpener, ClientError, MemoryKeyStore, MemoryRefreshStore,
+    NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore, provision_replica_key,
+    replica_db_name,
 };
+use connetto_core::traits::{SessionVerifier, SessionVerifyError};
 use connetto_server::{
     AuthConfig, AuthService, IdentityResolver, InMemoryAuthStore, PermissiveProvider,
     ProviderRegistry, RedirectPolicy, ResolveFuture, ResolvedIdentity, TokenAuthority,
@@ -78,13 +80,23 @@ fn identity() -> ResolvedIdentity {
 
 /// Serve the auth router on an ephemeral port and return the base URL.
 async fn spawn_auth_server() -> String {
+    spawn_auth_server_with_service().await.0
+}
+
+/// As [`spawn_auth_server`], also handing back the service so a test can ask the
+/// real handshake verifier what it makes of a token.
+async fn spawn_auth_server_with_service() -> (String, Arc<AuthService<InMemoryAuthStore>>) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let service = Arc::new(AuthService::new(authority, store));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(PermissiveProvider::new("permissive", identity())));
-    let router = auth_router(service, Arc::new(registry), RedirectPolicy::default());
+    let router = auth_router(
+        Arc::clone(&service),
+        Arc::new(registry),
+        RedirectPolicy::default(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind auth server");
@@ -92,7 +104,7 @@ async fn spawn_auth_server() -> String {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), service)
 }
 
 /// Serve an auth router whose store resolves identity to a typed
@@ -267,12 +279,14 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
     );
 }
 
-/// Phase E1 acceptance on the native path, against the real auth router.
+/// Phase E1 acceptance on the native path, against the real auth router, as E3
+/// re-shaped it: the key is minted on the device rather than carried by the
+/// login response.
 ///
-/// A first login provisions a per-replica key and caches it, a later login
-/// resolving the same identity keeps the cached key rather than adopting the
-/// freshly minted one, two identities on one device stay isolated, and a
-/// silent refresh carries no key at all.
+/// A first login mints a per-replica key and caches it, a later login resolving
+/// the same identity keeps the cached key rather than minting another, a cold
+/// start with no server in reach still resolves it, and two identities on one
+/// device stay isolated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     let base = spawn_typed_auth_server().await;
@@ -280,61 +294,138 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 
     let alice = login_as(&base, "alice").await;
     let alice_replica = replica_db_name("app.db", &alice.user_id).expect("alice replica");
-    let provisioned = alice
-        .replica_key
-        .clone()
-        .expect("a login response carries a freshly provisioned key");
 
-    // First sight: the provisioned key is adopted and written through.
-    let first = resolve_replica_key(&keys, &alice_replica, alice.replica_key)
-        .expect("resolve")
-        .expect("a key resolves on first login");
-    assert_eq!(first, provisioned);
+    // First sight of this replica: a key is minted locally and written through.
+    let provisioned =
+        provision_replica_key(&keys, &alice_replica).expect("a key is minted on first login");
     assert_eq!(
         keys.load(&alice_replica).expect("load"),
         Some(provisioned.clone()),
-        "the provisioned key is cached for a later cold start",
+        "the minted key is cached for a later cold start",
     );
 
-    // A second login for the same identity mints a different key server side,
-    // because the server retains nothing. Provision-once means the cached key
-    // still wins, which is what stops a re-login from stranding the replica.
+    // A second login for the same identity changes nothing about the key: the
+    // server has no say in it, and provision-once means the cached key wins,
+    // which is what stops a re-login from stranding the replica.
     let again = login_as(&base, "alice").await;
-    let reminted = again
-        .replica_key
-        .clone()
-        .expect("the second login also provisions");
-    assert_ne!(
-        reminted, provisioned,
-        "the server mints fresh key material every login, holding none",
+    assert_eq!(
+        replica_db_name("app.db", &again.user_id).expect("replica"),
+        alice_replica,
     );
-    let effective = resolve_replica_key(&keys, &alice_replica, again.replica_key)
-        .expect("resolve")
-        .expect("a key resolves");
+    let effective = provision_replica_key(&keys, &alice_replica).expect("resolve");
     assert_eq!(
         effective, provisioned,
-        "the cached key wins over the re-minted one",
+        "the cached key survives a second login",
     );
 
-    // A cold start with no wire key at all still resolves, which is the
-    // offline property: the replica opens with no valid credential.
-    let offline = resolve_replica_key(&keys, &alice_replica, None)
-        .expect("resolve")
-        .expect("the cached key resolves with nothing on the wire");
+    // The offline property: nothing but the local store is consulted, so the
+    // replica opens with no valid credential and no network.
+    let offline = keys
+        .load(&alice_replica)
+        .expect("load")
+        .expect("the cached key reads back");
     assert_eq!(offline, provisioned, "an offline cold start reads it back");
 
     // A second identity on the same device gets its own key and its own
     // record, so neither can read the other's replica.
     let bob = login_as(&base, "bob").await;
     let bob_replica = replica_db_name("app.db", &bob.user_id).expect("bob replica");
-    let bob_key = resolve_replica_key(&keys, &bob_replica, bob.replica_key)
-        .expect("resolve")
-        .expect("bob is provisioned too");
+    let bob_key = provision_replica_key(&keys, &bob_replica).expect("bob is provisioned too");
     assert_ne!(bob_key, provisioned, "identities do not share a key");
     assert_eq!(
         keys.load(&alice_replica).expect("load"),
         Some(provisioned),
         "bob's login leaves alice's cached key untouched",
+    );
+}
+
+/// Phase E3 acceptance, credential teardown against the real auth router.
+///
+/// A logout revokes the session server-side, which is the half a local clear
+/// cannot give: the next handshake is refused even though the access token it was
+/// minted with is still inside its own lifetime and still verifies by signature.
+/// The stored refresh token is gone too, and a copy of it kept elsewhere is dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
+    let (base, service) = spawn_auth_server_with_service().await;
+    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
+    let authenticator = NativeAuthenticator::new(base.clone(), "permissive", Arc::clone(&store))
+        .with_browser_opener(fake_browser(base.clone()));
+
+    let login = authenticator.login::<String>().await.expect("login");
+    let refresh = store
+        .load()
+        .expect("load")
+        .expect("the refresh token is stored");
+
+    // Before the logout the real handshake verifier accepts this token.
+    let verifier = service.verifier();
+    verifier
+        .verify_session(&login.access_token)
+        .await
+        .expect("a live session verifies");
+
+    authenticator.logout().await.expect("logout");
+
+    // Local state is gone, so nothing on this device can silently reacquire.
+    assert_eq!(
+        store.load().expect("load"),
+        None,
+        "the refresh token is cleared",
+    );
+
+    // Server-side liveness is gone, which is what makes the logout mean
+    // something: the access token is inside its 15 minute default TTL and its
+    // signature still checks out, and the handshake refuses it anyway.
+    match verifier.verify_session(&login.access_token).await {
+        Err(SessionVerifyError::Revoked) => {}
+        Err(other) => panic!("expected Revoked, got {other:?}"),
+        Ok(_) => panic!("a logged-out session must be refused at the next handshake"),
+    }
+
+    // A copy of the refresh token kept anywhere else is dead too, so the session
+    // cannot be resurrected into a fresh access token.
+    let kept = MemoryRefreshStore::default();
+    kept.store(&refresh).expect("seed the copy");
+    let resurrect = NativeAuthenticator::new(base, "permissive", Arc::new(kept))
+        .with_browser_opener(Arc::new(|_url: &str| {
+            panic!("no browser during a refresh attempt")
+        }));
+    match resurrect.refresh_access::<String>().await {
+        Err(ClientError::Auth(_)) => {}
+        Err(other) => panic!("expected a rejected credential, got {other:?}"),
+        Ok(_) => panic!("a revoked session must not rotate its refresh token"),
+    }
+
+    // Idempotent: with nothing stored there is nothing to revoke.
+    authenticator
+        .logout()
+        .await
+        .expect("a second logout is a no-op");
+}
+
+/// Offline logout, which decision three of phase E3 settles: the local clear
+/// happens even when the revoke cannot be delivered, and the failure is reported
+/// rather than swallowed, so the application knows the session stays live until it
+/// expires on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed() {
+    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
+    store.store("session-id.secret").expect("seed a credential");
+    // Port 1 is reserved and nothing listens there, which is this test's stand-in
+    // for a device with no connectivity.
+    let authenticator =
+        NativeAuthenticator::new("http://127.0.0.1:1", "permissive", Arc::clone(&store));
+
+    match authenticator.logout().await {
+        Err(ClientError::Transport(_)) => {}
+        Err(other) => panic!("expected a transport failure, got {other:?}"),
+        Ok(()) => panic!("an unreachable server must not report a successful revoke"),
+    }
+    assert_eq!(
+        store.load().expect("load"),
+        None,
+        "the credential is cleared even when the revoke never landed",
     );
 }
 

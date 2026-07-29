@@ -66,6 +66,10 @@ pub enum AuthError {
     /// A browser API was unavailable in this context.
     #[error("browser context error: {0}")]
     Context(String),
+    /// An existing database did not decrypt under the key supplied. A wrong key
+    /// and a corrupt file are indistinguishable to the page codec.
+    #[error("the database does not decrypt under the key supplied: {0}")]
+    Undecryptable(String),
 }
 
 fn js_error(context: &str, value: &JsValue) -> AuthError {
@@ -91,19 +95,18 @@ pub struct WorkerAuthConfig {
 /// is unavailable the same code runs against the in-memory VFS, so the session
 /// works but does not survive a worker restart.
 ///
-/// This database is **not** encrypted at rest, and the blocker is structural
-/// rather than a matter of effort. It is read to learn the identity, while the
-/// per-replica key that phase E2 applies everywhere else is addressed by
-/// `replica_db_name`, which is derived from that identity. So the refresh store
-/// must be readable strictly before any per-replica key can be resolved, and it
-/// cannot be encrypted under one. Covering it needs a device-scoped key with its
-/// own custody and its own lifetime, which is a second key concept the
-/// at-rest-encryption plan has not settled: it locked exactly one key, per
-/// replica. That decision belongs with the logout and key-lifecycle primitives.
+/// Encrypted at rest under [`device_key`](crate::storage::device_key) rather than
+/// under a per-replica key, and the distinction is structural. This store is read
+/// to learn the identity, while a per-replica key is addressed by
+/// `replica_db_name`, which is derived from that identity, so the store must be
+/// readable strictly before any per-replica key exists. A device-scoped key has
+/// no such ordering problem: it is named by a literal, minted locally on first
+/// use, and wrapped in the same non-extractable [`ReplicaKeyStore`] the replica
+/// keys live in.
 ///
-/// The exposure this leaves is bounded by what the token is: a rotating
-/// credential, revocable server-side, and useless once a logout revokes the
-/// session. It is not the user's data, which is what E2 encrypts.
+/// What that protects is bounded by what the token is: a rotating credential,
+/// revocable server-side, and useless once a logout revokes the session. The
+/// user's data is the replica's business, not this store's.
 pub struct RefreshStore {
     conn: RefCell<SqliteConnection>,
 }
@@ -116,15 +119,33 @@ diesel::table! {
 }
 
 impl RefreshStore {
-    /// Open (creating if needed) the refresh store in `db_name`, which resolves
-    /// through whichever VFS the worker installed.
+    /// Open (creating if needed) the refresh store at `db_url`, encrypted under
+    /// `key`.
+    ///
+    /// `db_url` is the codec URL
+    /// [`ReplicaStorage::db_url`](crate::storage::ReplicaStorage::db_url)
+    /// composes over the installed VFS, because the codec intercepts as a VFS
+    /// shim and a bare name would leave it out of the stack. `key` is
+    /// [`device_key`](crate::storage::device_key), not a per-replica key: this
+    /// store is read before any identity is known, so nothing addressed by an
+    /// identity can protect it.
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the database cannot be opened or initialized.
-    pub fn open(db_name: &str) -> Result<Self, AuthError> {
-        let mut conn = SqliteConnection::establish(db_name)
-            .map_err(|err| AuthError::Store(format!("open {db_name}: {err}")))?;
+    /// [`AuthError::Undecryptable`] if a store already exists and `key` does not
+    /// open it, or [`AuthError::Store`] if the database cannot be opened or
+    /// initialized.
+    pub fn open(db_url: &str, key: &ReplicaKey) -> Result<Self, AuthError> {
+        let mut conn = SqliteConnection::establish(db_url)
+            .map_err(|err| AuthError::Store(format!("open {db_url}: {err}")))?;
+        // Before any statement that reads a page: the CREATE TABLE below would
+        // otherwise read the header and fail on ciphertext.
+        connetto_client::cipher::unlock(&mut conn, key).map_err(|err| match err {
+            connetto_client::UnlockError::WrongKey(detail) => {
+                AuthError::Undecryptable(detail.to_string())
+            }
+            other => AuthError::Store(format!("unlock the refresh store: {other}")),
+        })?;
         conn.batch_execute(
             "CREATE TABLE IF NOT EXISTS connetto_refresh (id INTEGER PRIMARY KEY, token TEXT NOT NULL)",
         )
@@ -210,14 +231,17 @@ struct TokenResponse<Id> {
     refresh_token: String,
     user_id: Id,
     session_expires_at: u64,
-    #[serde(default)]
-    replica_key: Option<ReplicaKey>,
 }
 
 /// A completed acquisition: the access token the worker sets on its handshake,
 /// plus the identity and session deadline the worker needs to select the
 /// replica file this identity owns and to warn before an offline session
 /// lapses with unsynced data.
+///
+/// No key material rides this: the replica's encryption key is minted in the
+/// worker. Derive the replica name from [`user_id`](Self::user_id) and pass it
+/// to [`provision_replica_key`] for a fresh replica, or to
+/// [`ReplicaKeyStore::load`] for one already in storage.
 #[derive(Debug, Clone)]
 pub struct BrowserSession<Id> {
     /// connetto's short-lived access token, held only in the worker.
@@ -228,12 +252,6 @@ pub struct BrowserSession<Id> {
     pub user_id: Id,
     /// Unix seconds when the local session lapses if never refreshed again.
     pub session_expires_at: u64,
-    /// The effective per-replica encryption key for this identity on this
-    /// device. Populated by [`ReplicaKeyStore`] logic in
-    /// [`BrowserAuthenticator::complete`]: a cached key always wins over the
-    /// wire value, so this is stable across logins and never reset by a
-    /// later server response. `None` when no key has been provisioned yet.
-    pub replica_key: Option<ReplicaKey>,
 }
 
 impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
@@ -242,7 +260,6 @@ impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
             access_token: response.access_token,
             user_id: response.user_id,
             session_expires_at: response.session_expires_at,
-            replica_key: response.replica_key,
         }
     }
 }
@@ -491,36 +508,51 @@ impl ReplicaKeyStore {
     }
 }
 
-/// The effective key for the replica `name`, given whatever the login response
-/// carried in `wire`.
+/// The effective key for the replica `name`, minting one when this device has
+/// none cached.
 ///
 /// Provision-once, and the browser mirror of
-/// `connetto_client::auth::resolve_replica_key`: a key already cached on this
-/// device always wins and is never overwritten, so a re-login cannot silently
-/// re-key a replica and strand its contents. Only when nothing is cached is a
-/// freshly provisioned key adopted, and it is written through first.
+/// `connetto_client::auth::provision_replica_key`: a key already cached on this
+/// device always wins and is never overwritten, so a second login cannot
+/// silently re-key a replica and strand its contents. Only when nothing is
+/// cached is a fresh key minted, and it is written through first.
 ///
-/// Call this after acquisition, because `name` is derived from the identity
-/// the token response resolves.
+/// The key is minted here, in the worker, from the same platform RNG that mints
+/// the PKCE verifier and the AES-GCM IV this very key is wrapped under. No key
+/// material crosses the wire and the server never holds any.
+///
+/// Call this after acquisition, because `name` is derived from the identity the
+/// token response resolves, and **only for a replica that does not exist yet**.
+/// For one already in storage read [`ReplicaKeyStore::load`]: minting for an
+/// existing replica would return a key that decrypts nothing.
 ///
 /// # Errors
 ///
-/// [`AuthError::Store`] if the key store cannot be read or written.
-pub async fn resolve_replica_key(
+/// [`AuthError::Store`] if the key store cannot be read or written, or
+/// [`AuthError::Context`] if the platform RNG fails.
+pub async fn provision_replica_key(
     store: &ReplicaKeyStore,
     name: &str,
-    wire: Option<ReplicaKey>,
-) -> Result<Option<ReplicaKey>, AuthError> {
+) -> Result<ReplicaKey, AuthError> {
     if let Some(cached) = store.load(name).await? {
-        return Ok(Some(cached));
+        return Ok(cached);
     }
-    match wire {
-        Some(fresh) => {
-            store.save(name, &fresh).await?;
-            Ok(Some(fresh))
-        }
-        None => Ok(None),
-    }
+    let minted = mint_replica_key()?;
+    store.save(name, &minted).await?;
+    Ok(minted)
+}
+
+/// A fresh key from the platform RNG.
+///
+/// The staging array is key material until it is wiped, and a plain fill would
+/// be elidable where `zeroize` is not.
+fn mint_replica_key() -> Result<ReplicaKey, AuthError> {
+    let mut bytes = [0u8; ReplicaKey::LEN];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|err| AuthError::Context(format!("replica key mint: {err}")))?;
+    let key = ReplicaKey::from_bytes(bytes);
+    bytes.zeroize();
+    Ok(key)
 }
 
 /// The outcome of an acquisition attempt.
@@ -556,9 +588,8 @@ impl BrowserAuthenticator {
     /// Try a silent refresh from the stored token, on failure or absence
     /// produce a [`PendingLogin`] for interactive login.
     ///
-    /// The returned session's `replica_key` is the raw wire value, which a
-    /// refresh never carries. Resolve the effective key afterwards with
-    /// [`resolve_replica_key`], once the identity is known.
+    /// The replica key is not part of this exchange: see
+    /// [`complete`](Self::complete).
     ///
     /// # Errors
     ///
@@ -601,10 +632,9 @@ impl BrowserAuthenticator {
     /// Complete an interactive login: verify the returned state, exchange the
     /// code for tokens, and persist the refresh token.
     ///
-    /// The returned session's `replica_key` is the raw wire value the server
-    /// just provisioned. Resolve the effective key with
-    /// [`resolve_replica_key`], which applies provision-once against the
-    /// per-identity record.
+    /// The replica key is not part of this exchange. Resolve it afterwards from
+    /// the identity this returns, with [`provision_replica_key`] for a fresh
+    /// replica or [`ReplicaKeyStore::load`] for one already in storage.
     ///
     /// # Errors
     ///
@@ -622,6 +652,43 @@ impl BrowserAuthenticator {
         let tokens = self.exchange_code(code, &pending.verifier).await?;
         store.save(&tokens.refresh_token)?;
         Ok(tokens.into())
+    }
+
+    /// Credential teardown: revoke the session server-side and clear the stored
+    /// refresh token, so re-authentication is required.
+    ///
+    /// One half of the logout grid. It touches no data: the replica and its key
+    /// survive, which is what lets a returning user resume from their persisted
+    /// cursor instead of re-syncing. For the other half see
+    /// [`wipe_replica`](crate::storage::wipe_replica).
+    ///
+    /// The revoke is awaited, and **the local clear happens either way**. A tab
+    /// with no connectivity must still be able to log out, so a failed revoke is
+    /// reported rather than allowed to keep the credential in OPFS. `Ok` means the
+    /// session is refused at the next handshake, and an error means local state is
+    /// gone but the session stays live server-side until it expires on its own.
+    /// Queueing the revoke is not an option, since after the clear there is no
+    /// credential left to authenticate it with.
+    ///
+    /// Revocation is liveness, not expiry: the access token the worker still holds
+    /// in memory stays signature-valid until its own short TTL runs out, so drop
+    /// the connection rather than trusting the server to refuse it.
+    ///
+    /// Idempotent: with no refresh token stored there is nothing to revoke.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Transient`] or [`AuthError::Request`] if the revoke fails,
+    /// after the local clear, or [`AuthError::Store`] if the store cannot be read
+    /// or cleared.
+    pub async fn logout(&self, store: &RefreshStore) -> Result<(), AuthError> {
+        let Some(refresh) = store.load()? else {
+            return Ok(());
+        };
+        let body = serde_json::json!({ "refresh_token": refresh }).to_string();
+        let revoked = post_json(&format!("{}/auth/logout", self.config.auth_base_url), &body).await;
+        store.clear()?;
+        revoked.map(drop)
     }
 
     async fn refresh_tokens<Id: serde::de::DeserializeOwned>(

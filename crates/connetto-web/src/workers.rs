@@ -38,7 +38,6 @@ use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType}
 
 use crate::relay::{HubReconnect, LocalTier};
 use crate::{BroadcastTransport, BrowserSocket, HubNotice, RelayHub, locks};
-use connetto_client::cipher::cipher_url;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::SubscriptionSpec;
@@ -109,74 +108,6 @@ pub struct DbWorkerConfig {
     /// The OPFS database holding the worker-only refresh token, used only when
     /// `auth` is set.
     pub auth_db_name: &'static str,
-}
-
-/// The worker's SQLite storage backend. OPFS through the sahpool VFS is the
-/// durable default. When OPFS is unavailable (a Firefox private window
-/// refuses `getDirectory` with a `SecurityError`, for one), the worker falls
-/// back to the in-memory VFS so the app still boots instead of dying: this
-/// session gets no persistence and no cross-window OPFS sharing, but the live
-/// topology over `BroadcastChannel` and Web Locks stays intact.
-enum WorkerStorage {
-    Opfs(sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil),
-    Memory(sqlite_wasm_rs::MemVfsUtil<sqlite_wasm_rs::WasmOsCallback>),
-}
-
-impl WorkerStorage {
-    /// Install OPFS if the browser allows it, otherwise the in-memory VFS
-    /// (already registered as the default VFS at SQLite init, so plain file
-    /// names resolve to it once sahpool declines to take over the default).
-    async fn install() -> Self {
-        match sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
-            &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
-            true,
-        )
-        .await
-        {
-            Ok(util) => Self::Opfs(util),
-            Err(err) => {
-                web_sys::console::warn_1(
-                    &format!(
-                        "db worker: OPFS unavailable ({err:?}), using an in-memory replica: no persistence and no cross-window OPFS sharing this session"
-                    )
-                    .into(),
-                );
-                Self::Memory(sqlite_wasm_rs::MemVfsUtil::new())
-            }
-        }
-    }
-
-    /// Whether a database file of this name already exists in the backend.
-    fn exists(&self, name: &str) -> bool {
-        match self {
-            Self::Opfs(util) => util.exists(name).unwrap_or(false),
-            Self::Memory(util) => util.exists(name),
-        }
-    }
-
-    /// The name SQLite resolves to this backend's VFS.
-    const fn vfs_name(&self) -> &'static str {
-        match self {
-            Self::Opfs(_) => "opfs-sahpool",
-            Self::Memory(_) => "memvfs",
-        }
-    }
-
-    /// The database URL that opens `name` in this backend, encrypted or not.
-    ///
-    /// A plaintext database opens under its bare name, which resolves through
-    /// whichever VFS is the default. An encrypted one must name the codec shim
-    /// over this backend's VFS explicitly, because the codec intercepts as a VFS
-    /// layer: a bare name would open the real VFS with no codec in the stack, and
-    /// `PRAGMA key` would have nothing to talk to. Both backends are covered, so
-    /// the OPFS-unavailable fallback stays encrypted too.
-    fn db_url(&self, name: &str, encrypted: bool) -> String {
-        if encrypted {
-            cipher_url(name, self.vfs_name())
-        } else {
-            name.to_owned()
-        }
-    }
 }
 
 /// How the leader launches the dedicated DB worker, which differs only by how
@@ -318,11 +249,34 @@ pub async fn announce_tab(wire: &str) {
 /// the worker needs to select the replica file and to warn before an offline
 /// session lapses. The worker holds the tokens throughout; a tab only ever
 /// sees the login URL and returns the authorization code.
+///
+/// The refresh store is encrypted under this device's own key, which is minted on
+/// first use. A store that does not open under it is a store from before the key
+/// existed, or one whose key was destroyed: either way the credential inside is
+/// unreachable and the only recovery is a fresh login, so it is discarded rather
+/// than reported as a boot failure.
 async fn acquire_session<Id: serde::de::DeserializeOwned>(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::ReplicaKeyStore,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
-    let store = crate::auth::RefreshStore::open(auth_db_name).map_err(to_js)?;
+    let device_key = crate::storage::device_key(key_store).await.map_err(to_js)?;
+    let auth_db_url = storage.db_url(auth_db_name, true);
+    let store = match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
+        Ok(store) => store,
+        Err(crate::auth::AuthError::Undecryptable(detail)) => {
+            web_sys::console::warn_1(
+                &format!(
+                    "db worker: the refresh store does not decrypt ({detail}), discarding it and requiring a fresh login"
+                )
+                .into(),
+            );
+            storage.delete_db(auth_db_name).map_err(to_js)?;
+            crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)?
+        }
+        Err(err) => return Err(to_js(err)),
+    };
     let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone());
     match authenticator.acquire(&store).await.map_err(to_js)? {
         crate::auth::Acquired::Access(session) => Ok(session),
@@ -359,7 +313,7 @@ pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<(), JsValue>
 where
     Id: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let storage = WorkerStorage::install().await;
+    let storage = crate::storage::ReplicaStorage::install().await;
 
     // Acquire connetto's own access token when auth is configured: a silent
     // refresh from the OPFS-stored token on a cold start or leader failover,
@@ -370,9 +324,19 @@ where
     // identity decides which replica file to open. Connecting first and
     // checking identity afterwards would resume the previous identity's
     // replica over the wire under the new user's token.
-    let session = match &config.auth {
-        Some(auth_config) => Some(acquire_session::<Id>(auth_config, config.auth_db_name).await?),
+    //
+    // One key store serves the whole boot: this device's own key, which unlocks
+    // the refresh store, and the per-replica key both live in it, and opening
+    // IndexedDB twice buys nothing.
+    let key_store = match &config.auth {
+        Some(_) => Some(crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?),
         None => None,
+    };
+    let session = match (&config.auth, &key_store) {
+        (Some(auth_config), Some(keys)) => {
+            Some(acquire_session::<Id>(auth_config, config.auth_db_name, &storage, keys).await?)
+        }
+        _ => None,
     };
     // Identity continuity by file selection: each identity owns the replica
     // named from its own id, so an account switch opens a different file and
@@ -390,29 +354,40 @@ where
         None => config.replica_db_prefix.to_owned(),
     };
 
-    // Provision-once custody of the per-replica encryption key. It resolves
-    // here rather than inside acquisition because the record is addressed by
-    // the replica name, which only exists once the identity does. A key
-    // cached by an earlier boot wins, so a re-login never re-keys a replica.
-    let replica_key = match (&config.auth, &session) {
-        (Some(_), Some(session)) => {
-            let key_store = crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?;
-            crate::auth::resolve_replica_key(
-                &key_store,
-                &replica_db_name,
-                session.replica_key.clone(),
-            )
-            .await
-            .map_err(to_js)?
+    // A replica left by a previous worker generation of the SAME identity
+    // resumes: the persisted cursor rides the handshake and the subscription
+    // below catches up from the server oplog instead of re-snapshotting.
+    let existing = storage.exists(&replica_db_name);
+
+    // Provision-once custody of the per-replica encryption key, minted on this
+    // device. It resolves here rather than inside acquisition because the record
+    // is addressed by the replica name, which only exists once the identity
+    // does. A fresh replica mints its key and caches it. An existing one reads
+    // the cache and nothing else: minting for it would return a key that
+    // decrypts nothing, and would fill the record that restoring a backed-up
+    // key still could, so an absent record refuses in `Replica::encrypted_file`
+    // instead.
+    let replica_key = match &key_store {
+        Some(keys) => {
+            if existing {
+                keys.load(&replica_db_name).await.map_err(to_js)?
+            } else {
+                Some(
+                    crate::auth::provision_replica_key(keys, &replica_db_name)
+                        .await
+                        .map_err(to_js)?,
+                )
+            }
         }
-        _ => None,
+        None => None,
     };
     // Encrypted whenever authentication is configured, because that is exactly
-    // when an identity, a key store record, and a provisioning server all exist.
-    // With auth unset none of the three does, so the replica is plaintext and
-    // says so. The refusal for "auth configured but no key resolved" lives in
-    // `Replica::encrypted_file`, so a native application gets the same behaviour
-    // rather than a second implementation of it here.
+    // when an identity, and so a key store record addressed by it, exists. With
+    // auth unset there is no identity to name a record after, so the replica is
+    // plaintext and says so. The refusal for "auth configured but the key store
+    // no longer holds this replica's key" lives in `Replica::encrypted_file`, so
+    // a native application gets the same behaviour rather than a second
+    // implementation of it here.
     let encrypted = config.auth.is_some();
 
     let auth_token = session
@@ -425,10 +400,6 @@ where
         sql_functions: config.sql_functions.clone(),
     };
     let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
-    // A replica left by a previous worker generation of the SAME identity
-    // resumes: the persisted cursor rides the handshake and the subscription
-    // below catches up from the server oplog instead of re-snapshotting.
-    let existing = storage.exists(&replica_db_name);
     let replica_url = storage.db_url(&replica_db_name, encrypted);
     // Always a durable file here: OPFS, or the in-memory VFS's named file when
     // OPFS is unavailable. Never `Ephemeral`, which is the tab's case.

@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_core::ReplicaKey;
 use uuid::Uuid;
 
 use crate::authn::store::ResolvedIdentity;
@@ -422,6 +421,9 @@ impl Default for PendingLogins {
 /// A one-time connetto authorization code issued to a loopback client, holding
 /// the minted token pair until the client redeems it at the token endpoint with
 /// its PKCE verifier.
+///
+/// It holds no key material. The per-replica encryption key is minted on the
+/// device, so `AuthCodes` never becomes a window in which the server holds one.
 #[derive(Debug, Clone)]
 pub struct IssuedAuthCode<Id> {
     /// The access token to hand back on redemption.
@@ -434,11 +436,6 @@ pub struct IssuedAuthCode<Id> {
     pub user_id: Id,
     /// Unix-seconds instant the local session lapses without a further refresh.
     pub session_expires_at_secs: u64,
-    /// The per-replica encryption key from the login that produced this code.
-    /// This field keeps the key in `AuthCodes` server memory between issue and
-    /// redemption, bounded by the code TTL: that is the one window under
-    /// provision-once where the server holds key material at all.
-    pub replica_key: Option<ReplicaKey>,
     /// The client's PKCE S256 challenge that the redeeming verifier must match.
     pub code_challenge: String,
 }
@@ -639,7 +636,6 @@ mod tests {
             expires_in_secs: 900,
             user_id: "user".to_owned(),
             session_expires_at_secs: 0,
-            replica_key: None,
             code_challenge: "challenge".to_owned(),
         }
     }

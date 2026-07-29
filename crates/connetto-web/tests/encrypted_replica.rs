@@ -8,7 +8,7 @@
 //! Every assertion reads real bytes back out of OPFS through the pool's own
 //! export, not a pragma result. The codec is `SQLite3` Multiple Ciphers, reached
 //! by opening through a `multipleciphers-opfs-sahpool` URL, which is what
-//! [`cipher_url`] composes and what `WorkerStorage::db_url` hands the connection.
+//! [`cipher_url`] composes and what `ReplicaStorage::db_url` hands the connection.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
@@ -55,7 +55,7 @@ async fn pool() -> sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil {
     .expect("install the sahpool VFS")
 }
 
-/// Open `name` in OPFS under `key`, exactly as `WorkerStorage::db_url` plus the
+/// Open `name` in OPFS under `key`, exactly as `ReplicaStorage::db_url` plus the
 /// worker's own unlock do: an encrypted database names the codec shim over the
 /// sahpool VFS, a plaintext one opens under its bare name.
 fn open(name: &str, key: Option<&ReplicaKey>) -> SqliteConnection {

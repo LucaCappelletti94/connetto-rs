@@ -475,6 +475,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "diesel-sqlite-session",
+ "getrandom 0.3.4",
  "keyring",
  "libsqlite3-sys",
  "open",

@@ -73,6 +73,8 @@ tokio = { version = "1", default-features = false, features = ["macros", "sync"]
 # the worker mints PKCE with getrandom (js backend) plus sha2 and base64,
 # posts to connetto-server's token and refresh endpoints through web-sys fetch,
 # and serializes the login-channel messages and token responses with serde.
+# getrandom also mints the per-replica encryption key, which is minted on the
+# device and never crosses the wire.
 getrandom = { version = "0.2", features = ["js"] }
 sha2 = { version = "0.10", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
@@ -81,8 +83,9 @@ serde_json = "1"
 # The browser replica-key store: the wrapped page key and the non-extractable
 # AES-GCM wrapping key both live in IndexedDB.
 indexed_db_futures = "0.6"
-# That store hands WebCrypto a plaintext copy of the page key, so the buffer is
-# wiped rather than left for the allocator to recycle.
+# That store hands WebCrypto a plaintext copy of the page key, and the mint
+# stages fresh key bytes, so both buffers are wiped rather than left for the
+# allocator to recycle.
 zeroize = { version = "1", default-features = false }
 
 # The replica key store is exercised in a dedicated worker against real

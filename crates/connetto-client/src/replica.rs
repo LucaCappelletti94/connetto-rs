@@ -58,7 +58,7 @@ pub enum Replica<'a> {
         /// Where the replica lives.
         path: &'a str,
         /// The per-replica key, from
-        /// [`resolve_replica_key`](crate::auth::resolve_replica_key) or the
+        /// [`provision_replica_key`](crate::auth::provision_replica_key) or the
         /// browser equivalent.
         key: ReplicaKey,
     },
@@ -66,9 +66,8 @@ pub enum Replica<'a> {
     /// anyone who can read the file, and by anyone who later recovers the disk.
     ///
     /// **Correct in exactly one situation: the deployment has no authentication
-    /// configured.** Then there is no identity, no key store record to address,
-    /// and no provisioning server, so no key exists to encrypt under. That is
-    /// the dev loops, the pre-auth test suites, and connetto's own demos.
+    /// configured.** That is the dev loops, the pre-auth test suites, and
+    /// connetto's own demos.
     ///
     /// Note that this is narrower than "the user is logged out". The per-replica
     /// key is deliberately not session-scoped: it survives logout so a returning
@@ -78,24 +77,28 @@ pub enum Replica<'a> {
     /// [`EncryptedFile`](Self::EncryptedFile) from its cached key.
     ///
     /// It follows that an authenticating deployment reaching this variant is
-    /// always a bug. Two arguments for allowing it deliberately were considered
-    /// and both fail. Inspectability does not need it, because `sqlcipher` opens
-    /// an encrypted database and the key is in the keyring of the same user on
-    /// the same machine. Loss tolerance argues for something else entirely: the
-    /// fear is that a wiped key store takes the device-local tier with it, and
-    /// the answer to that is backing up the key or syncing the tier, not trading
-    /// away confidentiality to buy durability. Cheaper page crypto and an
-    /// external reader that links no codec are costs with their own fixes, not
-    /// reasons.
+    /// always a bug, and [`encrypted_file`](Self::encrypted_file) is what stops
+    /// it. Two arguments for allowing it deliberately were considered and both
+    /// fail. Inspectability does not need it, because `sqlcipher` opens an
+    /// encrypted database and the key is in the keyring of the same user on the
+    /// same machine. Loss tolerance argues for something else entirely: the fear
+    /// is that a wiped key store takes the device-local tier with it, and the
+    /// answer to that is backing up the key or syncing the tier, not trading away
+    /// confidentiality to buy durability. Cheaper page crypto and an external
+    /// reader that links no codec are costs with their own fixes, not reasons.
     ///
-    /// One thing this variant is **not** is the answer to "no key arrived from
-    /// the server". A key is 32 random bytes, and both clients already mint
-    /// security-critical randomness locally: the PKCE verifier on each side, and
-    /// in the browser the AES-GCM IV that wraps this very key. So an
-    /// unauthenticated deployment could encrypt under a device-minted key, and
-    /// then this variant would have no justified use at all. That path does not
-    /// exist yet, which is why the variant is currently reachable by necessity.
-    /// See `docs/handoff-auth-at-rest-encryption.md`.
+    /// This variant is scheduled for deletion and is not kept for symmetry. Its
+    /// stated justification is now thin: since keys are minted on the device
+    /// ([`provision_replica_key`](crate::auth::provision_replica_key)), an
+    /// unauthenticated deployment could name its key-store record after the bare
+    /// replica prefix and encrypt too. What still blocks the deletion is not that
+    /// argument but two concrete consumers, both of which first-boot a replica
+    /// from a baked plaintext template: `examples/wasm-smoke/tests/opfs.rs` and
+    /// `examples/dioxus-desktop-demo`. A template is a finished plaintext image
+    /// and no plaintext-to-encrypted transform exists in the browser codec, so
+    /// retiring the baked replica template comes first, and that is scheduled
+    /// after phase E4 rather than left open. See
+    /// `docs/handoff-auth-at-rest-encryption.md`.
     PlaintextFile {
         /// Where the replica lives.
         path: &'a str,
@@ -103,18 +106,23 @@ pub enum Replica<'a> {
 }
 
 impl<'a> Replica<'a> {
-    /// The encrypted replica at `path` under the key
-    /// [`resolve_replica_key`](crate::auth::resolve_replica_key) returned,
+    /// The encrypted replica at `path` under the key the key store holds for it,
     /// refusing when there is none.
     ///
     /// This is the check that stops an authenticating deployment from silently
     /// falling back to [`PlaintextFile`](Self::PlaintextFile), and it is the only
     /// place that refusal lives, so the browser worker and a native application
-    /// get the same behaviour. `None` means the login carried no key and nothing
-    /// was cached, which is the cleared-key-store case. Its recoveries are a
-    /// fresh interactive login, which provisions one, or an explicit data wipe.
-    /// Neither of them is "open it in the clear", so this returns an error rather
-    /// than choosing for the application.
+    /// get the same behaviour. `None` is what
+    /// [`ReplicaKeyStore::load`](crate::auth::ReplicaKeyStore::load) returns for a
+    /// replica whose key-store record is gone while the file survived, and its
+    /// recoveries are restoring the key, or an explicit data wipe followed by a
+    /// re-sync. Neither of them is "open it in the clear", so this returns an
+    /// error rather than choosing for the application.
+    ///
+    /// Note the asymmetry with
+    /// [`provision_replica_key`](crate::auth::provision_replica_key), which cannot
+    /// return `None` because it mints: a replica being created always has a key,
+    /// and only one already on disk can be missing its own.
     ///
     /// # Errors
     ///

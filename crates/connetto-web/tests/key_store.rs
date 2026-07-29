@@ -8,7 +8,7 @@
 //! is wrapped rather than the raw key.
 
 use connetto_core::ReplicaKey;
-use connetto_web::auth::{ReplicaKeyStore, resolve_replica_key};
+use connetto_web::auth::{ReplicaKeyStore, provision_replica_key};
 use indexed_db_futures::database::Database as IdbDatabase;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::query_source::QuerySource;
@@ -143,37 +143,39 @@ async fn what_lands_in_indexeddb_is_wrapped_not_the_raw_key() {
 }
 
 #[wasm_bindgen_test]
-async fn provision_once_prefers_the_cached_key() {
+async fn provision_once_mints_then_prefers_the_cached_key() {
     let store = ReplicaKeyStore::open().await.expect("open the key store");
     let record = name("provision-once");
 
-    // First sight: nothing cached, so the provisioned key is adopted and
-    // written through.
-    let first = resolve_replica_key(&store, &record, Some(key_from_byte(0xaa)))
+    // First sight: nothing cached, so a key is minted in the worker and written
+    // through before it is handed back.
+    let first = provision_replica_key(&store, &record)
         .await
-        .expect("resolve")
-        .expect("a key");
-    assert_eq!(first, key_from_byte(0xaa));
-
-    // A later login mints different material. The cached key still wins, or a
-    // re-login would re-key the replica and strand everything in it.
-    let effective = resolve_replica_key(&store, &record, Some(key_from_byte(0xbb)))
-        .await
-        .expect("resolve")
-        .expect("a key");
-    assert_eq!(effective, key_from_byte(0xaa));
+        .expect("a key is minted");
     assert_eq!(
         store.load(&record).await.expect("load"),
-        Some(key_from_byte(0xaa)),
-        "the wire key never overwrites the cache"
+        Some(first.clone()),
+        "the minted key is cached for a later cold start"
     );
 
-    // A refresh carries no key, and the cached one still resolves.
-    let offline = resolve_replica_key(&store, &record, None)
+    // A second call never mints again, or a re-login would re-key the replica
+    // and strand everything in it.
+    let effective = provision_replica_key(&store, &record)
         .await
-        .expect("resolve")
-        .expect("a key");
-    assert_eq!(offline, key_from_byte(0xaa));
+        .expect("resolve");
+    assert_eq!(effective, first, "the cached key wins over minting another");
+
+    // The mint is real randomness, not a constant or a hash of the name: a
+    // second record on the same device gets its own key.
+    let other = provision_replica_key(&store, &name("provision-once-other"))
+        .await
+        .expect("a second key is minted");
+    assert_ne!(other, first, "each record mints its own key");
+    assert_ne!(
+        other,
+        key_from_byte(0),
+        "an all-zero key would mean the fill never ran"
+    );
 }
 
 /// The bytes `IndexedDB` actually holds for `record`, read straight out of the

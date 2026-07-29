@@ -154,6 +154,16 @@ impl AuthStore for ServerStore {
         }
     }
 
+    async fn session_for_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<SessionId>, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.session_for_refresh(refresh_token).await,
+            Self::Db(store) => store.session_for_refresh(refresh_token).await,
+        }
+    }
+
     async fn set_retained_provider_token(
         &self,
         session_id: SessionId,

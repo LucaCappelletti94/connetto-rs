@@ -64,7 +64,7 @@ pub mod teardown;
 pub use auth::{
     AcquiredSession, BrowserOpener, KeyringKeyStore, KeyringStore, MemoryKeyStore,
     MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore,
-    resolve_replica_key, system_browser_opener,
+    provision_replica_key, system_browser_opener,
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;

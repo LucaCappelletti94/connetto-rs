@@ -185,6 +185,20 @@ pub trait AuthStore: Send + Sync {
         session_id: SessionId,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
 
+    /// The session a presented refresh token names, once its secret is
+    /// verified, or `None` when no live session matches.
+    ///
+    /// This is the authentication a logout needs: the caller holds the
+    /// credential it wants torn down, and nothing else identifies the session
+    /// to revoke. Unlike [`rotate_refresh`](Self::rotate_refresh) it does not
+    /// rotate, and a mismatched secret is `None` rather than a theft signal,
+    /// because an endpoint whose only effect is revocation must not become an
+    /// oracle for guessed session ids.
+    fn session_for_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> impl Future<Output = Result<Option<SessionId>, AuthStoreError>> + Send;
+
     /// Store the retained provider tokens for a session, replacing any existing.
     fn set_retained_provider_token(
         &self,
@@ -394,6 +408,24 @@ impl<
             record.revoked = true;
         }
         Ok(())
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn session_for_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<SessionId>, AuthStoreError> {
+        let Some((session_id, secret)) = split_refresh(refresh_token) else {
+            return Ok(None);
+        };
+        let sessions = self.sessions.lock().expect("auth store lock");
+        let Some(record) = sessions.get(&session_id) else {
+            return Ok(None);
+        };
+        if record.revoked || !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
+            return Ok(None);
+        }
+        Ok(Some(session_id))
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -675,6 +707,33 @@ mod db {
                 .await
                 .map_err(backend)?;
             Ok(())
+        }
+
+        async fn session_for_refresh(
+            &self,
+            refresh_token: &str,
+        ) -> Result<Option<SessionId>, AuthStoreError> {
+            let Some((session_id, secret)) = split_refresh(refresh_token) else {
+                return Ok(None);
+            };
+            let presented_hash = hash_secret(secret).to_vec();
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            // The rotation read is reused rather than adding a narrower one to
+            // the schema trait: it already selects the refresh hash and the
+            // revoked flag, and its row lock serializes a logout against a
+            // refresh landing at the same moment.
+            let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
+                .get_result(&mut conn)
+                .await
+                .optional()
+                .map_err(backend)?;
+            let Some((_, _, current_hash, _, _, revoked)) = row else {
+                return Ok(None);
+            };
+            if revoked || !hashes_match(&presented_hash, &current_hash) {
+                return Ok(None);
+            }
+            Ok(Some(session_id))
         }
 
         async fn set_retained_provider_token(

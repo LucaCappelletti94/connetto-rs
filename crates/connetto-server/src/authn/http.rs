@@ -1,4 +1,5 @@
-//! The login, callback, token, and refresh HTTP endpoints, served with axum.
+//! The login, callback, token, refresh, and logout HTTP endpoints, served with
+//! axum.
 //!
 //! `GET /auth/login?provider=<name>` begins the Authorization Code plus PKCE
 //! flow with the named provider, records the in-flight authorization keyed by
@@ -12,7 +13,9 @@
 //! browser-worker case). With one it mints a one-time connetto authorization
 //! code and redirects the browser back to the loopback, and the client redeems
 //! that code at `POST /auth/token` with its PKCE verifier. `POST /auth/refresh`
-//! rotates a refresh token.
+//! rotates a refresh token, and `POST /auth/logout` revokes the session a
+//! refresh token names, so a logged-out session is refused at the next
+//! handshake rather than merely forgotten locally.
 //!
 //! The BFF boundary holds: provider tokens never reach the client, only
 //! connetto's own tokens do, and the loopback exchange is PKCE-protected.
@@ -26,7 +29,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_core::ReplicaKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -128,7 +130,20 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+/// The `POST /auth/logout` body.
+#[derive(Debug, Deserialize)]
+pub struct LogoutRequest {
+    /// The refresh token whose session is to be revoked. It authenticates the
+    /// request as well as naming the session, which is why no access token is
+    /// needed: a device logging out holds the credential it is destroying, and
+    /// its access token may already have expired.
+    pub refresh_token: String,
+}
+
 /// The token pair returned by the callback, the token exchange, and refresh.
+///
+/// It carries no key material: the per-replica encryption key is minted on the
+/// device that owns the replica.
 #[derive(Debug, Serialize)]
 pub struct TokenResponse<Id> {
     /// The short-lived access token for `Handshake.auth_token`.
@@ -144,9 +159,6 @@ pub struct TokenResponse<Id> {
     /// Unix-seconds instant the local session lapses without a further
     /// refresh, for the client's proactive unsynced-data warning.
     pub session_expires_at: u64,
-    /// The per-replica encryption key, present only on login responses.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replica_key: Option<ReplicaKey>,
 }
 
 impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
@@ -157,7 +169,6 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
             expires_in: pair.expires_in_secs,
             user_id: pair.user_id,
             session_expires_at: pair.session_expires_at_secs,
-            replica_key: pair.replica_key,
         }
     }
 }
@@ -211,8 +222,7 @@ impl IntoResponse for AuthApiError {
         let status = match self {
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
-                | AuthError::Token(_)
-                | AuthError::KeyGen,
+                | AuthError::Token(_),
             ) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Service(AuthError::Store(_)) => StatusCode::UNAUTHORIZED,
             Self::Service(AuthError::Provider(err)) | Self::Provider(err) => match err {
@@ -250,6 +260,7 @@ pub fn auth_router<S: AuthStore + 'static>(
         .route("/auth/callback", get(callback::<S>))
         .route("/auth/token", post(token::<S>))
         .route("/auth/refresh", post(refresh::<S>))
+        .route("/auth/logout", post(logout::<S>))
         .with_state(state)
 }
 
@@ -320,7 +331,6 @@ async fn callback<S: AuthStore + 'static>(
                 expires_in_secs: pair.expires_in_secs,
                 user_id: pair.user_id,
                 session_expires_at_secs: pair.session_expires_at_secs,
-                replica_key: pair.replica_key,
                 code_challenge,
             });
             let state_param = pending.client_state.unwrap_or_default();
@@ -354,7 +364,6 @@ async fn token<S: AuthStore + 'static>(
         expires_in: issued.expires_in_secs,
         user_id: issued.user_id,
         session_expires_at: issued.session_expires_at_secs,
-        replica_key: issued.replica_key,
     }))
 }
 
@@ -368,6 +377,25 @@ async fn refresh<S: AuthStore + 'static>(
         .await
         .map_err(AuthApiError::Service)?;
     Ok(Json(pair.into()))
+}
+
+/// Revoke the session the presented refresh token names.
+///
+/// Always `204`, whether or not a session was revoked, so the endpoint cannot be
+/// used to probe whether a guessed refresh token names a live session. The
+/// client's own local teardown does not depend on the answer either: it clears
+/// its stored credential regardless, because a device with no connectivity must
+/// still be able to log out.
+async fn logout<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    Json(request): Json<LogoutRequest>,
+) -> Result<StatusCode, AuthApiError> {
+    state
+        .service
+        .logout(&request.refresh_token)
+        .await
+        .map_err(AuthApiError::Service)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Whether `verifier` hashes (S256) to `challenge`, compared in constant time

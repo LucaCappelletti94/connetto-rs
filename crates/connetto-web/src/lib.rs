@@ -11,10 +11,11 @@
 //! [`RelayHub`] re-serves the wire protocol from a worker-held connection to
 //! any number of tabs, [`port`] and [`broadcast`] carry that protocol over a
 //! `MessagePort` and a named `BroadcastChannel`, [`locks`] provides Web Locks
-//! liveness for dead-tab reaping and leader election, [`workers`] holds the DB
-//! worker orchestration ([`workers::boot_db_worker`]) and the page-side glue,
-//! and [`leader`] runs the multi-page election that decides which page owns
-//! the DB worker. The demo schema, server URL, and baked templates are the
+//! liveness for dead-tab reaping and leader election, [`storage`] owns the
+//! worker's durable databases and the data-wipe seam that removes one,
+//! [`workers`] holds the DB worker orchestration ([`workers::boot_db_worker`])
+//! and the page-side glue, and [`leader`] runs the multi-page election that
+//! decides which page owns the DB worker. The demo schema and server URL are the
 //! consumer's: [`workers::boot_db_worker`] takes them as a
 //! [`workers::DbWorkerConfig`], so this crate bakes nothing application
 //! specific.
@@ -25,6 +26,7 @@ pub mod leader;
 pub mod locks;
 pub mod port;
 pub mod relay;
+pub mod storage;
 pub mod workers;
 
 pub use auth::{
@@ -32,10 +34,6 @@ pub use auth::{
     PendingLogin, RefreshStore, WorkerAuthConfig, await_login_code, deliver_login_code,
 };
 pub use broadcast::{BroadcastTransport, BroadcastTransportError};
-pub use leader::{Membership, join};
-pub use port::{PortTransport, PortTransportError};
-pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
-
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
 };
@@ -45,6 +43,10 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
+pub use leader::{Membership, join};
+pub use port::{PortTransport, PortTransportError};
+pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
+pub use storage::{ReplicaStorage, WipeError, clear_device_key, device_key, wipe_replica};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};

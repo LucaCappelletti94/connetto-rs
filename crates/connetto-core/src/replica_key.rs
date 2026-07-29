@@ -9,21 +9,24 @@
 //! with every session. Two keys, two lifetimes, and nothing derives one from
 //! the other.
 //!
-//! The server mints it once, at login, and never retains a copy. The client
-//! caches it and prefers its cached copy forever after, which is what makes it
-//! per replica: two devices of one identity cache different keys, and neither
-//! can read the other's file. The consequence is deliberate and worth stating
-//! plainly: losing the cached key loses the replica. Synced tables recover by
-//! re-syncing from the server, device-local tables do not recover at all.
+//! The device mints it, on first sight of a replica it is about to create, and
+//! caches it. No key material ever crosses the wire and the server never holds
+//! one. That is what makes it per replica: two devices of one identity mint
+//! different keys, and neither can read the other's file. The consequence is
+//! deliberate and worth stating plainly: losing the cached key loses the
+//! replica. Synced tables recover by re-syncing from the server, device-local
+//! tables do not recover at all.
 //!
 //! The core carries no entropy source, exactly as it carries none for
-//! `SessionId`, so there is no `ReplicaKey::generate` here. Minting belongs to
-//! the server that owns the login, which already has a CSPRNG.
+//! `SessionId`, so there is no `ReplicaKey::generate` here. Minting belongs
+//! beside the key stores, in `connetto-client` and `connetto-web`, which are
+//! also the only places that know whether a replica already exists and so
+//! whether minting is even correct.
 //!
-//! Serialization is lowercase hex, because the value rides a JSON token
-//! response. The bytes are wiped when the key is dropped, and neither
-//! [`Debug`](core::fmt::Debug) nor [`Display`](core::fmt::Display) will print
-//! them.
+//! Serialization is lowercase hex, so the key has one canonical text form: the
+//! one the native keyring persists. The bytes are wiped when the key is
+//! dropped, and neither [`Debug`](core::fmt::Debug) nor
+//! [`Display`](core::fmt::Display) will print them.
 
 use core::fmt;
 use core::str::FromStr;
@@ -32,9 +35,10 @@ use zeroize::Zeroize;
 
 /// The raw key that encrypts one replica's pages.
 ///
-/// Obtain one from the token response at login, or from the client's key
-/// store on a later boot. Treat [`ReplicaKey::as_bytes`] as the only way the
-/// material leaves this type, and keep it out of logs.
+/// Obtain one from the client's key store, which mints it on first sight of a
+/// replica and hands back the cached copy ever after. Treat
+/// [`ReplicaKey::as_bytes`] as the only way the material leaves this type, and
+/// keep it out of logs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplicaKey([u8; Self::LEN]);
 

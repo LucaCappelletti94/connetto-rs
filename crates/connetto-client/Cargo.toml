@@ -43,6 +43,7 @@ native-auth = [
     "dep:open",
     "dep:base64",
     "dep:uuid",
+    "dep:getrandom",
 ]
 
 [[bin]]
@@ -90,12 +91,15 @@ anyhow.workspace = true
 # blocking client). keyring stores the refresh token in OS secure storage
 # (daemon-free keyutils on Linux, Keychain, Credential Manager). open launches
 # the system browser. base64 plus the unconditional sha2 above compute the PKCE
-# S256 challenge and uuid mints the verifier and CSRF state.
+# S256 challenge and uuid mints the verifier and CSRF state. getrandom mints the
+# per-replica encryption key, which is minted on the device and never crosses
+# the wire, from the same platform RNG the rest of that list draws on.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"], optional = true }
 open = { version = "5.4", optional = true }
 base64 = { version = "0.22", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+getrandom = { version = "0.3", optional = true }
 # Wiping the transient hex strings that carry key material: the `PRAGMA key`
 # statement built from a ReplicaKey, and the hex a KeyringKeyStore persists.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
