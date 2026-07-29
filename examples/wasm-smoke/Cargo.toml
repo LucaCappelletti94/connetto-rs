@@ -32,9 +32,15 @@ rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = [
     "BroadcastChannel",
     "MessageEvent",
+    # The browser-auth test stands in for a tab: it walks the login redirect chain
+    # with `fetch` from the worker and reads the delivered code out of the final
+    # URL, which needs the response, the worker global, and URL query parsing.
+    "Response",
     "Url",
+    "UrlSearchParams",
     "Window",
     "Worker",
+    "WorkerGlobalScope",
     "console",
 ] }
 

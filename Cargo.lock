@@ -576,6 +576,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tower",
+ "tower-http 0.6.11",
  "url",
  "uuid",
  "zstd",

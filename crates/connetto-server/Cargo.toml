@@ -116,3 +116,4 @@ connetto-test-harness = { path = "../connetto-test-harness" }
 # correctness here, and `openssl-sys` was already present through
 # `pg2sqlite`'s `git2`.
 oauth2-test-server = { version = "0.2", default-features = false, features = ["testing", "config"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
