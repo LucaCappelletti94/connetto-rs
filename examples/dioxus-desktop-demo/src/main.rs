@@ -193,7 +193,19 @@ fn main() {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let (client, backend, auth_ctx) = rt.block_on(setup());
+    // A startup failure opens a window that says so. Aborting here instead would
+    // leave nothing on screen to explain itself, and it would make signing out
+    // fatal: the teardown clears the mode flag and restarts, so the next process
+    // starts anonymously, which a server that requires signing in refuses.
+    let started = rt.block_on(setup());
+    let (client, backend, auth_ctx) = match started {
+        Ok(parts) => parts,
+        Err(err) => {
+            let _guard = rt.enter();
+            launch_startup_failure(&err);
+            return;
+        }
+    };
     let _guard = rt.enter();
     let title = format!("connetto live demo (pid {})", std::process::id());
     dioxus::LaunchBuilder::desktop()
@@ -210,10 +222,72 @@ fn main() {
         .launch(app);
 }
 
+/// Open a window that reports why startup failed, and offer the one action that
+/// can help: signing in, since the usual cause is a server that requires it.
+fn launch_startup_failure(err: &anyhow::Error) {
+    // The chain, not just the outermost message, so the cause is not hidden behind
+    // a summary.
+    let detail = err
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+    STARTUP_ERROR.set(detail).ok();
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            dioxus::desktop::Config::new().with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title("connetto demo: cannot start")
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(620.0, 320.0)),
+            ),
+        )
+        .launch(startup_failure_app);
+}
+
+/// Set once before the failure window launches, because `launch` takes the
+/// component by value and the message has to reach it without a context that the
+/// working app also uses.
+static STARTUP_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn startup_failure_app() -> Element {
+    let detail = STARTUP_ERROR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "unknown startup failure".to_owned());
+    let signed_in = mode_flag().exists();
+    rsx! {
+        div { style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
+            h2 { "connetto demo cannot start" }
+            p { style: "color: #a33;", {detail} }
+            if signed_in {
+                p { "Signed-in mode is selected. Sign out to return to anonymous mode." }
+                button {
+                    onclick: move |_| {
+                        let _ = std::fs::remove_file(mode_flag());
+                        restart();
+                    },
+                    "Sign out and restart"
+                }
+            } else {
+                button {
+                    onclick: move |_| {
+                        if let Some(dir) = mode_flag().parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(mode_flag(), b"");
+                        restart();
+                    },
+                    "Sign in and restart"
+                }
+            }
+        }
+    }
+}
+
 /// Connect to the server and start the backend writer task. The mode flag
 /// selects which path to take; the path is resolved once at startup and never
 /// changes while the process is alive.
-async fn setup() -> (ConnettoClient<Ws>, Backend, AuthCtx) {
+async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
     let server =
         std::env::var("CONNETTO_DEMO_SERVER").unwrap_or_else(|_| "127.0.0.1:7777".to_owned());
     let pg_url = std::env::var("CONNETTO_DEMO_PG")
@@ -221,15 +295,15 @@ async fn setup() -> (ConnettoClient<Ws>, Backend, AuthCtx) {
 
     let stream = TcpStream::connect(&server)
         .await
-        .expect("connect to server");
+        .with_context(|| format!("connecting to {server}"))?;
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
-        .expect("ws connect");
+        .map_err(|err| anyhow::anyhow!("websocket handshake: {err}"))?;
 
     let (conn, auth_ctx) = if mode_flag().exists() {
-        setup_authenticated(transport).await
+        setup_authenticated(transport).await?
     } else {
-        (setup_anonymous(transport).await, AuthCtx::Anonymous)
+        (setup_anonymous(transport).await?, AuthCtx::Anonymous)
     };
 
     let client = ConnettoClient::start(conn);
@@ -286,11 +360,13 @@ async fn setup() -> (ConnettoClient<Ws>, Backend, AuthCtx) {
         }
     });
 
-    (client, Backend(tx), auth_ctx)
+    Ok((client, Backend(tx), auth_ctx))
 }
 
 /// Anonymous mode: temp file, plaintext, no token, shared replica.
-async fn setup_anonymous(transport: WebSocketTransport<TcpStream>) -> ConnettoConnection<Ws> {
+async fn setup_anonymous(
+    transport: WebSocketTransport<TcpStream>,
+) -> anyhow::Result<ConnettoConnection<Ws>> {
     // The replica lives in a per-process temp file. The window loop never
     // returns, so no drop would run for it anyway and the OS temp cleaner
     // owns it.
@@ -298,7 +374,13 @@ async fn setup_anonymous(transport: WebSocketTransport<TcpStream>) -> ConnettoCo
         "connetto-desktop-demo-{}.sqlite",
         std::process::id()
     ));
-    let db_path = db_path.to_str().expect("utf8 temp path").to_owned();
+    let db_path = db_path
+        .to_str()
+        .context("the temp directory path is not utf8")?
+        .to_owned();
+    // A placeholder credential, which only a server that verifies nothing accepts.
+    // A server started with CONNETTO_AUTH refuses it, and that refusal is reported
+    // rather than fatal: see the mapping below.
     let config = ClientConfig {
         client_id: format!("desktop-demo-{}", std::process::id()),
         auth_token: "token".to_owned(),
@@ -313,7 +395,15 @@ async fn setup_anonymous(transport: WebSocketTransport<TcpStream>) -> ConnettoCo
         None,
     )
     .await
-    .expect("anonymous connect")
+    .map_err(|err| match err {
+        // Naming the cause, because "credential rejected" reads like a bug here
+        // when it is the server correctly refusing an unauthenticated client.
+        connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
+            "this server requires signing in, so there is nothing to show anonymously. \
+             Sign in to open a private encrypted replica."
+        ),
+        other => anyhow::anyhow!("anonymous connect: {other}"),
+    })
 }
 
 /// Authenticated mode: acquire a session via the native PKCE loopback flow,
@@ -327,8 +417,8 @@ async fn setup_anonymous(transport: WebSocketTransport<TcpStream>) -> ConnettoCo
 /// decides which file to open.
 async fn setup_authenticated(
     transport: WebSocketTransport<TcpStream>,
-) -> (ConnettoConnection<Ws>, AuthCtx) {
-    std::fs::create_dir_all(data_dir()).expect("create data dir");
+) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx)> {
+    std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
 
     // Credential store: one entry per app, user key `"refresh"`.
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE, "refresh"));
@@ -346,14 +436,18 @@ async fn setup_authenticated(
     let session = authenticator
         .acquire::<String>()
         .await
-        .expect("acquire session");
+        .map_err(|err| anyhow::anyhow!("acquiring a session: {err}"))?;
 
     // Identity is known now. Derive the replica name before opening anything:
     // the name decides which file to open, so it must come first.
-    let key_name = replica_db_name(REPLICA_PREFIX, &session.user_id).expect("derive replica name");
+    let key_name = replica_db_name(REPLICA_PREFIX, &session.user_id)
+        .map_err(|err| anyhow::anyhow!("naming the replica for this identity: {err}"))?;
 
     let db_path = data_dir().join(format!("{key_name}.sqlite"));
-    let db_path_str = db_path.to_str().expect("utf8 data dir path").to_owned();
+    let db_path_str = db_path
+        .to_str()
+        .context("the application data directory path is not utf8")?
+        .to_owned();
 
     let existing = db_path.exists();
 
@@ -364,16 +458,16 @@ async fn setup_authenticated(
     let replica_key = if existing {
         key_store
             .load(&key_name)
-            .expect("load replica key from keyring")
+            .map_err(|err| anyhow::anyhow!("reading the replica key from the keyring: {err}"))?
     } else {
         Some(
             provision_replica_key(key_store.as_ref() as &dyn ReplicaKeyStore, &key_name)
-                .expect("provision replica key"),
+                .map_err(|err| anyhow::anyhow!("storing a new replica key: {err}"))?,
         )
     };
 
-    let replica =
-        Replica::encrypted_file(&db_path_str, replica_key).expect("build encrypted replica");
+    let replica = Replica::encrypted_file(&db_path_str, replica_key)
+        .map_err(|err| anyhow::anyhow!("opening the encrypted replica: {err}"))?;
 
     let config = ClientConfig {
         // Use the replica name as the client id so the server can correlate
@@ -388,14 +482,14 @@ async fn setup_authenticated(
         // Resume: the replica already carries its schema and cursor.
         ConnettoConnection::connect_existing(transport, &replica, &config, None)
             .await
-            .expect("resume encrypted replica")
+            .map_err(|err| anyhow::anyhow!("resuming the encrypted replica: {err}"))?
     } else {
         // First boot: apply the schema DDL to the fresh encrypted file.
         // The plaintext template cannot be used here because the per-replica
         // key does not exist at build time.
         ConnettoConnection::connect(transport, &replica, REPLICA_SQLITE_DDL, &config, None)
             .await
-            .expect("first-boot encrypted replica")
+            .map_err(|err| anyhow::anyhow!("first boot of the encrypted replica: {err}"))?
     };
 
     // Install a silent-refresh token source so that every reconnect
@@ -409,7 +503,7 @@ async fn setup_authenticated(
         key_store,
         key_name,
     };
-    (conn, auth_ctx)
+    Ok((conn, auth_ctx))
 }
 
 fn app() -> Element {
