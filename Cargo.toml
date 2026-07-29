@@ -8,8 +8,6 @@ members = [
     "crates/connetto-yew",
     "crates/connetto-test-harness",
 ]
-# The desktop demo is a standalone workspace: it needs the webkit system
-# libraries, so it must never enter the headless gate builds.
 exclude = ["examples/dioxus-desktop-demo"]
 
 # Additional crates land here as their real content is ready:

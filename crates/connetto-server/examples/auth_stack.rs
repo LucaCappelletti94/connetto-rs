@@ -45,9 +45,8 @@ use tower_http::cors::{Any, CorsLayer};
 /// The provider name a client names in its login request.
 const PROVIDER: &str = "dev-idp";
 
-/// Where the stack listens unless `CONNETTO_AUTH_STACK_BIND` says otherwise. A
-/// fixed default, because a browser test cannot be told a random port, and a high
-/// one because the low 8000s are crowded on a developer machine.
+/// Where the stack listens unless `CONNETTO_AUTH_STACK_BIND` says otherwise. It is
+/// fixed rather than ephemeral because a browser test cannot be told a random port.
 const DEFAULT_BIND: &str = "127.0.0.1:18099";
 /// The path the client redirect points at. Serving it here keeps the redirect
 /// chain single-origin.

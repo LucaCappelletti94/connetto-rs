@@ -2,6 +2,5 @@
 target = "index.html"
 
 [serve]
-# 8080 is taken on this machine, and trunk does not auto-increment, so pin a
-# free port. Watch the trunk banner for the served URL.
+# Pinned because trunk does not fall back to another port when this one is taken.
 port = 9911
