@@ -323,6 +323,7 @@ dependencies = [
  "libsqlite3-sys",
  "pg2sqlite",
  "rosetta-uuid",
+ "serde_json",
  "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",

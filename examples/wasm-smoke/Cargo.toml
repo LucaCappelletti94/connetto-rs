@@ -56,6 +56,9 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d02
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# The logged-in startup test plays the tab, so it decodes the login-channel
+# message the worker broadcasts.
+serde_json = "1"
 # The full-resync parity test hand-builds snapshot patchsets to feed a fake
 # upstream through the relay hub, the same native encoding the wire carries.
 sqlite-diff-rs = { version = "0.9.0", default-features = false }
