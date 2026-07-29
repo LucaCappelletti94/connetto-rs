@@ -88,10 +88,21 @@ fn js_error(context: &str, value: &JsValue) -> AuthError {
 /// Worker-side confidential-client configuration for the browser flow.
 #[derive(Debug, Clone)]
 pub struct WorkerAuthConfig {
-    /// connetto-server's auth base URL, for example `https://app.example/auth`
-    /// stripped of the trailing `/auth`, i.e. the origin the endpoints hang off
-    /// (`{base}/auth/login`, `{base}/auth/token`, `{base}/auth/refresh`).
+    /// The origin the worker's `fetch` calls go to, for `{base}/auth/token`,
+    /// `{base}/auth/refresh`, and `{base}/auth/logout`. These carry no CORS
+    /// headers from connetto, so this is the application's own origin whenever the
+    /// deployment puts the auth endpoints behind its own reverse proxy.
     pub auth_base_url: String,
+    /// The origin the login navigation goes to, when it is not
+    /// [`auth_base_url`](Self::auth_base_url).
+    ///
+    /// A login is a navigation the browser follows, so it needs no CORS and only
+    /// needs an origin that actually serves the auth router. That is usually the
+    /// same one, and `None` means exactly that. It differs when the application is
+    /// served by a dev server whose proxy does not forward navigations, in which
+    /// case the navigation goes straight to the auth origin while the `fetch` calls
+    /// keep going through the proxy.
+    pub login_base_url: Option<String>,
     /// The provider name to log in with.
     pub provider: String,
     /// The app page the login redirect returns to, which posts the code back to
@@ -671,7 +682,10 @@ impl BrowserAuthenticator {
         let state = random_token();
         let login_url = format!(
             "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
-            self.config.auth_base_url,
+            self.config
+                .login_base_url
+                .as_ref()
+                .unwrap_or(&self.config.auth_base_url),
             percent_encode(&self.config.provider),
             percent_encode(&self.config.redirect_uri),
             percent_encode(&challenge),

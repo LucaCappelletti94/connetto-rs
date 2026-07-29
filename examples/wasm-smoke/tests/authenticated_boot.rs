@@ -38,15 +38,18 @@
 //! ```
 //!
 //! The server reads the schema from the same file the client hashes, because the
-//! handshake compares the two and a reworded copy is a different schema.
+//! handshake compares the two and a reworded copy is a different schema. It must
+//! also be started WITHOUT `CONNETTO_AUTH`, so the handshake trusts the token: the
+//! login here comes from `auth_stack`, whose sessions a database-backed server
+//! knows nothing about, and it would refuse them.
 //!
 //! One honest limit of this topology. The login server and the sync server are
 //! separate processes here, and cross-process token verification needs them to
 //! share a session store, which is what a real deployment gets by having one
 //! process do both jobs. So the sync server accepts the token without verifying
-//! it. That verification is not what this test is for, and it is covered against
-//! the real router by `connetto-server/tests/oidc_spine.rs` and
-//! `connetto-client/tests/native_auth.rs`.
+//! it. That verification is not what this test is for. It is proven, against one
+//! `connetto-server` minting and verifying its own tokens over a Postgres session
+//! store, by `connetto-client/tests/verified_topology.rs`.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -126,9 +129,19 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     // account, opens it encrypted, opens the private tables under the same key,
     // connects to the sync server, and subscribes.
     let logins_served = play_the_tab();
-    connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
-        .await
-        .expect("the logged-in startup completes");
+    let booted_as =
+        connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
+            .await
+            .expect("the logged-in startup completes");
+
+    // The startup reports the identity it acquired, which is the same account the
+    // first login named. An application needs this to say who is signed in without
+    // acquiring a second session of its own.
+    assert_eq!(
+        booted_as.as_deref(),
+        Some(user_id.as_str()),
+        "the startup reports the account it opened the replica for"
+    );
 
     // The login went through the tab, so the tab-to-worker handoff ran rather than
     // being bypassed by a silent refresh.

@@ -57,6 +57,7 @@ fn config() -> ClientConfig {
 fn unused_auth() -> WorkerAuthConfig {
     WorkerAuthConfig {
         auth_base_url: "http://127.0.0.1:1".to_owned(),
+        login_base_url: None,
         provider: "unused".to_owned(),
         redirect_uri: "http://127.0.0.1:1/unused".to_owned(),
     }

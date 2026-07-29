@@ -304,12 +304,18 @@ async fn acquire_session<Id: serde::de::DeserializeOwned>(
 /// when `config.auth` is `None`, where no identity is ever acquired and the
 /// replica keeps `config.replica_db_prefix` verbatim.
 ///
+/// Returns the identity the session was acquired for, or `None` when
+/// `config.auth` is unset. An application that shows who is signed in wants this:
+/// without it the only way to learn the identity is to acquire a second session
+/// alongside this one, which duplicates the acquisition and rotates the refresh
+/// token twice per boot.
+///
 /// # Errors
 ///
 /// A string describing the VFS, acquisition, upstream connect, or subscribe
 /// failure.
 #[allow(clippy::too_many_lines)]
-pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<(), JsValue>
+pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<Option<Id>, JsValue>
 where
     Id: serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -421,6 +427,7 @@ where
     let auth_token = session
         .as_ref()
         .map_or_else(|| "token".to_owned(), |s| s.access_token.clone());
+    let identity = session.map(|session| session.user_id);
     let client_config = ClientConfig {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
         auth_token,
@@ -601,7 +608,7 @@ where
     // The intake handler lives for the worker's whole life.
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
-    Ok(())
+    Ok(identity)
 }
 
 /// Serve [`LOGOUT_CHANNEL`](crate::auth::LOGOUT_CHANNEL) for this worker's life,

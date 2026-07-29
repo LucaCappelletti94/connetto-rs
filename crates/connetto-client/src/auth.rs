@@ -71,15 +71,28 @@ impl KeyringStore {
         }
     }
 
-    fn entry(&self) -> Result<keyring::Entry, ClientError> {
-        keyring::Entry::new(&self.service, &self.user)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))
+    /// The keyring entry, or `None` when this platform's backend reports that no
+    /// such entry exists.
+    ///
+    /// Some backends resolve the credential when the entry is constructed rather
+    /// than when it is read, so "not stored yet" can surface here instead of from
+    /// [`get_password`](keyring::Entry::get_password). Reporting that as an error
+    /// would make a first run fatal, when it only means there is nothing to load.
+    fn entry(&self) -> Result<Option<keyring::Entry>, ClientError> {
+        match keyring::Entry::new(&self.service, &self.user) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
+        }
     }
 }
 
 impl RefreshTokenStore for KeyringStore {
     fn load(&self) -> Result<Option<String>, ClientError> {
-        match self.entry()?.get_password() {
+        let Some(entry) = self.entry()? else {
+            return Ok(None);
+        };
+        match entry.get_password() {
             Ok(token) => Ok(Some(token)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
@@ -87,13 +100,19 @@ impl RefreshTokenStore for KeyringStore {
     }
 
     fn store(&self, token: &str) -> Result<(), ClientError> {
-        self.entry()?
+        // A backend that reports no entry before one is written still has to accept
+        // the write, so this asks for the entry again rather than reusing `entry`.
+        keyring::Entry::new(&self.service, &self.user)
+            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
             .set_password(token)
             .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
     }
 
     fn clear(&self) -> Result<(), ClientError> {
-        match self.entry()?.delete_credential() {
+        let Some(entry) = self.entry()? else {
+            return Ok(());
+        };
+        match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
         }
@@ -227,15 +246,24 @@ impl KeyringKeyStore {
         }
     }
 
-    fn entry(&self, name: &str) -> Result<keyring::Entry, ClientError> {
-        keyring::Entry::new(&self.service, name)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))
+    /// The keyring entry for `name`, or `None` when this platform's backend
+    /// reports that no such entry exists. See [`KeyringStore::entry`] for why a
+    /// missing entry can surface here rather than from the read.
+    fn entry(&self, name: &str) -> Result<Option<keyring::Entry>, ClientError> {
+        match keyring::Entry::new(&self.service, name) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
+        }
     }
 }
 
 impl ReplicaKeyStore for KeyringKeyStore {
     fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
-        match self.entry(name)?.get_password() {
+        let Some(entry) = self.entry(name)? else {
+            return Ok(None);
+        };
+        match entry.get_password() {
             // The keyring hands back an owned hex string, which is key
             // material until it is wiped, hence the `Zeroizing` wrapper.
             Ok(hex) => Zeroizing::new(hex)
@@ -252,13 +280,19 @@ impl ReplicaKeyStore for KeyringKeyStore {
         for byte in key.as_bytes() {
             let _ = write!(&mut *hex, "{byte:02x}");
         }
-        self.entry(name)?
+        // A backend that reports no entry before one is written still has to accept
+        // the write, so this asks for the entry again rather than reusing `entry`.
+        keyring::Entry::new(&self.service, name)
+            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
             .set_password(&hex)
             .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
     }
 
     fn clear(&self, name: &str) -> Result<(), ClientError> {
-        match self.entry(name)?.delete_credential() {
+        let Some(entry) = self.entry(name)? else {
+            return Ok(());
+        };
+        match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
         }

@@ -150,5 +150,7 @@ pub mod workers {
             auth_db_name: "connetto-auth.sqlite",
         })
         .await
+        // Unauthenticated, so the returned identity is always `None`.
+        .map(drop)
     }
 }
