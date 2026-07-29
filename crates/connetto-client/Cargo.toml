@@ -127,6 +127,8 @@ libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled-sqlcipher"] }
 sqlite-wasm-rs = { version = "0.5", default-features = false, features = ["sqlite3mc"] }
 
 [dev-dependencies]
+# The shared fake transport the suites here drive `connect` and `resume` with.
+connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the

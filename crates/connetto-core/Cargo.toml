@@ -32,6 +32,9 @@ native-transport = ["loopback", "dep:tokio-tungstenite", "dep:futures-util", "to
 # dependency, because that line carries the `sqlite` backend the core must not
 # require.
 diesel-pg = ["dep:diesel"]
+# Fakes the client and browser test suites share, chiefly a transport that answers
+# a handshake and nothing else. Test-only: no production build enables it.
+test-support = ["dep:thiserror"]
 
 [dependencies]
 serde.workspace = true

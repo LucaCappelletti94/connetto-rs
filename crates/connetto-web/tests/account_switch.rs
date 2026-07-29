@@ -18,15 +18,11 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use std::collections::VecDeque;
-
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, SqlFunctions,
     replica_db_name,
 };
-use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck};
-use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
+use connetto_core::test_support::FakeTransport;
 use connetto_web::storage::ReplicaStorage;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -43,60 +39,6 @@ diesel::table! {
     items (id) {
         id -> Integer,
         label -> Nullable<Text>,
-    }
-}
-
-/// A transport that acknowledges the handshake and swallows everything else, so
-/// `connect` completes with no server and an uploaded mutation is never retired.
-struct FakeTransport {
-    inbox: VecDeque<IncomingFrame>,
-}
-
-/// The trait needs a concrete typed error even though this fake never fails.
-#[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-struct FakeClosed;
-
-impl Transport for FakeTransport {
-    type Error = FakeClosed;
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
-        if matches!(message, ControlMessage::Handshake(_)) {
-            self.inbox
-                .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
-                    HandshakeAck {
-                        connection_id: "connection-fake".to_owned(),
-                        session_token: "token-fake".to_owned(),
-                        current_cursor: Cursor::new(Vec::new()),
-                        schema_version: None::<SchemaVersion>,
-                        initial_credits: 64,
-                        last_applied_seq: None,
-                    },
-                )));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
-        Ok(self.inbox.pop_front())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-}
-
-fn transport() -> FakeTransport {
-    FakeTransport {
-        inbox: VecDeque::new(),
     }
 }
 
@@ -119,7 +61,7 @@ fn key_from_byte(byte: u8) -> ReplicaKey {
 /// connection drops, which it must: one connection per database.
 async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<u64> {
     let mut conn = ConnettoConnection::connect(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile { path: url, key },
         SQLITE_DDL,
         &config(),
@@ -178,7 +120,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // replica rather than resuming onto Alice's rows or her pending mutations.
     {
         let mut conn = ConnettoConnection::connect(
-            transport(),
+            FakeTransport::accepting(),
             &Replica::EncryptedFile {
                 path: &bob_url,
                 key: bob_key,
@@ -212,7 +154,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // while holding this identity's key does not read it, so a switch cannot
     // degrade into a cross-identity resume even if the file selection were wrong.
     let crossed = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile {
             path: &bob_url,
             key: alice_key.clone(),
@@ -230,7 +172,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // Switching back resumes the replica that was left alone, with its rows and
     // its queued mutation, so no snapshot leg is needed.
     let mut conn = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile {
             path: &alice_url,
             key: alice_key,

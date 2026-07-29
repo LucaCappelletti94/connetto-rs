@@ -35,6 +35,8 @@ pub mod messages;
 pub mod replica_key;
 pub mod schema;
 pub mod session_id;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod traits;
 #[cfg(feature = "loopback")]
 pub mod transport;

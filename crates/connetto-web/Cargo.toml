@@ -94,6 +94,8 @@ zeroize = { version = "1", default-features = false }
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 indexed_db_futures = "0.6"
+# The shared fake transport the account-switch suite drives a real connection with.
+connetto-core = { path = "../connetto-core", features = ["test-support"] }
 
 # Standalone workspace: a wasm-only platform crate consumed by path from the
 # smoke tests and the dioxus-web demo, never entering the root headless gate.

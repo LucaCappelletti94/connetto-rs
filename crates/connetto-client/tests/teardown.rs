@@ -13,7 +13,6 @@
 
 #![cfg(feature = "native-auth")]
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,9 +24,7 @@ use connetto_client::{
     NativeAuthenticator, RefreshTokenStore, Replica, ReplicaKey, ReplicaKeyStore, SqlFunctions,
     provision_replica_key, replica_db_name,
 };
-use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck};
-use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
+use connetto_core::test_support::FakeTransport;
 use diesel::prelude::*;
 
 /// A string written into the replica, so a leftover-plaintext assertion has
@@ -40,60 +37,6 @@ diesel::table! {
     items (id) {
         id -> Integer,
         label -> Nullable<Text>,
-    }
-}
-
-/// A transport that acknowledges the handshake and swallows everything else, so
-/// `connect` completes with no server and an uploaded mutation is never retired.
-struct FakeTransport {
-    inbox: VecDeque<IncomingFrame>,
-}
-
-/// The trait needs a concrete typed error even though this fake never fails.
-#[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-struct FakeClosed;
-
-impl Transport for FakeTransport {
-    type Error = FakeClosed;
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
-        if matches!(message, ControlMessage::Handshake(_)) {
-            self.inbox
-                .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
-                    HandshakeAck {
-                        connection_id: "connection-fake".to_owned(),
-                        session_token: "token-fake".to_owned(),
-                        current_cursor: Cursor::new(Vec::new()),
-                        schema_version: None::<SchemaVersion>,
-                        initial_credits: 64,
-                        last_applied_seq: None,
-                    },
-                )));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
-        Ok(self.inbox.pop_front())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-}
-
-fn transport() -> FakeTransport {
-    FakeTransport {
-        inbox: VecDeque::new(),
     }
 }
 
@@ -125,7 +68,7 @@ async fn seed_replica(
     let db = url(&path);
     let key = provision_replica_key(keys, &record).expect("mint a key for a fresh replica");
     let mut conn = ConnettoConnection::connect(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile { path: &db, key },
         SQLITE_DDL,
         &config(),
@@ -151,7 +94,7 @@ async fn seed_replica(
 async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, ClientError> {
     let db = url(path);
     let mut conn = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile { path: &db, key },
         &config(),
         None,
@@ -260,7 +203,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
 
     let db = url(&path);
     let mut conn = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile { path: &db, key },
         &config(),
         None,
@@ -312,7 +255,7 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     let key = keys.load(&record).expect("load").expect("the minted key");
     let db = url(&path);
     let mut conn = ConnettoConnection::connect(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile { path: &db, key },
         SQLITE_DDL,
         &config(),

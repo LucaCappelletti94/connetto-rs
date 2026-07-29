@@ -13,14 +13,10 @@
 //! pretend when no codec is linked, because in a codec-less SQLite `PRAGMA key`
 //! is an unrecognised pragma that succeeds and encrypts nothing.
 
-use std::collections::VecDeque;
-
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, SqlFunctions, cipher,
 };
-use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck};
-use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
+use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
@@ -55,60 +51,6 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(items, notes);
-
-/// A transport that acknowledges the handshake and swallows everything else, so
-/// `connect` completes with no server and an uploaded mutation is never retired.
-struct FakeTransport {
-    inbox: VecDeque<IncomingFrame>,
-}
-
-/// The trait needs a concrete typed error even though this fake never fails.
-#[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-struct FakeClosed;
-
-impl Transport for FakeTransport {
-    type Error = FakeClosed;
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
-        if matches!(message, ControlMessage::Handshake(_)) {
-            self.inbox
-                .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
-                    HandshakeAck {
-                        connection_id: "connection-fake".to_owned(),
-                        session_token: "token-fake".to_owned(),
-                        current_cursor: Cursor::new(Vec::new()),
-                        schema_version: None::<SchemaVersion>,
-                        initial_credits: 64,
-                        last_applied_seq: None,
-                    },
-                )));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
-        Ok(self.inbox.pop_front())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-}
-
-fn transport() -> FakeTransport {
-    FakeTransport {
-        inbox: VecDeque::new(),
-    }
-}
 
 fn config() -> ClientConfig {
     ClientConfig {
@@ -168,10 +110,15 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
             path: &plaintext_url,
         },
     ] {
-        let mut conn =
-            ConnettoConnection::connect(transport(), &replica, SQLITE_DDL, &config(), None)
-                .await
-                .expect("connect");
+        let mut conn = ConnettoConnection::connect(
+            FakeTransport::accepting(),
+            &replica,
+            SQLITE_DDL,
+            &config(),
+            None,
+        )
+        .await
+        .expect("connect");
         diesel::insert_into(items::table)
             .values((items::id.eq(1), items::label.eq(MARKER)))
             .execute(conn.conn())
@@ -212,10 +159,15 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
     };
 
     let unsynced = {
-        let mut conn =
-            ConnettoConnection::connect(transport(), &replica, SQLITE_DDL, &config(), None)
-                .await
-                .expect("first connect");
+        let mut conn = ConnettoConnection::connect(
+            FakeTransport::accepting(),
+            &replica,
+            SQLITE_DDL,
+            &config(),
+            None,
+        )
+        .await
+        .expect("first connect");
         diesel::insert_into(items::table)
             .values((items::id.eq(7), items::label.eq(MARKER)))
             .execute(conn.conn())
@@ -231,9 +183,10 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
 
     // A different connection, a different capture session, the same file and the
     // same cached key: this is the cold start an offline reboot performs.
-    let mut conn = ConnettoConnection::connect_existing(transport(), &replica, &config(), None)
-        .await
-        .expect("reopen with the cached key");
+    let mut conn =
+        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
+            .await
+            .expect("reopen with the cached key");
     let rows: Vec<Option<String>> = items::table
         .select(items::label)
         .load(conn.conn())
@@ -254,7 +207,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
 
     {
         let mut conn = ConnettoConnection::connect(
-            transport(),
+            FakeTransport::accepting(),
             &Replica::EncryptedFile {
                 path: &db,
                 key: key(),
@@ -276,7 +229,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // reported as its own variant rather than as corruption, because the recovery
     // is discard and re-sync.
     let wrong = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile {
             path: &db,
             key: other_key(),
@@ -295,7 +248,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // silently reading garbage: the codec never gets a key, so the first header
     // read fails.
     let unkeyed = ConnettoConnection::connect_existing(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::PlaintextFile { path: &db },
         &config(),
         None,
@@ -311,7 +264,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // the file this key will not open, so there is nothing left to guard.
     connetto_client::teardown::purge_replica(&path, &[], true).expect("discard the replica");
     let mut fresh = ConnettoConnection::connect(
-        transport(),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile {
             path: &db,
             key: other_key(),
@@ -346,10 +299,15 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     // First boot. The tier is created through the replica connection, which is
     // what makes its key salt agree with the replica's, and nothing else does.
     {
-        let mut conn =
-            ConnettoConnection::connect(transport(), &replica, SQLITE_DDL, &config(), None)
-                .await
-                .expect("connect the encrypted replica");
+        let mut conn = ConnettoConnection::connect(
+            FakeTransport::accepting(),
+            &replica,
+            SQLITE_DDL,
+            &config(),
+            None,
+        )
+        .await
+        .expect("connect the encrypted replica");
         conn.attach_local_tier_ddl(&tier, TIER_DDL)
             .expect("first-boot the durable tier through the replica connection");
         assert!(conn.local_tables().contains("notes"));
@@ -370,9 +328,10 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     // Second run: the existing tier file re-attaches with no DDL and no key
     // clause, and its rows come back. This is the resume path, and it works
     // because the first boot made the two salts agree.
-    let mut conn = ConnettoConnection::connect_existing(transport(), &replica, &config(), None)
-        .await
-        .expect("reopen the encrypted replica");
+    let mut conn =
+        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
+            .await
+            .expect("reopen the encrypted replica");
     conn.attach_local_tier(&tier)
         .expect("re-attach the tier a previous run created");
     let rows: Vec<Option<String>> = notes::table
@@ -395,7 +354,7 @@ async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_repli
         let replica_url = url(&dir.path().join(format!("replica-for-{name}")));
         first_boot_standalone(&tier, tier_key.as_ref(), TIER_DDL);
         let mut conn = ConnettoConnection::connect(
-            transport(),
+            FakeTransport::accepting(),
             &Replica::EncryptedFile {
                 path: &replica_url,
                 key: key(),

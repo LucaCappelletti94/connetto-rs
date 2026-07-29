@@ -5,18 +5,13 @@
 //! `user_id` is an account switch onto its own replica rather than a resume
 //! onto another identity's data.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
     ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper, replica_db_name,
 };
-use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck,
-};
-use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, SchemaVersion};
+use connetto_core::test_support::{FakeClosed, FakeTransport};
 use diesel::prelude::*;
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
@@ -25,82 +20,6 @@ diesel::table! {
     items (id) {
         id -> Integer,
         label -> Nullable<Text>,
-    }
-}
-
-/// The reply a [`FakeTransport`] sends back the moment it sees a handshake.
-#[derive(Clone, Copy)]
-enum HandshakeReply {
-    /// A well-formed acknowledgement: the handshake succeeds.
-    Accept,
-    /// `FatalError(AuthenticationFailed)`: the credential is rejected.
-    Reject,
-}
-
-/// A transport that answers a handshake with a canned reply and otherwise
-/// drops sends on the floor. Enough to drive `connect`/`resume` without a
-/// server.
-struct FakeTransport {
-    reply: HandshakeReply,
-    inbox: VecDeque<IncomingFrame>,
-}
-
-impl FakeTransport {
-    fn new(reply: HandshakeReply) -> Self {
-        Self {
-            reply,
-            inbox: VecDeque::new(),
-        }
-    }
-
-    fn ack() -> IncomingFrame {
-        IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-            connection_id: "connection-fake".to_owned(),
-            session_token: "token-fake".to_owned(),
-            current_cursor: Cursor::new(Vec::new()),
-            schema_version: None::<SchemaVersion>,
-            initial_credits: 64,
-            last_applied_seq: None,
-        }))
-    }
-}
-
-/// The fake never fails a send or recv, but the trait needs a concrete typed
-/// error, so this stands in for "the peer is gone".
-#[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-struct FakeClosed;
-
-impl Transport for FakeTransport {
-    type Error = FakeClosed;
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
-        if matches!(message, ControlMessage::Handshake(_)) {
-            let frame = match self.reply {
-                HandshakeReply::Accept => Self::ack(),
-                HandshakeReply::Reject => IncomingFrame::Control(ControlMessage::FatalError(
-                    FatalError::new(FatalErrorReason::AuthenticationFailed),
-                )),
-            };
-            self.inbox.push_back(frame);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
-        Ok(())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
-        Ok(self.inbox.pop_front())
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
-        Ok(())
     }
 }
 
@@ -115,7 +34,7 @@ fn config() -> ClientConfig {
 
 #[tokio::test]
 async fn handshake_rejection_surfaces_as_auth_error() {
-    let transport = FakeTransport::new(HandshakeReply::Reject);
+    let transport = FakeTransport::rejecting();
     let result =
         ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
             .await;
@@ -131,7 +50,7 @@ async fn handshake_rejection_surfaces_as_auth_error() {
 /// pending sequence numbers, captured before the connection drops.
 async fn first_boot_with_a_queued_row(replica: &Replica<'_>, label: &str) -> Vec<u64> {
     let mut conn = ConnettoConnection::connect(
-        FakeTransport::new(HandshakeReply::Accept),
+        FakeTransport::accepting(),
         replica,
         SQLITE_DDL,
         &config(),
@@ -208,7 +127,7 @@ async fn each_identity_opens_its_own_replica() {
     // so he starts on an empty replica and can neither read Alice's rows nor
     // inherit her pending mutations.
     let mut conn = ConnettoConnection::connect(
-        FakeTransport::new(HandshakeReply::Accept),
+        FakeTransport::accepting(),
         &bob_replica,
         SQLITE_DDL,
         &config(),
@@ -238,7 +157,7 @@ async fn each_identity_opens_its_own_replica() {
     // holding this identity's key does not read it, so a switch cannot degrade
     // into a cross-identity resume even if the file selection were wrong.
     let crossed = ConnettoConnection::connect_existing(
-        FakeTransport::new(HandshakeReply::Accept),
+        FakeTransport::accepting(),
         &Replica::EncryptedFile {
             path: &bob,
             key: alice_key.clone(),
@@ -257,7 +176,7 @@ async fn each_identity_opens_its_own_replica() {
     // and her queued mutation, which is the fast return the per-replica key
     // exists to make possible.
     let mut conn = ConnettoConnection::connect_existing(
-        FakeTransport::new(HandshakeReply::Accept),
+        FakeTransport::accepting(),
         &alice_replica,
         &config(),
         None,
@@ -280,13 +199,12 @@ async fn each_identity_opens_its_own_replica() {
 async fn reconnect_routes_rejected_credential_to_relogin() {
     // The live session drops, and every reconnect attempt is met with a
     // rejected credential: the driver must stop retrying and signal re-login.
-    let initial = FakeTransport::new(HandshakeReply::Accept);
+    let initial = FakeTransport::accepting();
     let conn =
         ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
             .await
             .expect("initial connect");
-    let factory =
-        || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::new(HandshakeReply::Reject)) };
+    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::rejecting()) };
     let policy = ReconnectPolicy {
         initial_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
@@ -318,7 +236,7 @@ async fn reconnect_retries_a_transient_refresh_fault() {
     // from /auth/refresh would. The driver must keep retrying and eventually
     // exhaust its attempts, never routing a transient fault to interactive
     // re-login.
-    let initial = FakeTransport::new(HandshakeReply::Accept);
+    let initial = FakeTransport::accepting();
     let conn =
         ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
             .await
@@ -328,8 +246,7 @@ async fn reconnect_retries_a_transient_refresh_fault() {
                     "refresh endpoint returned 503".to_owned(),
                 ))
             }));
-    let factory =
-        || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::new(HandshakeReply::Accept)) };
+    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy {
         initial_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
