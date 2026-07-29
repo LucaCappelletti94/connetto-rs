@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    ReconnectPolicy, Replica, SqlFunctions, TokioSleeper, replica_db_name,
+    ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper, replica_db_name,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck,
@@ -126,6 +126,48 @@ async fn handshake_rejection_surfaces_as_auth_error() {
     }
 }
 
+/// First-boot `replica`, write `label`, and leave the captured mutation queued,
+/// since the fake server acknowledges the handshake and nothing else. Returns the
+/// pending sequence numbers, captured before the connection drops.
+async fn first_boot_with_a_queued_row(replica: &Replica<'_>, label: &str) -> Vec<u64> {
+    let mut conn = ConnettoConnection::connect(
+        FakeTransport::new(HandshakeReply::Accept),
+        replica,
+        SQLITE_DDL,
+        &config(),
+        None,
+    )
+    .await
+    .expect("first connect");
+    assert!(
+        conn.unsynced().is_empty(),
+        "no unsynced work on a fresh replica"
+    );
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq(label)))
+        .execute(conn.conn())
+        .expect("insert");
+    conn.push().await.expect("upload the captured mutation");
+    let unsynced = conn.unsynced();
+    assert!(
+        !unsynced.is_empty(),
+        "the unacknowledged mutation stays pending"
+    );
+    unsynced
+}
+
+/// Phase E4 acceptance, the native half of the account switch.
+///
+/// Each identity owns a replica named from its own id, encrypted under its own
+/// key. A switch opens a different file, so the arriving identity can read none
+/// of the departing one's rows and inherit none of its pending mutations, the
+/// departing replica is neither deleted nor readable with the arriving key, and
+/// switching back resumes from the file that was left alone.
+///
+/// The keys here are two fixed values rather than minted ones, because the link
+/// from an identity to its own key is what `native_auth.rs` and `teardown.rs`
+/// prove. What this test owes is that the two replicas are mutually opaque given
+/// distinct keys.
 #[tokio::test]
 async fn each_identity_opens_its_own_replica() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -147,32 +189,27 @@ async fn each_identity_opens_its_own_replica() {
         "one identity always returns to the same replica",
     );
 
-    // Alice syncs a row into her replica.
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::new(HandshakeReply::Accept),
-        &Replica::PlaintextFile { path: &alice },
-        SQLITE_DDL,
-        &config(),
-        None,
-    )
-    .await
-    .expect("connect alice");
-    assert!(
-        conn.unsynced().is_empty(),
-        "no unsynced work on a fresh replica"
-    );
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::label.eq("alice-row")))
-        .execute(conn.conn())
-        .expect("insert");
-    drop(conn);
+    let alice_key = ReplicaKey::from_bytes([0x11; ReplicaKey::LEN]);
+    let bob_key = ReplicaKey::from_bytes([0x22; ReplicaKey::LEN]);
+    let alice_replica = Replica::EncryptedFile {
+        path: &alice,
+        key: alice_key.clone(),
+    };
+    let bob_replica = Replica::EncryptedFile {
+        path: &bob,
+        key: bob_key,
+    };
+
+    // Alice syncs a row into her replica and leaves a mutation queued, since the
+    // fake server acknowledges the handshake and nothing else.
+    let alice_unsynced = first_boot_with_a_queued_row(&alice_replica, "alice-row").await;
 
     // Bob authenticates on the same device. His boot derives a different file,
     // so he starts on an empty replica and can neither read Alice's rows nor
     // inherit her pending mutations.
     let mut conn = ConnettoConnection::connect(
         FakeTransport::new(HandshakeReply::Accept),
-        &Replica::PlaintextFile { path: &bob },
+        &bob_replica,
         SQLITE_DDL,
         &config(),
         None,
@@ -184,12 +221,44 @@ async fn each_identity_opens_its_own_replica() {
         .load(conn.conn())
         .expect("read bob");
     assert!(seen.is_empty(), "bob's replica holds none of alice's rows");
+    assert!(
+        conn.unsynced().is_empty(),
+        "and none of her pending mutations either"
+    );
     drop(conn);
 
-    // Alice's own replica is untouched by the switch and resumes with her data.
+    // Neither replica was deleted by the switch: a returning identity resumes
+    // rather than re-syncing, which is why a wipe has to be explicit.
+    assert!(
+        std::path::Path::new(&alice).exists() && std::path::Path::new(&bob).exists(),
+        "a switch deletes nothing"
+    );
+
+    // The files are mutually opaque. Naming the other identity's replica while
+    // holding this identity's key does not read it, so a switch cannot degrade
+    // into a cross-identity resume even if the file selection were wrong.
+    let crossed = ConnettoConnection::connect_existing(
+        FakeTransport::new(HandshakeReply::Accept),
+        &Replica::EncryptedFile {
+            path: &bob,
+            key: alice_key.clone(),
+        },
+        &config(),
+        None,
+    )
+    .await;
+    match crossed {
+        Err(ClientError::ReplicaUndecryptable(_)) => {}
+        Err(other) => panic!("expected ReplicaUndecryptable, got {other:?}"),
+        Ok(_) => panic!("one identity's key must not open another's replica"),
+    }
+
+    // Alice's own replica is untouched by the switch and resumes with her data
+    // and her queued mutation, which is the fast return the per-replica key
+    // exists to make possible.
     let mut conn = ConnettoConnection::connect_existing(
         FakeTransport::new(HandshakeReply::Accept),
-        &Replica::PlaintextFile { path: &alice },
+        &alice_replica,
         &config(),
         None,
     )
@@ -200,6 +269,11 @@ async fn each_identity_opens_its_own_replica() {
         .load(conn.conn())
         .expect("read alice");
     assert_eq!(seen, vec![Some("alice-row".to_owned())]);
+    assert_eq!(
+        conn.unsynced(),
+        alice_unsynced,
+        "her unuploaded mutation survived the switch and replays"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
