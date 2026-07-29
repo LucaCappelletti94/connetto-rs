@@ -4,3 +4,9 @@ target = "index.html"
 [serve]
 # Pinned because trunk does not fall back to another port when this one is taken.
 port = 9911
+
+[[proxy]]
+# Trunk matches the backend URL's path as the intercept prefix and forwards
+# requests to the backend host preserving the full path, so
+# GET /auth/token reaches http://127.0.0.1:18081/auth/token with no rewrite.
+backend = "http://127.0.0.1:18081/auth"

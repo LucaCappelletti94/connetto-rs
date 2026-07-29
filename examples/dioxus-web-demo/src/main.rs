@@ -14,22 +14,39 @@
 //! through the hub alone and never reaches the server: the worker replica does
 //! not even contain the table.
 //!
-//! The DB worker shares this same wasm module: [`db_worker_boot`] is a
-//! `wasm_bindgen` export the worker bootstrap (`assets/db-worker.js`) calls.
-//! The app's [`main`] returns early in a worker context, where there is no
-//! `Window` and Dioxus cannot run.
+//! Two auth modes, chosen at startup from `localStorage["connetto-demo-signed-in"]`:
+//! absent boots unauthenticated (shared plaintext replica, identical to the
+//! original single-mode behaviour). Present boots authenticated: the worker
+//! acquires connetto's own JWT through the dev OIDC provider, names the
+//! replica from the identity, and encrypts it at rest.
 //!
-//! Run against the demo stack (server on 7777, `connetto-demo-pg` on 55456):
-//! `dx serve` from this directory, then open the served URL in several windows.
+//! Switching modes reloads the page. The OAuth callback lands at
+//! `/auth/callback` (registered in the dev IdP); the proxy only covers
+//! `/auth/token`, `/auth/refresh`, and `/auth/logout`.
+//!
+//! The DB worker shares this same wasm module: the leader spawns it pointed at
+//! the dx glue, appending `?signed_in=1` to the URL when authenticated mode is
+//! active so the worker can read that flag from its own `self.location.search`
+//! (workers cannot access `localStorage`).
+//!
+//! Run with: `dx serve --port 9912` from this directory.
 
-use connetto_client::reconnect::ReconnectPolicy;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::{cell::RefCell, time::Duration};
+
 use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica};
 use connetto_dioxus::use_live;
-use connetto_web::{BroadcastTransport, leader, locks, workers};
+use connetto_web::{
+    BroadcastTransport,
+    auth::{LogoutOutcome, WorkerAuthConfig, deliver_login_code, request_logout, request_unsynced},
+    leader, locks, workers,
+};
 use diesel::prelude::*;
 use dioxus::prelude::*;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{BroadcastChannel, MessageEvent};
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = BroadcastTransport;
@@ -48,16 +65,34 @@ const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uu
      CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-/// The OPFS file holding the worker's durable synced replica.
+/// The OPFS file holding the worker's durable synced replica (base name; with
+/// auth enabled the worker appends the identity hash so each account gets its
+/// own encrypted file).
 const DB_NAME: &str = "connetto-relay.sqlite";
 /// The OPFS file holding the worker's durable device-private tier.
 const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
+/// The OPFS file holding the worker-only refresh token, encrypted at rest.
+const AUTH_DB_NAME: &str = "connetto-auth.sqlite";
 /// The shared leader lock every window of this app races.
 const LEADER_LOCK: &str = "connetto-demo-leader";
-/// The local tier schema, translated from `frontend.sql` by build.rs. DDL rather
-/// than a baked template, because a tier encrypted at rest cannot be seeded from
-/// a plaintext byte image.
+/// The local tier schema, translated from `frontend.sql` by build.rs.
 const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
+/// `localStorage` key that selects authenticated vs. unauthenticated mode.
+const SIGNED_IN_KEY: &str = "connetto-demo-signed-in";
+/// Query parameter the leader page appends to the glue URL when spawning the
+/// worker in authenticated mode.
+const SIGNED_IN_PARAM: &str = "signed_in=1";
+/// BroadcastChannel on which the worker publishes the authenticated user id
+/// once it has acquired a session.
+const DEMO_UID_CHANNEL: &str = "connetto-demo-uid";
+/// The origin serving `connetto-server`'s auth router, which the login navigation
+/// goes to directly. The worker's `fetch` calls go through this app's own origin
+/// instead, where the dev server proxies them.
+const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
+/// OIDC provider registered in the dev IdP.
+const AUTH_PROVIDER: &str = "dev-idp";
+/// Path the dev IdP redirects back to after login.
+const AUTH_CALLBACK_PATH: &str = "/auth/callback";
 
 diesel::table! {
     orders (id) {
@@ -91,23 +126,22 @@ struct Note {
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
 // tab write omits the id and this registered function mints it. The impl is
-// `rosetta_uuid::Uuid::utc_v7`, the same strongly typed key the `orders` schema
-// uses on SQLite and Postgres.
+// `rosetta_uuid::Uuid::utc_v7`, the same strongly typed key the `orders`
+// schema uses on SQLite and Postgres. Declared as nondeterministic so SQLite
+// calls it per row instead of folding the DEFAULT to a constant.
+// Declared with the built-in Binary type so diesel generates
+// register_nondeterministic_impl for SQLite. rosetta_uuid::Uuid implements
+// ToSql<Binary, Sqlite>, so the closure still returns the right value.
 #[diesel::declare_sql_function]
 extern "SQL" {
-    /// Client-authored primary key: a 16-byte UUID v7, stored as a BLOB.
     fn uuidv7() -> diesel::sql_types::Binary;
 }
 
 /// The registrar connetto installs on every connection it opens for this app.
-/// Nondeterministic, so SQLite calls `uuidv7()` per row instead of folding the
-/// DEFAULT to a constant.
 fn uuidv7_functions() -> connetto_client::SqlFunctions {
-    connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
-        |conn: &mut diesel::SqliteConnection| {
-            uuidv7_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::utc_v7)
-        },
-    ))
+    connetto_client::SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
+        uuidv7_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::utc_v7)
+    }))
 }
 
 /// A device-unique integer id for a local-only `notes` row. `notes` stays on
@@ -115,35 +149,121 @@ fn uuidv7_functions() -> connetto_client::SqlFunctions {
 /// The millisecond clock plus a random low tag keeps two windows of one device
 /// from colliding within the same millisecond.
 fn fresh_note_id() -> i64 {
-    let now = js_sys::Date::now();
-    debug_assert!(now.is_finite() && now >= 0.0);
-    // Intended truncation: whole milliseconds since the epoch.
-    let millis = now as i64;
-    let tag = js_sys::Math::random() * 1000.0;
-    // Math::random is [0, 1); scale to a 0..=999 tag. Deliberate quantization.
-    debug_assert!(tag.is_finite() && (0.0..1000.0).contains(&tag));
-    millis * 1000 + tag as i64
+    let ts = js_sys::Date::now();
+    // Deliberate truncation: current epoch ms (~1.7e12) fits i64 for 292 M years.
+    debug_assert!(ts.is_finite() && ts >= 0.0 && ts < i64::MAX as f64);
+    let ms = ts as i64;
+    let r = js_sys::Math::random() * 1000.0;
+    // Deliberate quantization: [0.0, 1000.0) -> [0, 999].
+    debug_assert!(r.is_finite() && (0.0..1000.0).contains(&r));
+    let low = r as i64;
+    ms * 1000 + low
 }
 
 /// A visible order quantity inside the subscription's `quantity > 0` window.
-///
-/// The id is minted by the DEFAULT now, so quantity cannot key off it. A random
-/// `1..=9` times five gives spread while staying strictly positive.
 fn fresh_quantity() -> i64 {
-    let scaled = js_sys::Math::random() * 9.0;
-    // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
-    debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
-    (scaled as i64 + 1) * 5
+    let r = js_sys::Math::random() * 9.0;
+    // Deliberate quantization: [0.0, 9.0) -> [0, 8], result [5, 45].
+    debug_assert!(r.is_finite() && (0.0..9.0).contains(&r));
+    (r as i64 + 1) * 5
 }
+
+// --- Auth-mode helpers -------------------------------------------------------
+
+/// True when `localStorage["connetto-demo-signed-in"]` is present.
+fn page_signed_in_flag() -> bool {
+    js_sys::eval(&format!("localStorage.getItem('{SIGNED_IN_KEY}') !== null"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// If the page URL carries `?code=...&state=...`, return the pair.
+fn page_login_callback() -> Option<(String, String)> {
+    // Returns [code, state] or null via a self-executing function.
+    let result = js_sys::eval(
+        "(function(){\
+            var p=new URLSearchParams(location.search);\
+            var c=p.get('code'),s=p.get('state');\
+            return c&&s?[c,s]:null;\
+        })()",
+    )
+    .ok()?;
+    if result.is_null() || result.is_undefined() {
+        return None;
+    }
+    let arr = js_sys::Array::from(&result);
+    let code = arr.get(0).as_string()?;
+    let state = arr.get(1).as_string()?;
+    Some((code, state))
+}
+
+/// Strip the query string from the current URL without a page reload so a
+/// spent authorization code is not replayed on refresh.
+fn clear_url_query() {
+    let _ = js_sys::eval("history.replaceState(null,'',location.pathname)");
+}
+
+/// Set the signed-in flag and reload, entering authenticated mode on the next
+/// boot.
+fn set_flag_and_reload() {
+    let _ = js_sys::eval(&format!(
+        "localStorage.setItem('{SIGNED_IN_KEY}','1');location.reload();"
+    ));
+}
+
+/// Clear the signed-in flag and reload, returning to unauthenticated mode.
+fn clear_flag_and_reload() {
+    let _ = js_sys::eval(&format!(
+        "localStorage.removeItem('{SIGNED_IN_KEY}');location.reload();"
+    ));
+}
+
+/// Navigate the browser to `url`. Used to send the user to the login page.
+fn navigate_to(url: &str) {
+    // Encode the URL as a JSON string literal so it is safe regardless of
+    // what characters the IdP URL carries.
+    let encoded = js_sys::JSON::stringify(&JsValue::from_str(url))
+        .ok()
+        .and_then(|s| s.as_string())
+        .unwrap_or_else(|| format!("\"{}\"", url.replace('"', "%22")));
+    let _ = js_sys::eval(&format!("location.href={encoded}"));
+}
+
+/// True when the worker's own URL carries `?signed_in=1`.
+///
+/// Workers cannot access `localStorage`, so the leader page appends
+/// `?signed_in=1` to the glue URL when spawning in authenticated mode.
+fn worker_signed_in_flag() -> bool {
+    js_sys::eval(&format!(
+        "self.location.search.includes('{SIGNED_IN_PARAM}')"
+    ))
+    .ok()
+    .and_then(|v| v.as_bool())
+    .unwrap_or(false)
+}
+
+/// The origin of the worker's own URL, e.g. `http://127.0.0.1:9912`.
+///
+/// Same as the page origin because the worker script is served from the same
+/// host. Used to build `WorkerAuthConfig` entirely within the worker.
+fn worker_origin() -> String {
+    js_sys::eval("self.location.origin")
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
+}
+
+// -----------------------------------------------------------------------------
 
 fn main() {
     // The dedicated DB worker imports this same wasm module: the leader spawns
-    // it pointed straight at the dx glue, which auto-initializes and runs this
-    // `main`. A worker has no `Window`, so boot the DB tier there instead of
-    // launching the UI.
+    // it pointed straight at the dx glue (optionally with ?signed_in=1 appended),
+    // which auto-initializes and runs this `main`. A worker has no `Window`.
     if web_sys::window().is_none() {
-        spawn_local(async {
-            if let Err(err) = run_db_worker().await {
+        let signed_in = worker_signed_in_flag();
+        spawn_local(async move {
+            if let Err(err) = run_db_worker(signed_in).await {
                 web_sys::console::error_1(&format!("db worker failed: {err:?}").into());
             }
         });
@@ -152,16 +272,37 @@ fn main() {
     dioxus::launch(App);
 }
 
-/// Boot the connetto DB tier in the worker context with the demo config.
+/// Boot the connetto DB tier in the worker context.
+///
+/// Calls [`workers::boot_db_worker`] with or without an auth config depending
+/// on `signed_in`. When authenticated, `boot_db_worker` returns the resolved
+/// `user_id` which is broadcast on [`DEMO_UID_CHANNEL`] so the page can display
+/// which account owns the replica. The broadcast happens after `boot_db_worker`
+/// returns, so the identity arrives after the worker has posted "ready" and the
+/// Dashboard is already visible.
 ///
 /// # Errors
 ///
-/// A JS string describing the VFS, upstream connect, or subscribe failure.
-async fn run_db_worker() -> Result<(), JsValue> {
-    // `Id` names the user id the reference connetto-server mints, a `String`.
-    // This demo runs unauthenticated, so no identity is ever acquired and the
-    // replica keeps `DB_NAME` verbatim.
-    connetto_web::workers::boot_db_worker::<String>(&connetto_web::workers::DbWorkerConfig {
+/// A JS string describing the VFS, acquisition, upstream connect, or subscribe
+/// failure.
+async fn run_db_worker(signed_in: bool) -> Result<(), JsValue> {
+    let auth = if signed_in {
+        let origin = worker_origin();
+        Some(WorkerAuthConfig {
+            // Fetch calls go through this origin, where the dev server proxies
+            // them, so they are same-origin and need no CORS.
+            auth_base_url: origin.clone(),
+            // The login is a navigation, which the dev server's proxy does not
+            // forward, so it goes straight to the auth origin. A navigation needs
+            // no CORS either way.
+            login_base_url: Some(AUTH_ORIGIN.to_owned()),
+            provider: AUTH_PROVIDER.to_owned(),
+            redirect_uri: format!("{origin}{AUTH_CALLBACK_PATH}"),
+        })
+    } else {
+        None
+    };
+    let user_id = workers::boot_db_worker::<String>(&workers::DbWorkerConfig {
         ws_url: DEMO_WS_URL,
         replica_db_prefix: DB_NAME,
         replica_ddl: DEMO_SQLITE_DDL,
@@ -173,10 +314,16 @@ async fn run_db_worker() -> Result<(), JsValue> {
         client_id_prefix: "db-worker",
         schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
         sql_functions: uuidv7_functions(),
-        auth: None,
-        auth_db_name: "connetto-auth.sqlite",
+        auth,
+        auth_db_name: AUTH_DB_NAME,
     })
-    .await
+    .await?;
+    // Post the identity so the page can show which account owns the replica.
+    if let (Some(uid), Ok(ch)) = (user_id, BroadcastChannel::new(DEMO_UID_CHANNEL)) {
+        let _ = ch.post_message(&JsValue::from_str(&uid));
+        ch.close();
+    }
+    Ok(())
 }
 
 /// The served URL of this app's wasm-bindgen glue module, recovered from the
@@ -206,12 +353,20 @@ struct Boot {
 
 /// Join the topology and connect this window's tab client.
 ///
-/// The sequence mirrors what the browser test suite pins: join the leader
-/// election (the winner spawns the worker), wait for the worker to answer,
-/// hold the tab liveness lock BEFORE connecting, connect over a boot wire, and
-/// wrap the connection in the reconnecting client so a worker swap recovers.
-async fn boot_window() -> Result<Boot, JsValue> {
-    let glue = glue_url();
+/// When `signed_in` is true the glue URL passed to the leader election carries
+/// `?signed_in=1` so the spawned worker knows to boot in authenticated mode.
+/// The sequence otherwise mirrors what the browser test suite pins: join the
+/// leader election (the winner spawns the worker), wait for the worker to
+/// answer, hold the tab liveness lock BEFORE connecting, connect over a boot
+/// wire, and wrap the connection in the reconnecting client so a worker swap
+/// recovers.
+async fn boot_window(signed_in: bool) -> Result<Boot, JsValue> {
+    let raw_glue = glue_url();
+    let glue = if signed_in {
+        format!("{raw_glue}?{SIGNED_IN_PARAM}")
+    } else {
+        raw_glue
+    };
     let client_id = format!("tab-{}", js_sys::Date::now());
 
     // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
@@ -234,9 +389,9 @@ async fn boot_window() -> Result<Boot, JsValue> {
         ConnettoConnection::connect(transport, &Replica::Ephemeral, DEMO_TAB_DDL, &config, None)
             .await
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let policy = ReconnectPolicy {
-        initial_backoff: core::time::Duration::from_millis(100),
-        max_backoff: core::time::Duration::from_secs(2),
+    let policy = connetto_client::reconnect::ReconnectPolicy {
+        initial_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_secs(2),
         max_attempts: None,
     };
     let (client, pump) = ConnettoClient::with_reconnect(
@@ -287,27 +442,109 @@ const CSS: &str = r"
     th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
     input { padding: 4px; }
     button { padding: 4px 10px; cursor: pointer; }
-    .row { display: flex; gap: 6px; margin-top: 8px; }
+    .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .auth-banner { border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }
+    .auth-anon { background: #f5f5f5; border: 1px solid #ddd; }
+    .auth-signed-in { background: #eaf4ea; border: 1px solid #7cb97c; }
+    .auth-banner p { margin: 0 0 6px; }
+    .auth-banner button { margin-right: 6px; }
+    .logout-confirm { background: #fff8e1; border: 1px solid #f0c040;
+                      border-radius: 6px; padding: 8px 12px; }
+    .logout-confirm p { margin: 0 0 6px; }
 ";
 
 // Dioxus components are PascalCase by convention; the `rsx!` call sites name
 // them as elements, so keep the component name and silence the lint.
 #[allow(non_snake_case)]
 fn App() -> Element {
+    let signed_in = page_signed_in_flag();
+
+    // Read ?code=...&state=... from the URL once, then clear it so a reload
+    // does not attempt to redeem a spent authorization code.
+    let pending = page_login_callback();
+    if pending.is_some() {
+        clear_url_query();
+    }
+
     let mut client_slot = use_signal(|| None::<ConnettoClient<Tab>>);
     let mut status = use_signal(|| "connecting to the connetto stack".to_owned());
-    // Provided so the panes read the client and status without prop plumbing
-    // through non-`PartialEq` component boundaries.
+    // User id received from the worker after authentication.
+    let mut user_id: Signal<Option<String>> = use_signal(|| None);
+
     use_context_provider(|| client_slot);
     use_context_provider(|| status);
+    use_context_provider(|| user_id);
 
-    // The boot tokens live as long as the app: dropping them on page close
-    // resigns leadership and frees the tab lock, which reaps this tab.
-    let boot_hold = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None::<Boot>)));
+    // Listen for the user id the worker broadcasts after boot_db_worker returns.
+    // The broadcast arrives AFTER the worker posts "ready", so the Dashboard is
+    // already visible when this fires and the banner updates reactively from
+    // "authenticating..." to the actual account name. Wrapped in Rc<RefCell<_>>
+    // because Closure<dyn FnMut> is not Clone, but use_hook requires Clone.
+    let _uid_listener = use_hook(move || {
+        Rc::new(RefCell::new(if signed_in {
+            let ch = BroadcastChannel::new(DEMO_UID_CHANNEL).expect("uid channel");
+            let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                if let Some(uid) = e.data().as_string() {
+                    user_id.set(Some(uid));
+                }
+            });
+            ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+            Some((ch, on_msg))
+        } else {
+            None
+        }))
+    });
+
+    // Listen on the login channel. When the worker broadcasts its login URL:
+    //   - If this page load is the OAuth callback (pending.is_some()), deliver
+    //     the code and state to the worker.
+    //   - Otherwise navigate the browser to the login URL.
+    let _login_listener = use_hook(move || {
+        Rc::new(RefCell::new(if signed_in {
+            let login_ch =
+                BroadcastChannel::new(connetto_web::LOGIN_CHANNEL).expect("login channel");
+            let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                let Some(text) = e.data().as_string() else {
+                    return;
+                };
+                // Parse LoginMessage::Request via js_sys::JSON to avoid a
+                // serde_json dependency in the demo.
+                let val = match js_sys::JSON::parse(&text) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let kind = js_sys::Reflect::get(&val, &JsValue::from_str("kind"))
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if kind.as_deref() != Some("request") {
+                    return;
+                }
+                let Some(url) = js_sys::Reflect::get(&val, &JsValue::from_str("url"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                else {
+                    return;
+                };
+                if let Some((code, state)) = &pending {
+                    // This page IS the callback: deliver the code to the worker.
+                    let _ = deliver_login_code(code, state);
+                } else {
+                    // Initial sign-in: send the user to the IdP.
+                    navigate_to(&url);
+                }
+            });
+            login_ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+            Some((login_ch, on_msg))
+        } else {
+            None
+        }))
+    });
+
+    let boot_hold = use_hook(|| Rc::new(RefCell::new(None::<Boot>)));
     use_hook(move || {
         let boot_hold = boot_hold.clone();
         spawn(async move {
-            match boot_window().await {
+            match boot_window(signed_in).await {
                 Ok(boot) => {
                     let mut events = boot.client.events();
                     client_slot.set(Some(boot.client.clone()));
@@ -330,12 +567,156 @@ fn App() -> Element {
         div { class: "wrap",
             h1 { "connetto web demo" }
             p { class: "status", "status: " {status} }
+            AuthBanner { signed_in }
             if ready {
                 Dashboard {}
             } else {
                 p { "Connecting to the DB worker and the connetto stack..." }
             }
         }
+    }
+}
+
+/// Auth status banner shown above the dashboard.
+///
+/// Unauthenticated: explains the mode and offers a sign-in button. Authenticated:
+/// shows which account owns the replica and provides logout controls.
+#[component]
+#[allow(non_snake_case)]
+fn AuthBanner(signed_in: bool) -> Element {
+    let user_id = use_context::<Signal<Option<String>>>();
+
+    if !signed_in {
+        rsx! {
+            div { class: "auth-banner auth-anon",
+                p {
+                    "Unauthenticated mode: shared plaintext replica. \
+                     Signing in switches to a private encrypted replica named after your account."
+                }
+                button {
+                    onclick: move |_| set_flag_and_reload(),
+                    "Sign in (private encrypted replica)"
+                }
+            }
+        }
+    } else {
+        let uid_text = user_id
+            .read()
+            .clone()
+            .unwrap_or_else(|| "authenticating...".to_owned());
+        rsx! {
+            div { class: "auth-banner auth-signed-in",
+                p { "Signed in as: " strong { {uid_text} } }
+                p {
+                    "Using a private encrypted replica. \
+                     Signing out returns to the shared unauthenticated replica."
+                }
+                LogoutControls {}
+            }
+        }
+    }
+}
+
+/// The three possible states of the logout UI.
+#[derive(Clone, PartialEq)]
+enum LogoutState {
+    /// Showing the two logout buttons.
+    Idle,
+    /// Awaiting user confirmation: delete would lose this many unsynced writes.
+    ConfirmDelete { unsynced_count: usize },
+    /// A logout or unsynced-count request is in flight.
+    Working,
+    /// The request failed.
+    Error(String),
+}
+
+/// Logout controls rendered inside the signed-in auth banner.
+///
+/// "Log out, keep local data" keeps the encrypted replica so a future login
+/// with the same account resumes from the persisted cursor. "Delete local data
+/// and log out" checks for unsynced writes first and confirms before losing any.
+#[component]
+#[allow(non_snake_case)]
+fn LogoutControls() -> Element {
+    let mut state = use_signal(|| LogoutState::Idle);
+
+    let on_keep = move |_| {
+        spawn(async move {
+            state.set(LogoutState::Working);
+            match request_logout(false, false).await {
+                Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => clear_flag_and_reload(),
+                // Refused cannot occur when delete=false; treat as success.
+                Ok(LogoutOutcome::Refused { .. }) => clear_flag_and_reload(),
+                Err(err) => state.set(LogoutState::Error(err.to_string())),
+            }
+        });
+    };
+
+    let on_delete = move |_| {
+        spawn(async move {
+            state.set(LogoutState::Working);
+            match request_unsynced().await {
+                Ok(seqs) if seqs.is_empty() => {
+                    // Nothing would be lost: proceed without a confirmation prompt.
+                    match request_logout(true, false).await {
+                        Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => {
+                            clear_flag_and_reload();
+                        }
+                        Ok(LogoutOutcome::Refused { seqs }) => {
+                            // A write landed between our check and the request.
+                            // Show the count and let the user confirm.
+                            state.set(LogoutState::ConfirmDelete {
+                                unsynced_count: seqs.len(),
+                            });
+                        }
+                        Err(err) => state.set(LogoutState::Error(err.to_string())),
+                    }
+                }
+                Ok(seqs) => {
+                    state.set(LogoutState::ConfirmDelete {
+                        unsynced_count: seqs.len(),
+                    });
+                }
+                Err(err) => state.set(LogoutState::Error(err.to_string())),
+            }
+        });
+    };
+
+    let on_confirm = move |_| {
+        spawn(async move {
+            state.set(LogoutState::Working);
+            match request_logout(true, true).await {
+                Ok(_) => clear_flag_and_reload(),
+                Err(err) => state.set(LogoutState::Error(err.to_string())),
+            }
+        });
+    };
+
+    let on_cancel = move |_| state.set(LogoutState::Idle);
+
+    match state.read().clone() {
+        LogoutState::Idle => rsx! {
+            div { class: "row",
+                button { onclick: on_keep, "Log out, keep local data" }
+                button { onclick: on_delete, "Delete local data and log out" }
+            }
+        },
+        LogoutState::ConfirmDelete { unsynced_count } => rsx! {
+            div { class: "logout-confirm",
+                p {
+                    "You have {unsynced_count} unsynced write(s) that would be permanently lost."
+                }
+                div { class: "row",
+                    button { onclick: on_confirm, "Confirm: delete and log out" }
+                    button { onclick: on_cancel, "Cancel" }
+                }
+            }
+        },
+        LogoutState::Working => rsx! { p { "Working..." } },
+        LogoutState::Error(msg) => rsx! {
+            p { style: "color:#b00;", "Error: {msg}" }
+            button { onclick: on_cancel, "Dismiss" }
+        },
     }
 }
 

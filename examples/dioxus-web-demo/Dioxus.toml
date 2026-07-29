@@ -1,0 +1,18 @@
+[application]
+name = "connetto-dioxus-web-demo"
+
+[web.watcher]
+# Serve index.html for any unmatched path so the SPA handles /auth/callback.
+index_on_404 = true
+
+# Forward the three auth POST endpoints same-origin so JS fetch calls work
+# without CORS. /auth/callback is intentionally excluded: the IdP redirects
+# the browser there and the SPA reads the code and state parameters itself.
+[[web.proxy]]
+backend = "http://127.0.0.1:18081/auth/token"
+
+[[web.proxy]]
+backend = "http://127.0.0.1:18081/auth/refresh"
+
+[[web.proxy]]
+backend = "http://127.0.0.1:18081/auth/logout"

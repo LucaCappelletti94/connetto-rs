@@ -8,7 +8,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-connetto-client = { path = "../../crates/connetto-client" }
+connetto-client = { path = "../../crates/connetto-client", features = ["native-auth"] }
 connetto-core = { path = "../../crates/connetto-core" }
 connetto-dioxus = { path = "../../crates/connetto-dioxus" }
 diesel = { version = "2", features = ["sqlite"] }

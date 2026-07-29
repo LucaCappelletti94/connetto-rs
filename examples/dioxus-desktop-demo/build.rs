@@ -25,6 +25,10 @@ fn main() {
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");
     ddl.push(';');
+    // Also expose the DDL as a text file so the app can seed a fresh encrypted
+    // replica through `ConnettoConnection::connect` with DDL (the template
+    // approach only seeds a plaintext file; an encrypted first-boot uses DDL).
+    std::fs::write(out_dir.join("replica-ddl.sql"), &ddl).expect("write replica-ddl.sql");
 
     let template = out_dir.join("replica-template.sqlite");
     // Rebuild the template from scratch so a schema edit never layers onto a
