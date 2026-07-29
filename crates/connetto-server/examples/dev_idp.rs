@@ -17,10 +17,12 @@
 //! cargo run --bin connetto-server
 //! ```
 //!
-//! `CONNETTO_DEV_IDP_CALLBACKS` is the comma-separated list of redirect URIs to
-//! register, which must contain the server's `/auth/callback` **as the browser sees
-//! it**. A deployment behind a reverse proxy is reached at the proxy's origin, so a
-//! demo served by trunk on its own port registers that port, not the server's.
+//! The registered redirect defaults to `http://$CONNETTO_AUTH_BIND/auth/callback`,
+//! so running this and the server with the same `CONNETTO_AUTH_BIND` needs no
+//! further configuration. Set `CONNETTO_DEV_IDP_CALLBACKS` to a comma-separated
+//! list to override it, which a deployment behind a reverse proxy has to do: the
+//! browser reaches the callback at the proxy's origin, so an app served by trunk on
+//! its own port registers that port rather than the server's.
 
 use std::path::PathBuf;
 
@@ -32,6 +34,10 @@ use serde_json::json;
 /// rather than ephemeral because the server is configured with the issuer URL up
 /// front, and discovery refuses an issuer that is not the URL it was fetched from.
 const DEFAULT_BIND: &str = "127.0.0.1:18098";
+
+/// `connetto-server`'s own default for `CONNETTO_AUTH_BIND`, mirrored so the
+/// registered callback lands where the server actually serves it.
+const DEFAULT_SERVER_AUTH_BIND: &str = "127.0.0.1:8081";
 
 /// The provider name a client names in its login request.
 const PROVIDER: &str = "dev-idp";
@@ -48,8 +54,15 @@ async fn main() -> Result<()> {
     let addr = listener.local_addr().context("reading the bound address")?;
     let issuer = format!("http://{addr}");
 
+    // Defaulted from the same variable the server reads for its auth bind, because
+    // the provider redirects the browser to the server's own callback. Deriving it
+    // means the two agree by construction: a server moved to another port would
+    // otherwise leave the provider redirecting to a dead one, which fails remotely
+    // and late, at the provider-to-server hop.
+    let auth_bind =
+        std::env::var("CONNETTO_AUTH_BIND").unwrap_or_else(|_| DEFAULT_SERVER_AUTH_BIND.to_owned());
     let callbacks: Vec<String> = std::env::var("CONNETTO_DEV_IDP_CALLBACKS")
-        .unwrap_or_else(|_| "http://127.0.0.1:8081/auth/callback".to_owned())
+        .unwrap_or_else(|_| format!("http://{auth_bind}/auth/callback"))
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
