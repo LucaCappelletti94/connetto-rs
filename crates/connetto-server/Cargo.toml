@@ -101,3 +101,18 @@ rosetta-uuid = { version = "0.1.3", features = ["serde"] }
 # crate, so the harness-backed tests are Docker-gated (a dev-dependency cycle
 # Cargo permits).
 connetto-test-harness = { path = "../connetto-test-harness" }
+# A real, conformant OIDC provider on a loopback socket, so `GenericOidcProvider`
+# can be pointed at one unchanged and its discovery, token exchange, and JWKS
+# fetch actually run (phase E4.a). Consent is auto-granted in its authorize
+# handler, so no human and no login form is involved.
+#
+# Both features are named rather than taken from `default` because dropping
+# either does not work: `config` looks droppable (this test configures the
+# provider in code, not from YAML or TOML) but the crate's `lib.rs` re-exports
+# `config::ConfigError` unconditionally, so `default-features = false` with only
+# `testing` fails to compile upstream. It also declares `reqwest` without
+# `default-features = false`, which is what pulls `native-tls` into the dev tree
+# alongside the `rustls-tls` this workspace otherwise uses. Neither costs
+# correctness here, and `openssl-sys` was already present through
+# `pg2sqlite`'s `git2`.
+oauth2-test-server = { version = "0.2", default-features = false, features = ["testing", "config"] }
