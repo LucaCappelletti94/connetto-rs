@@ -21,7 +21,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
@@ -222,9 +222,10 @@ async fn full_resync_is_relay_transparent() {
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
-        .await
-        .expect("worker connect");
+    let mut worker =
+        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+            .await
+            .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -258,7 +259,7 @@ async fn full_resync_is_relay_transparent() {
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut tab = ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config, None)
+    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_config, None)
         .await
         .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)

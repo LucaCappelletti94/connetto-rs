@@ -16,7 +16,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Watchable};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica, Watchable,
+};
 use connetto_core::Cursor;
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
@@ -176,11 +178,12 @@ async fn connect_with_tier(
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client =
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+            .await
+            .expect("client connect");
     client
-        .attach_local_tier_ddl(NOTES_DDL)
+        .attach_local_tier_ddl(":memory:", NOTES_DDL)
         .expect("attach the local tier");
     client
 }

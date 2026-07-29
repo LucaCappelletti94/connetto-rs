@@ -139,7 +139,7 @@ pub mod workers {
             replica_db_prefix: DB_NAME,
             replica_ddl: DEMO_SQLITE_DDL,
             frontend_db_name: FRONTEND_DB_NAME,
-            frontend_template: FRONTEND_TEMPLATE,
+            frontend_ddl: DEMO_FRONTEND_DDL,
             upstream_sub_id: "db-upstream",
             upstream_query: DEMO_QUERY,
             hub_meta_name: "connetto-hub-meta.sqlite",

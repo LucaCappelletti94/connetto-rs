@@ -14,7 +14,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
 use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv7_functions};
@@ -107,7 +107,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
+    ConnettoConnection::connect(transport, &Replica::Ephemeral, DEMO_TAB_DDL, &config, None)
         .await
         .expect("tab connect through the wire channel")
 }

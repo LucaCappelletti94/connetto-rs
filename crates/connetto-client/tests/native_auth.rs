@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use connetto_client::{
-    AcquiredSession, BrowserOpener, MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore,
-    replica_db_name,
+    AcquiredSession, BrowserOpener, MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator,
+    RefreshTokenStore, ReplicaKeyStore, replica_db_name, resolve_replica_key,
 };
 use connetto_server::{
     AuthConfig, AuthService, IdentityResolver, InMemoryAuthStore, PermissiveProvider,
@@ -264,6 +264,77 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
         alice_replica,
         replica_db_name("app.db", &typed_id("alice")).expect("stable"),
         "one identity always returns to the same replica",
+    );
+}
+
+/// Phase E1 acceptance on the native path, against the real auth router.
+///
+/// A first login provisions a per-replica key and caches it, a later login
+/// resolving the same identity keeps the cached key rather than adopting the
+/// freshly minted one, two identities on one device stay isolated, and a
+/// silent refresh carries no key at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
+    let base = spawn_typed_auth_server().await;
+    let keys = MemoryKeyStore::default();
+
+    let alice = login_as(&base, "alice").await;
+    let alice_replica = replica_db_name("app.db", &alice.user_id).expect("alice replica");
+    let provisioned = alice
+        .replica_key
+        .clone()
+        .expect("a login response carries a freshly provisioned key");
+
+    // First sight: the provisioned key is adopted and written through.
+    let first = resolve_replica_key(&keys, &alice_replica, alice.replica_key)
+        .expect("resolve")
+        .expect("a key resolves on first login");
+    assert_eq!(first, provisioned);
+    assert_eq!(
+        keys.load(&alice_replica).expect("load"),
+        Some(provisioned.clone()),
+        "the provisioned key is cached for a later cold start",
+    );
+
+    // A second login for the same identity mints a different key server side,
+    // because the server retains nothing. Provision-once means the cached key
+    // still wins, which is what stops a re-login from stranding the replica.
+    let again = login_as(&base, "alice").await;
+    let reminted = again
+        .replica_key
+        .clone()
+        .expect("the second login also provisions");
+    assert_ne!(
+        reminted, provisioned,
+        "the server mints fresh key material every login, holding none",
+    );
+    let effective = resolve_replica_key(&keys, &alice_replica, again.replica_key)
+        .expect("resolve")
+        .expect("a key resolves");
+    assert_eq!(
+        effective, provisioned,
+        "the cached key wins over the re-minted one",
+    );
+
+    // A cold start with no wire key at all still resolves, which is the
+    // offline property: the replica opens with no valid credential.
+    let offline = resolve_replica_key(&keys, &alice_replica, None)
+        .expect("resolve")
+        .expect("the cached key resolves with nothing on the wire");
+    assert_eq!(offline, provisioned, "an offline cold start reads it back");
+
+    // A second identity on the same device gets its own key and its own
+    // record, so neither can read the other's replica.
+    let bob = login_as(&base, "bob").await;
+    let bob_replica = replica_db_name("app.db", &bob.user_id).expect("bob replica");
+    let bob_key = resolve_replica_key(&keys, &bob_replica, bob.replica_key)
+        .expect("resolve")
+        .expect("bob is provisioned too");
+    assert_ne!(bob_key, provisioned, "identities do not share a key");
+    assert_eq!(
+        keys.load(&alice_replica).expect("load"),
+        Some(provisioned),
+        "bob's login leaves alice's cached key untouched",
     );
 }
 

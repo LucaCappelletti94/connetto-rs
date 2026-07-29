@@ -560,13 +560,17 @@ dependencies = [
  "connetto-core",
  "diesel",
  "diesel-sqlite-session",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlite-diff-rs",
+ "sqlite-wasm-rs",
  "sqlparser",
  "subql",
  "thiserror 2.0.19",
  "tokio",
+ "zeroize",
  "zstd",
 ]
 
@@ -582,6 +586,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -590,6 +596,7 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
+ "diesel",
  "dioxus-core",
  "dioxus-hooks",
  "dioxus-signals",
@@ -976,7 +983,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.11"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "bitflags 2.13.1",
  "byteorder",
@@ -1008,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#f6aba483a6a031c735a63639a7c13380b3b696ac"
+source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#6504251de04c0f647670d7ba2d7a8139d406d481"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -1019,7 +1026,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1029,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -1042,7 +1049,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "syn 2.0.119",
 ]
@@ -1550,7 +1557,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#2c114c6d5f85615ae2f8ae27330d9f60fb1a574a"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
 dependencies = [
  "darling 0.23.0",
  "either",
@@ -2900,9 +2907,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
 dependencies = [
  "bindgen",
  "cc",
@@ -5380,7 +5387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

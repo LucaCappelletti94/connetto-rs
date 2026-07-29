@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "native-auth")]
 pub mod auth;
+pub mod cipher;
 pub mod dsl;
 pub mod live;
 pub mod reconnect;
@@ -61,9 +62,11 @@ pub mod teardown;
 
 #[cfg(feature = "native-auth")]
 pub use auth::{
-    AcquiredSession, BrowserOpener, KeyringStore, MemoryRefreshStore, NativeAuthenticator,
-    RefreshTokenStore, system_browser_opener,
+    AcquiredSession, BrowserOpener, KeyringKeyStore, KeyringStore, MemoryKeyStore,
+    MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore,
+    resolve_replica_key, system_browser_opener,
 };
+pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
 pub use live::{
     ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_is_aggregate,
@@ -72,7 +75,7 @@ pub use live::{
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
-pub use replica::replica_db_name;
+pub use replica::{Replica, replica_db_name};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -118,6 +121,49 @@ pub enum ClientError {
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
+    /// The local database exists but does not decrypt under the key given at
+    /// connect.
+    ///
+    /// A wrong key and a corrupt file are indistinguishable to the page codec.
+    /// The benign cause is a device whose key store was cleared while its
+    /// replica file survived, which the next login re-keys, so the recovery is
+    /// discard and re-sync rather than a corruption report.
+    ///
+    /// There is no unsynced-mutation guard on that discard, and there cannot be
+    /// one: the pending mutations live inside the file this key will not open,
+    /// so they are unreadable and therefore already lost. Delete the replica
+    /// with [`purge_replica`](teardown::purge_replica) and `force` set, then
+    /// connect afresh to re-sync the synced tables from the server. The
+    /// device-local tier does not come back, which is the cost the plan states
+    /// for provision-once custody.
+    #[error("the local database does not decrypt under the key supplied: {0}")]
+    ReplicaUndecryptable(String),
+    /// Applying the replica cipher failed before any page was read: this build
+    /// links a SQLite with no page codec, or a cipher pragma was rejected.
+    #[error("replica cipher: {0}")]
+    Cipher(String),
+    /// An encrypted replica was asked for and no key resolved: the login carried
+    /// none and none was cached.
+    ///
+    /// Raised by [`Replica::encrypted_file`], which exists so this cannot
+    /// instead become a silent [`Replica::PlaintextFile`] behind an
+    /// authenticating deployment's back. The reachable cause is a device whose
+    /// key store was cleared while its replica survived. Recover with a fresh
+    /// interactive login, which provisions a key, or with an explicit data wipe.
+    #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
+    ReplicaKeyMissing,
+}
+
+/// Split a cipher failure by what the caller can do about it: a key that does
+/// not decrypt is recoverable by discarding the replica, everything else is a
+/// build or configuration fault.
+impl From<UnlockError> for ClientError {
+    fn from(error: UnlockError) -> Self {
+        match error {
+            UnlockError::WrongKey(_) => Self::ReplicaUndecryptable(error.to_string()),
+            UnlockError::CodecMissing | UnlockError::Pragma(_) => Self::Cipher(error.to_string()),
+        }
+    }
 }
 
 /// The boxed future a token factory returns.
@@ -741,29 +787,32 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    /// Connect: open the local database, hook the capture session, and run the
+    /// Connect: open the local replica, hook the capture session, and run the
     /// handshake.
     ///
-    /// `db_path` is the local replica. A file path persists it across runs,
-    /// `:memory:` works for throwaway replicas now that a single connection
-    /// serves capture and apply alike. `sqlite_ddl` creates the local schema.
-    /// Pass `resume` to continue from a persisted cursor on reconnect.
+    /// `replica` says where the replica lives and whether its pages are
+    /// encrypted, as one value, so a connection cannot exist without its opener
+    /// having stated both and cannot claim a key over storage that has nothing
+    /// at rest. `sqlite_ddl` creates the local schema. Pass `resume` to continue
+    /// from a persisted cursor on reconnect.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] on a database, session, transport, or handshake failure.
+    /// [`ClientError`] on a database, cipher, session, transport, or handshake
+    /// failure. [`ClientError::ReplicaUndecryptable`] when an existing replica
+    /// does not open under the key given.
     pub async fn connect(
         transport: T,
-        db_path: &str,
+        replica: &Replica<'_>,
         sqlite_ddl: &str,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(transport, db_path, Some(sqlite_ddl), config, resume).await
+        Self::connect_inner(transport, replica, Some(sqlite_ddl), config, resume).await
     }
 
-    /// Connect like [`connect`](Self::connect), but seed a fresh replica from
-    /// a template database instead of executing DDL.
+    /// Connect like [`connect`](Self::connect), but seed a fresh **plaintext**
+    /// replica from a template database instead of executing DDL.
     ///
     /// `template` is the complete byte image of a SQLite database with the
     /// replica schema already applied, the build-time product of translating
@@ -772,16 +821,24 @@ where
     /// written there and no DDL ever runs. An existing replica is reused
     /// untouched, which is the resume path.
     ///
-    /// Native only: it writes through the filesystem. On wasm, import the
-    /// template through the VFS (OPFS utilities) and use
-    /// [`connect_existing`](Self::connect_existing).
+    /// The plaintext is in the name because it is unavoidable here and would
+    /// otherwise be invisible: a baked byte image is a plaintext database, the
+    /// per-replica key does not exist at build time, and neither page codec
+    /// offers a plaintext-to-encrypted transform that works on both backends. So
+    /// an authenticated application calling this still gets a readable file, and
+    /// has to have typed the word to get there. An encrypted replica first-boots
+    /// from DDL through [`connect`](Self::connect) with
+    /// [`Replica::encrypted_file`](replica::Replica::encrypted_file).
+    ///
+    /// Native only: it writes through the filesystem. On wasm, first-boot from
+    /// DDL and use [`connect`](Self::connect).
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a filesystem, database, session, transport, or
     /// handshake failure.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-    pub async fn connect_with_replica_template(
+    pub async fn connect_with_plaintext_template(
         transport: T,
         db_path: &str,
         template: &[u8],
@@ -791,38 +848,57 @@ where
         if !std::path::Path::new(db_path).exists() {
             std::fs::write(db_path, template).map_err(|e| ClientError::Connect(e.to_string()))?;
         }
-        Self::connect_existing(transport, db_path, config, resume).await
+        Self::connect_existing(
+            transport,
+            &Replica::PlaintextFile { path: db_path },
+            config,
+            resume,
+        )
+        .await
     }
 
     /// Connect to a replica that already carries its schema, executing no
-    /// DDL: a template imported through a VFS (the wasm OPFS path), a file
-    /// seeded by the native template constructor, or a previous run's replica
-    /// on reconnect.
+    /// DDL: a previous run's replica on reconnect, or a file seeded by the
+    /// native template constructor.
+    ///
+    /// `replica` must describe the replica as it was created. See
+    /// [`connect`](Self::connect) for why it is stated rather than inferred.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] on a database, session, transport, or handshake
-    /// failure.
+    /// [`ClientError`] on a database, cipher, session, transport, or handshake
+    /// failure. [`ClientError::ReplicaUndecryptable`] when the replica does not
+    /// open under the key given.
     pub async fn connect_existing(
         transport: T,
-        db_path: &str,
+        replica: &Replica<'_>,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(transport, db_path, None, config, resume).await
+        Self::connect_inner(transport, replica, None, config, resume).await
     }
 
-    /// Shared connect body: open the connection, apply the schema when it
-    /// arrives as DDL, hook the capture session, and run the handshake.
+    /// Shared connect body: open the connection, unlock the page codec, apply
+    /// the schema when it arrives as DDL, hook the capture session, and run the
+    /// handshake.
     async fn connect_inner(
         mut transport: T,
-        db_path: &str,
+        replica: &Replica<'_>,
         sqlite_ddl: Option<&str>,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        let mut db = SqliteConnection::establish(db_path)
+        let mut db = SqliteConnection::establish(replica.path())
             .map_err(|e| ClientError::Connect(e.to_string()))?;
+        // First, ahead of everything: setting the journal mode reads the
+        // database header, which is ciphertext until the codec is keyed. Every
+        // database later attached to this connection inherits the key from an
+        // `ATTACH` with no `KEY` clause, so the local tier and the relay hub's
+        // own state are covered by this one call.
+        match replica {
+            Replica::Ephemeral | Replica::PlaintextFile { .. } => {}
+            Replica::EncryptedFile { key, .. } => cipher::unlock(&mut db, key)?,
+        }
         db.batch_execute("PRAGMA journal_mode=WAL")?;
         // Register app-supplied functions before any DDL or insert, so a
         // column DEFAULT that calls one fires on the first write.
@@ -1003,6 +1079,19 @@ where
     /// empty database. Attach before creating live queries, since tier
     /// dispatch happens at registration.
     ///
+    /// The tier shares the replica's cipher, always: SQLite gives an attached
+    /// database the connection's VFS and the page codec gives it the main
+    /// database's derived key. One device, one key, because two would double the
+    /// lost-key failure modes and isolate nothing, since both entries would sit
+    /// in the same key store behind the same wrap.
+    ///
+    /// Under an encrypted replica the tier file must have been created through a
+    /// connection keyed the same way, which in practice means a previous run's
+    /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl). A file created
+    /// elsewhere carries its own key salt and will not decrypt here, and a
+    /// plaintext baked template will not either. Both fail loudly with
+    /// [`ClientError::Db`] rather than leaving the tier in the clear.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Db`] when the file is missing, is not a database, or a
@@ -1021,10 +1110,23 @@ where
         Ok(())
     }
 
-    /// Attach an ephemeral in-memory local tier and create its schema from
-    /// `ddl`, for replicas that are themselves ephemeral (a tab's `:memory:`
-    /// mirror, tests). The durable flavor is
-    /// [`attach_local_tier`](Self::attach_local_tier).
+    /// Attach the local tier at `path`, creating it and applying `ddl` when it
+    /// is empty. `":memory:"` gives the ephemeral tier a `:memory:` replica
+    /// wants (a tab's mirror, tests), a file path gives a durable one, and
+    /// either way a second run over an already populated tier re-attaches it
+    /// untouched.
+    ///
+    /// This is the only way to first-boot a durable tier under an encrypted
+    /// replica, and the reason is a property of the page codec rather than a
+    /// preference. A database created through an `ATTACH` on a keyed connection
+    /// inherits the main database's key salt, and an `ATTACH` of an existing
+    /// database applies the main database's derived key regardless of any `KEY`
+    /// clause, so a tier file created by some other connection carries a
+    /// different salt and will not decrypt here. Creating it through the replica
+    /// connection is what makes the salts agree, which is also why
+    /// [`attach_local_tier`](Self::attach_local_tier) works on every later run.
+    /// This is measured behaviour: see
+    /// `crates/connetto-client/tests/encrypted_replica.rs`.
     ///
     /// `ddl` must consist of `CREATE TABLE` statements only: each is
     /// requalified into the attached schema, since an unqualified `CREATE
@@ -1035,10 +1137,14 @@ where
     /// [`ClientError::Session`] on a non-`CREATE TABLE` statement,
     /// [`ClientError::Db`] when a statement fails or a tier is already
     /// attached.
-    pub fn attach_local_tier_ddl(&mut self, ddl: &str) -> Result<(), ClientError> {
-        self.db.attach_database(":memory:", LOCAL_SCHEMA)?;
-        for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            self.db.batch_execute(&qualify_create_table(statement)?)?;
+    pub fn attach_local_tier_ddl(&mut self, path: &str, ddl: &str) -> Result<(), ClientError> {
+        self.db.attach_database(path, LOCAL_SCHEMA)?;
+        // An attached database with no tables is a fresh one, on every target
+        // and with no filesystem probe, which wasm does not have.
+        if local_tier_tables(&mut self.db)?.is_empty() {
+            for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                self.db.batch_execute(&qualify_create_table(statement)?)?;
+            }
         }
         self.local_tables = local_tier_tables(&mut self.db)?;
         Ok(())

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -256,7 +256,7 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
     // ever processes them.
     let mut conn = ConnettoConnection::connect(
         black_hole(),
-        ":memory:",
+        &Replica::Ephemeral,
         SQLITE_DDL,
         &config("replay"),
         None,
@@ -316,10 +316,15 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
         // Dropping both ends here loses the acknowledgement forever.
     });
 
-    let mut conn =
-        ConnettoConnection::connect(client_end, ":memory:", SQLITE_DDL, &config("dedupe"), None)
-            .await
-            .expect("connect");
+    let mut conn = ConnettoConnection::connect(
+        client_end,
+        &Replica::Ephemeral,
+        SQLITE_DDL,
+        &config("dedupe"),
+        None,
+    )
+    .await
+    .expect("connect");
     insert_local(&mut conn, 61);
     conn.push().await.expect("push").expect("mutation sent");
     relay.await.expect("mitm relay");
@@ -353,7 +358,9 @@ async fn restart_replays_persisted_pending() {
     {
         let mut conn = ConnettoConnection::connect(
             black_hole(),
-            &replica_path,
+            &Replica::PlaintextFile {
+                path: &replica_path,
+            },
             SQLITE_DDL,
             &config("restart"),
             None,
@@ -368,7 +375,9 @@ async fn restart_replays_persisted_pending() {
     // record, and the connect-time reconcile replays it.
     let mut conn = ConnettoConnection::connect_existing(
         open_session(&manager),
-        &replica_path,
+        &Replica::PlaintextFile {
+            path: &replica_path,
+        },
         &config("restart"),
         None,
     )

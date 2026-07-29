@@ -17,7 +17,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck, NonFatalError, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
@@ -148,7 +148,7 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
 
     let worker = ConnettoConnection::connect(
         worker_up,
-        ":memory:",
+        &Replica::Ephemeral,
         DDL,
         &tab_config(base, "worker"),
         None,
@@ -162,10 +162,15 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let mut tab =
-        ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config(base, "tab"), None)
-            .await
-            .expect("tab connect");
+    let mut tab = ConnettoConnection::connect(
+        tab_end,
+        &Replica::Ephemeral,
+        DDL,
+        &tab_config(base, "tab"),
+        None,
+    )
+    .await
+    .expect("tab connect");
 
     // A well-formed subscription is served from the (empty) replica.
     tab.subscribe("tab-good", QUERY)
@@ -212,7 +217,7 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
 
     let worker = ConnettoConnection::connect(
         worker_up,
-        ":memory:",
+        &Replica::Ephemeral,
         DDL,
         &tab_config(base, "worker"),
         None,
@@ -226,10 +231,15 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let mut tab =
-        ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config(base, "tab"), None)
-            .await
-            .expect("tab connect");
+    let mut tab = ConnettoConnection::connect(
+        tab_end,
+        &Replica::Ephemeral,
+        DDL,
+        &tab_config(base, "tab"),
+        None,
+    )
+    .await
+    .expect("tab connect");
 
     // The tab's aggregate registers a private upstream sub the fake server
     // rejects. The worker's NonFatal for it must map back to this tab's sub id.
@@ -259,7 +269,7 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
 
     let worker = ConnettoConnection::connect(
         worker_up,
-        ":memory:",
+        &Replica::Ephemeral,
         DDL,
         &tab_config(base, "worker"),
         None,
@@ -283,10 +293,15 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let mut tab =
-        ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config(base, "tab"), None)
-            .await
-            .expect("tab connect");
+    let mut tab = ConnettoConnection::connect(
+        tab_end,
+        &Replica::Ephemeral,
+        DDL,
+        &tab_config(base, "tab"),
+        None,
+    )
+    .await
+    .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)
         .await
         .expect("tab subscribe");

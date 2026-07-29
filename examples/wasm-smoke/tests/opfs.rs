@@ -13,7 +13,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, dsl::Watchable};
+use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Replica, dsl::Watchable};
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -55,9 +55,14 @@ async fn connect(config: &ClientConfig) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
-    ConnettoConnection::connect_existing(transport, DB_NAME, config, None)
-        .await
-        .expect("client connect")
+    ConnettoConnection::connect_existing(
+        transport,
+        &Replica::PlaintextFile { path: DB_NAME },
+        config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 #[wasm_bindgen_test]

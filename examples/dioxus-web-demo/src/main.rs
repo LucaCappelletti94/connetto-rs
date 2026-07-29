@@ -23,7 +23,7 @@
 //! `dx serve` from this directory, then open the served URL in several windows.
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica};
 use connetto_dioxus::use_live;
 use connetto_web::{BroadcastTransport, leader, locks, workers};
 use diesel::prelude::*;
@@ -54,9 +54,10 @@ const DB_NAME: &str = "connetto-relay.sqlite";
 const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The shared leader lock every window of this app races.
 const LEADER_LOCK: &str = "connetto-demo-leader";
-/// The baked local tier template, translated from `frontend.sql` by build.rs.
-const FRONTEND_TEMPLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
+/// The local tier schema, translated from `frontend.sql` by build.rs. DDL rather
+/// than a baked template, because a tier encrypted at rest cannot be seeded from
+/// a plaintext byte image.
+const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
 
 diesel::table! {
     orders (id) {
@@ -165,7 +166,7 @@ async fn run_db_worker() -> Result<(), JsValue> {
         replica_db_prefix: DB_NAME,
         replica_ddl: DEMO_SQLITE_DDL,
         frontend_db_name: FRONTEND_DB_NAME,
-        frontend_template: FRONTEND_TEMPLATE,
+        frontend_ddl: FRONTEND_DDL,
         upstream_sub_id: "db-upstream",
         upstream_query: DEMO_QUERY,
         hub_meta_name: "connetto-hub-meta.sqlite",
@@ -229,9 +230,10 @@ async fn boot_window() -> Result<Boot, JsValue> {
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
         sql_functions: uuidv7_functions(),
     };
-    let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_TAB_DDL, &config, None)
-        .await
-        .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let conn =
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, DEMO_TAB_DDL, &config, None)
+            .await
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let policy = ReconnectPolicy {
         initial_backoff: core::time::Duration::from_millis(100),
         max_backoff: core::time::Duration::from_secs(2),

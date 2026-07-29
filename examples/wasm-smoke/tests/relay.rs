@@ -17,7 +17,9 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+};
 use connetto_core::{Transport, loopback};
 use connetto_wasm_smoke::{BrowserSocket, PortTransport, RelayHub};
 use diesel::prelude::*;
@@ -83,7 +85,7 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
+    ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
         .await
         .expect("client connect")
 }
@@ -184,7 +186,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let tab = ConnettoConnection::connect(tab_end, ":memory:", SQLITE_DDL, &config, None)
+    let tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, SQLITE_DDL, &config, None)
         .await
         .expect("tab connect through relay");
     let (tab, pump) = ConnettoClient::with_pump(tab);
@@ -275,7 +277,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     };
     let mut tab = ConnettoConnection::connect(
         PortTransport::new(channel.port2()),
-        ":memory:",
+        &Replica::Ephemeral,
         SQLITE_DDL,
         &config,
         None,

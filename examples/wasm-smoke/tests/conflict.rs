@@ -17,7 +17,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin, SnapshotEnd,
     SnapshotPatch, SubscriptionPriority,
@@ -200,9 +200,10 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
-        .await
-        .expect("worker connect");
+    let mut worker =
+        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+            .await
+            .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -226,7 +227,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut tab = ConnettoConnection::connect(tab_end, ":memory:", DDL, &tab_config, None)
+    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_config, None)
         .await
         .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)

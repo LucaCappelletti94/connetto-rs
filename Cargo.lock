@@ -476,6 +476,7 @@ dependencies = [
  "diesel-async",
  "diesel-sqlite-session",
  "keyring",
+ "libsqlite3-sys",
  "open",
  "pg2sqlite 0.1.0 (git+https://github.com/LucaCappelletti94/pg2sqlite?rev=d0247132b7a571f70601fb389f119863b32ba94d)",
  "reqwest",
@@ -484,12 +485,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlite-diff-rs",
+ "sqlite-wasm-rs",
  "sqlparser",
  "subql",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "zeroize",
  "zstd",
 ]
 
@@ -508,6 +511,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

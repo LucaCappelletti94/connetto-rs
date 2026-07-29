@@ -21,7 +21,7 @@ futures-util = { version = "0.3", default-features = false }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# OPFS persistence: the sahpool VFS install and the template import utility.
+# OPFS persistence: the sahpool VFS install and its file management utility.
 sqlite-wasm-vfs = "0.2"
 sqlite-wasm-rs = { version = "0.5", default-features = false }
 thiserror = "2"
@@ -31,6 +31,8 @@ web-sys = { version = "0.3", features = [
     "BlobPropertyBag",
     "BroadcastChannel",
     "CloseEvent",
+    "Crypto",
+    "CryptoKey",
     "Event",
     "ErrorEvent",
     "Lock",
@@ -44,6 +46,7 @@ web-sys = { version = "0.3", features = [
     "RequestInit",
     "Response",
     "Navigator",
+    "SubtleCrypto",
     "Url",
     "WebSocket",
     "Window",
@@ -75,6 +78,19 @@ sha2 = { version = "0.10", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The browser replica-key store: the wrapped page key and the non-extractable
+# AES-GCM wrapping key both live in IndexedDB.
+indexed_db_futures = "0.6"
+# That store hands WebCrypto a plaintext copy of the page key, so the buffer is
+# wiped rather than left for the allocator to recycle.
+zeroize = { version = "1", default-features = false }
+
+# The replica key store is exercised in a dedicated worker against real
+# IndexedDB and real WebCrypto, and the at-rest assertion reads the stored
+# record straight out of the database rather than through the store.
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+indexed_db_futures = "0.6"
 
 # Standalone workspace: a wasm-only platform crate consumed by path from the
 # smoke tests and the dioxus-web demo, never entering the root headless gate.

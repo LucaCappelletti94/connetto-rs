@@ -10,7 +10,7 @@
 //! A deterministic fake server completes the handshake advertising a chosen
 //! schema version, so the test controls exactly what the client compares against.
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
@@ -60,7 +60,7 @@ async fn stale_baked_schema_is_rejected_at_handshake() {
 
     let result = ConnettoConnection::connect(
         transport,
-        ":memory:",
+        &Replica::Ephemeral,
         SQLITE_DDL,
         &config(Some(client_version.clone())),
         None,
@@ -91,7 +91,7 @@ async fn matching_schema_connects() {
 
     let conn = ConnettoConnection::connect(
         transport,
-        ":memory:",
+        &Replica::Ephemeral,
         SQLITE_DDL,
         &config(Some(version)),
         None,
@@ -113,8 +113,14 @@ async fn undeclared_client_rejected_by_versioned_server() {
     let server_version = SchemaVersion::from_source("CREATE TABLE orders (id INT);");
     let transport = fake_server(Some(server_version.clone()));
 
-    let result =
-        ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config(None), None).await;
+    let result = ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        SQLITE_DDL,
+        &config(None),
+        None,
+    )
+    .await;
 
     match result {
         Err(ClientError::SchemaOutdated { client, server }) => {
@@ -134,7 +140,7 @@ async fn empty_server_skips_detection() {
 
     let conn = ConnettoConnection::connect(
         transport,
-        ":memory:",
+        &Replica::Ephemeral,
         SQLITE_DDL,
         &config(Some(SchemaVersion::from_source(
             "CREATE TABLE orders (id INT);",

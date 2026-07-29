@@ -476,6 +476,11 @@ impl RelayHub {
         F: TransportFactory<Transport = U>,
         S: Sleeper,
     {
+        // The hub's own state is attached to the worker replica, so it shares
+        // the replica's cipher: an attached database takes the connection's VFS
+        // and the page codec gives it the main database's derived key. Creating
+        // it here through the keyed connection is also what makes its key salt
+        // agree with the replica's, which is what lets a later run re-attach it.
         worker
             .conn()
             .batch_execute(&format!("ATTACH DATABASE '{hub_meta}' AS connetto_hub"))?;

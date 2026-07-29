@@ -28,7 +28,7 @@
 // these helpers, so unused ones are expected per binary.
 #![allow(dead_code)]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::leader::Membership;
 use connetto_wasm_smoke::locks::HeldLock;
@@ -119,9 +119,15 @@ pub async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTranspo
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("tab connect through the wire channel")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("tab connect through the wire channel")
 }
 
 /// Connect a client directly to `connetto-server` over a `BrowserSocket`.
@@ -135,9 +141,15 @@ pub async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserS
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in between.

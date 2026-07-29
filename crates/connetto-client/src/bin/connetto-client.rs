@@ -26,7 +26,7 @@
 //! then observes its own rows echoed back over CDC.
 
 use anyhow::{Context, Result, anyhow};
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
 use tokio::net::TcpStream;
@@ -83,9 +83,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|err| anyhow!("websocket handshake to {server}: {err}"))?;
 
-    let mut client = ConnettoConnection::connect(transport, &db_path, &sqlite_ddl, &config, None)
-        .await
-        .map_err(|err| anyhow!("connecting sync client: {err}"))?;
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        &sqlite_ddl,
+        &config,
+        None,
+    )
+    .await
+    .map_err(|err| anyhow!("connecting sync client: {err}"))?;
     eprintln!("connected, connection {}", client.connection_id());
     client
         .subscribe(&sub_id, &query)

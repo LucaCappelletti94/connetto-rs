@@ -43,6 +43,10 @@ sha2 = { version = "0.10", default-features = false }
 # one, it only carries an id the server handed it, which keeps the browser wasm
 # build free of an entropy backend.
 uuid = { version = "1", default-features = false }
+# Key material hygiene for `ReplicaKey`: the owned bytes and the transient hex
+# built around them are wiped on drop. No entropy backend, so the browser wasm
+# build is unaffected.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { workspace = true, optional = true }
 # The loopback pair needs only the sync primitives, which compile on wasm.
 # The native transport feature adds the net stack on top.

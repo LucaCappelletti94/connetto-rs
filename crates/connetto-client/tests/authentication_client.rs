@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    ReconnectPolicy, SqlFunctions, TokioSleeper, replica_db_name,
+    ReconnectPolicy, Replica, SqlFunctions, TokioSleeper, replica_db_name,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck,
@@ -117,7 +117,8 @@ fn config() -> ClientConfig {
 async fn handshake_rejection_surfaces_as_auth_error() {
     let transport = FakeTransport::new(HandshakeReply::Reject);
     let result =
-        ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config(), None).await;
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+            .await;
     match result {
         Err(ClientError::Auth(_)) => {}
         Err(other) => panic!("expected ClientError::Auth, got {other:?}"),
@@ -149,7 +150,7 @@ async fn each_identity_opens_its_own_replica() {
     // Alice syncs a row into her replica.
     let mut conn = ConnettoConnection::connect(
         FakeTransport::new(HandshakeReply::Accept),
-        &alice,
+        &Replica::PlaintextFile { path: &alice },
         SQLITE_DDL,
         &config(),
         None,
@@ -171,7 +172,7 @@ async fn each_identity_opens_its_own_replica() {
     // inherit her pending mutations.
     let mut conn = ConnettoConnection::connect(
         FakeTransport::new(HandshakeReply::Accept),
-        &bob,
+        &Replica::PlaintextFile { path: &bob },
         SQLITE_DDL,
         &config(),
         None,
@@ -188,7 +189,7 @@ async fn each_identity_opens_its_own_replica() {
     // Alice's own replica is untouched by the switch and resumes with her data.
     let mut conn = ConnettoConnection::connect_existing(
         FakeTransport::new(HandshakeReply::Accept),
-        &alice,
+        &Replica::PlaintextFile { path: &alice },
         &config(),
         None,
     )
@@ -206,9 +207,10 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
     // The live session drops, and every reconnect attempt is met with a
     // rejected credential: the driver must stop retrying and signal re-login.
     let initial = FakeTransport::new(HandshakeReply::Accept);
-    let conn = ConnettoConnection::connect(initial, ":memory:", SQLITE_DDL, &config(), None)
-        .await
-        .expect("initial connect");
+    let conn =
+        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+            .await
+            .expect("initial connect");
     let factory =
         || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::new(HandshakeReply::Reject)) };
     let policy = ReconnectPolicy {
@@ -243,14 +245,15 @@ async fn reconnect_retries_a_transient_refresh_fault() {
     // exhaust its attempts, never routing a transient fault to interactive
     // re-login.
     let initial = FakeTransport::new(HandshakeReply::Accept);
-    let conn = ConnettoConnection::connect(initial, ":memory:", SQLITE_DDL, &config(), None)
-        .await
-        .expect("initial connect")
-        .with_token_source(AccessTokenSource::new(|| async {
-            Err(ClientError::Transport(
-                "refresh endpoint returned 503".to_owned(),
-            ))
-        }));
+    let conn =
+        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+            .await
+            .expect("initial connect")
+            .with_token_source(AccessTokenSource::new(|| async {
+                Err(ClientError::Transport(
+                    "refresh endpoint returned 503".to_owned(),
+                ))
+            }));
     let factory =
         || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::new(HandshakeReply::Accept)) };
     let policy = ReconnectPolicy {

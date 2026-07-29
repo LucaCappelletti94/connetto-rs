@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use connetto_client::{
     AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, KeyValue,
-    LiveQuery, Watchable,
+    LiveQuery, Replica, Watchable,
 };
 use connetto_core::Cursor;
 use connetto_server::{
@@ -363,9 +363,15 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // Subscribe and apply the initial snapshot.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -500,9 +506,15 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // The snapshot arrives through next_event, which reports the changed table.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -623,9 +635,15 @@ async fn connection_is_a_diesel_connection() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // Write through the diesel Connection impl: a typed insert runs on
     // `&mut client` directly, with no `.conn()` and no manual push.
@@ -717,9 +735,15 @@ async fn rejected_write_rolls_back_locally() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // Optimistic local write through the connection.
     diesel::insert_into(orders::table)
@@ -824,9 +848,15 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut client = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // Sync the seed row so the client has a local (stale) basis to update from.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -896,9 +926,15 @@ async fn connect_client(
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    ConnettoConnection::connect(transport, db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2520,9 +2556,15 @@ async fn watch_fn_drives_a_boxed_row_query() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let conn = ConnettoConnection::connect(transport, &db_path, GADGETS_SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        GADGETS_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
     let client = ConnettoClient::start(conn);
     let mut events = client.events();
 

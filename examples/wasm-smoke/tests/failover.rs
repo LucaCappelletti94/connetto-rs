@@ -19,7 +19,8 @@ use core::time::Duration;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, dsl::Watchable,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+    dsl::Watchable,
 };
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{
@@ -100,9 +101,15 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`. The harness timeout bounds
@@ -190,9 +197,15 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let conn = ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("tab connect");
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("tab connect");
     let policy = ReconnectPolicy {
         initial_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(500),

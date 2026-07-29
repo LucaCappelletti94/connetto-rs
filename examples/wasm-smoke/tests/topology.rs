@@ -18,7 +18,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{
     DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready,
@@ -105,9 +105,15 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("tab connect through the wire channel")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("tab connect through the wire channel")
 }
 
 async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
@@ -120,9 +126,15 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", DEMO_SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in

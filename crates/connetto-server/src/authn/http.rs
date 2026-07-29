@@ -26,6 +26,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::ReplicaKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -143,6 +144,9 @@ pub struct TokenResponse<Id> {
     /// Unix-seconds instant the local session lapses without a further
     /// refresh, for the client's proactive unsynced-data warning.
     pub session_expires_at: u64,
+    /// The per-replica encryption key, present only on login responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_key: Option<ReplicaKey>,
 }
 
 impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
@@ -153,6 +157,7 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
             expires_in: pair.expires_in_secs,
             user_id: pair.user_id,
             session_expires_at: pair.session_expires_at_secs,
+            replica_key: pair.replica_key,
         }
     }
 }
@@ -206,7 +211,8 @@ impl IntoResponse for AuthApiError {
         let status = match self {
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
-                | AuthError::Token(_),
+                | AuthError::Token(_)
+                | AuthError::KeyGen,
             ) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Service(AuthError::Store(_)) => StatusCode::UNAUTHORIZED,
             Self::Service(AuthError::Provider(err)) | Self::Provider(err) => match err {
@@ -314,6 +320,7 @@ async fn callback<S: AuthStore + 'static>(
                 expires_in_secs: pair.expires_in_secs,
                 user_id: pair.user_id,
                 session_expires_at_secs: pair.session_expires_at_secs,
+                replica_key: pair.replica_key,
                 code_challenge,
             });
             let state_param = pending.client_state.unwrap_or_default();
@@ -347,6 +354,7 @@ async fn token<S: AuthStore + 'static>(
         expires_in: issued.expires_in_secs,
         user_id: issued.user_id,
         session_expires_at: issued.session_expires_at_secs,
+        replica_key: issued.replica_key,
     }))
 }
 

@@ -14,7 +14,9 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+};
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -58,7 +60,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
+    ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
         .await
         .expect("client connect")
 }

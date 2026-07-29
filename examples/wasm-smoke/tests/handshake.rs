@@ -16,7 +16,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ConnettoConnection};
+use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, Handshake, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, PROTOCOL_VERSION, SchemaVersion, loopback};
@@ -71,9 +71,10 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
         schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
-        .await
-        .expect("worker connect");
+    let worker =
+        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+            .await
+            .expect("worker connect");
     assert_eq!(
         worker.schema_version(),
         &Some(upstream_version.clone()),

@@ -149,7 +149,7 @@ async fn setup() -> (ConnettoClient<Ws>, Backend) {
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
         sql_functions: uuidv7_functions(),
     };
-    let conn = ConnettoConnection::connect_with_replica_template(
+    let conn = ConnettoConnection::connect_with_plaintext_template(
         transport,
         &db_path,
         REPLICA_TEMPLATE,

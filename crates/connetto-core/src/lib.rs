@@ -32,6 +32,7 @@ pub mod codec;
 pub mod cursor;
 pub mod error;
 pub mod messages;
+pub mod replica_key;
 pub mod schema;
 pub mod session_id;
 pub mod traits;
@@ -44,6 +45,7 @@ pub use auth::{AuthContext, TrustingSessionVerifier, VerifiedSession};
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
+pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};
 pub use traits::{

@@ -10,7 +10,7 @@
 //! `is_full_result: false`) can only be proven with a hand-crafted frame. This
 //! test drives the client's decode with exactly that frame over a loopback.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{AggregateUpdate, ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -66,10 +66,15 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
         result_json: "{\"count\":3}".to_owned(),
         is_full_result: false,
     });
-    let mut conn =
-        ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config("t"), None)
-            .await
-            .expect("connect");
+    let mut conn = ConnettoConnection::connect(
+        transport,
+        &Replica::Ephemeral,
+        SQLITE_DDL,
+        &config("t"),
+        None,
+    )
+    .await
+    .expect("connect");
 
     let event = conn.pump_one().await.expect("pump");
     assert_eq!(

@@ -14,7 +14,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
@@ -65,9 +65,10 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
         schema_version: Some(server_version),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
-        .await
-        .expect("worker connect");
+    let worker =
+        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+            .await
+            .expect("worker connect");
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
@@ -90,7 +91,7 @@ async fn stale_tab_is_rejected_through_the_relay() {
         schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let result = ConnettoConnection::connect(tab_end, ":memory:", DDL, &stale, None).await;
+    let result = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &stale, None).await;
     match result {
         Err(ClientError::SchemaOutdated { server, .. }) => {
             assert_eq!(
@@ -118,7 +119,7 @@ async fn matching_tab_connects_through_the_relay() {
         schema_version: Some(version),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let conn = ConnettoConnection::connect(tab_end, ":memory:", DDL, &fresh, None).await;
+    let conn = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &fresh, None).await;
     assert!(
         conn.is_ok(),
         "a tab whose baked version matches the server connects normally: {:?}",

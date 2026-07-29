@@ -38,9 +38,11 @@ use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType}
 
 use crate::relay::{HubReconnect, LocalTier};
 use crate::{BroadcastTransport, BrowserSocket, HubNotice, RelayHub, locks};
+use connetto_client::cipher::cipher_url;
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::SubscriptionSpec;
+use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 
 /// The shared rendezvous channel for worker readiness and tab announcements.
@@ -72,8 +74,16 @@ pub struct DbWorkerConfig {
     /// The OPFS file holding the durable local tier (device-private tables,
     /// never synced).
     pub frontend_db_name: &'static str,
-    /// The baked local tier template, imported on a first boot.
-    pub frontend_template: &'static [u8],
+    /// The local tier DDL, applied only on a first boot, exactly like
+    /// `replica_ddl`.
+    ///
+    /// The tier used to first-boot from a baked byte-image template, and cannot
+    /// any more: a template is a plaintext database, the per-replica key does not
+    /// exist at build time, and neither page codec offers a
+    /// plaintext-to-encrypted transform that works on both backends. DDL is the
+    /// route that works whether the tier is encrypted or not, and the replica
+    /// already took it.
+    pub frontend_ddl: &'static str,
     /// The subscription id the worker registers upstream.
     pub upstream_sub_id: &'static str,
     /// The subscription query the worker registers upstream.
@@ -144,17 +154,28 @@ impl WorkerStorage {
         }
     }
 
-    /// Import baked template bytes as a new database file.
-    fn import_db(&self, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
-        let result = match self {
-            Self::Opfs(util) => util
-                .import_db(name, bytes)
-                .map_err(|err| format!("{err:?}")),
-            Self::Memory(util) => util
-                .import_db(name, bytes)
-                .map_err(|err| format!("{err:?}")),
-        };
-        result.map_err(|err| JsValue::from_str(&format!("import {name}: {err}")))
+    /// The name SQLite resolves to this backend's VFS.
+    const fn vfs_name(&self) -> &'static str {
+        match self {
+            Self::Opfs(_) => "opfs-sahpool",
+            Self::Memory(_) => "memvfs",
+        }
+    }
+
+    /// The database URL that opens `name` in this backend, encrypted or not.
+    ///
+    /// A plaintext database opens under its bare name, which resolves through
+    /// whichever VFS is the default. An encrypted one must name the codec shim
+    /// over this backend's VFS explicitly, because the codec intercepts as a VFS
+    /// layer: a bare name would open the real VFS with no codec in the stack, and
+    /// `PRAGMA key` would have nothing to talk to. Both backends are covered, so
+    /// the OPFS-unavailable fallback stays encrypted too.
+    fn db_url(&self, name: &str, encrypted: bool) -> String {
+        if encrypted {
+            cipher_url(name, self.vfs_name())
+        } else {
+            name.to_owned()
+        }
     }
 }
 
@@ -369,6 +390,31 @@ where
         None => config.replica_db_prefix.to_owned(),
     };
 
+    // Provision-once custody of the per-replica encryption key. It resolves
+    // here rather than inside acquisition because the record is addressed by
+    // the replica name, which only exists once the identity does. A key
+    // cached by an earlier boot wins, so a re-login never re-keys a replica.
+    let replica_key = match (&config.auth, &session) {
+        (Some(_), Some(session)) => {
+            let key_store = crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?;
+            crate::auth::resolve_replica_key(
+                &key_store,
+                &replica_db_name,
+                session.replica_key.clone(),
+            )
+            .await
+            .map_err(to_js)?
+        }
+        _ => None,
+    };
+    // Encrypted whenever authentication is configured, because that is exactly
+    // when an identity, a key store record, and a provisioning server all exist.
+    // With auth unset none of the three does, so the replica is plaintext and
+    // says so. The refusal for "auth configured but no key resolved" lives in
+    // `Replica::encrypted_file`, so a native application gets the same behaviour
+    // rather than a second implementation of it here.
+    let encrypted = config.auth.is_some();
+
     let auth_token = session
         .as_ref()
         .map_or_else(|| "token".to_owned(), |s| s.access_token.clone());
@@ -383,14 +429,22 @@ where
     // resumes: the persisted cursor rides the handshake and the subscription
     // below catches up from the server oplog instead of re-snapshotting.
     let existing = storage.exists(&replica_db_name);
+    let replica_url = storage.db_url(&replica_db_name, encrypted);
+    // Always a durable file here: OPFS, or the in-memory VFS's named file when
+    // OPFS is unavailable. Never `Ephemeral`, which is the tab's case.
+    let replica = if encrypted {
+        Replica::encrypted_file(&replica_url, replica_key).map_err(to_js)?
+    } else {
+        Replica::PlaintextFile { path: &replica_url }
+    };
     let mut worker = if existing {
-        ConnettoConnection::connect_existing(transport, &replica_db_name, &client_config, None)
+        ConnettoConnection::connect_existing(transport, &replica, &client_config, None)
             .await
             .map_err(to_js)?
     } else {
         ConnettoConnection::connect(
             transport,
-            &replica_db_name,
+            &replica,
             config.replica_ddl,
             &client_config,
             None,
@@ -409,16 +463,21 @@ where
         )
         .into(),
     );
-    // The local tier: first boot imports the baked frontend template. The
-    // hub serves these tables from a second connection whose main schema
-    // IS the tier file, because a changeset apply always targets main.
-    // The worker replica never contains them, so a note can never ride an
-    // upstream mutation.
-    if !storage.exists(config.frontend_db_name) {
-        storage.import_db(config.frontend_db_name, config.frontend_template)?;
+    // The local tier is a second connection whose main schema IS the tier file,
+    // because a changeset apply always targets main. The worker replica never
+    // contains these tables, so a note can never ride an upstream mutation.
+    //
+    // Being its own main database, it carries its own key salt and is unlocked
+    // independently, unlike the native tier which is attached to the replica and
+    // inherits from it. Same key either way: one device, one key.
+    let tier_is_new = !storage.exists(config.frontend_db_name);
+    let mut frontend =
+        SqliteConnection::establish(&storage.db_url(config.frontend_db_name, encrypted))
+            .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
+    if let Some(key) = replica.key() {
+        connetto_client::cipher::unlock(&mut frontend, key)
+            .map_err(|err| JsValue::from_str(&format!("unlock the frontend tier: {err}")))?;
     }
-    let mut frontend = SqliteConnection::establish(config.frontend_db_name)
-        .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
     // Same registrar set as the replica: connetto installs it on every
     // connection it opens, before any DDL or insert, even where the tier
     // schema does not call a registered function.
@@ -426,6 +485,11 @@ where
         .sql_functions
         .install(&mut frontend)
         .map_err(|err| JsValue::from_str(&format!("register sql functions on the tier: {err}")))?;
+    if tier_is_new {
+        frontend
+            .batch_execute(config.frontend_ddl)
+            .map_err(|err| JsValue::from_str(&format!("apply the frontend tier schema: {err}")))?;
+    }
     let local = LocalTier::new(frontend).map_err(to_js)?;
     worker
         .subscribe(config.upstream_sub_id, config.upstream_query)

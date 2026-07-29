@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use connetto_core::SessionId;
 use connetto_core::traits::{SessionVerifier, SessionVerifyError, SessionVerifyFuture};
+use connetto_core::{ReplicaKey, SessionId};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::authn::provider::{
@@ -20,6 +20,7 @@ use crate::authn::provider::{
 };
 use crate::authn::store::{AuthStore, AuthStoreError, ResolvedIdentity};
 use crate::authn::token::{TokenAuthority, TokenError};
+use ring::rand::{SecureRandom, SystemRandom};
 
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
@@ -39,6 +40,9 @@ pub struct TokenPair<Id> {
     /// Unix-seconds instant the local session lapses if never refreshed again.
     /// The client warns before it passes with unsynced data queued.
     pub session_expires_at_secs: u64,
+    /// The per-replica encryption key, provisioned once at login. `None` on
+    /// refresh responses: a client refreshing already holds its key.
+    pub replica_key: Option<ReplicaKey>,
 }
 
 /// Unix seconds for a [`SystemTime`], clamped at the epoch.
@@ -46,6 +50,15 @@ fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+/// Fill a fresh [`ReplicaKey`] from the platform RNG.
+fn mint_replica_key() -> Result<ReplicaKey, AuthError> {
+    let mut bytes = [0u8; ReplicaKey::LEN];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| AuthError::KeyGen)?;
+    Ok(ReplicaKey::from_bytes(bytes))
 }
 
 /// Failure of a login or refresh.
@@ -60,6 +73,9 @@ pub enum AuthError {
     /// A provider operation (a retained-token refresh) failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// The platform RNG failed to fill the replica key bytes.
+    #[error("replica key generation failed")]
+    KeyGen,
 }
 
 /// Mints and rotates connetto tokens over an [`AuthStore`].
@@ -115,6 +131,7 @@ impl<S: AuthStore> AuthService<S> {
             expires_in_secs: self.authority.access_ttl().as_secs(),
             user_id: issued.context.user_id,
             session_expires_at_secs: unix_secs(issued.session_expires_at),
+            replica_key: Some(mint_replica_key()?),
         })
     }
 
@@ -144,6 +161,7 @@ impl<S: AuthStore> AuthService<S> {
             expires_in_secs: self.authority.access_ttl().as_secs(),
             user_id: issued.context.user_id,
             session_expires_at_secs: unix_secs(issued.session_expires_at),
+            replica_key: Some(mint_replica_key()?),
         })
     }
 
@@ -224,6 +242,7 @@ impl<S: AuthStore> AuthService<S> {
             expires_in_secs: self.authority.access_ttl().as_secs(),
             user_id: outcome.context.user_id,
             session_expires_at_secs: unix_secs(outcome.session_expires_at),
+            replica_key: None,
         })
     }
 

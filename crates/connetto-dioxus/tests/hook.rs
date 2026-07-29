@@ -7,7 +7,7 @@
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection};
+use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Replica};
 use connetto_core::Cursor;
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
@@ -254,9 +254,15 @@ async fn use_live_renders_and_follows_cdc() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let conn = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
     let client = ConnettoClient::start(conn);
     *CLIENT.lock().expect("client slot poisoned") = Some(client.clone());
 
@@ -329,9 +335,15 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let conn = ConnettoConnection::connect(transport, &db_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile { path: &db_path },
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
     let client = ConnettoClient::start(conn);
     *CLIENT_FN.lock().expect("client slot poisoned") = Some(client.clone());
 

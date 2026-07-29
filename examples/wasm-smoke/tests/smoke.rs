@@ -14,7 +14,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -84,9 +84,10 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let mut conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let mut conn =
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+            .await
+            .expect("client connect");
 
     // Subscribe and take the snapshot of whatever the backend holds.
     conn.subscribe("orders", QUERY).await.expect("subscribe");

@@ -18,9 +18,14 @@ use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::ReplicaKey;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::{Connection, SqliteConnection};
+use indexed_db_futures::database::Database as IdbDatabase;
+use indexed_db_futures::prelude::*;
+use indexed_db_futures::query_source::QuerySource;
+use indexed_db_futures::transaction::TransactionMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsCast;
@@ -30,6 +35,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     BroadcastChannel, Headers, MessageEvent, Request, RequestInit, Response, WorkerGlobalScope,
 };
+use zeroize::Zeroize;
 
 /// The `BroadcastChannel` the worker and tabs use to coordinate interactive
 /// login. It carries only [`LoginMessage`], which cannot hold a token.
@@ -84,6 +90,20 @@ pub struct WorkerAuthConfig {
 /// database so a cold start or leader failover can silently refresh. When OPFS
 /// is unavailable the same code runs against the in-memory VFS, so the session
 /// works but does not survive a worker restart.
+///
+/// This database is **not** encrypted at rest, and the blocker is structural
+/// rather than a matter of effort. It is read to learn the identity, while the
+/// per-replica key that phase E2 applies everywhere else is addressed by
+/// `replica_db_name`, which is derived from that identity. So the refresh store
+/// must be readable strictly before any per-replica key can be resolved, and it
+/// cannot be encrypted under one. Covering it needs a device-scoped key with its
+/// own custody and its own lifetime, which is a second key concept the
+/// at-rest-encryption plan has not settled: it locked exactly one key, per
+/// replica. That decision belongs with the logout and key-lifecycle primitives.
+///
+/// The exposure this leaves is bounded by what the token is: a rotating
+/// credential, revocable server-side, and useless once a logout revokes the
+/// session. It is not the user's data, which is what E2 encrypts.
 pub struct RefreshStore {
     conn: RefCell<SqliteConnection>,
 }
@@ -190,6 +210,8 @@ struct TokenResponse<Id> {
     refresh_token: String,
     user_id: Id,
     session_expires_at: u64,
+    #[serde(default)]
+    replica_key: Option<ReplicaKey>,
 }
 
 /// A completed acquisition: the access token the worker sets on its handshake,
@@ -206,6 +228,12 @@ pub struct BrowserSession<Id> {
     pub user_id: Id,
     /// Unix seconds when the local session lapses if never refreshed again.
     pub session_expires_at: u64,
+    /// The effective per-replica encryption key for this identity on this
+    /// device. Populated by [`ReplicaKeyStore`] logic in
+    /// [`BrowserAuthenticator::complete`]: a cached key always wins over the
+    /// wire value, so this is stable across logins and never reset by a
+    /// later server response. `None` when no key has been provisioned yet.
+    pub replica_key: Option<ReplicaKey>,
 }
 
 impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
@@ -214,7 +242,284 @@ impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
             access_token: response.access_token,
             user_id: response.user_id,
             session_expires_at: response.session_expires_at,
+            replica_key: response.replica_key,
         }
+    }
+}
+
+/// `IndexedDB` database name for the key store.
+const KEY_STORE_DB: &str = "connetto-key-store";
+/// Object store holding the non-extractable KEK.
+const STORE_KEK: &str = "kek";
+/// Object store holding per-identity IV-plus-ciphertext records.
+const STORE_WRAPPED: &str = "wrapped";
+/// Fixed record key for the sole KEK entry.
+const KEK_KEY: u32 = 1;
+/// AES-GCM IV length in bytes. Used for slice operations.
+const AES_GCM_IV_LEN: usize = 12;
+
+/// Wraps and unwraps per-identity replica keys in `IndexedDB` using a
+/// non-extractable AES-GCM-256 key-encryption key (KEK).
+///
+/// The KEK is generated once per browser profile, stored as a
+/// structured-cloneable `CryptoKey` value in `IndexedDB`, and marked
+/// non-extractable so its raw bytes cannot be read by script. Each replica
+/// key is stored as a record keyed by the caller-supplied identity name,
+/// containing a 12-byte random IV followed by the AES-GCM ciphertext.
+///
+/// This design defends against two specific threats: script-level
+/// exfiltration of the raw key bytes (the KEK is non-extractable, so
+/// reading the IDB store yields only opaque ciphertext), and an off-device
+/// copy of the `IndexedDB` contents alone (without the KEK the ciphertext is
+/// inert). It does not defend against a resident attacker who can call
+/// `load` directly through this store, and it does not necessarily defend
+/// against an attacker who has access to the full browser profile directory,
+/// which includes both the IDB files and the backing storage for
+/// non-extractable keys.
+pub struct ReplicaKeyStore {
+    db: IdbDatabase,
+}
+
+impl ReplicaKeyStore {
+    /// Open (creating if needed) the key-store `IndexedDB` database.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the database cannot be opened.
+    pub async fn open() -> Result<Self, AuthError> {
+        let db = IdbDatabase::open(KEY_STORE_DB)
+            .with_version(1u8)
+            .with_on_upgrade_needed(|_event, db| {
+                db.create_object_store(STORE_KEK).build()?;
+                db.create_object_store(STORE_WRAPPED).build()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| AuthError::Store(format!("open key store: {e}")))?;
+        Ok(Self { db })
+    }
+
+    /// Load the replica key for `name`, or `None` if no key has been saved.
+    ///
+    /// `name` is the caller-supplied record key, typically the value returned
+    /// by `connetto_client::replica_db_name`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB or `SubtleCrypto` failure.
+    pub async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, AuthError> {
+        let Some(kek) = self.load_kek().await? else {
+            return Ok(None);
+        };
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .build()
+            .map_err(|e| AuthError::Store(format!("load tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("load store: {e}")))?;
+        let record: Option<JsValue> = store
+            .get(name)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("load get: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("load get await: {e}")))?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let buf = js_sys::Uint8Array::new(&record).to_vec();
+        if buf.len() <= AES_GCM_IV_LEN {
+            return Err(AuthError::Store("key record truncated".into()));
+        }
+        let (iv_bytes, ct_bytes) = buf.split_at(AES_GCM_IV_LEN);
+        let iv = js_sys::Uint8Array::from(iv_bytes);
+        let params = aes_gcm_params(&iv);
+        let ct_buf = ct_bytes.to_vec();
+        let plain_js = JsFuture::from(
+            subtle()?
+                .decrypt_with_object_and_u8_array(&params, &kek, &ct_buf)
+                .map_err(|e| AuthError::Store(format!("decrypt: {e:?}")))?,
+        )
+        .await
+        .map_err(|e| AuthError::Store(format!("decrypt await: {e:?}")))?;
+        let plain = js_sys::Uint8Array::new(&plain_js).to_vec();
+        if plain.len() != ReplicaKey::LEN {
+            return Err(AuthError::Store("decrypted key has wrong length".into()));
+        }
+        let mut arr = [0u8; ReplicaKey::LEN];
+        arr.copy_from_slice(&plain);
+        Ok(Some(ReplicaKey::from_bytes(arr)))
+    }
+
+    /// Save `key` for `name`, overwriting any prior value.
+    ///
+    /// `name` is the caller-supplied record key, typically the value returned
+    /// by `connetto_client::replica_db_name`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB or `SubtleCrypto` failure.
+    pub async fn save(&self, name: &str, key: &ReplicaKey) -> Result<(), AuthError> {
+        let kek = self.get_or_create_kek().await?;
+        let iv_bytes = random_iv();
+        let iv = js_sys::Uint8Array::from(iv_bytes.as_ref());
+        let params = aes_gcm_params(&iv);
+        // Copy key bytes into a mutable buffer for the SubtleCrypto API.
+        let mut key_buf = *key.as_bytes();
+        let ct_js = JsFuture::from(
+            subtle()?
+                .encrypt_with_object_and_u8_array(&params, &kek, &key_buf)
+                .map_err(|e| AuthError::Store(format!("encrypt: {e:?}")))?,
+        )
+        .await
+        .map_err(|e| AuthError::Store(format!("encrypt await: {e:?}")))?;
+        // The plaintext copy handed to WebCrypto is key material, so it does
+        // not outlive the call. A plain fill would be elidable, zeroize is not.
+        key_buf.zeroize();
+        let ct = js_sys::Uint8Array::new(&ct_js);
+        // Store IV (12 bytes) followed by ciphertext in one Uint8Array.
+        let record = js_sys::Uint8Array::new_with_length(12u32 + ct.length());
+        record.set(&iv, 0);
+        record.set(&ct, 12u32);
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("save tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("save store: {e}")))?;
+        let record_val: JsValue = record.into();
+        store
+            .put(record_val)
+            .with_key(name)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("save put: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("save put await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("save commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove the wrapped key for `name`.
+    ///
+    /// E3 calls this during a data-wipe cycle. It is a no-op when no record
+    /// exists for `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB failure.
+    pub async fn clear(&self, name: &str) -> Result<(), AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("clear tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("clear store: {e}")))?;
+        store
+            .delete(name)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("clear delete: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("clear delete await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("clear commit: {e}")))?;
+        Ok(())
+    }
+    async fn load_kek(&self) -> Result<Option<web_sys::CryptoKey>, AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_KEK)
+            .build()
+            .map_err(|e| AuthError::Store(format!("kek read tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_KEK)
+            .map_err(|e| AuthError::Store(format!("kek store: {e}")))?;
+        let kek_js: Option<JsValue> = store
+            .get(KEK_KEY)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("kek get: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("kek get await: {e}")))?;
+        Ok(kek_js.map(wasm_bindgen::JsCast::unchecked_into::<web_sys::CryptoKey>))
+    }
+
+    async fn get_or_create_kek(&self) -> Result<web_sys::CryptoKey, AuthError> {
+        if let Some(kek) = self.load_kek().await? {
+            return Ok(kek);
+        }
+        let params = aes_key_gen_params();
+        let usages = js_sys::Array::new();
+        usages.push(&JsValue::from_str("encrypt"));
+        usages.push(&JsValue::from_str("decrypt"));
+        // extractable = false: the KEK bytes can never be exported by script.
+        let kek_js = JsFuture::from(
+            subtle()?
+                .generate_key_with_object(&params, false, &usages)
+                .map_err(|e| AuthError::Store(format!("generate kek: {e:?}")))?,
+        )
+        .await
+        .map_err(|e| AuthError::Store(format!("generate kek await: {e:?}")))?;
+        let tx = self
+            .db
+            .transaction(STORE_KEK)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("kek write tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_KEK)
+            .map_err(|e| AuthError::Store(format!("kek store: {e}")))?;
+        store
+            .put(kek_js.clone())
+            .with_key(KEK_KEY)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("kek put: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("kek put await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("kek commit: {e}")))?;
+        Ok(kek_js.unchecked_into::<web_sys::CryptoKey>())
+    }
+}
+
+/// The effective key for the replica `name`, given whatever the login response
+/// carried in `wire`.
+///
+/// Provision-once, and the browser mirror of
+/// `connetto_client::auth::resolve_replica_key`: a key already cached on this
+/// device always wins and is never overwritten, so a re-login cannot silently
+/// re-key a replica and strand its contents. Only when nothing is cached is a
+/// freshly provisioned key adopted, and it is written through first.
+///
+/// Call this after acquisition, because `name` is derived from the identity
+/// the token response resolves.
+///
+/// # Errors
+///
+/// [`AuthError::Store`] if the key store cannot be read or written.
+pub async fn resolve_replica_key(
+    store: &ReplicaKeyStore,
+    name: &str,
+    wire: Option<ReplicaKey>,
+) -> Result<Option<ReplicaKey>, AuthError> {
+    if let Some(cached) = store.load(name).await? {
+        return Ok(Some(cached));
+    }
+    match wire {
+        Some(fresh) => {
+            store.save(name, &fresh).await?;
+            Ok(Some(fresh))
+        }
+        None => Ok(None),
     }
 }
 
@@ -248,12 +553,16 @@ impl BrowserAuthenticator {
         Self { config }
     }
 
-    /// Try a silent refresh from the stored token; on failure or absence,
+    /// Try a silent refresh from the stored token, on failure or absence
     /// produce a [`PendingLogin`] for interactive login.
+    ///
+    /// The returned session's `replica_key` is the raw wire value, which a
+    /// refresh never carries. Resolve the effective key afterwards with
+    /// [`resolve_replica_key`], once the identity is known.
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the store cannot be read.
+    /// [`AuthError::Store`] if the refresh store cannot be read.
     pub async fn acquire<Id: serde::de::DeserializeOwned>(
         &self,
         store: &RefreshStore,
@@ -290,7 +599,12 @@ impl BrowserAuthenticator {
     }
 
     /// Complete an interactive login: verify the returned state, exchange the
-    /// code for tokens, persist the refresh token, and return the access token.
+    /// code for tokens, and persist the refresh token.
+    ///
+    /// The returned session's `replica_key` is the raw wire value the server
+    /// just provisioned. Resolve the effective key with
+    /// [`resolve_replica_key`], which applies provision-once against the
+    /// per-identity record.
     ///
     /// # Errors
     ///
@@ -455,4 +769,36 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+/// Return the `SubtleCrypto` interface from the current worker global scope.
+fn subtle() -> Result<web_sys::SubtleCrypto, AuthError> {
+    let scope: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let crypto = scope
+        .crypto()
+        .map_err(|e| AuthError::Context(format!("crypto: {e:?}")))?;
+    Ok(crypto.subtle())
+}
+
+/// Build an `AES-GCM` algorithm parameter object with the given IV.
+fn aes_gcm_params(iv: &js_sys::Uint8Array) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from("name"), &JsValue::from("AES-GCM")).unwrap_throw();
+    js_sys::Reflect::set(&obj, &JsValue::from("iv"), iv.as_ref()).unwrap_throw();
+    obj
+}
+
+/// Build an `AES-GCM` key-generation parameter object requesting a 256-bit key.
+fn aes_key_gen_params() -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from("name"), &JsValue::from("AES-GCM")).unwrap_throw();
+    js_sys::Reflect::set(&obj, &JsValue::from("length"), &JsValue::from(256u32)).unwrap_throw();
+    obj
+}
+
+/// Generate a fresh 12-byte random IV for AES-GCM.
+fn random_iv() -> [u8; AES_GCM_IV_LEN] {
+    let mut iv = [0u8; AES_GCM_IV_LEN];
+    getrandom::getrandom(&mut iv).unwrap_throw();
+    iv
 }

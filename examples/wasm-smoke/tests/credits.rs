@@ -25,7 +25,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, NonFatalError,
     SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
@@ -202,9 +202,10 @@ async fn hub_enforces_the_per_tab_credit_window() {
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut worker = ConnettoConnection::connect(worker_up, ":memory:", DDL, &worker_config, None)
-        .await
-        .expect("worker connect");
+    let mut worker =
+        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+            .await
+            .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await

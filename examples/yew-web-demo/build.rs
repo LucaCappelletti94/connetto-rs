@@ -13,8 +13,17 @@ use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TranslationOptions, UuidRepresentation};
 
-/// Translate one source document and bake it into a template database file.
-fn bake(document: &str, template: &std::path::Path) {
+/// Translate one source document, write the SQLite DDL beside the template, and
+/// bake the template database file.
+///
+/// The DDL text is an artifact in its own right because a tier that is encrypted
+/// at rest cannot first-boot from a template: a baked byte image is a plaintext
+/// database, the per-replica key does not exist at build time, and neither page
+/// codec offers a plaintext-to-encrypted transform that works on both backends.
+/// The template bake stays because it is where pg2sqlite validates the document,
+/// including the reference closure that makes a foreign key across the tier
+/// boundary fail this build.
+fn bake(document: &str, template: &std::path::Path, ddl_out: &std::path::Path) {
     let pg_sql = std::fs::read_to_string(document).expect("read the source document");
     let statements = Pg2Sqlite::default()
         .sql(&pg_sql)
@@ -27,6 +36,7 @@ fn bake(document: &str, template: &std::path::Path) {
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");
     ddl.push(';');
+    std::fs::write(ddl_out, &ddl).expect("write the translated DDL");
 
     // Rebuild the template from scratch so a schema edit never layers onto a
     // stale file.
@@ -41,6 +51,14 @@ fn main() {
     println!("cargo::rerun-if-changed=schema.sql");
     println!("cargo::rerun-if-changed=frontend.sql");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    bake("schema.sql", &out_dir.join("replica-template.sqlite"));
-    bake("frontend.sql", &out_dir.join("frontend-template.sqlite"));
+    bake(
+        "schema.sql",
+        &out_dir.join("replica-template.sqlite"),
+        &out_dir.join("replica-ddl.sql"),
+    );
+    bake(
+        "frontend.sql",
+        &out_dir.join("frontend-template.sqlite"),
+        &out_dir.join("frontend-ddl.sql"),
+    );
 }

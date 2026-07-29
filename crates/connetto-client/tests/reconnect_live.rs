@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, ReconnectPolicy,
-    TokioSleeper,
+    Replica, TokioSleeper,
 };
 use connetto_core::Cursor;
 use connetto_server::{
@@ -210,6 +210,17 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
     }
 }
 
+/// The client identity every test in this file presents, differing only by the
+/// client id it labels its connection with.
+fn config(client_id: &str) -> ClientConfig {
+    ClientConfig {
+        client_id: client_id.to_owned(),
+        auth_token: "token".to_owned(),
+        schema_version: None,
+        sql_functions: connetto_client::SqlFunctions::new(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
@@ -228,15 +239,11 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let offline = Arc::new(AtomicBool::new(false));
 
     let transport = open_session(&manager, &slot).await;
-    let config = ClientConfig {
-        client_id: "reconnect-live".to_owned(),
-        auth_token: "token".to_owned(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
-    let conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let config = config("reconnect-live");
+    let conn =
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+            .await
+            .expect("client connect");
     let (client, pump) = ConnettoClient::with_reconnect(
         conn,
         session_factory(
@@ -338,15 +345,11 @@ async fn offline_write_reflushes_after_resume() {
     let offline = Arc::new(AtomicBool::new(false));
 
     let transport = open_session(&manager, &slot).await;
-    let config = ClientConfig {
-        client_id: "reconnect-write".to_owned(),
-        auth_token: "token".to_owned(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
-    let conn = ConnettoConnection::connect(transport, ":memory:", SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
+    let config = config("reconnect-write");
+    let conn =
+        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+            .await
+            .expect("client connect");
     let (client, pump) = ConnettoClient::with_reconnect(
         conn,
         session_factory(
@@ -426,15 +429,18 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     // First run: a file-backed replica, one live query, one synced row. The
     // applied cursor lands in the replica's meta table transactionally.
     let transport = open_session(&manager, &slot).await;
-    let config = ClientConfig {
-        client_id: "restart-first".to_owned(),
-        auth_token: "token".to_owned(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
-    let conn = ConnettoConnection::connect(transport, &replica_path, SQLITE_DDL, &config, None)
-        .await
-        .expect("first connect");
+    let first = config("restart-first");
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::PlaintextFile {
+            path: &replica_path,
+        },
+        SQLITE_DDL,
+        &first,
+        None,
+    )
+    .await
+    .expect("first connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump_handle = tokio::spawn(pump);
     let mut live: LiveQuery<Order> = client
@@ -471,15 +477,17 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     // persisted cursor makes the new subscription catch up from the oplog,
     // never re-snapshot.
     let transport = open_session(&manager, &slot).await;
-    let config = ClientConfig {
-        client_id: "restart-second".to_owned(),
-        auth_token: "token".to_owned(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
-    let conn = ConnettoConnection::connect_existing(transport, &replica_path, &config, None)
-        .await
-        .expect("second connect");
+    let second = config("restart-second");
+    let conn = ConnettoConnection::connect_existing(
+        transport,
+        &Replica::PlaintextFile {
+            path: &replica_path,
+        },
+        &second,
+        None,
+    )
+    .await
+    .expect("second connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
     let mut audit = client.events();
