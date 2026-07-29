@@ -15,7 +15,8 @@
 use connetto_client::cipher::ReplicaKey;
 use connetto_web::auth::{AuthError, RefreshStore, ReplicaKeyStore, provision_replica_key};
 use connetto_web::storage::{
-    ReplicaStorage, WipeError, clear_device_key, device_key, wipe_replica,
+    ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
+    wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -279,5 +280,126 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
         store.load().expect("load"),
         None,
         "the discarded credential is gone, so the next boot must log in"
+    );
+}
+
+/// A wipe the application asks for is deferred to the next boot, because nothing
+/// can delete the replica while the hub's pump holds a connection to it. The record
+/// survives being written and is taken exactly once, so the wipe happens on the
+/// next boot and not on the one after that too.
+#[wasm_bindgen_test]
+async fn a_pending_wipe_is_taken_exactly_once() {
+    let name = "e4c-pending.sqlite";
+
+    // Whatever an earlier test or run left, start from nothing.
+    take_pending_wipes().await.expect("drain");
+
+    mark_wipe_pending(name, &[], false)
+        .await
+        .expect("mark a clean replica");
+    // Marking twice is the same as marking once, which matters because a user can
+    // press the button twice.
+    mark_wipe_pending(name, &[], false)
+        .await
+        .expect("mark again");
+
+    let taken = take_pending_wipes().await.expect("take");
+    assert_eq!(
+        taken,
+        vec![name.to_owned()],
+        "the boot after the request finds it, once"
+    );
+    assert!(
+        take_pending_wipes().await.expect("take again").is_empty(),
+        "and the boot after that finds nothing, so a wipe is not repeated"
+    );
+}
+
+/// Nothing about acting on a pending wipe needs an identity, which is what lets the
+/// boot do it before any login. Two identities' replicas marked in turn come back
+/// from one drain, with no login and no name given.
+#[wasm_bindgen_test]
+async fn pending_wipes_are_drained_without_naming_anyone() {
+    take_pending_wipes().await.expect("drain");
+
+    let alice = "e4c-drain-alice.sqlite";
+    let bob = "e4c-drain-bob.sqlite";
+    mark_wipe_pending(alice, &[], false).await.expect("mark");
+    mark_wipe_pending(bob, &[], false).await.expect("mark");
+
+    let mut taken = take_pending_wipes().await.expect("take");
+    taken.sort();
+    assert_eq!(
+        taken,
+        vec![alice.to_owned(), bob.to_owned()],
+        "one drain returns every outstanding wipe, whoever asked for it"
+    );
+}
+
+/// The unsynced guard lives at the marking, not at the boot, and this is why: at
+/// boot the replica is closed and its queued writes are unreadable, so the only
+/// moment the guard can protect anything is while the connection is open and the
+/// credential still works.
+#[wasm_bindgen_test]
+async fn marking_a_wipe_refuses_to_discard_unsynced_writes() {
+    let name = "e4c-pending-guard.sqlite";
+    take_pending_wipes().await.expect("drain");
+
+    match mark_wipe_pending(name, &[3, 4], false).await {
+        Err(WipeError::Unsynced(blocked)) => assert_eq!(blocked, vec![3, 4]),
+        Err(other) => panic!("expected Unsynced, got {other:?}"),
+        Ok(()) => panic!("marking must not silently accept losing queued writes"),
+    }
+    assert!(
+        take_pending_wipes().await.expect("take").is_empty(),
+        "a refused request leaves nothing pending, so the next boot opens normally"
+    );
+
+    // Forcing is the app telling the user what is being discarded and proceeding.
+    mark_wipe_pending(name, &[3, 4], true)
+        .await
+        .expect("a forced request is accepted");
+    assert_eq!(
+        take_pending_wipes().await.expect("take"),
+        vec![name.to_owned()],
+        "and it is pending for the next boot"
+    );
+}
+
+/// The deferred wipe destroys the same things the immediate one does, which is the
+/// point: deferring moves *when* it happens, never *what* happens.
+#[wasm_bindgen_test]
+async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
+    let storage = ReplicaStorage::install().await;
+    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let name = "e4c-deferred.sqlite";
+    reset(&storage, &keys, name).await;
+    take_pending_wipes().await.expect("drain");
+
+    let key = provision_replica_key(&keys, name)
+        .await
+        .expect("mint a key");
+    write_marker(&mut open(&storage, name, &key));
+    assert!(storage.exists(name), "the replica is here to begin with");
+
+    // What the application does at the prompt.
+    mark_wipe_pending(name, &[], false).await.expect("mark");
+
+    // What the next boot does before its login and before it opens anything, which
+    // is exactly the sequence `boot_db_worker` runs.
+    for pending in take_pending_wipes().await.expect("take") {
+        wipe_replica(&storage, &keys, &pending, &[], true)
+            .await
+            .expect("carry out the deferred wipe");
+    }
+
+    assert!(
+        !storage.list().iter().any(|entry| entry == name),
+        "the replica is gone from the pool"
+    );
+    assert_eq!(
+        keys.load(name).await.expect("load"),
+        None,
+        "and its key is gone, so the leftover ciphertext is inert"
     );
 }

@@ -332,6 +332,35 @@ where
         Some(_) => Some(crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?),
         None => None,
     };
+
+    // Every wipe the application asked for is carried out here, before the login
+    // and before anything is opened.
+    //
+    // Two reasons for this position, both learned the hard way. Nothing holds the
+    // replica yet: once the hub's pump owns the connection it holds it for this
+    // worker's whole life, and the OPFS delete cannot run against a live one. And
+    // it is ahead of acquisition, because acquisition blocks on an interactive
+    // login when the credential was cleared, which is exactly what logging out
+    // does. A wipe behind that wait would only happen once somebody logged in
+    // again, and only if it were the same somebody, so a user who asked to have
+    // their data deleted and never came back would keep it.
+    //
+    // Each record names its own replica, so no identity is needed to act on it.
+    // The unsynced guard ran when the record was written, which is the one moment
+    // the queued writes could still have been uploaded, so this is unconditional.
+    // A failure is fatal to the boot rather than logged past: the record is already
+    // taken, so continuing would open a replica the user asked to destroy.
+    if let Some(keys) = &key_store {
+        for name in crate::storage::take_pending_wipes().await.map_err(to_js)? {
+            crate::storage::wipe_replica(&storage, keys, &name, &[], true)
+                .await
+                .map_err(to_js)?;
+            web_sys::console::log_1(
+                &format!("db worker: carried out the pending data wipe of {name}").into(),
+            );
+        }
+    }
+
     let session = match (&config.auth, &key_store) {
         (Some(auth_config), Some(keys)) => {
             Some(acquire_session::<Id>(auth_config, config.auth_db_name, &storage, keys).await?)
@@ -353,7 +382,6 @@ where
         }
         None => config.replica_db_prefix.to_owned(),
     };
-
     // A replica left by a previous worker generation of the SAME identity
     // resumes: the persisted cursor rides the handshake and the subscription
     // below catches up from the server oplog instead of re-snapshotting.

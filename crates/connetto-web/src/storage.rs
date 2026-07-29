@@ -24,6 +24,10 @@
 //! independently usable, and the ordering they encode is documented on each.
 
 use connetto_core::ReplicaKey;
+use indexed_db_futures::database::Database as IdbDatabase;
+use indexed_db_futures::prelude::*;
+use indexed_db_futures::transaction::TransactionMode;
+use wasm_bindgen::JsValue;
 
 use crate::auth::{AuthError, ReplicaKeyStore};
 use connetto_client::cipher::cipher_url;
@@ -237,4 +241,129 @@ pub async fn device_key(key_store: &ReplicaKeyStore) -> Result<ReplicaKey, AuthE
 /// [`AuthError::Store`] if the key store cannot be cleared.
 pub async fn clear_device_key(key_store: &ReplicaKeyStore) -> Result<(), AuthError> {
     key_store.clear(DEVICE_KEY_RECORD).await
+}
+
+/// `IndexedDB` database naming replicas a wipe has been asked for but not yet
+/// performed. Its own database rather than a third store in the key store's,
+/// so no key-store version bump and no two record kinds in one object store.
+const WIPE_DB: &str = "connetto-pending-wipes";
+/// The object store holding one record per replica name awaiting a wipe.
+const WIPE_STORE: &str = "pending";
+
+/// Open (creating if needed) the pending-wipe database.
+async fn pending_wipes() -> Result<IdbDatabase, AuthError> {
+    IdbDatabase::open(WIPE_DB)
+        .with_version(1u8)
+        .with_on_upgrade_needed(|_event, db| {
+            db.create_object_store(WIPE_STORE).build()?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| AuthError::Store(format!("open the pending-wipe store: {err}")))
+}
+
+/// Record that the replica `name` must be wiped before it is next opened, and
+/// refuse when that would discard unsynced writes.
+///
+/// This exists because a browser wipe cannot happen where the application asks
+/// for it. The replica connection lives inside the relay hub's pump for the DB
+/// worker's whole life, and the OPFS delete cannot run while a connection to that
+/// name is live, so the wipe is deferred to the next boot, where nothing is open
+/// yet. [`boot_db_worker`](crate::workers::boot_db_worker) performs it before it
+/// opens anything, and the marker survives a reload, so a tab closing mid-wipe
+/// leaves the wipe to happen on the boot after that rather than half done.
+///
+/// **The unsynced guard lives here, and it has to.** At boot the replica is closed
+/// and its pending mutations are unreadable, so nothing there can distinguish a
+/// clean replica from one with queued writes. Here the connection is still open
+/// and the credential still works, which is the one moment the queued writes could
+/// still be uploaded. Pass the connection's `unsynced` and only set `force` when
+/// the user has been told what is being discarded.
+///
+/// Marking twice is the same as marking once.
+///
+/// # Errors
+///
+/// [`WipeError::Unsynced`] when unsynced writes remain and `force` is false, or
+/// [`WipeError::KeyStore`] when the marker cannot be written.
+pub async fn mark_wipe_pending(name: &str, unsynced: &[u64], force: bool) -> Result<(), WipeError> {
+    if !unsynced.is_empty() && !force {
+        return Err(WipeError::Unsynced(unsynced.to_vec()));
+    }
+    let db = pending_wipes()
+        .await
+        .map_err(|err| WipeError::KeyStore(err.to_string()))?;
+    let tx = db
+        .transaction(WIPE_STORE)
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+        .map_err(|err| WipeError::KeyStore(format!("mark tx: {err}")))?;
+    let store = tx
+        .object_store(WIPE_STORE)
+        .map_err(|err| WipeError::KeyStore(format!("mark store: {err}")))?;
+    store
+        .put(JsValue::from_str(name))
+        .with_key(name)
+        .primitive()
+        .map_err(|err| WipeError::KeyStore(format!("mark put: {err}")))?
+        .await
+        .map_err(|err| WipeError::KeyStore(format!("mark put await: {err}")))?;
+    tx.commit()
+        .await
+        .map_err(|err| WipeError::KeyStore(format!("mark commit: {err}")))
+}
+
+/// Every replica name with a wipe outstanding, clearing the records as it reports
+/// them.
+///
+/// Deliberately not addressed by name, and this is the whole point of the design.
+/// Each record already carries the name it refers to, so nothing about acting on it
+/// needs an identity, which means the wipe can happen at the very start of a boot,
+/// before any login. A version of this that looked up one name would only fire on
+/// a boot where that same person logged in again, so someone who asked for a wipe
+/// and never came back would keep their data, and a different person logging in on
+/// the same device would leave the first person's data untouched. Neither is what
+/// "delete my data" means.
+///
+/// Taken rather than read, so a wipe that has been carried out is not repeated on
+/// the boot after it. The caller performs the wipe after this returns: if it fails,
+/// the record is already gone and a later boot would open a replica the user asked
+/// to destroy, so treat a failed wipe as fatal to the boot rather than logging past
+/// it.
+///
+/// # Errors
+///
+/// [`AuthError::Store`] when the records cannot be read or cleared.
+pub async fn take_pending_wipes() -> Result<Vec<String>, AuthError> {
+    let db = pending_wipes().await?;
+    let tx = db
+        .transaction(WIPE_STORE)
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+        .map_err(|err| AuthError::Store(format!("take tx: {err}")))?;
+    let store = tx
+        .object_store(WIPE_STORE)
+        .map_err(|err| AuthError::Store(format!("take store: {err}")))?;
+    // The listing arrives as an iterator of fallible conversions, since each key
+    // comes back as a JS value.
+    let pending: Vec<String> = store
+        .get_all_keys::<String>()
+        .primitive()
+        .map_err(|err| AuthError::Store(format!("take list: {err}")))?
+        .await
+        .map_err(|err| AuthError::Store(format!("take list await: {err}")))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|err| AuthError::Store(format!("take list decode: {err}")))?;
+    for name in &pending {
+        store
+            .delete(name.as_str())
+            .primitive()
+            .map_err(|err| AuthError::Store(format!("take delete: {err}")))?
+            .await
+            .map_err(|err| AuthError::Store(format!("take delete await: {err}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|err| AuthError::Store(format!("take commit: {err}")))?;
+    Ok(pending)
 }

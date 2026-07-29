@@ -46,7 +46,10 @@ use js_sys::{ArrayBuffer, Uint8Array};
 pub use leader::{Membership, join};
 pub use port::{PortTransport, PortTransportError};
 pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
-pub use storage::{ReplicaStorage, WipeError, clear_device_key, device_key, wipe_replica};
+pub use storage::{
+    ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
+    wipe_replica,
+};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
