@@ -198,6 +198,15 @@ fn page_login_callback() -> Option<(String, String)> {
     Some((code, state))
 }
 
+/// True when this page was opened by another page on this origin, which is how a
+/// login popup is distinguished from the application itself.
+fn is_login_popup() -> bool {
+    js_sys::eval("window.opener !== null && window.opener !== undefined")
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Strip the query string from the current URL without a page reload so a
 /// spent authorization code is not replayed on refresh.
 fn clear_url_query() {
@@ -219,15 +228,22 @@ fn clear_flag_and_reload() {
     ));
 }
 
-/// Navigate the browser to `url`. Used to send the user to the login page.
-fn navigate_to(url: &str) {
+/// Open `url` in a popup to run the login there.
+///
+/// Navigating this tab instead would destroy the page, and with it the dedicated
+/// DB worker that asked for the login and holds the PKCE verifier. The returning
+/// page would start a fresh worker with a fresh verifier, so the code it carried
+/// home could never be redeemed. A popup leaves the opener and its worker alive.
+fn open_login_popup(url: &str) {
     // Encode the URL as a JSON string literal so it is safe regardless of
     // what characters the IdP URL carries.
     let encoded = js_sys::JSON::stringify(&JsValue::from_str(url))
         .ok()
         .and_then(|s| s.as_string())
         .unwrap_or_else(|| format!("\"{}\"", url.replace('"', "%22")));
-    let _ = js_sys::eval(&format!("location.href={encoded}"));
+    let _ = js_sys::eval(&format!(
+        "window.open({encoded},'connetto-login','popup=yes,width=520,height=640')"
+    ));
 }
 
 /// True when the worker's own URL carries `?signed_in=1`.
@@ -267,6 +283,17 @@ fn main() {
                 web_sys::console::error_1(&format!("db worker failed: {err:?}").into());
             }
         });
+        return;
+    }
+    // A login popup exists only to carry the code home. It must not boot a worker
+    // of its own: the login belongs to the opener's worker, which holds the PKCE
+    // verifier, and a second worker here would elect itself leader and open the
+    // same replica.
+    if is_login_popup() {
+        if let Some((code, state)) = page_login_callback() {
+            let _ = deliver_login_code(&code, &state);
+        }
+        let _ = js_sys::eval("window.close()");
         return;
     }
     dioxus::launch(App);
@@ -453,6 +480,11 @@ const CSS: &str = r"
     .logout-confirm p { margin: 0 0 6px; }
 ";
 
+/// The pending login URL, wrapped so the context lookup does not collide with the
+/// identity signal, which is the same underlying type.
+#[derive(Clone, Copy)]
+struct LoginPrompt(Signal<Option<String>>);
+
 // Dioxus components are PascalCase by convention; the `rsx!` call sites name
 // them as elements, so keep the component name and silence the lint.
 #[allow(non_snake_case)]
@@ -470,10 +502,14 @@ fn App() -> Element {
     let mut status = use_signal(|| "connecting to the connetto stack".to_owned());
     // User id received from the worker after authentication.
     let mut user_id: Signal<Option<String>> = use_signal(|| None);
+    // The login URL the worker is waiting on. A popup can only be opened from a
+    // real click, so the URL is parked here and a button offers it.
+    let login_prompt: Signal<Option<String>> = use_signal(|| None);
 
     use_context_provider(|| client_slot);
     use_context_provider(|| status);
     use_context_provider(|| user_id);
+    use_context_provider(|| LoginPrompt(login_prompt));
 
     // Listen for the user id the worker broadcasts after boot_db_worker returns.
     // The broadcast arrives AFTER the worker posts "ready", so the Dashboard is
@@ -498,7 +534,9 @@ fn App() -> Element {
     // Listen on the login channel. When the worker broadcasts its login URL:
     //   - If this page load is the OAuth callback (pending.is_some()), deliver
     //     the code and state to the worker.
-    //   - Otherwise navigate the browser to the login URL.
+    //   - Otherwise park the URL so a button can offer it. A popup opened from
+    //     this handler would be blocked, because a message is not user activation.
+    let prompt = LoginPrompt(login_prompt);
     let _login_listener = use_hook(move || {
         Rc::new(RefCell::new(if signed_in {
             let login_ch =
@@ -529,8 +567,7 @@ fn App() -> Element {
                     // This page IS the callback: deliver the code to the worker.
                     let _ = deliver_login_code(code, state);
                 } else {
-                    // Initial sign-in: send the user to the IdP.
-                    navigate_to(&url);
+                    prompt.0.clone().set(Some(url));
                 }
             });
             login_ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
@@ -585,6 +622,7 @@ fn App() -> Element {
 #[allow(non_snake_case)]
 fn AuthBanner(signed_in: bool) -> Element {
     let user_id = use_context::<Signal<Option<String>>>();
+    let login_prompt = use_context::<LoginPrompt>().0;
 
     if !signed_in {
         rsx! {
@@ -596,6 +634,20 @@ fn AuthBanner(signed_in: bool) -> Element {
                 button {
                     onclick: move |_| set_flag_and_reload(),
                     "Sign in (private encrypted replica)"
+                }
+            }
+        }
+    } else if user_id.read().is_none() && login_prompt.read().is_some() {
+        // The worker is waiting for an interactive login. A popup keeps this page
+        // and its worker alive, and it can only be opened from a real click, so the
+        // prompt is a button rather than something that fires on its own.
+        let url = login_prompt.read().clone().unwrap_or_default();
+        rsx! {
+            div { class: "auth-banner auth-signed-in",
+                p { "Signed in, private encrypted replica (account loading)." }
+                button {
+                    onclick: move |_| open_login_popup(&url),
+                    "Sign in with dev-idp"
                 }
             }
         }
