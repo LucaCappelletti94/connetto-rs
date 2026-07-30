@@ -33,6 +33,7 @@ diesel.workspace = true
 connetto-client = { path = "../connetto-client", features = ["native-transport"] }
 connetto-server = { path = "../connetto-server" }
 connetto-test-harness = { path = "../connetto-test-harness" }
+connetto-core = { workspace = true, features = ["test-support"] }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "0.7.9"

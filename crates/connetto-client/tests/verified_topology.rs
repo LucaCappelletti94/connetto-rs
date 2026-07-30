@@ -219,7 +219,10 @@ async fn handshake_with(token: &str) -> Result<(), ClientError> {
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &path },
+        &Replica::EncryptedFile {
+            path: &path,
+            key: connetto_core::test_support::replica_key(),
+        },
         "CREATE TABLE probe (id INTEGER PRIMARY KEY)",
         &config,
         None,

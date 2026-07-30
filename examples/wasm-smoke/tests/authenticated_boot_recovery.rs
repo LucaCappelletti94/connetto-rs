@@ -36,7 +36,7 @@ async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
         .delete_db(REFRESH_DB)
         .expect("clear an earlier refresh store");
     let stale_device = device_key(&keys).await.expect("mint a device key");
-    let auth_db_url = storage.db_url(REFRESH_DB, true);
+    let auth_db_url = storage.db_url(REFRESH_DB);
     RefreshStore::open(&auth_db_url, &stale_device)
         .expect("open the refresh store")
         .save("a-refresh-token-the-device-key-can-no-longer-reach")

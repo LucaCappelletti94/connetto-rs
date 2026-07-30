@@ -57,8 +57,7 @@ async fn pool() -> sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil {
 /// `sqlite-wasm-rs` allows one connection per database. Dropping is enough and
 /// needs no await, which is the precondition phase E2 measured.
 fn open(storage: &ReplicaStorage, name: &str, key: &ReplicaKey) -> SqliteConnection {
-    let mut conn =
-        SqliteConnection::establish(&storage.db_url(name, true)).expect("open the database");
+    let mut conn = SqliteConnection::establish(&storage.db_url(name)).expect("open the database");
     connetto_client::cipher::unlock(&mut conn, key).expect("apply the key");
     conn
 }
@@ -202,7 +201,7 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
         .expect("clear any earlier key");
 
     let device = device_key(&keys).await.expect("mint the device key");
-    let url = storage.db_url(name, true);
+    let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
         store.save(REFRESH_TOKEN).expect("save the token");
@@ -254,7 +253,7 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
         .expect("clear any earlier key");
 
     let device = device_key(&keys).await.expect("mint the device key");
-    let url = storage.db_url(name, true);
+    let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
         store.save(REFRESH_TOKEN).expect("save the token");

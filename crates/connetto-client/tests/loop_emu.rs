@@ -365,7 +365,10 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -508,7 +511,10 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -637,7 +643,10 @@ async fn connection_is_a_diesel_connection() {
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -737,7 +746,10 @@ async fn rejected_write_rolls_back_locally() {
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -850,7 +862,10 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -928,7 +943,10 @@ async fn connect_client(
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: db_path },
+        &Replica::EncryptedFile {
+            path: db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -2558,7 +2576,10 @@ async fn watch_fn_drives_a_boxed_row_query() {
     };
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: connetto_core::test_support::replica_key(),
+        },
         GADGETS_SQLITE_DDL,
         &config,
         None,

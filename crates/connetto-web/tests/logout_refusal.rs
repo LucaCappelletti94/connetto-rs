@@ -18,7 +18,7 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_client::{ClientConfig, ConnettoConnection, Replica, SqlFunctions};
-use connetto_core::test_support::FakeTransport;
+use connetto_core::test_support::{FakeTransport, replica_key};
 use connetto_web::RelayHub;
 use connetto_web::auth::{LogoutOutcome, WorkerAuthConfig, request_logout, request_unsynced};
 use connetto_web::storage::{ReplicaStorage, take_pending_wipes};
@@ -78,10 +78,13 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
 
     // Strand a write: the insert is captured, the push uploads it, and the fake
     // upstream never acknowledges it, so its seq stays queued for good.
-    let url = storage.db_url(REPLICA, false);
+    let url = storage.db_url(REPLICA);
     let mut worker = ConnettoConnection::connect(
         FakeTransport::accepting_but_silent(),
-        &Replica::PlaintextFile { path: &url },
+        &Replica::EncryptedFile {
+            path: &url,
+            key: replica_key(),
+        },
         SQLITE_DDL,
         &config(),
         None,

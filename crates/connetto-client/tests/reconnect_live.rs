@@ -432,8 +432,9 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let first = config("restart-first");
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile {
+        &Replica::EncryptedFile {
             path: &replica_path,
+            key: connetto_core::test_support::replica_key(),
         },
         SQLITE_DDL,
         &first,
@@ -480,8 +481,9 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let second = config("restart-second");
     let conn = ConnettoConnection::connect_existing(
         transport,
-        &Replica::PlaintextFile {
+        &Replica::EncryptedFile {
             path: &replica_path,
+            key: connetto_core::test_support::replica_key(),
         },
         &second,
         None,

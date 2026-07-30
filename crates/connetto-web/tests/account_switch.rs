@@ -109,8 +109,8 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
 
     let alice_key = key_from_byte(0x11);
     let bob_key = key_from_byte(0x22);
-    let alice_url = storage.db_url(&alice, true);
-    let bob_url = storage.db_url(&bob, true);
+    let alice_url = storage.db_url(&alice);
+    let bob_url = storage.db_url(&bob);
 
     // Alice's boot: a fresh replica, a synced row, and a mutation left queued
     // because the fake server acknowledges the handshake and nothing else.

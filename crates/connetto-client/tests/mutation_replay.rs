@@ -358,8 +358,9 @@ async fn restart_replays_persisted_pending() {
     {
         let mut conn = ConnettoConnection::connect(
             black_hole(),
-            &Replica::PlaintextFile {
+            &Replica::EncryptedFile {
                 path: &replica_path,
+                key: connetto_core::test_support::replica_key(),
             },
             SQLITE_DDL,
             &config("restart"),
@@ -375,8 +376,9 @@ async fn restart_replays_persisted_pending() {
     // record, and the connect-time reconcile replays it.
     let mut conn = ConnettoConnection::connect_existing(
         open_session(&manager),
-        &Replica::PlaintextFile {
+        &Replica::EncryptedFile {
             path: &replica_path,
+            key: connetto_core::test_support::replica_key(),
         },
         &config("restart"),
         None,

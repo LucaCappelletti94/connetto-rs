@@ -8,7 +8,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Replica};
-use connetto_core::Cursor;
+use connetto_core::{Cursor, test_support::replica_key};
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -256,7 +256,10 @@ async fn use_live_renders_and_follows_cdc() {
     };
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,
@@ -337,7 +340,10 @@ async fn use_live_fn_follows_a_boxed_row_query() {
     };
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::PlaintextFile { path: &db_path },
+        &Replica::EncryptedFile {
+            path: &db_path,
+            key: replica_key(),
+        },
         SQLITE_DDL,
         &config,
         None,

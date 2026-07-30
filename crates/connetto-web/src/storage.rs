@@ -100,21 +100,16 @@ impl ReplicaStorage {
         }
     }
 
-    /// The database URL that opens `name` in this backend, encrypted or not.
+    /// The database URL that opens `name` in this backend.
     ///
-    /// A plaintext database opens under its bare name, which resolves through
-    /// whichever VFS is the default. An encrypted one must name the codec shim
-    /// over this backend's VFS explicitly, because the codec intercepts as a VFS
-    /// layer: a bare name would open the real VFS with no codec in the stack, and
-    /// `PRAGMA key` would have nothing to talk to. Both backends are covered, so
-    /// the OPFS-unavailable fallback stays encrypted too.
+    /// Always the codec shim over this backend's VFS, named explicitly, because
+    /// the codec intercepts as a VFS layer: a bare name would open the real VFS
+    /// with no codec in the stack and `PRAGMA key` would have nothing to talk to.
+    /// Both backends are covered, so the OPFS-unavailable fallback stays
+    /// encrypted too.
     #[must_use]
-    pub fn db_url(&self, name: &str, encrypted: bool) -> String {
-        if encrypted {
-            cipher_url(name, self.vfs_name())
-        } else {
-            name.to_owned()
-        }
+    pub fn db_url(&self, name: &str) -> String {
+        cipher_url(name, self.vfs_name())
     }
 
     /// Delete the database `name` and any journal or WAL sidecar it left, by

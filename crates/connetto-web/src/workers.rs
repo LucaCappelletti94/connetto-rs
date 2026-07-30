@@ -262,7 +262,7 @@ async fn acquire_session<Id: serde::de::DeserializeOwned>(
     key_store: &crate::auth::ReplicaKeyStore,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
     let device_key = crate::storage::device_key(key_store).await.map_err(to_js)?;
-    let auth_db_url = storage.db_url(auth_db_name, true);
+    let auth_db_url = storage.db_url(auth_db_name);
     let store = match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
         Ok(store) => store,
         Err(crate::auth::AuthError::Undecryptable(detail)) => {
@@ -334,10 +334,11 @@ where
     // One key store serves the whole boot: this device's own key, which unlocks
     // the refresh store, and the per-replica key both live in it, and opening
     // IndexedDB twice buys nothing.
-    let key_store = match &config.auth {
-        Some(_) => Some(crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?),
-        None => None,
-    };
+    //
+    // Opened whether or not authentication is configured. A durable replica is
+    // encrypted, and with no auth there is simply no identity in the record name,
+    // which is the same shape `device_key` already uses for the refresh store.
+    let key_store = crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?;
 
     // Every wipe the application asked for is carried out here, before the login
     // and before anything is opened.
@@ -356,22 +357,20 @@ where
     // the queued writes could still have been uploaded, so this is unconditional.
     // A failure is fatal to the boot rather than logged past: the record is already
     // taken, so continuing would open a replica the user asked to destroy.
-    if let Some(keys) = &key_store {
-        for name in crate::storage::take_pending_wipes().await.map_err(to_js)? {
-            crate::storage::wipe_replica(&storage, keys, &name, &[], true)
-                .await
-                .map_err(to_js)?;
-            web_sys::console::log_1(
-                &format!("db worker: carried out the pending data wipe of {name}").into(),
-            );
-        }
+    for name in crate::storage::take_pending_wipes().await.map_err(to_js)? {
+        crate::storage::wipe_replica(&storage, &key_store, &name, &[], true)
+            .await
+            .map_err(to_js)?;
+        web_sys::console::log_1(
+            &format!("db worker: carried out the pending data wipe of {name}").into(),
+        );
     }
 
-    let session = match (&config.auth, &key_store) {
-        (Some(auth_config), Some(keys)) => {
-            Some(acquire_session::<Id>(auth_config, config.auth_db_name, &storage, keys).await?)
-        }
-        _ => None,
+    let session = match &config.auth {
+        Some(auth_config) => Some(
+            acquire_session::<Id>(auth_config, config.auth_db_name, &storage, &key_store).await?,
+        ),
+        None => None,
     };
     // Identity continuity by file selection: each identity owns the replica
     // named from its own id, so an account switch opens a different file and
@@ -396,33 +395,20 @@ where
     // Provision-once custody of the per-replica encryption key, minted on this
     // device. It resolves here rather than inside acquisition because the record
     // is addressed by the replica name, which only exists once the identity
-    // does. A fresh replica mints its key and caches it. An existing one reads
-    // the cache and nothing else: minting for it would return a key that
-    // decrypts nothing, and would fill the record that restoring a backed-up
-    // key still could, so an absent record refuses in `Replica::encrypted_file`
-    // instead.
-    let replica_key = match &key_store {
-        Some(keys) => {
-            if existing {
-                keys.load(&replica_db_name).await.map_err(to_js)?
-            } else {
-                Some(
-                    crate::auth::provision_replica_key(keys, &replica_db_name)
-                        .await
-                        .map_err(to_js)?,
-                )
-            }
-        }
-        None => None,
+    // does, or is the bare prefix when there is no identity at all. A fresh
+    // replica mints its key and caches it. An existing one reads the cache and
+    // nothing else: minting for it would return a key that decrypts nothing, and
+    // would fill the record that restoring a backed-up key still could, so an
+    // absent record refuses in `Replica::encrypted_file` instead.
+    let replica_key = if existing {
+        key_store.load(&replica_db_name).await.map_err(to_js)?
+    } else {
+        Some(
+            crate::auth::provision_replica_key(&key_store, &replica_db_name)
+                .await
+                .map_err(to_js)?,
+        )
     };
-    // Encrypted whenever authentication is configured, because that is exactly
-    // when an identity, and so a key store record addressed by it, exists. With
-    // auth unset there is no identity to name a record after, so the replica is
-    // plaintext and says so. The refusal for "auth configured but the key store
-    // no longer holds this replica's key" lives in `Replica::encrypted_file`, so
-    // a native application gets the same behaviour rather than a second
-    // implementation of it here.
-    let encrypted = config.auth.is_some();
 
     let auth_token = session
         .as_ref()
@@ -435,14 +421,10 @@ where
         sql_functions: config.sql_functions.clone(),
     };
     let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
-    let replica_url = storage.db_url(&replica_db_name, encrypted);
+    let replica_url = storage.db_url(&replica_db_name);
     // Always a durable file here: OPFS, or the in-memory VFS's named file when
     // OPFS is unavailable. Never `Ephemeral`, which is the tab's case.
-    let replica = if encrypted {
-        Replica::encrypted_file(&replica_url, replica_key).map_err(to_js)?
-    } else {
-        Replica::PlaintextFile { path: &replica_url }
-    };
+    let replica = Replica::encrypted_file(&replica_url, replica_key).map_err(to_js)?;
     let mut worker = if existing {
         ConnettoConnection::connect_existing(transport, &replica, &client_config, None)
             .await
@@ -477,9 +459,8 @@ where
     // independently, unlike the native tier which is attached to the replica and
     // inherits from it. Same key either way: one device, one key.
     let tier_is_new = !storage.exists(config.frontend_db_name);
-    let mut frontend =
-        SqliteConnection::establish(&storage.db_url(config.frontend_db_name, encrypted))
-            .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
+    let mut frontend = SqliteConnection::establish(&storage.db_url(config.frontend_db_name))
+        .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
     if let Some(key) = replica.key() {
         connetto_client::cipher::unlock(&mut frontend, key)
             .map_err(|err| JsValue::from_str(&format!("unlock the frontend tier: {err}")))?;
@@ -761,7 +742,7 @@ async fn logout_locally(
     let storage = crate::storage::ReplicaStorage::install().await;
     let keys = crate::auth::ReplicaKeyStore::open().await?;
     let device = crate::storage::device_key(&keys).await?;
-    let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name, true), &device)?;
+    let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name), &device)?;
     crate::auth::BrowserAuthenticator::new(auth.clone())
         .logout(&store)
         .await

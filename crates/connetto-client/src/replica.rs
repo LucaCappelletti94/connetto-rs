@@ -32,12 +32,17 @@ use sha2::{Digest, Sha256};
 /// replica does have something at rest, so it has to say which of the two it is,
 /// in a word that does not also mean "in memory".
 ///
-/// There is no `Default` and no `Option`. A caller with a key says
-/// [`EncryptedFile`](Self::EncryptedFile), a caller with no file says
-/// [`Ephemeral`](Self::Ephemeral), and a caller writing a readable file on disk
-/// has to type the word plaintext. That third case is not a free choice between
-/// equals: see [`PlaintextFile`](Self::PlaintextFile) for the single situation it
-/// is correct in.
+/// There is no `Default` and no `Option`. A caller with something at rest says
+/// [`EncryptedFile`](Self::EncryptedFile), a caller with nothing at rest says
+/// [`Ephemeral`](Self::Ephemeral), and there is no third choice.
+///
+/// A durable replica with its pages in the clear was the third variant until
+/// phase E5, and it went because the key is minted on the device
+/// ([`provision_replica_key`](crate::auth::provision_replica_key)). A deployment
+/// with no authentication at all therefore still has a key: it names the
+/// key-store record after the bare replica prefix, the same way the browser's
+/// `device_key` names one after a literal to protect the store it has to read
+/// before any identity exists.
 #[derive(Debug, Clone)]
 pub enum Replica<'a> {
     /// In-process and gone when the connection closes. A tab's mirror of the
@@ -62,57 +67,16 @@ pub enum Replica<'a> {
         /// browser equivalent.
         key: ReplicaKey,
     },
-    /// A durable replica at `path` with its pages in the clear: readable by
-    /// anyone who can read the file, and by anyone who later recovers the disk.
-    ///
-    /// **Correct in exactly one situation: the deployment has no authentication
-    /// configured.** That is the dev loops, the pre-auth test suites, and
-    /// connetto's own demos.
-    ///
-    /// Note that this is narrower than "the user is logged out". The per-replica
-    /// key is deliberately not session-scoped: it survives logout so a returning
-    /// user resumes from their replica instead of re-syncing, and only an
-    /// explicit data wipe destroys it. So a logged-out client of an
-    /// authenticating deployment still opens
-    /// [`EncryptedFile`](Self::EncryptedFile) from its cached key.
-    ///
-    /// It follows that an authenticating deployment reaching this variant is
-    /// always a bug, and [`encrypted_file`](Self::encrypted_file) is what stops
-    /// it. Two arguments for allowing it deliberately were considered and both
-    /// fail. Inspectability does not need it, because `sqlcipher` opens an
-    /// encrypted database and the key is in the keyring of the same user on the
-    /// same machine. Loss tolerance argues for something else entirely: the fear
-    /// is that a wiped key store takes the device-local tier with it, and the
-    /// answer to that is backing up the key or syncing the tier, not trading away
-    /// confidentiality to buy durability. Cheaper page crypto and an external
-    /// reader that links no codec are costs with their own fixes, not reasons.
-    ///
-    /// This variant is scheduled for deletion and is not kept for symmetry. Its
-    /// stated justification is now thin: since keys are minted on the device
-    /// ([`provision_replica_key`](crate::auth::provision_replica_key)), an
-    /// unauthenticated deployment could name its key-store record after the bare
-    /// replica prefix and encrypt too. What still blocks the deletion is not that
-    /// argument but two concrete consumers, both of which first-boot a replica
-    /// from a baked plaintext template: `examples/wasm-smoke/tests/opfs.rs` and
-    /// `examples/dioxus-desktop-demo`. A template is a finished plaintext image
-    /// and no plaintext-to-encrypted transform exists in the browser codec, so
-    /// retiring the baked replica template comes first, and that is scheduled
-    /// after phase E4 rather than left open. See
-    /// `docs/handoff-auth-at-rest-encryption.md`.
-    PlaintextFile {
-        /// Where the replica lives.
-        path: &'a str,
-    },
 }
 
 impl<'a> Replica<'a> {
     /// The encrypted replica at `path` under the key the key store holds for it,
     /// refusing when there is none.
     ///
-    /// This is the check that stops an authenticating deployment from silently
-    /// falling back to [`PlaintextFile`](Self::PlaintextFile), and it is the only
-    /// place that refusal lives, so the browser worker and a native application
-    /// get the same behaviour. `None` is what
+    /// This is the check that stops a durable replica from opening without the
+    /// key it was written under, and it is the only place that refusal lives, so
+    /// the browser worker and a native application get the same behaviour.
+    /// `None` is what
     /// [`ReplicaKeyStore::load`](crate::auth::ReplicaKeyStore::load) returns for a
     /// replica whose key-store record is gone while the file survived, and its
     /// recoveries are restoring the key, or an explicit data wipe followed by a
@@ -138,7 +102,8 @@ impl<'a> Replica<'a> {
         }
     }
 
-    /// The key, or `None` when these pages are not encrypted.
+    /// The key, or `None` for [`Ephemeral`](Self::Ephemeral), which has nothing
+    /// at rest to key.
     ///
     /// For a second connection that has to match this replica's cipher, which in
     /// the browser is the device-local tier: it is its own main database, so it
@@ -146,7 +111,7 @@ impl<'a> Replica<'a> {
     #[must_use]
     pub const fn key(&self) -> Option<&ReplicaKey> {
         match self {
-            Self::Ephemeral | Self::PlaintextFile { .. } => None,
+            Self::Ephemeral => None,
             Self::EncryptedFile { key, .. } => Some(key),
         }
     }
@@ -157,7 +122,7 @@ impl<'a> Replica<'a> {
     pub const fn path(&self) -> &'a str {
         match self {
             Self::Ephemeral => ":memory:",
-            Self::EncryptedFile { path, .. } | Self::PlaintextFile { path } => path,
+            Self::EncryptedFile { path, .. } => path,
         }
     }
 }
@@ -238,15 +203,6 @@ mod tests {
             Err(other) => panic!("expected ReplicaKeyMissing, got {other:?}"),
             Ok(_) => panic!("an absent key must not silently open anything"),
         }
-    }
-
-    #[test]
-    fn a_plaintext_file_carries_no_key() {
-        let replica = Replica::PlaintextFile {
-            path: "replica.sqlite",
-        };
-        assert_eq!(replica.path(), "replica.sqlite");
-        assert!(replica.key().is_none());
     }
 
     #[test]

@@ -7,8 +7,19 @@
 
 use crate::messages::{BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck};
 use crate::traits::{IncomingFrame, Transport};
-use crate::{Cursor, SchemaVersion};
+use crate::{Cursor, ReplicaKey, SchemaVersion};
 use std::collections::VecDeque;
+
+/// A fixed key for a test replica.
+///
+/// A durable replica is always encrypted, so a suite whose subject is something
+/// else still needs a key to open one. Sharing the constant keeps those suites
+/// from each inventing their own, and it is deliberately not the key any suite
+/// that is actually about the codec uses.
+#[must_use]
+pub fn replica_key() -> ReplicaKey {
+    ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN])
+}
 
 /// How a [`FakeTransport`] answers the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

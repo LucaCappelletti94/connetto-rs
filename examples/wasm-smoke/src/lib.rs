@@ -106,10 +106,6 @@ pub mod workers {
     /// The OPFS file holding the DB worker's durable local tier (device-private
     /// tables, never synced).
     pub const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
-    /// The baked local tier template, translated from `frontend.sql` by
-    /// build.rs.
-    pub const FRONTEND_TEMPLATE: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/frontend-template.sqlite"));
 
     /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
     ///

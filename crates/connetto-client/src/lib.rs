@@ -145,11 +145,11 @@ pub enum ClientError {
     /// An encrypted replica was asked for and no key resolved: the login carried
     /// none and none was cached.
     ///
-    /// Raised by [`Replica::encrypted_file`], which exists so this cannot
-    /// instead become a silent [`Replica::PlaintextFile`] behind an
-    /// authenticating deployment's back. The reachable cause is a device whose
-    /// key store was cleared while its replica survived. Recover with a fresh
-    /// interactive login, which provisions a key, or with an explicit data wipe.
+    /// Raised by [`Replica::encrypted_file`], which is where the refusal lives so
+    /// that no caller can turn a missing key into a readable file instead. The
+    /// reachable cause is a device whose key store was cleared while its replica
+    /// survived. Recover with a fresh interactive login, which provisions a key,
+    /// or with an explicit data wipe.
     #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
     ReplicaKeyMissing,
 }
@@ -811,55 +811,8 @@ where
         Self::connect_inner(transport, replica, Some(sqlite_ddl), config, resume).await
     }
 
-    /// Connect like [`connect`](Self::connect), but seed a fresh **plaintext**
-    /// replica from a template database instead of executing DDL.
-    ///
-    /// `template` is the complete byte image of a SQLite database with the
-    /// replica schema already applied, the build-time product of translating
-    /// the backend schema (SQLite's file format is its own deployable
-    /// artifact). When nothing exists at `db_path` the template bytes are
-    /// written there and no DDL ever runs. An existing replica is reused
-    /// untouched, which is the resume path.
-    ///
-    /// The plaintext is in the name because it is unavoidable here and would
-    /// otherwise be invisible: a baked byte image is a plaintext database, the
-    /// per-replica key does not exist at build time, and neither page codec
-    /// offers a plaintext-to-encrypted transform that works on both backends. So
-    /// an authenticated application calling this still gets a readable file, and
-    /// has to have typed the word to get there. An encrypted replica first-boots
-    /// from DDL through [`connect`](Self::connect) with
-    /// [`Replica::encrypted_file`](replica::Replica::encrypted_file).
-    ///
-    /// Native only: it writes through the filesystem. On wasm, first-boot from
-    /// DDL and use [`connect`](Self::connect).
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a filesystem, database, session, transport, or
-    /// handshake failure.
-    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-    pub async fn connect_with_plaintext_template(
-        transport: T,
-        db_path: &str,
-        template: &[u8],
-        config: &ClientConfig,
-        resume: Option<Cursor>,
-    ) -> Result<Self, ClientError> {
-        if !std::path::Path::new(db_path).exists() {
-            std::fs::write(db_path, template).map_err(|e| ClientError::Connect(e.to_string()))?;
-        }
-        Self::connect_existing(
-            transport,
-            &Replica::PlaintextFile { path: db_path },
-            config,
-            resume,
-        )
-        .await
-    }
-
     /// Connect to a replica that already carries its schema, executing no
-    /// DDL: a previous run's replica on reconnect, or a file seeded by the
-    /// native template constructor.
+    /// DDL: a previous run's replica on reconnect.
     ///
     /// `replica` must describe the replica as it was created. See
     /// [`connect`](Self::connect) for why it is stated rather than inferred.
@@ -896,7 +849,7 @@ where
         // `ATTACH` with no `KEY` clause, so the local tier and the relay hub's
         // own state are covered by this one call.
         match replica {
-            Replica::Ephemeral | Replica::PlaintextFile { .. } => {}
+            Replica::Ephemeral => {}
             Replica::EncryptedFile { key, .. } => cipher::unlock(&mut db, key)?,
         }
         db.batch_execute("PRAGMA journal_mode=WAL")?;

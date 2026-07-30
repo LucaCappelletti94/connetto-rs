@@ -1,9 +1,6 @@
 //! Build-time schema pipeline: translate the Postgres dialect schema in
-//! `schema.sql` to SQLite DDL through pg2sqlite, apply it to a fresh SQLite
-//! database, and hand the resulting file to the app as bytes. SQLite's file
-//! format is its own deployable artifact, so the app ships the schema
-//! pre-applied and never executes DDL at startup. This is the pipeline a
-//! generated schema crate would run, inlined here for the demo.
+//! `schema.sql` to SQLite DDL through pg2sqlite and write the result as
+//! `replica-ddl.sql` for the app to read at compile time.
 
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
@@ -25,17 +22,13 @@ fn main() {
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");
     ddl.push(';');
-    // Also expose the DDL as a text file so the app can seed a fresh encrypted
-    // replica through `ConnettoConnection::connect` with DDL (the template
-    // approach only seeds a plaintext file; an encrypted first-boot uses DDL).
     std::fs::write(out_dir.join("replica-ddl.sql"), &ddl).expect("write replica-ddl.sql");
-
-    let template = out_dir.join("replica-template.sqlite");
-    // Rebuild the template from scratch so a schema edit never layers onto a
-    // stale file.
-    let _ = std::fs::remove_file(&template);
-    let mut conn = SqliteConnection::establish(template.to_str().expect("utf8 OUT_DIR"))
-        .expect("create the template database");
-    conn.batch_execute(&ddl)
-        .expect("apply the translated DDL to the template");
+    // Applying the translation to a throwaway database is the only check that
+    // SQLite accepts what pg2sqlite emitted. It used to land in a baked template
+    // the app imported, and that file is gone: an encrypted replica cannot be
+    // seeded from a plaintext byte image.
+    SqliteConnection::establish(":memory:")
+        .expect("open the validation database")
+        .batch_execute(&ddl)
+        .expect("SQLite accepts the translated DDL");
 }

@@ -4,7 +4,8 @@
 //!
 //! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/`).
 //! - `CONNETTO_DB`: local SQLite file path (required, not `:memory:`, since the
-//!   capture and apply connections share the file).
+//!   capture and apply connections share the file). The replica is encrypted at
+//!   rest under a key kept in the OS keyring, one entry per path.
 //! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: local schema DDL.
 //! - `CONNETTO_CLIENT_ID`: identity presented at handshake (default `anonymous`).
 //! - `CONNETTO_TOKEN`: opaque auth token (default empty).
@@ -26,10 +27,15 @@
 //! then observes its own rows echoed back over CDC.
 
 use anyhow::{Context, Result, anyhow};
+use connetto_client::auth::{KeyringKeyStore, ReplicaKeyStore, provision_replica_key};
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
 use tokio::net::TcpStream;
+
+/// Keyring service holding this binary's replica keys, one entry per
+/// `CONNETTO_DB` path.
+const KEYRING_SERVICE: &str = "connetto-client";
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -83,15 +89,25 @@ async fn main() -> Result<()> {
         .await
         .map_err(|err| anyhow!("websocket handshake to {server}: {err}"))?;
 
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::PlaintextFile { path: &db_path },
-        &sqlite_ddl,
-        &config,
-        None,
-    )
-    .await
-    .map_err(|err| anyhow!("connecting sync client: {err}"))?;
+    // Provision-once, addressed by the replica path since this binary has no
+    // identity to name a record after. A replica already on disk reads the cache
+    // and never mints: a fresh key for an existing file decrypts nothing, and
+    // writing one would fill the record that restoring a backup still could.
+    let keys = KeyringKeyStore::new(KEYRING_SERVICE);
+    let resolved = if std::path::Path::new(&db_path).exists() {
+        keys.load(&db_path)
+            .with_context(|| format!("reading the replica key for {db_path}"))?
+    } else {
+        Some(
+            provision_replica_key(&keys, &db_path)
+                .with_context(|| format!("minting the replica key for {db_path}"))?,
+        )
+    };
+    let replica = Replica::encrypted_file(&db_path, resolved)?;
+
+    let mut client = ConnettoConnection::connect(transport, &replica, &sqlite_ddl, &config, None)
+        .await
+        .map_err(|err| anyhow!("connecting sync client: {err}"))?;
     eprintln!("connected, connection {}", client.connection_id());
     client
         .subscribe(&sub_id, &query)

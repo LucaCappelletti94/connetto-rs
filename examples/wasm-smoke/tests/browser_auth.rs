@@ -126,8 +126,8 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     }
     let device = device_key(&keys).await.expect("mint the device key");
 
-    let store = RefreshStore::open(&storage.db_url(REFRESH_DB, true), &device)
-        .expect("open the refresh store");
+    let store =
+        RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("open the refresh store");
     let authenticator = BrowserAuthenticator::new(config());
 
     // Nothing is stored, so there is nothing to refresh from and the worker asks
@@ -203,7 +203,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         use diesel::Connection as _;
         use diesel::connection::SimpleConnection as _;
 
-        let mut conn = diesel::SqliteConnection::establish(&storage.db_url(&replica_name, true))
+        let mut conn = diesel::SqliteConnection::establish(&storage.db_url(&replica_name))
             .expect("open the replica");
         connetto_client::cipher::unlock(&mut conn, &replica_key).expect("apply the key");
         conn.batch_execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -217,8 +217,8 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // Keep a copy of the live credential, so the revoke can be observed rather
     // than inferred from the local clear.
     let live_refresh = store.load().expect("load").expect("a refresh token");
-    let revoked_store = RefreshStore::open(&storage.db_url(REVOKED_DB, true), &device)
-        .expect("open the second store");
+    let revoked_store =
+        RefreshStore::open(&storage.db_url(REVOKED_DB), &device).expect("open the second store");
     revoked_store
         .save(&live_refresh)
         .expect("seed the copy before the logout");

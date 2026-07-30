@@ -101,28 +101,36 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
 
     let encrypted_url = url(&encrypted);
     let plaintext_url = url(&plaintext);
-    for replica in [
-        Replica::EncryptedFile {
+    let mut conn = ConnettoConnection::connect(
+        FakeTransport::accepting(),
+        &Replica::EncryptedFile {
             path: &encrypted_url,
             key: key(),
         },
-        Replica::PlaintextFile {
-            path: &plaintext_url,
-        },
-    ] {
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            SQLITE_DDL,
-            &config(),
-            None,
-        )
-        .await
-        .expect("connect");
+        SQLITE_DDL,
+        &config(),
+        None,
+    )
+    .await
+    .expect("connect");
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq(MARKER)))
+        .execute(conn.conn())
+        .expect("write the canary");
+    drop(conn);
+
+    // The control is a bare SQLite connection rather than a second replica,
+    // because a durable replica is always encrypted now. What it has to prove is
+    // unchanged: the same bytes written with no codec stay readable, so the
+    // assertions above measure the codec rather than the absence of the string.
+    first_boot_standalone(&plaintext_url, None, SQLITE_DDL);
+    {
+        let mut plain =
+            SqliteConnection::establish(&plaintext_url).expect("open the plaintext control");
         diesel::insert_into(items::table)
             .values((items::id.eq(1), items::label.eq(MARKER)))
-            .execute(conn.conn())
-            .expect("write the canary");
+            .execute(&mut plain)
+            .expect("write the canary in the clear");
     }
 
     let cipher_bytes = std::fs::read(&encrypted).expect("read the encrypted replica");
@@ -140,8 +148,8 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
     );
 
     // The control proves the assertions above are testing the codec rather than
-    // the absence of the string: the same write through a plaintext replica
-    // leaves both readable on disk.
+    // the absence of the string: the same write with no codec leaves both
+    // readable on disk.
     let plain_bytes = std::fs::read(&plaintext).expect("read the plaintext replica");
     assert!(plain_bytes.starts_with(SQLITE_MAGIC));
     assert!(contains(&plain_bytes, MARKER.as_bytes()));
@@ -244,20 +252,16 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
         Ok(_) => panic!("a wrong key must not open the replica"),
     }
 
-    // Claiming the replica is plaintext fails too, and specifically not by
-    // silently reading garbage: the codec never gets a key, so the first header
-    // read fails.
-    let unkeyed = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::PlaintextFile { path: &db },
-        &config(),
-        None,
-    )
-    .await;
+    // An open with no key at all fails too, and specifically not by silently
+    // reading garbage: the codec never gets a key, so the first header read
+    // fails. This is a bare connection because `Replica` can no longer express
+    // an unkeyed durable file, which is the point of the phase that removed it.
+    let mut unkeyed = SqliteConnection::establish(&db).expect("establish without a key");
     assert!(
-        unkeyed.is_err(),
-        "no key at all must not open the replica either"
+        unkeyed.batch_execute("SELECT count(*) FROM items").is_err(),
+        "no key at all must not read the replica either"
     );
+    drop(unkeyed);
 
     // And the discard the error documents actually clears the file, so the next
     // connect rebuilds. `force` is set because the pending mutations live inside

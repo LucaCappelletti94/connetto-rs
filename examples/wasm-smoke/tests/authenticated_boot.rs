@@ -87,7 +87,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     // silently and has to log in through the tab.
     let device = device_key(&keys).await.expect("mint the device key");
     let user_id = {
-        let store = RefreshStore::open(&storage.db_url(REFRESH_DB, true), &device)
+        let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device)
             .expect("open the refresh store");
         let authenticator = BrowserAuthenticator::new(auth_config());
         let pending = match authenticator

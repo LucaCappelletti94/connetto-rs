@@ -61,8 +61,8 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
         "keeping the data asks for no deletion"
     );
     let device = device_key(&keys).await.expect("the device key survives");
-    let store = RefreshStore::open(&storage.db_url(REFRESH_DB, true), &device)
-        .expect("the store still opens");
+    let store =
+        RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("the store still opens");
     assert!(
         store.load().expect("read the store").is_none(),
         "the credential is gone, so the next boot cannot refresh silently"

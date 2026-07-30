@@ -2,8 +2,8 @@
 //!
 //! Two modes, selected by a flag file at startup:
 //!
-//! - Anonymous (flag absent): no auth, shared plaintext replica seeded from
-//!   the shipped template. Matches the original single-mode behavior.
+//! - Anonymous (flag absent): no auth, ephemeral in-memory replica, no keyring
+//!   required. The replica vanishes when the process exits.
 //! - Authenticated (flag present): acquires a connetto session via the RFC 8252
 //!   loopback PKCE flow against `connetto-server`'s auth endpoints, names the
 //!   replica from the resolved identity, opens it with an OS-keyring-held
@@ -44,12 +44,7 @@ use rosetta_uuid::Uuid;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-/// Replica template baked by build.rs: the schema pre-applied to a fresh
-/// SQLite file. Used for the anonymous plaintext path only.
-const REPLICA_TEMPLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/replica-template.sqlite"));
-/// The translated SQLite DDL, used to seed a fresh encrypted replica on first
-/// authenticated boot (the template approach only seeds a plaintext file).
+/// The translated SQLite DDL, used to seed a replica on first boot.
 const REPLICA_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 /// The Postgres schema source the connetto-server must be started with
 /// (`CONNETTO_PG_DDL`). Its SHA-256 is the schema version presented at the
@@ -363,21 +358,10 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
     Ok((client, Backend(tx), auth_ctx))
 }
 
-/// Anonymous mode: temp file, plaintext, no token, shared replica.
+/// Anonymous mode: ephemeral in-memory replica, no token, per-process.
 async fn setup_anonymous(
     transport: WebSocketTransport<TcpStream>,
 ) -> anyhow::Result<ConnettoConnection<Ws>> {
-    // The replica lives in a per-process temp file. The window loop never
-    // returns, so no drop would run for it anyway and the OS temp cleaner
-    // owns it.
-    let db_path = std::env::temp_dir().join(format!(
-        "connetto-desktop-demo-{}.sqlite",
-        std::process::id()
-    ));
-    let db_path = db_path
-        .to_str()
-        .context("the temp directory path is not utf8")?
-        .to_owned();
     // A placeholder credential, which only a server that verifies nothing accepts.
     // A server started with CONNETTO_AUTH refuses it, and that refusal is reported
     // rather than fatal: see the mapping below.
@@ -387,10 +371,10 @@ async fn setup_anonymous(
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
         sql_functions: uuidv7_functions(),
     };
-    ConnettoConnection::connect_with_plaintext_template(
+    ConnettoConnection::connect(
         transport,
-        &db_path,
-        REPLICA_TEMPLATE,
+        &Replica::Ephemeral,
+        REPLICA_SQLITE_DDL,
         &config,
         None,
     )
