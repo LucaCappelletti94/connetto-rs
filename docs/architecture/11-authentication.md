@@ -135,7 +135,7 @@ OIDC standardizes assurance signaling. A deployment can require step-up authenti
 
 Two seams, both mirroring the `AuthPolicy` pattern of a trait plus a permissive stand-in.
 
-At the login callback, the `IdentityProvider` registry verifies the provider token and the mapper resolves the identity. **Decided (R1).** `PermissiveProvider` is deleted. The replacements are the `oauth2-test-server` fixture and the `dev_idp` example, which already exist. An unrecognised `CONNETTO_OIDC_PROVIDER` becomes a startup error rather than falling through to a permissive default, because the current fall-through means a capitalised provider name yields a deployment that mints real signed tokens in which every user is the same dev identity.
+At the login callback, the `IdentityProvider` registry verifies the provider token and the mapper resolves the identity. **Decided (R1).** `PermissiveProvider` goes, and it is present in `crates/connetto-server/src/authn/provider.rs` until that phase runs. The replacements are the `oauth2-test-server` fixture and the `dev_idp` example, which already exist. An unrecognised `CONNETTO_OIDC_PROVIDER` becomes a startup error rather than falling through to a permissive default, because the current fall-through means a capitalised provider name yields a deployment that mints real signed tokens in which every user is the same dev identity.
 
 At the handshake, `SessionVerifier` today turns connetto's own access token into an `AuthContext`. **Decided (R3).** Under R3 it resolves a list of grants into a `Principal`, which may carry no identity at all. It verifies each grant's signature and expiry without a store round-trip, and checks that the session is still live in the auth store, which is what makes revocation authoritative rather than bounded by the token's remaining lifetime. It is held as a runtime trait-object field on the server rather than as a generic type parameter, because verification fires once per connection and is off any hot path, so static dispatch buys nothing, and a trait object keeps the server's public type signature stable no matter how a deployment configures identity. This differs deliberately from `AuthPolicy`, which stays a generic because it fires per row on the CDC hot path where monomorphization pays.
 
@@ -272,7 +272,7 @@ See `open-questions.md` section 11, where Q11.1 through Q11.4 are resolved: cons
 - **Decided (R3).** A grant that fails to resolve does not end the connection. The reply says nothing about the failure, not the reason and not which grant it was.
 - **Decided (R8).** An identity carries a user id and nothing else. `AuthContext.tenant_id`, `.roles`, and `.claims` are deleted because nothing ever read them.
 - **Decided (R3).** A caller with no identity gets an in-memory local copy, always, with no opt-in. `Replica::Ephemeral` already exists and is already `:memory:`.
-- **Decided (R1).** `PermissiveProvider` is deleted. An unrecognised `CONNETTO_OIDC_PROVIDER` becomes a startup error.
+- **Decided (R1).** `PermissiveProvider` goes, and it is present in `crates/connetto-server/src/authn/provider.rs` until that phase runs. An unrecognised `CONNETTO_OIDC_PROVIDER` becomes a startup error.
 
 ---
 

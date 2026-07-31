@@ -119,17 +119,22 @@ File chunk streaming is mandatory: the client must write chunks to storage as th
 
 The native and WASM clients expose the same public API. Platform-specific code is isolated behind trait implementations:
 
+**Abridged, and `crates/connetto-core/src/traits.rs` is the signature of record.** The shapes below show the seam, not the exact bounds.
+
 ```rust
-trait Transport: Send {
-    async fn send(&self, msg: WireMessage) -> Result<()>;
-    async fn recv(&self) -> Result<WireMessage>;
+trait Transport {
+    type Error;
+    fn send_control(&mut self, msg: ControlMessage) -> Result<(), Self::Error>;
+    fn send_bulk(&mut self, msg: BulkMessage) -> Result<(), Self::Error>;
+    // plus the receive half
 }
 
-trait Store: Send {
-    async fn apply_row_update(&self, patch: LivePatch) -> Result<()>;
-    async fn queue_mutation(&self, m: MutationRecord) -> Result<()>;
-    async fn get_pending_mutations(&self) -> Result<Vec<MutationRecord>>;
-    async fn get_last_lsn(&self) -> Result<u64>;
+trait Store {
+    type Error;
+    async fn apply_bulk(&mut self, frame: BulkMessage) -> Result<(), Self::Error>;
+    async fn enqueue_mutation(/* ... */) -> Result<(), Self::Error>;
+    async fn pending_mutations(&mut self) -> Result<Vec<PendingMutation>, Self::Error>;
+    async fn discard_mutation(&mut self, client_seq: u64) -> Result<(), Self::Error>;
 }
 
 trait FileStore: Send {

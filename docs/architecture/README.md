@@ -15,7 +15,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `04-subscriptions.md` | How a client declares interest in data, and the life of a subscription |
 | `05-aggregate-queries.md` | Counts, sums and grouped results, which are a different problem from row subscriptions |
 | `06-reconnect.md` | Going offline and coming back: resume, catchup, the oplog and its retention window |
-| `07-file-sync.md` | File content sync. **Deferred design, not a current commitment** |
+| `07-file-sync.md` | File content sync, which connetto does **not** build. Retained as the record behind that decision and as input to the exploratory integration phase R24 |
 | `08-authorization.md` | Which caller may see which row, on reads, on changes and on writes. The two executors and the revocation path |
 | `09-wasm.md` | Running the client in a browser: the worker topology, storage, and what the platform does and does not offer |
 | `10-subscription-materializer.md` | The server component that hosts `subql` and turns its per-consumer output into per-session wire output |

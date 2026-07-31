@@ -20,7 +20,9 @@ The markers exist because this repository already shipped a design that was docu
 
 **Table cells carry markers too.** A row of a table is a normative statement like any other, and the marker discipline was applied only to prose until it let four cells assert unbuilt behaviour in the present tense, including that an authorization-service outage cannot leak rows when no such service is wired. If a cell claims a mechanism exists or behaves a certain way, it names its status.
 
-**Tense follows the marker.** Inside a `Decided (RN)` block, write what will be true and name the phase, not what is true. A reader takes the sentence more readily than the heading above it.
+**A decision block describes the target state.** Inside a `Decided (RN)` block, present tense means the end state that phase RN produces, not the state today. So "the field is deleted" under a `Decided (R8)` marker reads as the decision, and no rewriting into the future tense is wanted.
+
+**The exception, which is the case that actually misleads.** When a sentence names something a reader can go and find still present, say so in the same sentence. "`PermissiveProvider` goes, and it is present in `provider.rs` until that phase runs" costs a clause and removes the only reading that does real harm.
 
 ## Purpose
 

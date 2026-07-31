@@ -14,6 +14,8 @@ This programme closes a security defect in how connetto decides who a caller is,
 
 **Every phase has the same shape:** Status, Purpose, Blocked on, Steps, Done when, and where the ordering or the necessity is counterintuitive, Why. A phase is done when its Done when clause is demonstrated, never when it merely compiles.
 
+**The last section holds exploratory phases.** Those are not committed work, each may conclude it should not be built, and deleting one after its investigation changes nothing else. Every phase before that section is committed.
+
 **Record deviations in place, with the reason.** A plan that silently diverges from what was built is worse than no plan, because the next session trusts it.
 
 ## Step zero, before any phase
@@ -70,7 +72,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 |---|---|---|
 | 1 | R1 | Closes the defect the programme exists for, and blocked on nothing |
 | 2 | R0 part A, the connetto-only counters | Cheap, and it prices the dispatch loop before R5b changes what dominates it |
-| 2 | R16 part A, the fan-out research | Blocked on nothing and needs no code, so it runs alongside everything early |
+| 2 | ~~R16 part A, the fan-out research~~ **DONE** | Blocked on nothing and needed no code, so it ran alongside everything early |
 | 3 | R2 | Gives the session layer a durable identity, which R3 consumes |
 | 4 | R8 | Independent surface cleanup, apart from one item wanting R2's registry |
 | 5 | R12 | Prerequisite for R3, because R3 makes a refusal silent on the wire |
@@ -78,11 +80,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 7 | R4 | Needs R3 |
 | 8 | R13 | Needs R3. Off the critical path, so it may slip later without blocking anything |
 | 8 | R22 | Blocked on nothing, and it should land before R19 because it shrinks what throttling must defend against |
-| 9 | R19 | Needs R3, for the same reason: the anonymous tier has to be representable first |
+| 9 | R19 | Needs R2 for the session handle it counts against, and R3 so the anonymous tier is representable |
 | 10 | R5a | Waits on the subql trait landing upstream |
 | 11 | R0 part B, the full measurement | Needs R5a's seam to measure through |
 | 12 | R5b | Needs R5a, R0, and the rls2fga per-row mapping |
-| 13 | R16 part B, the fan-out architecture | Needs R0's numbers and part A's findings |
+| 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. **The bulk frame decision alone must be settled before step 6 ships**, because R3 carries the `PROTOCOL_VERSION` bump and a second bump is a second flag day |
 | 14 | R14 | Needs R0's data and R5b. **Conditional**: dropped if R0 shows the dispatch loop is not the ceiling |
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R4 and R6 |
@@ -93,7 +95,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R17 | A defect, blocked on nothing. Land it whenever, and before anything else relies on the local tier |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
-| any | R15 | Off the critical path. Gated on five unfiled upstream diesel proposals, and filing them is its own first step |
+| any | R15 | Off the critical path. Gated on five upstream diesel proposals landing |
+| last | R24 | Exploratory. How connetto integrates a file-sync stack it does not own |
+| last | R25 | Exploratory, and not now. Device-to-device sync with no server |
 
 ## Status and blockers
 
@@ -114,8 +118,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R5a visibility seam | NOT STARTED | a small subql change | **yes, subql** |
 | R0 part B, full measurement | NOT STARTED | R5a | yes, via R5a |
 | R5b service as executor | NOT STARTED | R5a, R0, rls2fga | **yes, rls2fga** |
-| R16 part A, fan-out research | NOT STARTED | nothing | no |
-| R16 part B, fan-out architecture | NOT STARTED | R0 and R16 part A | no |
+| R16 part A, fan-out research | **DONE** | nothing | no |
+| R16 part B, fan-out architecture | NOT STARTED | R0, and R3 for the wire question only | no |
 | R14 dispatch-loop cost | NOT STARTED | R0 and R5b, conditional on R0's data | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R4 and R6 | inherited |
@@ -126,7 +130,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R17 local tier name and key scope | NOT STARTED | nothing | no |
 | R18 SQLite hardening surface | NOT STARTED | nothing here, `diesel-rs/diesel#5128` for unpinned diesel | no |
 | R11 shared public store | NOT STARTED | nothing | no |
-| R15 replica retention and trimming | NOT STARTED | five unfiled diesel proposals | **yes, diesel** |
+| R15 replica retention and trimming | NOT STARTED | five diesel proposals landing | **yes, diesel** |
+| R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
+| R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
 
 ## Dependency graph
 
@@ -149,8 +155,9 @@ graph TD
   U2[upstream: subql visibility trait] --> R5a
   R5b --> R6[R6 two-check change form]
   R5b --> R14[R14 dispatch-loop cost]
-  R16[R16 fan-out research and architecture]
+  R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture]
   R0 --> R16
+  R16 -.->|frame decision only,<br/>before R3 ships| R3
   R0 --> R14
   R4 --> R7[R7 revocation teardown]
   R6 --> R7
@@ -162,7 +169,9 @@ graph TD
   R17[R17 local tier name and key scope]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
-  U3[upstream: five diesel vacuum proposals, unfiled] --> R15[R15 replica retention and trimming]
+  U3[upstream: five diesel vacuum proposals] --> R15[R15 replica retention and trimming]
+  R24[R24 file-sync integration, exploratory]
+  R25[R25 device-to-device sync, exploratory]
   R2 -.->|registry only| R8
 ```
 
@@ -326,7 +335,13 @@ The codebase advertises behaviour it does not have: error variants nothing const
 2. **Write the migration** for the session row, since the `attrs` blob loses fields.
 3. Construct `FatalErrorReason::ServerShuttingDown`. A graceful shutdown walks R2's connection registry, sends the reason, and closes, so a client backs off instead of hammering a dying process with immediate reconnects. **This item alone needs R2.**
 4. Remove `Oplog::prune` from the trait in `crates/connetto-server/src/oplog.rs`. Both implementations call it from their own `append` and nothing calls it through the trait, so it is an implementation detail exposed as a public seam where an external caller would race with `append`. It is not dead code, and finding it a caller would be the wrong fix.
-5. Fill or remove the browser relay's `MutationConflict.server_updated_at` and `.server_row_json`, which are empty strings (in `conflict_tab_mutation` in `crates/connetto-web/src/relay.rs`) where the server supplies the row's version and JSON (`conflict_outcome` in `crates/connetto-server/src/write_target.rs`). The relay applies the mutation against the local replica, so it **has** the row: either fill them from it, or change the type so their absence is expressible rather than faked.
+5. **Correct four doc comments that advertise behaviour the code does not have.** A `///` or `//!` is surface like any other: it appears in generated rustdoc and a reader takes it as fact. These four were found by sweeping the doc comments, a surface no earlier audit covered.
+   - **`session.rs` module doc says "replies only on failure. Success is the CDC echo, so there is no dedicated ack."** False. `SessionManager` sends `MutationApplied` on every durable apply, and `crates/connetto-core/src/messages/mutation.rs` says so in the same workspace: "a durable apply is additionally confirmed with a `MutationApplied` acknowledgement". **This doc comment is the origin of the same false claim found in `open-questions.md` Q2.2 and Q3.5**, which have since been corrected, so fixing it closes the source rather than another copy.
+   - **`cipher.rs` module doc claims the encryption "defends ... a shared device".** It does not, per the threat model in `docs/architecture/12-identity-session-capability.md`: nothing checks that whoever asks for an account's key is that account, and separation between people is the operating system's user boundary. Chapter 14 carried the identical sentence and was corrected. This is where it came from.
+   - **`locks.rs` module doc attributes the Web Locks liveness protocol to `SharedWorker` ports having no reliable close event.** connetto never constructs a `SharedWorker`. The problem is real for the ports it does use, so the mechanism is right and the motivation names the wrong thing.
+   - **`relay.rs` module doc lists a `SharedWorker` port among the transports a tab may use.** No such port is ever created. The type would accept one, which is why this reads as plausible.
+6. **Fix the broken intra-doc link on `SessionConfig` in `crates/connetto-server/src/session.rs`**, which references `AuthContext` without it being in scope. Verify against the gate first: `RUSTDOCFLAGS="-D warnings" cargo +stable doc` should already be failing on it if it is genuinely unresolved, and if the gate passes then the link resolves and there is nothing to fix.
+7. Fill or remove the browser relay's `MutationConflict.server_updated_at` and `.server_row_json`, which are empty strings (in `conflict_tab_mutation` in `crates/connetto-web/src/relay.rs`) where the server supplies the row's version and JSON (`conflict_outcome` in `crates/connetto-server/src/write_target.rs`). The relay applies the mutation against the local replica, so it **has** the row: either fill them from it, or change the type so their absence is expressible rather than faked.
 
 ### Proof
 
@@ -405,6 +420,8 @@ A refused grant is visible in the log, so R3 may proceed.
 **Status.** NOT STARTED
 
 **Blocked on R2 and R12.** R12 because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. Supersedes the uncommitted E6 step-one work, which is the right vocabulary and the wrong shape.
+
+**Carries the `PROTOCOL_VERSION` bump, and R16 part B may need to ride it.** R16 part A established that the protocol hard-rejects a version mismatch with no negotiation, so every bump is a flag day for all deployed clients. R3's grant list already requires one and has not shipped. If R16 part B's design changes the bulk frame layout, which part A found it probably should, that change must be settled before this phase ships or it forces a second flag day. **This is a coupling on the decision, not on R16 part B's implementation**, and it is the only reason anything in R16 has a deadline. R16 part B is otherwise gated on R0.
 
 ### Purpose
 
@@ -569,40 +586,69 @@ The counter test passes. A policy with no translation and no supplied mapping re
 
 ## R16: how fan-out should scale, researched then designed
 
-**Status.** NOT STARTED
+**Status.** Part A **DONE**. Part B NOT STARTED.
 
-**Part A, the research, is blocked on nothing and can start immediately.** Part B, the architecture, wants R0's numbers so it targets a measured cost rather than a guessed one.
+**Part B is blocked on R0** for the numbers, **and coupled to R3 for one item only.** Part A discovered that the protocol hard-rejects a version mismatch with no negotiation, and that R3's grant list already requires a `PROTOCOL_VERSION` bump which has not shipped. So if part B's design implies a bulk frame change, that change should ride R3's bump rather than force a second flag day for every deployed client. The coupling is a deadline on the *decision*, not on the implementation, and it is recorded in R3 as well.
 
 ### Purpose
 
-Per-event work today is proportional to the number of subscribers, and **it is not established that it has to be.** `docs/architecture/08-authorization.md` asserts that "delivery is K messages for K subscribers and always will be", and that assertion has never been checked against how comparable systems actually work. It is load-bearing: every other phase that touches subscriber cost treats it as a floor, so if it is wrong, those phases are optimizing inside a constraint that does not exist.
+Per-event work today is proportional to the number of subscribers, and **it was not established that it has to be.** `08-authorization.md` asserted that "delivery is K messages for K subscribers and always will be", and that assertion had never been checked against how comparable systems actually work. It was load-bearing: every other phase that touches subscriber cost treated it as a floor.
 
-R5b removes the per-subscriber authorization round trip and R14 removes three per-subscriber allocations and lock acquisitions. **Neither changes the shape of the work**, which stays one unit per subscriber per event. This phase asks whether the unit should be the subscriber at all, or the distinct query, the distinct authorization class, or something else, and answers it from evidence rather than from first principles.
+R5b removes the per-subscriber authorization round trip and R14 removes three per-subscriber allocations and lock acquisitions. **Neither changes the shape of the work.** This phase asks whether the unit should be the subscriber at all, and answers it from evidence.
+
+### Part A, done, and what it established
+
+Six systems read from primary sources at named commits: PowerSync, ElectricSQL, Rocicorp Zero, Convex, Supabase Realtime with its `walrus` RLS filter and the Phoenix fastlane beneath it, and the incremental view maintenance line of differential dataflow, Materialize and Feldera.
+
+**The verdict.** Deliveries are K for K subscribers and that part is inherent, since bytes must reach each client and no studied system escapes it, including the one that pushes the writes onto a CDN. **K deliveries are not K units of work.** K computations, K authorization questions, K frame serializations and K payload copies have each been eliminated by at least one shipping system. The floor is one socket write per client, of bytes that need not be distinct, copied, or computed. The mechanism is always the same: remove the per-client identifier from the artifact.
+
+**The evidence, the reasoning, the five protocol properties that move the floor, and where connetto stands against each, are now in `08-authorization.md` under "The per-client floor".** That chapter is committed, so nothing load-bearing depends on a process artifact. The full working, with a citation per claim, is in `docs/research-fanout-scaling.md` and `docs/research-fanout-connetto-comparison.md`, which are process artifacts and are never committed.
+
+### Findings that change other phases, and must be honoured there
+
+1. **R14 step 3's upstream speculation is answered: no upstream is needed.** That step says sharing the compressed payload "may need the same upstream treatment as the visibility trait". It does not. `subql`'s `pgoutput_patchset` already returns an owned `Vec<u8>`, so wrapping it in a shared handle costs nothing and changes no subql signature.
+2. **R14 steps 1 to 3 are confirmed as the right local targets**, and part A adds the reason they matter more than the plan assumed: the payload copy happens three times per subscriber, not once. A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload, and a second copy into the tagged frame. All three scale with patch size as well as with K.
+3. **Sharing an artifact between clients is gated on R5b, not merely on the artifact's shape.** `subql` already interns two identical queries onto one predicate, but `can_read` still runs per subscriber, so two clients asking the same question can get different answers and cannot share bytes. R5b is therefore the precondition for every multi-client delivery saving, not only a throughput fix. This is the single most important structural finding and it strengthens R5b's priority.
+4. **Deriving subscription identity from the question needs nothing upstream either.** `subql`'s `RegisterResult` already returns `predicate_hash` and `created_new_predicate`. `Materializer::register_request` in `crates/connetto-server/src/materializer.rs` discards both, keeping only the subscription id. The signal Electric derives by hashing a shape and Zero by hashing a transformed AST is already being handed over and dropped.
+5. **One finding has no home in the current plan.** `SessionManager::catch_up_row` in `crates/connetto-server/src/session.rs` calls `Materializer::encode_patch` per record per subscription, rebuilding bytes already produced when the change was live. No studied system does this, and the closest comparable one does the exact inverse. It is a reconnect cost rather than a fan-out cost, so it belongs to neither R14 nor R16 as currently scoped. Part B's chapter covers it and an implementation phase should be derived from that chapter rather than invented here.
 
 ### Steps, part A: research
 
-1. **Read how the state of the art does it, from primary sources**, meaning documentation, source, and papers rather than blog summaries. The standing rule against assuming an external system's capabilities applies with full force here, since the whole point is to learn what these systems actually do. Candidates worth reading: PowerSync's buckets and sync rules, ElectricSQL's shapes and whether their logs are cacheable by a third party, Rocicorp's Zero, Convex, Supabase Realtime, and the incremental view maintenance line (Materialize, Feldera, differential dataflow).
-2. **For each, answer one question: what is the unit of computation, and what is the unit of delivery.** Those are separable, and conflating them is what produced the assertion above. A system may compute once per query shape and still write once per socket, in which case delivery stays proportional while computation does not.
-3. **Establish what is genuinely inherent.** A byte has to reach every client, so some per-client work is a floor. Determine precisely where that floor sits: whether it is a socket write, a frame serialization, or a full patch computation, and what protocol properties move it.
-4. **Write the findings up as a document**, with a citation per claim. A finding without a source is not a finding, and this phase exists because an unsourced assertion became architecture.
+All four are complete.
+
+1. ~~Read how the state of the art does it, from primary sources.~~ **Done**, six systems at named commits.
+2. ~~For each, answer what is the unit of computation and what is the unit of delivery.~~ **Done**, kept apart per system.
+3. ~~Establish what is genuinely inherent.~~ **Done.** The floor is the socket write, and the five protocol properties that move everything above it are recorded.
+4. ~~Write the findings up as a document, with a citation per claim.~~ **Done.**
 
 ### Steps, part B: the architecture
 
-5. **Draft connetto's own design against those findings**, as an architecture chapter rather than as a phase. Name the unit of computation it chooses and why, and say explicitly what remains proportional to subscriber count and why that is acceptable.
-6. **Say what it costs to get there.** If the answer implies a protocol change, a materializer API change, or an upstream change in `subql`, name each, because the current per-consumer patch and per-consumer frame are both structural rather than incidental.
-7. **Correct or delete the assertion in `08-authorization.md`**, whichever the evidence supports, and remove the marker this phase adds to it.
+5. **Draft connetto's own design against those findings**, as an architecture chapter rather than as a phase. Name the unit of computation it chooses and why, and say explicitly what remains proportional to subscriber count and why that is acceptable. Part A pre-answers a good deal of this and finding 5 adds catchup to its scope.
+6. **Say what it costs to get there.** Part A establishes that no upstream change is required for anything on the delivery side, so this step reduces to naming the protocol and materializer changes. The bulk frame layout is the item on R3's clock.
+7. ~~Correct or delete the assertion in `08-authorization.md`, and remove the marker.~~ **Done early**, during part A, because part A produced exactly the evidence the correction needed and leaving a known-false sentence marked in a committed chapter served nobody. Both occurrences were corrected, at the decisions list and in "Cost on the change path", and the marker is gone.
+
+### Inputs already settled with the maintainer, ahead of part B
+
+Recorded as a **deviation from this plan's sequencing**, with its reason, so part B writes them up rather than re-deriving them. The deviation is that these were settled without R0's numbers.
+
+The reason is twofold. The frame layout has a deadline that belongs to R3 rather than to R0, and a second `PROTOCOL_VERSION` bump costs every deployed client a second forced upgrade. The remainder are strictly less work for identical behaviour, which R0 cannot veto, only prioritise.
+
+- **Bulk frame layout: split the header from the body.** A bulk frame becomes the tag, a short encoded header, then the compressed payload appended untouched. This resolves a drift rather than changing direction: `02-protocol.md` already gives the bulk plane's encoding as "Zstd-precompressed opaque bytes" whose payloads "arrive already compressed", and `crates/connetto-core/src/messages/bulk.rs` says the same, while the code MessagePack-encodes a struct that embeds them. Buys copy elimination, not frame sharing, because `sub_id` is client-chosen.
+- **Payload by shared reference, `Arc<[u8]>`, no new dependency.** `tokio-tungstenite` is pinned at 0.24 where `Message::Binary` takes an owned `Vec<u8>`, so `bytes::Bytes` buys nothing at the send boundary. Together with the frame split this takes payload copies per subscriber per event from three to one, and one is the floor until that dependency is upgraded.
+- **The oplog stores the prepared patch rather than rebuilding it per reader**, with a byte bound added to `OplogConfig` alongside the existing entry and age bounds, because payload size otherwise escapes retention control.
+- **Subscription lifetime is aligned with the oplog retention window.** A subscription outlives its socket by the same window the log retains, then expires. This is required for the previous item to work at all: `dispatch` only builds a payload when a consumer matches, teardown destroys the subscription the instant the socket closes, so a change arriving while a client is briefly offline is appended with no payload and that client is exactly who will ask for it. `subql` already models the distinction with `SubscriptionScope::{Durable, Session}`, unused by connetto today. It implies splitting teardown so the route drops immediately and the subscription defers, an expiry sweeper, and setting a registry cap, since the registry is currently uncapped.
 
 ### Proof
 
-Part A is proved by the document: every claim about an external system carries a source, and the inherent floor is stated with the reasoning that establishes it. Part B is proved by the architecture chapter naming a unit of computation and the changes required to adopt it, at a level of detail an implementation phase could be written from.
+Part A is proved by the document: every claim about an external system carries a source, and the inherent floor is stated with the reasoning that establishes it. **Met.** Part B is proved by the architecture chapter naming a unit of computation and the changes required to adopt it, at a level of detail an implementation phase could be written from.
 
 ### Done when
 
-The question "does per-event work have to scale with subscriber count" has a sourced answer, and connetto has a written target architecture rather than an assumption. **A conclusion that the current shape is correct is a valid outcome**, provided it is sourced, because the defect being fixed is that nobody checked.
+Part A: the question "does per-event work have to scale with subscriber count" has a sourced answer. **Met, and the answer is no for every layer except the socket write.** Part B: connetto has a written target architecture rather than an assumption.
 
 ### Why this precedes an implementation refactor
 
-No implementation phase should be written before this lands. R14 is a local optimization inside the current shape and is safe to do either way, but anything larger would be committing to a structure chosen without evidence, which is how the current assertion got in.
+No implementation phase should be written before part B lands. R14 is a local optimization inside the current shape and is safe to do either way, but anything larger would be committing to a structure chosen without evidence, which is how the original assertion got in. **Part A does not license implementation.** It licenses part B.
 
 ---
 
@@ -623,8 +669,9 @@ Today the per-subscriber authorization check dominates them by orders of magnitu
 
 1. Take the materializer lock **out of the per-subscriber loop.** The loop needs what the lock guards, not the lock, so hoist the read or take a snapshot of what the fan-out consumes before entering the loop.
 2. Stop cloning a `Route` per subscriber. A `Principal` behind a shared reference or a cheap handle is enough for a fan-out that only reads it.
-3. **Stop copying the compressed payload per subscriber.** `Materializer::dispatch` compresses once and then hands every consumer its own `Vec<u8>` through `MatchedPatch::payload_zstd`. A shared immutable handle carries the same bytes to every consumer. This is an API change on the materializer rather than a change inside connetto's loop, so it may need the same upstream treatment as the visibility trait.
-4. Do nothing else. **Scope is exactly what R0 measured**, and any further optimization needs its own measurement rather than this phase's momentum.
+3. **Stop copying the compressed payload per subscriber.** `Materializer::dispatch` compresses once and then hands every consumer its own `Vec<u8>` through `MatchedPatch::payload_zstd`. A shared immutable handle carries the same bytes to every consumer. **Corrected by R16 part A: this needs no upstream change.** The step previously speculated it "may need the same upstream treatment as the visibility trait". `subql`'s `pgoutput_patchset` already returns an owned `Vec<u8>`, so wrapping it in an `Arc<[u8]>` costs nothing and changes no subql signature. It is a connetto-local API change on the materializer.
+4. **Also corrected by R16 part A: the payload is copied three times per subscriber, not once.** A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload in the encoded frame, and a second copy into the tagged frame. This step removes the first. The other two are removed by the bulk frame layout change, which is R16 part B's and is coupled to R3's `PROTOCOL_VERSION` bump rather than to R0. If the two phases land apart, note that this step alone takes three copies to two.
+5. Do nothing else. **Scope is exactly what R0 measured**, and any further optimization needs its own measurement rather than this phase's momentum. In particular, reconnect catchup rebuilds patches per client and is *not* in this scope: R16 part A found it and R16 part B covers it.
 
 ### Proof
 
@@ -1022,6 +1069,70 @@ A replica that has held and released a large window returns disk to the filesyst
 ### Why step 2 cannot simply be deferred with the rest
 
 `auto_vacuum` is not retroactive, so a replica created without it can never shrink incrementally and needs a full rewrite instead. **This is not urgent today:** the workspace is `version = "0.0.0"`, unpublished, with no deployment, so no user file exists to foreclose. It becomes irreversible at the first release, which is the deadline it actually has.
+
+---
+
+# Exploratory phases
+
+**Neither of these is committed work.** They exist so the ideas are not lost, they are last on purpose, and each is allowed to conclude that it should not be built. A phase in this section may be deleted after its investigation without anything else changing, which is not true of any phase above.
+
+## R24: how connetto integrates a file-sync stack
+
+**Status.** NOT STARTED, exploratory.
+
+**Blocked on nothing, and deliberately last.** Nothing above depends on it.
+
+### Purpose
+
+**connetto does not build file sync**, and that is recorded: `docs/architecture/open-questions.md` puts file sync permanently outside its scope and names a separate stack, `https://github.com/LucaCappelletti94/file-system`. What is not decided is how connetto **integrates** such a stack, and there is already a seam pointing at it: `FileStore` in `crates/connetto-core/src/traits.rs` declares `write_chunk`, `read_chunk` and `has_chunk` over content hashes, and **nothing implements it**.
+
+So the question is not whether to build file sync. It is whether that seam is the right shape for a stack connetto does not own, and what the split of responsibility is when file metadata travels as ordinary synced rows while content does not.
+
+**One record now, not two.** `07-file-sync.md` previously described file sync as "deferred to a future phase of connetto", contradicting the index. That is resolved: the chapter is retained as the record behind the out-of-scope decision and as input to this phase, and it says so.
+
+### Steps
+
+1. Read the separate stack and establish what it actually offers, rather than designing against an assumption about it.
+2. Judge whether `FileStore` is the right seam. It is content-addressed chunk storage, which suits some designs and not others. An unimplemented trait is cheap to change and expensive to keep if it is wrong.
+3. Decide what travels on connetto's wire. Metadata as ordinary rows is the obvious answer and the one chapter 07 assumes, so verify it rather than inherit it.
+4. **Say what the authorization story is**, because a content-addressed chunk store has no rows for row-level security to gate, so whatever guards file content is a different mechanism from everything in R5b.
+
+### Proof
+
+A written position on the seam, with the separate stack's real surface cited rather than assumed.
+
+### Done when
+
+Either a justified seam or a justified deletion of `FileStore`, decided against the separate stack's real surface rather than against an assumption about it.
+
+---
+
+## R25: device-to-device sync without a server
+
+**Status.** NOT STARTED, exploratory, and explicitly not now.
+
+**Blocked on nothing and wanted by nothing.** Recorded so the idea survives, not because it is next.
+
+### Purpose
+
+Every path today assumes a server: the client syncs to one, authorization is answered by one, and the change stream originates in one Postgres. Two devices belonging to the same person cannot reconcile directly, even when both hold a replica of overlapping data and neither can reach the network.
+
+Nothing in the repository mentions this, so this phase exists to hold the question rather than to answer it.
+
+### Steps
+
+1. **Establish what would break, before designing anything.** The interesting parts are already visible: the exactly-once mutation watermark is keyed on a session handle a peer never issued, cursors are positions in one server's change log, and authorization on the change path is a question only a server can answer today. Each is a real obstacle and naming them honestly is most of the value here.
+2. Decide whether the goal is convergence between peers or only a faster path to the same server-mediated result. Those are different products and conflating them is how this kind of work becomes unbounded.
+3. Read how comparable systems do it before proposing a mechanism, per the standing rule about not assuming an external system's capabilities.
+4. **Reach a recommendation that is allowed to be no.** A written conclusion that connetto should stay server-mediated is a successful outcome, provided the obstacles are named.
+
+### Proof
+
+A document naming what breaks and why, with a recommendation either way, at a level of detail a real phase could be written from if the answer is yes.
+
+### Done when
+
+The question has a sourced answer instead of being absent. **No implementation follows from this phase**, whatever it concludes.
 
 ---
 

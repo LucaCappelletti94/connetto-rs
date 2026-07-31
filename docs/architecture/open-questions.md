@@ -261,7 +261,7 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 
 **Q7.1 to Q7.8** ~~All file sync questions.~~
 
-**Decision: file sync is permanently outside connecto's scope.** It belongs to a separate stack (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are for that stack to answer. See https://github.com/LucaCappelletti94/file-system-review for notes and research.
+**Decision: file sync is permanently outside connetto's scope.** It belongs to a separate stack (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are for that stack to answer. See https://github.com/LucaCappelletti94/file-system-review for notes and research.
 
 ---
 

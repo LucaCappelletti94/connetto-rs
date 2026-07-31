@@ -2,7 +2,9 @@
 
 **Status**: draft
 
-> **Scope notice:** File sync is deferred to a future phase of connetto, after the current identity, session, capability, and authorization work is complete. This chapter records the design intent for that future phase, not a current commitment. The index records the original deferral at Q7.1 to Q7.8.
+> **Scope notice: connetto does not build file sync, and this chapter is not a plan to.** The index records the decision at Q7.1 to Q7.8: file sync is outside connetto's scope and belongs to a separate stack, `https://github.com/LucaCappelletti94/file-system`. What remains connetto's is how it **integrates** such a stack, for which `FileStore` in `crates/connetto-core/src/traits.rs` is an unimplemented seam, and that is phase R24, which is exploratory and may conclude the seam is wrong.
+>
+> This chapter is retained as a record of the design thinking that produced that decision, including the chunking, hashing and content-channel questions the separate stack has to answer. **Read it as history and as input to R24, not as intent.** An earlier version of this notice said file sync was "deferred to a future phase of connetto", which contradicted the index.
 
 ---
 

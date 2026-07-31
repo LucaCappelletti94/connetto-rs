@@ -50,7 +50,7 @@ On receiving a `MutationHeader` and its `MutationPatch`:
 2. Check schema: does the payload match the current column set?
 3. Check for conflict: compare `base_version` to the current row version in PostgreSQL.
 4. If all checks pass: `BEGIN`, apply the mutation, `COMMIT`.
-5. Reply with `MutationAck(client_seq)`.
+5. Reply with `MutationApplied { client_seq }`.
 
 On authorization failure: `MutationReject(client_seq, reason=Unauthorized)`.
 On schema mismatch: `MutationReject(client_seq, reason=SchemaMismatch)`.
