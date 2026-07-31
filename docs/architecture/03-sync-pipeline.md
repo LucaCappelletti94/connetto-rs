@@ -1,4 +1,4 @@
-# 03 — Sync Pipeline
+# 03: Sync Pipeline
 
 **Status**: draft
 
@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Describe how mutations flow from client to server (write path) and how server-side changes flow back to clients (read/push path). This file covers the happy path and the main failure modes; offline/reconnect is in `06-reconnect.md`.
+Describe how mutations flow from client to server (write path) and how server-side changes flow back to clients (read/push path). This file covers the happy path and the main failure modes. Offline/reconnect is in `06-reconnect.md`.
 
 ---
 
@@ -38,13 +38,13 @@ The queue survives process restart and network interruption.
 
 ### 3. Sending
 
-The mutation sender reads the head of the queue and sends a `Mutation` message to the server. It does not dequeue until it receives `MutationAck`, `MutationReject`, or `MutationConflict`.
+The mutation sender reads the head of the queue and sends a `MutationHeader` control frame followed by its `MutationPatch` bulk frame. It does not dequeue until it receives `MutationApplied`, `MutationReject`, or `MutationConflict`.
 
 If the connection drops before an ack, the mutation is re-sent after reconnect (the server is idempotent on duplicate `client_seq` within a session).
 
 ### 4. Server validation and apply
 
-On receiving a `Mutation`:
+On receiving a `MutationHeader` and its `MutationPatch`:
 
 1. Check authorization: does the client have write permission for this table and row?
 2. Check schema: does the payload match the current column set?
@@ -113,30 +113,30 @@ For each matched subscription, the auth engine checks:
 
 - **Before the change**: if the client could see the old row, it may need a delete event.
 - **After the change**: if the client can see the new row, it gets an insert/update event.
-- **Visibility change**: a row becoming visible to a client is delivered as an insert; a row becoming invisible is delivered as a delete (even if the underlying op was an update).
+- **Visibility change**: a row becoming visible to a client is delivered as an insert. A row becoming invisible is delivered as a delete (even if the underlying op was an update).
 
 Auth is evaluated in batch for all affected subscriptions at once, not per-subscription serially.
 
 ### 4. Delta packager
 
-Matching, authorized changes are grouped into a `RowUpdate` batch per session. The batch includes:
+Matching, authorized changes are grouped into a `LivePatch` frame per session. The frame includes:
 
 - The server LSN (so the client can advance its cursor)
 - A list of `(sub_id, op, pk, new_values)` entries
 
-Multiple subscriptions affected by the same underlying change may be bundled in the same `RowUpdate` message.
+Multiple subscriptions affected by the same underlying change may be bundled in the same `LivePatch` frame.
 
 ### 5. Delivery
 
-The packaged `RowUpdate` is placed in the session's outbound delivery queue. The delivery queue respects the flow-control window (see `02-protocol.md`). If the window is exhausted, delivery is paused.
+The packaged `LivePatch` frame is placed in the session's outbound delivery queue. The delivery queue respects the flow-control window (see `02-protocol.md`). If the window is exhausted, delivery is paused.
 
 The message is sent over the WebSocket connection.
 
 ### 6. Client apply
 
-On receiving `RowUpdate`:
+On receiving `LivePatch`:
 
-1. Buffer if LSN is not contiguous with the last applied LSN (gap detected — see `06-reconnect.md`).
+1. Buffer if LSN is not contiguous with the last applied LSN (gap detected: see `06-reconnect.md`).
 2. For each entry, apply to local SQLite: INSERT / UPDATE / DELETE on the relevant local table.
 3. Clear the `pending` flag on local rows that match a confirmed mutation (matched by pk + LSN).
 4. Persist the new LSN as the client's resume cursor.
@@ -146,22 +146,22 @@ On receiving `RowUpdate`:
 
 ## Interaction Between Write and Read Paths
 
-When a client's own mutation is successfully applied server-side, it triggers a CDC event. That event flows through the fanout engine and may arrive back at the originating client as a `RowUpdate`.
+When a client's own mutation is successfully applied server-side, it triggers a CDC event. That event flows through the fanout engine and may arrive back at the originating client as a `LivePatch` frame.
 
 The client must recognize this and not double-apply:
 
-- Server-confirmed rows are matched by pk + LSN (the LSN of the mutation's commit is included in `MutationAck`).
-- When a `RowUpdate` arrives for a row the client already applied optimistically, the client reconciles: if the server value matches the local value, it just clears the `pending` flag; if it differs, it applies the server value (server wins by default for own-mutation reconciliation).
+- Server-confirmed rows are matched by pk + LSN (the LSN of the mutation's commit is included in `MutationApplied`).
+- When a `LivePatch` frame arrives for a row the client already applied optimistically, the client reconciles: if the server value matches the local value, it just clears the `pending` flag. If it differs, it applies the server value (server wins by default for own-mutation reconciliation).
 
 ---
 
 ## Open Questions
 
-1. **Mutation window**: should the client pipeline multiple in-flight mutations (window of N) or enforce strict one-at-a-time? Pipelining increases throughput but complicates conflict handling when an early mutation in the window is rejected.
-2. **Base version representation**: what exactly is `base_version`? Row-level timestamp? Vector clock? PostgreSQL `xmin`? Choice affects conflict granularity and server-side comparison cost.
-3. **CDC source**: logical replication vs. trigger-based `NOTIFY` — tradeoffs in latency, setup complexity, and permission requirements.
-4. **Predicate evaluation**: for complex subscription filters, should matching be done fully in-process, or should the server issue a small SQL query per CDC event? The latter is accurate but slower.
-5. **Own-mutation echo suppression**: should the server suppress the CDC echo for the originating client (send only `MutationAck` and no `RowUpdate`), or always send both? Suppression is an optimization but complicates LSN tracking.
+1. ~~**Mutation window**: should the client pipeline multiple in-flight mutations (window of N) or enforce strict one-at-a-time? Pipelining increases throughput but complicates conflict handling when an early mutation in the window is rejected.~~ **Decided (Q3.1):** Dissolved by Q2.2. The client sends PatchSets, not individual mutations, so the concept of a mutation window does not apply.
+2. ~~**Base version representation**: what exactly is `base_version`? Row-level timestamp? Vector clock? PostgreSQL `xmin`? Choice affects conflict granularity and server-side comparison cost.~~ **Decided (Q3.2):** `updated_at TIMESTAMPTZ` is the conflict token, using `WHERE id = ? AND updated_at = ?` to detect conflicts. `xmin` wraps internally and is unsuitable. Vector clocks and HLC are overkill for a single-authority PostgreSQL backend.
+3. ~~**CDC source**: logical replication vs. trigger-based `NOTIFY`: tradeoffs in latency, setup complexity, and permission requirements.~~ **Decided (Q3.3):** Logical replication. The entire stack is built on logical replication, so no trigger-based `NOTIFY` path is needed or planned.
+4. ~~**Predicate evaluation**: for complex subscription filters, should matching be done fully in-process, or should the server issue a small SQL query per CDC event? The latter is accurate but slower.~~ **Decided (Q3.4, Q8.1):** Subscription predicate matching is in-process via `subql` (bitmap-indexed candidate pruning plus predicate bytecode VM), with SQL re-execution fallback for predicates outside its scope (JOINs, subqueries, MIN or MAX extreme removal). Authorization is evaluated via OpenFGA using its Rust SDK (Q8.1), not per-row SQL queries.
+5. ~~**Own-mutation echo suppression**: should the server suppress the CDC echo for the originating client (send only `MutationAck` and no `RowUpdate`), or always send both? Suppression is an optimization but complicates LSN tracking.~~ **Decided (Q3.5):** No suppression. The `LivePatch` frame arriving from the CDC fanout is the de-facto acknowledgement: the client matches it against pending ops by PK and clears the pending status. Dedicated reject or conflict messages handle error cases only.
 
 ---
 

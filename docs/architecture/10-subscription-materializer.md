@@ -1,4 +1,4 @@
-# 10 — Subscription Materializer
+# 10: Subscription Materializer
 
 **Status**: draft
 
@@ -6,15 +6,15 @@
 
 ## Purpose
 
-The **Subscription Materializer** is the server-side component that hosts `subql` and turns its per-consumer output into per-session wire output for each client. It is the only server piece that knows about client sessions, authorization, and the reliability policy.
+The **Subscription Materializer** is the server-side component that hosts `subql` and turns its per-consumer output into per-session wire output for each client. It is the only server piece that knows about client sessions and the reliability policy. Authorization is split at the boundary: the visibility trait is defined in `subql`, and the materializer holds the implementation.
 
-It is deliberately thin. After the `subql` full-loop work, the library owns the CDC ingestion, the event to patchset conversion, the inbound apply, and the re-execution state machine. The materializer is what remains once those live inside `subql`: the session, authorization, and reliability surface a sync server must own and a CDC library must not. This chapter pins that boundary as it stands today (an earlier draft placed the CDC connection and patchset building inside the materializer, which is no longer where they live) and fixes where reliability and retry sit, which had been folklore under one Transport bullet in `01-pieces.md`.
+It is deliberately thin. After the `subql` full-loop work, the library owns the CDC ingestion, the event to patchset conversion, the inbound apply, and the re-execution state machine. The materializer is what remains once those live inside `subql`: the session and reliability surface a sync server must own, and the implementation of the visibility trait `subql` defines. This chapter pins that boundary as it stands today (an earlier draft placed the CDC connection and patchset building inside the materializer, which is no longer where they live) and fixes where reliability and retry sit, which had been folklore under one Transport bullet in `01-pieces.md`.
 
 ---
 
 ## What subql owns (the materializer only drives it)
 
-`subql` is an in-process library with no async runtime of its own. The materializer supplies the runtime, the connections, and the policy, then drives `subql`. The library owns:
+`subql` is an in-process library with no async runtime of its own. The materializer supplies the runtime, the connections, and the visibility trait implementation, then drives `subql`. The library owns:
 
 - **CDC ingestion.** The `CdcSource` trait plus concrete sources: `PgStreamingCdcSource` (holds a `pg_walstream` replication connection, issues `START_REPLICATION`, stamps each event with its LSN, and flows acks back so PG can recycle WAL), `PollingPgCdcSource` (drains a slot over plain SQL), and `SqliteCdcSource` on the client side. WAL parsers for pgoutput, wal2json v1 and v2, Maxwell, and Debezium feed one path. The materializer drives the consume loop (`next_event` and `ack`) and decides the ack cadence and reconnect policy, but does not parse WAL or hold the replication protocol.
 - **Matching and classification.** The subscription registry, routing by referenced tables, the bitmap-indexed candidate prune, the predicate VM with SQL three-valued logic, and UPDATE transition detection. A base UPDATE surfaces per consumer as `inserted`, `deleted`, or `updated` when a row enters, leaves, or changes within its result set.
@@ -23,18 +23,19 @@ It is deliberately thin. After the `subql` full-loop work, the library owns the 
 - **Inbound apply.** `SubscriptionEngine::apply_diffset_bytes` parses uploaded SQLite session bytes, dispatches the patchset or changeset marker, reconstructs against the catalog, and applies transactionally through native diesel adapters (`PgAdapter`, `MysqlAdapter`, `SqliteAdapter`, and `CustomTypePgAdapter` for enum and domain columns). No SQL casts.
 - **Re-execution state machine.** The `reexec` module. `ReExecEngine` classifies queries the row-image engine cannot resolve (MIN or MAX extreme removal, single-table row re-execution behind a filter it cannot evaluate, multi-table aggregates, complex HAVING) and either emits a `ReExecutionTrigger` for the caller to service, or, via `AutoResolvingEngine` and a caller-supplied `Connector`, runs the query itself and returns a `ScalarUpdate`. `install(query_id, value)` sets the stored value unconditionally. `subql` owns the classification and the state. The caller owns the actual DB query and its retry.
 - **Predicate-state persistence and position types.** Durable shards for predicate state, and the `Checkpoint` family (`PgLsn`, `MysqlBinlogPos`).
+- **OpenFGA upkeep.** The per-row upkeep of the permission records lives in `subql`, driven from the change stream, because removing a record requires the value it was built from and `subql` is where both row versions are in hand. **Decided (R5b).** Blocked on `rls2fga` gaining a per-row mapping, which it does not have today, and that blocks R5b.
 
 The line to hold onto: `subql` runs re-execution queries through a `Connector` the materializer implements, and it holds no retry anywhere. Everything that can transiently fail crosses a connection the materializer owns or configures.
 
 ---
 
-## What the materializer owns (subql never will)
+## What the materializer owns
 
 - **Sessions and the wire.** `subql` speaks in consumer ids, typed events, `AggDelta`s, and patchset bytes. It has no notion of a WebSocket session, the flow-control window, keepalive, the reconnect handshake, or the `connetto-core` `ControlMessage` and `BulkMessage`. The materializer maps `subql`'s per-consumer output onto sessions and frames it into `SnapshotPatch`, `LivePatch`, and aggregate envelopes carrying the resume `Cursor`, back-pressured per session.
-- **Authorization.** `subql` holds no policy engine. Read visibility: after `consumers()` matches on the predicate, the materializer applies the OpenFGA and RLS check per (session, row, event), fail-closed, and only then assembles that session's patchset from its visible subset. A row becoming invisible is delivered as a delete. Write authority: every inbound mutation is gated before apply. `subql`'s `Connector::AuthContext` carries a per-subscription identity into a re-execution so an RLS re-query runs under the right role, but the policy decision is the materializer's (see `08-authorization.md` and the `AuthPolicy` trait in `connetto-core`).
-- **Per-session patchset assembly.** `subql`'s builder folds a slice of events into one patchset. Because authorization and per-subscription filtering differ per client, the materializer selects each session's authorized, matched event subset and invokes the builder for it. The primitive is `subql`'s. The per-session selection is the materializer's.
-- **The write path end to end.** A client uploads a `MutationPatch`. The materializer authorizes the write, detects conflicts (the `updated_at` token per Q3.2), calls `subql.apply_diffset_bytes` in a transaction against its PG pool, and reports the outcome (per Q3.5 the CDC echo serves as the success ack, so only `MutationReject` and `MutationConflict` are dedicated messages). `client_seq` idempotency and the reply are the materializer's.
-- **Oplog, reconnect, and catchup.** The retention-bounded oplog keyed by LSN, the catchup versus `FullResyncRequired` decision, and tombstones (`06-reconnect.md`) are session-bound server state.
+- **Authorization.** The visibility trait is defined in `subql`, which holds the replication connection and already computes previous-versus-current transitions per subscriber for the subscription predicate. `subql` ships a ready-made implementation backed by the authorization service, and a downstream user may implement the trait itself. connetto's `AuthPolicy` is superseded by it. **Decided (R5a).** The trait has callers on both sides of the boundary, which is why it is defined low and consumed upward: the live change path moves into `subql`, while the reconnect catchup path and the write path stay in connetto. This follows an idiom `subql` already uses: query re-execution works by `subql` asking the caller through a `Connector`, because the query and its retry belong to the caller. A row becoming invisible is delivered as a delete. The check runs against both versions of the row, with the previous-version check made only when the current version is absent or invisible. **Decided (R6).** `subql`'s `Connector` carries a `Principal` (which may carry no identity) into a re-execution so an RLS re-query runs under the right role. **Decided (R3).** Write authority: every inbound mutation is gated before apply.
+- **Per-session patchset assembly.** `subql`'s builder folds a slice of events into one patchset. Because per-subscription filtering differs per client, the materializer selects each session's matched event subset and invokes the builder for it. The visibility answer for each row comes from the trait `subql` defines, not from a check the materializer performs independently. The primitive is `subql`'s. The per-session selection is the materializer's.
+- **The write path end to end.** A client uploads a `MutationPatch`. The materializer authorizes the write (strict consistency preference, versus the fast preference on the change path, **Decided (R5b)**, see `08-authorization.md`), detects conflicts (the `updated_at` token per Q3.2), calls `subql.apply_diffset_bytes` in a transaction against its PG pool, and reports the outcome (per Q3.5 the CDC echo serves as the success ack, so only `MutationReject` and `MutationConflict` are dedicated messages). `client_seq` idempotency and the reply are the materializer's.
+- **Oplog, reconnect, and catchup.** The retention-bounded oplog keyed by LSN, the catchup versus `FullResyncRequired` decision, and tombstones (`06-reconnect.md`) are session-bound server state. The catchup path carries the same two-version authorization obligation as the live path, so the oplog must carry whatever those checks need. **Decided (R6).**
 - **Reliability orchestration.** `subql` keeps zero retry surface on purpose. The materializer is where one backoff primitive covers CDC reconnect, re-execution retry and coalescing, OpenFGA retry, delivery back-pressure, and mutation retry.
 - **Wiring choices subql leaves open.** Streaming versus polling source, the bare `ReExecEngine` (explicit coalescing and retry) versus `AutoResolvingEngine` with a `Connector`, and how a stateful subscription bootstraps its first `install`ed value.
 
@@ -62,7 +63,7 @@ The big-picture diagram in `00-overview.md` collapsed everything server-side aft
 │      │     │ (via Connector)               ▼ patchset bytes      install │    │
 │      │     │           ┌──── Subscription Materializer ──────────────────┴┐ │
 │      │     │ mutation  │  drive CdcSource loop + ack                       │ │
-│      │     └───────────┤  authorize (OpenFGA read filter, write gate)      │ │
+│      │     └───────────┤  authorize (visibility trait, write gate)         │ │
 │      │       apply     │  per-session patchset assembly + framing          │ │
 │      └─────────────────┤  oplog + catchup, all retry                       │ │
 │                        └────────────────────────┬──────────────────────────┘ │
@@ -71,7 +72,7 @@ The big-picture diagram in `00-overview.md` collapsed everything server-side aft
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-`subql` owns the connection and the byte-level conversion. The materializer owns the policy, the sessions, and the reliability that wraps it.
+`subql` owns the connection and the byte-level conversion. The materializer owns the sessions, the visibility trait implementation, and the reliability that wraps it.
 
 ---
 
@@ -95,8 +96,8 @@ The big-picture diagram in `00-overview.md` collapsed everything server-side aft
 |---|---|
 | **Drive the CDC loop** | Consume `subql`'s `CdcSource`, feed events into matching in order, and ack progress so PG recycles WAL. |
 | **Fan out to sessions** | Map `subql`'s per-consumer notifications and aggregate deltas onto sessions, framed as `connetto-core` bulk messages under flow control. |
-| **Authorize** | Apply OpenFGA per (session, row, event) after matching and before per-session patchset assembly, and gate every inbound mutation. |
-| **Assemble per-session patchsets** | Select each session's authorized, matched event subset and invoke `subql`'s patchset builder for it. |
+| **Authorize** | Implement the visibility trait `subql` defines, called by `subql` on the live change path and by the materializer on the write and catchup paths. Gate every inbound mutation. |
+| **Assemble per-session patchsets** | Select each session's matched event subset (visibility determined by the trait `subql` defines) and invoke `subql`'s patchset builder for it. |
 | **Run the write path** | Authorize and conflict-check an uploaded `MutationPatch`, then apply it through `subql.apply_diffset_bytes` transactionally and report the outcome. |
 | **Provide the re-exec Connector** | Implement the `Connector` (or service bare `ReExecEngine` triggers) that runs re-execution queries against PG, then `install` the result. |
 | **Bootstrap stateful subscriptions** | On `Subscribe`, when `subql` classifies a query as stateful (MIN or MAX, multi-table aggregate, complex HAVING), run it once and `install` the initial value. |
@@ -117,7 +118,7 @@ The retry policy lives here because everything that can transiently fail in the 
 | 1 | CDC source drop (replication slot or slot poll) | materializer, driving `subql`'s `CdcSource` | replication LSN | reconnect with exponential backoff and jitter, resume from the last consumed LSN, alert operators on a bounded outage rather than silently dropping events |
 | 2 | Re-execution against PG | materializer, via `subql`'s re-exec `Connector` | `(query_id, last_observed_lsn)` | bounded retries with backoff, then surface `SyncFailure { query_id, reason }` to affected sessions, never lose the trigger (re-arm on reconnect) |
 | 3 | Bootstrap re-execution (initial value for a stateful subscription) | materializer | `(sub_id)` | bounded retries, then `Reject` the subscription with the cause and tell the client |
-| 4 | OpenFGA authorization call | materializer, auth filter | request id plus content hash | short-window retries on transient outage, then fail closed (drop the row from delivery and log), never deliver unauthorized rows |
+| 4 | Authorization call. **Decided (R5b), not built** | materializer, auth filter | request id plus content hash | Intended: short-window retries on a transient outage, then fail closed, dropping the row and logging. Today the call goes to Postgres row-level security with no retry, and it fails closed |
 | 5 | Patchset write to a session outbound queue | materializer | server LSN of the batch | per-session bounded retries respecting flow-control credits, back-pressure CDC on session-buffer exhaustion rather than dropping events server-side |
 | 6 | Server-side mutation apply (transient PG error, serialization failure) | materializer, mutation handler | `client_seq` | bounded retries with backoff, then `MutationReject` with the cause so the client's optimistic write rolls back |
 | 7 | Client transport reconnect | client connector (Sync Client) | session id plus `last_applied_lsn` | exponential backoff and jitter, resume via `06-reconnect.md`, full re-sync if the cursor falls off the oplog |
@@ -176,7 +177,7 @@ These five let the materializer treat `subql`'s event processing as a determinis
 1. **Bootstrap concurrency.** When a stateful subscription registers, the bootstrap re-execution can race with live CDC events. Two options: (a) freeze CDC dispatch for that subscription until the bootstrap LSN is reached, or (b) re-execute at a snapshot LSN and replay the oplog forward to the live tip. Option (b) is what the snapshot and catchup pattern already implies. Pin which.
 2. **Trigger executor concurrency.** How many concurrent re-executions per session and per server? A pool with a per-session cap plus a global cap is the obvious shape, but the numbers and the back-pressure behavior when the cap is hit need deciding.
 3. **Retry budget surface.** Should retry budgets (per-trigger, per-mutation) be observable to operators via metrics, or only via give-up surfaces to clients? Metrics are cheap and probably the right answer.
-4. **Auth retry policy under outage.** If OpenFGA is down for minutes, should the materializer pause delivery (fail closed, conservative, may stall many clients) or degrade with a cached policy (riskier)? Decide before production.
+4. ~~**Auth retry policy under outage.** If OpenFGA is down for minutes, should the materializer pause delivery (fail closed, conservative, may stall many clients) or degrade with a cached policy (riskier)? Decide before production.~~ **Decided (R5b), fail closed.** No patch is delivered and no mutation accepted while the answer is unknown, because a patch sent to a caller who may not be allowed to see it cannot be recalled and a stall can. Two wire additions follow: a typed signal that delivery is paused rather than quiet, and a rejection reason meaning cannot determine, which must not reuse `Unauthorized` because a client believing itself unauthorized stops retrying and may discard the mutation. Snapshots are unaffected, since they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
 5. **CDC source placement.** Is `subql`'s `CdcSource` driven once per server (one ingestor with a fanout) or once per session? Per-server with a fanout is the conventional shape and what the diagram implies.
 
 ---

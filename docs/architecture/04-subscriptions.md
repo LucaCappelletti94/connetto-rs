@@ -1,4 +1,4 @@
-# 04 — Subscriptions
+# 04: Subscriptions
 
 **Status**: draft
 
@@ -56,7 +56,7 @@ Predicate =
   | Not(Predicate)
 ```
 
-Predicates are restricted to column comparisons against literal values — no subqueries, no cross-table joins in the predicate itself. This constraint makes server-side subscription matching feasible without issuing a SQL query per CDC event for simple cases.
+Predicates are restricted to column comparisons against literal values: no subqueries, no cross-table joins in the predicate itself. This constraint makes server-side subscription matching feasible without issuing a SQL query per CDC event for simple cases.
 
 ### Open question: cross-table and join subscriptions
 
@@ -82,30 +82,24 @@ Subscribe {
 Server:
 
 1. Validates the spec (table exists, client has read permission, predicate is well-formed).
-2. Records the subscription in the registry: `(session_id, sub_id) → (spec, auth_context, lsn=None)`.
+2. Records the subscription in the registry: `(session_id, sub_id) → (spec, principal, lsn=None)`.
 3. Begins snapshot delivery (see below).
 
 On validation failure, server sends `Error(sub_id, reason)` and does not add the subscription.
 
 ### Snapshot delivery
 
-After registration, the server delivers an initial snapshot of all matching rows:
-
-```
-SnapshotBegin { sub_id }
-SnapshotRows  { sub_id, rows: Vec<Row> }   // zero or more, batched
-SnapshotEnd   { sub_id, lsn: u64 }
-```
+After registration, the server delivers an initial snapshot. `SnapshotBegin { sub_id }` and `SnapshotEnd { sub_id, lsn: u64 }` are control-plane frames that bracket the snapshot. The row data travels on the bulk plane as one or more `SnapshotPatch` frames, each carrying `sub_id` and `patchset_zstd` (a Zstd-compressed SQLite patchset).
 
 The snapshot is taken at a consistent point. The `lsn` in `SnapshotEnd` is the LSN at which the snapshot was read.
 
-Any `RowUpdate` messages for this subscription with `lsn > snapshot_lsn` that arrive after `SnapshotEnd` are applied on top. Any `RowUpdate` messages with `lsn ≤ snapshot_lsn` are discarded.
+Any `LivePatch` frames for this subscription with `lsn > snapshot_lsn` that arrive after `SnapshotEnd` are applied on top. Any `LivePatch` frames with `lsn <= snapshot_lsn` are discarded.
 
 The client buffers updates received during snapshot delivery and applies them after `SnapshotEnd`.
 
 ### Ongoing updates
 
-After `SnapshotEnd`, the server delivers incremental updates via `RowUpdate` messages as the underlying data changes. See `03-sync-pipeline.md` for the CDC fanout path.
+After `SnapshotEnd`, the server delivers incremental updates via `LivePatch` bulk frames as the underlying data changes. See `03-sync-pipeline.md` for the CDC fanout path.
 
 ### Cancellation
 
@@ -117,7 +111,7 @@ Unsubscribe { sub_id }
 
 Server removes the subscription from the registry. No further updates are delivered for this `sub_id`.
 
-The client may delete the locally cached data for this subscription, or retain it for offline use — application's choice.
+The client may delete the locally cached data for this subscription, or retain it for offline use: application's choice.
 
 ### Update (modify a subscription)
 
@@ -137,13 +131,15 @@ The registry maps `(session_id, sub_id)` to:
 ```
 SubscriptionEntry {
   spec:         SubscriptionSpec,
-  auth_context: AuthContext,
+  principal:    Principal,         // optional identity plus resolved capabilities
   last_lsn:     Option<u64>,    // None until SnapshotEnd is sent
   snapshot_lsn: Option<u64>,    // LSN at which snapshot was taken
 }
 ```
 
-The registry is in-memory (session lifetime). It is not persisted server-side; on reconnect the client re-declares all subscriptions.
+**Decided (R3).** The caller may have no identity at all. See `12-identity-session-capability.md`.
+
+The registry is in-memory (session lifetime). It is not persisted server-side, and on reconnect the client re-declares all subscriptions.
 
 ---
 
@@ -189,11 +185,11 @@ If the LSN is outside the window, or if the server does not support catchup patc
 
 ## Open Questions
 
-1. **Predicate language scope**: is the current predicate tree sufficient, or do clients need more expressive filters (e.g. LIKE, IS NULL, array containment)? More expressiveness makes server-side in-process evaluation harder.
-2. **Subscription count limits**: should the server enforce a maximum number of subscriptions per session? What happens when the limit is hit?
-3. **Snapshot parallelism**: should the server deliver snapshots for multiple subscriptions concurrently, or serially? Concurrency helps latency but increases server load.
-4. **Catchup patch optimization**: is the "deliver catchup patch instead of full snapshot on reconnect" optimization in scope for v1?
-5. **Column projection**: if a client subscribes with `columns: Some([...])`, does the server track only those columns for matching, or does it always track all columns and project at delivery time?
+1. ~~**Predicate language scope**: is the current predicate tree sufficient, or do clients need more expressive filters (e.g. LIKE, IS NULL, array containment)? More expressiveness makes server-side in-process evaluation harder.~~ **Decided (Q4.1):** connetto accepts SQL WHERE clause text directly, matching `subql`'s input format. The custom predicate tree is superseded. `subql` supports `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, and arithmetic, rejecting unsupported constructs at registration time.
+2. ~~**Subscription count limits**: should the server enforce a maximum number of subscriptions per session? What happens when the limit is hit?~~ **Decided (Q4.2):** Not a connetto concern. Subscription registry memory management is owned by `subql` (`subql.md`, "Subscription registry limits (Q4.2)"). connetto imposes no limits of its own.
+3. ~~**Snapshot parallelism**: should the server deliver snapshots for multiple subscriptions concurrently, or serially? Concurrency helps latency but increases server load.~~ **Decided (Q4.3):** Priority-tiered delivery. Higher-priority tiers complete before lower-priority tiers begin. Within a tier, subscriptions are delivered concurrently, interleaved on the WebSocket and tagged by `sub_id` (the PowerSync model).
+4. ~~**Catchup patch optimization**: is the "deliver catchup patch instead of full snapshot on reconnect" optimization in scope for v1?~~ **Decided (Q4.4):** Yes, in scope. On reconnect, if the client's LSN falls within the oplog retention window, the server delivers only changes since that LSN rather than a full snapshot.
+5. ~~**Column projection**: if a client subscribes with `columns: Some([...])`, does the server track only those columns for matching, or does it always track all columns and project at delivery time?~~ **Decided (Q4.5):** Deferred. Column projection is an optimization layerable at delivery time. The subscription language is SQL WHERE clauses via `subql`, which operates on full rows, so projection does not affect the core design.
 
 ---
 
@@ -205,5 +201,5 @@ If the LSN is outside the window, or if the server does not support catchup patc
 
 ## Notes
 
-- `limit` in `SubscriptionSpec` is an approximation — it applies to the initial snapshot ordering. As rows are inserted/deleted, the live result set may grow beyond the original limit without the server enforcing it. Clients that need a strict top-N should manage this locally.
+- `limit` in `SubscriptionSpec` is an approximation: it applies to the initial snapshot ordering. As rows are inserted/deleted, the live result set may grow beyond the original limit without the server enforcing it. Clients that need a strict top-N should manage this locally.
 - The predicate tree is intentionally simple. Complex logic (full-text search, geographic queries) should be handled by materializing a computed column in PostgreSQL that can then be filtered simply.

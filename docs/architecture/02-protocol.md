@@ -1,4 +1,4 @@
-# 02 — Protocol
+# 02: Protocol
 
 **Status**: draft
 
@@ -12,7 +12,7 @@ Define how client and server talk to each other: the transport channel, the mess
 
 ## Transport Channel
 
-The primary transport is a **persistent, full-duplex connection** — WebSocket is the baseline. Both sides can send messages at any time without a request/response pairing.
+The primary transport is a **persistent, full-duplex connection** (WebSocket is the baseline). Both sides can send messages at any time without a request/response pairing.
 
 ### Why not HTTP request/response?
 
@@ -34,21 +34,30 @@ This is deferred until the WebSocket path is stable.
 Each message is a length-prefixed binary frame. The frame structure:
 
 ```
-[ 4 bytes: payload length (big-endian u32) ][ payload bytes ]
+[ 1 byte: tag ][ 4 bytes: payload length (big-endian u32) ][ payload bytes ]
 ```
 
-The payload is a serialized `WireMessage`.
+The payload is a serialized `ControlMessage` or `BulkMessage`, chosen by the tag byte. There is no single top-level message type.
 
 ### Serialization format
 
-Open question — see below. Candidates:
+Open question, see below. Candidates:
 
 | Format | Pros | Cons |
 |---|---|---|
 | MessagePack | Compact, schema-less, fast | Schema evolution without versioning is fragile |
-| Protobuf / FlatBuffers | Compact, schema-enforced, good evolution story | Requires `.proto` / schema files; code-gen step |
-| JSON | Human-readable, easy to debug | Verbose; slower; no binary blob support without base64 |
+| Protobuf / FlatBuffers | Compact, schema-enforced, good evolution story | Requires `.proto` or schema files and a code-gen step |
+| JSON | Human-readable, easy to debug | Verbose, slower, no binary blob support without base64 |
 | CBOR | Compact, standardized (RFC 7049), native binary | Less tooling than protobuf |
+
+### Two-plane framing
+
+The protocol has two planes. The **control plane** carries typed, MessagePack-encoded frames for signaling, handshake, and subscription management. The **bulk plane** carries large, opaque, Zstd-precompressed byte payloads (snapshot data, live patches, and client-uploaded mutation patchsets). The tag byte at the start of each frame distinguishes the planes: `TAG_CONTROL = 0`, `TAG_BULK = 1`. Bulk payloads arrive already compressed. The transport does not re-compress them, and decompression is the consumer's responsibility.
+
+| Plane | Tag | Encoding | Frame types |
+|---|---|---|---|
+| Control | `TAG_CONTROL = 0` | MessagePack | `Handshake`, `Subscribe`, `SnapshotBegin`, `SnapshotEnd`, `MutationHeader`, and so on |
+| Bulk | `TAG_BULK = 1` | Zstd-precompressed opaque bytes | `SnapshotPatch`, `LivePatch`, `MutationPatch` |
 
 ---
 
@@ -58,29 +67,58 @@ Open question — see below. Candidates:
 
 | Message | Purpose |
 |---|---|
-| `Handshake` | Opens session: client ID, last known server LSN, auth token |
+| `Handshake` | Opens or resumes a session: a client-chosen correlation label (never a trust input), the resume cursor, the server-issued session token when resuming, and zero or more opaque grants. **Decided (R3)** for the grant list shape. |
 | `Subscribe` | Registers a new subscription: sub ID + `SubscriptionSpec` |
 | `Unsubscribe` | Cancels a subscription by sub ID |
-| `Mutation` | Submits a mutation: client sequence number + `MutationRecord` |
-| `Ack` | Client acknowledges receipt of a server batch (used for flow control) |
+| `MutationHeader` | Submits a mutation: control frame carrying the client sequence number, paired one-to-one with the `MutationPatch` bulk frame that follows it |
+| `AckCredits` | Client returns flow-control credits for delivered bulk payloads |
 | `Ping` | Keepalive probe |
 
 ### Server → Client
 
 | Message | Purpose |
 |---|---|
-| `HandshakeAck` | Session accepted: assigned session ID, current server LSN, schema version |
-| `SnapshotBegin` | Start of initial snapshot for a subscription |
-| `SnapshotRows` | Batch of rows for the ongoing snapshot |
-| `SnapshotEnd` | Snapshot complete for a subscription; includes the LSN at which snapshot was taken |
-| `RowUpdate` | Incremental row-level change batch (CDC-sourced) |
+| `HandshakeAck` | Session accepted: a per-connection routing label, the session token to persist, the current cursor, the schema version, the initial credit, and the durable mutation watermark. Carries nothing about a grant that failed to resolve: not-allowed and never-existed are indistinguishable on the wire, and must be. **Decided (R3)** |
+| `SnapshotBegin` | Control frame: start of initial snapshot for a subscription |
+| `SnapshotPatch` | **Bulk plane.** Snapshot data: `sub_id` + `patchset_zstd` (Zstd-compressed SQLite patchset). One or more frames complete the snapshot. |
+| `SnapshotEnd` | Control frame: snapshot complete; carries `sub_id` and the LSN at which the snapshot was taken |
+| `LivePatch` | **Bulk plane.** Incremental CDC patch: `sub_id` + `cursor` + `patchset_zstd` |
 | `AggregateUpdate` | Incremental or full aggregate result update |
-| `MutationAck` | Mutation accepted: client sequence number echoed |
-| `MutationReject` | Mutation rejected: client sequence number + reason code |
+| `MutationApplied` | Mutation accepted: client sequence number echoed |
+| `MutationReject` | Mutation rejected: client sequence number + reason code. **Decided (R5b)**: gains a reason meaning cannot determine, retry, for when the authorization service is unreachable. It must not reuse `Unauthorized`, which asserts the caller lacks permission when the truth is that the server cannot tell, and which makes a client stop retrying and possibly discard the mutation. Adding a variant is a wire change. |
 | `MutationConflict` | Conflict detected: client sequence number + server's current value |
+| `FullResyncRequired` | Server requires the client to re-snapshot a subscription. `FullResyncReason` gains a variant for authorization change in phase R7. Adding a variant is a wire change: the enum has no forward-compatible fallback for an unknown value. |
 | `Pong` | Keepalive reply |
 | `Error` | Non-fatal error associated with a specific request |
-| `FatalError` | Server is closing the session: reason code |
+| `FatalError` | Server is closing the session: reason code. `FatalErrorReason::SessionRevoked` and `FatalErrorReason::ServerShuttingDown` exist on the wire and are never constructed by the server today. **Built, defective.** R2 wires `SessionRevoked`, and R8 constructs `ServerShuttingDown` on a graceful shutdown by walking the connection registry R2 builds, so a client backs off instead of hammering a dying process. |
+
+**Decided (R5b): a delivery-paused signal.** When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to distinguish that from nothing changing. `NonFatalError` carries only `related_to` and an untyped `detail`, so this needs a typed signal rather than a string a client parses. Snapshots are unaffected throughout, because they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
+
+---
+
+## Grants and the handshake
+
+**Decided (R3).** A grant is a connetto-signed token asserting that the bearer is a named subject, either a person (`user:alice`) or a key (`key:abc123`). It is opaque to the client, which never parses it and only stores and presents it. It says nothing about what the subject may do: `08-authorization.md` answers that from the authorization model. The list may be empty, and each grant is checked independently.
+
+**Every grant is checked by arithmetic.** Because both kinds are connetto-signed, checking one is a signature verification against connetto's own public key, with no database lookup. So the list carries no routing metadata, nothing sniffs the shape of a string, no order of checks is load-bearing, and an unrecognised string costs arithmetic and nothing more.
+
+A grant that fails to resolve does not end the connection. The session proceeds on whatever resolved. A caller who presents an expired key beside a valid login is signed in and sees less, which is the ordinary case.
+
+The reply (`HandshakeAck`) says nothing about a failure: no reason, and not which grant it was. Not-allowed, no-longer-allowed, and never-existed are indistinguishable, on the same reasoning that a service does not distinguish an authorization failure from a missing resource. Failures are recorded in the server's audit trail and silent on the wire.
+
+This replaces a single credential field (`Credential::{Anonymous, Token}`) with a variable-length list and is a `PROTOCOL_VERSION` bump.
+
+See `12-identity-session-capability.md` for the full model.
+
+---
+
+## Session token
+
+**Built, defective.** `session_token` exists on the wire (on `Handshake` and `HandshakeAck` in `crates/connetto-core/src/messages/handshake.rs`). The server stubs it as `format!("token-{connection_num}")` and never reads the client's value back. No client persists it.
+
+**Decided (R2).** Under R2 the server mints a real opaque durable handle at handshake. The client persists it outside the local replica (because an unidentified session's replica is in memory and would not survive a reload) and presents it on reconnect. The exactly-once mutation watermark is re-keyed from `(user_id, session_id)` onto the session handle alone.
+
+See `12-identity-session-capability.md` for the session model.
 
 ---
 
@@ -90,21 +128,21 @@ Open question — see below. Candidates:
 
 - Mutations carry a monotonically increasing `client_seq` per session.
 - The server processes mutations in `client_seq` order per session.
-- The server echoes `client_seq` in `MutationAck` / `MutationReject` / `MutationConflict`.
+- The server echoes `client_seq` in `MutationApplied`, `MutationReject`, and `MutationConflict`.
 - The client does not send a new mutation until the previous one is acknowledged, **or** the client sends a window of N mutations and back-pressures at N unacknowledged (to be decided).
 
 ### Server → client ordering
 
 - Row updates and aggregate updates carry the server LSN.
-- The client applies updates in LSN order; updates out of order are buffered until the gap is filled.
+- The client applies updates in LSN order. Updates out of order are buffered until the gap is filled.
 - The client stores its highest applied LSN and sends it in `Handshake` on reconnect.
 
 ### Snapshot before updates
 
-- After a `Subscribe`, the server sends `SnapshotBegin` → zero or more `SnapshotRows` → `SnapshotEnd(lsn)`.
+- After a `Subscribe`, the server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames, then `SnapshotEnd(lsn)` (control).
 - The LSN in `SnapshotEnd` is the point at which the snapshot was taken.
-- Any `RowUpdate` messages with LSN > snapshot LSN that arrive after `SnapshotEnd` are applied on top.
-- Any `RowUpdate` messages with LSN ≤ snapshot LSN that arrive before `SnapshotEnd` are buffered and discarded after the snapshot is complete (they are already reflected in the snapshot).
+- Any `LivePatch` frames with LSN > snapshot LSN that arrive after `SnapshotEnd` are applied on top.
+- Any `LivePatch` frames with LSN <= snapshot LSN that arrive before `SnapshotEnd` are buffered and discarded after the snapshot is complete (they are already reflected in the snapshot).
 
 ---
 
@@ -114,27 +152,31 @@ The client maintains a **receive credit** budget. On connect, the server is gran
 
 The server pauses delivery when credits reach zero and resumes when credits are replenished.
 
-This is a simple stop-and-wait variant; a sliding-window variant may be needed for high-throughput scenarios.
+This is a simple stop-and-wait variant. A sliding-window variant may be needed for high-throughput scenarios.
 
 ---
 
 ## Open Questions
 
-1. **Serialization format**: which format? Decision needed before any message types are implemented.
-2. **Mutation window**: single in-flight mutation vs. sliding window of N — what is N, and how does it interact with client-seq ordering?
-3. **Versioning / evolution**: how are breaking changes to `WireMessage` handled? A version field in `Handshake`? A negotiation step?
-4. **HTTP fallback**: is it in scope for v1?
-5. **Compression**: per-message or per-frame compression (e.g. `permessage-deflate` for WebSocket)? Worthwhile for large snapshots.
+1. ~~**Serialization format**: which format? Decision needed before any message types are implemented.~~ **Decided (Q2.1):** MessagePack via `rmp-serde` for the control plane, JSON for aggregate results only. Shipped: `crates/connetto-core/src/codec.rs` implements MessagePack encode/decode with length-prefixed framing (`:1`, `:5`).
+2. ~~**Mutation window**: single in-flight mutation vs. sliding window of N? What is N, and how does it interact with client-seq ordering?~~ **Decided (Q2.2):** Dissolved. The client sends PatchSets, not individual mutations, so the window concept does not apply.
+3. **Versioning / evolution**: `PROTOCOL_VERSION` exists on the wire and `ProtocolVersionMismatch` is a `FatalErrorReason`. A mismatch is fatal and the connection closes. Negotiation is not currently implemented: a client on the wrong version is disconnected. Whether the server should advertise its version before disconnecting, or whether a compatibility range should be negotiated, is **deferred until the first release, and is not an open question before then**. The workspace is at `version = "0.0.0"` and nothing is published, so no client exists that a server must stay compatible with and negotiation would protect nothing. The condition that makes it real is a released client that updates on its own schedule, a mobile fleet being the obvious case, and it should be decided then rather than guessed now.
+4. ~~**HTTP fallback**: is it in scope for v1?~~ **Decided (Q2.4):** Dissolved by Q0.1. WebSocket only.
+5. ~~**Compression**: per-message or per-frame compression (e.g. `permessage-deflate` for WebSocket)? Worthwhile for large snapshots.~~ **Decided (Q2.5):** Zstd at the application layer on PatchSet and snapshot payloads only. Control plane messages are not compressed.
 
 ---
 
 ## Decisions
 
-*(none yet)*
+- **Grant list shape (R3)**: `Handshake` carries zero or more opaque grants, not one credential. Each resolves independently into an identity, capabilities, or a refusal. This supersedes `Credential::{Anonymous, Token}` and is a `PROTOCOL_VERSION` bump.
+- **Silent rejection (R3)**: a grant that fails to resolve does not end the connection and produces no field on `HandshakeAck`. Not-allowed, no-longer-allowed, and never-existed are indistinguishable on the wire.
+- **Session token (R2)**: the server mints a real durable handle at handshake and the client persists it outside the local replica. The current implementation is a non-functional stub (**Built, defective**).
+- **Enum-variant wire change**: adding a variant to `FullResyncReason` or `FatalErrorReason` is a wire-breaking change. Neither enum has a forward-compatible fallback for an unknown value.
 
 ---
 
 ## Notes
 
-- `SubscriptionSpec` is defined in `01-pieces.md`; its exact wire encoding depends on the serialization format decision.
-- The `client_seq` namespace is per-session, not global; it resets on reconnect from the client's perspective (the server associates it with the session ID).
+- `SubscriptionSpec` is defined in `01-pieces.md`. Its exact wire encoding depends on the serialization format decision.
+- The `client_seq` namespace is per-session, not global. It resets on reconnect from the client's perspective (the server associates it with the session ID).
+- For the canonical model of grants, sessions, and identity, see `12-identity-session-capability.md`.

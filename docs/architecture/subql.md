@@ -1,4 +1,4 @@
-# subql — Required Features & Responsibilities
+# subql: Required Features & Responsibilities
 
 Tracking document for features and responsibilities that connetto's architecture decisions have assigned to `subql`. Each item references the decision that created it and notes whether it has shipped. `subql` has since grown from an in-process predicate filter into a CDC subscription runtime, so the loop surface below is shipped and consumed by the Subscription Materializer (`10-subscription-materializer.md`).
 
@@ -22,7 +22,7 @@ The items below track the finer-grained responsibilities and their status.
 **Shipped.** `subql` evaluates both `old_row` and `new_row` for UPDATE and returns the transition per consumer through `ConsumerNotifications`: **enter** surfaces in `inserted`, **exit** in `deleted`, **update** in `updated`, and **no-op** yields nothing. connetto delivers correct INSERT and DELETE events when rows move in and out of a subscription's result set.
 
 ### SQL WHERE clause input (Q4.1)
-`subql` accepts SQL WHERE clause text directly — no custom AST. Supported: `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, arithmetic. Unsupported constructs are rejected at registration time.
+`subql` accepts SQL WHERE clause text directly: no custom AST. Supported: `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, arithmetic. Unsupported constructs are rejected at registration time.
 
 ---
 
@@ -73,4 +73,4 @@ For queries involving JOINs, `subql` must track all involved tables and trigger 
 ## Accumulator Lifecycle
 
 ### In-memory with re-execution rebuild (Q5.4)
-Accumulators are currently in-memory. On server restart, they are rebuilt via re-execution. Persisting accumulator state to avoid rebuild cost is a future `subql` optimization — not a connetto concern.
+Accumulators are currently in-memory. On server restart, they are rebuilt via re-execution. Persisting accumulator state to avoid rebuild cost is a future `subql` optimization: not a connetto concern.

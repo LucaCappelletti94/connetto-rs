@@ -1,4 +1,4 @@
-# 05 — Aggregate Queries
+# 05: Aggregate Queries
 
 **Status**: draft
 
@@ -16,7 +16,7 @@ For row-level subscriptions, the client can maintain a local replica and compute
 
 It breaks down when:
 
-- The aggregate spans a large table the client cannot fully replicate (e.g. total order count across all users — a client should not receive all orders)
+- The aggregate spans a large table the client cannot fully replicate (e.g. total order count across all users: a client should not receive all orders)
 - The aggregate is over data the client is not authorized to see row-by-row (e.g. anonymized statistics)
 - The client does not want the memory/bandwidth cost of syncing all rows just to show a count
 
@@ -32,7 +32,7 @@ Client-authorized view (rows, and per-client aggregates over them). The client h
 
 Global, cross-client statistics (non-RLS only). A statistic over rows the client does not hold (total order count across all users, an anonymized average) cannot be computed on the device, so only these go through the server-side delta accumulator that subql maintains in process and pushes as a `ClientEvent::Aggregate`. subql rejects an aggregator on an RLS-protected table at registration (`RegisterError::AggregatorOnRlsTable`), which connetto surfaces as a `ClientEvent::NonFatal` with the session intact, because a single shared accumulator cannot represent a value that differs per viewer. The server-side family is therefore global statistics only, by construction.
 
-The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP`, seeded once through the connector then folded per CDC event. `MIN` and `MAX` stay on the re-execution path. See `10-subscription-materializer.md` for the server mechanics and `10-client-connection.md` for the client-query mechanism.
+The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP`, seeded once through the connector then folded per CDC event. `MIN` and `MAX` stay on the re-execution path. See `10-subscription-materializer.md` for the server mechanics and `13-client-connection.md` for the client-query mechanism.
 
 ---
 
@@ -42,7 +42,7 @@ The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `
 
 In the crate split, the accumulator state and its incremental maintenance live in `subql`. The materializer wraps them with authorization, the re-execution `Connector`, and per-session delivery (see `10-subscription-materializer.md`).
 
-### Supported aggregate shapes (initial scope — open question)
+### Supported aggregate shapes (initial scope: open question)
 
 | Shape | Incremental update rule |
 |---|---|
@@ -62,11 +62,13 @@ MIN and MAX with deletions are problematic for incremental updates: if the curre
 AggregateSubscriptionEntry {
   sub_id:       String,
   spec:         AggregateSpec,
-  auth_context: AuthContext,
+  principal:    Principal,         // optional identity plus resolved capabilities
   state:        AccumulatorState,  // variant-specific
   last_lsn:     u64,
 }
 ```
+
+**Decided (R3).** The caller may have no identity at all. See `12-identity-session-capability.md`.
 
 `AggregateSpec` includes:
 - The table being aggregated
@@ -89,7 +91,7 @@ For GROUP BY aggregates, the `value` is the updated group map (or a delta of cha
 
 The client stores the aggregate result in a local SQLite table with a schema matching the aggregate shape. On receiving `AggregateUpdate`, it replaces the stored value.
 
-The client does not compute the aggregate locally — it trusts the server's accumulator.
+The client does not compute the aggregate locally: it trusts the server's accumulator.
 
 ---
 
@@ -141,30 +143,30 @@ Both paths are indexed by table name and filtered by predicate.
 
 ## Open Questions
 
-1. **Which aggregate shapes get IVM (incremental view maintenance) vs. re-execution fallback?** The initial list above is a starting point. MIN and MAX with deletions are the hardest — are they in scope for IVM?
-2. ~~**Having clauses**: should `HAVING` filters be supported in the aggregate spec? These apply after grouping and are harder to evaluate incrementally.~~ **Decided (Q5.2):** HAVING is evaluated server-side by `subql`. Groups that fail the HAVING predicate are never sent to the client. Follows the same two-tier pattern: in-process fast path for predicates `subql` can evaluate against accumulator state, SQL re-execution fallback for the rest. Per-session map tracks which queries require re-execution; coverage expands over time as `subql`'s fast solver adds support for more HAVING shapes.
+1. ~~**Which aggregate shapes get IVM (incremental view maintenance) vs. re-execution fallback?** The initial list above is a starting point. MIN and MAX with deletions are the hardest: are they in scope for IVM?~~ **Decided (Q5.1):** Follows `subql` capabilities. `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, and the variance and standard-deviation family are maintained incrementally. MIN and MAX ship on a v1 incremental path that folds inserts and most updates and deletes in memory, re-querying only when the current extreme is removed or displaced (`subql.md`: "MIN/MAX incremental maintenance (Q5.1): Shipped (v1)").
+2. ~~**Having clauses**: should `HAVING` filters be supported in the aggregate spec? These apply after grouping and are harder to evaluate incrementally.~~ **Decided (Q5.2):** HAVING is evaluated server-side by `subql`. Groups that fail the HAVING predicate are never sent to the client. Follows the same two-tier pattern: in-process fast path for predicates `subql` can evaluate against accumulator state, SQL re-execution fallback for the rest. Per-session map tracks which queries require re-execution. Coverage expands over time as `subql`'s fast solver adds support for more HAVING shapes.
 3. ~~**Multi-table aggregates**: aggregates that JOIN multiple tables (e.g. `SELECT COUNT(*) FROM orders JOIN users ...`) are not addressed here. Are they in scope?~~ **Decided (Q5.3):** Yes, supported via re-execution fallback. Multi-table aggregates go into the per-session re-execution map. `subql` tracks all involved tables and triggers re-execution on CDC events from any of them. No in-process IVM for joins.
-4. ~~**Accumulator persistence**: is the accumulator state kept only in memory (lost on server restart, requiring re-execution to rebuild) or persisted? Memory is simpler; persistence is more efficient for long-running subscriptions.~~ **Decided (Q5.4):** Not a connetto concern. `subql` owns accumulator lifecycle. Currently in-memory; rebuilt via re-execution on restart. Persistence is a future `subql` optimization.
-5. ~~**Rate-limiting re-execution**: what is the right throttle for re-execution? Per-subscription cooldown? Global quota?~~ **Decided (Q5.5):** Not a connetto concern. `subql` owns re-execution scheduling — debounce, concurrency caps, and burst coalescing are internal to `subql`.
-6. ~~**Delta format for GROUP BY**: when many groups change at once (e.g. a batch import), should the server send full group map replacement or a delta list? At what size does full replacement become preferable?~~ **Decided (Q5.6):** Dissolved. IVM path naturally produces per-group deltas (only changed groups). Re-execution fallback naturally produces full results. No threshold switching needed — the format follows from which path was used.
-7. **Client schema for aggregate results**: the client stores aggregate results in local SQLite — what does the schema look like for GROUP BY results? A key-value table? A typed table generated from the spec?
+4. ~~**Accumulator persistence**: is the accumulator state kept only in memory (lost on server restart, requiring re-execution to rebuild) or persisted? Memory is simpler, but persistence is more efficient for long-running subscriptions.~~ **Decided (Q5.4):** Not a connetto concern. `subql` owns accumulator lifecycle. Currently in-memory. Rebuilt via re-execution on restart. Persistence is a future `subql` optimization.
+5. ~~**Rate-limiting re-execution**: what is the right throttle for re-execution? Per-subscription cooldown? Global quota?~~ **Decided (Q5.5):** Not a connetto concern. `subql` owns re-execution scheduling: debounce, concurrency caps, and burst coalescing are internal to `subql`.
+6. ~~**Delta format for GROUP BY**: when many groups change at once (e.g. a batch import), should the server send full group map replacement or a delta list? At what size does full replacement become preferable?~~ **Decided (Q5.6):** Dissolved. IVM path naturally produces per-group deltas (only changed groups). Re-execution fallback naturally produces full results. No threshold switching needed: the format follows from which path was used.
+7. ~~**Client schema for aggregate results**: the client stores aggregate results in local SQLite: what does the schema look like for GROUP BY results? A key-value table? A typed table generated from the spec?~~ **Decided (Q5.7):** Generic `_connetto_aggregates` table: `(sub_id TEXT, group_key BLOB, result_json TEXT, PRIMARY KEY (sub_id, group_key))`. The application reads results via a custom Diesel connection that deserializes `result_json` into `T: serde::DeserializeOwned`. No per-subscription DDL is generated.
 
 ---
 
 ## Decisions
 
-**Server-side aggregates are global non-RLS statistics only; per-client aggregates are computed locally.** The earlier plan to route every aggregate through one per-user server-side path was reversed. A per-viewer value cannot be shared across consumers, and the client already holds its authorized rows, so it computes its own view locally over the replica. The server-side delta accumulator is reserved for global statistics over data the client does not replicate, and subql rejects aggregators on RLS tables to enforce it.
+**Server-side aggregates are global non-RLS statistics only. Per-client aggregates are computed locally.** The earlier plan to route every aggregate through one per-user server-side path was reversed. A per-viewer value cannot be shared across consumers, and the client already holds its authorized rows, so it computes its own view locally over the replica. The server-side delta accumulator is reserved for global statistics over data the client does not replicate, and subql rejects aggregators on RLS tables to enforce it.
 
-**Reason RLS kills materialized views:** a materialized view is a single computed result. Under RLS, `COUNT(*) FROM orders` returns a different value per user — there is no single server-side value to mirror. The result only exists in the context of a specific user's authorization context.
+**Reason RLS kills materialized views:** a materialized view is a single computed result. Under RLS, `COUNT(*) FROM orders` returns a different value per user: there is no single server-side value to mirror. The result only exists in the context of a specific user's authorization context.
 
-**Aggregate results are connetto-managed client storage, not application schema.** The schema symmetry principle (client mirrors server) applies to row-level data only. Aggregate results have no PostgreSQL counterpart — they are per-session computed values cached by connetto on the client.
+**Aggregate results are connetto-managed client storage, not application schema.** The schema symmetry principle (client mirrors server) applies to row-level data only. Aggregate results have no PostgreSQL counterpart: they are per-session computed values cached by connetto on the client.
 
-**Wire format for aggregate results: JSON.** Results are delivered as JSON and deserialized on the client into `T: serde::DeserializeOwned`. The application defines the result struct; connetto provides the raw JSON.
+**Wire format for aggregate results: JSON.** Results are delivered as JSON and deserialized on the client into `T: serde::DeserializeOwned`. The application defines the result struct. Connetto provides the raw JSON.
 
 ---
 
 ## Notes
 
 - The term "IVM" (Incremental View Maintenance) is borrowed from database research. This system implements a subset of IVM for the aggregate shapes listed above.
-- A client that only needs row-level data should use a row-level subscription and compute aggregates locally — this is simpler and avoids server-side accumulator state.
+- A client that only needs row-level data should use a row-level subscription and compute aggregates locally: this is simpler and avoids server-side accumulator state.
 - The accumulator approach is stateful on the server: each active aggregate subscription is a resource. Aggregate subscriptions should be used deliberately, not for every possible aggregate a UI might display.
