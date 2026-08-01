@@ -36,6 +36,8 @@ The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `
 
 The client's answer-path classifier is deliberately broader than this family. `AGGREGATE_FUNCTIONS` in `crates/connetto-client/src/live.rs` recognizes the delta family plus `MIN`, `MAX`, and SQLite's `TOTAL`, and it decides only which path a query rides, never what the server maintains: anything aggregate-shaped must reach the server path, because running it as a row query against a partial replica would return a wrong answer silently. `MIN` and `MAX` are then served by re-execution. `TOTAL` has no server-side variant at all (no `AggSpec` member in `subql` and no re-execution class), so it rides the registration-refusal path and surfaces as a `NonFatal`, loud rather than silently wrong, though that exact fate is untested end to end.
 
+No SQLite table backs the delivered path: the value is held in memory on the `LiveValue` handle, `None` until the server's bootstrap push, re-bootstrapped on an online restart by the startup re-declaration, and absent on an offline restart. The generic `_connetto_aggregates` table of question 7 below is superseded for scalars and parked for GROUP BY results, which have no server capability yet, the named obstacle being accumulator memory growing with group cardinality (see the memory analysis in `open-questions.md` section 05).
+
 ---
 
 ## Primary Approach: Server-Side Accumulator

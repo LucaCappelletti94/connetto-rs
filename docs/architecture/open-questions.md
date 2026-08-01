@@ -153,10 +153,10 @@ DISTINCT aggregates (`COUNT(DISTINCT col)`, `SUM(DISTINCT col)`) are harder than
 
 **Core algorithm (frequency map per group):**
 
-For `AGG(DISTINCT col_d) GROUP BY col_g`, maintain a map `(group_key, distinct_value) → occurrence_count`:
+For `AGG(DISTINCT col_d) GROUP BY col_g`, maintain a map from `(group_key, distinct_value)` to an occurrence count:
 
-- **Insert row with value `v` in group `g`**: increment `freq[g][v]`. If count goes from 0→1, the distinct value has appeared. Update the aggregate (e.g. increment COUNT, add `v` to SUM).
-- **Delete row with value `v` in group `g`**: decrement `freq[g][v]`. If count goes from 1→0, the distinct value has disappeared. Update the aggregate (e.g. decrement COUNT, subtract `v` from SUM). Remove the entry entirely when count hits 0 to reclaim memory.
+- **Insert row with value `v` in group `g`**: increment `freq[g][v]`. If the count goes from 0 to 1, the distinct value has appeared. Update the aggregate (e.g. increment COUNT, add `v` to SUM).
+- **Delete row with value `v` in group `g`**: decrement `freq[g][v]`. If the count goes from 1 to 0, the distinct value has disappeared. Update the aggregate (e.g. decrement COUNT, subtract `v` from SUM). Remove the entry entirely when the count hits 0 to reclaim memory.
 - **Update**: treat as delete-old + insert-new.
 
 Complexity per group: O(1) amortized per event (hash map lookup). Memory: O(D_g) per group where D_g = number of distinct values in that group.
@@ -169,9 +169,9 @@ Complexity per group: O(1) amortized per event (hash map lookup). Memory: O(D_g)
 
 | Tier | Aggregates | State per group | Update cost |
 |------|-----------|----------------|-------------|
-| Easy | COUNT(\*), SUM, AVG | O(1) — 2–3 counters | O(1) |
-| Medium | COUNT(DISTINCT), SUM(DISTINCT) | O(D_g) — frequency map | O(1) amortized |
-| Hard | MIN, MAX | O(D_g) — all values needed; delete of extremum triggers re-scan or re-query | O(1) amortized, O(D_g) worst case on extremum delete |
+| Easy | COUNT(\*), SUM, AVG | O(1), two or three counters | O(1) |
+| Medium | COUNT(DISTINCT), SUM(DISTINCT) | O(D_g), frequency map | O(1) amortized |
+| Hard | MIN, MAX | O(D_g), all values needed, and a delete of the extremum triggers a re-scan or re-query | O(1) amortized, O(D_g) worst case on extremum delete |
 
 **Approximate alternative (HyperLogLog):** HLL++ (precision p=14, ~12 KB per group, ~0.8% standard error) can approximate `COUNT(DISTINCT)` in O(1) per event with fixed memory. However, **HLL does not support retractions (deletes)**. ksqlDB uses this approach but restricts it to append-only streams. Since connetto must handle deletes, HLL is not viable for the general case. It could be offered as an opt-in approximate mode for append-heavy workloads in the future.
 
@@ -190,7 +190,7 @@ Complexity per group: O(1) amortized per event (hash map lookup). Memory: O(D_g)
 
 1. Add a `FrequencyMap<V>` structure (likely `HashMap<V, u64>`) to the accumulator state.
 2. For each aggregate call with DISTINCT, maintain one frequency map per group. Aggregate calls on the same distinct column share one map (with per-call counters, following RisingWave's model).
-3. On CDC event: update the frequency map first, then conditionally update the aggregate value based on whether the distinct value appeared (0→1) or disappeared (1→0).
+3. On CDC event: update the frequency map first, then conditionally update the aggregate value based on whether the distinct value appeared (0 to 1) or disappeared (1 to 0).
 4. Memory is bounded by total distinct values across all groups, the same order as the base table cardinality in the worst case.
 
 References:
@@ -230,6 +230,8 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 **Q5.7** ~~**Client schema for aggregate results**: what does the local SQLite schema look like for GROUP BY results: a generic key-value table, or a typed table generated from the spec?~~
 
 **Decision: generic `_connetto_aggregates` table with JSON result column.** A single connetto-managed table stores all aggregate subscription results. Schema: `(sub_id TEXT, group_key BLOB, result_json TEXT, PRIMARY KEY (sub_id, group_key))`. The application reads results via a custom Diesel connection that deserializes the JSON into typed Rust structs (`T: serde::DeserializeOwned`). No per-subscription DDL generation. connetto owns this table entirely. Delta updates upsert by `(sub_id, group_key)`. Full re-execution results replace all rows for that `sub_id`.
+
+**Status split.** The delivered scalar family superseded this table for ungrouped aggregates: values ride `AggregateUpdate` pushes into an in-memory `LiveValue` (`None` until the bootstrap, an online restart re-bootstraps through the startup re-declaration, an offline restart shows no value, accepted). The table remains the recorded design for GROUP BY results only, parked until grouped aggregates gain a `subql` `AggSpec` variant and a phase. The wire already carries the dormant `group_key` field on `AggregateUpdate`. The named obstacle for grouped support is memory: one accumulator per distinct group value per subscription, worst case the base-table cardinality, per the DISTINCT memory analysis earlier in this section.
 
 ---
 
@@ -281,7 +283,7 @@ This governs point-shaped questions on the change and write paths. A snapshot is
 
 **Decision: two tiers (session invalidation on model change, OpenFGA cache TTL for tuple changes).**
 
-- **Authorization model change** (RLS policy DDL altered → `rls2fga` re-translates → OpenFGA model updated): this is a schema-level event. All active sessions are invalidated. Clients must re-authenticate and re-subscribe from scratch (full snapshot). This is the PowerSync approach, conservative but correct. Model changes are rare (deploy-time events).
+- **Authorization model change** (RLS policy DDL altered, so `rls2fga` re-translates and the OpenFGA model updates): this is a schema-level event. All active sessions are invalidated. Clients must re-authenticate and re-subscribe from scratch (full snapshot). This is the PowerSync approach, conservative but correct. Model changes are rare (deploy-time events).
 - **Grant (record) change** (a permission Postgres row is inserted, updated, or deleted): `rls2fga` names which tables carry authorization meaning, because reading the policies is all it does. The changed row names its grantee, and that grantee's affected subscriptions receive a `FullResyncRequired` whose fresh snapshot recomputes what they may see under the current model. Nothing polls the authorization service, and the service is never a notice source, because every permission is backed by a Postgres row: a permission existing only in the service would make it a second source of truth. A synthesized row deletion is not the mechanism, because working out which rows became invisible is the capped enumeration direction and a truncated withdrawal would look complete. Residual case: a nested group model where the changed row joins one group to another names no person, and the affected callers are one join away in Postgres.
 - **Relationship tuple change** (latency from grant change to enforcement): all three OpenFGA caches (`checkQueryCache`, `checkIteratorCache`, `cacheController`) default to disabled, each with a 10-second TTL when enabled. Cache invalidation from recent record writes is triggered by incoming questions rather than by a background poller, so an idle store does not invalidate itself. An authorization change takes effect immediately for writes, which use the strict consistency preference because they are low volume and a write accepted against a just-revoked capability must never slip through. For reads, the change takes effect within the cache TTL, because the fast preference is what makes the change-path fan-out affordable. When the change triggers a teardown, it takes effect immediately for both. The consistency preference is per request and not per item inside a batch, so a strict question cannot travel in the same batch as cached ones.
 
@@ -289,7 +291,7 @@ No production sync system enforces policy changes instantly for connected client
 
 **Q8.3** ~~**Auth context lifetime**: can the auth context be refreshed mid-session (e.g. a role is added without disconnect)? Is this required?~~
 
-**Decision: dissolved. Auth context is always live via OpenFGA.** The session token identifies the user. Actual permissions are resolved per-check from OpenFGA, not cached at session start. Role/permission changes originating as PostgreSQL rows are replicated into OpenFGA tuples via CDC (WAL event → tuple write). Subsequent visibility checks pick up the change automatically, bounded by OpenFGA's cache TTL (Q8.2). No mid-session refresh mechanism needed.
+**Decision: dissolved. Auth context is always live via OpenFGA.** The session token identifies the user. Actual permissions are resolved per-check from OpenFGA, not cached at session start. Role/permission changes originating as PostgreSQL rows are replicated into OpenFGA tuples via CDC (a WAL event becomes a tuple write). Subsequent visibility checks pick up the change automatically, bounded by OpenFGA's cache TTL (Q8.2). No mid-session refresh mechanism needed.
 
 The mechanism by which permission changes as Postgres rows reach the authorization service is now load-bearing for revocation: see the grant change entry under Q8.2 for how that propagates and what the response is. Open dependency: `rls2fga` today generates whole-table queries that load every permission record from scratch and nothing that produces the change for one row, so keeping the service current row by row is unbuilt and blocks the phase that makes it the change-path executor.
 
@@ -299,13 +301,13 @@ The mechanism by which permission changes as Postgres rows reach the authorizati
 
 **Q8.5** ~~**Tenant isolation**: in a multi-tenant deployment, is there a top-level isolation layer above RLS, or is tenant isolation fully expressed in RLS policies?~~
 
-**Decision: tenant isolation is expressed in the RLS→OpenFGA authorization model.** `rls2fga` translates tenant-scoping RLS policies into FGA tuples/relations (user belongs to tenant, resource belongs to tenant). No separate isolation mechanism above the auth layer. Tenant boundaries are just another dimension of the authorization model. connetto does not need tenant-aware logic. It delegates to OpenFGA like any other visibility check.
+**Decision: tenant isolation is expressed in the RLS to OpenFGA authorization model.** `rls2fga` translates tenant-scoping RLS policies into FGA tuples/relations (user belongs to tenant, resource belongs to tenant). No separate isolation mechanism above the auth layer. Tenant boundaries are just another dimension of the authorization model. connetto does not need tenant-aware logic. It delegates to OpenFGA like any other visibility check.
 
 **Decided (R8).** `AuthContext.tenant_id`, `.roles`, and `.claims` are deleted. They were written and never read (traced end to end in `12-identity-session-capability.md`). Roles belong in the model too: `rls2fga` emits a `pg_role` type with a `member` relation and requires the deployment to load records mapping users to Postgres roles.
 
 **Q8.6** ~~**Audit log destination**: is the `auth_log` table in PostgreSQL the right destination, or should audit events go to a separate log aggregator?~~
 
-**Decision: structured logging for the firehose, PostgreSQL table for critical events.** High-volume operational events (auth check denials, connection events, CDC visibility checks) go to structured logging (stdout → external aggregator). Critical state changes (permission changes, session invalidations, model changes) are persisted to a PostgreSQL `auth_events` table for application-level querying. OpenFGA's own audit log covers tuple/model changes on the authorization side.
+**Decision: structured logging for the firehose, PostgreSQL table for critical events.** High-volume operational events (auth check denials, connection events, CDC visibility checks) go to structured logging (stdout to an external aggregator). Critical state changes (permission changes, session invalidations, model changes) are persisted to a PostgreSQL `auth_events` table for application-level querying. OpenFGA's own audit log covers tuple/model changes on the authorization side.
 
 **Decided, not built.** Structured logging has no implementation today: no `tracing` or `log` dependency anywhere in the workspace. Phase R12 in `plans/master-implementation-plan.md` builds it, and R3 requires it because a refused grant is otherwise visible nowhere. The `auth_events` table is also unbuilt, with its own phase after R3.
 

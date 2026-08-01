@@ -90,7 +90,7 @@ If the app executes an aggregate query (GROUP BY, COUNT, SUM, etc.) against a ta
 
 - It knows which tables are synced (partial replicas)
 - It knows which aggregate queries are subscribed
-- An unsubscribed aggregate on a synced table → warning or error, configurable by the app
+- An unsubscribed aggregate on a synced table produces a warning or error, configurable by the app
 
 ---
 
@@ -166,7 +166,7 @@ Both hooks compose with connetto's drop-unsubscribe contract: dropping the `Live
 1. ~~**Query serialization for `ConnettoProxyConnection`**: what is the format for serializing a Diesel query + bind parameters over `postMessage`? Raw SQL string + binds as MessagePack? Or a higher-level representation?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** The tab-to-worker channel uses the same binary framing as the WebSocket transport: one tag byte followed by MessagePack-encoded payload (`ControlMessage` or `BulkMessage`). Query messages are `ControlMessage` frames carrying the SQL text and typed binds.
 2. ~~**Proxy result format**: how are result rows serialized back from the worker to the tab? Row-level MessagePack? Or raw SQLite row bytes?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** Row updates arrive as `BulkMessage` frames (SQLite PatchSets, MessagePack). Snapshot control events and aggregate pushes arrive as `ControlMessage` frames (MessagePack). Aggregate values within those messages are JSON, per Q2.1.
 3. ~~**Connection pooling in the worker**: does the dedicated worker maintain a single `ConnettoWorkerConnection` or a pool? SQLite is single-writer, so writes are serialized regardless, but concurrent reads from multiple tabs might benefit from multiple reader connections (WAL mode).~~ **Decided (shipped, `ReplicaStorage::delete_db` in `crates/connetto-web/src/storage.rs`):** The sahpool VFS allows one connection per database. A second open handle trips a `debug_assert`, making pooling impossible in the browser build. The worker maintains a single `ConnettoConnection`.
-4. ~~**Aggregate rewrite and Diesel type safety**: the rewritten query (`SELECT * FROM _connetto_agg_{hash}`) must produce rows that Diesel can deserialize into the app's result type. How is the column ordering guaranteed to match?~~ **Decided (Q5.7):** The `_connetto_agg_{hash}` backing table is superseded by the generic `_connetto_aggregates` table storing results as `result_json TEXT`. JSON deserialization via `T: serde::DeserializeOwned` is field-name-based, so column ordering is not a concern.
+4. ~~**Aggregate rewrite and Diesel type safety**: the rewritten query (`SELECT * FROM _connetto_agg_{hash}`) must produce rows that Diesel can deserialize into the app's result type. How is the column ordering guaranteed to match?~~ **Decided (Q5.7):** The `_connetto_agg_{hash}` backing table is superseded by the generic `_connetto_aggregates` table storing results as `result_json TEXT`. JSON deserialization via `T: serde::DeserializeOwned` is field-name-based, so column ordering is not a concern. **Status split:** superseded for the delivered scalar family by the push path (`LiveValue`, no table at all), parked for GROUP BY results, which do not exist anywhere yet (see `05-aggregate-queries.md` question 7).
 
 ---
 
