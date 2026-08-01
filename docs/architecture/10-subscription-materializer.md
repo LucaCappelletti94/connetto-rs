@@ -126,6 +126,12 @@ The retry policy lives here because everything that can transiently fail in the 
 | 9 | Patchset apply on local SQLite (disk full, locked) | client | server LSN of the batch | bounded retries, then surface `SyncFailure` to the app |
 | 10 | File chunk transfer (`07-file-sync.md`) | both, per chunk | chunk content hash | per-chunk bounded retries, chunk resumability already covers the multi-chunk case |
 
+### The replication slot
+
+**Decided (R32).** The slot and the publication are the deployment's to provision and to drop, matching the rule that connetto emits no server DDL on any path a deployment runs, and the tests already practice this. Two Postgres facts make the rest necessary. A slot retains WAL without limit by default (`max_slot_wal_keep_size` is `-1`, the Postgres documentation states "replication slots may retain an unlimited amount of WAL files"), so a decommissioned or long-crashed connetto-server makes the primary retain its journal until the disk fills and writes stop for everyone. And once the deployment caps it, an invalidated slot leaves a gap in connetto's ingest that sits upstream of the oplog, so the oplog never contains those changes and the stale-cursor comparison cannot see the hole.
+
+Three responses, all connetto's. Startup refuses when the slot or the publication is missing, joining the existing refusal pattern, because a silent retry loop against a missing slot helps nobody. The slot's lag is written to the structured log on a cadence (the R12 facade), so an operator hears about a stalled slot before the cap trips, with alerting belonging to the deployment's aggregator as everywhere else. And an invalidated slot, detected when the replication connection reports it, declares a resync epoch: every session cursor older than the gap is forced through `FullResyncRequired`, because continuing from a fresh slot position without that would silently lose every change that fell in the hole. Deployment guidance: set `max_slot_wal_keep_size` to a bound the primary's disk can afford, and optionally `idle_replication_slot_timeout` (both default to off).
+
 ### Shared retry primitive
 
 The materializer and the client connector use one backoff abstraction: exponential with jitter, a hard attempt cap, and a hard total-duration cap, parameterizable per failure class. Per-piece policies live next to the piece (in the table) but call into the same primitive, with no ad-hoc loops scattered across files.

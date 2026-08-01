@@ -100,6 +100,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
 | any | R15 | Off the critical path. Gated on five upstream diesel proposals landing |
+| any | R31 | Application schema majors: the drain gate, the resync boundary, and the local-tier migration trait. Deadline is the first deployment intending to survive a schema change |
+| any | R32 | The replication slot lifecycle: startup refusal, lag logging, and the invalidation resync epoch. Deadline is any production deployment |
 | last | R24 | Exploratory. How connetto integrates a file-sync stack it does not own |
 | last | R25 | Exploratory, and not now. Device-to-device sync with no server |
 | last | R30 | Exploratory. Revisit grouped aggregates from the recorded research |
@@ -140,6 +142,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R18 SQLite hardening surface | NOT STARTED | nothing here, `diesel-rs/diesel#5128` for unpinned diesel | no |
 | R11 shared public store | NOT STARTED | nothing | no |
 | R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
+| R31 application schema majors and the update path | NOT STARTED | nothing | no |
+| R32 replication slot lifecycle | NOT STARTED | R12 for the lag line only | no |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
 | R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
 | R30 grouped aggregates revisited | NOT STARTED, exploratory | nothing | no |
@@ -179,6 +183,9 @@ graph TD
   R17[R17 local tier name and key scope]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
+  R31[R31 application schema majors]
+  R32[R32 replication slot lifecycle]
+  R12 -.->|lag line only| R32
   U3[upstream: five diesel vacuum proposals] --> R15[R15 replica retention and trimming]
   R23[R23 user-verified unlock of local secrets]
   P[probe: webauthn-prf-probe-spec] --> R23
@@ -1266,6 +1273,60 @@ A replica that has held and released a large window returns disk to the filesyst
 
 ---
 
+## R31: application schema majors and the update path
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** Its deadline is the first deployment that intends to survive a schema change, the same class of deadline as R21 and the `auto_vacuum` default: nothing is urgent at `version = "0.0.0"`, and it becomes load-bearing the day old clients exist.
+
+### Purpose
+
+An application schema change is a major version, decided with the maintainer. A deployment hosts one connetto-server per supported major, so old clients keep syncing against the major they speak until they update, and the client's transition is **flush, update, resync, convert the local tier**. The observation that makes this cheap: synced data never needs client-side conversion, because the deployment migrates Postgres itself and the new-major server serves new-schema snapshots. The client-side residue is exactly three things: pending un-uploaded mutations captured under the old schema, the local tier (device-private, no server copy exists, only the application can convert it), and the bandwidth of re-downloading the synced set, accepted because majors are rare by definition.
+
+### Steps
+
+1. **The drain gate in the update procedure.** The application refuses or warns on update while un-acked mutations exist, draining them to the old-major server, which still speaks their shape. The surfaces exist: the pending queue's sequence numbers natively, `request_unsynced` in the browser, and the `expiry_warning` pattern for presenting it. connetto supplies the gate as a queryable condition, the application owns the update flow.
+2. **A major mismatch at handshake surfaces as update-required, not as an error.** `schema_version` staleness detection exists. A client at an older major connecting to a newer server (its major decommissioned) receives a typed signal the application renders as "update the app", never a silent failure or a resync into a schema it cannot read.
+3. **The local-tier migration trait.** App-supplied and diesel-typed: one step per major boundary, run by connetto on the first open of a tier whose recorded major is behind, with the applied major persisted in the tier so each step runs exactly once. Only device-private tables ride it. Rescue conversion of synced data or stranded mutations (server-side upload-and-convert) is explicitly out of scope, prevented instead by the deployment policy of keeping a major up until its clients drain.
+4. **Resync at the boundary rides existing machinery.** The updated app's first connect against the new major full-resyncs the synced tables, which is `FullResyncRequired` plus the coverage rules already decided, nothing new.
+
+### Proof
+
+An app spanning two majors end to end: writes under major N, the gate refuses update while they are un-acked, drains, updates, the synced tables resync from the major N+1 server, the local tier converts through the trait exactly once, and everything is readable. A client presenting major N to a server that no longer hosts it receives the typed update-required signal.
+
+### Done when
+
+The gate condition is queryable, the trait exists with a two-major fixture, a decommissioned-major handshake surfaces as update-required, and the flush-update-resync-convert story is recorded where the chapters describe connection and reconnect.
+
+---
+
+## R32: the replication slot lifecycle
+
+**Status.** NOT STARTED
+
+**Blocked on R12 for the lag line only.** The startup refusal and the invalidation response need nothing: the refusal joins an existing pattern and the response rides `FullResyncRequired`. Design recorded in `10-subscription-materializer.md` under "The replication slot", decided with the maintainer.
+
+### Purpose
+
+A replication slot retains WAL without limit by default (`max_slot_wal_keep_size` is `-1`), so a decommissioned or long-crashed connetto-server fills the primary's disk and stops writes for every application, not only sync. Once the deployment caps it, an invalidated slot leaves a gap upstream of the oplog that the stale-cursor comparison cannot see, so the server would reconnect at a fresh position and every client would silently miss the changes in the hole. The deployment owns provisioning and the cap. connetto owns refusing, watching, and forcing the resync.
+
+### Steps
+
+1. **Refuse startup when the slot or the publication is missing**, naming which, joining the five-check startup pattern in the cross-cutting checklist.
+2. **Log the slot's lag on a cadence** through R12's facade (restart LSN distance against the current LSN), so a stalled slot is visible before the cap trips. Alerting is the aggregator's, as everywhere.
+3. **Detect invalidation and declare a resync epoch.** When the replication connection reports the slot invalidated or gone, record the gap boundary (the last LSN the oplog ingested), and force every session cursor at or below it through `FullResyncRequired` instead of resuming silently from a fresh slot position.
+4. **Write the deployment guidance**: provision and drop procedures, `max_slot_wal_keep_size` sizing against the primary's disk, and optionally `idle_replication_slot_timeout`.
+
+### Proof
+
+A server started against a database with no slot refuses and names it. With a capped slot, a stalled consumer trips invalidation, the restarted server forces exactly the stale cursors through full resync, and a client holding a cursor newer than the gap resumes incrementally. The lag line appears on cadence in the log.
+
+### Done when
+
+A deployment following the guidance cannot lose changes silently to a slot invalidation, and cannot discover a missing slot any way except the startup refusal naming it.
+
+---
+
 # Exploratory phases
 
 **Neither of these is committed work.** They exist so the ideas are not lost, they are last on purpose, and each is allowed to conclude that it should not be built. A phase in this section may be deleted after its investigation without anything else changing, which is not true of any phase above.
@@ -1364,7 +1425,7 @@ Tick these off across the whole programme, because each is easy to lose inside a
 
 **Migrations, deployment-facing**: R2 re-keys `_connetto_mutations`. R8 removes fields from the session row's `attrs` blob. Both need a written migration, not just a note.
 
-**Startup checks, all four refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping. R6 on a table without `REPLICA IDENTITY FULL`. One pattern, so build it once and reuse it.
+**Startup checks, all five refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it.
 
 **Type-enforced guards, not documentation**: R3's ephemeral replica may attach only an ephemeral tier. R3's `Principal` must make all four arrival cases representable.
 
