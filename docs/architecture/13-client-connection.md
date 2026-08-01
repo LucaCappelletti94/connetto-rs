@@ -14,49 +14,30 @@ Define the client-side Diesel connection wrapper that makes connetto's sync, rea
 
 The Dioxus application queries local SQLite via Diesel. Several concerns must be handled transparently at the connection level:
 
-1. **Aggregate query routing**: the app writes `SELECT region, COUNT(*) FROM orders GROUP BY region` against its domain table. But the client may not have all rows, so the result must come from a server-computed aggregate cached in a backing table, not from a local computation over a partial replica.
+1. **Aggregate query routing**: the app writes `SELECT region, COUNT(*) FROM orders GROUP BY region` against its domain table. But the client may not have all rows, so the result must come from a server-computed aggregate pushed to the client, not from a local computation over a partial replica.
 2. **Mutation interception**: writes against local SQLite must be captured and queued for server-bound PatchSet generation.
-3. **Reactivity via update hooks**: the Diesel SQLite hooks PR ([diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969)) provides `on_insert`, `on_update`, `on_delete` callbacks that fire during `sqlite3_step()`. These drive UI re-rendering in Dioxus.
-4. **Dedicated worker boundary**: in WASM, the real SQLite connection lives inside a dedicated `Worker` elected via Web Locks. Tabs in the main thread need a proxy connection that serializes queries over `postMessage`.
+3. **Reactivity via update hooks**: diesel's SQLite hooks ([diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969), landed in the pinned fork) fire during `sqlite3_step()`. The shipped wiring is an `on_update` router feeding a changed-tables set plus an `on_commit` dirty flag, driving re-queries and UI re-renders.
+4. **Dedicated worker boundary**: in WASM, the real SQLite connection lives inside a dedicated `Worker` elected via Web Locks. Tabs in the main thread reach it over the wire protocol through the worker's relay.
 
 ---
 
 ## Connection Variants
 
-### `ConnettoConnection`: Native (direct)
+### `ConnettoConnection`: the one shipped connection
 
-Used in native (non-WASM) builds. Wraps a real `SqliteConnection` in-process.
+Wraps the capture-managed `SqliteConnection` and implements diesel's `Connection` and `LoadConnection` traits. All query routing, mutation interception, and hook setup happen here. It is the connection everywhere a real SQLite file is held: natively in-process, and inside the browser's dedicated DB worker over OPFS, where it is the same object with a worker `Transport` (see "Native driver" below).
 
-```
-ConnettoConnection {
-    inner: SqliteConnection,
-    aggregate_registry: AggregateRegistry,
-    // + mutation queue, hook wiring, etc.
-}
-```
+### The browser split: the worker owns, tabs speak the wire protocol
 
-Implements Diesel's `Connection` and `LoadConnection` traits. All query routing, aggregate rewriting, mutation interception, and hook setup happen here.
+In WASM the elected DB worker (Web Locks election, `spawn_db_worker` and `boot_db_worker` in `crates/connetto-web/src/workers.rs`) owns the single OPFS connection and the upstream WebSocket. A tab holds no diesel connection to the replica. It reaches the worker over the same binary wire protocol the server speaks, `ControlMessage` and `BulkMessage` frames over `PortTransport` or `BroadcastTransport` (`crates/connetto-web/src/port.rs`, Q2.1 below), served worker-side by `RelayHub` (`crates/connetto-web/src/relay.rs`) from the worker-held replica.
 
-### `ConnettoWorkerConnection`: WASM dedicated worker
+**Status note.** An earlier draft named two further connection types, `ConnettoWorkerConnection` and `ConnettoProxyConnection`. Neither exists. The worker side is plain `ConnettoConnection`, and the tab side shipped as the wire-protocol relay above rather than as a diesel `Connection` implementation. A tab-side diesel-facing connection remains a possible later layer on top of the relay, per Q9.4 in `09-wasm.md`.
 
-Used inside the dedicated `Worker` in browser builds. Nearly identical to `ConnettoConnection` but backed by OPFS SQLite. Owns the WebSocket to the server, applies PatchSets, and serves queries from tabs via `postMessage`.
-
-### `ConnettoProxyConnection`: WASM Tab / Main Thread
-
-Used in the main thread (Dioxus rendering context) in browser builds. Implements the same Diesel `Connection` trait but does not hold a real SQLite connection. Instead:
-
-1. Renders the query to SQL (via `QueryFragment`)
-2. Serializes the SQL + bind parameters over `postMessage` to the dedicated worker
-3. The worker executes it on `ConnettoWorkerConnection` and returns serialized rows
-4. The proxy deserializes the result into Diesel's expected row format
-
-The app code is identical on both sides: same Diesel queries, same model types.
-
-| Variant | Context | SQLite access | Aggregate rewrite |
-|---|---|---|---|
-| `ConnettoConnection` | Native | In-process | Yes |
-| `ConnettoWorkerConnection` | WASM dedicated worker | OPFS | Yes |
-| `ConnettoProxyConnection` | WASM tab | `postMessage` → worker | Delegated to worker |
+| Context | SQLite access | How queries travel |
+|---|---|---|
+| Native | in-process `ConnettoConnection` | direct |
+| WASM dedicated worker | `ConnettoConnection` over OPFS | direct, worker-side |
+| WASM tab | none | wire protocol to the worker's `RelayHub` |
 
 ---
 
@@ -127,13 +108,12 @@ When the server confirms (via CDC echo) or rejects, the pending status is update
 
 ## Reactivity via Diesel SQLite Hooks
 
-The connection sets up Diesel's SQLite hooks ([diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969)):
+The hooks from [diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969) are landed in the pinned fork, and the connection wires two of them:
 
-- **`on_insert` / `on_update` / `on_delete`**: fire synchronously during `sqlite3_step()` when PatchSets are applied or when the app writes locally. These notify Dioxus that specific tables changed, triggering re-queries and UI re-renders.
-- **`on_commit` / `on_rollback`**: used for batching: buffer change notifications during a transaction and flush on commit.
-- **`find_by_rowid`**: loads the full row after the hook fires (since callbacks cannot use the connection during the hook). Used when the UI needs the actual row data, not just the change event.
+- **`on_update`**, with `SqliteUpdateRouter::on_any` over every change op: records the name of each table whose rows change, local writes and applied server patches alike, into the shared changed-tables set that drives re-queries, surfaced as `Reactive::changed_tables` and as the live-query refresh in `ConnettoClient`'s pump.
+- **`on_commit`**: sets the auto-submit dirty flag when a local write commits. The hook only signals, because SQLite forbids using the connection inside it, and `flush()` drains the capture session afterwards.
 
-For aggregate backing tables, the same hooks fire when connetto updates them with server-pushed results. The Dioxus component that depends on the aggregate re-queries and re-renders (same mechanism as row-level data).
+The PR also provides per-op callbacks (`on_insert`, `on_delete`), `on_rollback`, and `find_by_rowid`. None of these is wired today: table-level granularity is sufficient for re-query reactivity, and nothing needs row images at hook time. Server-pushed aggregate values bypass this path entirely, since they arrive as `ClientEvent::Aggregate` pushes on the `LiveValue` handle and never touch a SQLite table.
 
 ---
 
@@ -147,9 +127,9 @@ Mutation interception (auto-submit) is landed. An `on_commit` hook on the app co
 
 Rejection rollback is landed. Each pushed changeset is retained keyed by `client_seq` (bounded by `PENDING_CAP`). When the server replies `MutationReject` or `MutationConflict`, the connection inverts that changeset with `invert_changeset` and applies the inverse with capture suspended (`Session::set_enabled` toggled off for the apply, re-enabled by a drop guard), undoing the optimistic local write without re-uploading it. A row a concurrent server patch already changed is left as the server left it (the inverse is omitted on any conflict). Both events carry the affected rows as `AffectedRow { table, key }`, the table name and primary-key values (`Vec<KeyValue>`) decoded from the pushed changeset via `op.primary_key()`, so the app can show which rows reverted. Server patches apply through the same suspension window: the client holds ONE SQLite connection for capture and apply alike, the topology `sqlite-wasm-rs` requires on wasm (no multiple connections per database), adopted on native too so both platforms share it.
 
-Reactivity is landed. The connection's `on_update` hook records the name of every table whose rows change (local writes and applied server patches alike, capture suspension does not silence it) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection is `Send` (the capture `Session` is `Send`, mirroring diesel's own `SqliteConnection`), so it can move between threads, but it is driven by one task at a time and is not `Sync`. In WASM this same object is the worker-side connection with a worker `Transport`, while the main-thread tab uses a separate proxy connection that forwards queries over `postMessage`.
+Reactivity is landed. The connection's `on_update` hook records the name of every table whose rows change (local writes and applied server patches alike, capture suspension does not silence it) into a shared set, surfaced as `Reactive::changed_tables` from `next_event()` for the app to re-query. The connection is `Send` (the capture `Session` is `Send`, mirroring diesel's own `SqliteConnection`), so it can move between threads, but it is driven by one task at a time and is not `Sync`. In WASM this same object is the worker-side connection with a worker `Transport`, while a tab reaches it over the wire protocol through the worker's relay (`RelayHub`, Q2.1 below), holding no diesel connection of its own.
 
-The delta aggregate family is now delivered end to end: `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` are seeded once through the connector and then folded from subql's per-event deltas, delivered as `ClientEvent::Aggregate`. The `MIN`/`MAX` re-execution aggregates remain alongside them. Both are declared through a single `subscribe(sub_id, query)` (there is no longer a `subscribe_aggregate`), and the server classifies row versus aggregate from the SQL. An aggregate on an RLS-protected table is refused at registration (subql's `AggregatorOnRlsTable`) and surfaces as `ClientEvent::NonFatal` with the session intact. Verified end to end by the `loop_emu` tests `delta_aggregates_bootstrap_and_fold_through_the_client`, `aggregate_on_rls_table_is_rejected_without_closing`, and `aggregate_subscription_bootstraps_and_updates_through_the_client` (the `MIN` path), and by the Docker-gated `pg_async` test `async_pg_delta_aggregate_bootstraps_family`. Conflict convergence is landed and rides the existing sync stream: once a `MutationConflict` rolls the local write back, the server's authoritative row arrives as a normal `LivePatch` and applies under the same capture suspension with the server-wins resolver, so the client converges without the conflict message carrying any server state, verified end to end by the `loop_emu` test `conflicting_write_converges_to_server_after_rollback`. Still ahead: the WASM variants above.
+The delta aggregate family is now delivered end to end: `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` are seeded once through the connector and then folded from subql's per-event deltas, delivered as `ClientEvent::Aggregate`. The `MIN`/`MAX` re-execution aggregates remain alongside them. Both are declared through a single `subscribe(sub_id, query)` (there is no longer a `subscribe_aggregate`), and the server classifies row versus aggregate from the SQL. An aggregate on an RLS-protected table is refused at registration (subql's `AggregatorOnRlsTable`) and surfaces as `ClientEvent::NonFatal` with the session intact. Verified end to end by the `loop_emu` tests `delta_aggregates_bootstrap_and_fold_through_the_client`, `aggregate_on_rls_table_is_rejected_without_closing`, and `aggregate_subscription_bootstraps_and_updates_through_the_client` (the `MIN` path), and by the Docker-gated `pg_async` test `async_pg_delta_aggregate_bootstraps_family`. Conflict convergence is landed and rides the existing sync stream: once a `MutationConflict` rolls the local write back, the server's authoritative row arrives as a normal `LivePatch` and applies under the same capture suspension with the server-wins resolver, so the client converges without the conflict message carrying any server state, verified end to end by the `loop_emu` test `conflicting_write_converges_to_server_after_rollback`. Still ahead on this path: only the optional tab-side diesel-facing layer noted under Connection Variants.
 
 ---
 
@@ -185,13 +165,13 @@ Both hooks compose with connetto's drop-unsubscribe contract: dropping the `Live
 
 1. ~~**Query serialization for `ConnettoProxyConnection`**: what is the format for serializing a Diesel query + bind parameters over `postMessage`? Raw SQL string + binds as MessagePack? Or a higher-level representation?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** The tab-to-worker channel uses the same binary framing as the WebSocket transport: one tag byte followed by MessagePack-encoded payload (`ControlMessage` or `BulkMessage`). Query messages are `ControlMessage` frames carrying the SQL text and typed binds.
 2. ~~**Proxy result format**: how are result rows serialized back from the worker to the tab? Row-level MessagePack? Or raw SQLite row bytes?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** Row updates arrive as `BulkMessage` frames (SQLite PatchSets, MessagePack). Snapshot control events and aggregate pushes arrive as `ControlMessage` frames (MessagePack). Aggregate values within those messages are JSON, per Q2.1.
-3. ~~**Connection pooling in the worker**: does the dedicated worker maintain a single `ConnettoWorkerConnection` or a pool? SQLite is single-writer, so writes are serialized regardless, but concurrent reads from multiple tabs might benefit from multiple reader connections (WAL mode).~~ **Decided (shipped, `ReplicaStorage::delete_db` in `crates/connetto-web/src/storage.rs`):** The sahpool VFS allows one connection per database. A second open handle trips a `debug_assert`, making pooling impossible in the browser build. The worker maintains a single `ConnettoWorkerConnection`.
+3. ~~**Connection pooling in the worker**: does the dedicated worker maintain a single `ConnettoWorkerConnection` or a pool? SQLite is single-writer, so writes are serialized regardless, but concurrent reads from multiple tabs might benefit from multiple reader connections (WAL mode).~~ **Decided (shipped, `ReplicaStorage::delete_db` in `crates/connetto-web/src/storage.rs`):** The sahpool VFS allows one connection per database. A second open handle trips a `debug_assert`, making pooling impossible in the browser build. The worker maintains a single `ConnettoConnection`.
 4. ~~**Aggregate rewrite and Diesel type safety**: the rewritten query (`SELECT * FROM _connetto_agg_{hash}`) must produce rows that Diesel can deserialize into the app's result type. How is the column ordering guaranteed to match?~~ **Decided (Q5.7):** The `_connetto_agg_{hash}` backing table is superseded by the generic `_connetto_aggregates` table storing results as `result_json TEXT`. JSON deserialization via `T: serde::DeserializeOwned` is field-name-based, so column ordering is not a concern.
 
 ---
 
 ## Notes
 
-- The custom connection approach means the app's Diesel code is backend-agnostic at the query level: it works against local SQLite, remote PostgreSQL (if ever needed), or the connetto proxy, all through the same trait.
+- The custom connection approach means the app's Diesel code is backend-agnostic at the query level: it works against local SQLite natively, in the worker over OPFS, and through whatever tab-side layer may later sit on the relay, all through the same trait.
 - The aggregate rewrite layer is conceptually similar to PostgreSQL's query rewriting for materialized views, but implemented at the application level in Rust.
 - The Diesel hooks PR is a prerequisite for the reactivity story. Without it, the client would need to poll for changes or use a separate notification channel.

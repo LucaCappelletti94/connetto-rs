@@ -1,6 +1,6 @@
 # 15: Replica retention, eviction, and physical trimming
 
-**Status**: normative. This is the design document referenced as "the retention design" by `docs/upstream-diesel-auto-vacuum-mode.md`, `docs/upstream-diesel-incremental-vacuum.md`, `docs/upstream-diesel-vacuum-into.md`, `docs/upstream-diesel-page-counters.md`, and `docs/upstream-diesel-wal-checkpoint.md`. Nothing in this chapter is built yet. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The trimming mechanisms are blocked on the five upstream diesel proposals landing. Filing them is the first action of R15.
+**Status**: normative. This is the design document referenced as "the retention design" by `docs/upstream-diesel-auto-vacuum-mode.md`, `docs/upstream-diesel-incremental-vacuum.md`, `docs/upstream-diesel-vacuum-into.md`, `docs/upstream-diesel-page-counters.md`, and `docs/upstream-diesel-wal-checkpoint.md`. Every mechanism this chapter decides is unbuilt. Paragraphs marked **Built.** describe adjacent machinery that already exists and that the decisions lean on. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The trimming mechanisms are blocked on the five upstream diesel proposals landing. Filing them is the first action of R15.
 
 ---
 

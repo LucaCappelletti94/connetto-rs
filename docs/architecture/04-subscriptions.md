@@ -177,7 +177,7 @@ SubscriptionEntry {
 
 **Decided (R3).** The caller may have no identity at all. See `12-identity-session-capability.md`.
 
-The registry is in-memory (session lifetime). It is not persisted server-side, and on reconnect the client re-declares all subscriptions.
+The registry is in-memory (session lifetime). It is not persisted server-side, and on reconnect the client re-declares all subscriptions. Across a client restart the same re-declaration comes from the client's own persisted subscription set, pins always and watch-backed entries still within their grace (`15-replica-retention.md` under "What covers a row", phase R29).
 
 ---
 

@@ -34,6 +34,8 @@ Global, cross-client statistics (non-RLS only). A statistic over rows the client
 
 The delivered server-side delta family is `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP`, seeded once through the connector then folded per CDC event. `MIN` and `MAX` stay on the re-execution path. See `10-subscription-materializer.md` for the server mechanics and `13-client-connection.md` for the client-query mechanism.
 
+The client's answer-path classifier is deliberately broader than this family. `AGGREGATE_FUNCTIONS` in `crates/connetto-client/src/live.rs` recognizes the delta family plus `MIN`, `MAX`, and SQLite's `TOTAL`, and it decides only which path a query rides, never what the server maintains: anything aggregate-shaped must reach the server path, because running it as a row query against a partial replica would return a wrong answer silently. `MIN` and `MAX` are then served by re-execution. `TOTAL` has no server-side variant at all (no `AggSpec` member in `subql` and no re-execution class), so it rides the registration-refusal path and surfaces as a `NonFatal`, loud rather than silently wrong, though that exact fate is untested end to end.
+
 ---
 
 ## Primary Approach: Server-Side Accumulator
@@ -47,12 +49,12 @@ In the crate split, the accumulator state and its incremental maintenance live i
 | Shape | Incremental update rule |
 |---|---|
 | `COUNT(*)` | +1 on insert, -1 on delete, 0 on update |
-| `COUNT(col)` | +1 on insert where col IS NOT NULL, -1 on delete where col IS NOT NULL, ±1 on update based on nullability change |
+| `COUNT(col)` | +1 on insert where col IS NOT NULL, -1 on delete where col IS NOT NULL, plus or minus 1 on update based on nullability change |
 | `SUM(col)` | +new_val on insert, -old_val on delete, +(new_val - old_val) on update |
-| `MIN(col)` | Incremental only if new value < current min (insert) or old value was the min (delete/update) — else no push needed or re-query needed |
+| `MIN(col)` | Incremental only if the new value < current min (insert) or the old value was the min (delete/update), otherwise either no push or a re-query is needed |
 | `MAX(col)` | Symmetric to MIN |
-| `COUNT(*) GROUP BY col` | Maintain a map of group → count; update affected bucket |
-| `SUM(col) GROUP BY grp` | Maintain a map of group → sum |
+| `COUNT(*) GROUP BY col` | Maintain a map from group to count, updating the affected bucket |
+| `SUM(col) GROUP BY grp` | Maintain a map from group to sum |
 
 MIN and MAX with deletions are problematic for incremental updates: if the current minimum is deleted, the new minimum requires scanning all remaining rows. This is the main reason MIN/MAX fall back to re-execution more readily than COUNT/SUM.
 

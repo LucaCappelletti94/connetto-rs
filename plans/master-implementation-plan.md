@@ -123,14 +123,14 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R0 part B, full measurement | NOT STARTED | R5a | yes, via R5a |
 | R5b service as executor | NOT STARTED | R5a, R0, rls2fga | **yes, rls2fga** |
 | R16 part A, fan-out research | **DONE** | nothing | no |
-| R16 part B, fan-out architecture | NOT STARTED | R0, and R3 for the wire question only | no |
+| R16 part B, the fan-out architecture | NOT STARTED | R0 (the bulk-frame decision is a deadline coupled to R3, not a blocker, see the section) | no |
 | R14 dispatch-loop cost | NOT STARTED | R0 and R5b, conditional on R0's data | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R4 and R6 | inherited |
 | R9 permissive policy out of tests | NOT STARTED | R5b | inherited |
 | R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
 | R26 local data export | NOT STARTED | nothing | no |
-| R27 membership term in the subscription language | NOT STARTED | R5b, R6, R22, and a subql change | **yes, subql** |
+| R27 membership term in the subscription language | NOT STARTED | R6, R22, and a subql change | **yes, subql** |
 | R28 subscribe-time delivery gap | NOT STARTED | nothing | no |
 | R29 client-side coverage | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
@@ -148,25 +148,26 @@ A rendering of the table above, for reading rather than for deciding. **If the t
 
 ```mermaid
 graph TD
-  R1[R1 security defaults] --> R2[R2 durable session identity]
+  R1[R1 security defaults]
   R12[R12 structured logging] --> R3
-  R2 --> R3[R3 grants and Principal]
+  R2[R2 durable session identity] --> R3[R3 grants and Principal]
   R3 --> R4[R4 capabilities in the model]
   R3 --> R13[R13 auth_events audit table]
   R3 --> R19[R19 request throttling]
   R2 --> R19
-  R22[R22 compile-time query set] --> R19
-  R5a[R5a visibility seam] --> R0[R0 measurement]
+  R22[R22 compile-time query set] -.->|should land first| R19
+  R0A[R0 part A, connetto-only counters]
+  R5a[R5a visibility seam] --> R0B[R0 part B, full measurement]
   R5a --> R5b[R5b service as executor]
-  R0 --> R5b
+  R0B --> R5b
   U1[upstream: rls2fga per-row records] --> R5b
   U2[upstream: subql visibility trait] --> R5a
   R5b --> R6[R6 two-check change form]
   R5b --> R14[R14 dispatch-loop cost]
   R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture]
-  R0 --> R16
+  R0B --> R16
   R16 -.->|frame decision only,<br/>before R3 ships| R3
-  R0 --> R14
+  R0B --> R14
   R4 --> R7[R7 revocation teardown]
   R6 --> R7
   R5b --> R9[R9 permissive policy out of tests]
@@ -299,7 +300,7 @@ No fixes. R0 measures and does not optimize.
 
 ### Purpose
 
-`session_token` was designed in the first commit, documented as the resume key, and never built. The server never reads the client's value back and no client persists it. `docs/architecture/11-authentication.md:158` has been correct and unimplemented for the life of the repository.
+`session_token` was designed in the first commit, documented as the resume key, and never built. The server never reads the client's value back and no client persists it. The sentence in `11-authentication.md` under "connetto session credential", that `session_token` remains the resume key doing a different job from the auth credential, has been correct and unimplemented for the life of the repository.
 
 ### Steps
 
@@ -309,7 +310,7 @@ No fixes. R0 measures and does not optimize.
 4. Present it on reconnect and resume the session's operational state. Pass a stable `u64` derived from the handle to `advance_cursor` in place of `connection_num`, which is what makes subql's per-subscription cursors and pending buffer resume (`open-questions.md` Q6.4 and Q6.5).
 5. **A handle covers one unbroken run of one caller.** Signing in ends the unidentified run and starts an identified one, signing out ends that one, and nothing is ever inherited. Four things key on the handle, so a handle outliving a change of caller would hand the next person on a shared device the previous person's subscriptions, cursors and buffered changes.
 6. Re-key the exactly-once watermark. `_connetto_mutations` becomes keyed on the handle alone, the `user_id` column and its foreign key go, and the `connetto_watermark_table!` macro changes with it.
-7. **Write the migration.** This is a deployment-facing schema contract (`11-authentication.md:114-124`). Existing deployments must migrate before upgrading.
+7. **Write the migration.** This is a deployment-facing schema contract (the `_connetto_mutations` schema in `11-authentication.md` under "Migrations: the tables are the deployment's"). Existing deployments must migrate before upgrading.
 8. **Add a startup check on the watermark table's shape** and refuse to run against the old one, naming what is wrong. Same treatment R6 gives `REPLICA IDENTITY`, and for the same reason: connetto emits no server DDL on any path a deployment runs, so the trait is the only contract, and an unchecked contract lets a server run while mis-keying its exactly-once records. That failure is silent until a replay happens.
 9. Add `Outbound::Fatal(FatalError)` to `Outbound` in `crates/connetto-server/src/session.rs` (which currently has only `Live` and `Aggregate`) and a pump arm that sends it and closes.
 10. Add a connection registry keyed on the durable handle, and construct `FatalErrorReason::SessionRevoked` so revoking a session closes its live connection rather than only refusing its next handshake. The per-subscription route map is **not** sufficient: a session with no subscriptions has no route and would be unreachable.
@@ -408,9 +409,9 @@ It puts R0's authorization counter on a seam that then never relocates, so the b
 
 **Blocked on nothing, and a prerequisite for R3.** Ordered before it.
 
-**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only stdout output is `println!` in the two CLI binaries. Meanwhile `08-authorization.md:249` records structured logging as **Decided**, `11-authentication.md:214` calls it "no new mechanism" as though one existed, `open-questions.md:302` decides it for the firehose, and the architecture diagram draws a log aggregator.
+**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only stdout output is `println!` in the two CLI binaries. Meanwhile `08-authorization.md` under "Audit" records structured logging as **Decided**, the Audit paragraph of `11-authentication.md` under "Deployment shape" calls it "no new mechanism" as though one existed, `open-questions.md` Q8.6 decides it for the firehose, and the architecture diagram draws a log aggregator.
 
-**One of those dependencies is load-bearing for security.** `08-authorization.md:266`, restated in R3 step 7, says that because the wire says nothing about a refused grant, "the log line is the only place the failure is visible and is therefore what makes it loud". With no logging a refused grant is visible nowhere, so R3's silent-refusal design is unsafe until this lands. That is why this is a prerequisite rather than observability polish.
+**One of those dependencies is load-bearing for security.** `08-authorization.md` under "Audit", restated in R3 step 7, says that because the wire says nothing about a refused grant, "the log line is the only place the failure is visible and is therefore what makes it loud". With no logging a refused grant is visible nowhere, so R3's silent-refusal design is unsafe until this lands. That is why this is a prerequisite rather than observability polish.
 
 ### Purpose
 
@@ -420,7 +421,7 @@ The architecture records structured logging as decided in three chapters and in 
 
 1. Add the facade and one initialization point. The decision is already recorded: structured, to stdout, aggregator chosen by the deployment. There is nothing to decide here, only to build.
 2. Emit at the call sites the architecture already names: authentication outcomes, refused grants, connection events, and change-stream connection failures. A CDC outage is a connection failure and wants a log line, not a subsystem.
-3. Keep denials out of `auth_events`, per the split at `08-authorization.md:249`. High-volume goes to the log, state changes go to the table, and that table is its own later phase.
+3. Keep denials out of `auth_events`, per the split in `08-authorization.md` under "Audit". High-volume goes to the log, state changes go to the table, and that table is its own later phase.
 
 ### Proof
 
@@ -452,7 +453,7 @@ A refused grant is visible in the log, so R3 may proceed.
 4. `SessionVerifier` becomes a grant checker producing a `Principal`. It is **not** a resolver: `IdentityResolver` in `crates/connetto-server/src/authn/identity.rs` already exists and means mapping a provider's asserted claims to a typed user id in the deployment's own users table.
 5. `Principal` carries an optional identity plus resolved capabilities, and the **type must make all four arrival cases representable**: nothing, identity only, capability only, and both.
 6. A failed grant does **not** end the connection. The session proceeds on whatever was accepted.
-7. **`HandshakeAck` gains no field.** The reply says nothing about a failure, not the reason and not which grant. Not allowed, no longer allowed and never existed are indistinguishable. The failure is recorded in the server's **structured log** and nowhere else, which is what makes it loud. Not in `auth_events`: a denial is high-volume by the split at `08-authorization.md:227`, and that table holds state changes.
+7. **`HandshakeAck` gains no field.** The reply says nothing about a failure, not the reason and not which grant. Not allowed, no longer allowed and never existed are indistinguishable. The failure is recorded in the server's **structured log** and nowhere else, which is what makes it loud. Not in `auth_events`: a denial is high-volume by the split in `08-authorization.md` under "Audit", and that table holds state changes.
 8. A caller with no identity gets `Replica::Ephemeral`, always, with no opt-in. The variant exists already and is already `:memory:` (`Replica::Ephemeral` in `crates/connetto-client/src/replica.rs`, `:124`, `:114`).
 9. **Type guard**: an ephemeral replica may attach only an ephemeral local tier. A file tier attached to an ephemeral replica would be unencrypted, because the tier inherits the replica's key (see `connect_inner` in `crates/connetto-client/src/lib.rs`) and an ephemeral replica has none, which is the durable-plaintext variant E5 deleted arriving by the back door. **Enforce it in the type, not in the documentation.**
 10. Sign-in seam: sends any queued writes first and refuses the switch if it cannot, and surfaces both the outgoing session handle and the incoming identity so the application can re-key its own rows. **connetto performs no merge**, because only the application knows which of its tables to re-key.
@@ -1339,7 +1340,7 @@ Tick these off across the whole programme, because each is easy to lose inside a
 
 **Symbols that must cease to exist**: `PermissiveProvider` (R1), `TrustingSessionVerifier` (R2), `Credential::{Anonymous, Token}` (R3), `AuthPolicy` (R5a), `PermissiveAuth` (R9), `AuthContext.tenant_id`, `.roles`, `.claims` (R8).
 
-**One line that is correct and must not be touched**: `docs/architecture/11-authentication.md:158`, which already says `session_token` is the resume key doing a different job from the auth credential. R2 makes the code match a doc that has been right all along.
+**One sentence that is correct and must not be touched**: in `11-authentication.md` under "connetto session credential", `session_token` is the resume key doing a different job from the auth credential. R2 makes the code match a doc that has been right all along.
 
 ---
 # Parked, with reasons
@@ -1358,15 +1359,15 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **The unsynced-data warning as a session nears expiry needs no phase.** `expiry_warning` in `crates/connetto-client/src/teardown.rs` already takes the expiry, a lead time and the unsynced sequence numbers, and `session_expires_at` already reaches the client on the auth response. Its caller is the embedding application by design.
 
-**Backoff and retry uniformity.** The shared retry primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, one abstraction shared by the materializer and the client connector) still has no phase and no observable criterion. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
+**Backoff and retry uniformity, partially owned.** R5b step 12 unifies the three backoff loops that exist by then (client reconnect, CDC reconnect, and the authorization-service outage it adds) into one policy with per-caller bounds. The fuller shared primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, covering re-execution retry, delivery back-pressure, and mutation retry as well) still has no phase and no observable criterion beyond those three loops. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
 
 ---
 
 # What must not be done
 
-Do not commit any `.md` from `docs/` or this file. Handoff, prompt, plan, upstream and roadmap documents are process artifacts. `plans/` is git-excluded, `docs/upstream-*.md` and `docs/handoff-*.md` are untracked and must stay so.
+Handoff, prompt, upstream and roadmap documents are process artifacts and are never committed. `docs/upstream-*.md` and `docs/handoff-*.md` are untracked and must stay so. This file and the architecture chapters are committed only when the maintainer names them in that moment.
 
-Do not commit at all without an explicit instruction in the moment. Do not push. Do not open a pull request. Four commits are already unpushed.
+Do not commit at all without an explicit instruction in the moment. Do not push. Do not open a pull request.
 
 Do not treat a phase as done because it compiles. Every phase above has an acceptance section naming an observable result.
 

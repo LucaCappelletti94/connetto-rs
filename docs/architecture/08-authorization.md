@@ -277,7 +277,7 @@ And a refused write must **not** be reported as unauthorized. Rejecting it that 
 
 **Decided.** High-volume operational events (denials, connection events, per-row visibility questions) go to structured logging on stdout, and the aggregator is a deployment choice. **Decided, not built:** no crate declares `tracing` or `log` and no `src` uses either, so every claim about structured logging in these chapters describes an intended mechanism. Phase R12 builds it, and R3 is blocked on it because a refused grant is silent on the wire and the log line is what makes it loud. State changes that matter (permission changes, session invalidations, model changes) are persisted to an `auth_events` table for application-level querying. OpenFGA's own audit log covers model and record changes on the authorization side.
 
-**Naming correction.** An earlier version of this chapter defined the table as `auth_log` while `11-authentication.md:208` and `open-questions.md:287` both call it `auth_events` and the first of them cites this chapter as the definition. `auth_events` is the name. The shape:
+**Naming correction.** An earlier version of this chapter defined the table as `auth_log` while the Audit paragraph under "Deployment shape" in `11-authentication.md` and `open-questions.md` Q8.6 both call it `auth_events` and the first of them cites this chapter as the definition. `auth_events` is the name. The shape:
 
 ```
 auth_events(
