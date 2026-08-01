@@ -35,7 +35,9 @@ All sync logic runs in a **background worker**, never on the main thread. The ma
 | `Worker` | Per-tab | Simplest; sync state is per-tab |
 | `ServiceWorker` | Persistent, survives tab close | Most complex; enables background sync |
 
-The shipped topology is a dedicated `Worker` spawned by whichever tab wins a Web Locks election (via `spawn_db_worker` in `crates/connetto-web/src/workers.rs`). `BroadcastChannel` carries the tab-to-worker leg. This is the only viable path: `createSyncAccessHandle` is `[Exposed=DedicatedWorker]` in the WHATWG File System IDL, so `SharedWorker` cannot host the database tier in any conforming browser. Android exclusion is a product choice, not a browser limitation. `ServiceWorker` is a future consideration for background sync.
+The shipped topology is a dedicated `Worker` spawned by whichever tab wins a Web Locks election (via `spawn_db_worker` in `crates/connetto-web/src/workers.rs`). `BroadcastChannel` carries the tab-to-worker leg. This is the only viable path: `createSyncAccessHandle` is `[Exposed=DedicatedWorker]` in the WHATWG File System IDL, so `SharedWorker` cannot host the database tier in any conforming browser. **Android is supported on the web**, on both Chrome for Android and WebView, with the floors recorded in `open-questions.md`. It is also supported as a native app. The earlier exclusion rested on the `SharedWorker` premise, which is void. `ServiceWorker` is a future consideration for background sync.
+
+**A second interface pins the topology from the other direction, and it pulls the opposite way.** `createSyncAccessHandle` is dedicated-worker-only, which forces the database into the worker. `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, which forces the unlock that produces the replica's key into a tab. The two cannot be co-located, so the key crosses from tab to worker as a non-extractable `CryptoKey` rather than as bytes. `14-at-rest-encryption.md` specifies the handoff and its residual exposure, and `11-authentication.md` qualifies the worker-custody invariant accordingly. Tokens continue to travel in neither direction.
 
 ### Communication with main thread
 

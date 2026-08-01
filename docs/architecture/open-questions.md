@@ -41,7 +41,11 @@ The technical reason is void. connetto does not use a `SharedWorker` and cannot:
 
 One factual claim above is also now false. Chrome for Android gained `SharedWorker` in version 148, stated explicitly in `mdn/browser-compat-data`. It was true when written. WebView Android still lacks it, verified by measurement, and that no longer matters.
 
-What remains is the product reason, and it stands until stated otherwise: Android users install the native app. That is a product choice about who the web target serves, not a browser limitation, and it should be recorded as one. Both Android platforms are technically capable of running connetto's web topology, with a floor of Chrome Android 109 and WebView 102.
+**The product reason is now also withdrawn, on the maintainer's statement.** It read that Android users install the native app, so the web target was desktop browsers and iOS Safari. That framing came from the `SharedWorker` premise, which is void, and it was never a considered product position in its own right. **Android is supported both in the browser and as a native app.** Both Android platforms run connetto's web topology, with a floor of Chrome Android 109 and WebView 102.
+
+The usage data argues the same way. Chrome for Android is 92.9% of Android browser usage and the single largest browser in the caniuse dataset at 44.75% of all tracked usage, so excluding Android from the web target would exclude the largest browser population there is.
+
+**One split matters and is easy to miss.** Android in a browser and Android in an embedded WebView are different surfaces for key custody. Chrome for Android has had the WebAuthn PRF extension since version 116, so it gets the gate in `14-at-rest-encryption.md`. Android WebView has no WebAuthn at all, not merely no PRF, so it never gets it. And a Dioxus Android app renders in that same WebView while running Rust natively, which would want the OS keystore instead, except that `keyring` has no Android backend. See `14-at-rest-encryption.md`.
 
 ---
 
@@ -358,7 +362,7 @@ Safari drops from 16.0 to 15.4, because 16.0 came from `SharedWorker` and nothin
 
 A note for anyone repeating that measurement: `navigator.storage` and `navigator.locks` are both `[SecureContext]`, so serving the probe to an emulator over `http://10.0.2.2:<port>` makes three of the five appear absent. Use `adb reverse` and load it over `http://localhost:<port>`, which is a trustworthy origin. The first run of this probe was wrong for exactly that reason.
 
-**Whether to support Android on the web is a product decision and is not settled here.** Q1.3 gave two reasons for excluding it, one technical and one product. The technical one is void. The product one, that Android users install the native app, stands until stated otherwise, and it should be recorded as a product choice rather than as a browser limitation.
+**Android on the web is supported. Decided, superseding the deferral this line used to record.** Q1.3 gave two reasons for excluding it. The technical one is void, and the product one has been withdrawn by the maintainer: Android is served both in the browser and by a native app, not by the app alone. Nothing here excludes Android.
 
 Unsupported entirely: any browser below its minimum above.
 

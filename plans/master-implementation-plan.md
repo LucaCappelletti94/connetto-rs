@@ -89,7 +89,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R4 and R6 |
 | 17 | R9 | Needs R5b |
-| any | R23 | Blocked on nothing. Step 1 is a support check that may end it |
+| any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
+| any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
 | any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it |
 | any | R17 | A defect, blocked on nothing. Land it whenever, and before anything else relies on the local tier |
@@ -124,7 +125,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R4 and R6 | inherited |
 | R9 permissive policy out of tests | NOT STARTED | R5b | inherited |
-| R23 passkey-derived browser key | NOT STARTED | nothing, step 1 is a platform-support check | no |
+| R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
+| R26 local data export | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | NOT STARTED | nothing | no |
 | R17 local tier name and key scope | NOT STARTED | nothing | no |
@@ -163,13 +165,15 @@ graph TD
   R6 --> R7
   R5b --> R9[R9 permissive policy out of tests]
   R8[R8 inert surface]
-  R23[R23 passkey-derived browser key]
   R21[R21 one page codec on both backends]
   R20[R20 start with no reachable server]
   R17[R17 local tier name and key scope]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
   U3[upstream: five diesel vacuum proposals] --> R15[R15 replica retention and trimming]
+  R23[R23 user-verified unlock of local secrets]
+  P[probe: webauthn-prf-probe-spec] --> R23
+  R26[R26 local data export]
   R24[R24 file-sync integration, exploratory]
   R25[R25 device-to-device sync, exploratory]
   R2 -.->|registry only| R8
@@ -922,33 +926,76 @@ Subscription creation, connection rate and the auth endpoints are all metered, t
 
 ---
 
-## R23: derive the browser replica key from a passkey
+## R23: user-verified unlock of locally stored secrets
 
 **Status.** NOT STARTED
 
-**Blocked on nothing, and step 1 may end the phase.** If the platforms do not support what this needs, the phase stops after the check having cost only the check.
+**Blocked on a measurement, not on code.** `docs/webauthn-prf-probe-spec.md` specifies a probe to be built and run separately. Two decisions inside this phase wait on its report, and a negative result on its central question would reshape the phase rather than merely delay it.
+
+**Renamed and rescoped.** It was "derive the browser replica key from a passkey". That undersized it in three ways: it covered one of the two secrets, it was browser-only, and its step 1 conflated "is the extension supported" with "is the mechanism it replaces actually weak", so it could never deliver what its own step 5 promised.
 
 ### Purpose
 
-In the browser the replica key is wrapped by a non-extractable key in IndexedDB, so **the ciphertext and the key that opens it live in the same browser profile directory**. Anyone who copies that directory plausibly has both, which is why `docs/architecture/14-at-rest-encryption.md` records the stolen-copy claim as unverified for the browser rather than making it.
+Locally stored secrets are readable by anyone holding the device or the browser profile. In the browser the replica key is wrapped by a key that lives in the same profile directory as the ciphertext. On native, `keyring` stores secrets with no user-verification attribute at all, verified against its source. So the encryption defends against script-level exfiltration and against an off-device copy of the storage alone, and not against someone with the whole profile or the unlocked machine.
 
-WebAuthn's `prf` extension derives a stable secret from a passkey given a salt the caller chooses. Its documented purpose is generating "a symmetric key for encrypting sensitive data, and that can only be decrypted by a user who has the seed and the associated authenticator", which is this problem exactly. Two things follow: the key leaves the profile entirely, and a platform passkey gates it behind the device's own face, fingerprint or passcode check, so the user-verification gate arrives as a property of the mechanism rather than as separate work.
+The target is the behaviour a banking application has: open it, present a finger, and the local data is readable. The server verifies nothing and is not involved, which is what distinguishes this from a login mechanism. `11-authentication.md` records that distinction and rejects the login variant as bad practice.
 
 ### Steps
 
-1. **Verify support before anything else, and treat a negative as the phase's answer.** Establish which browsers implement `prf` and, separately, whether the built-in platform authenticators on the targets support the authenticator feature it rests on. A browser implementing the extension is not the same as the user's authenticator being able to satisfy it, and the design depends on both. Record the finding either way, because the current unverified note in chapter 14 is what this replaces.
-2. Derive the replica key from `prf` with a **per-identity salt**, so one passkey yields a different key per account and the existing per-identity key design is unchanged.
-3. **Keep a fallback and make it explicit.** An authenticator without support, or a user who declines to enrol, still needs a working replica. That path is today's IndexedDB-wrapped key, and it must be labelled as the weaker one rather than silently equivalent.
-4. **State the loss story.** Losing the passkey loses the replica, the same shape as losing the cached key today but far more visible to a user. Say what recovers: synced tables re-snapshot from the server, device-local tables do not.
-5. Update chapter 14 to replace the unverified browser note with whatever step 1 established, and to say which threat the passkey path closes that the IndexedDB path does not.
+1. **Run the probe and record the report.** `docs/webauthn-prf-probe-spec.md` lists thirteen browser questions and two native ones, with the consequence of each answer. A negative on its Q5, stability of the derived value, ends this approach outright.
+2. **Browser: derive the key-encryption key from the passkey** with one fixed input, through HKDF with a per-purpose label, replacing the stored non-extractable key. Re-key the `wrapped` store to (replica name, credential id) while writing a single row.
+3. **Browser: move the assertion into a tab and hand the key to the worker.** `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, so this is forced by the interface. State what the main thread may retain, since key material now transits it.
+4. **Native Apple: gate the keychain items** with biometry-any combined with device passcode. Biometry-any because biometry-current-set invalidates on a fingerprint change, and the passcode combination gives a fallback without a second stored copy.
+5. **Add access control to the Apple store crate upstream, and use it.** Decided rather than open: version 4 of that library split into a core plus per-platform store crates, so the capability lands in the Apple store alone and no cross-platform interface has to express something three platforms lack. The project is active with outside contributions merging within days, and no such request exists yet. Confirm the flags behave as expected via the probe's native leg before proposing anything. Reaching around the library was the alternative and is rejected, since the capability belongs where every other user of it can have it.
+6. **Windows, pending its own measurement.** Credential Manager has no user-verification attribute, so the gate cannot be a flag on existing storage. Hello is reachable through the `windows` crate's `Security_Credentials` features, but its consent check is worth nothing against an attacker holding the files, and its platform-held key signs rather than encrypts. Whether a key can be seeded from it depends on the signature being deterministic, which the probe's W2 measures. A negative puts Windows with the unsupported surfaces.
+7. **Expose which custody applies to the open replica**, as a property of the connection alongside the existing `ClientEvent` stream rather than as a new channel. Three levels, derived from a user-verified credential, stored without verification, and no durable key at all, each carrying a reason so an application can explain why rather than only what. The reason must separate a platform that cannot support the gate from a user who declined it, because only the second can be offered again, and enrolling later re-wraps the replica key under the derived one. This exists so an interface can warn plainly when protection is absent, since a user cannot infer it from their browser. Reporting a level connetto does not provide would be worse than reporting nothing, so it must be derived from what actually happened at unlock rather than from a capability guess made earlier.
+8. **Confirm the unsupported population**, from the probe's matrix. Structurally it is about 2.3% of tracked usage and the decision is already taken, no gate and the chapter says so. That decision stands only if a synced software passkey satisfies the extension. If it does not, the unsupported case becomes the common one and the fallback reopens with a passphrase as the serious candidate.
+9. **Update `14-at-rest-encryption.md`** to replace the pending markers with what the report established, including whether the stolen-profile claim can finally be made.
 
 ### Proof
 
-A replica written under a passkey-derived key opens after user verification and fails without it. **Copying the browser profile to a fresh browser and attempting to open the replica fails**, which is the property this phase exists to buy and the one the current design cannot demonstrate. The fallback path still works on an authenticator without support.
+A replica written under a derived key opens after user verification and fails without it. **Copying the browser profile to a fresh browser and failing to open the replica** is the property this phase exists to buy and the one the current design cannot demonstrate. On Apple, an item survives a fingerprint-set change and still prompts.
 
 ### Done when
 
-The browser replica key is derived from a passkey where the platform allows it, a copied profile is provably insufficient to open the replica, the fallback is present and labelled weaker, and chapter 14 states a verified position instead of an open question.
+Both the replica and the stored refresh token are behind a user-verified gate wherever the platform allows one, the surfaces where it does not are named rather than implied, a copied profile is provably insufficient, and chapter 14 states a measured position instead of a pending one.
+
+### Out of scope
+
+Multiple wrapped copies per replica. Every copy would live in the same store and be lost together, so they protect only against losing an authenticator sitting on a different device, and only for a user who enrolled a backup beforehand. Durability of device-private data is served by R26 instead. The record key is shaped to allow a second holder later without a migration, and one row is written.
+
+---
+
+## R26: local data export
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** Independent of everything in R23.
+
+### Purpose
+
+Nothing in the architecture addresses exporting a user's data, and the obligation is not optional for a product handling personal data. It also carries the durability story for the device-private tier, which is the only data connetto can genuinely lose: the local-only tier is "device-private, never synced" by definition, so losing the device loses it, and no key mechanism can change that without making the tier not device-private.
+
+That makes export the honest answer to durability rather than a recovery credential. It puts the user in control, needs no enrolment flow and no additional cryptography, and it has to exist regardless.
+
+### Steps
+
+1. **Export both tiers**, synced and device-private, since a portability request covers everything held about the person and the two tiers are one database from the user's point of view.
+2. **Choose and document an interchange format.** A raw encrypted file is not an export. This is the phase's real design question.
+3. **Cover the server side**, since data held server-side is equally in scope for portability and the client alone cannot satisfy the obligation.
+4. **State what export does not include**, so the boundary is explicit rather than assumed.
+
+### Proof
+
+A user exports, and the result is readable without connetto and contains both tiers.
+
+### Done when
+
+A documented export exists covering both tiers and the server side, and the durability position for device-private data points at it.
+
+### Out of scope
+
+Import, and device-to-device transfer. The latter is `R25`, exploratory and explicitly not now, and is expected to follow local wireless transport rather than an export file.
 
 ---
 
