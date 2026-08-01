@@ -202,7 +202,7 @@ For each CDC event:
   - `old does not, new matches` → deliver as insert (row entered the result set).
   - `old does not, new does not` → no delivery needed.
 
-**The two deletes above are different events and the wire must distinguish them. Decided (R29).** The `op = Delete` case removes a row that no longer exists. The `old matches, new does not` case removes a row that still exists and merely left this subscription's window. Today both arrive as a delete and the client cannot tell them apart.
+**The two deletes above are different events and the wire must distinguish them. Decided (R29).** The `op = Delete` case removes a row that no longer exists. The `old matches, new does not` case removes a row that still exists and merely left this subscription's window. Today both arrive as a delete and the client cannot tell them apart. The marker is the patchset op's own session-format indirect flag, set on synthesized departure deletes, so no frame or format changes (`15-replica-retention.md`, The one case predicates cannot answer).
 
 That is safe only while one subscription owns a table. With two subscriptions over one table it is not, because patches from both apply into the same replica table, so a row leaving the first one's window deletes it out from under the second, which still covers it. Nor can the client repair this by checking the other predicates itself: on a genuine deletion the server sends a delete to every covering subscription, each is held back by the others still matching the stale local row, and the row is never removed at all.
 
