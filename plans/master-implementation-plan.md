@@ -196,15 +196,15 @@ graph TD
 
 ## Upstream dependencies
 
-Two documents, both untracked and never to be committed.
+Three documents, all untracked and never to be committed.
 
 **`docs/upstream-rls2fga-per-row-records.md`** blocks R5b, and therefore R6, R7 and R9. Self-contained and self-testable inside rls2fga: emit the per-row description beside the existing SQL, ship a reference evaluator, assert that no exclusion subtracts anything row-derived. Its acceptance is a differential test against its own whole-table SQL.
 
 **`docs/upstream-subql-visibility-trait.md`** blocks R5a. The trait must live in subql, because subql calls it and subql cannot depend on connetto-core. Its per-row half is blocked on the rls2fga change, but the trait's shape is not, which is why R5a can proceed on a small subql change alone.
 
-Neither has a tracking issue. Open one in each repository, or the blocker is invisible from outside this file.
+**`docs/upstream-subql-membership-term.md`** blocks R27's subql half. The shape is settled (one filter written as SQL, two executors, R27 step 1), the term is bounded to what `rls2fga` classifies, and it lands after the other two documents because its change path rides their machinery. A wanted capability rather than a defect found, recorded in the same form regardless.
 
-**R27 needs a third subql change, and has no document yet.** The membership term is a change to the subscription language, which subql owns. No document exists because the phase sits behind R6 and its shape is still open, between a SQL subquery and a relation check against the compiled model. This is a wanted capability rather than a defect found, so it is not an upstream finding in the sense the other two are.
+None has a tracking issue. Open one in each repository, or the blocker is invisible from outside this file.
 
 ---
 
@@ -1020,7 +1020,7 @@ Import, and device-to-device transfer. The latter is `R25`, exploratory and expl
 
 **Status.** NOT STARTED
 
-**Blocked on R6, R22, and a subql change.** R22 is a new dependency: the evaluation question is now settled as one filter compiled to two executors, and compiling a subscription filter requires the query set to be known ahead of time, which is what R22 establishes. Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
+**Blocked on R6, R22, and a subql change (`docs/upstream-subql-membership-term.md`).** R22 is a new dependency: the evaluation question is now settled as one filter compiled to two executors, and compiling a subscription filter requires the query set to be known ahead of time, which is what R22 establishes. Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
 
 ### Purpose
 
