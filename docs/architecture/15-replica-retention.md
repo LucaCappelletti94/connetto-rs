@@ -38,7 +38,49 @@ Eviction must run with the capture session suspended. `SuspendedCapture` in `cra
 
 **Built.** Local-tier rows are structurally safe from eviction. The constraint recorded in `docs/architecture/open-questions.md` at decision Q10.7 is that no `SubscriptionSpec` can ever carry a frontend-tier table. Eviction works by checking which rows remain covered by some active `SubscriptionSpec`. Since `SubscriptionSpec` cannot reference the frontend tier, the eviction scan has no path to a frontend row. Device-local data survives a retention pass by placement rather than by a runtime guard, because the FK closure rule that enforces the tier boundary at generation time also forecloses cascade paths into the tier.
 
-The interplay between eviction, per-table retention declarations in the synql schema, and pending local writes that reference rows whose subscription window has moved is not yet fully designed. The `docs/roadmap.md` entry for this work defers code until that design is settled.
+**Decided: coverage is recomputed from the subscriptions themselves, and never stored per row.** The client persists its subscriptions in the never-synced tier and derives what is covered by running their queries against the replica. It stores no association between a row and the subscription that brought it.
+
+This is possible because the client already holds, per subscription, the **SQLite-dialect** query text and its bind values (`ConnettoSession::subscribe_spec`), so a subscription is directly runnable against the replica. Storing the association instead was rejected on two grounds: a record per row per covering subscription is more storage than the data itself on a narrow table, which is self-defeating in a feature meant to shrink the replica, and it would need reference counting, which fails in both directions (a leaked count pins rows forever, a lost count deletes live data).
+
+**Overlap falls out for free, which is the property that matters.** Every subscription is a predicate over one table, so the surviving predicates `OR` together and eviction deletes the complement:
+
+```sql
+DELETE FROM orders
+WHERE NOT ( (<predicate of surviving subscription B>) OR (<predicate of surviving subscription C>) );
+```
+
+Dropping a subscription never names it. It stops contributing a clause. A row another subscription still wants matches that clause and survives, and with no surviving subscription on the table the clause list is empty and the statement degenerates to `DELETE FROM orders`.
+
+**The schema is normalised so a shared query is stored once.** Three tables in the never-synced tier: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the bind values keyed by subscription and position. Two subscriptions differing only in a bind value therefore share one row of query text.
+
+**This also fixes two things that are not about retention.** The same statement replaces `clear_subscription_rows`, which today issues `DELETE FROM "{table}"` per table the subscription reads, so a resync of one subscription wipes a sibling's rows over the same table. And persisting the set replaces the in-memory, best-effort `sub_tables`, which records nothing at all for a query it cannot parse and does not survive a restart. Phase R29.
+
+### The one case predicates cannot answer
+
+**A row-by-row coverage test is wrong for deletions, and the wire has to close the gap.**
+
+Worked through, because the conclusion alone does not read clearly. Table `orders`, one client, two subscriptions: **A** is `status = 'open'` and **B** is `customer = 42`. Row 7 is open and belongs to customer 42, so both want it, and there is **one** copy of it in the replica.
+
+Two different things can happen and **both arrive as the same frame**, a delete for row 7 addressed to A.
+
+- **The row is deleted in Postgres.** It leaves both subscriptions, so the server sends a delete to A and a delete to B.
+- **Its status changes to closed.** It leaves A only, so the server sends a delete to A and an ordinary update to B, which still wants it.
+
+Now apply the naive rule, which is to check whether another subscription's predicate still matches before deleting locally. In the second case it is right: `customer = 42` still matches, the row stays, and B keeps what it is entitled to.
+
+In the first case it fails, and it fails twice. A's delete arrives, B's predicate is checked against the row still sitting in the replica, `customer = 42` matches, so the row is kept. Then B's delete arrives, A's predicate is checked against that same untouched row, `status = 'open'` matches, so it is kept again. **Each delete is vetoed by a subscription that is itself being deleted.** Nothing removes the row, and nothing later will, because upstream it no longer exists and will never change again.
+
+| | Row deleted upstream | Row leaves A, B still wants it |
+|---|---|---|
+| Today | correctly removed | **wrongly removed**, B silently loses it |
+| Naive predicate check | **never removed** | correctly kept |
+| With the wire distinction | correctly removed | correctly kept |
+
+So today's defect is over-deletion, the naive fix trades it for under-deletion, and only separating the two cases is correct in both directions.
+
+A deletion and a departure from a subscription's window are indistinguishable on the wire today, and the predicate cannot separate them because it is evaluated against a row that is leaving either way. **The delete must therefore carry which it is.** A removed row applies unconditionally. A row that merely left this subscription's window applies only when no surviving predicate matches it. This is a protocol addition and it is free: nothing is published, and `PROTOCOL_VERSION` takes one deliberate bump at the first release.
+
+**Two costs, stated rather than buried.** Recomputation does real work when tidying, one pass per surviving subscription over the affected table, where a stored association would have the answer ready. And a subscription carrying `LIMIT` does not recompute to the set it was delivered, since `limit` is already an approximation applied to the snapshot only (`04-subscriptions.md`). Those subscriptions need their own rule, and until they have one they are not evictable.
 
 ---
 

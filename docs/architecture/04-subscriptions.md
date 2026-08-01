@@ -58,11 +58,47 @@ Predicate =
 
 Predicates are restricted to column comparisons against literal values: no subqueries, no cross-table joins in the predicate itself. This constraint makes server-side subscription matching feasible without issuing a SQL query per CDC event for simple cases.
 
-### Open question: cross-table and join subscriptions
+**The tree above is superseded by Q4.1 below.** The subscription language is SQL `WHERE` clause text, parsed by `subql`, which accepts `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT` and arithmetic, and rejects anything else at registration. The tree is retained as a statement of the intended expressiveness. What matters for the section below is that the restriction to literals is unchanged, and that the language is owned upstream.
 
-Subscribing to a join or a view is not supported in the initial design. If a client needs data from multiple tables, it creates one subscription per table and joins locally in SQLite.
+### Cross-table and join subscriptions
 
-This may be revisited if cross-table subscriptions are commonly needed.
+**Researched from primary sources.** This section previously declined joins in two sentences and offered "one subscription per table, join locally in SQLite" as the workaround. That workaround answers half the question, and the half it leaves out is already answered elsewhere in this architecture without this chapter saying so. Seven systems were read at pinned commits: PowerSync, ElectricSQL, Zero, Convex, Supabase realtime and walrus, Phoenix, and Materialize.
+
+**"Support joins" is two capabilities, and no system treats them as one.**
+
+A **join as output shape** puts columns from two tables in one result row. A client holding both tables can do this itself, so local SQLite genuinely solves it. This is what the old workaround addressed.
+
+A **join as membership predicate** decides which rows of the second table the client receives at all, based on a relationship to a row in the first: the line items of my orders, the documents in the workspaces I belong to. **A client cannot solve this locally, because it would have to already hold the rows in order to decide whether it should hold them.**
+
+**Only two of the seven support the output-shape join, and six of the seven still provide a membership mechanism.** PowerSync rejects with `Must SELECT from a single table` on the legacy data-query path and `Sync streams can only select from a single table` in the current compiler, then supplies membership through a second query language whose parameter queries populate a bucket index. Electric rejects with `Expected a single table reference`, then supplies membership through `IN (SELECT ...)` tracked as a shape dependency with incremental move-in and move-out. Supabase accepts thirteen filter operators over one table against literals, then lets row-level security decide actual visibility. Convex dissolves the distinction by subscribing to a function's read set, and pays for it with hard caps of 32000 documents, 16 MiB, and 4096 index intervals per transaction. Only Zero and Materialize support the output-shape join outright, both by maintaining materialized state per query. Only Phoenix has no membership mechanism, because it has no data model to attach one to.
+
+**The single-table boundary is therefore correct and stays.** What was missing is the statement of where membership comes from.
+
+### Where membership comes from here
+
+**It comes from row-level security, exactly as in Supabase.** The snapshot query runs with `app.user_id` bound on a pool subject to RLS, and change-time delivery is authorized per row (`08-authorization.md`). A policy is arbitrary SQL and may contain a subquery over another table, so "the line items of my orders" is already expressible today, as a policy rather than as a subscription. The predicate above is the equivalent of Supabase's stage one, and the policy is stage two.
+
+### What is still missing
+
+Three things, and only the first is about joins.
+
+**Authorization is not interest.** RLS returns everything the caller may see, whereas a subscription should say what the caller wants now. Those diverge once the authorized set is large, and a client cannot narrow to a related subset unless the discriminating column sits on the subscribed table as a literal. A transitive relationship offers no such literal.
+
+**Revising a predicate costs a full re-snapshot.** There is no in-place modify, by the lifecycle section below. A client can work around a transitive relationship by computing the parent keys itself and passing them as an `IN` list of literals, which the language allows, but that set goes stale whenever the parent set changes. **Adding one order re-snapshots the line items of every order.** This is the reason the gap is not cosmetic.
+
+**There is no incremental move-out.** Every peer has one: `removed_buckets` in PowerSync, the subquery index in Electric, per-change policy re-evaluation in Supabase, read-set invalidation in Convex. The equivalent here is `FullResyncRequired` per subscription, decided in `08-authorization.md` for grant changes. It is complete by construction, and it is the coarsest option in the set.
+
+**Decided: add a membership term to the subscription language, after R5b and R6.** Its right side names a relationship or a single-table subquery rather than a literal, and it intersects with RLS rather than replacing it. Four systems sharing no implementation converged on this shape, which is the strongest evidence available. It is sequenced after R5b and R6 because the incremental move-in and move-out that makes it worth having is the same machinery as change-time visibility transitions, and building it earlier would deliver the expressiveness while resyncing on every dependency change.
+
+**This lands upstream, not here.** The subscription language belongs to `subql` by Q4.1, so a subquery term is a `subql` capability and the dependency tracking that keeps it current is `subql` machinery. Electric's shape maps onto this almost exactly, since its mechanism is a subquery inside a `WHERE` clause and that is already the input format. The connetto-side work is confined to whatever the wire protocol must carry.
+
+**Decided: the membership term is written once as SQL and evaluated by two executors, exactly as policy already is.** The subquery runs against Postgres for the snapshot, and the compiled relationships answer the per-row question on the change path. This is not a new pattern, it is the split `08-authorization.md` already establishes, adopted for the same reason: a set question ("give me every matching row") suits the database, and a point question ("does this one row match") asked once per changed row per subscriber does not.
+
+The two alternatives are both foreclosed by decisions already in place. Evaluating the subquery per changed row rebuilds the per-row database round trip that R5b exists to remove, in the same loop. Compiling it away entirely cannot serve the snapshot, because enumerating everything a subject may see is capped at `listObjectsMaxResults` 1000 and `listObjectsDeadline` 3 seconds and a truncated snapshot does not announce itself, which is why the snapshot stays on RLS permanently.
+
+**What this costs, stated plainly: a second pair of evaluators that must not diverge.** That risk is already accepted for policy, and it is accepted here for the same reason, that one source compiles to both. It is what makes the compilation load-bearing rather than convenient, and it doubles the surface over which that holds. The failure it produces is a row present in the snapshot and then withdrawn on the first change, or never delivered at all.
+
+**Two consequences follow.** The term must be compilable, so it is bounded by what `rls2fga` can classify, currently ten canonical patterns, and a term outside them is refused at registration rather than silently evaluated one way only. And the query set must be known ahead of time for the compilation to happen at all, which is R22, so **R27 gains a dependency on R22** that it did not have when it was written.
 
 ---
 
@@ -96,6 +132,8 @@ The snapshot is taken at a consistent point. The `lsn` in `SnapshotEnd` is the L
 Any `LivePatch` frames for this subscription with `lsn > snapshot_lsn` that arrive after `SnapshotEnd` are applied on top. Any `LivePatch` frames with `lsn <= snapshot_lsn` are discarded.
 
 The client buffers updates received during snapshot delivery and applies them after `SnapshotEnd`.
+
+**Neither of the two paragraphs above is implemented, and the gap between them loses data.** They describe the right design: live delivery runs during the snapshot and the overlap is discarded by LSN. The server does the opposite, installing the route only after `SnapshotEnd`, so no overlapping frame is ever sent and everything committed during the snapshot is dropped instead. The client correspondingly has no discard rule and no buffer, applying every `LivePatch` as it arrives. The two halves are consistent with each other and both diverge from this chapter. See `10-subscription-materializer.md` open question 1 for the evidence, and phase R28 for the fix, which has to change both sides at once.
 
 ### Ongoing updates
 
@@ -164,6 +202,12 @@ For each CDC event:
   - `old does not, new matches` → deliver as insert (row entered the result set).
   - `old does not, new does not` → no delivery needed.
 
+**The two deletes above are different events and the wire must distinguish them. Decided (R29).** The `op = Delete` case removes a row that no longer exists. The `old matches, new does not` case removes a row that still exists and merely left this subscription's window. Today both arrive as a delete and the client cannot tell them apart.
+
+That is safe only while one subscription owns a table. With two subscriptions over one table it is not, because patches from both apply into the same replica table, so a row leaving the first one's window deletes it out from under the second, which still covers it. Nor can the client repair this by checking the other predicates itself: on a genuine deletion the server sends a delete to every covering subscription, each is held back by the others still matching the stale local row, and the row is never removed at all.
+
+So a delete carries which of the two it is. A removed row applies unconditionally. A row that left a window applies only when no surviving subscription's predicate still matches it. Free to add, since nothing is published and `PROTOCOL_VERSION` takes one deliberate bump at the first release.
+
 This ensures clients maintain correct result sets even when rows move in and out of filter bounds.
 
 ---
@@ -195,11 +239,14 @@ If the LSN is outside the window, or if the server does not support catchup patc
 
 ## Decisions
 
-*(none yet)*
+- **A subscription names one table, and that boundary stays.** Established from seven systems at pinned commits. Only two allow an output-shape join (Zero, Materialize) and both pay with materialized state per query. Materialize additionally has no parameterized view, so per-viewer incremental maintenance would mean one dataflow per client.
+- **Membership comes from row-level security, and this chapter now says so.** The previous workaround, one subscription per table joined locally, answers only the output-shape half. The half a client cannot answer locally was already answered by RLS in `08-authorization.md`, unstated here until now.
+- **A membership term is added to the subscription language, after R5b and R6, and it lands in `subql`.** Four independent systems converged on the same shape: keep the subscription single-table and let the predicate name a relationship rather than a value. Sequenced behind the change-time visibility machinery it depends on.
+- **The membership term is one written filter with two executors**, the subquery for the snapshot and the compiled relationships for the change path, mirroring the policy split for the same reason. The per-row-query alternative rebuilds the bottleneck R5b removes, and the compile-everything alternative cannot serve a snapshot under the enumeration caps. Cost accepted: a second pair of executors that must agree. Adds a dependency on R22, since compilation needs the query set known in advance.
 
 ---
 
 ## Notes
 
 - `limit` in `SubscriptionSpec` is an approximation: it applies to the initial snapshot ordering. As rows are inserted/deleted, the live result set may grow beyond the original limit without the server enforcing it. Clients that need a strict top-N should manage this locally.
-- The predicate tree is intentionally simple. Complex logic (full-text search, geographic queries) should be handled by materializing a computed column in PostgreSQL that can then be filtered simply.
+- The predicate tree is intentionally simple. Complex logic (full-text search, geographic queries) should be handled by materializing a computed column in PostgreSQL that can then be filtered simply. This applies to scalar expressiveness and is unaffected by the membership term above, which adds a relationship rather than a richer scalar comparison.

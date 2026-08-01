@@ -89,6 +89,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R4 and R6 |
 | 17 | R9 | Needs R5b |
+| 18 | R27 | Needs R6 for the incremental move-in and move-out, and R22 because the filter is compiled and compilation needs the query set known in advance. Buildable before R6 only in a form that resyncs on every dependency change |
+| any | R28 | A defect, blocked on nothing. Silent data loss on every fresh subscription, so it outranks everything discretionary |
+| any | R29 | A defect plus its missing mechanism, blocked on nothing. Two subscriptions over one table lose each other's rows today, and R15 cannot be built without what this delivers |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
@@ -127,12 +130,15 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R9 permissive policy out of tests | NOT STARTED | R5b | inherited |
 | R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
 | R26 local data export | NOT STARTED | nothing | no |
+| R27 membership term in the subscription language | NOT STARTED | R5b, R6, R22, and a subql change | **yes, subql** |
+| R28 subscribe-time delivery gap | NOT STARTED | nothing | no |
+| R29 client-side coverage | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | NOT STARTED | nothing | no |
 | R17 local tier name and key scope | NOT STARTED | nothing | no |
 | R18 SQLite hardening surface | NOT STARTED | nothing here, `diesel-rs/diesel#5128` for unpinned diesel | no |
 | R11 shared public store | NOT STARTED | nothing | no |
-| R15 replica retention and trimming | NOT STARTED | five diesel proposals landing | **yes, diesel** |
+| R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
 | R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
 
@@ -174,6 +180,11 @@ graph TD
   R23[R23 user-verified unlock of local secrets]
   P[probe: webauthn-prf-probe-spec] --> R23
   R26[R26 local data export]
+  R6 --> R27[R27 membership term in the subscription language]
+  U4[upstream: subql subquery membership term] --> R27
+  R22 --> R27
+  R28[R28 subscribe-time delivery gap]
+  R29[R29 client-side coverage] --> R15
   R24[R24 file-sync integration, exploratory]
   R25[R25 device-to-device sync, exploratory]
   R2 -.->|registry only| R8
@@ -188,6 +199,8 @@ Two documents, both untracked and never to be committed.
 **`docs/upstream-subql-visibility-trait.md`** blocks R5a. The trait must live in subql, because subql calls it and subql cannot depend on connetto-core. Its per-row half is blocked on the rls2fga change, but the trait's shape is not, which is why R5a can proceed on a small subql change alone.
 
 Neither has a tracking issue. Open one in each repository, or the blocker is invisible from outside this file.
+
+**R27 needs a third subql change, and has no document yet.** The membership term is a change to the subscription language, which subql owns. No document exists because the phase sits behind R6 and its shape is still open, between a SQL subquery and a relation check against the compiled model. This is a wanted capability rather than a defect found, so it is not an upstream finding in the sense the other two are.
 
 ---
 
@@ -999,6 +1012,133 @@ Import, and device-to-device transfer. The latter is `R25`, exploratory and expl
 
 ---
 
+## R27: a membership term in the subscription language
+
+**Status.** NOT STARTED
+
+**Blocked on R6, R22, and a subql change.** R22 is a new dependency: the evaluation question is now settled as one filter compiled to two executors, and compiling a subscription filter requires the query set to be known ahead of time, which is what R22 establishes. Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
+
+### Purpose
+
+A subscription today names one table and filters it with literals, and membership in the sense of "the rows of B related to my rows in A" is answered by row-level security. That works, and it conflates two different questions: what the caller may see, and what the caller wants now. They diverge once the authorized set is large, and a client cannot narrow to a related subset when the relationship is transitive, because the discriminating value is not a column on the subscribed table.
+
+The workaround the language already permits is for the client to compute the parent keys and pass them as an `IN` list. That is correct and it goes stale, and since there is no in-place modify, refreshing it re-snapshots the whole child set. Adding one order re-snapshots the line items of every order.
+
+Seven systems were read at pinned commits for this. Only two support an output-shape join and six ship a dedicated membership mechanism, and four of them converged on the same shape despite sharing no implementation: keep the subscription single-table, and let the predicate name a relationship rather than a value. That convergence is the evidence for this phase.
+
+### Steps
+
+1. ~~**Settle the open question first**: whether the term is a SQL subquery or a relation check.~~ **Settled: one filter written as SQL, two executors.** The subquery serves the snapshot against Postgres, the compiled relationships serve the per-row change question, mirroring the policy split in `08-authorization.md` for the same reason. Per-row SQL was rejected because it rebuilds the round trip R5b removes, and compile-everything was rejected because enumeration is capped at 1000 results and 3 seconds and a truncated snapshot is silent data loss. **Accepted cost: a second pair of executors that must not diverge**, safe only because one source compiles to both, which is what makes the compilation load-bearing.
+2. **Bound the term to what is compilable.** `rls2fga` classifies into ten canonical patterns, so a term outside them is refused at registration rather than served by one executor only. A term that evaluates one way for the snapshot and another way on the change path is the divergence this phase must not introduce.
+3. **Land the term in subql**, which owns the subscription language by Q4.1. Electric's mechanism is a subquery inside a `WHERE` clause, and `WHERE` clause text is already the input format, so the wire may not change at all.
+4. **Track the dependency**, so a change to the referenced table moves rows in and out. This is the part that needs R6, since it is the same machinery as change-time visibility transitions.
+5. **Keep it intersected with RLS**, never replacing it. The term expresses interest, the policy expresses permission, and a term that widened the visible set would be a leak.
+
+### Proof
+
+A subscription whose membership depends on another table receives a row when the relationship is created and loses it when the relationship is removed, without a full re-snapshot in either direction, and without ever receiving a row the policy forbids.
+
+### Done when
+
+The term exists in subql, connetto exposes it, dependency changes move rows incrementally, and the intersection with RLS is tested in both directions.
+
+### Out of scope
+
+Output-shape joins. The single-table boundary is a decision, not a limitation to be lifted later: the two systems that cross it, Zero and Materialize, both pay with materialized state per query, and Materialize has no parameterized view at all, so per-viewer maintenance would mean one dataflow per client.
+
+---
+
+## R28: the subscribe-time delivery gap
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** A defect, found while pinning open question 1 of `docs/architecture/10-subscription-materializer.md`. It loses data on every fresh subscription, so it is not discretionary.
+
+### Purpose
+
+**A change committed while a subscription is being set up is silently dropped, and neither side can tell.**
+
+`SessionManager::handle_subscribe` registers the consumer with the materializer first, so `dispatch_event` starts producing patches for it immediately. `SessionManager::snapshot_row` then sends `SnapshotBegin`, reads the snapshot, sends the patch and `SnapshotEnd`, and installs the route **last**. Until that route exists, `dispatch_event` discards every patch for the consumer on `let Some(route) = route else { continue }`. Anything committed after the snapshot read and before the route is installed is therefore never delivered, and the window is not small: it spans the snapshot read, the compression and the whole bulk transfer.
+
+**The client cannot detect it.** Its cursor advances to whatever patch arrives next, so the gap leaves no trace and reconnect resumes past it. The rows stay missing until something else touches them.
+
+**The correct pattern is already in the same file.** `catch_up_row` installs the route **before** replaying, then bounds the replay with a ceiling taken after the route exists, on the stated grounds that an entry at or below it "was appended before this consumer could receive live delivery, so replaying it cannot duplicate a live patch". The fresh-subscribe path is the one that does it backwards.
+
+### Steps
+
+1. **Install the route before reading the snapshot** in `snapshot_row`, mirroring `catch_up_row`.
+2. **Discard the overlap on the client.** Step 1 deliberately produces live patches for changes the snapshot already contains, which is exactly the case `04-subscriptions.md` covers with "any `LivePatch` frames with `lsn <= snapshot_lsn` are discarded". The client does not implement this: `pump_one` applies every `LivePatch` unconditionally. **These two steps must land together**, because either alone is wrong: step 1 without step 2 double-applies, step 2 without step 1 changes nothing.
+3. **Reconcile `04-subscriptions.md` with whichever buffering the client actually adopts.** That chapter also says the client "buffers updates received during snapshot delivery and applies them after `SnapshotEnd`", which is a second unimplemented claim in the same paragraph, and the discard rule alone may make the buffer unnecessary.
+
+### Proof
+
+Commit a change while a snapshot is in flight and prove the subscribing client ends with it. The test has to hold the snapshot open long enough for the write to land inside the window, so the snapshot source needs a delay seam. **Run it against the current code first and watch it fail**, because a race test that has never failed proves nothing.
+
+Then prove the overlap is not double-applied, by committing a change after the route exists but before the snapshot is read and asserting the row appears exactly once.
+
+### Done when
+
+A change committed at any point during subscription setup reaches the client exactly once, proved by a test that fails before the fix. `04-subscriptions.md` describes what the code does.
+
+### Why this is separate from R6
+
+R6 is about which version of a row is authorized on the change path. This is about a route that does not exist yet, so it drops rows nobody disputes the client may see. Same file, same loop, unrelated causes, and this one needs neither R5b nor the change log.
+
+---
+
+## R29: the client knows what covers a row
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** A defect plus the mechanism it needs, decided with the maintainer and recorded in `docs/architecture/15-replica-retention.md` and `docs/architecture/04-subscriptions.md`. **R15 cannot be built without this**, since its eviction design assumes a coverage test that does not exist.
+
+### Purpose
+
+**The client cannot tell which subscription wants a row, so it deletes by table.** The only association it holds is `sub_tables`, a subscription id to a set of table names, parsed from the query, held in memory, and best-effort: a query it cannot parse records nothing at all and silently disables the resync clear for that subscription.
+
+Two live consequences, both requiring only that a client hold two subscriptions over one table, which nothing discourages.
+
+**A resync of one wipes the other.** `clear_subscription_rows` issues `DELETE FROM "{table}"` for each table the subscription reads. On reconnect with a stale cursor each subscription resyncs in turn, so the second one's clear destroys the first one's freshly delivered snapshot, and only the second is repopulated.
+
+**A row leaving one subscription's window is deleted out from under the other.** `04-subscriptions.md` specifies that `old matches, new does not` delivers as a delete, patches from both subscriptions apply into the same replica table, and the client has no way to know another subscription still covers the row.
+
+### The mechanism, decided
+
+**Coverage is recomputed, never stored per row.** The client already holds each subscription's **SQLite-dialect** query and its binds (`ConnettoSession::subscribe_spec`), so a subscription runs directly against the replica. Storing a row-to-subscription association was considered and rejected: a record per row per covering subscription exceeds the data it tracks on a narrow table, which is self-defeating in a feature meant to shrink the replica, and it needs reference counting, which fails in both directions.
+
+Overlap then costs nothing to handle, because the surviving predicates `OR` together and the delete takes the complement:
+
+```sql
+DELETE FROM orders
+WHERE NOT ( (<predicate of surviving subscription B>) OR (<predicate of surviving subscription C>) );
+```
+
+Dropping a subscription never names it, it stops contributing a clause. With no surviving subscription on the table the clause list is empty and this degenerates to today's unconditional `DELETE FROM orders`.
+
+### Steps
+
+1. **Persist the subscriptions in the never-synced tier, normalised so a shared query is stored once.** Three tables: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the binds keyed by subscription and position. Two subscriptions differing only in a bind value share one row of query text. This replaces `sub_tables` and survives a restart.
+2. **Re-declare subscriptions from that table on startup**, rather than depending on the application to remember what it had.
+3. **Replace `clear_subscription_rows` with the complement-of-union delete** above, built from the surviving subscriptions rather than from the resyncing one's table list.
+4. **Distinguish the two deletes on the wire.** A removed row and a row that left this subscription's window are indistinguishable today. A removed row applies unconditionally, a departed row applies only when no surviving predicate matches. **A predicate check alone cannot substitute**: on a genuine deletion the server sends a delete to every covering subscription and each is held back by the others still matching the stale local row, so the row is never removed at all. Free to add, since nothing is published.
+5. **Exclude `LIMIT` subscriptions from eviction until they have a rule.** Such a query does not recompute to the set it was delivered, because `limit` applies to the snapshot only. Excluding them keeps rows, which is the safe direction.
+
+### Proof
+
+Two subscriptions over one table, and a stale cursor forcing both to resync: both sets of rows survive. That fails today, and it is the test that pins step 3.
+
+Then a row leaving the first subscription's window while the second still covers it: the row stays. Then the same row deleted upstream: it goes, from both. Those two together are what step 4 buys, and neither passes without it.
+
+### Done when
+
+Subscriptions survive a restart and are re-declared from the replica. No delete is issued by table. A row survives exactly as long as some subscription still wants it, proved in both the resync and the window-exit directions. `15-replica-retention.md` no longer describes a coverage test that does not exist.
+
+### Why this is not part of R15
+
+R15 is retention: deciding what to discard and returning the space. This is the question R15's eviction asks and cannot currently answer, and two of its consequences are live defects that have nothing to do with retention. R15 is additionally blocked on five upstream diesel proposals, and none of this is.
+
+---
+
 ## R21: one page codec on both backends
 
 **Status.** NOT STARTED
@@ -1091,7 +1231,7 @@ Public rows are stored once per device rather than once per identity, the switch
 
 **Status.** NOT STARTED
 
-**Blocked on five upstream diesel proposals landing.** In `docs/`: `upstream-diesel-auto-vacuum-mode.md`, `upstream-diesel-incremental-vacuum.md`, `upstream-diesel-vacuum-into.md`, `upstream-diesel-page-counters.md`, `upstream-diesel-wal-checkpoint.md`. **The maintainer is driving those PRs**, so the dependency is tracked rather than owned here. Off the critical path, independent of every other phase.
+**Blocked on R29, and on five upstream diesel proposals landing.** R29 first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. The proposals, in `docs/`: `upstream-diesel-auto-vacuum-mode.md`, `upstream-diesel-incremental-vacuum.md`, `upstream-diesel-vacuum-into.md`, `upstream-diesel-page-counters.md`, `upstream-diesel-wal-checkpoint.md`. **The maintainer is driving those PRs**, so that dependency is tracked rather than owned here. Off the critical path.
 
 ### Purpose
 
