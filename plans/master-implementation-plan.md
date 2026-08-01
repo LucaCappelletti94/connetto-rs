@@ -102,6 +102,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R15 | Off the critical path. Gated on five upstream diesel proposals landing |
 | last | R24 | Exploratory. How connetto integrates a file-sync stack it does not own |
 | last | R25 | Exploratory, and not now. Device-to-device sync with no server |
+| last | R30 | Exploratory. Revisit grouped aggregates from the recorded research |
 
 ## Status and blockers
 
@@ -141,6 +142,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
 | R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
+| R30 grouped aggregates revisited | NOT STARTED, exploratory | nothing | no |
 
 ## Dependency graph
 
@@ -188,6 +190,7 @@ graph TD
   R29[R29 client-side coverage] --> R15
   R24[R24 file-sync integration, exploratory]
   R25[R25 device-to-device sync, exploratory]
+  R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
 ```
 
@@ -1324,6 +1327,32 @@ A document naming what breaks and why, with a recommendation either way, at a le
 ### Done when
 
 The question has a sourced answer instead of being absent. **No implementation follows from this phase**, whatever it concludes.
+
+---
+
+## R30: grouped aggregates, revisited from the research
+
+**Status.** NOT STARTED, exploratory.
+
+**Blocked on nothing.** The findings it starts from are already written: `docs/research-grouped-aggregates.md`, a process artifact, never committed, with a citation per claim at pinned revisions (Materialize `11ed4b6`, RisingWave `d4a8483`, Feldera `a7a7deb`, Kafka and ksqlDB by URL).
+
+### Purpose
+
+Grouped aggregate support is parked (Q5.7 status split in `docs/architecture/open-questions.md`) on the memory obstacle: one accumulator per distinct group value per subscription, worst case the base-table cardinality, and `DISTINCT` frequency maps carry that worst case even when the result is small. The research established what shipping systems do about it (disk-backed state, kill at a budget, or restricted semantics) and that none of them has connetto's option: an authoritative queryable Postgres behind the CDC, already used by the `MIN`/`MAX` re-execution path to avoid holding exactly this class of state. This phase decides, from those findings, whether grouped support is worth building.
+
+### Steps
+
+1. Confirm or reject the candidate design in the research document: the accumulable family grouped in memory under a registration-time group-cardinality budget with loud refusal beyond it, `DISTINCT` and `MIN`/`MAX` grouped served by per-group re-execution through the existing `Connector`, restart re-seeded through the connector like the scalar bootstrap, client storage on the parked Q5.7 table with the wire's dormant `group_key` field as the delivery half.
+2. Decide the budget's shape (registration-declared versus server configuration) and its number, which the research deliberately left open.
+3. Conclude either way. Yes derives the real phases (a `subql` grouped `AggSpec` variant, the wire activation, the client keyed handle and table) as committed work outside this section. No reaffirms the parking, and this phase is deleted per this section's rule.
+
+### Proof
+
+A written conclusion citing the research document, at a level of detail the derived phases could be written from if the answer is yes.
+
+### Done when
+
+Grouped aggregates are either phased as committed work or reaffirmed as parked, and Q5.7's status split says which.
 
 ---
 
