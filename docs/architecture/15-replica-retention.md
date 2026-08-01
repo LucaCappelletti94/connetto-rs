@@ -1,6 +1,6 @@
 # 15: Replica retention, eviction, and physical trimming
 
-**Status**: normative. This is the design document referenced as "the retention design" by `docs/upstream-diesel-auto-vacuum-mode.md`, `docs/upstream-diesel-incremental-vacuum.md`, `docs/upstream-diesel-vacuum-into.md`, `docs/upstream-diesel-page-counters.md`, and `docs/upstream-diesel-wal-checkpoint.md`. Nothing in this chapter is built yet. Every normative statement is marked **Decided (R15)**, naming phase R15 in `plans/master-implementation-plan.md`. All mechanisms are blocked on the five upstream diesel proposals landing. Filing them is the first action of R15.
+**Status**: normative. This is the design document referenced as "the retention design" by `docs/upstream-diesel-auto-vacuum-mode.md`, `docs/upstream-diesel-incremental-vacuum.md`, `docs/upstream-diesel-vacuum-into.md`, `docs/upstream-diesel-page-counters.md`, and `docs/upstream-diesel-wal-checkpoint.md`. Nothing in this chapter is built yet. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The trimming mechanisms are blocked on the five upstream diesel proposals landing. Filing them is the first action of R15.
 
 ---
 
@@ -20,19 +20,37 @@ The primary control on replica size is therefore subscription shape, not deletio
 
 ---
 
+## What covers a row
+
+**Decided (R29).** Coverage is application-driven through two mechanisms, watches and pins, and through nothing else. There are no schema-declared keep rules and no connetto-side retention policy, because only the application knows why it holds data.
+
+**Watches.** `ConnettoClient::watch` in `crates/connetto-client/src/live.rs` already ties a wire subscription to a handle: identical queries share one reference-counted `WireSub` entry, and dropping the last handle unsubscribes. On top of that, a watch-backed subscription survives its last drop by a grace period, so navigating away and back does not pay a fresh snapshot. The grace defaults to five minutes, is capped at ten, and is per-watch configurable within the cap. The cap is deliberate: wanting to outlive it is by definition a pin, and the cap enforces that boundary mechanically. Precedent, verified at Zero commit `a8b03c7` in `packages/zql/src/query/ttl.ts`: their per-query TTL serves exactly this navigation case, `DEFAULT_TTL` is five minutes, and `clampTTL` clamps every higher value, `forever` included, to `MAX_TTL` of ten minutes with a warning, precisely so the grace cannot become a retention policy.
+
+Across a restart the countdown runs from the recorded stop moment, so a subscription already past its grace ends at launch. A subscription the app died still watching has no recorded stop moment and gets a fresh countdown from launch, giving the UI time to re-claim it as screens mount. The accepted cost is a small asymmetry: a query unwatched moments before a crash is protected for less time than one watched through it.
+
+**Pins.** A pin is a durable, named request to keep a query's rows synced and covered until the application removes it. `pin(name, query)` creates or replaces, `unpin(name)` ends, and pins are listable. The application chooses the name, so startup pinning is idempotent (same name and same query is a no-op) and re-pinning a changed query under the same name is the upgrade path. Collisions between application features are the application's responsibility. A pin has no clock and no handle: it survives closing and reopening the app, and it survives offline.
+
+Durability is not optional for the offline case. `attach_wire` in `crates/connetto-client/src/live.rs` sends the `Subscribe` frame inline, so `watch` on a synced table fails while the transport is down. An application restarting offline cannot re-establish any watch, and only a persisted record keeps its rows covered until connectivity returns. This is the case that motivated the pin: a dataset downloaded deliberately before going offline, cleared explicitly after coming back.
+
+**Notifications need neither mechanism.** A watch handle is not tied to a page: the application can hold one at application scope, or observe the raw event stream through `ConnettoClient::events`, and turn changes into notifications while the process runs, whatever page is mounted. Startup re-declaration means catch-up is already flowing before any page mounts. Waking a dead process is platform push territory, server-side and outside the replica.
+
+---
+
 ## Rotating time-windowed subscriptions
 
 **Decided (R15).** A subscription registered with a predicate such as `WHERE created_at > ?` fixes the bound value at registration time. The bound does not advance as time passes. A client that subscribed in January with a 30-day lookback still holds January rows in December unless it replaces the subscription.
 
 Rotation means tearing down the old subscription and opening a new one with a fresh bound. The new bound excludes rows the old bound covered. Those rows receive no delete instruction from the server: the server knows nothing about the client's retention policy and issues no instruction. They become uncovered, meaning no active subscription includes them, which makes them candidates for local eviction.
 
-The client is the only party that can determine when a row is uncovered. A row that falls outside one subscription's new window may still be covered by a second overlapping subscription, may be referenced by a pending local write that has not yet been uploaded, or may be data the user wants to view in a history pane. Evicting any of those cases would lose data the user did not choose to discard, so the eviction step is always separate from the rotation step and the client owns the decision.
+The client is the only party that can determine when a row is uncovered. A row that falls outside one subscription's new window may still be covered by a second overlapping subscription, may be referenced by a pending local write that has not yet been uploaded, or may be data the user wants kept for a history pane, which the application expresses as a pin or a held watch. Evicting any of those would lose data the user did not choose to discard, so the eviction step is always separate from the rotation step, and coverage is owned by the application through watches and pins.
 
 ---
 
 ## Local eviction
 
-**Decided (R15).** Eviction removes from the replica any row that no active subscription covers. The client determines this by scanning its active subscription set against the local rows.
+**Decided (R15).** Eviction removes from the replica any row that no active subscription covers, where active means a watch-backed subscription still within its grace or a pin. The client determines this by scanning its active subscription set against the local rows.
+
+**Decided (R15).** The pass runs by itself when a subscription ends, that is when a watch's grace expires or the application unpins, and is scoped to the tables that subscription read. A callable tidy pass exists besides, for a free-up-space affordance. Automatic won over app-only triggering because retention exists to bound the replica by default, and the application already expressed its intent by letting the subscription end. The stated cost: deletes run at moments the application did not schedule, though only ever on uncovered rows.
 
 Eviction must run with the capture session suspended. `SuspendedCapture` in `crates/connetto-client/src/lib.rs` is the existing mechanism, used when server patches apply so that server-originated writes are never re-uploaded. A captured eviction delete would be uploaded as a real client mutation and applied to the Postgres backend, discarding server data the user did not ask to delete.
 
@@ -80,7 +98,7 @@ So today's defect is over-deletion, the naive fix trades it for under-deletion, 
 
 A deletion and a departure from a subscription's window are indistinguishable on the wire today, and the predicate cannot separate them because it is evaluated against a row that is leaving either way. **The delete must therefore carry which it is.** A removed row applies unconditionally. A row that merely left this subscription's window applies only when no surviving predicate matches it. This is a protocol addition and it is free: nothing is published, and `PROTOCOL_VERSION` takes one deliberate bump at the first release.
 
-**Two costs, stated rather than buried.** Recomputation does real work when tidying, one pass per surviving subscription over the affected table, where a stored association would have the answer ready. And a subscription carrying `LIMIT` does not recompute to the set it was delivered, since `limit` is already an approximation applied to the snapshot only (`04-subscriptions.md`). Those subscriptions need their own rule, and until they have one they are not evictable.
+**Two costs, stated rather than buried.** Recomputation does real work when tidying, one pass per surviving subscription over the affected table, where a stored association would have the answer ready. And a subscription carrying pagination (`LIMIT`, its `OFFSET`, `FETCH`) does not recompute to the set it was delivered, since pagination is already an approximation applied to the snapshot only (`04-subscriptions.md`). **Decided (R29):** such a subscription contributes its predicate with the pagination stripped to the coverage union while it lives, protecting a superset of what it delivered, which can only keep too much, and it dies like any other, so its rows become evictable when it ends and the accumulation is bounded by its lifetime. Pagination is the whole class needing this rule: joins, subqueries and set operations are rejected at registration, aggregate shapes hold no replica rows to evict, and `ORDER BY` or a projection changes no row membership.
 
 ---
 
@@ -162,4 +180,4 @@ All five mechanisms that implement this design are proposed in `docs/` but not y
 
 ## Open questions
 
-Two questions are genuinely unresolved. First, how eviction interacts with per-table retention declarations in the synql schema and with pending local writes that reference rows whose subscription window has moved. The `docs/roadmap.md` entry defers code until that design is complete. Second, whether OPFS provides an atomic path for swapping a `vacuum_into`-produced file into service in place of the original, which determines whether full compaction is practical in the browser.
+Two questions are genuinely unresolved. First, how eviction interacts with pending local writes that reference rows whose subscription window has moved. The `docs/roadmap.md` entry defers code until that design is complete. Second, whether OPFS provides an atomic path for swapping a `vacuum_into`-produced file into service in place of the original, which determines whether full compaction is practical in the browser. A third question, per-table retention declarations in the synql schema, was resolved by rejection: coverage comes from watches and pins alone, so there is nothing for a schema declaration to add (see What covers a row).

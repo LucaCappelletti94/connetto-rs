@@ -1050,7 +1050,7 @@ Output-shape joins. The single-table boundary is a decision, not a limitation to
 
 ## R28: the subscribe-time delivery gap
 
-**Status.** NOT STARTED
+**Status.** NOT STARTED. **Demonstrated 2026-08-01 against `2e671a8`**: a failing test committed a change while a gated snapshot was in flight and the client never received it (the control variant, dispatched after `SnapshotEnd`, passed). Test preserved at `~/github/connetto-r28-snapshot-delivery-gap.rs`, rerunnable by dropping it into `crates/connetto-server/tests/` with the usual throwaway Postgres.
 
 **Blocked on nothing.** A defect, found while pinning open question 1 of `docs/architecture/10-subscription-materializer.md`. It loses data on every fresh subscription, so it is not discretionary.
 
@@ -1088,7 +1088,7 @@ R6 is about which version of a row is authorized on the change path. This is abo
 
 ## R29: the client knows what covers a row
 
-**Status.** NOT STARTED
+**Status.** NOT STARTED. **Both consequences demonstrated 2026-08-01 against `2e671a8`**: subscription B's row wiped by A's resync clear (left `[1]`, expected `[1, 2]`), and the shared row removed by a window-exit delete addressed to A while B still covers it (left `[]`, expected `[7]`), controls passing in both. Test preserved at `~/github/connetto-r29-coverage-loss.rs`, rerunnable by dropping it into `crates/connetto-client/tests/`, no Postgres needed.
 
 **Blocked on nothing.** A defect plus the mechanism it needs, decided with the maintainer and recorded in `docs/architecture/15-replica-retention.md` and `docs/architecture/04-subscriptions.md`. **R15 cannot be built without this**, since its eviction design assumes a coverage test that does not exist.
 
@@ -1117,11 +1117,12 @@ Dropping a subscription never names it, it stops contributing a clause. With no 
 
 ### Steps
 
-1. **Persist the subscriptions in the never-synced tier, normalised so a shared query is stored once.** Three tables: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the binds keyed by subscription and position. Two subscriptions differing only in a bind value share one row of query text. This replaces `sub_tables` and survives a restart.
-2. **Re-declare subscriptions from that table on startup**, rather than depending on the application to remember what it had.
+1. **Persist the subscriptions in the never-synced tier, normalised so a shared query is stored once.** Three tables: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the binds keyed by subscription and position. Two subscriptions differing only in a bind value share one row of query text. This replaces `sub_tables` and survives a restart. The subscription row also records its kind: watch-backed, carrying the recorded stop moment (when the last handle dropped) and its grace duration, or a pin, carrying an app-chosen unique name.
+2. **Re-declare subscriptions from that table on startup**, rather than depending on the application to remember what it had: pins always, watch-backed entries still within their grace. An entry the app died still watching anchors its countdown at launch. One past its grace is unsubscribed rather than re-declared, and its rows become evictable.
 3. **Replace `clear_subscription_rows` with the complement-of-union delete** above, built from the surviving subscriptions rather than from the resyncing one's table list.
 4. **Distinguish the two deletes on the wire.** A removed row and a row that left this subscription's window are indistinguishable today. A removed row applies unconditionally, a departed row applies only when no surviving predicate matches. **A predicate check alone cannot substitute**: on a genuine deletion the server sends a delete to every covering subscription and each is held back by the others still matching the stale local row, so the row is never removed at all. Free to add, since nothing is published.
-5. **Exclude `LIMIT` subscriptions from eviction until they have a rule.** Such a query does not recompute to the set it was delivered, because `limit` applies to the snapshot only. Excluding them keeps rows, which is the safe direction.
+5. **A subscription carrying pagination (`LIMIT`, its `OFFSET`, `FETCH`) contributes its predicate with the pagination stripped, and dies like any other.** Its delivered set is not locally recomputable: the snapshot honors the pagination (`translate_subscription_sql` is a whole-statement round trip), live matching ignores it (`subql` extracts table and `WHERE` only), and local ordering can disagree with the server's since Postgres and SQLite collate differently. While alive it therefore protects a superset of what it delivered, which can only keep too much, and once it ends its rows are evictable like any other's, so accumulation is bounded by its lifetime. Stripping is AST surgery at the pinned `sqlparser` (`Query.limit_clause`, which carries any `OFFSET`, and `Query.fetch` are public, `VisitorMut` covers nested shapes), no upstream change wanted, and `OFFSET` cannot even appear without `LIMIT` in the client's SQLite dialect. **Pagination is the whole class needing this rule**: joins, subqueries and set operations are rejected at registration, aggregate shapes ride the pushed-value path and hold no replica rows to evict, and `ORDER BY` alone or a projection changes no row membership, ordering mattering only as what gives `LIMIT` its meaning. Decided with the maintainer, superseding the earlier blanket exclusion.
+6. **Carry the coverage model decided with the maintainer** (`15-replica-retention.md`, What covers a row). Watches gain a grace period after the last handle drops: default five minutes, capped at ten, per-watch configurable within the cap, the cap being what keeps grace from becoming a second retention mechanism beside pins. Pins are the durable form: `pin(name, query)` creates or replaces, `unpin(name)` ends, listable, idempotent at startup, no clock, offline-safe. Ending either is what makes rows evictable. The eviction pass itself is R15's.
 
 ### Proof
 
@@ -1131,7 +1132,7 @@ Then a row leaving the first subscription's window while the second still covers
 
 ### Done when
 
-Subscriptions survive a restart and are re-declared from the replica. No delete is issued by table. A row survives exactly as long as some subscription still wants it, proved in both the resync and the window-exit directions. `15-replica-retention.md` no longer describes a coverage test that does not exist.
+Subscriptions survive a restart and are re-declared from the replica. No delete is issued by table. A row survives exactly as long as some subscription still wants it, proved in both the resync and the window-exit directions. Pins survive restart and offline and end only by name, and a watch-backed entry past its grace is not re-declared. `15-replica-retention.md` no longer describes a coverage test that does not exist.
 
 ### Why this is not part of R15
 
@@ -1155,16 +1156,15 @@ The saved database is encrypted by **two different libraries**: SQLCipher native
 
 1. Replace the native vendoring so both backends run SQLite3 Multiple Ciphers on one SQLite version.
 2. **Keep the pin until the split is actually gone**, then remove it in the same change that removes the second library, never before, because it is what holds compatibility together in the meantime.
-3. **Prove a file written by the old native codec still opens.** Existing replicas were written by SQLCipher, so this is a migration and not only a dependency swap. If it is not readable, the phase needs a migration step and must say so rather than stranding data.
-4. Record the version both backends now pin, since one version was the point.
+3. Record the version both backends now pin, since one version was the point.
 
 ### Proof
 
-A file written natively opens in the browser and the reverse, with the pin removed. **And a file written by the previous native codec still opens after the switch**, which is the criterion that decides whether a migration is needed.
+A file written natively opens in the browser and the reverse, with the pin removed.
 
 ### Done when
 
-One library and one SQLite version on both backends, the pin deleted rather than merely unused, and existing replicas still open or a migration is specified.
+One library and one SQLite version on both backends, and the pin deleted rather than merely unused.
 
 ---
 
@@ -1233,6 +1233,8 @@ Public rows are stored once per device rather than once per identity, the switch
 
 **Blocked on R29, and on five upstream diesel proposals landing.** R29 first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. The proposals, in `docs/`: `upstream-diesel-auto-vacuum-mode.md`, `upstream-diesel-incremental-vacuum.md`, `upstream-diesel-vacuum-into.md`, `upstream-diesel-page-counters.md`, `upstream-diesel-wal-checkpoint.md`. **The maintainer is driving those PRs**, so that dependency is tracked rather than owned here. Off the critical path.
 
+**The diesel API surface still missing, listed so the blockers are not forgotten.** From `upstream-diesel-auto-vacuum-mode.md`: `SqliteConnection::set_auto_vacuum`, `SqliteConnection::auto_vacuum`, `AutoVacuumMode`. From `upstream-diesel-page-counters.md`: `SqliteConnection::page_count`, `SqliteConnection::freelist_count`. From `upstream-diesel-incremental-vacuum.md`: `SqliteConnection::incremental_vacuum`. From `upstream-diesel-wal-checkpoint.md`: `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome`. From `upstream-diesel-vacuum-into.md`: `SqliteConnection::vacuum`, `SqliteConnection::vacuum_into`. The PRs land serially because real stacked PRs are not an option, which is why the wait is long. The OPFS atomic-swap probe (`15-replica-retention.md`, open questions) waits specifically on `vacuum_into`, since the meaningful probe swaps a real compacted file under the sahpool VFS.
+
 ### Purpose
 
 The replica holds the union of subscribed query results, so it grows with what is subscribed rather than through a leak. Left alone it grows without bound, and in the browser it grows into an OPFS quota. The design is `docs/architecture/15-replica-retention.md`.
@@ -1242,12 +1244,12 @@ The replica holds the union of subscribed query results, so it grows with what i
 1. **The five upstream proposals are being driven by the maintainer**, so this phase does not file them. It waits for them to land and then uses the typed API rather than reaching for raw SQL, which is the whole reason for waiting.
 2. **Settle `auto_vacuum` in the replica create path.** It is the one pragma that must be set **before the first table exists**, because the mode lives in the file and changing it later needs a full `VACUUM` rewrite. There is no replica template any more (E5 deleted `connect_with_plaintext_template`), so connetto creates the file and connetto sets it. It joins the ordered pragma sequence in `docs/architecture/14-at-rest-encryption.md`, after the key pragma.
 3. Rotating time-windowed subscriptions: a standing predicate fixes its bound at registration, so rotation means re-subscribing with a fresh bound.
-4. Local eviction of rows no active subscription covers. **Local-tier rows are never evictable**, and that holds structurally rather than by rule, because no `SubscriptionSpec` can carry a frontend-tier table.
+4. Local eviction of rows no active subscription covers, where active means a watch-backed subscription within its grace or a pin. The pass runs by itself when a subscription ends (grace expiry or unpin), scoped to that subscription's tables, and a callable tidy pass exists besides. **Local-tier rows are never evictable**, and that holds structurally rather than by rule, because no `SubscriptionSpec` can carry a frontend-tier table.
 5. The trimming pass: bounded `incremental_vacuum` plus `wal_checkpoint(TRUNCATE)`, triggered on `freelist_count` relative to `page_count` rather than on a schedule.
 
 ### Proof
 
-A rotated subscription drops rows outside its new bound and keeps everything still covered, proven by reading the client's own copy rather than by trusting the server. A local-tier row survives an eviction pass that removes synced rows. After a bulk eviction, the trimming pass reduces `page_count`, which is the only observable that distinguishes trimming from deletion.
+A rotated subscription drops rows outside its new bound and keeps everything still covered, proven by reading the client's own copy rather than by trusting the server. A local-tier row survives an eviction pass that removes synced rows. After a bulk eviction, the trimming pass reduces `page_count`, which is the only observable that distinguishes trimming from deletion. A pinned query's rows survive every pass until `unpin`, and go on the next pass after it.
 
 ### Done when
 
@@ -1356,7 +1358,7 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **The unsynced-data warning as a session nears expiry needs no phase.** `expiry_warning` in `crates/connetto-client/src/teardown.rs` already takes the expiry, a lead time and the unsynced sequence numbers, and `session_expires_at` already reaches the client on the auth response. Its caller is the embedding application by design.
 
-**Backoff and retry uniformity, and operator alerting on a bounded CDC outage.** Both stated in `10-subscription-materializer.md` with no phase and no observable criterion.
+**Backoff and retry uniformity.** The shared retry primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, one abstraction shared by the materializer and the client connector) still has no phase and no observable criterion. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
 
 ---
 

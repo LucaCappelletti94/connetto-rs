@@ -26,17 +26,17 @@ A subscription has:
 
 ## SubscriptionSpec
 
-The spec describes the query the client wants to observe:
+The spec describes the query the client wants to observe. The shipped shape (`SubscriptionSpec` in `crates/connetto-core/src/messages/subscription.rs`) is:
 
 ```
 SubscriptionSpec {
-  table:      String,
-  filter:     Option<Predicate>,
-  columns:    Option<Vec<String>>,   // None = all columns
-  order_by:   Option<Vec<OrderBy>>,  // affects snapshot ordering only
-  limit:      Option<u32>,           // affects snapshot; incremental updates ignore limit
+  priority: SubscriptionPriority,  // delivery tier
+  query:    String,                // full SELECT in the client's SQLite dialect
+  binds:    Vec<BindValue>,        // values for the ? placeholders, in order
 }
 ```
+
+An earlier sketch here showed `table`, `filter`, `columns`, `order_by`, and `limit` as struct fields. That shape predates Q4.1: the table and the filter became the SQL text itself, column projection is deferred by Q4.5, and ordering or pagination (`LIMIT` with any `OFFSET`) ride inside `query`, where pagination shapes the snapshot only and live updates ignore it (see the design note at the end of this chapter).
 
 ### Predicate
 
@@ -248,5 +248,5 @@ If the LSN is outside the window, or if the server does not support catchup patc
 
 ## Notes
 
-- `limit` in `SubscriptionSpec` is an approximation: it applies to the initial snapshot ordering. As rows are inserted/deleted, the live result set may grow beyond the original limit without the server enforcing it. Clients that need a strict top-N should manage this locally.
+- Pagination in a subscription query (`LIMIT` and any `OFFSET` riding with it) is an approximation: it applies to the initial snapshot only. As rows are inserted or deleted, the live result set may grow beyond the original window without the server enforcing it. Clients that need a strict top-N should manage this locally.
 - The predicate tree is intentionally simple. Complex logic (full-text search, geographic queries) should be handled by materializing a computed column in PostgreSQL that can then be filtered simply. This applies to scalar expressiveness and is unaffected by the membership term above, which adds a relationship rather than a richer scalar comparison.
