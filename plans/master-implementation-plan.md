@@ -20,26 +20,11 @@ This programme closes a security defect in how connetto decides who a caller is,
 
 ## Step zero, before any phase
 
-**The working tree has 62 modified source files plus one untracked test**, which are the E6 step-one work. It is green.
+**RESOLVED before execution began.** This section described a working tree holding 62 modified source files plus one untracked test from the E6 step-one work, to be reset with the maintainer present after writing the diff outside the repository. That tree no longer exists: the working tree holds no source changes, `tests/anonymous.rs` is absent, and `crates/connetto-server/tests/rls_read_filter.rs` is tracked at 143 lines with history predating E6, so the salvage need is met by the committed file. The maintainer recalls the reset as deliberate, because the work served the discarded E-series plan whose central type Decision 9 superseded. Whether a recovery diff was saved is unrecorded, and nothing in that tree is wanted back.
 
-**Reset it, salvaging `crates/connetto-server/tests/rls_read_filter.rs` only. This is the first action of the code session**, taken with the maintainer present, and after writing the diff somewhere outside the repository.
+The reasoning that mandated the reset is kept for the record: the tree was a rename R3 redoes (`auth_token` to `credential` across roughly 40 files, the `Credential` enum, `PROTOCOL_VERSION` at 2), plus one useful test, plus a rule decided against (refusing an anonymous connection, which Decision 7 contradicts) with a green test defending it. Nothing further to do here.
 
-The decision rests on what the 62 files actually contain, which is not 62 substantive changes:
-
-| Category | Extent | Fate |
-|---|---|---|
-| `auth_token: String` becomes `credential: Credential::Token(..)` in test and demo configs | roughly 40 files, one or two lines each | **Redone.** R3 replaces `credential` with a grant list, so every one of these lines changes again |
-| `AuthContext` becomes `Principal` in `SnapshotSource` signatures | a handful of files | **Survives in shape**, but it is a mechanical sweep R3 performs anyway |
-| The `Credential` enum itself, and `PROTOCOL_VERSION` at 2 | `messages/handshake.rs`, `version.rs` | **Redone.** R3 replaces the enum, and R2 and R3 bump the version again |
-| Refusing an anonymous **connection**, and its stated reason | the `Credential::Anonymous` arm inside `SessionManager::run_handshake` and the `SessionConfig::allow_anonymous` doc, both in `crates/connetto-server/src/session.rs` | **Wrong.** Decision 7 says an unidentified caller writes when a capability authorizes it, and R2 removes the watermark constraint the refusal cites |
-| `tests/anonymous.rs`, asserting that refusal | untracked, new | **Wrong, and worse than absent**, because it is green and therefore defends the rule |
-| `tests/rls_read_filter.rs` | 84 lines, new | **Salvage.** The only file with content rather than churn |
-
-So the tree is not a head start. It is a rename R3 redoes, plus one useful test, plus a rule we have decided against with a passing test defending it.
-
-**Before resetting, preserve a recovery path**: write the full diff to a file outside the repository, since 62 green files are being discarded. Then reset, keep the salvaged test aside, and let R2 and R3 reintroduce the `Principal` signature change deliberately rather than inheriting it.
-
-**R3 supersedes the central type.** `Credential::{Anonymous, Token}` cannot express a grant that authorizes without identifying, and a caller must be able to present several. The vocabulary survives, the shape does not.
+**R3 supersedes the central type.** `Credential::{Anonymous, Token}` cannot express a grant that authorizes without identifying, and a caller must be able to present several. The vocabulary survives, the shape does not. `Principal` enters the code at R3 and nowhere earlier, and the `AuthContext` to `Principal` sweep is R3's alone: no earlier phase names the type.
 
 ## The gate
 
@@ -70,8 +55,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 
 | Step | Phase | Why it sits here |
 |---|---|---|
-| 1 | R1 | Closes the defect the programme exists for, and blocked on nothing |
-| 2 | R0 part A, the connetto-only counters | Cheap, and it prices the dispatch loop before R5b changes what dominates it |
+| 1 | ~~R1~~ **DONE** | Closed the defect the programme existed for, and was blocked on nothing |
+| 2 | ~~R0 part A, the connetto-only counters~~ **DONE** | Cheap, and it priced the dispatch loop before R5b changes what dominates it |
 | 2 | ~~R16 part A, the fan-out research~~ **DONE** | Blocked on nothing and needed no code, so it ran alongside everything early |
 | 3 | R2 | Gives the session layer a durable identity, which R3 consumes |
 | 4 | R8 | Independent surface cleanup, apart from one item wanting R2's registry |
@@ -84,7 +69,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 10 | R5a | Waits on the subql trait landing upstream |
 | 11 | R0 part B, the full measurement | Needs R5a's seam to measure through |
 | 12 | R5b | Needs R5a, R0, and the rls2fga per-row mapping |
-| 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. **The bulk frame decision alone must be settled before step 6 ships**, because R3 carries the `PROTOCOL_VERSION` bump and a second bump is a second flag day |
+| 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. The bulk frame decision it once had to settle before R3 shipped is settled, recorded under its inputs section |
 | 14 | R14 | Needs R0's data and R5b. **Conditional**: dropped if R0 shows the dispatch loop is not the ceiling |
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R4 and R6 |
@@ -112,8 +97,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 
 | Phase | Status | Blocked on | Upstream needed |
 |---|---|---|---|
-| R1 security defaults | NOT STARTED | nothing | no |
-| R0 part A, connetto-only counters | NOT STARTED | nothing | no |
+| R1 security defaults | **DONE** | nothing | no |
+| R0 part A, connetto-only counters | **DONE** | nothing | no |
 | R2 durable session identity | NOT STARTED | nothing | no |
 | R8 inert surface | NOT STARTED | nothing, apart from one item on R2 | no |
 | R12 structured logging | NOT STARTED | nothing | no |
@@ -126,7 +111,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R0 part B, full measurement | NOT STARTED | R5a | yes, via R5a |
 | R5b service as executor | NOT STARTED | R5a, R0, rls2fga | **yes, rls2fga** |
 | R16 part A, fan-out research | **DONE** | nothing | no |
-| R16 part B, the fan-out architecture | NOT STARTED | R0 (the bulk-frame decision is a deadline coupled to R3, not a blocker, see the section) | no |
+| R16 part B, the fan-out architecture | NOT STARTED | R0 (the bulk-frame decision is settled, see the section) | no |
 | R14 dispatch-loop cost | NOT STARTED | R0 and R5b, conditional on R0's data | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R4 and R6 | inherited |
@@ -219,9 +204,15 @@ None has a tracking issue. Open one in each repository, or the blocker is invisi
 
 ## R1: security defaults
 
-**Status.** NOT STARTED
+**Status.** **DONE** (2026-08-01). The gate ran in full: fmt, nightly clippy, the 52 non-Docker suites, rustdoc, the six Docker-gated e2e tests (three functional under the reader role, three startup refusals), and `verified_topology` against a live dev stack running `CONNETTO_AUTH=database` with the `dev_idp` provider and the `connetto_reader` role.
 
-**Blocked on nothing. Independently shippable. The only phase that closes a live hole.**
+**Deviations, recorded in place.**
+
+1. **The demo role lives in a `roles.sql` beside each `schema.sql`, not inside it.** `schema.sql` also feeds `CONNETTO_PG_DDL` and the `pg2sqlite` translation in each demo's `build.rs`, both of which expect pure table DDL, so the role and its grants would have had to survive two parsers they were never meant for.
+2. **The two functional e2e tests were already broken before this phase**, silently, since E5 made the client replica always encrypted: the test poller opened the replica with a plain SQLite connection, which cannot decrypt it, and the open itself created an empty file that made the freshly spawned client refuse its own path as an existing file with no cached key. The poller now probes for the file first, reads the key from the OS keyring where the client binary stored it, and unlocks before counting. Relatedly, the client `[[bin]]` lacked `native-auth` in its `required-features`, so the plain build command the e2e header documented had not compiled since E5 either. Both fixed here because this phase's Done when depends on those tests being green.
+3. **`tests/verified_topology.rs` and the wasm-smoke stack recipe gained `CONNETTO_READER_URL`**, since the documented dev stack no longer starts without it.
+
+**Refusal message shapes, for anyone matching on them**: the missing reader message names `CONNETTO_READER_URL` and the owner pool, the unset provider message says `CONNETTO_OIDC_PROVIDER is unset, expected one of google, microsoft, or generic`, and the unrecognised one quotes the value in Debug form and notes the names are lowercase.
 
 ### Purpose
 
@@ -229,13 +220,13 @@ Three permissive stand-ins are reachable from configuration alone and compose in
 
 ### Steps
 
-1. Delete `PermissiveProvider` in `crates/connetto-server/src/authn/provider.rs` and its re-exports (`crates/connetto-server/src/lib.rs`, `crates/connetto-server/src/authn/mod.rs`).
+1. Delete `PermissiveProvider` in `crates/connetto-server/src/authn/provider.rs` and its re-exports (`crates/connetto-server/src/lib.rs`, `crates/connetto-server/src/authn/mod.rs`). The same file's inline test module then fails to compile, because it constructs the struct twice: delete `permissive_provider_resolves_its_configured_identity` (`:608-619`), whose only subject is the struct, and repoint `registry_routes_by_name_issuer_and_matcher` (`:561-588`, a `ProviderRegistry` routing test) off the `PermissiveProvider` it registers (`:564-567`) onto another concrete provider advertising name `google` and exact issuer `https://accounts.google.com`, which it asserts through both the name lookup and the exact-issuer index hit. The existing `PatternProvider` double (`:532-559`) cannot stand in, being named `pattern` and matching only `microsoftonline` issuers, so give it a configurable name and issuer or add a small double.
 2. Replace the catch-all arm in `build_registry` in `crates/connetto-server/src/bin/connetto-server.rs` (the `_ =>` at `:260-281`) with a **startup error** naming the unrecognised value and listing the recognised ones. Today a merely miscapitalised provider name yields real signed tokens in which every user is `dev-user`.
-3. Delete the `PermissiveAuth` fallback reached when `CONNETTO_READER_URL` is unset (the `else` branch inside `main` in `crates/connetto-server/src/bin/connetto-server.rs`). That branch also puts the snapshot source and the write target on the **owner** pool, where Postgres applies no policy to a superuser or table owner. The binary refuses to start without a reader role.
-4. Repoint the four test files that use `PermissiveProvider` at the existing `oauth2-test-server` and `dev_idp` example: `crates/connetto-client/tests/native_auth.rs`, `crates/connetto-server/tests/authn_flow.rs`, `crates/connetto-server/tests/oidc_spine.rs`, `crates/connetto-server/tests/provider.rs`.
-5. Change `spawn_server_cfg` in `crates/connetto-server/tests/e2e.rs`, which deliberately spawns the binary both with and without a reader role. The without-case becomes an expected startup refusal.
+3. Delete the `PermissiveAuth` fallback reached when `CONNETTO_READER_URL` is unset (the `else` branch inside `main` in `crates/connetto-server/src/bin/connetto-server.rs`, `:396-402`). That branch also puts the snapshot source and the write target on the **owner** pool, where Postgres applies no policy to a superuser or table owner. The binary refuses to start without a reader role. Deleting the branch leaves `ServerAuth::Permissive(PermissiveAuth)` (`:66-67`) constructed nowhere, which the gate rejects as a dead variant, so remove it and its arm in `impl AuthPolicy for ServerAuth` (`:72-102`). Only the `Rls` arm then remains, so dissolve `ServerAuth` into the concrete `RlsAuth`: delete the enum and its `impl AuthPolicy` block, build `auth` as a plain `RlsAuth` in `main`, change `run`'s `SessionManager` type parameter (`:459`) from `ServerAuth` to `RlsAuth`, and drop the now-unused `PermissiveAuth` import (`:39`). `PermissiveAuth` the symbol stays, per Out of scope.
+4. Repoint the three test files that **construct** `PermissiveProvider` at the existing `oauth2-test-server` (a real loopback OIDC server, `crates/connetto-server/Cargo.toml:108`) or the `dev_idp` example, using `oidc_spine.rs` as the template: `crates/connetto-client/tests/native_auth.rs`, `crates/connetto-server/tests/authn_flow.rs`, `crates/connetto-server/tests/provider.rs`. `oidc_spine.rs` does **not** construct it: it already points `GenericOidcProvider` at `oauth2-test-server` and only names `PermissiveProvider` in two module-doc lines (`:13`, an intra-doc link, and `:30`). Delete or reword both so `RUSTDOCFLAGS="-D warnings" cargo +stable doc` does not break on the dangling link.
+5. The three e2e tests spawn the binary through `spawn_server`/`spawn_server_cfg` in `crates/connetto-server/tests/e2e.rs`. Two of them, `e2e_two_clients_snapshot_live_and_reconnect` and `e2e_client_write_lands_in_pg_and_fans_out`, go through `spawn_server`, which supplies no reader role (it removes `CONNETTO_READER_URL` from the child environment), and both need a **running** server to prove snapshot, live, reconnect and write fan-out. Give each a reader role the way `e2e_rls_write_enforced_owned_lands_foreign_refused` already does (`spawn_server_cfg(..., Some(&reader_url))` with the role and its grants) so they keep passing. Add **one** new e2e test that spawns with no reader role and asserts the startup refusal.
 6. Add a non-owner role and its grants to the demo schemas, which today contain no `GRANT`, no `CREATE ROLE` and no policy, and update the demo doc comments that document the environment.
-7. Update the `CONNETTO_OIDC_PROVIDER` and `CONNETTO_READER_URL` documentation in the binary's header comment in `crates/connetto-server/src/bin/connetto-server.rs`.
+7. Update the environment documentation in `crates/connetto-server/src/bin/connetto-server.rs`: `CONNETTO_READER_URL` in the module header (`:17-24`), which now refuses when unset rather than falling back to permissive, and `CONNETTO_OIDC_PROVIDER` on `build_registry` (`:238-242`, it is not in the header today), which now refuses on an unrecognised value. Scrub the `PermissiveProvider` intra-doc link on `build_registry` (`:240`) so `RUSTDOCFLAGS="-D warnings" cargo +stable doc` stays green.
 
 ### Proof
 
@@ -248,7 +239,7 @@ A new or extended test in `crates/connetto-server/tests/` proving each refusal i
 
 ### Done when
 
-`PermissiveProvider` does not exist as a symbol. No configuration reaches the owner pool for reads or writes. Each of the four refusals above has a passing test. The four repointed tests still prove what they proved before. Every demo still runs, which is expected: **verified that no demo constructs a server**, all four connect to a separately started `connetto-server` over `CONNETTO_DEMO_SERVER`, and none references `CONNETTO_READER_URL`.
+`PermissiveProvider` does not exist as a symbol. No configuration reaches the owner pool for reads or writes. Each of the four refusals above has a passing test, including the new no-reader startup refusal. The three repointed tests still prove what they proved before, and the two functional e2e tests still prove snapshot, live, reconnect and write fan-out under a reader role. Every demo still runs, which is expected: **verified that no demo constructs a server**, all four connect to a separately started `connetto-server` over `CONNETTO_DEMO_SERVER`, and none references `CONNETTO_READER_URL`.
 
 ### Out of scope
 
@@ -258,9 +249,11 @@ A new or extended test in `crates/connetto-server/tests/` proving each refusal i
 
 ## R0: the measurement
 
-**Status.** NOT STARTED
+**Status.** Part A **DONE** (2026-08-01). Part B NOT STARTED, **blocked on R5a**.
 
-**Blocked on nothing** for the connetto-only counters. The full measurement is **blocked on R5a**.
+**Part A landed.** The counters live in `crates/connetto-server/src/counters.rs` (always-on relaxed atomics per the decision below), incremented at the three named `dispatch_event` lock sites, the per-consumer `payload_zstd` copy in `Materializer::dispatch`, the per-subscriber `Route` clone, and `RlsAuth::can_read`. The load fixture is `connetto_test_harness::fanout::fanout_run` (N subscribers over one table under the RLS policy, M admin writes, counter deltas bracketing exactly that window), and the counter test is `crates/connetto-test-harness/tests/fanout_counters.rs`, green in the gate. **Measured, exact**: at K subscribers each event costs K authorization round trips, K route clones, K plus two materializer lock takes, and K full payload copies. The test asserts that growth today and is the file where R5b flips the assertions to their negation.
+
+**Part A deviations.** The two subscriber counts are 10 and 100 rather than the example's 10 and 1000: the requirement is one order of magnitude, and 100 keeps the run inside two seconds where 1000 would put a thousand snapshot reads and five thousand sequential RLS round trips in the gate for no additional signal. The lock-take assertion is a difference lower bound between the two runs rather than an absolute equality, because the fixed per-event takes (and any time-based source events) cancel in the difference while per-subscriber takes cannot hide in it. The baseline events-per-second figure and the lock-wait fraction remain part B deliverables.
 
 ### Purpose
 
@@ -270,8 +263,10 @@ Nothing in this repository has ever been measured. Every performance figure in t
 
 **Part A, connetto only, do this first.**
 
+**Decided with the maintainer (2026-08-01): the counters are always on, plain relaxed atomics, never feature-gated.** An uncontended relaxed increment costs single-digit nanoseconds beside the operations it counts (a mutex take, a payload copy, a per-subscriber Postgres round trip), so gating would buy an unobservable saving at the price of the measured binary not being the shipped binary, and of every later reader of the counters (R5b's acceptance, R14's trigger and proof) having to remember a feature. The counters are a permanent instrument, not a probe: the counter test stays in the gate as the regression guard on per-event work staying independent of subscriber count.
+
 1. Add an atomic counter for materializer mutex acquisitions. `dispatch_event` takes the lock three times per event (in `SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`, at the `dispatch`, `oplog_record`, and `advance_cursor` calls) and **the third is inside the per-subscriber loop**, so it is taken once per subscriber per event on the shared ingestion path.
-2. Add an atomic counter for **bytes copied per event in the fan-out**, covering the compressed payload clone in `Materializer::dispatch` (one full copy of `payload_zstd` per consumer) and the `Route` clone in `SessionManager::dispatch_event`. Count bytes rather than clones: a clone count hides that the payload copy scales with patch size as well as with subscriber count, which is the interaction that matters. Add a counter for `Route` clones in the fan-out (in `SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), each of which carries a `Principal`, so this is per-subscriber allocation on the same path.
+2. Add an atomic counter for **bytes copied per event in the fan-out**, covering the compressed payload clone in `Materializer::dispatch` (one full copy of `payload_zstd` per consumer) and the `Route` clone in `SessionManager::dispatch_event`. Count bytes rather than clones: a clone count hides that the payload copy scales with patch size as well as with subscriber count, which is the interaction that matters. Add a counter for `Route` clones in the fan-out (in `SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), each of which carries an `AuthContext<Id>`, so this is per-subscriber allocation on the same path.
 3. Add an atomic counter for authorization calls. Before R5a this sits on `RlsAuth::can_read` and will relocate. After R5a it sits on the trait and never moves again, which is why R5a should precede part B.
 4. Create the benchmark and load-harness scaffolding, which does not exist: no `benches` directory, no `[[bench]]` target, no criterion anywhere in the workspace. `crates/connetto-test-harness` already spins Postgres, so extend it rather than starting over.
 5. Build a fixture that connects N subscribers to one table and writes rows at a known rate.
@@ -304,9 +299,21 @@ No fixes. R0 measures and does not optimize.
 
 ## R2: the session layer's own durable identity
 
-**Status.** NOT STARTED
+**Status.** **Server and native complete and green. The browser suites are the one open item.** (2026-08-02)
+
+**Landed.** Every step except 3 in full. The handle is `VerifiedSession.session_id`, folded to a `u64` by `SessionId::as_u64_key` and passed to `advance_cursor` in place of `connection_num`, so subql's per-subscription cursors resume. `_connetto_mutations` is keyed on `session_id` alone and `connetto_watermark_table!` takes one argument. `check_watermark_shape` refuses a table missing `session_id`/`last_seq`, an absent table, or a leftover `user_id`. `Outbound::Fatal` plus a pump arm closes a connection. The registry (`SessionManager::{register_connection, unregister_connection, close_session}`) keys live connections on the handle, serves revocation, and enforces one live connection per handle with the newer winning. `TrustingSessionVerifier` is deleted, the verifier is a required constructor argument at roughly 45 callsites, and the test-only stand-in is `connetto_core::test_support::TestSessionVerifier`, which reads a `user#session` token as one user holding several sessions. `AuthService` gained a revocation hook the binary wires to `close_session`, so a logout closes the live connection.
+
+**Proven.** `crates/connetto-test-harness/tests/session_handle.rs` (7 tests) plus `authn_flow.rs::logout_closes_the_live_connection_it_revoked`. All of the plan's proofs pass: revocation idle and subscribed, supersession, a handle not surviving a change of caller, the watermark resuming on the handle across a reconnect, and the stale-shape startup refusal. The full gate is green: fmt, nightly clippy, rustdoc, 54 non-Docker suites, and the whole Docker-gated sweep including a converted `e2e.rs` that now runs a loopback identity provider in-process and mints real tokens for the client binary.
+
+**Two things this phase added that the step list did not name.** The binary refuses to start without `CONNETTO_AUTH` (the no-escape-hatch decision), and its auth router gained a CORS layer configured by `CONNETTO_AUTH_CORS_ORIGINS` with loopback always allowed, mirroring the redirect policy's loopback rule. The second is forced by the first: a browser deployment serves its app on a different origin from the auth endpoints, so without it script there cannot read a login response.
+
+**Step 3 is deferred to R3, deliberately.** The handle rides the connection and is presented on every reconnect (`ConnettoConnection::session_handle`), but it is not persisted across a process restart. The plan's own rationale for persisting it is entirely about unidentified sessions, whose replica is in memory, and decision A moved those to R3. For an identified run the handle is re-derived from the verified credential, so persistence buys nothing until R3 mints handles for callers who present none.
+
+**OPEN: the multi-client browser suites hang.** The demos are converted (no unauthenticated mode remains, each authenticates against the local dev IdP) and compile clean. Of the 21 wasm-smoke targets, the single-client ones pass against a real stack (`smoke`, `opfs`, `relay`, `conflict`, `credits`, `browser_auth`, both `authenticated_boot` suites), and every suite that opens several concurrent clients hangs with "failed to detect test as having been run": `election`, `failover`, `parity`, `topology`. Not a timeout (120s changes nothing) and not the one-connection-per-OPFS-file trap (a per-mint counter and closing the store before deleting it changed nothing). The stack those suites need is `auth_stack` on one origin sharing the sync server's signing key (`CONNETTO_JWT_*_KEY_FILE`) and its Postgres session store, because a browser cannot fetch-follow a login chain that crosses to the identity provider and back: the origin goes opaque and the return hop carries `Origin: null`. `auth_stack` was extended to accept both, which is what makes its tokens verify at the sync handshake. Leaving the conversion in place is strictly better than reverting, because without it every browser suite fails at the handshake instead.
 
 **Blocked on nothing.** Verified: subql does not mint the session identity, connetto supplies it as a caller-chosen `u64` to `Materializer::advance_cursor` in `crates/connetto-server/src/materializer.rs`, and today it passes `route.connection_num`, which is precisely why nothing resumes. Passing a stable value derived from the durable handle makes cursors resume **with no subql change**.
+
+**Decided with the maintainer (2026-08-01): no escape hatch when the trusting default dies.** When step 10 makes the verifier a required constructor argument, the server binary REFUSES to start with `CONNETTO_AUTH` unset, and no dev flag reintroduces the trusting behaviour in any production build. The demos become complete: each runs against the local dev IdP (`dev_idp`) and authenticates for real, with no unauthenticated mode left. The wasm-smoke browser suites authenticate their worker boots the way `authenticated_boot` already does. The renamed test stand-in lives only behind `connetto-core`'s `test-support` feature, reachable by test builds alone. This widens the phase beyond the step list: the e2e tests must spin a loopback OIDC provider and mint real tokens for the client binary, and the demo and suite conversions are part of this phase's Done when, not follow-up work. The apps-without-login product shape is NOT served by any of this and never was: it arrives in R3 as the zero-grants anonymous caller, under a real verifier.
 
 ### Purpose
 
@@ -314,32 +321,34 @@ No fixes. R0 measures and does not optimize.
 
 ### Steps
 
-1. **One durable handle per run, and it is a `SessionId`.** For an authenticated run the auth store's `SessionId` **is** the handle, so there is never a second name for the same visit. For an unidentified run connetto mints a `SessionId` itself at handshake. This costs nothing structurally: `SessionId` is already a `connetto-core` type (`crates/connetto-core/src/session_id.rs`) that the auth store uses rather than owns.
-2. **`Principal::session_id` stops returning an `Option`.** It returns `Option<SessionId>` today with `None` for `Principal::Anonymous` (`crates/connetto-core/src/auth.rs`), which is the single fact that made an unidentified caller look like it had no session at all. Every caller has one after this, so the `Option` goes and with it a whole class of special-casing downstream.
+1. **One durable handle per run, and it is a `SessionId`.** For an authenticated run the auth store's `SessionId` **is** the handle, so there is never a second name for the same visit. This costs nothing structurally: `SessionId` is already a `connetto-core` type (`crates/connetto-core/src/session_id.rs`) that the auth store uses rather than owns. Unidentified runs get their handle in R3, the phase that first makes an unidentified caller representable: until then every connection presents a token and every verified session already carries a `SessionId`.
+2. **The handle becomes the only operational key.** No new type work happens here: `VerifiedSession.session_id` (`crates/connetto-core/src/auth.rs`) is already non-optional, and the defect is that nothing downstream keys on it. Steps 4, 6 and 9 move the cursor, the watermark and the registry onto it. Making `session_id` non-optional on `Principal` is R3's work, recorded there, because `Principal` and the anonymous caller both first exist in R3.
 3. **Persist it client-side outside the local replica.** An unidentified session's replica is in memory under R3, so a handle kept inside it would not survive a reload and the session would be lost on every page load. Native puts it where the refresh token already lives, and the browser keeps it worker-only, as the refresh token already is.
 4. Present it on reconnect and resume the session's operational state. Pass a stable `u64` derived from the handle to `advance_cursor` in place of `connection_num`, which is what makes subql's per-subscription cursors and pending buffer resume (`open-questions.md` Q6.4 and Q6.5).
-5. **A handle covers one unbroken run of one caller.** Signing in ends the unidentified run and starts an identified one, signing out ends that one, and nothing is ever inherited. Four things key on the handle, so a handle outliving a change of caller would hand the next person on a shared device the previous person's subscriptions, cursors and buffered changes.
+5. **A handle covers one unbroken run of one caller.** Signing out ends the run, and nothing is ever inherited. Once R3 makes unidentified runs representable, signing in also ends the unidentified run and starts an identified one. Four things key on the handle, so a handle outliving a change of caller would hand the next person on a shared device the previous person's subscriptions, cursors and buffered changes.
 6. Re-key the exactly-once watermark. `_connetto_mutations` becomes keyed on the handle alone, the `user_id` column and its foreign key go, and the `connetto_watermark_table!` macro changes with it.
-7. **Write the migration.** This is a deployment-facing schema contract (the `_connetto_mutations` schema in `11-authentication.md` under "Migrations: the tables are the deployment's"). Existing deployments must migrate before upgrading.
-8. **Add a startup check on the watermark table's shape** and refuse to run against the old one, naming what is wrong. Same treatment R6 gives `REPLICA IDENTITY`, and for the same reason: connetto emits no server DDL on any path a deployment runs, so the trait is the only contract, and an unchecked contract lets a server run while mis-keying its exactly-once records. That failure is silent until a replay happens.
-9. Add `Outbound::Fatal(FatalError)` to `Outbound` in `crates/connetto-server/src/session.rs` (which currently has only `Live` and `Aggregate`) and a pump arm that sends it and closes.
-10. Add a connection registry keyed on the durable handle, and construct `FatalErrorReason::SessionRevoked` so revoking a session closes its live connection rather than only refusing its next handshake. The per-subscription route map is **not** sufficient: a session with no subscriptions has no route and would be unreachable.
-11. Delete `TrustingSessionVerifier` in `crates/connetto-core/src/auth.rs` and its re-export in `crates/connetto-core/src/lib.rs`, and stop `SessionManager::with_oplog` installing any verifier by default in `crates/connetto-server/src/session.rs`. A verifier becomes a required constructor argument. Update `crates/connetto-client/tests/verified_topology.rs` and `crates/connetto-server/tests/authentication.rs`, which reference it, to name a test verifier from the existing `test-support` feature explicitly. **The defect was that the stand-in was the default, not that it existed.**
+7. **Add a startup check on the watermark table's shape** and refuse to run against the old one, naming what is wrong. Same treatment R6 gives `REPLICA IDENTITY`, and for the same reason: connetto emits no server DDL on any path a deployment runs, so the trait is the only contract, and an unchecked contract lets a server run while mis-keying its exactly-once records. That failure is silent until a replay happens.
+8. Add `Outbound::Fatal(FatalError)` to `Outbound` in `crates/connetto-server/src/session.rs` (which currently has only `Live` and `Aggregate`) and a pump arm that sends it and closes.
+9. Add a connection registry keyed on the durable handle: a locked map from `SessionId` to the live connection's outbound sender plus its `connection_num`, inserted when the handshake completes and removed when the connection closes. The per-subscription route map is **not** sufficient: a session with no subscriptions has no route and would be unreachable. Two consumers:
+    - **Revocation.** Construct `FatalErrorReason::SessionRevoked` so revoking a session closes its live connection rather than only refusing its next handshake.
+    - **Supersession.** One live connection per handle, and the newer connection wins: a handshake presenting a handle that is already live replaces the registry entry and closes the old socket with a new `FatalErrorReason::ConnectionSuperseded` variant. Two connections must not share one handle, because the handle keys the per-subscription cursor and the pending buffer, and two readers would each consume the other's changes. Last-wins is what makes a reconnect racing its own half-dead socket self-heal, at the cost that two deliberately concurrent processes on one stored token evict each other.
+10. Delete `TrustingSessionVerifier` in `crates/connetto-core/src/auth.rs` and its re-export in `crates/connetto-core/src/lib.rs`, and stop `SessionManager::with_oplog` installing any verifier by default in `crates/connetto-server/src/session.rs`. A verifier becomes a required constructor argument. **The blast radius is every constructor caller, not the two files that name the type**: `SessionManager::{new, with_connector, with_oplog}` have roughly 45 callsites across 18 files, namely the server binary (which today keeps the trusting default whenever `CONNETTO_AUTH` is unset), `crates/connetto-test-harness/src/lib.rs`, four `connetto-client` test files (`local_tier`, `loop_emu`, `mutation_replay`, `reconnect_live`), eleven `connetto-server` test files (`authentication`, `authn_flow`, `cdc_reconnect`, `pg_async`, `read_filter`, `reconnect`, `reexec`, `rls_write_filter`, `session_loop`, `snapshot_nonfatal`, `write_path`), and the `connetto-dioxus` `hook.rs` tests. Each supplies a test verifier from the existing `test-support` feature explicitly, and `crates/connetto-client/tests/verified_topology.rs` and `crates/connetto-server/tests/authentication.rs`, which reference the deleted type by name, are repointed. **The defect was that the stand-in was the default, not that it existed.**
 
 ### Wire and schema impact
 
-**Wire**: `session_token` on `Handshake` and `HandshakeAck` goes from stub to load-bearing. Bump `PROTOCOL_VERSION`. **Schema**: `_connetto_mutations` re-keyed, migration required, startup check added.
+**Wire**: `session_token` on `Handshake` and `HandshakeAck` goes from stub to load-bearing. The fields already exist (`Option<String>` on `Handshake`, `String` on `HandshakeAck`, `crates/connetto-core/src/messages/handshake.rs`) and the semantics are settled in `11-authentication.md` under "connetto session credential": a real server-minted opaque handle the client persists and presents on reconnect. `FatalErrorReason` gains `ConnectionSuperseded` (step 9). **Schema**: `_connetto_mutations` re-keyed, startup check added.
 
 ### Proof
 
 - A client reconnects on its handle and resumes **without re-snapshotting** and **without replaying a mutation the server already applied**. The existing `crates/connetto-server/tests/reconnect.rs` and `crates/connetto-client/tests/mutation_replay.rs` are the natural homes.
 - Revoking a session closes its live connection with `SessionRevoked`, proved twice: with the connection **idle** and with it **subscribed**. The idle case is the one the route map cannot serve and is therefore the one that proves the registry.
+- A second handshake on a handle that is already live closes the first connection with `ConnectionSuperseded`, and the new connection proceeds with the session's cursors intact.
 - A handle does not survive a change of caller: signing out and signing in as somebody else yields a different handle and inherits no subscriptions.
 - Starting against an old watermark table refuses, naming the problem.
 
 ### Done when
 
-All four tests above pass. `_connetto_mutations` has no identity column. `TrustingSessionVerifier` does not exist as a symbol and no constructor supplies a default verifier. A migration document exists.
+All five tests above pass. `_connetto_mutations` has no identity column. `TrustingSessionVerifier` does not exist as a symbol and no constructor supplies a default verifier.
 
 ### Why
 
@@ -359,11 +368,10 @@ The codebase advertises behaviour it does not have: error variants nothing const
 
 ### Steps
 
-1. Delete `AuthContext.tenant_id`, `.roles` and `.claims` (`AuthContext` in `crates/connetto-core/src/auth.rs`), the JWT claims carrying them (`TokenAuthority::mint_access` in `crates/connetto-server/src/authn/token.rs` and `:225-250`), and the session-row JSON blob storing them (`SessionAttrs` in `crates/connetto-server/src/authn/store.rs`, `:582-584`, `:605-607`). Seventeen mechanical compile sites and **no behaviour change**, because nothing ever read them. `GenericOidcProvider::verify_claims` in `crates/connetto-server/src/authn/provider_oidc.rs` sets them, and `roles` is initialised empty and never filled.
-2. **Write the migration** for the session row, since the `attrs` blob loses fields.
-3. Construct `FatalErrorReason::ServerShuttingDown`. A graceful shutdown walks R2's connection registry, sends the reason, and closes, so a client backs off instead of hammering a dying process with immediate reconnects. **This item alone needs R2.**
-4. Remove `Oplog::prune` from the trait in `crates/connetto-server/src/oplog.rs`. Both implementations call it from their own `append` and nothing calls it through the trait, so it is an implementation detail exposed as a public seam where an external caller would race with `append`. It is not dead code, and finding it a caller would be the wrong fix.
-5. **Correct four doc comments that advertise behaviour the code does not have.** A `///` or `//!` is surface like any other: it appears in generated rustdoc and a reader takes it as fact. These four were found by sweeping the doc comments, a surface no earlier audit covered.
+1. Delete `AuthContext.tenant_id`, `.roles` and `.claims` (`AuthContext` in `crates/connetto-core/src/auth.rs`), the JWT claims carrying them (`TokenAuthority::mint_access` and `verify_access` in `crates/connetto-server/src/authn/token.rs`), the session-row JSON blob storing them (`SessionAttrs` in `crates/connetto-server/src/authn/store.rs`), and the copies that feed them, which become dead the moment the context fields go: the same three fields on `ResolvedIdentity` (also `store.rs`), the static `tenant_id` on `GenericOidcConfig` (`crates/connetto-server/src/authn/provider_oidc.rs`), and the `CONNETTO_OIDC_TENANT` environment variable in the server binary. Roughly 45 mechanical sites across 13 files, and **no behaviour change**: the values are written, signed into the token, deserialized and reconstructed in `TokenAuthority::verify_access`, and never once acted on. `GenericOidcProvider::verify_claims` sets them, and `roles` is initialised empty and never filled.
+2. Construct `FatalErrorReason::ServerShuttingDown`. A graceful shutdown walks R2's connection registry, sends the reason, and closes, so a client backs off instead of hammering a dying process with immediate reconnects. **This item alone needs R2.**
+3. Remove `Oplog::prune` from the trait in `crates/connetto-server/src/oplog.rs`. Both implementations call it from their own `append` and nothing calls it through the trait, so it is an implementation detail exposed as a public seam where an external caller would race with `append`. It is not dead code, and finding it a caller would be the wrong fix.
+4. **Correct four doc comments that advertise behaviour the code does not have.** A `///` or `//!` is surface like any other: it appears in generated rustdoc and a reader takes it as fact. These four were found by sweeping the doc comments, a surface no earlier audit covered.
    - **`session.rs` module doc says "replies only on failure. Success is the CDC echo, so there is no dedicated ack."** False. `SessionManager` sends `MutationApplied` on every durable apply, and `crates/connetto-core/src/messages/mutation.rs` says so in the same workspace: "a durable apply is additionally confirmed with a `MutationApplied` acknowledgement". **This doc comment is the origin of the same false claim found in `open-questions.md` Q2.2 and Q3.5**, which have since been corrected, so fixing it closes the source rather than another copy.
    - **`cipher.rs` module doc claims the encryption "defends ... a shared device".** It does not, per the threat model in `docs/architecture/12-identity-session-capability.md`: nothing checks that whoever asks for an account's key is that account, and separation between people is the operating system's user boundary. Chapter 14 carried the identical sentence and was corrected. This is where it came from.
    - **`locks.rs` module doc attributes the Web Locks liveness protocol to `SharedWorker` ports having no reliable close event.** connetto never constructs a `SharedWorker`. The problem is real for the ports it does use, so the mechanism is right and the motivation names the wrong thing.
@@ -377,7 +385,7 @@ A test constructs **every** variant of `FatalErrorReason` the server can send, w
 
 ### Done when
 
-No variant of a wire enum the server can send is unconstructed. No public trait method is uncalled through the trait. No field is populated and never read. No placeholder empty string stands in for a value the sender holds. A migration document exists for the session row.
+No variant of a wire enum the server can send is unconstructed. No public trait method is uncalled through the trait. No field is populated and never read. No placeholder empty string stands in for a value the sender holds.
 
 ---
 
@@ -419,7 +427,7 @@ It puts R0's authorization counter on a seam that then never relocates, so the b
 
 **Blocked on nothing, and a prerequisite for R3.** Ordered before it.
 
-**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only stdout output is `println!` in the two CLI binaries. Meanwhile `08-authorization.md` under "Audit" records structured logging as **Decided**, the Audit paragraph of `11-authentication.md` under "Deployment shape" calls it "no new mechanism" as though one existed, `open-questions.md` Q8.6 decides it for the firehose, and the architecture diagram draws a log aggregator.
+**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only output anywhere is unstructured `println!` and `eprintln!` in the two CLI binaries, the server binary alone carrying a dozen `eprintln!` lines (startup notices, CDC reconnect events, session errors) that this phase replaces. Meanwhile `08-authorization.md` under "Audit" records structured logging as **Decided**, the Audit paragraph of `11-authentication.md` under "Deployment shape" calls it "no new mechanism" as though one existed, `open-questions.md` Q8.6 decides it for the firehose, and the architecture diagram draws a log aggregator.
 
 **One of those dependencies is load-bearing for security.** `08-authorization.md` under "Audit", restated in R3 step 7, says that because the wire says nothing about a refused grant, "the log line is the only place the failure is visible and is therefore what makes it loud". With no logging a refused grant is visible nowhere, so R3's silent-refusal design is unsafe until this lands. That is why this is a prerequisite rather than observability polish.
 
@@ -447,9 +455,7 @@ A refused grant is visible in the log, so R3 may proceed.
 
 **Status.** NOT STARTED
 
-**Blocked on R2 and R12.** R12 because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. Supersedes the uncommitted E6 step-one work, which is the right vocabulary and the wrong shape.
-
-**Carries the `PROTOCOL_VERSION` bump, and R16 part B may need to ride it.** R16 part A established that the protocol hard-rejects a version mismatch with no negotiation, so every bump is a flag day for all deployed clients. R3's grant list already requires one and has not shipped. If R16 part B's design changes the bulk frame layout, which part A found it probably should, that change must be settled before this phase ships or it forces a second flag day. **This is a coupling on the decision, not on R16 part B's implementation**, and it is the only reason anything in R16 has a deadline. R16 part B is otherwise gated on R0.
+**Blocked on R2 and R12.** R12 because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. Supersedes the discarded E6 step-one work, which was the right vocabulary and the wrong shape.
 
 ### Purpose
 
@@ -457,11 +463,11 @@ A refused grant is visible in the log, so R3 may proceed.
 
 ### Steps
 
-1. `Handshake` carries **zero or more** grants in place of a single credential. **Bump `PROTOCOL_VERSION`.**
+1. `Handshake` carries **zero or more** grants in place of a single credential.
 2. A grant is a connetto-signed token asserting the bearer is a named subject, either a person or a key. It is opaque to the client and says nothing about what the subject may do.
 3. Each grant is checked independently, by signature, against connetto's own public key. **No database lookup, no shape sniffing, no routing metadata on the wire, and no load-bearing order of checks.** An unrecognised string costs arithmetic and nothing more.
 4. `SessionVerifier` becomes a grant checker producing a `Principal`. It is **not** a resolver: `IdentityResolver` in `crates/connetto-server/src/authn/identity.rs` already exists and means mapping a provider's asserted claims to a typed user id in the deployment's own users table.
-5. `Principal` carries an optional identity plus resolved capabilities, and the **type must make all four arrival cases representable**: nothing, identity only, capability only, and both.
+5. `Principal` carries an optional identity plus resolved capabilities, and the **type must make all four arrival cases representable**: nothing, identity only, capability only, and both. **Its `session_id` is non-optional**: an unidentified caller gets a `SessionId` connetto mints at handshake, an authenticated caller carries the auth store's, so every caller has a handle and R2's resume, cursor, watermark and registry machinery covers all four cases uniformly. Both anonymous-facing rules live here rather than in R2 because this phase is what first makes an unidentified caller representable.
 6. A failed grant does **not** end the connection. The session proceeds on whatever was accepted.
 7. **`HandshakeAck` gains no field.** The reply says nothing about a failure, not the reason and not which grant. Not allowed, no longer allowed and never existed are indistinguishable. The failure is recorded in the server's **structured log** and nowhere else, which is what makes it loud. Not in `auth_events`: a denial is high-volume by the split in `08-authorization.md` under "Audit", and that table holds state changes.
 8. A caller with no identity gets `Replica::Ephemeral`, always, with no opt-in. The variant exists already and is already `:memory:` (`Replica::Ephemeral` in `crates/connetto-client/src/replica.rs`, `:124`, `:114`).
@@ -470,7 +476,7 @@ A refused grant is visible in the log, so R3 may proceed.
 
 ### Wire and schema impact
 
-Grant list replaces the single credential. `PROTOCOL_VERSION` bumps. `HandshakeAck` unchanged.
+Grant list replaces the single credential. No version bump pre-release, per the cross-cutting checklist. `HandshakeAck` unchanged.
 
 ### Proof
 
@@ -479,10 +485,11 @@ Grant list replaces the single credential. `PROTOCOL_VERSION` bumps. `HandshakeA
 - An unidentified session's replica is in memory, and attaching a file tier to it **fails to compile** if the guard is in the type, or fails at runtime if it is not, in which case the guard is not done.
 - The switch refuses when it holds writes it cannot send.
 - A signed-in caller holding a capability over somebody else's row sees exactly the union.
+- An unidentified session resumes on its minted handle across a reconnect without re-snapshotting, proving R2's resume machinery holds with no identity present.
 
 ### Done when
 
-All of the above pass. A single-grant shape is not representable. `Credential::{Anonymous, Token}` does not exist.
+All of the above pass. A single-grant shape is not representable. `Credential::{Anonymous, Token}` does not exist. No `session_id` is optional anywhere.
 
 ### Out of scope
 
@@ -616,7 +623,7 @@ The counter test passes. A policy with no translation and no supplied mapping re
 
 **Status.** Part A **DONE**. Part B NOT STARTED.
 
-**Part B is blocked on R0** for the numbers, **and coupled to R3 for one item only.** Part A discovered that the protocol hard-rejects a version mismatch with no negotiation, and that R3's grant list already requires a `PROTOCOL_VERSION` bump which has not shipped. So if part B's design implies a bulk frame change, that change should ride R3's bump rather than force a second flag day for every deployed client. The coupling is a deadline on the *decision*, not on the implementation, and it is recorded in R3 as well.
+**Part B is blocked on R0** for the numbers, and on nothing else. The old coupling to R3 is dissolved: `PROTOCOL_VERSION` is frozen until the first release (cross-cutting checklist), so a pre-release frame change carries no bump, and the bulk frame decision itself is settled below under "Inputs already settled with the maintainer". Part A's finding that a mismatch hard-rejects with no negotiation still matters, but only from the first release onward.
 
 ### Purpose
 
@@ -659,7 +666,7 @@ All four are complete.
 
 Recorded as a **deviation from this plan's sequencing**, with its reason, so part B writes them up rather than re-deriving them. The deviation is that these were settled without R0's numbers.
 
-The reason is twofold. The frame layout has a deadline that belongs to R3 rather than to R0, and a second `PROTOCOL_VERSION` bump costs every deployed client a second forced upgrade. The remainder are strictly less work for identical behaviour, which R0 cannot veto, only prioritise.
+The reason recorded at the time was the R3 deadline: a second `PROTOCOL_VERSION` bump would have cost every deployed client a second forced upgrade. That deadline has since dissolved (the version is frozen until the first release, per the cross-cutting checklist), and the settlements stand on the remaining reason: they are strictly less work for identical behaviour, which R0 cannot veto, only prioritise.
 
 - **Bulk frame layout: split the header from the body.** A bulk frame becomes the tag, a short encoded header, then the compressed payload appended untouched. This resolves a drift rather than changing direction: `02-protocol.md` already gives the bulk plane's encoding as "Zstd-precompressed opaque bytes" whose payloads "arrive already compressed", and `crates/connetto-core/src/messages/bulk.rs` says the same, while the code MessagePack-encodes a struct that embeds them. Buys copy elimination, not frame sharing, because `sub_id` is client-chosen.
 - **Payload by shared reference, `Arc<[u8]>`, no new dependency.** `tokio-tungstenite` is pinned at 0.24 where `Message::Binary` takes an owned `Vec<u8>`, so `bytes::Bytes` buys nothing at the send boundary. Together with the frame split this takes payload copies per subscriber per event from three to one, and one is the floor until that dependency is upgraded.
@@ -698,7 +705,7 @@ Today the per-subscriber authorization check dominates them by orders of magnitu
 1. Take the materializer lock **out of the per-subscriber loop.** The loop needs what the lock guards, not the lock, so hoist the read or take a snapshot of what the fan-out consumes before entering the loop.
 2. Stop cloning a `Route` per subscriber. A `Principal` behind a shared reference or a cheap handle is enough for a fan-out that only reads it.
 3. **Stop copying the compressed payload per subscriber.** `Materializer::dispatch` compresses once and then hands every consumer its own `Vec<u8>` through `MatchedPatch::payload_zstd`. A shared immutable handle carries the same bytes to every consumer. **Corrected by R16 part A: this needs no upstream change.** The step previously speculated it "may need the same upstream treatment as the visibility trait". `subql`'s `pgoutput_patchset` already returns an owned `Vec<u8>`, so wrapping it in an `Arc<[u8]>` costs nothing and changes no subql signature. It is a connetto-local API change on the materializer.
-4. **Also corrected by R16 part A: the payload is copied three times per subscriber, not once.** A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload in the encoded frame, and a second copy into the tagged frame. This step removes the first. The other two are removed by the bulk frame layout change, which is R16 part B's and is coupled to R3's `PROTOCOL_VERSION` bump rather than to R0. If the two phases land apart, note that this step alone takes three copies to two.
+4. **Also corrected by R16 part A: the payload is copied three times per subscriber, not once.** A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload in the encoded frame, and a second copy into the tagged frame. This step removes the first. The other two are removed by the bulk frame layout change, which is R16 part B's. If the two phases land apart, note that this step alone takes three copies to two.
 5. Do nothing else. **Scope is exactly what R0 measured**, and any further optimization needs its own measurement rather than this phase's momentum. In particular, reconnect catchup rebuilds patches per client and is *not* in this scope: R16 part A found it and R16 part B covers it.
 
 ### Proof
@@ -766,13 +773,13 @@ A revoked session keeps its replica and its rows on the device. Revocation has t
 1. Watch the Postgres change log for rows in the tables rls2fga names as carrying authorization meaning. **Nothing polls the authorization service and it is never a notice source**, because every permission is backed by a Postgres row. Watching the service would mean polling anyway: its changelog call is unary and paged with no streaming variant.
 2. Map the changed row to its grantee, which the row names, and send `FullResyncRequired` to that grantee's affected subscriptions.
 3. **Never synthesize a row deletion.** Finding the affected rows is the capped enumeration direction, and a truncated withdrawal would look complete. Resync avoids the question because a replacement is complete by construction where a diff is not.
-4. Add a `FullResyncReason` variant for an authorization change. **This is a wire change and needs a version bump**, because that enum has no fallback for an unknown value.
+4. Add a `FullResyncReason` variant for an authorization change. A wire change, free pre-release per the cross-cutting checklist. Post-release the same change would force a version bump, because that enum has no fallback for an unknown value.
 5. Follow the join for the nested-group case, where the changed row names a group rather than a person.
 6. State the promise in the deployment documentation: immediate for writes, within the read cache TTL for reads, immediate for both on teardown.
 
 ### Wire and schema impact
 
-New `FullResyncReason` variant. Bump `PROTOCOL_VERSION`.
+New `FullResyncReason` variant. No version bump pre-release.
 
 ### Proof
 
@@ -799,15 +806,15 @@ Tests install a policy that authorizes unconditionally, so the suite cannot catc
 
 ### Steps
 
-Replace `PermissiveAuth` in these files. Seventeen test files plus the harness and three source files:
+Replace `PermissiveAuth` across the suite: fifteen test files construct it, `e2e.rs` names it in a comment only, plus the harness and the definition and re-exports:
 
-Tests: `connetto-client/tests/{local_tier,loop_emu,mutation_replay,reconnect_live}.rs`, `connetto-dioxus/tests/hook.rs`, `connetto-server/tests/{anonymous,authentication,authn_flow,cdc_reconnect,e2e,pg_async,reconnect,reexec,rls_write_filter,session_loop,snapshot_nonfatal,write_path}.rs`. Plus `connetto-test-harness/src/lib.rs`, and the definition and re-exports in `connetto-server/src/{auth.rs,lib.rs,bin/connetto-server.rs}`.
+Tests: `connetto-client/tests/{local_tier,loop_emu,mutation_replay,reconnect_live}.rs`, `connetto-dioxus/tests/hook.rs`, `connetto-server/tests/{authentication,authn_flow,cdc_reconnect,pg_async,reconnect,reexec,rls_write_filter,session_loop,snapshot_nonfatal,write_path}.rs`. Plus `connetto-test-harness/src/lib.rs` (its `HarnessAuth::Permissive` variant), and the definition and re-exports in `connetto-server/src/{auth.rs,lib.rs}`. The server binary's own construction is already gone by this phase's turn, deleted when R1 step 3 dissolves `ServerAuth`.
 
-All seventeen already require Postgres through the shared fixture and are Docker-gated. Only three enable row-level security on their fixtures (`e2e.rs`, `rls_write_filter.rs`, `loop_emu.rs`), so pointing the other fourteen at a real policy changes no behaviour: **verified by probe that a non-owner role reading a table with no policy sees every row.**
+All fifteen already require Postgres through the shared fixture and are Docker-gated. Only three exercise row-level security on their fixtures (`e2e.rs` through the spawned binary, `rls_write_filter.rs`, `loop_emu.rs`), so pointing the rest at a real policy changes no behaviour: **verified by probe that a non-owner role reading a table with no policy sees every row.**
 
 ### Proof
 
-**Run the seventeen before and after and compare, rather than trusting the probe.** The probe established that a non-owner role reading a policy-free table sees every row, which is why fourteen of them should be unaffected, but "should be" is the claim under test. Any test whose result changes is either a test that was silently relying on the permissive policy, which is a finding worth having, or a mistake in the swap.
+**Run the full set before and after and compare, rather than trusting the probe.** The probe established that a non-owner role reading a policy-free table sees every row, which is why the files without row-level security should be unaffected, but "should be" is the claim under test. Any test whose result changes is either a test that was silently relying on the permissive policy, which is a finding worth having, or a mistake in the swap.
 
 The three that enable row-level security are the ones to watch: `e2e.rs`, `rls_write_filter.rs` and `loop_emu.rs` each assert a real policy decision, so they must still fail for the same reason when given a caller who should be denied. Confirm that by making one of them deny and checking the failure mode, not just by seeing green.
 
@@ -922,7 +929,7 @@ No query outside the compiled set is served, no rejection reveals why, and a dow
 
 **Status.** NOT STARTED
 
-**Blocked on R2 and R3.** R2 because it mints the durable session handle this phase counts against, and it mints one for an unidentified caller too. R3 because the tiering has two tiers only once an anonymous caller is representable.
+**Blocked on R2 and R3.** R2 because it makes the durable session handle the operational key this phase counts against. R3 because it mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable.
 
 ### Purpose
 
@@ -1421,9 +1428,7 @@ Grouped aggregates are either phased as committed work or reaffirmed as parked, 
 
 Tick these off across the whole programme, because each is easy to lose inside a phase.
 
-**Wire changes, and why they need no version coordination.** R2 makes `session_token` real. R3 replaces the credential with a grant list. R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 2) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
-
-**Migrations, deployment-facing**: R2 re-keys `_connetto_mutations`. R8 removes fields from the session row's `attrs` blob. Both need a written migration, not just a note.
+**Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
 
 **Startup checks, all five refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it.
 

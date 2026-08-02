@@ -159,11 +159,11 @@ At sign-in the server re-keys that row from the session to the user. **connetto 
 
 **Decided (R2).** The exactly-once mutation watermark keys on the session and not on the identity. `_connetto_mutations` is `PRIMARY KEY (user_id, session_id)` today (`11-authentication.md:114-122`) and becomes keyed on the session handle alone. The watermark needs a stable per-client handle, which is what a session is. It does not need to know who the client is.
 
-That is a deployment-facing schema change and needs a migration note, which `11-authentication.md` carries.
-
 Routing, flow-control credits, and subscription bookkeeping key on `connection_num` and need neither an identity nor a session. They are per-connection by nature and stay that way.
 
-**There is exactly one durable handle per run, and it is a `SessionId`. Decided (R2).** For an authenticated run the auth store's `SessionId` is the handle. For an unidentified run connetto mints one itself. A visit therefore never carries two names, and `Principal::session_id` stops returning an `Option`, which is what made an unidentified caller appear to have no session at all.
+**There is exactly one durable handle per run, and it is a `SessionId`. Decided (R2, R3).** For an authenticated run the auth store's `SessionId` is the handle (R2). For an unidentified run connetto mints one itself at handshake (R3, the phase that first makes an unidentified caller representable). A visit therefore never carries two names, and `Principal::session_id` is non-optional from its introduction, which closes what would otherwise make an unidentified caller appear to have no session at all.
+
+**Decided (R2).** One live connection per handle, and the newer connection wins. A handshake presenting a handle that is already live replaces the registry entry, and the old socket is closed with `FatalErrorReason::ConnectionSuperseded`. Two connections must not share a handle, because the handle keys the per-subscription cursor and the pending buffer, and two readers would each consume the other's changes. Last-wins makes a reconnect racing its own half-dead socket self-heal, at the cost that two deliberately concurrent processes on one stored token evict each other.
 
 **Three things exist and each has one job**, which is worth stating because two of them are currently misnamed in the code. `connection_num` is one socket, used for routing and credits, and it dies with the socket. The `SessionId` handle is one unbroken run of one caller, used for resume, the per-subscription cursor, the exactly-once watermark and the revocation registry, and it survives a reconnect. The auth store's session record is the authenticated run's own state, holding whether it is live and its retained provider token.
 
