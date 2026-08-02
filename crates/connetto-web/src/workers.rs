@@ -266,11 +266,10 @@ async fn acquire_session<Id: serde::de::DeserializeOwned>(
     let store = match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
         Ok(store) => store,
         Err(crate::auth::AuthError::Undecryptable(detail)) => {
-            web_sys::console::warn_1(
-                &format!(
-                    "db worker: the refresh store does not decrypt ({detail}), discarding it and requiring a fresh login"
-                )
-                .into(),
+            tracing::warn!(
+                detail = %detail,
+                "db worker: the refresh store does not decrypt, discarding it and requiring a \
+                 fresh login"
             );
             storage.delete_db(auth_db_name).map_err(to_js)?;
             crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)?
@@ -361,9 +360,7 @@ where
         crate::storage::wipe_replica(&storage, &key_store, &name, &[], true)
             .await
             .map_err(to_js)?;
-        web_sys::console::log_1(
-            &format!("db worker: carried out the pending data wipe of {name}").into(),
-        );
+        tracing::info!(replica = %name, "db worker: carried out a pending data wipe");
     }
 
     let session = match &config.auth {
@@ -440,16 +437,10 @@ where
         .await
         .map_err(to_js)?
     };
-    web_sys::console::log_1(
-        &format!(
-            "db worker: {} replica",
-            if existing {
-                "resuming the existing"
-            } else {
-                "creating a fresh"
-            }
-        )
-        .into(),
+    tracing::info!(
+        replica = %replica_db_name,
+        resumed = existing,
+        "db worker: replica open"
     );
     // The local tier is a second connection whose main schema IS the tier file,
     // because a changeset apply always targets main. The worker replica never
@@ -521,7 +512,7 @@ where
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
     spawn_local(async move {
         if let Err(err) = pump.await {
-            web_sys::console::error_1(&format!("relay hub ended: {err}").into());
+            tracing::error!(error = %err, "relay hub ended");
         }
     });
 
@@ -577,9 +568,7 @@ where
                         let _ = hello.post_message(&JsValue::from_str(&format!("attached:{wire}")));
                     }
                     Err(err) => {
-                        web_sys::console::error_1(
-                            &format!("tab wire channel {wire} failed: {err}").into(),
-                        );
+                        tracing::error!(wire = %wire, error = %err, "tab wire channel failed");
                     }
                 }
             }
@@ -640,9 +629,9 @@ pub fn serve_logout_requests(
                         Ok(encoded) => {
                             let _ = channel.post_message(&JsValue::from_str(&encoded));
                         }
-                        Err(err) => web_sys::console::error_1(
-                            &format!("db worker: encode a logout reply: {err}").into(),
-                        ),
+                        Err(err) => {
+                            tracing::error!(error = %err, "db worker: encoding a logout reply failed");
+                        }
                     }
                 }
             });
@@ -665,9 +654,7 @@ async fn ask_unsynced(hub: &crate::relay::RelayHub) -> Option<Vec<u64>> {
     match hub.unsynced().await {
         Ok(seqs) => Some(seqs),
         Err(err) => {
-            web_sys::console::error_1(
-                &format!("db worker: the hub cannot report unsynced work: {err}").into(),
-            );
+            tracing::error!(error = %err, "db worker: the hub cannot report unsynced work");
             None
         }
     }
@@ -712,9 +699,7 @@ async fn serve_logout(
             return match err {
                 crate::storage::WipeError::Unsynced(seqs) => Some(LogoutMessage::Refused { seqs }),
                 other => {
-                    web_sys::console::error_1(
-                        &format!("db worker: mark the replica for deletion: {other}").into(),
-                    );
+                    tracing::error!(error = %other, "db worker: marking the replica for deletion failed");
                     None
                 }
             };
@@ -726,9 +711,9 @@ async fn serve_logout(
     // does not make this tab any less logged out.
     match logout_locally(auth, auth_db_name).await {
         Ok(()) => {}
-        Err(err) => web_sys::console::warn_1(
-            &format!("db worker: the session revoke failed, local state cleared anyway: {err}")
-                .into(),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "db worker: the session revoke failed, local state cleared anyway"
         ),
     }
     Some(LogoutMessage::Done { deleted: delete })

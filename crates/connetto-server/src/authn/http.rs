@@ -217,8 +217,25 @@ enum AuthApiError {
     InvalidRedirect,
 }
 
+impl AuthApiError {
+    /// Why the request failed. This never reaches the caller: the wire answer
+    /// is the same on every path, so the log line is the only place a refusal
+    /// says what it was.
+    fn detail(&self) -> String {
+        match self {
+            Self::Service(err) => format!("service: {err}"),
+            Self::Provider(err) => format!("provider: {err}"),
+            Self::UnknownProvider => "no provider matched the requested name".to_owned(),
+            Self::UnknownState => "no in-flight authorization matched the callback".to_owned(),
+            Self::InvalidGrant => "unknown, expired, or PKCE-mismatched grant".to_owned(),
+            Self::InvalidRedirect => "the client redirect uri was refused".to_owned(),
+        }
+    }
+}
+
 impl IntoResponse for AuthApiError {
     fn into_response(self) -> Response {
+        let detail = self.detail();
         let status = match self {
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
@@ -238,6 +255,7 @@ impl IntoResponse for AuthApiError {
                 StatusCode::BAD_REQUEST
             }
         };
+        tracing::warn!(status = status.as_u16(), detail = %detail, "authentication failed");
         (status, "authentication failed").into_response()
     }
 }

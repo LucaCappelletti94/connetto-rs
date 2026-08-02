@@ -28,6 +28,9 @@ wasm-bindgen-futures = "0.4"
 # browser CSPRNG through getrandom's wasm_js backend.
 rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = ["BroadcastChannel", "MessageEvent", "Window", "console"] }
+# Structured logging (R12): this demo emits through `tracing` and installs the
+# developer-console destination in `main`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # The build script translates schema.sql and frontend.sql through pg2sqlite and
 # bakes a template per tier, so the app ships every tier's schema pre-applied

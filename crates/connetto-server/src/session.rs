@@ -36,6 +36,7 @@ use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
+use tracing::Instrument;
 
 use crate::counters;
 use crate::materializer::{
@@ -551,6 +552,7 @@ where
         let live = { self.sessions.lock().await.remove(&session_id) };
         match live {
             Some(live) => {
+                tracing::info!(session = %session_id, reason = ?reason, "closing a live connection");
                 let _ = live.tx.send(Outbound::Fatal(FatalError::new(reason)));
                 true
             }
@@ -602,6 +604,11 @@ where
             )
         };
         if let Some(old) = superseded {
+            tracing::warn!(
+                session = %session_id,
+                superseded = old.connection_num,
+                "a newer connection claimed this session handle"
+            );
             let _ = old.tx.send(Outbound::Fatal(FatalError::new(
                 FatalErrorReason::ConnectionSuperseded,
             )));
@@ -890,6 +897,14 @@ where
             None => return Ok(None),
         };
         if handshake.protocol_version != PROTOCOL_VERSION {
+            // Outside any connection context on purpose: no session exists yet,
+            // so the handle is absent rather than a stand-in.
+            tracing::warn!(
+                client_id = %handshake.client_id,
+                expected = PROTOCOL_VERSION,
+                got = handshake.protocol_version,
+                "handshake refused, protocol version mismatch"
+            );
             let _ = transport
                 .send_control(ControlMessage::FatalError(FatalError::new(
                     FatalErrorReason::ProtocolVersionMismatch {
@@ -913,6 +928,11 @@ where
             match self.verifier.verify_session(&handshake.auth_token).await {
                 Ok(verified) => (verified.context, verified.session_id),
                 Err(err) => {
+                    tracing::warn!(
+                        client_id = %handshake.client_id,
+                        error = %err,
+                        "handshake refused, the credential did not verify"
+                    );
                     let _ = transport
                         .send_control(ControlMessage::FatalError(FatalError::new(
                             FatalErrorReason::AuthenticationFailed,
@@ -970,16 +990,36 @@ where
         self: Arc<Self>,
         mut transport: T,
     ) -> Result<(), SessionError> {
-        let Some(HandshakeOutcome {
+        let Some(outcome) = self.run_handshake(&mut transport).await? else {
+            return Ok(());
+        };
+        // Every event emitted while serving this caller picks the handle and the
+        // identity up from here, so no writing site carries them by hand. The
+        // handshake's own refusals stay outside it: no session exists yet, and a
+        // stand-in handle on them would be a fiction.
+        let span = tracing::info_span!(
+            "connection",
+            session = %outcome.session_id,
+            user = %outcome.auth_ctx.user_id,
+            connection = outcome.connection_num,
+        );
+        self.run_session(transport, outcome).instrument(span).await
+    }
+
+    /// The run loop and its teardown, inside the connection's logging context.
+    async fn run_session<T: Transport>(
+        self: Arc<Self>,
+        mut transport: T,
+        outcome: HandshakeOutcome<Id>,
+    ) -> Result<(), SessionError> {
+        let HandshakeOutcome {
             connection_num,
             auth_ctx,
             resume_lsn,
             session_id,
             applied_watermark,
-        }) = self.run_handshake(&mut transport).await?
-        else {
-            return Ok(());
-        };
+        } = outcome;
+        tracing::info!(resume_lsn, "connection established");
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
         self.register_connection(session_id, connection_num, &outbound_tx)
@@ -1066,6 +1106,7 @@ where
                 .await
                 .unregister_delta_aggregate(consumer_id, sub_id);
         }
+        tracing::info!("connection closed");
         Ok(())
     }
 

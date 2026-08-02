@@ -58,11 +58,10 @@ impl ReplicaStorage {
         {
             Ok(util) => Self::Opfs(util),
             Err(err) => {
-                web_sys::console::warn_1(
-                    &format!(
-                        "db worker: OPFS unavailable ({err:?}), using an in-memory replica: no persistence and no cross-window OPFS sharing this session"
-                    )
-                    .into(),
+                tracing::warn!(
+                    error = ?err,
+                    "db worker: OPFS unavailable, using an in-memory replica with no persistence \
+                     and no cross-window OPFS sharing this session"
                 );
                 Self::Memory(sqlite_wasm_rs::MemVfsUtil::new())
             }

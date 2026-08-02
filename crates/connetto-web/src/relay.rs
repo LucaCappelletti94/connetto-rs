@@ -715,7 +715,7 @@ where
         if driver.policy.max_attempts.is_some_and(|max| attempt > max) {
             return false;
         }
-        web_sys::console::warn_1(&format!("relay hub upstream reconnect attempt {attempt}").into());
+        tracing::warn!(attempt, "relay hub upstream reconnecting");
         driver.sleeper.sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff);
 
@@ -775,7 +775,7 @@ where
     match outcome {
         Ok(()) => Ok(()),
         Err(TabFault::Close(reason)) => {
-            web_sys::console::warn_1(&format!("relay hub closed tab {id}: {reason}").into());
+            tracing::warn!(tab = %id, reason = %reason, "relay hub closed a tab");
             state.tabs.remove(&id);
             Ok(())
         }

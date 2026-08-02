@@ -43,10 +43,10 @@ use connetto_server::watermark_schema::check_watermark_shape;
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
     GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
-    PgSnapshotSource, ProviderRegistry, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
-    ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, TokenAuthority, WebSocketTransport, auth_router, connetto_auth_tables,
-    connetto_watermark_table, pg_write_target,
+    PgSnapshotSource, ProviderRegistry, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
+    RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, TokenAuthority, WebSocketTransport, auth_router,
+    connetto_auth_tables, connetto_watermark_table, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -293,9 +293,9 @@ fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
         TokenAuthority::from_ed_pem(&private, &public, config)
             .map_err(|err| anyhow!("loading JWT keypair: {err}"))
     } else {
-        eprintln!(
-            "connetto-server: no CONNETTO_JWT_*_KEY_FILE set, generating an ephemeral \
-             Ed25519 keypair (tokens do not survive a restart)"
+        tracing::warn!(
+            "no CONNETTO_JWT_*_KEY_FILE set, generating an ephemeral Ed25519 keypair, so \
+             tokens do not survive a restart"
         );
         TokenAuthority::generate(config).map_err(|err| anyhow!("generating JWT keypair: {err}"))
     }
@@ -341,6 +341,10 @@ async fn build_pool(url: &str) -> Result<Pool<AsyncPgConnection>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `pg_walstream` reports every standby status update at `info`, which is one
+    // line per ten seconds per server whether or not anything happened, and it
+    // buries this server's own events. `RUST_LOG` brings it back.
+    connetto_core::logging::init_stdout_with_default("info,pg_walstream=warn");
     let bind = env_or("CONNETTO_BIND", "127.0.0.1:8080");
     let database_url = std::env::var("DATABASE_URL").context("set DATABASE_URL")?;
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
@@ -469,12 +473,14 @@ fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<P
     tokio::spawn(async move {
         match TcpListener::bind(&auth_bind).await {
             Ok(listener) => {
-                eprintln!("connetto-server auth endpoints on {auth_bind}");
+                tracing::info!(bind = %auth_bind, "auth endpoints listening");
                 if let Err(err) = axum::serve(listener, router).await {
-                    eprintln!("auth server stopped: {err}");
+                    tracing::error!(error = %err, "auth endpoint server stopped");
                 }
             }
-            Err(err) => eprintln!("binding auth endpoints {auth_bind}: {err}"),
+            Err(err) => {
+                tracing::error!(bind = %auth_bind, error = %err, "binding the auth endpoints failed");
+            }
         }
     });
 }
@@ -496,7 +502,7 @@ async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(err) => {
-                eprintln!("no SIGTERM handler, interrupt only: {err}");
+                tracing::warn!(error = %err, "no SIGTERM handler, interrupt only");
                 std::future::pending::<()>().await;
             }
         }
@@ -547,19 +553,33 @@ async fn run(
             }
         };
         if let Err(err) = ingest_manager
-            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
-                eprintln!("cdc reconnect: {event:?}");
+            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| match event {
+                ReconnectEvent::Retrying {
+                    attempt,
+                    backoff,
+                    error,
+                } => tracing::warn!(
+                    attempt,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    error,
+                    "change stream lost, retrying"
+                ),
+                ReconnectEvent::GaveUp { attempts, error } => tracing::error!(
+                    attempts,
+                    error,
+                    "change stream gave up reconnecting, live delivery has stopped"
+                ),
             })
             .await
         {
-            eprintln!("cdc ingest stopped: {err}");
+            tracing::error!(error = %err, "change stream ingest stopped");
         }
     });
 
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
-    eprintln!("connetto-server listening on {bind}");
+    tracing::info!(bind = %bind, "sync listener started");
     let mut sessions = JoinSet::new();
     loop {
         let accepted = tokio::select! {
@@ -574,18 +594,18 @@ async fn run(
             let transport = match WebSocketTransport::accept(tcp).await {
                 Ok(transport) => transport,
                 Err(err) => {
-                    eprintln!("websocket handshake failed: {err}");
+                    tracing::warn!(error = %err, "websocket handshake failed");
                     return;
                 }
             };
             if let Err(err) = session.serve(transport).await {
-                eprintln!("session ended: {err}");
+                tracing::warn!(error = %err, "session ended with an error");
             }
         });
     }
 
     let told = manager.shutdown().await;
-    eprintln!("connetto-server shutting down, closed {told} session(s)");
+    tracing::info!(closed = told, "shutting down");
     // The close frame is queued, not sent: each session's own loop delivers it
     // and then tears down, so the exit waits on those rather than racing them.
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -594,7 +614,7 @@ async fn run(
     .await
     .is_err()
     {
-        eprintln!("shutdown grace elapsed with sessions still open");
+        tracing::warn!("shutdown grace elapsed with sessions still open");
     }
     Ok(())
 }

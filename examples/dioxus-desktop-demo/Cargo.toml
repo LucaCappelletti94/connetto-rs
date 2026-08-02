@@ -12,13 +12,16 @@ publish = false
 # the whole setup path is fallible.
 anyhow = "1"
 connetto-client = { path = "../../crates/connetto-client", features = ["native-auth"] }
-connetto-core = { path = "../../crates/connetto-core" }
+connetto-core = { path = "../../crates/connetto-core", features = ["logging"] }
 connetto-dioxus = { path = "../../crates/connetto-dioxus" }
 diesel = { version = "2", features = ["sqlite"] }
 # Backend writer buttons: direct Postgres DML over tokio-postgres, no libpq.
 diesel-async = { version = "0.7", default-features = false, features = ["postgres"] }
 dioxus = { version = "0.7.9", features = ["desktop"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+# Structured logging (R12): this demo emits through `tracing` and installs the
+# stdout destination in `main`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Client-authored uuid v7 keys: one strongly typed `rosetta_uuid::Uuid` that
 # maps to SQLite BLOB (frontend replica) and Postgres uuid (backend writer)
 # from a single `orders` schema. postgres feature for the typed backend writes.

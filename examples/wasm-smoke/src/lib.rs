@@ -127,6 +127,7 @@ pub mod workers {
     /// A string describing the VFS, upstream connect, or subscribe failure.
     #[wasm_bindgen]
     pub async fn db_worker_boot() -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
         // `Id` names the user id the server mints. The server requires a session
         // from the dev identity provider, so the worker authenticates before
         // connecting and names the replica after the acquired identity.

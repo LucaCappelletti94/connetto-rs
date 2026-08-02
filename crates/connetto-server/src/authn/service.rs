@@ -128,6 +128,11 @@ impl<S: AuthStore> AuthService<S> {
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
+        tracing::info!(
+            session = %issued.session_id,
+            user = %issued.context.user_id,
+            "login succeeded, session created"
+        );
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -157,6 +162,12 @@ impl<S: AuthStore> AuthService<S> {
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
+        tracing::info!(
+            session = %issued.session_id,
+            user = %issued.context.user_id,
+            issuer = %login.retained.issuer,
+            "login succeeded, session created with retained provider tokens"
+        );
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -237,6 +248,11 @@ impl<S: AuthStore> AuthService<S> {
         let access_token = self
             .authority
             .mint_access(&outcome.context, outcome.session_id, now)?;
+        tracing::info!(
+            session = %outcome.session_id,
+            user = %outcome.context.user_id,
+            "refresh token rotated, access token reissued"
+        );
         Ok(TokenPair {
             access_token,
             refresh_token: outcome.refresh_token,
@@ -253,6 +269,7 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the store fails.
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
         self.store.revoke_session(session_id).await?;
+        tracing::info!(session = %session_id, "session revoked");
         if let Some(hook) = self.revocation_hook.get() {
             hook(session_id);
         }

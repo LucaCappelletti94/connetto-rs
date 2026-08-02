@@ -165,7 +165,7 @@ fn load_authority(config: &AuthConfig) -> Result<TokenAuthority> {
         std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
         std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE"),
     ) else {
-        println!("  key          ephemeral (set CONNETTO_JWT_*_KEY_FILE to share one)");
+        tracing::warn!("no CONNETTO_JWT_*_KEY_FILE set, signing with an ephemeral key");
         return TokenAuthority::generate(config).map_err(|err| anyhow::anyhow!("keypair: {err}"));
     };
     let private_pem =
@@ -184,7 +184,7 @@ async fn build_service(
 ) -> Result<Arc<AuthService<ServerStore>>> {
     let authority = Arc::new(authority);
     let Ok(url) = std::env::var("DATABASE_URL") else {
-        println!("  store        in-memory (set DATABASE_URL to share one)");
+        tracing::warn!("no DATABASE_URL set, keeping sessions in memory");
         return Ok(Arc::new(AuthService::new(
             authority,
             Arc::new(ServerStore::InMemory(InMemoryAuthStore::new(
@@ -209,6 +209,7 @@ async fn build_service(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    connetto_core::logging::init_stdout();
     let bind =
         std::env::var("CONNETTO_AUTH_STACK_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -292,10 +293,13 @@ async fn main() -> Result<()> {
 
     let app = oauth2_test_server::router::build_router(idp).merge(connetto);
 
-    println!("connetto auth stack on {base}");
-    println!("  provider     {PROVIDER}");
-    println!("  redirect_uri {base}{LANDING_PATH}");
-    println!("  issuer       {base}");
+    tracing::info!(
+        base = %base,
+        provider = PROVIDER,
+        redirect_uri = %format!("{base}{LANDING_PATH}"),
+        issuer = %base,
+        "auth stack listening"
+    );
     axum::serve(listener, app).await.context("serving")?;
     Ok(())
 }

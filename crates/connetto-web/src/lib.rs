@@ -24,6 +24,7 @@ pub mod auth;
 pub mod broadcast;
 pub mod leader;
 pub mod locks;
+pub mod logging;
 pub mod port;
 pub mod relay;
 pub mod storage;

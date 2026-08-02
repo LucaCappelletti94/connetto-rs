@@ -35,6 +35,10 @@ diesel-pg = ["dep:diesel"]
 # Fakes the client and browser test suites share, chiefly a transport that answers
 # a handshake and nothing else. Test-only: no production build enables it.
 test-support = ["dep:thiserror"]
+# The stdout destination a native program installs (R12). Off by default: a
+# library emits through `tracing` and installs nothing, so only a program pays
+# for a subscriber. Browser programs install `connetto_web::logging` instead.
+logging = ["dep:tracing-subscriber"]
 
 [dependencies]
 serde.workspace = true
@@ -57,6 +61,11 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 tokio-tungstenite = { version = "0.24", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"], optional = true }
 diesel = { version = "2", default-features = false, features = ["postgres_backend"], optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+# The logging test reads the exact bytes the stdout destination writes, so it
+# emits through the facade and supplies its own `MakeWriter`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

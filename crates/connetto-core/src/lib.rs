@@ -31,6 +31,8 @@ pub mod auth;
 pub mod codec;
 pub mod cursor;
 pub mod error;
+#[cfg(feature = "logging")]
+pub mod logging;
 pub mod messages;
 pub mod replica_key;
 pub mod schema;

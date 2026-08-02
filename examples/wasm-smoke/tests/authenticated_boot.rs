@@ -20,29 +20,41 @@
 //! **Needs the stack up.** Database, single-origin auth stack, and sync server:
 //!
 //! ```text
-//! docker run -d --rm --name connetto-e42-pg -e POSTGRES_PASSWORD=postgres \
-//!   -p 55470:5432 postgres:16 -c wal_level=logical
-//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//! docker run -d --rm --name connetto-smoke-pg -e POSTGRES_PASSWORD=postgres \
+//!   -p 55471:5432 postgres:16 -c wal_level=logical
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "$(cat examples/wasm-smoke/schema.sql)"
-//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "CREATE PUBLICATION connetto_pub FOR TABLE orders"
-//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')"
-//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
-//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)"
-//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "CREATE TABLE connetto_sessions (session_id UUID PRIMARY KEY, \
+//!       user_id TEXT NOT NULL, current_refresh_hash BYTEA NOT NULL, \
+//!       idle_deadline_ms BIGINT NOT NULL, absolute_deadline_ms BIGINT NOT NULL, \
+//!       revoked BOOLEAN NOT NULL DEFAULT FALSE)"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "CREATE TABLE connetto_provider_tokens (session_id UUID PRIMARY KEY \
+//!       REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
+//!       issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
+//!       expires_at_ms BIGINT)"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY \
+//!       REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
+//!       last_seq BIGINT NOT NULL)"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "$(cat examples/wasm-smoke/roles.sql)"
 //! mkdir -p target/devkeys
 //! openssl genpkey -algorithm ed25519 -out target/devkeys/priv.pem
 //! openssl pkey -in target/devkeys/priv.pem -pubout -out target/devkeys/pub.pem
-//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
 //!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
 //!   cargo run --release --all-features -p connetto-server --example auth_stack
 //! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
-//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
+//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55471/postgres \
 //!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
 //!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
 //!   CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \
@@ -52,6 +64,14 @@
 //!   cargo run --release --all-features -p connetto-server --bin connetto-server
 //! wasm-pack test --headless --chrome examples/wasm-smoke --test authenticated_boot
 //! ```
+//!
+//! Both processes select `DbAuthStore` because `DATABASE_URL` is set, so the two
+//! session tables have to exist before either starts, and `connetto_sessions` is
+//! first because the other two reference it. They belong to the deployment, not
+//! to connetto, which emits no server DDL: the shape is the reference SQL under
+//! "Migrations" in `docs/architecture/11-authentication.md`, over the `TEXT`
+//! `user_id` the reference binary's `String` id maps to. The reader role needs no
+//! grant on them, since both processes reach the store through the owner pool.
 //!
 //! The login server has to be `auth_stack` rather than `dev_idp` behind the sync
 //! server's own auth router: a worker walks the login with `fetch`, and a chain

@@ -53,6 +53,7 @@ fn read_ddl(key: &str) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    connetto_core::logging::init_stdout();
     let server = env_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
     let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
     let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
@@ -108,7 +109,7 @@ async fn main() -> Result<()> {
     let mut client = ConnettoConnection::connect(transport, &replica, &sqlite_ddl, &config, None)
         .await
         .map_err(|err| anyhow!("connecting sync client: {err}"))?;
-    eprintln!("connected, connection {}", client.connection_id());
+    tracing::info!(connection = %client.connection_id(), "connected");
     client
         .subscribe(&sub_id, &query)
         .await
@@ -128,7 +129,7 @@ async fn main() -> Result<()> {
                 .push()
                 .await
                 .map_err(|err| anyhow!("pushing local write: {err}"))?;
-            eprintln!("pushed local write as client_seq {seq:?}");
+            tracing::info!(client_seq = ?seq, "pushed a local write");
         }
     }
 
@@ -139,14 +140,14 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow!("pumping frames: {err}"))?
         {
             ClientEvent::ServerClosed { reason } => {
-                eprintln!("server closed the session: {reason:?}");
+                tracing::info!(reason = ?reason, "the server closed the session");
                 return Ok(());
             }
             ClientEvent::Closed => {
-                eprintln!("server closed the connection");
+                tracing::info!("the server closed the connection");
                 return Ok(());
             }
-            event => println!("{event:?}"),
+            event => tracing::info!(event = ?event, "client event"),
         }
     }
 }

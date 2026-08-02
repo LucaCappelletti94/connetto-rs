@@ -20,6 +20,7 @@ default = ["native-transport"]
 # ConnettoClient::start and the client binary. Wasm builds leave this off,
 # inject their own transport, and drive the pump with spawn_local.
 native-transport = [
+    "connetto-core/logging",
     "connetto-core/native-transport",
     "tokio/rt",
     "tokio/rt-multi-thread",
@@ -86,6 +87,9 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros"]
 thiserror.workspace = true
 # Binary error handling (connetto-client bin).
 anyhow.workspace = true
+# Structured logging (R12). The facade only: a library emits and installs no
+# destination, and the binary installs `connetto_core::logging`.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 # Native OAuth acquisition (feature native-auth), all native-only and optional.
 # reqwest posts to connetto-server's token and refresh endpoints (rustls, no
 # blocking client). keyring stores the refresh token in OS secure storage

@@ -19,7 +19,7 @@ name = "connetto-server"
 path = "src/bin/connetto-server.rs"
 
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport", "diesel-pg"] }
+connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging"] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming"] }
 # Reverse translation of the client's SQLite-dialect subscription query into the
 # Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).
@@ -55,6 +55,9 @@ diesel-async = { version = "0.7", default-features = false, features = ["postgre
 rmp-serde.workspace = true
 # Binary error handling (connetto-server bin).
 anyhow.workspace = true
+# Structured logging (R12). The facade only: the library emits, and each
+# program installs `connetto_core::logging`.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 # Authentication (docs/architecture/11-authentication.md). connetto mints and
 # verifies its own asymmetrically signed session access token with jsonwebtoken
 # (EdDSA/Ed25519, ring-backed, native backend only, no wasm), generates the

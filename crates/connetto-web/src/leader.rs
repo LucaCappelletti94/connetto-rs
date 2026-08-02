@@ -124,23 +124,21 @@ async fn run_election(
             leadership.borrow_mut().replace(Leadership { held, worker });
         }
         Err(err) => {
-            web_sys::console::error_1(
-                &format!("leader election: spawning the db worker failed: {err:?}").into(),
-            );
+            tracing::error!(error = ?err, "leader election: spawning the db worker failed");
             // Releasing leadership lets another candidate try.
             held.release();
         }
     }
 }
 
-/// Surface a DB worker's load or runtime errors to the console: a worker's
-/// own console is not always visible to the page that spawned it.
+/// Surface a DB worker's load or runtime errors: a worker's own console is not
+/// always visible to the page that spawned it.
 fn log_worker_errors(worker: &Worker) {
     let on_error = Closure::<dyn FnMut(Event)>::new(|event: Event| {
         let detail = event
             .dyn_ref::<ErrorEvent>()
             .map_or_else(|| "no error detail".to_owned(), ErrorEvent::message);
-        web_sys::console::error_1(&format!("db worker error: {detail}").into());
+        tracing::error!(detail = %detail, "db worker error");
     });
     worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     // The handler lives for the worker's whole life.

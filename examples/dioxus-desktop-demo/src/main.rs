@@ -169,6 +169,7 @@ fn restart() {
 /// `block_on` is correct here because `main` is a sync function that owns the
 /// runtime, not a worker task running inside it.
 fn main() {
+    connetto_core::logging::init_stdout();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -310,7 +311,7 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
                 }
             };
             if let Err(err) = run {
-                eprintln!("backend write failed: {err}");
+                tracing::error!(error = %err, "backend write failed");
             }
         }
     });
@@ -568,7 +569,7 @@ fn app() -> Element {
                                 })
                                 .await;
                             if let Err(err) = result {
-                                eprintln!("local insert failed: {err}");
+                                tracing::error!(error = %err, "local insert failed");
                             }
                         });
                     },

@@ -985,3 +985,112 @@ async fn e2e_startup_refuses_without_an_auth_store() {
         "expected CONNETTO_AUTH in stderr, got: {stderr}"
     );
 }
+
+/// The structured log, read back off the real server's stdout.
+///
+/// R12 part A. Three properties: the destination is stdout and every line is
+/// one JSON object, work serving a caller carries the durable session handle
+/// and the identity without the writing site naming either, and an event that
+/// belongs to no session carries no stand-in for one.
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
+    assert!(
+        client_bin().exists(),
+        "client binary missing at {}: build it with the same profile, \
+         `cargo build --release -p connetto-client --bin connetto-client --all-features`",
+        client_bin().display()
+    );
+    let _serial = PG_SERIAL.lock().await;
+
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let auth_stack = build_auth_stack(auth_port).await;
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let mut command = Command::new(server_bin());
+    command
+        .env("DATABASE_URL", &url)
+        .env("CONNETTO_BIND", &bind)
+        .env("CONNETTO_PG_DDL", PG_DDL)
+        .env("CONNETTO_WRITABLE", "orders")
+        .env("CONNETTO_SLOT", SLOT)
+        .env("CONNETTO_PUBLICATION", PUBLICATION)
+        .env("CONNETTO_READER_URL", &reader_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for (key, value) in &auth_stack.env_pairs {
+        command.env(key, value);
+    }
+    let mut server = command.spawn().expect("spawn server");
+
+    let secs = Duration::from_secs(20);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}"
+    );
+
+    let (token, user_id) = mint_token(&auth_stack.auth_base).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("log-probe.db");
+    let client = spawn_client(&ws, &db, "log-probe", &token, None);
+    assert_eq!(
+        wait_for_rows(&db, 1, secs).await,
+        1,
+        "the probe client never received its snapshot"
+    );
+    drop(client);
+
+    // Rust's stdout is line buffered, so every line already emitted is in the
+    // pipe and a kill loses none of them.
+    server.kill().expect("kill the server");
+    let output = tokio::task::spawn_blocking(move || server.wait_with_output())
+        .await
+        .expect("spawn_blocking task panicked")
+        .expect("read the server's output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("stdout line is not JSON ({err}): {line}"))
+        })
+        .collect();
+    assert!(!lines.is_empty(), "the server wrote nothing to stdout");
+
+    let listening = lines
+        .iter()
+        .find(|line| line["message"] == "sync listener started")
+        .unwrap_or_else(|| panic!("no listener event on stdout: {stdout}"));
+    assert_eq!(
+        listening["bind"], bind,
+        "the listener event lost its bind address"
+    );
+    assert!(
+        listening["span"].is_null(),
+        "an event fired before any session exists must carry no session context: {listening}"
+    );
+
+    let established = lines
+        .iter()
+        .find(|line| line["message"] == "connection established")
+        .unwrap_or_else(|| panic!("no connection event on stdout: {stdout}"));
+    assert_eq!(
+        established["span"]["user"], user_id,
+        "the connection context lost the caller's identity"
+    );
+    assert!(
+        established["span"]["session"]
+            .as_str()
+            .is_some_and(|session| !session.is_empty()),
+        "the connection context lost the durable session handle: {established}"
+    );
+}

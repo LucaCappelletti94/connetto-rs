@@ -233,13 +233,14 @@ fn worker_origin() -> String {
 // -----------------------------------------------------------------------------
 
 fn main() {
+    connetto_web::logging::init_console();
     // The dedicated DB worker imports this same wasm module: the leader spawns
     // it pointed straight at the dx glue, which auto-initializes and runs this
     // `main`. A worker has no `Window`.
     if web_sys::window().is_none() {
         spawn_local(async {
             if let Err(err) = run_db_worker().await {
-                web_sys::console::error_1(&format!("db worker failed: {err:?}").into());
+                tracing::error!(error = ?err, "db worker failed");
             }
         });
         return;
@@ -763,7 +764,7 @@ fn Dashboard() -> Element {
                                     })
                                     .await;
                                 if let Err(err) = result {
-                                    web_sys::console::error_1(&format!("order insert failed: {err}").into());
+                                    tracing::error!(error = %err, "order insert failed");
                                 }
                             });
                         },
@@ -814,7 +815,7 @@ fn Dashboard() -> Element {
                                 match result {
                                     Ok(_) => note_text.set(String::new()),
                                     Err(err) => {
-                                        web_sys::console::error_1(&format!("note save failed: {err}").into());
+                                        tracing::error!(error = %err, "note save failed");
                                     }
                                 }
                             });

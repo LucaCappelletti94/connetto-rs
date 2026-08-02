@@ -47,6 +47,7 @@ const DEFAULT_ENV_FILE: &str = "target/dev-idp.env";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    connetto_core::logging::init_stdout();
     let bind = std::env::var("CONNETTO_DEV_IDP_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -115,12 +116,13 @@ async fn main() -> Result<()> {
     std::fs::write(&env_path, &env_file)
         .with_context(|| format!("writing {}", env_path.display()))?;
 
-    println!("dev idp on {issuer}");
-    println!("  provider   {PROVIDER}");
-    for callback in &callbacks {
-        println!("  callback   {callback}");
-    }
-    println!("  env file   {}", env_path.display());
+    tracing::info!(
+        issuer = %issuer,
+        provider = PROVIDER,
+        callbacks = %callbacks.join(","),
+        env_file = %env_path.display(),
+        "dev idp listening"
+    );
     axum::serve(listener, oauth2_test_server::router::build_router(idp))
         .await
         .context("serving")?;

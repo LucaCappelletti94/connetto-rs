@@ -87,6 +87,11 @@ indexed_db_futures = "0.6"
 # stages fresh key bytes, so both buffers are wiped rather than left for the
 # allocator to recycle.
 zeroize = { version = "1", default-features = false }
+# Structured logging (R12): every module emits through `tracing`, and
+# `logging::init_console` installs the developer-console destination that a
+# browser program needs because it has no stdout.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # The replica key store is exercised in a dedicated worker against real
 # IndexedDB and real WebCrypto, and the at-rest assertion reads the stored

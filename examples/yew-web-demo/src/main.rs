@@ -154,12 +154,13 @@ fn fresh_quantity() -> i64 {
 }
 
 fn main() {
+    connetto_web::logging::init_console();
     // The dedicated DB worker runs this same wasm module. A worker has no
     // Window, so boot the DB tier there instead of rendering the UI.
     if web_sys::window().is_none() {
         spawn_local(async {
             if let Err(err) = run_db_worker().await {
-                web_sys::console::error_1(&format!("db worker failed: {err:?}").into());
+                tracing::error!(error = ?err, "db worker failed");
             }
         });
         return;
@@ -755,7 +756,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                     })
                     .await;
                 if let Err(err) = result {
-                    web_sys::console::error_1(&format!("order insert failed: {err}").into());
+                    tracing::error!(error = %err, "order insert failed");
                 }
             });
         })
@@ -791,7 +792,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 match result {
                     Ok(_) => note_text.set(String::new()),
                     Err(err) => {
-                        web_sys::console::error_1(&format!("note save failed: {err}").into());
+                        tracing::error!(error = %err, "note save failed");
                     }
                 }
             });
