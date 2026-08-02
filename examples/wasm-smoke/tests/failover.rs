@@ -175,6 +175,10 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let before_id = write_row(&mut writer, 1).await;
     stage("writer seeded the first row");
 
+    // Each worker generation logs in for itself, and only a tab can answer
+    // that request.
+    common::play_the_tab();
+
     // This page is the leader for the whole test: it holds the leader lock
     // and spawns each worker generation. A multi-page app races the same
     // lock and the winner runs exactly this code.

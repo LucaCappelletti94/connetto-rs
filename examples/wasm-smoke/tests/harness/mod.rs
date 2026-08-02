@@ -269,6 +269,11 @@ impl ParityFixture {
     ) -> ParityFixture {
         relay_worker_breadcrumbs();
 
+        // The worker logs in for itself, and only a tab can answer that
+        // request. Installed before the worker spawns, because a
+        // `BroadcastChannel` buffers nothing for a late subscriber.
+        crate::common::play_the_tab();
+
         // This page wins the leader election and owns the DB worker that hosts
         // the relay hub the tab client speaks to.
         let membership = leader::join(&format!("connetto-parity-{base}"), &glue_url());

@@ -181,6 +181,9 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
     let glue = glue_url();
     let leader_lock = format!("connetto-leader-{base}");
 
+    // The worker logs in for itself, and only a tab can answer that request.
+    common::play_the_tab();
+
     // Candidate A joins first: the lock is free, so it wins and spawns the
     // first DB worker.
     let membership_a = leader::join(&leader_lock, &glue);

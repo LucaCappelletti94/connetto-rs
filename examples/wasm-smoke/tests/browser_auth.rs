@@ -18,9 +18,12 @@
 //! Postgres:
 //!
 //! ```text
-//! CONNETTO_AUTH_BIND=127.0.0.1:18099 \
-//!   cargo run --release -p connetto-server --example dev_idp
-//! cargo run --release --all-features -p connetto-server --example auth_stack
+//! mkdir -p target/devkeys
+//! openssl genpkey -algorithm ed25519 -out target/devkeys/priv.pem
+//! openssl pkey -in target/devkeys/priv.pem -pubout -out target/devkeys/pub.pem
+//! CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
+//!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
+//!   cargo run --release --all-features -p connetto-server --example auth_stack
 //! wasm-pack test --headless --chrome examples/wasm-smoke --test browser_auth
 //! ```
 //!

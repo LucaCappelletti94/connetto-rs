@@ -21,8 +21,10 @@
 //! [`Router`], and a deployment that puts its app and its auth endpoints on
 //! different origins is the one that has to decide how to bridge them.
 //!
-//! It verifies nothing about identity and holds an in-memory store, so it is a
-//! test fixture and never a deployment. Run it with:
+//! It verifies nothing about identity, so it is a test fixture and never a
+//! deployment. Its session store is in memory and its signing key is ephemeral
+//! unless `DATABASE_URL` and `CONNETTO_JWT_*_KEY_FILE` point it at the ones a
+//! sync server shares. Run it with:
 //!
 //! ```text
 //! cargo run --example auth_stack
@@ -156,6 +158,55 @@ impl AuthStore for ServerStore {
     }
 }
 
+/// The token signing keypair, shared with a sync server when
+/// `CONNETTO_JWT_PRIVATE_KEY_FILE` and `CONNETTO_JWT_PUBLIC_KEY_FILE` name one.
+fn load_authority(config: &AuthConfig) -> Result<TokenAuthority> {
+    let (Ok(private), Ok(public)) = (
+        std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
+        std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE"),
+    ) else {
+        println!("  key          ephemeral (set CONNETTO_JWT_*_KEY_FILE to share one)");
+        return TokenAuthority::generate(config).map_err(|err| anyhow::anyhow!("keypair: {err}"));
+    };
+    let private_pem =
+        std::fs::read(&private).with_context(|| format!("reading the private key at {private}"))?;
+    let public_pem =
+        std::fs::read(&public).with_context(|| format!("reading the public key at {public}"))?;
+    TokenAuthority::from_ed_pem(&private_pem, &public_pem, config)
+        .map_err(|err| anyhow::anyhow!("loading the signing keypair: {err}"))
+}
+
+/// The auth service, sharing a session store with a sync server when
+/// `DATABASE_URL` names one.
+async fn build_service(
+    authority: TokenAuthority,
+    config: &AuthConfig,
+) -> Result<Arc<AuthService<ServerStore>>> {
+    let authority = Arc::new(authority);
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        println!("  store        in-memory (set DATABASE_URL to share one)");
+        return Ok(Arc::new(AuthService::new(
+            authority,
+            Arc::new(ServerStore::InMemory(InMemoryAuthStore::new(
+                config.refresh_lifetimes(),
+            ))),
+        )));
+    };
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder()
+        .build(manager)
+        .await
+        .context("building the Postgres pool for the shared session store")?;
+    Ok(Arc::new(AuthService::new(
+        authority,
+        Arc::new(ServerStore::Db(DbAuthStore::new(
+            pool,
+            config.refresh_lifetimes(),
+            Arc::new(DefaultUuidResolver),
+        ))),
+    )))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let bind =
@@ -221,49 +272,8 @@ async fn main() -> Result<()> {
     // Postgres and a token minted here opens a handshake there. With neither
     // set this falls back to an ephemeral key and an in-memory store, which
     // suits a login-only loop where nothing syncs.
-    let authority = match (
-        std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
-        std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE"),
-    ) {
-        (Ok(private), Ok(public)) => {
-            let private_pem = std::fs::read(&private)
-                .with_context(|| format!("reading the private key at {private}"))?;
-            let public_pem = std::fs::read(&public)
-                .with_context(|| format!("reading the public key at {public}"))?;
-            TokenAuthority::from_ed_pem(&private_pem, &public_pem, &config)
-                .map_err(|err| anyhow::anyhow!("loading the signing keypair: {err}"))?
-        }
-        _ => {
-            println!("  key          ephemeral (set CONNETTO_JWT_*_KEY_FILE to share one)");
-            TokenAuthority::generate(&config).map_err(|err| anyhow::anyhow!("keypair: {err}"))?
-        }
-    };
-    let service: Arc<AuthService<ServerStore>> = match std::env::var("DATABASE_URL") {
-        Ok(url) => {
-            let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-            let pool = Pool::builder()
-                .build(manager)
-                .await
-                .context("building the Postgres pool for the shared session store")?;
-            Arc::new(AuthService::new(
-                Arc::new(authority),
-                Arc::new(ServerStore::Db(DbAuthStore::new(
-                    pool,
-                    config.refresh_lifetimes(),
-                    Arc::new(DefaultUuidResolver),
-                ))),
-            ))
-        }
-        Err(_) => {
-            println!("  store        in-memory (set DATABASE_URL to share one)");
-            Arc::new(AuthService::new(
-                Arc::new(authority),
-                Arc::new(ServerStore::InMemory(InMemoryAuthStore::new(
-                    config.refresh_lifetimes(),
-                ))),
-            ))
-        }
-    };
+    let service = build_service(load_authority(&config)?, &config).await?;
+
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(provider));
 

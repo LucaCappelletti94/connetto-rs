@@ -349,8 +349,7 @@ async fn main() -> Result<()> {
     let pool = build_pool(&database_url).await?;
     // connetto emits no DDL. The deployment owns the `_connetto_mutations`
     // watermark table (see `docs/architecture/11-authentication.md`) and the
-    // `ConnettoWatermark` reference schema keys on it; the operator runs the
-    // migration alongside the auth tables.
+    // `ConnettoWatermark` reference schema keys on it.
     let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
@@ -424,12 +423,17 @@ async fn main() -> Result<()> {
             });
         }));
     }
-    // Serve the login and refresh endpoints beside the sync listener.
+    spawn_auth_endpoints(&service, registry);
+    run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
+}
+
+/// Serve the login and refresh endpoints beside the sync listener.
+fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<ProviderRegistry>) {
     let auth_bind = env_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
     // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
-    // non-loopback client redirect URIs the deployment permits (a browser
-    // deployment lists its own callback). Loopback redirects are always
-    // allowed, so a native client needs no entry.
+    // non-loopback client redirect URIs that are permitted (a browser client
+    // lists its own callback). Loopback redirects are always allowed, so a
+    // native client needs no entry.
     let allowlist = env_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
         .split(',')
         .map(str::trim)
@@ -437,11 +441,11 @@ async fn main() -> Result<()> {
         .map(str::to_owned)
         .collect();
     // CONNETTO_AUTH_CORS_ORIGINS is a comma-separated list of exact origins
-    // whose script may read a login response. A browser deployment serves its
-    // app on a different origin from these endpoints, so without this the
-    // browser refuses to hand the response to the page. Loopback origins are
-    // always allowed, mirroring the redirect policy's loopback rule and for
-    // the same reason: script on a loopback origin is already on the machine.
+    // whose script may read a login response. An app served from a different
+    // origin than these endpoints needs one, because without it the browser
+    // refuses to hand the response to the page. Loopback origins are always
+    // allowed, mirroring the redirect policy's loopback rule and for the same
+    // reason: script on a loopback origin is already on the machine.
     let cors_origins: Vec<String> = env_or("CONNETTO_AUTH_CORS_ORIGINS", "")
         .split(',')
         .map(str::trim)
@@ -457,7 +461,7 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
     let router = auth_router(
-        Arc::clone(&service),
+        Arc::clone(service),
         registry,
         RedirectPolicy::new(allowlist),
     )
@@ -473,7 +477,6 @@ async fn main() -> Result<()> {
             Err(err) => eprintln!("binding auth endpoints {auth_bind}: {err}"),
         }
     });
-    run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
 }
 
 /// Start CDC ingestion and serve connections until the listener fails.

@@ -175,6 +175,9 @@ async fn local_tier_notes_fan_out_across_tabs() {
     let note_id = base;
     let mixed_note_id = base + 1;
 
+    // The worker logs in for itself, and only a tab can answer that request.
+    common::play_the_tab();
+
     // This page wins the leader election and owns the DB worker.
     let membership = leader::join(&format!("connetto-notes-leader-{base}"), &glue_url());
     await_db_worker_ready().await;

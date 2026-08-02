@@ -219,6 +219,9 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     let snapshot_id = write_row(&mut writer, 1).await;
     stage("writer seeded the snapshot row");
 
+    // The worker logs in for itself, and only a tab can answer that request.
+    common::play_the_tab();
+
     // This page wins the leader election and owns the DB worker. A
     // multi-page app races the same leader lock, and the winner runs this.
     let membership = leader::join(&format!("connetto-leader-{base}"), &glue_url());

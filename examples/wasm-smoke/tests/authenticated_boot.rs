@@ -17,7 +17,7 @@
 //! the branch fired. The fourth, recovering from a refresh store that no longer
 //! decrypts, is in `authenticated_boot_recovery.rs`.
 //!
-//! **Needs the stack up.** Database, sync server, and identity provider:
+//! **Needs the stack up.** Database, single-origin auth stack, and sync server:
 //!
 //! ```text
 //! docker run -d --rm --name connetto-e42-pg -e POSTGRES_PASSWORD=postgres \
@@ -32,17 +32,34 @@
 //!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)"
 //! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
 //!   -c "$(cat examples/wasm-smoke/roles.sql)"
-//! CONNETTO_AUTH_BIND=127.0.0.1:18099 \
-//!   cargo run --release -p connetto-server --example dev_idp
-//! source target/dev-idp.env
+//! mkdir -p target/devkeys
+//! openssl genpkey -algorithm ed25519 -out target/devkeys/priv.pem
+//! openssl pkey -in target/devkeys/priv.pem -pubout -out target/devkeys/pub.pem
+//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
+//!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
+//!   cargo run --release --all-features -p connetto-server --example auth_stack
 //! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
 //!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
 //!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
-//!   CONNETTO_AUTH=in-memory CONNETTO_AUTH_BIND=127.0.0.1:18099 \
+//!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
+//!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
+//!   CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \
+//!   CONNETTO_OIDC_PROVIDER=generic CONNETTO_OIDC_NAME=dev-idp \
+//!   CONNETTO_OIDC_ISSUER=http://127.0.0.1:18099 CONNETTO_OIDC_CLIENT_ID=unused \
+//!   CONNETTO_OIDC_REDIRECT_URL=http://127.0.0.1:18081/auth/callback \
 //!   cargo run --release --all-features -p connetto-server --bin connetto-server
 //! wasm-pack test --headless --chrome examples/wasm-smoke --test authenticated_boot
 //! ```
+//!
+//! The login server has to be `auth_stack` rather than `dev_idp` behind the sync
+//! server's own auth router: a worker walks the login with `fetch`, and a chain
+//! that hops to a second origin and back cannot be followed, so every hop stays
+//! on one origin. The two processes share the token keys and the session store,
+//! which is what makes a token the stack mints verify at the sync handshake. The
+//! sync server's own login routes are never reached from a test, so its
+//! `CONNETTO_OIDC_*` values only have to build a registry.
 //!
 //! The server reads the schema from the same file the client hashes, because
 //! the handshake compares them and a reworded copy is a different schema.

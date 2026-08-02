@@ -16,7 +16,7 @@ use connetto_wasm_smoke::workers::{
 use connetto_web::auth::{
     Acquired, BrowserAuthenticator, LoginMessage, RefreshStore, ReplicaKeyStore, WorkerAuthConfig,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -102,8 +102,19 @@ pub async fn walk_the_login(login_url: &str) -> (String, String) {
 ///
 /// Returns a count of the login requests served, so a test can insist the handoff
 /// really ran. Without that, a startup that found a way to skip the login would
-/// leave the listener idle and still pass.
+/// leave the listener idle and still pass. The listener is installed once per test
+/// binary, so in a binary of several tests the count carries across them.
 pub fn play_the_tab() -> Rc<Cell<u32>> {
+    THE_TAB.with(|slot| Rc::clone(slot.borrow_mut().get_or_insert_with(install_the_tab)))
+}
+
+thread_local! {
+    /// The listener outlives the test that installed it, because the channel is
+    /// forgotten, so a binary running several tests must install exactly one.
+    static THE_TAB: RefCell<Option<Rc<Cell<u32>>>> = const { RefCell::new(None) };
+}
+
+fn install_the_tab() -> Rc<Cell<u32>> {
     let served = Rc::new(Cell::new(0));
     let counter = Rc::clone(&served);
     let channel =
