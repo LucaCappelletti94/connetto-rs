@@ -98,7 +98,6 @@ The `user_id` type is a placeholder the deployment fills for its `Id` (for examp
 CREATE TABLE connetto_sessions (
     session_id           UUID PRIMARY KEY,
     user_id              <IdSqlType> NOT NULL REFERENCES your_users (id),
-    attrs                JSONB NOT NULL,
     current_refresh_hash BYTEA NOT NULL,
     idle_deadline_ms     BIGINT NOT NULL,
     absolute_deadline_ms BIGINT NOT NULL,
