@@ -106,7 +106,7 @@ A grant that fails to resolve does not end the connection. The session proceeds 
 
 The reply (`HandshakeAck`) says nothing about a failure: no reason, and not which grant it was. Not-allowed, no-longer-allowed, and never-existed are indistinguishable, on the same reasoning that a service does not distinguish an authorization failure from a missing resource. Failures are recorded in the server's audit trail and silent on the wire.
 
-This replaces a single credential field (`Credential::{Anonymous, Token}`) with a variable-length list and is a `PROTOCOL_VERSION` bump.
+This replaces a single credential field (`Credential::{Anonymous, Token}`) with a variable-length list and is a breaking wire change (no bump before the first release, see the version-bump decision under Decisions).
 
 See `12-identity-session-capability.md` for the full model.
 
@@ -168,10 +168,11 @@ This is a simple stop-and-wait variant. A sliding-window variant may be needed f
 
 ## Decisions
 
-- **Grant list shape (R3)**: `Handshake` carries zero or more opaque grants, not one credential. Each resolves independently into an identity, capabilities, or a refusal. This supersedes `Credential::{Anonymous, Token}` and is a `PROTOCOL_VERSION` bump.
+- **Grant list shape (R3)**: `Handshake` carries zero or more opaque grants, not one credential. Each resolves independently into an identity, capabilities, or a refusal. This supersedes `Credential::{Anonymous, Token}` and is a breaking wire change.
 - **Silent rejection (R3)**: a grant that fails to resolve does not end the connection and produces no field on `HandshakeAck`. Not-allowed, no-longer-allowed, and never-existed are indistinguishable on the wire.
 - **Session token (R2)**: the server mints a real durable handle at handshake and the client persists it outside the local replica. The current implementation is a non-functional stub (**Built, defective**).
 - **Enum-variant wire change**: adding a variant to `FullResyncReason` or `FatalErrorReason` is a wire-breaking change. Neither enum has a forward-compatible fallback for an unknown value.
+- **Version bumps (decided)**: `PROTOCOL_VERSION` stays frozen at 1 until the first release, wire changes land freely before then, and the first release performs one deliberate bump. Per-phase bumps were considered and rejected as ceremony while nothing is published. A mismatch stays detectable throughout.
 
 ---
 

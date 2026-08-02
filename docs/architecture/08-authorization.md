@@ -37,7 +37,7 @@ Define how permissions are enforced on reads (snapshot delivery and change deliv
 | yes | none | whatever the identity grants | where the identity grants it |
 | yes | some | the union | the union |
 
-**Built, defective.** Today the caller is an `AuthContext` with a mandatory user id, and a caller with no identity is impossible to express, so one is invented from the client's own handshake string. Chapter 12 describes the defect. Fixed by R1 and R2.
+**Built, defective.** Today the caller is an `AuthContext` with a mandatory user id, and a caller with no identity is impossible to express, so one is invented from the client's own handshake string. Chapter 12 describes the defect. Fixed by R1 (landed) and R2.
 
 **Decided (R8).** An identity carries a user id and nothing else. `tenant_id`, `roles`, and `claims` are deleted, because they were written and never read, and because tenant and role both belong in the authorization model rather than on the session. `open-questions.md:283` decided the first and `rls2fga` requires the second, emitting a `pg_role` type with a `member` relation and stating that the deployment must load records mapping users to Postgres roles.
 
@@ -97,7 +97,7 @@ That direction is chosen because the trait has callers on both sides. `SessionMa
 
 **Built.** The snapshot query runs with `app.user_id` bound for the session, on a pool whose role is subject to RLS, so only rows that pass the policy are included in the `SnapshotPatch`. This is the natural behaviour of executing the query as the caller.
 
-**Built, defective.** When `CONNETTO_READER_URL` is unset the reference binary puts the snapshot source and the write target on the owner pool, where RLS is bypassed entirely, because Postgres does not apply policies to a superuser or to the table owner. Fixed by R1.
+**Fixed (R1).** The reference binary refuses to start without `CONNETTO_READER_URL`, so snapshots, read authorization, and mutation applies never run on the owner pool, where RLS is bypassed entirely because Postgres does not apply policies to a superuser or to the table owner.
 
 A caller with no identity leaves `app.user_id` unset for the whole transaction rather than binding an empty string. That is deliberate and it is what makes the policy answer correctly with no policy change: `current_setting('app.user_id', true)` is NULL, so an owner comparison is NULL rather than true and the row is hidden, while a public predicate still returns its own rows. An empty string would be a real identity that happens to be blank, and a policy comparing against it could match.
 
@@ -253,7 +253,7 @@ Per-event, per-client cost separates into six layers. Five of them have been eli
 
 **Where connetto stands against that.** Matching is already at the state of the art and needs nothing: `subql` interns predicates by a hash of normalized SQL and refcounts them, evaluates each candidate predicate once, and resolves matched consumers from a bitmap, so two clients issuing the same SELECT already share one evaluation. Content computation is already once per event. Authorization is where Supabase Postgres Changes is, which R5b addresses. The remaining gaps are properties 1, 3 and 5, and one finding with no counterpart in any studied system: reconnect catchup rebuilds each missed patch per client per subscription rather than reading a stored one.
 
-**R16 part B chooses the shape.** It is gated on R0 so that it targets a measured cost, except where a wire change must be settled before R3's `PROTOCOL_VERSION` bump ships, which is a scheduling coupling part A discovered and R16 records.
+**R16 part B chooses the shape.** It is gated on R0 so that it targets a measured cost. The scheduling coupling to R3 that part A discovered is dissolved: the bulk frame decision is settled (recorded under R16's inputs in the master plan) and `PROTOCOL_VERSION` stays frozen until the first release (see `02-protocol.md`).
 
 ---
 
