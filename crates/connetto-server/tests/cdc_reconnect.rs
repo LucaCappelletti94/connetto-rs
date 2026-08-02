@@ -13,11 +13,13 @@
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, Subscribe, SubscriptionSpec,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -159,6 +161,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         Materializer::new(PG_DDL).expect("build materializer"),
         EmptySnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

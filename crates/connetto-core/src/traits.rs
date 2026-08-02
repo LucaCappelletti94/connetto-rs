@@ -255,7 +255,8 @@ pub type SessionVerifyFuture<'a, Id = String> = core::pin::Pin<
 /// path so static dispatch buys nothing, and a trait object keeps the server's
 /// public type signature stable no matter how a deployment configures identity.
 /// This mirrors the [`AuthPolicy`] pattern of a real implementation plus a
-/// permissive stand-in ([`TrustingSessionVerifier`](crate::auth::TrustingSessionVerifier)).
+/// stand-in, with the stand-in confined to the `test-support` feature so no
+/// production build can reach it.
 pub trait SessionVerifier<Id = String>: Send + Sync {
     /// Verify `auth_token` (connetto's own access token) and resolve the session
     /// identity plus its session id, or refuse it with a [`SessionVerifyError`].

@@ -1,24 +1,12 @@
-//! Windowed desktop demo of connetto live queries, with optional native auth.
+//! Windowed desktop demo of connetto live queries with native auth.
 //!
-//! Two modes, selected by a flag file at startup:
-//!
-//! - Anonymous (flag absent): no auth, ephemeral in-memory replica, no keyring
-//!   required. The replica vanishes when the process exits.
-//! - Authenticated (flag present): acquires a connetto session via the RFC 8252
-//!   loopback PKCE flow against `connetto-server`'s auth endpoints, names the
-//!   replica from the resolved identity, opens it with an OS-keyring-held
-//!   encryption key, and installs a silent-refresh token source for reconnects.
-//!
-//! The mode flag is a plain file whose presence, not contents, carries the
-//! signal. It lives at:
-//!   `$XDG_DATA_HOME/connetto-dioxus-demo/signed-in`
-//!   (fallback: `$HOME/.local/share/connetto-dioxus-demo/signed-in`)
-//!
-//! Signing in sets the flag and restarts the process. The restarted process
-//! runs the interactive PKCE login (or silently refreshes if a refresh token is
-//! already stored) before opening the window. Signing out calls `forget_device`
-//! (credential revoke plus key destroy plus file delete), clears the flag, and
-//! restarts into anonymous mode.
+//! On launch the app acquires a connetto session via the RFC 8252 loopback
+//! PKCE flow against `connetto-server`'s auth endpoints (or silently refreshes
+//! if a refresh token is already stored), names the replica from the resolved
+//! identity, opens it with an OS-keyring-held encryption key, and installs a
+//! silent-refresh token source for reconnects. Signing out calls `forget_device`
+//! (credential revoke plus key destroy), then restarts the process so a fresh
+//! login begins immediately.
 //!
 //! Configuration environment variables:
 //!
@@ -26,7 +14,12 @@
 //!   (default `127.0.0.1:7777`).
 //! - `CONNETTO_DEMO_PG`: Postgres conninfo for the backend writer buttons
 //!   (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
-//! - `CONNETTO_READER_URL`: conninfo for the non-owner Postgres role provisioned by `roles.sql` (required).
+//! - `CONNETTO_READER_URL`: conninfo for the non-owner Postgres role provisioned
+//!   by `roles.sql` (required).
+//! - `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and `CONNETTO_OIDC_*`: server auth
+//!   env from the dev IdP. Start the dev IdP with
+//!   `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source `target/dev-idp.env`
+//!   before starting the server.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -123,25 +116,21 @@ enum DemoCmd {
 #[derive(Clone)]
 struct Backend(mpsc::UnboundedSender<DemoCmd>);
 
-/// Authentication state passed as Dioxus context.
+/// Authentication context passed as Dioxus context.
 ///
 /// Clone is cheap: the heavy pieces live behind `Arc`.
 #[derive(Clone)]
-enum AuthCtx {
-    Anonymous,
-    Authenticated {
-        /// The authenticator that owns the refresh-token store and can revoke
-        /// the session server-side.
-        authenticator: Arc<NativeAuthenticator>,
-        /// Absolute path to the replica SQLite file for this identity.
-        db_path: PathBuf,
-        /// Key store that holds the per-replica encryption key in the OS
-        /// keyring. Shared with the connection opener.
-        key_store: Arc<KeyringKeyStore>,
-        /// The replica name (from `replica_db_name`), used as both the key
-        /// record name in the keyring and the human-readable replica label.
-        key_name: String,
-    },
+struct AuthCtx {
+    /// The authenticator that owns the refresh-token store and can revoke
+    /// the session server-side.
+    authenticator: Arc<NativeAuthenticator>,
+    /// Absolute path to the replica SQLite file for this identity.
+    db_path: PathBuf,
+    /// Key store that holds the per-replica encryption key in the OS keyring.
+    key_store: Arc<KeyringKeyStore>,
+    /// The replica name (from `replica_db_name`), used as both the keyring
+    /// record name and the human-readable replica label.
+    key_name: String,
 }
 
 /// App data directory following XDG conventions on Linux.
@@ -159,12 +148,7 @@ fn data_dir() -> PathBuf {
     .join("connetto-dioxus-demo")
 }
 
-/// Path to the mode flag file.
-fn mode_flag() -> PathBuf {
-    data_dir().join("signed-in")
-}
-
-/// Restart the current binary and exit this process, so a mode-switch takes
+/// Restart the current binary and exit this process, so a sign-out takes
 /// effect immediately. A clean exit is performed if the binary path cannot be
 /// resolved: the user relaunches manually.
 ///
@@ -190,9 +174,7 @@ fn main() {
         .build()
         .expect("build tokio runtime");
     // A startup failure opens a window that says so. Aborting here instead would
-    // leave nothing on screen to explain itself, and it would make signing out
-    // fatal: the teardown clears the mode flag and restarts, so the next process
-    // starts anonymously, which a server that requires signing in refuses.
+    // leave nothing on screen to explain itself.
     let started = rt.block_on(setup());
     let (client, backend, auth_ctx) = match started {
         Ok(parts) => parts,
@@ -218,8 +200,8 @@ fn main() {
         .launch(app);
 }
 
-/// Open a window that reports why startup failed, and offer the one action that
-/// can help: signing in, since the usual cause is a server that requires it.
+/// Open a window that reports why startup failed, showing the error so the
+/// user can diagnose and fix the configuration.
 fn launch_startup_failure(err: &anyhow::Error) {
     // The chain, not just the outermost message, so the cause is not hidden behind
     // a summary.
@@ -250,40 +232,21 @@ fn startup_failure_app() -> Element {
         .get()
         .cloned()
         .unwrap_or_else(|| "unknown startup failure".to_owned());
-    let signed_in = mode_flag().exists();
     rsx! {
-        div { style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
+        div {
+            style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
             h2 { "connetto demo cannot start" }
             p { style: "color: #a33;", {detail} }
-            if signed_in {
-                p { "Signed-in mode is selected. Sign out to return to anonymous mode." }
-                button {
-                    onclick: move |_| {
-                        let _ = std::fs::remove_file(mode_flag());
-                        restart();
-                    },
-                    "Sign out and restart"
-                }
-            } else {
-                button {
-                    onclick: move |_| {
-                        if let Some(dir) = mode_flag().parent() {
-                            let _ = std::fs::create_dir_all(dir);
-                        }
-                        let _ = std::fs::write(mode_flag(), b"");
-                        restart();
-                    },
-                    "Sign in and restart"
-                }
-            }
+            p { "Check that CONNETTO_AUTH, CONNETTO_AUTH_BIND, and the CONNETTO_OIDC_* variables are set correctly, then relaunch." }
         }
     }
 }
 
-/// Connect to the server and start the backend writer task. The mode flag
-/// selects which path to take; the path is resolved once at startup and never
-/// changes while the process is alive.
+/// Connect to the server and start the backend writer task. Always runs the
+/// authenticated path via the native PKCE loopback flow.
 async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
+    use anyhow::Context as _;
+
     let server =
         std::env::var("CONNETTO_DEMO_SERVER").unwrap_or_else(|_| "127.0.0.1:7777".to_owned());
     let pg_url = std::env::var("CONNETTO_DEMO_PG")
@@ -296,11 +259,7 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
         .await
         .map_err(|err| anyhow::anyhow!("websocket handshake: {err}"))?;
 
-    let (conn, auth_ctx) = if mode_flag().exists() {
-        setup_authenticated(transport).await?
-    } else {
-        (setup_anonymous(transport).await?, AuthCtx::Anonymous)
-    };
+    let (conn, auth_ctx) = setup_authenticated(transport).await?;
 
     let client = ConnettoClient::start(conn);
 
@@ -359,42 +318,9 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
     Ok((client, Backend(tx), auth_ctx))
 }
 
-/// Anonymous mode: ephemeral in-memory replica, no token, per-process.
-async fn setup_anonymous(
-    transport: WebSocketTransport<TcpStream>,
-) -> anyhow::Result<ConnettoConnection<Ws>> {
-    // A placeholder credential, which only a server that verifies nothing accepts.
-    // A server started with CONNETTO_AUTH refuses it, and that refusal is reported
-    // rather than fatal: see the mapping below.
-    let config = ClientConfig {
-        client_id: format!("desktop-demo-{}", std::process::id()),
-        auth_token: "token".to_owned(),
-        schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
-        sql_functions: uuidv7_functions(),
-    };
-    ConnettoConnection::connect(
-        transport,
-        &Replica::Ephemeral,
-        REPLICA_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .map_err(|err| match err {
-        // Naming the cause, because "credential rejected" reads like a bug here
-        // when it is the server correctly refusing an unauthenticated client.
-        connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
-            "this server requires signing in, so there is nothing to show anonymously. \
-             Sign in to open a private encrypted replica."
-        ),
-        other => anyhow::anyhow!("anonymous connect: {other}"),
-    })
-}
-
-/// Authenticated mode: acquire a session via the native PKCE loopback flow,
-/// name the replica from the resolved identity, provision or load the
-/// per-replica encryption key, open the replica, and install a silent-refresh
-/// token source.
+/// Acquire a session via the native PKCE loopback flow, name the replica from
+/// the resolved identity, provision or load the per-replica encryption key,
+/// open the replica, and install a silent-refresh token source.
 ///
 /// The sequence mirrors the ordering in `connetto-web/src/workers.rs`:
 /// acquire first, name the replica from the identity, resolve the key,
@@ -403,6 +329,8 @@ async fn setup_anonymous(
 async fn setup_authenticated(
     transport: WebSocketTransport<TcpStream>,
 ) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx)> {
+    use anyhow::Context as _;
+
     std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
 
     // Credential store: one entry per app, user key `"refresh"`.
@@ -467,14 +395,26 @@ async fn setup_authenticated(
         // Resume: the replica already carries its schema and cursor.
         ConnettoConnection::connect_existing(transport, &replica, &config, None)
             .await
-            .map_err(|err| anyhow::anyhow!("resuming the encrypted replica: {err}"))?
+            .map_err(|err| match err {
+                connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
+                    "the server refused the credential; \
+                     check CONNETTO_AUTH and OIDC settings"
+                ),
+                other => anyhow::anyhow!("resuming the encrypted replica: {other}"),
+            })?
     } else {
         // First boot: apply the schema DDL to the fresh encrypted file.
         // The plaintext template cannot be used here because the per-replica
         // key does not exist at build time.
         ConnettoConnection::connect(transport, &replica, REPLICA_SQLITE_DDL, &config, None)
             .await
-            .map_err(|err| anyhow::anyhow!("first boot of the encrypted replica: {err}"))?
+            .map_err(|err| match err {
+                connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
+                    "the server refused the credential; \
+                     check CONNETTO_AUTH and OIDC settings"
+                ),
+                other => anyhow::anyhow!("first boot of the encrypted replica: {other}"),
+            })?
     };
 
     // Install a silent-refresh token source so that every reconnect
@@ -482,7 +422,7 @@ async fn setup_authenticated(
     // without opening a browser.
     let conn = conn.with_token_source(authenticator.token_source());
 
-    let auth_ctx = AuthCtx::Authenticated {
+    let auth_ctx = AuthCtx {
         authenticator,
         db_path,
         key_store,
@@ -522,36 +462,14 @@ fn app() -> Element {
 
     let mut logout_msg: Signal<Option<String>> = use_signal(|| None);
 
-    // Pre-extract authenticated state so the closures below can be simple
-    // `move` captures without needing to match inside the onclick.
-    let auth_label = match &auth_ctx {
-        AuthCtx::Anonymous => "Anonymous (shared replica, unencrypted)",
-        AuthCtx::Authenticated { .. } => "Signed in (private encrypted replica)",
-    };
-    let is_authenticated = matches!(auth_ctx, AuthCtx::Authenticated { .. });
-    let auth_data: Option<(
-        Arc<NativeAuthenticator>,
-        PathBuf,
-        Arc<KeyringKeyStore>,
-        String,
-    )> = match &auth_ctx {
-        AuthCtx::Authenticated {
-            authenticator,
-            db_path,
-            key_store,
-            key_name,
-        } => Some((
-            Arc::clone(authenticator),
-            db_path.clone(),
-            Arc::clone(key_store),
-            key_name.clone(),
-        )),
-        AuthCtx::Anonymous => None,
-    };
-    let replica_label = auth_data
-        .as_ref()
-        .map(|(_, _, _, kn)| kn.clone())
-        .unwrap_or_default();
+    // Extract auth data for the logout closure and the replica label.
+    let auth_data = (
+        Arc::clone(&auth_ctx.authenticator),
+        auth_ctx.db_path.clone(),
+        Arc::clone(&auth_ctx.key_store),
+        auth_ctx.key_name.clone(),
+    );
+    let replica_label = auth_ctx.key_name.clone();
 
     rsx! {
         div {
@@ -563,72 +481,53 @@ fn app() -> Element {
                 p {
                     style: "margin: 0 0 6px 0; font-size: 0.9em; color: #444;",
                     "Mode: "
-                    strong { {auth_label} }
+                    strong { "Signed in (private encrypted replica)" }
                 }
-                if is_authenticated {
-                    p {
-                        style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
-                        "Replica: {replica_label}"
-                    }
-                    button {
-                        onclick: move |_| {
-                            // Clone the captured auth_data tuple for the async task.
-                            if let Some((auth, path, ks, kn)) = auth_data.clone() {
-                                let cl = logout_client.clone();
-                                spawn(async move {
-                                    let unsynced =
-                                        cl.with_conn(|conn| conn.unsynced()).await;
-                                    match forget_device(
-                                        &auth,
-                                        &path,
-                                        ks.as_ref() as &dyn ReplicaKeyStore,
-                                        &kn,
-                                        &unsynced,
-                                        false,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            let _ = std::fs::remove_file(mode_flag());
-                                            restart();
-                                        }
-                                        Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
-                                            logout_msg.set(Some(format!(
-                                                "Logout refused: {} write(s) not yet synced. \
-                                                 Wait for sync to complete, then retry.",
-                                                seqs.len()
-                                            )));
-                                        }
-                                        Err(err) => {
-                                            logout_msg.set(Some(format!(
-                                                "Logout error: {err}"
-                                            )));
-                                        }
-                                    }
-                                });
+                p {
+                    style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
+                    "Replica: {replica_label}"
+                }
+                button {
+                    onclick: move |_| {
+                        let (auth, path, ks, kn) = auth_data.clone();
+                        let cl = logout_client.clone();
+                        spawn(async move {
+                            let unsynced =
+                                cl.with_conn(|conn| conn.unsynced()).await;
+                            match forget_device(
+                                &auth,
+                                &path,
+                                ks.as_ref() as &dyn ReplicaKeyStore,
+                                &kn,
+                                &unsynced,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    restart();
+                                }
+                                Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
+                                    logout_msg.set(Some(format!(
+                                        "Logout refused: {} write(s) not yet synced. \
+                                         Wait for sync to complete, then retry.",
+                                        seqs.len()
+                                    )));
+                                }
+                                Err(err) => {
+                                    logout_msg.set(Some(format!(
+                                        "Logout error: {err}"
+                                    )));
+                                }
                             }
-                        },
-                        "Sign out (wipe local replica)"
-                    }
-                    if let Some(msg) = logout_msg.read().clone() {
-                        p {
-                            style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
-                            {msg}
-                        }
-                    }
-                } else {
+                        });
+                    },
+                    "Sign out (wipe local replica)"
+                }
+                if let Some(msg) = logout_msg.read().clone() {
                     p {
-                        style: "margin: 0 0 8px 0; font-size: 0.85em; color: #666;",
-                        "Sign in to switch to a private encrypted replica named after your account."
-                    }
-                    button {
-                        onclick: move |_| {
-                            let dir = data_dir();
-                            let _ = std::fs::create_dir_all(&dir);
-                            let _ = std::fs::write(dir.join("signed-in"), b"");
-                            restart();
-                        },
-                        "Sign in"
+                        style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
+                        {msg}
                     }
                 }
             }

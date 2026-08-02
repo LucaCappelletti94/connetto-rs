@@ -9,17 +9,18 @@
 //! failing assertion for the leg it fixes (an aggregate value, a full-resync
 //! deletion, a conflict distinction), then implements until it passes.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! Run with the demo stack up. See `authenticated_boot.rs` for the commands.
 
 #![cfg(target_arch = "wasm32")]
 
+mod common;
 mod harness;
 
+use common::mint_token;
 use harness::{ParityFixture, connect_server, stage, unique_base, write_row};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// A row live query is relay-transparent: a pre-existing row reaches both
 /// clients through their snapshot, a subsequent write reaches both as a live
@@ -28,14 +29,19 @@ wasm_bindgen_test_configure!(run_in_browser);
 async fn row_live_query_is_relay_transparent() {
     let base = unique_base();
 
+    // Each concurrent client needs a distinct session token.
+    let writer_token = mint_token().await;
+    let direct_token = mint_token().await;
+    let relay_token = mint_token().await;
+
     // Seed a row BEFORE the fixture brings up the worker and both clients, so
     // it can only reach either client through the snapshot leg. The DEFAULT
     // mints the id, which the writer reads back for the convergence assertion.
-    let mut writer = connect_server("parity-writer", base).await;
+    let mut writer = connect_server("parity-writer", base, writer_token).await;
     let snapshot_id = write_row(&mut writer, 1).await;
     stage("writer seeded the snapshot row");
 
-    let mut fixture = ParityFixture::setup(base, "parity-orders").await;
+    let mut fixture = ParityFixture::setup(base, "parity-orders", direct_token, relay_token).await;
 
     // Snapshot parity: both clients received the pre-existing row, and their
     // mirrors are identical.
@@ -63,8 +69,12 @@ async fn row_live_query_is_relay_transparent() {
 async fn aggregate_is_relay_transparent() {
     let base = unique_base();
 
-    let mut writer = connect_server("parity-agg-writer", base).await;
-    let mut fixture = ParityFixture::setup(base, "parity-agg").await;
+    let writer_token = mint_token().await;
+    let direct_token = mint_token().await;
+    let relay_token = mint_token().await;
+
+    let mut writer = connect_server("parity-agg-writer", base, writer_token).await;
+    let mut fixture = ParityFixture::setup(base, "parity-agg", direct_token, relay_token).await;
 
     // Both clients subscribe to the same global aggregate.
     fixture

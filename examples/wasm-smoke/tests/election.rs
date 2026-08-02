@@ -1,21 +1,15 @@
-//! Multi-page leader election: two candidate pages race for one leader lock,
-//! the winner owns the dedicated DB worker, and dropping the leader promotes
-//! the survivor, which spawns a replacement worker and serves the tab a row
-//! written while the topology had no worker at all.
+//! Multi-context leader election: two candidate contexts race for one leader
+//! lock, the winner owns the dedicated DB worker, and dropping the leader
+//! promotes the survivor, which spawns a replacement worker and serves the tab
+//! a row written while the topology had no worker at all.
 //!
-//! This is the election leg on top of the failover machinery: `failover.rs`
-//! proves that a freshly spawned replacement worker resumes the OPFS replica
-//! and the tab reconnects, and this test proves the election picks which
-//! surviving page spawns that replacement. Two candidates in one page model
-//! the multi-page race faithfully, since Web Locks serializes lock requests
-//! across every same-origin context, and dropping a leader's `Membership`
-//! does what the browser does on context death: terminate the child worker
-//! and release the leader lock.
-//!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test election`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use core::time::Duration;
 
@@ -34,7 +28,7 @@ use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// Progress marker for diagnosing a harness timeout: the stages appear in
 /// the captured console output.
@@ -99,7 +93,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -213,7 +207,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
         BroadcastTransport::with_peer_liveness(&wire, DB_ALIVE_LOCK).expect("boot wire");
     let config = ClientConfig {
         client_id: client_id.clone(),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

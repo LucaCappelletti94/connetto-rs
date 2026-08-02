@@ -150,8 +150,8 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     /// Probe conflicts, apply one upload, and advance the durable watermark in
     /// the same transaction, reporting the outcome. The apply runs under
     /// `ctx.user_id`, so Postgres RLS gates it, and the watermark is keyed by
-    /// `(user_id, session_id)`, both from the verified access token, so a
-    /// reconnect reusing the same session dedupes replayed uploads.
+    /// `session_id` alone, the durable handle from the verified access token,
+    /// so a reconnect reusing the same session dedupes replayed uploads.
     pub(crate) async fn commit(
         &self,
         ctx: &AuthContext<W::Id>,
@@ -169,9 +169,9 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
         // The RLS GUC binds `user_id` as text via `Display`; a genuine text
-        // boundary, distinct from the typed watermark column below.
+        // boundary. The identity gates the APPLY only: the watermark below
+        // keys on the session handle alone.
         let guc_user = ctx.user_id.to_string();
-        let watermark_user = ctx.user_id.clone();
         let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
@@ -206,7 +206,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
                     // apply and its dedupe record are one atomic step. The
                     // deployment owns the table; connetto keeps the monotone
                     // GREATEST advance inside `watermark_upsert`.
-                    W::watermark_upsert(watermark_user, watermark_session, seq)
+                    W::watermark_upsert(watermark_session, seq)
                         .execute(c)
                         .await?;
                     Ok(WriteOutcome::Applied)
@@ -225,12 +225,11 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         }
     }
 
-    /// The highest `client_seq` durably applied for `(user_id, session_id)`,
-    /// read at handshake so the ack can carry it. The deployment owns the
-    /// watermark table; connetto emits no DDL for it.
+    /// The highest `client_seq` durably applied for this session handle, read
+    /// at handshake so the ack can carry it. The deployment owns the watermark
+    /// table; connetto emits no DDL for it.
     pub(crate) async fn last_applied(
         &self,
-        ctx: &AuthContext<W::Id>,
         session_id: SessionId,
     ) -> Result<Option<u64>, WriteError> {
         let mut conn = self
@@ -238,10 +237,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        let filtered = FilterDsl::filter(
-            W::WatermarkQuery::default(),
-            W::wm_pk(ctx.user_id.clone(), session_id),
-        );
+        let filtered = FilterDsl::filter(W::WatermarkQuery::default(), W::wm_pk(session_id));
         let query = SelectDsl::select(filtered, W::LastSeq::default());
         let last_seq: Option<i64> = query
             .first(&mut conn)

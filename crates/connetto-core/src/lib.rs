@@ -43,7 +43,7 @@ pub mod transport;
 pub mod version;
 pub mod write;
 
-pub use auth::{AuthContext, TrustingSessionVerifier, VerifiedSession};
+pub use auth::{AuthContext, VerifiedSession};
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};

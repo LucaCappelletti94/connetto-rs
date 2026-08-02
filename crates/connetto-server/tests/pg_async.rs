@@ -6,8 +6,11 @@
 //! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
 
+use std::sync::Arc;
+
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
@@ -330,6 +333,7 @@ async fn async_pg_reexec_bootstraps_min() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         connector,
         target,
         SessionConfig::default(),
@@ -526,6 +530,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         connector,
         target,
         SessionConfig::default(),

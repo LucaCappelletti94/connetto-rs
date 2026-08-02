@@ -109,13 +109,13 @@ pub fn glue_url() -> String {
 ///
 /// Announces the channel and waits for the worker's attachment ack first, so
 /// the handshake cannot outrun the worker's end of the channel.
-pub async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> {
+pub async fn connect_tab(client_id: &str, token: String) -> ConnettoConnection<BroadcastTransport> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
     let transport = BroadcastTransport::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        auth_token: token,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -131,13 +131,17 @@ pub async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTranspo
 }
 
 /// Connect a client directly to `connetto-server` over a `BrowserSocket`.
-pub async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
+pub async fn connect_server(
+    name: &str,
+    tag: i64,
+    token: String,
+) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: "token".to_owned(),
+        auth_token: token,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -257,7 +261,12 @@ impl ParityFixture {
     /// The caller seeds any pre-existing rows through a writer BEFORE calling
     /// this, so both the worker replica and the direct client snapshot them.
     /// `base` names this run's unique id band and the leader lock.
-    pub async fn setup(base: i64, sub_id: &str) -> ParityFixture {
+    pub async fn setup(
+        base: i64,
+        sub_id: &str,
+        direct_token: String,
+        relay_token: String,
+    ) -> ParityFixture {
         relay_worker_breadcrumbs();
 
         // This page wins the leader election and owns the DB worker that hosts
@@ -267,7 +276,7 @@ impl ParityFixture {
         stage("db worker ready");
 
         // The direct client: a plain server session, the parity reference.
-        let mut direct = connect_server("parity-direct", base).await;
+        let mut direct = connect_server("parity-direct", base, direct_token).await;
         direct
             .subscribe(&format!("{sub_id}-direct"), DEMO_QUERY)
             .await
@@ -282,7 +291,7 @@ impl ParityFixture {
         // protocol the hub's reaper requires.
         let client_id = format!("parity-tab-{base}");
         let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-        let mut relay = connect_tab(&client_id).await;
+        let mut relay = connect_tab(&client_id, relay_token).await;
         relay
             .subscribe(&format!("{sub_id}-relay"), DEMO_QUERY)
             .await

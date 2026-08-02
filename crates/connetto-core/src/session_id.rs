@@ -51,12 +51,11 @@ impl SessionId {
 
     /// Derive a session id deterministically from a credential string.
     ///
-    /// Used by the non-production
-    /// [`TrustingSessionVerifier`](crate::auth::TrustingSessionVerifier), where
-    /// the presented token stands in for a verified session. Deterministic so
-    /// that a reconnect presenting the same token lands on the same watermark
-    /// key, which is the property that makes the exactly-once gate work in the
-    /// test and local-loop paths.
+    /// Used by the test-support session verifier, where the presented token
+    /// stands in for a verified session. Deterministic so that a reconnect
+    /// presenting the same token lands on the same watermark key, which is the
+    /// property that makes the exactly-once gate work in the test and
+    /// local-loop paths.
     #[must_use]
     pub fn from_token_hash(token: &str) -> Self {
         use sha2::{Digest, Sha256};
@@ -64,6 +63,16 @@ impl SessionId {
         let mut bytes = [0_u8; 16];
         bytes.copy_from_slice(&digest[..16]);
         Self(uuid::Uuid::from_bytes(bytes))
+    }
+
+    /// Fold the 128-bit id into the `u64` key subql's per-session cursors and
+    /// pending buffers are addressed by. Deterministic per handle, so a
+    /// reconnect on the same session resumes the same cursor slot where the
+    /// old per-connection counter never could.
+    #[must_use]
+    pub fn as_u64_key(&self) -> u64 {
+        let (hi, lo) = self.0.as_u64_pair();
+        hi ^ lo
     }
 }
 

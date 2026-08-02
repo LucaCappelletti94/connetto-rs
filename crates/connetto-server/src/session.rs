@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use connetto_core::auth::{AuthContext, TrustingSessionVerifier};
+use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
@@ -258,13 +258,18 @@ enum Outbound {
     Live(LivePatch),
     /// An aggregate value update (control plane, never credit-gated).
     Aggregate(AggregateUpdate),
+    /// A fatal close: the pump sends it as a control frame and ends the
+    /// session (revocation and supersession arrive this way).
+    Fatal(FatalError),
 }
 
 /// Route from a `subql` consumer id back to the owning session's outbound
 /// channel.
 #[derive(Clone)]
 struct Route<Id> {
-    connection_num: u64,
+    /// The durable handle folded to the `u64` subql keys this session's
+    /// per-subscription cursors on, stable across reconnects.
+    session_key: u64,
     sub_id: SubscriptionId,
     label: String,
     tx: mpsc::UnboundedSender<Outbound>,
@@ -278,6 +283,13 @@ struct Route<Id> {
 #[derive(Clone)]
 struct AggRoute {
     label: String,
+    tx: mpsc::UnboundedSender<Outbound>,
+}
+
+/// A live connection in the session registry: the socket counter that owns
+/// the entry and the outbound channel a fatal close is delivered on.
+struct LiveSession {
+    connection_num: u64,
     tx: mpsc::UnboundedSender<Outbound>,
 }
 
@@ -378,14 +390,16 @@ where
     /// `agg_routes` (keyed by re-execution query id) because the two u64
     /// keyspaces are distinct and could otherwise collide.
     delta_agg_routes: Mutex<HashMap<u64, AggRoute>>,
+    /// Live connections keyed by the durable session handle, for revocation
+    /// and supersession. The per-subscription route map cannot serve either,
+    /// because a session with no subscriptions has no route.
+    sessions: Mutex<HashMap<SessionId, LiveSession>>,
     snapshot_source: Snap,
     auth: Auth,
     /// Turns the handshake `auth_token` into the session [`AuthContext`]. A
     /// runtime trait object so a deployment configures identity without
-    /// changing the manager's type. Defaults to
-    /// [`TrustingSessionVerifier`], which trusts the token and closes no
-    /// spoofing hole, so a production deployment injects a real verifier
-    /// through [`with_session_verifier`](Self::with_session_verifier).
+    /// changing the manager's type. Required at construction with no default,
+    /// because the deleted trusting default was itself the spoofing hole (R2).
     verifier: Arc<dyn SessionVerifier<Id>>,
     connector: C,
     oplog: O,
@@ -404,7 +418,9 @@ where
     /// Build a manager with no re-execution connector and a default in-memory
     /// oplog.
     ///
-    /// Aggregate subscriptions need a connector; use
+    /// The `verifier` is required: nothing installs one by default, so a
+    /// deployment chooses its identity story explicitly. Aggregate
+    /// subscriptions need a connector; use
     /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
     /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
     #[must_use]
@@ -412,6 +428,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
+        verifier: Arc<dyn SessionVerifier>,
         target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
@@ -419,6 +436,7 @@ where
             materializer,
             snapshot_source,
             auth,
+            verifier,
             NoConnector,
             InMemoryOplog::default(),
             target,
@@ -442,6 +460,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
+        verifier: Arc<dyn SessionVerifier>,
         connector: C,
         target: PgWriteTarget<W>,
         config: SessionConfig,
@@ -450,6 +469,7 @@ where
             materializer,
             snapshot_source,
             auth,
+            verifier,
             connector,
             InMemoryOplog::default(),
             target,
@@ -468,11 +488,17 @@ where
     W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with an explicit re-execution connector and oplog.
+    // Every collaborator the manager owns arrives here explicitly. The other
+    // two constructors delegate to it with defaults, so this is the one place
+    // the full set is named, and grouping it into a config struct would only
+    // move the same arity behind another type.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_oplog(
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
+        verifier: Arc<dyn SessionVerifier>,
         connector: C,
         oplog: O,
         target: PgWriteTarget<W>,
@@ -483,9 +509,10 @@ where
             routes: Mutex::new(HashMap::new()),
             agg_routes: Mutex::new(HashMap::new()),
             delta_agg_routes: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             snapshot_source,
             auth,
-            verifier: Arc::new(TrustingSessionVerifier),
+            verifier,
             connector,
             oplog,
             target,
@@ -506,34 +533,71 @@ where
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
-    /// Replace the session verifier that resolves identity at the handshake.
-    ///
-    /// The default is [`TrustingSessionVerifier`], which verifies nothing. A
-    /// production deployment injects a real verifier here. Call this
-    /// immediately after a constructor, while the manager is still solely
-    /// owned, before any clone or spawn.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the manager is already shared (its `Arc` has other owners),
-    /// because the verifier must be set before the manager is put to work.
-    #[must_use]
-    pub fn with_session_verifier(
-        self: Arc<Self>,
-        verifier: Arc<dyn SessionVerifier<Id>>,
-    ) -> Arc<Self> {
-        let mut inner = Arc::into_inner(self)
-            .expect("with_session_verifier must run before the manager is shared");
-        inner.verifier = verifier;
-        Arc::new(inner)
-    }
-
     fn next_connection_num(&self) -> u64 {
         self.next_session.fetch_add(1, Ordering::Relaxed)
     }
 
     fn next_consumer_id(&self) -> u64 {
         self.next_consumer.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Close `session_id`'s live connection, if one exists, sending `reason`
+    /// as a fatal frame first. Returns whether a live connection was found.
+    ///
+    /// The revocation path (`FatalErrorReason::SessionRevoked`): revoking a
+    /// session closes its live connection rather than only refusing its next
+    /// handshake.
+    pub async fn close_session(&self, session_id: SessionId, reason: FatalErrorReason) -> bool {
+        let live = { self.sessions.lock().await.remove(&session_id) };
+        match live {
+            Some(live) => {
+                let _ = live.tx.send(Outbound::Fatal(FatalError::new(reason)));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Claim `session_id` for this connection, superseding whatever held it.
+    ///
+    /// One live connection per durable handle, newer wins. Two connections
+    /// must not share a handle, because the handle keys the per-subscription
+    /// cursors and the pending buffer, and two readers would each consume the
+    /// other's changes. Last-wins also makes a reconnect racing its own
+    /// half-dead socket self-heal.
+    async fn register_connection(
+        &self,
+        session_id: SessionId,
+        connection_num: u64,
+        tx: &mpsc::UnboundedSender<Outbound>,
+    ) {
+        let superseded = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(
+                session_id,
+                LiveSession {
+                    connection_num,
+                    tx: tx.clone(),
+                },
+            )
+        };
+        if let Some(old) = superseded {
+            let _ = old.tx.send(Outbound::Fatal(FatalError::new(
+                FatalErrorReason::ConnectionSuperseded,
+            )));
+        }
+    }
+
+    /// Drop the registry entry only if this connection still owns it: a
+    /// superseded connection's cleanup must not evict its successor.
+    async fn unregister_connection(&self, session_id: SessionId, connection_num: u64) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&session_id)
+            .is_some_and(|live| live.connection_num == connection_num)
+        {
+            sessions.remove(&session_id);
+        }
     }
 
     async fn add_route(&self, consumer_id: u64, route: Route<Id>) {
@@ -611,7 +675,7 @@ where
             {
                 counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
                 self.materializer.lock().await.advance_cursor(
-                    route.connection_num,
+                    route.session_key,
                     route.sub_id,
                     &patch.cursor,
                 )?;
@@ -850,7 +914,7 @@ where
         // at or below it and replays the rest.
         let applied_watermark = self
             .target
-            .last_applied(&auth_ctx, token_session_id)
+            .last_applied(token_session_id)
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
 
@@ -858,7 +922,7 @@ where
         transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 connection_id: format!("connection-{connection_num}"),
-                session_token: format!("token-{connection_num}"),
+                session_token: token_session_id.to_string(),
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
@@ -898,6 +962,8 @@ where
         };
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        self.register_connection(session_id, connection_num, &outbound_tx)
+            .await;
         let mut state = SessionState {
             credits: self.config.initial_credits,
             pending: VecDeque::new(),
@@ -918,7 +984,7 @@ where
                     match incoming.map_err(transport_err)? {
                         None => break,
                         Some(IncomingFrame::Control(msg)) => {
-                            self.handle_control(&mut transport, msg, &mut state, connection_num).await?;
+                            self.handle_control(&mut transport, msg, &mut state).await?;
                         }
                         Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
                             self.handle_mutation(&mut transport, patch, &mut state).await?;
@@ -949,10 +1015,18 @@ where
                                 .await
                                 .map_err(transport_err)?;
                         }
+                        Outbound::Fatal(fatal) => {
+                            let _ = transport
+                                .send_control(ControlMessage::FatalError(fatal))
+                                .await;
+                            break;
+                        }
                     }
                 }
             }
         }
+
+        self.unregister_connection(session_id, connection_num).await;
 
         for (consumer_id, sub_id) in state.subs.into_values() {
             self.remove_route(consumer_id).await;
@@ -980,13 +1054,9 @@ where
         transport: &mut T,
         msg: ControlMessage,
         state: &mut SessionState<Id>,
-        connection_num: u64,
     ) -> Result<(), SessionError> {
         match msg {
-            ControlMessage::Subscribe(sub) => {
-                self.handle_subscribe(transport, sub, state, connection_num)
-                    .await
-            }
+            ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
                 if let Some((consumer_id, sub_id)) = state.subs.remove(&unsub.sub_id) {
                     self.remove_route(consumer_id).await;
@@ -1193,7 +1263,6 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        connection_num: u64,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
         let SqliteRegistration {
@@ -1225,10 +1294,7 @@ where
                     sub_id,
                     pg_sql,
                 };
-                match self
-                    .subscribe_row(transport, sub, state, connection_num, reg)
-                    .await
-                {
+                match self.subscribe_row(transport, sub, state, reg).await {
                     // A snapshot failure is scoped to this one subscription:
                     // the registration is rolled back and the session (with
                     // every sibling subscription) stays alive. Transport and
@@ -1270,7 +1336,6 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        connection_num: u64,
         reg: RowRegistration,
     ) -> Result<(), SessionError> {
         if state.resume_lsn != 0 {
@@ -1278,9 +1343,7 @@ where
             let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
             match catchup_decision(state.resume_lsn, min, current) {
                 CatchupDecision::Catchup => {
-                    return self
-                        .catch_up_row(transport, sub, state, connection_num, &reg)
-                        .await;
+                    return self.catch_up_row(transport, sub, state, &reg).await;
                 }
                 CatchupDecision::FullResync => {
                     transport
@@ -1293,8 +1356,7 @@ where
                 }
             }
         }
-        self.snapshot_row(transport, sub, state, connection_num, &reg)
-            .await
+        self.snapshot_row(transport, sub, state, &reg).await
     }
 
     /// Snapshot a row subscription: begin, patch, end, then route live patches.
@@ -1303,7 +1365,6 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        connection_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         transport
@@ -1338,7 +1399,7 @@ where
         self.add_route(
             reg.consumer_id,
             Route {
-                connection_num,
+                session_key: state.session_id.as_u64_key(),
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
@@ -1366,13 +1427,12 @@ where
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id>,
-        connection_num: u64,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         self.add_route(
             reg.consumer_id,
             Route {
-                connection_num,
+                session_key: state.session_id.as_u64_key(),
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
@@ -1431,7 +1491,7 @@ where
             let cursor = record.lsn().to_be_bytes().to_vec();
             {
                 self.materializer.lock().await.advance_cursor(
-                    connection_num,
+                    state.session_id.as_u64_key(),
                     reg.sub_id,
                     &cursor,
                 )?;

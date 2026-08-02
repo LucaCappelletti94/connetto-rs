@@ -11,10 +11,15 @@
 //! handshake with a distinctive schema version, so no real server or Postgres
 //! is needed.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
+//! commands. No server or Postgres is needed; only the identity provider and
+//! login server are required to mint the session tokens the clients carry.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test handshake`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, Handshake, HandshakeAck};
@@ -60,6 +65,7 @@ async fn schema_upstream(mut server: LoopbackTransport) {
 #[wasm_bindgen_test]
 async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     let base = unique_base();
+    let tab_token = common::mint_token().await;
     let upstream_version = SchemaVersion::from_hash(SCHEMA_HASH.to_vec());
 
     let (worker_up, fake_up) = loopback();
@@ -67,7 +73,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
 
     let worker_config = ClientConfig {
         client_id: format!("handshake-worker-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -92,7 +98,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
         format!("handshake-tab-{base}"),
-        "token",
+        &tab_token,
     )))
     .await
     .expect("tab handshake");

@@ -9,10 +9,14 @@
 //! The worker's upstream is a fake server over a loopback that advertises a
 //! distinctive schema version, so no real server or Postgres is needed.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
+//! commands. No server or Postgres is needed for this test.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test schema`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
@@ -59,7 +63,7 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
     spawn_local(schema_upstream(fake_up, server_version.clone()));
     let worker_config = ClientConfig {
         client_id: format!("schema-worker-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         // The worker presents the same version the upstream advertises, so it
         // connects and then forwards that version to tabs.
         schema_version: Some(server_version),
@@ -87,7 +91,7 @@ async fn stale_tab_is_rejected_through_the_relay() {
     hub.attach(relay_end);
     let stale = ClientConfig {
         client_id: format!("schema-tab-stale-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -115,7 +119,7 @@ async fn matching_tab_connects_through_the_relay() {
     hub.attach(relay_end);
     let fresh = ClientConfig {
         client_id: format!("schema-tab-fresh-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(version),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

@@ -15,10 +15,14 @@
 //! the same approach the native test uses. The tab stays attached to the hub
 //! throughout, exercising the hub's resync fan-out.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
+//! commands. No server or Postgres is needed for this test.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test resync`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
@@ -218,7 +222,7 @@ async fn full_resync_is_relay_transparent() {
 
     let worker_config = ClientConfig {
         client_id: format!("resync-worker-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
@@ -255,7 +259,7 @@ async fn full_resync_is_relay_transparent() {
     hub.attach(relay_end);
     let tab_config = ClientConfig {
         client_id: format!("resync-tab-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };

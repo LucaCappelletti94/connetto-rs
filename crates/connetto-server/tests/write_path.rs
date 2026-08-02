@@ -14,10 +14,12 @@
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{ControlMessage, MutationRejectReason};
-use connetto_core::traits::{AuthPolicy, MutationOp};
+use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
@@ -31,6 +33,9 @@ use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, U
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
 struct NoSnapshot;
@@ -206,6 +211,7 @@ async fn write_path_applies_conflicts_and_dedups() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -310,6 +316,7 @@ async fn write_path_rejects_unauthorized() {
         materializer,
         NoSnapshot,
         DenyAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -357,6 +364,7 @@ async fn watermark_survives_reconnect_reusing_session() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );

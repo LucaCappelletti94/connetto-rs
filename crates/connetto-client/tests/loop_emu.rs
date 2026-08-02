@@ -21,7 +21,7 @@ use connetto_client::{
     AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, KeyValue,
     LiveQuery, Replica, Watchable,
 };
-use connetto_core::Cursor;
+use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
 use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
     Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
@@ -40,6 +40,10 @@ const PG_DDL: &str =
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
 
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
@@ -333,6 +337,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         server_write_target(&fixture),
         SessionConfig::default(),
     );
@@ -481,6 +486,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         server_write_target(&fixture),
         SessionConfig::default(),
     );
@@ -613,6 +619,7 @@ async fn connection_is_a_diesel_connection() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         server_write_target(&fixture),
         SessionConfig::default(),
     );
@@ -716,6 +723,7 @@ async fn rejected_write_rolls_back_locally() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -832,6 +840,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -937,7 +946,12 @@ async fn connect_client(
         .expect("ws connect");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        // One user, one session per client. The test verifier reads the part
+        // before the `#` as the identity, so these stay the same caller while
+        // holding distinct durable handles, which is what two devices of one
+        // person look like. Sharing a handle would make the newer connection
+        // supersede the older.
+        auth_token: format!("token#{client_id}"),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
@@ -973,6 +987,7 @@ async fn conflicting_write_converges_to_server_after_rollback() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -1225,6 +1240,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -1309,6 +1325,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -1422,6 +1439,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -1515,6 +1533,7 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -1580,6 +1599,7 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -1642,6 +1662,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -1740,6 +1761,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -1844,6 +1866,7 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -1965,6 +1988,7 @@ async fn live_value_tracks_a_server_aggregate() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -2090,6 +2114,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -2174,6 +2199,7 @@ async fn identical_row_watches_share_one_subscription() {
             seen: Arc::clone(&seen),
         },
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -2319,6 +2345,7 @@ async fn distinct_row_queries_do_not_collapse() {
             seen: Arc::clone(&seen),
         },
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -2397,6 +2424,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -2544,6 +2572,7 @@ async fn watch_fn_drives_a_boxed_row_query() {
         materializer,
         seed,
         PermissiveAuth,
+        test_verifier(),
         gadgets_write_target(&fixture),
         SessionConfig::default(),
     );
@@ -2666,6 +2695,7 @@ async fn watch_fn_shares_a_subscription_with_watch() {
             seen: Arc::clone(&seen),
         },
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );
@@ -2745,6 +2775,7 @@ async fn watch_fn_rejects_an_aggregate_query() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );

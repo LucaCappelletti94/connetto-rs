@@ -8,10 +8,13 @@
 //! the pump, and a second connection to the same OPFS file proves the write
 //! persisted and still decrypts.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test opfs`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{
     ClientConfig, ConnettoClient, ConnettoConnection, Replica, ReplicaKey, cipher::cipher_url,
@@ -96,7 +99,7 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
 
     let config = ClientConfig {
         client_id: format!("wasm-opfs-{}", unique_id()),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

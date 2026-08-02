@@ -36,8 +36,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::SessionVerifier;
 use connetto_core::{SchemaVersion, SessionId};
+use connetto_server::watermark_schema::check_watermark_shape;
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
     GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
@@ -53,6 +55,24 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+/// Whether `origin` is a loopback origin, so script served from it may read a
+/// login response without being listed.
+///
+/// Parsed rather than string-matched, mirroring the redirect policy's own
+/// loopback rule, so a host like `127.0.0.1.evil.example` cannot pass.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
 
 // The reference binary uses the default connetto auth and watermark tables over
 // `Id = String` (Text `user_id`), matching the `DefaultUuidResolver`. These
@@ -60,7 +80,7 @@ use tokio::net::TcpListener;
 // `ConnettoAuthSchema`, and the `_connetto_mutations` table plus
 // `ConnettoWatermark`. connetto emits no DDL; the deployment runs the migration.
 connetto_auth_tables!(String, diesel::sql_types::Text);
-connetto_watermark_table!(String, diesel::sql_types::Text);
+connetto_watermark_table!(String);
 
 /// The auth store chosen at startup. A single concrete type so the auth
 /// service and session-verifier futures stay `Send`.
@@ -335,6 +355,19 @@ async fn main() -> Result<()> {
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
 
+    // The session verifier is a required constructor argument with no default
+    // (R2), so the auth service is built first and the server refuses to run
+    // without one: an unset CONNETTO_AUTH would otherwise mean a handshake
+    // that trusts whatever identity the client claims.
+    let Some((service, registry)) = build_auth(&pool).await? else {
+        return Err(anyhow!(
+            "set CONNETTO_AUTH to in-memory or database: the server refuses to run \
+             without a session verifier, because the handshake would otherwise trust \
+             whatever identity the client claims"
+        ));
+    };
+    let verifier: Arc<dyn SessionVerifier> = Arc::new(service.verifier());
+
     // Snapshots, read authorization, and the write apply all run under RLS as
     // the reader role, which must be subject to RLS (non-superuser, not the
     // table owner). Postgres applies no policy to a superuser or table owner,
@@ -347,6 +380,17 @@ async fn main() -> Result<()> {
         )
     })?;
     let reader_pool = build_pool(&reader_url).await?;
+    // Refuse a watermark table whose shape mismatches this build's key: a
+    // mis-keyed exactly-once record stays silent until a replay happens.
+    {
+        let mut conn = reader_pool
+            .get()
+            .await
+            .map_err(|err| anyhow!("connecting as the reader role: {err}"))?;
+        check_watermark_shape::<ConnettoWatermark>(&mut conn)
+            .await
+            .map_err(|err| anyhow!("{err}"))?;
+    }
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?;
     let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)
@@ -358,6 +402,7 @@ async fn main() -> Result<()> {
         materializer,
         snapshot,
         auth,
+        verifier,
         connector,
         write,
         SessionConfig {
@@ -365,44 +410,69 @@ async fn main() -> Result<()> {
             ..SessionConfig::default()
         },
     );
-    // When CONNETTO_AUTH is set, mint and verify connetto's own tokens: serve
-    // the login and refresh endpoints and inject the real session verifier so
-    // the handshake trusts only a token connetto signed. Injection happens here
-    // while the manager is still solely owned, before run clones it.
-    let manager = match build_auth(&pool).await? {
-        Some((service, registry)) => {
-            let auth_bind = env_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
-            let verifier: Arc<dyn SessionVerifier> = Arc::new(service.verifier());
-            // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
-            // non-loopback client redirect URIs the deployment permits (a browser
-            // deployment lists its own callback). Loopback redirects are always
-            // allowed, so a native client needs no entry.
-            let allowlist = env_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_owned)
-                .collect();
-            let router = auth_router(
-                Arc::clone(&service),
-                registry,
-                RedirectPolicy::new(allowlist),
-            );
+    // Revoking a session closes its live connection rather than only refusing
+    // its next handshake. The hook fires synchronously inside the revoke, so
+    // the close itself rides a spawned task.
+    {
+        let revoke_manager = Arc::clone(&manager);
+        service.set_revocation_hook(Arc::new(move |session_id| {
+            let manager = Arc::clone(&revoke_manager);
             tokio::spawn(async move {
-                match TcpListener::bind(&auth_bind).await {
-                    Ok(listener) => {
-                        eprintln!("connetto-server auth endpoints on {auth_bind}");
-                        if let Err(err) = axum::serve(listener, router).await {
-                            eprintln!("auth server stopped: {err}");
-                        }
-                    }
-                    Err(err) => eprintln!("binding auth endpoints {auth_bind}: {err}"),
-                }
+                manager
+                    .close_session(session_id, FatalErrorReason::SessionRevoked)
+                    .await;
             });
-            manager.with_session_verifier(verifier)
+        }));
+    }
+    // Serve the login and refresh endpoints beside the sync listener.
+    let auth_bind = env_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
+    // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
+    // non-loopback client redirect URIs the deployment permits (a browser
+    // deployment lists its own callback). Loopback redirects are always
+    // allowed, so a native client needs no entry.
+    let allowlist = env_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // CONNETTO_AUTH_CORS_ORIGINS is a comma-separated list of exact origins
+    // whose script may read a login response. A browser deployment serves its
+    // app on a different origin from these endpoints, so without this the
+    // browser refuses to hand the response to the page. Loopback origins are
+    // always allowed, mirroring the redirect policy's loopback rule and for
+    // the same reason: script on a loopback origin is already on the machine.
+    let cors_origins: Vec<String> = env_or("CONNETTO_AUTH_CORS_ORIGINS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
+            origin.to_str().is_ok_and(|origin| {
+                is_loopback_origin(origin) || cors_origins.iter().any(|allowed| allowed == origin)
+            })
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any);
+    let router = auth_router(
+        Arc::clone(&service),
+        registry,
+        RedirectPolicy::new(allowlist),
+    )
+    .layer(cors);
+    tokio::spawn(async move {
+        match TcpListener::bind(&auth_bind).await {
+            Ok(listener) => {
+                eprintln!("connetto-server auth endpoints on {auth_bind}");
+                if let Err(err) = axum::serve(listener, router).await {
+                    eprintln!("auth server stopped: {err}");
+                }
+            }
+            Err(err) => eprintln!("binding auth endpoints {auth_bind}: {err}"),
         }
-        None => manager,
-    };
+    });
     run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
 }
 

@@ -4,11 +4,15 @@
 //! row query renders its rows and a COUNT(*) aggregate renders its pushed
 //! value, in the same component.
 
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Replica};
-use connetto_core::{Cursor, test_support::replica_key};
+use connetto_core::{
+    Cursor,
+    test_support::{TestSessionVerifier, replica_key},
+    traits::SessionVerifier,
+};
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -22,6 +26,10 @@ use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
+
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
@@ -225,6 +233,7 @@ async fn use_live_renders_and_follows_cdc() {
         materializer,
         EmptySnapshot,
         PermissiveAuth,
+        test_verifier(),
         connector,
         target,
         SessionConfig::default(),
@@ -310,6 +319,7 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         materializer,
         SeedOneOrder,
         PermissiveAuth,
+        test_verifier(),
         target,
         SessionConfig::default(),
     );

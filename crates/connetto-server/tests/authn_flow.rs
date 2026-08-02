@@ -92,11 +92,11 @@ fn manager_with(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot,
         PermissiveAuth,
+        verifier,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
     )
-    .with_session_verifier(verifier)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,6 +182,72 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     assert_eq!(fatal.reason, FatalErrorReason::AuthenticationFailed);
     let outcome = server.await.expect("join");
     assert!(matches!(outcome, Err(SessionError::Authentication(_))));
+}
+
+/// R2: revoking a session closes its live connection rather than only refusing
+/// the next handshake, and it does so through the real logout path.
+///
+/// The deployment wires `AuthService`'s revocation observer at the manager,
+/// exactly as the server binary does, so a logout reaches the connection
+/// registry. Without the hook a revoked caller keeps streaming until it
+/// happens to reconnect, which is the gap this closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn logout_closes_the_live_connection_it_revoked() {
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service();
+    let pair = svc.login(&identity("dave")).await.expect("login");
+    let manager = manager_with(
+        Arc::new(svc.verifier()),
+        CapturingSnapshot::default(),
+        &fixture,
+    );
+
+    // The binary's wiring: a revoke closes the session's live connection.
+    {
+        let revoke_manager = Arc::clone(&manager);
+        svc.set_revocation_hook(Arc::new(move |session_id| {
+            let manager = Arc::clone(&revoke_manager);
+            tokio::spawn(async move {
+                manager
+                    .close_session(session_id, FatalErrorReason::SessionRevoked)
+                    .await;
+            });
+        }));
+    }
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(Arc::clone(&manager).serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(Handshake::new(
+            PROTOCOL_VERSION,
+            "dave-device",
+            &pair.access_token,
+        )))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+
+    // The logout endpoint's own path: verify the refresh token, revoke, and
+    // (through the hook) close whatever connection that session still holds.
+    assert!(
+        svc.logout(&pair.refresh_token).await.expect("logout"),
+        "the refresh token names a live session"
+    );
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let ControlMessage::FatalError(fatal) = next_control(&mut client).await {
+                return fatal;
+            }
+        }
+    })
+    .await
+    .expect("the revoked connection must be closed, not left streaming");
+    assert_eq!(closed.reason, FatalErrorReason::SessionRevoked);
+    let _ = server.await.expect("join");
 }
 
 #[tokio::test]

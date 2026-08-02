@@ -1,17 +1,19 @@
-//! Active reloading on the PAGE main thread, no worker, no proxy: the full
-//! client (memory VFS replica, pump under `spawn_local`, typed `live()`)
-//! runs directly in the page, and a change made by a SECOND client arrives
-//! through the real server and refreshes the first client's live handle.
+//! Two independent clients against the real server: the full client (memory
+//! VFS replica, pump under `spawn_local`, typed `live()`) running in a
+//! dedicated worker, and a change made by a second client arriving through
+//! the real server refreshing the first client's live handle.
 //!
-//! This pins the baseline the tab proxy work builds on: single tab apps
-//! without OPFS persistence need no worker at all, the page is just another
-//! replication tier. The worker topology adds persistence and multi tab
-//! sharing, not reactivity.
+//! This pins the baseline the tab proxy work builds on: single-context apps
+//! without OPFS persistence need no worker separation. The worker topology
+//! adds persistence and multi-tab sharing, not reactivity.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test page`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{
@@ -21,7 +23,7 @@ use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 
@@ -56,7 +58,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{}", unique_id()),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -67,7 +69,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
 
 #[wasm_bindgen_test]
 async fn page_live_query_reloads_on_another_clients_write() {
-    // The observing client lives on the page main thread.
+    // The observing client runs in a dedicated worker, same as the data tier.
     let (observer, pump) = ConnettoClient::with_pump(connect("page-observer").await);
     wasm_bindgen_futures::spawn_local(pump);
     let mut live: LiveQuery<Order> = orders::table
@@ -112,11 +114,10 @@ async fn page_live_query_reloads_on_another_clients_write() {
     }
     writer.close().await.expect("close writer");
 
-    // Active reload on the page: the observer's handle refreshes with no
-    // local interaction at all. The snapshot and the echo each bump the
-    // handle once, in either interleaving, so wait until the written row is
-    // visible rather than counting refreshes. The harness timeout bounds
-    // the loop.
+    // Active reload: the observer's handle refreshes with no local interaction
+    // at all. The snapshot and the echo each bump the handle once, in either
+    // interleaving, so wait until the written row is visible. The harness
+    // timeout bounds the loop.
     loop {
         if live.rows().iter().any(|row| row.id == id) {
             break;

@@ -51,11 +51,11 @@ pub mod fanout;
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
 pub type RowValue = Value<String, Vec<u8>>;
 
-/// The reference watermark schema over `Id = String` (`TEXT user_id`), the shape
-/// every harness-backed test uses. connetto ships no schema, so the harness owns
+/// The reference watermark schema over `Id = String`, the shape every
+/// harness-backed test uses. connetto ships no schema, so the harness owns
 /// this reference via the macro, matching [`WATERMARK_DDL`].
 pub mod watermark {
-    connetto_server::connetto_watermark_table!(String, diesel::sql_types::Text);
+    connetto_server::connetto_watermark_table!(String);
 }
 pub use watermark::ConnettoWatermark;
 
@@ -133,12 +133,11 @@ pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
     panic!("replication slot {SLOT} could not be dropped");
 }
 
-/// Reference DDL for the deployment-owned exactly-once watermark, keyed on
-/// `(user_id, session_id)`. connetto emits no DDL, so the harness owns this
+/// Reference DDL for the deployment-owned exactly-once watermark, keyed on the
+/// session handle alone (R2). connetto emits no DDL, so the harness owns this
 /// migration; the shape matches the `ConnettoWatermark` reference schema.
 pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
-    (user_id TEXT NOT NULL, session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
-    PRIMARY KEY (user_id, session_id))";
+    (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
 /// Create the reference watermark table if missing, as admin. A restricted
 /// writer role only needs `SELECT, INSERT, UPDATE` on it, granted separately.
@@ -359,8 +358,21 @@ pub fn spawn_server(
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let connector = PgAsyncDieselConnector::new(connector_pool);
-    let manager =
-        SessionManager::with_connector(materializer, snapshot, auth, connector, write, session);
+    // The manager requires a verifier with no default (R2). The harness is
+    // test-only, so it installs the `test-support` stand-in that resolves the
+    // presented token as the identity, which is what `Client::handshake`
+    // assumes. Nothing here is reachable from a production build.
+    let verifier: Arc<dyn connetto_core::traits::SessionVerifier> =
+        Arc::new(connetto_core::test_support::TestSessionVerifier);
+    let manager = SessionManager::with_connector(
+        materializer,
+        snapshot,
+        auth,
+        verifier,
+        connector,
+        write,
+        session,
+    );
 
     let ingest_manager = Arc::clone(&manager);
     let ddl = pg_ddl;

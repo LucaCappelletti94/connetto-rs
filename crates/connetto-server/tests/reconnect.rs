@@ -22,8 +22,9 @@ use std::time::Duration;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, Handshake, Subscribe, SubscriptionSpec,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION};
+use connetto_core::{Cursor, PROTOCOL_VERSION, SessionVerifier};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
     SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -40,6 +41,10 @@ const PG_DDL: &str =
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
 
 /// A snapshot source returning one seed row. Only the full-resync path delivers
 /// it, and that test asserts the frame sequence rather than applying it.
@@ -214,6 +219,7 @@ async fn catchup_within_window_streams_missed_ops() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -322,6 +328,7 @@ async fn cursor_outside_window_forces_full_resync() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         NoConnector,
         oplog,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
@@ -379,6 +386,7 @@ async fn tombstone_replays_the_delete() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

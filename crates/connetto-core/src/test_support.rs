@@ -21,6 +21,47 @@ pub fn replica_key() -> ReplicaKey {
     ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN])
 }
 
+/// A [`SessionVerifier`](crate::traits::SessionVerifier) that trusts the
+/// presented token as the identity, performing no cryptographic verification.
+///
+/// The test replacement for the deleted production default: it refuses only an
+/// empty token (an absent credential) and otherwise resolves the identity and
+/// the session from the token, deterministically, so a reconnect on the same
+/// token keeps its watermark. It lives behind `test-support` precisely because
+/// it verifies nothing, so no production build can reach it and no constructor
+/// installs it by default.
+///
+/// A `user#session` token names one user holding several concurrent sessions:
+/// the part before the `#` is the `user_id` and the whole token seeds the
+/// session id. A real deployment gets this from the auth store, which mints a
+/// fresh session per login, so two devices of one person never collide. A
+/// plain token with no `#` is one user with one session, which is what most
+/// suites want.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TestSessionVerifier;
+
+impl crate::traits::SessionVerifier<String> for TestSessionVerifier {
+    fn verify_session<'a>(
+        &'a self,
+        auth_token: &'a str,
+    ) -> crate::traits::SessionVerifyFuture<'a, String> {
+        Box::pin(async move {
+            if auth_token.trim().is_empty() {
+                return Err(crate::traits::SessionVerifyError::Invalid(
+                    "no auth token presented at handshake".to_owned(),
+                ));
+            }
+            let user_id = auth_token
+                .split_once('#')
+                .map_or(auth_token, |(user, _session)| user);
+            Ok(crate::auth::VerifiedSession {
+                context: crate::auth::AuthContext::new(user_id),
+                session_id: crate::SessionId::from_token_hash(auth_token),
+            })
+        })
+    }
+}
+
 /// How a [`FakeTransport`] answers the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeReply {

@@ -1,19 +1,20 @@
 //! Leader failover with the reconnect machinery: the DB worker dies
-//! mid-session and a replacement (spawned by the still-leading page,
-//! standing in for a freshly elected leader) takes over. The replacement
-//! resumes the OPFS replica from its persisted cursor and catches up from
-//! the server oplog, the tab's reconnect driver finds it through the ready
-//! handshake, and the tab converges on a row that was written while no
-//! worker existed at all.
+//! mid-session and a replacement takes over. The replacement resumes the OPFS
+//! replica from its persisted cursor and catches up from the server oplog, the
+//! tab's reconnect driver finds it through the ready handshake, and the tab
+//! converges on a row that was written while no worker existed at all.
 //!
 //! Dead-worker detection is the alive lock: a broadcast peer dies silently,
 //! so the tab's transport watches the lock the worker holds for its whole
 //! life and injects a clean close when the browser releases it.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test failover`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use core::time::Duration;
 
@@ -32,7 +33,7 @@ use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// Progress marker for diagnosing a harness timeout: the stages appear in
 /// the captured console output.
@@ -97,7 +98,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -193,7 +194,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
         BroadcastTransport::with_peer_liveness(&wire, DB_ALIVE_LOCK).expect("boot wire");
     let config = ClientConfig {
         client_id: client_id.clone(),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

@@ -83,8 +83,16 @@ url = "2"
 # comparison cannot leak a partial match through timing. ring's generic slice
 # compare is deprecated for external use, so subtle is the maintained primitive.
 subtle = "2"
+# CORS on the reference binary's auth endpoints. A browser deployment serves
+# its app on a different origin from the auth router, so script there cannot
+# read a login response without it. The library's `auth_router` stays a plain
+# Router: the binary decides.
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [dev-dependencies]
+# The session verifier is a required constructor argument with no production
+# default (R2), so the suites install the test-only stand-in from the core.
+connetto-core = { workspace = true, features = ["test-support"] }
 # Minting a local ID token to verify the provider path offline, and timestamp
 # primary keys in the Docker-gated RLS test (both are normal deps too).
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
@@ -106,9 +114,6 @@ connetto-test-harness = { path = "../connetto-test-harness" }
 # `config` cannot be dropped: the crate re-exports `config::ConfigError`
 # unconditionally and fails to build without it.
 oauth2-test-server = { version = "0.2", default-features = false, features = ["testing", "config"] }
-# The CORS layer the browser-test auth stack example puts in front of the auth
-# router. Not used by the library.
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # Reading the client binary's encrypted replica in the e2e assertions: the key
 # comes from the OS keyring where the client binary stored it, and the cipher
 # unlock applies it before counting rows.

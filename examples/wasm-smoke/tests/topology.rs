@@ -1,22 +1,21 @@
-//! The leader topology in a real page: the page wins the leader lock and
-//! spawns the dedicated DB worker (the only context kind with OPFS sync
-//! access handles), the worker owns the sahpool replica, the server
-//! connection, and the relay hub, and independent tab clients speak the
-//! wire protocol to it over per-tab `BroadcastChannel`s, with Web Locks
-//! based dead-tab reaping.
+//! The leader topology: the test wins the leader lock and spawns the dedicated
+//! DB worker, the worker owns the sahpool replica, the server connection, and
+//! the relay hub, and independent tab clients speak the wire protocol to it
+//! over per-tab `BroadcastChannel`s, with Web Locks based dead-tab reaping.
 //!
-//! One test walks every leg: a pre-existing row arrives in a tab only
-//! through the DB worker's snapshot, an external write fans out to two
-//! tabs through one server connection, a tab write rides up into Postgres
-//! and echoes to the sibling tab, releasing a tab's liveness lock gets it
-//! reaped without disturbing the survivor, and the survivor keeps
-//! receiving patches afterward. Leader failover needs the client reconnect
-//! machinery and is deferred with it.
+//! One test walks every leg: a pre-existing row arrives in a tab only through
+//! the DB worker's snapshot, an external write fans out to two tabs through one
+//! server connection, a tab write rides up into Postgres and echoes to the
+//! sibling tab, releasing a tab's liveness lock gets it reaped without
+//! disturbing the survivor, and the survivor keeps receiving patches afterward.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test topology`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Transport;
@@ -28,7 +27,7 @@ use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// Progress marker for diagnosing a harness timeout: the stages appear in
 /// the captured console output.
@@ -101,7 +100,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
     let transport = BroadcastTransport::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -122,7 +121,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

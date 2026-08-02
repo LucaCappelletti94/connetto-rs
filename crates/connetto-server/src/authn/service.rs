@@ -81,7 +81,15 @@ pub struct AuthService<S: AuthStore> {
     /// concurrent callers on one node cannot double-refresh and trip the
     /// provider's rotation-reuse defense.
     refresh_locks: Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>,
+    /// Observer fired after a session is revoked, set once at startup. The
+    /// deployment points it at the session manager so revocation closes the
+    /// session's live connection rather than only refusing its next handshake.
+    revocation_hook: std::sync::OnceLock<SessionRevocationHook>,
 }
+
+/// Observes a session revocation. Fired synchronously after the store revoke
+/// succeeds, so an async close belongs on a spawned task inside the hook.
+pub type SessionRevocationHook = Arc<dyn Fn(SessionId) + Send + Sync>;
 
 impl<S: AuthStore> AuthService<S> {
     /// Build over a shared token authority and store, with no provider registry.
@@ -92,6 +100,7 @@ impl<S: AuthStore> AuthService<S> {
             store,
             registry: None,
             refresh_locks: Mutex::new(HashMap::new()),
+            revocation_hook: std::sync::OnceLock::new(),
         }
     }
 
@@ -100,6 +109,12 @@ impl<S: AuthStore> AuthService<S> {
     pub fn with_registry(mut self, registry: Arc<ProviderRegistry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Attach the revocation observer, once, after construction. A second call
+    /// is ignored, which suits the one startup wiring point this exists for.
+    pub fn set_revocation_hook(&self, hook: SessionRevocationHook) {
+        let _ = self.revocation_hook.set(hook);
     }
 
     /// Create a session for a verified identity and mint its first token pair.
@@ -238,6 +253,9 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the store fails.
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
         self.store.revoke_session(session_id).await?;
+        if let Some(hook) = self.revocation_hook.get() {
+            hook(session_id);
+        }
         Ok(())
     }
 

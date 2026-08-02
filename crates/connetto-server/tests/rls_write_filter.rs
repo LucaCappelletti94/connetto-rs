@@ -16,11 +16,13 @@
 #![allow(clippy::too_many_lines)]
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, Ping,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
@@ -211,6 +213,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         target,
         SessionConfig::default(),
     );

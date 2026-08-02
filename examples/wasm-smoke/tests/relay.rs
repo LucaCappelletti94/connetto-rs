@@ -11,10 +11,13 @@
 //! must land in Postgres (an independent observer sees it) and the echo must
 //! flow back down to the tab.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test relay`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{
@@ -81,7 +84,7 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -182,7 +185,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
     let config = ClientConfig {
         client_id: format!("relay-tab-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
@@ -271,7 +274,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     let config = ClientConfig {
         client_id: format!("port-tab-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

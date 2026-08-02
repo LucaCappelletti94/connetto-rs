@@ -127,9 +127,9 @@ pub mod workers {
     /// A string describing the VFS, upstream connect, or subscribe failure.
     #[wasm_bindgen]
     pub async fn db_worker_boot() -> Result<(), JsValue> {
-        // `Id` names the user id the reference connetto-server mints, a
-        // `String`. This demo runs unauthenticated, so no identity is ever
-        // acquired and the replica keeps `DB_NAME` verbatim.
+        // `Id` names the user id the server mints. The server requires a session
+        // from the dev identity provider, so the worker authenticates before
+        // connecting and names the replica after the acquired identity.
         connetto_web::workers::boot_db_worker::<String>(&connetto_web::workers::DbWorkerConfig {
             ws_url: DEMO_WS_URL,
             replica_db_prefix: DB_NAME,
@@ -142,11 +142,15 @@ pub mod workers {
             client_id_prefix: "db-worker",
             schema_version: crate::demo_schema_version(),
             sql_functions: crate::uuidv7_functions(),
-            auth: None,
+            auth: Some(connetto_web::auth::WorkerAuthConfig {
+                auth_base_url: "http://127.0.0.1:18099".to_owned(),
+                login_base_url: None,
+                provider: "dev-idp".to_owned(),
+                redirect_uri: "http://127.0.0.1:18099/dev/landing".to_owned(),
+            }),
             auth_db_name: "connetto-auth.sqlite",
         })
         .await
-        // Unauthenticated, so the returned identity is always `None`.
         .map(drop)
     }
 }

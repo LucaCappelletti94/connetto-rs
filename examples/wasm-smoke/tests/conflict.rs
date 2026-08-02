@@ -12,10 +12,14 @@
 //! `MutationConflict` frame, the same approach the resync test uses. The tab
 //! stays attached to the hub throughout, exercising the hub's conflict path.
 //!
-//! Run with the demo stack up (this test needs neither the server nor Postgres):
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
+//! commands. No server or Postgres is needed for this test.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test conflict`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{
@@ -196,7 +200,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
 
     let worker_config = ClientConfig {
         client_id: format!("conflict-worker-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
@@ -223,7 +227,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     hub.attach(relay_end);
     let tab_config = ClientConfig {
         client_id: format!("conflict-tab-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Ping, Subscribe, SubscriptionSpec};
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -55,6 +56,7 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         materializer,
         BrokenSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

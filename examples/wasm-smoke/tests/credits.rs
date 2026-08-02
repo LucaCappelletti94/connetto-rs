@@ -19,10 +19,14 @@
 //! The worker's upstream is a fake server over a loopback, so no real server or
 //! Postgres is needed.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
+//! commands. No server or Postgres is needed for this test.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test credits`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
@@ -189,6 +193,8 @@ async fn recv(tab: &mut LoopbackTransport) -> IncomingFrame {
 #[wasm_bindgen_test]
 async fn hub_enforces_the_per_tab_credit_window() {
     let base = unique_base();
+    let worker_token = common::mint_token().await;
+    let tab_token = common::mint_token().await;
 
     // The worker's upstream is a fake server we drive frame by frame. It seeds
     // one row up front, so the worker replica is non-empty before the hub runs.
@@ -198,7 +204,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
 
     let worker_config = ClientConfig {
         client_id: format!("credits-worker-{base}"),
-        auth_token: "token".to_owned(),
+        auth_token: worker_token,
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
@@ -237,7 +243,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
         format!("credits-tab-{base}"),
-        "token",
+        &tab_token,
     )))
     .await
     .expect("tab handshake");

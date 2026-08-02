@@ -9,12 +9,14 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, Subscribe, SubscriptionSpec,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -139,6 +141,7 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
         materializer,
         EmptySnapshot,
         DenyId2,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

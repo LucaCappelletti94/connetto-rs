@@ -19,7 +19,7 @@ use std::time::Duration;
 use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica, Watchable,
 };
-use connetto_core::Cursor;
+use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, WebSocketTransport, pg_write_target,
@@ -121,6 +121,10 @@ impl SnapshotSource for RecordingSnapshot {
     }
 }
 
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
+
 /// One in-process server over a localhost WebSocket, serving `sessions`
 /// connections. Returns the manager (for CDC dispatch), the recorder's log,
 /// the address, and the join handle.
@@ -142,6 +146,7 @@ async fn spawn_server(
         materializer,
         recorder,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

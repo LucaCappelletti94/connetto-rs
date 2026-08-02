@@ -1,22 +1,26 @@
 //! Shared harness for the logged-in startup suites.
 //!
-//! Both suites boot the worker with logins on against the login server that
-//! `connetto-server`'s `auth_stack` example runs, and both have to play the tab,
-//! since the worker asks a tab to carry out the login and waits for the answer.
-//!
-//! Needs the stack up. See `authenticated_boot.rs` for the commands.
+//! These suites boot the worker with logins on against the server's built-in
+//! auth endpoint, which the dev identity provider backs. See
+//! `authenticated_boot.rs` for the full stack commands.
 
 #![cfg(target_arch = "wasm32")]
+// A shared test module is compiled into every binary that includes it, and
+// each suite uses a different subset (most want only the token mint), so the
+// rest reads as dead to that binary.
+#![allow(dead_code)]
 
 use connetto_wasm_smoke::workers::{
     DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, FRONTEND_DB_NAME,
 };
-use connetto_web::auth::{LoginMessage, WorkerAuthConfig};
+use connetto_web::auth::{
+    Acquired, BrowserAuthenticator, LoginMessage, RefreshStore, ReplicaKeyStore, WorkerAuthConfig,
+};
 use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{BroadcastChannel, MessageEvent, Response, WorkerGlobalScope};
+use web_sys::{BroadcastChannel, MessageEvent, Response};
 
 /// Where the login server listens by default.
 pub const AUTH_BASE: &str = "http://127.0.0.1:18099";
@@ -60,12 +64,19 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
 /// opaque, so this follows the chain and reads the final URL. It works because the
 /// login server keeps every hop on one origin.
 pub async fn walk_the_login(login_url: &str) -> (String, String) {
-    let global: WorkerGlobalScope = js_sys::global()
-        .dyn_into()
-        .expect("this test runs in a worker");
-    let response: Response = JsFuture::from(global.fetch_with_str(login_url))
+    // Fetch the login URL and follow redirects. Works from both a dedicated
+    // worker (WorkerGlobalScope) and the browser main thread (Window).
+    let global = js_sys::global();
+    let promise = if let Ok(worker) = global.clone().dyn_into::<web_sys::WorkerGlobalScope>() {
+        worker.fetch_with_str(login_url)
+    } else {
+        web_sys::window()
+            .expect("window or worker global required")
+            .fetch_with_str(login_url)
+    };
+    let response: Response = JsFuture::from(promise)
         .await
-        .expect("the login server must be running: see authenticated_boot.rs")
+        .expect("the auth server must be running: see this file's suite headers")
         .dyn_into()
         .expect("a fetch resolves to a Response");
     let final_url = response.url();
@@ -119,4 +130,44 @@ pub fn play_the_tab() -> Rc<Cell<u32>> {
     on_message.forget();
     std::mem::forget(channel);
     served
+}
+
+/// Mint a fresh access token by walking the login against the auth server.
+///
+/// Each call performs a complete login and returns a distinct session token.
+/// Requires the auth server to be running at `AUTH_BASE`.
+pub async fn mint_token() -> String {
+    let storage = connetto_web::storage::ReplicaStorage::install().await;
+    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let device = connetto_web::storage::device_key(&keys)
+        .await
+        .expect("device key");
+    // A fresh store per call, so every mint starts empty and lands a distinct
+    // server session. The name comes from a counter rather than the clock:
+    // two mints inside one millisecond would otherwise pick the same OPFS
+    // file, and the sahpool VFS allows only one live connection per file.
+    static NEXT_MINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let db_name = format!("common-mint-{unique}.sqlite");
+    let store = RefreshStore::open(&storage.db_url(&db_name), &device).expect("open refresh store");
+    let authenticator = BrowserAuthenticator::new(auth_config());
+    let pending = match authenticator
+        .acquire::<String>(&store)
+        .await
+        .expect("acquire")
+    {
+        Acquired::NeedLogin(pending) => pending,
+        Acquired::Access(_) => panic!("a fresh store cannot refresh silently"),
+    };
+    let (code, state) = walk_the_login(&pending.login_url).await;
+    let token = authenticator
+        .complete::<String>(&pending, &code, &state, &store)
+        .await
+        .expect("complete login")
+        .access_token;
+    // Close the connection before removing the file: deleting an OPFS database
+    // out from under a live handle is what trips the sahpool bookkeeping.
+    drop(store);
+    storage.delete_db(&db_name).ok();
+    token
 }

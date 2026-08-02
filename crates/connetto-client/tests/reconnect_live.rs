@@ -16,7 +16,7 @@ use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, ReconnectPolicy,
     Replica, TokioSleeper,
 };
-use connetto_core::Cursor;
+use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -102,6 +102,10 @@ type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 
 /// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
 type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
+
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
 
 /// Rows in the Postgres write target matching `id`, read as admin.
 async fn target_rows(fixture: &Fixture, id: i64) -> Vec<Order> {
@@ -230,6 +234,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -337,6 +342,7 @@ async fn offline_write_reflushes_after_resume() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -419,6 +425,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

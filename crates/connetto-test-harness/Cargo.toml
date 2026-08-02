@@ -14,7 +14,7 @@ publish = false
 workspace = true
 
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport"] }
+connetto-core = { workspace = true, features = ["native-transport", "test-support"] }
 # The harness exercises the real Postgres write and read paths, which
 # connetto-server now compiles unconditionally.
 connetto-server = { path = "../connetto-server" }

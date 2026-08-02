@@ -9,9 +9,8 @@
 //! Postgres, and the same process verifies it when the client connects.
 //!
 //! The negative case is the load-bearing one. A passing positive is equally
-//! consistent with [`TrustingSessionVerifier`](connetto_core::auth::TrustingSessionVerifier),
-//! which accepts anything, so the proof that verification is on is that a forged
-//! token is refused.
+//! consistent with a trusting stand-in that accepts anything, so the proof
+//! that verification is on is that a forged token is refused.
 //!
 //! Ignored by default, because it needs the dev stack up:
 //!

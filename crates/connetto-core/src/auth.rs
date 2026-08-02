@@ -82,36 +82,3 @@ pub struct VerifiedSession<Id = String> {
     /// The connetto-minted session id, keyed on by the durable watermark.
     pub session_id: crate::SessionId,
 }
-
-/// A [`SessionVerifier`](crate::traits::SessionVerifier) stand-in that trusts
-/// the presented token as the identity, performing no cryptographic
-/// verification.
-///
-/// It mirrors the permissive stand-in for
-/// [`AuthPolicy`](crate::traits::AuthPolicy): it lets tests and local loops run
-/// with no live identity provider. It refuses only an empty token (an absent
-/// credential) and otherwise resolves the token string itself as the `user_id`
-/// and a deterministic hash of it as the session id, so a reconnect on the same
-/// token keeps its watermark. It MUST NOT front a production deployment,
-/// because it verifies nothing and so leaves the identity attacker-chosen.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TrustingSessionVerifier;
-
-impl crate::traits::SessionVerifier<String> for TrustingSessionVerifier {
-    fn verify_session<'a>(
-        &'a self,
-        auth_token: &'a str,
-    ) -> crate::traits::SessionVerifyFuture<'a, String> {
-        Box::pin(async move {
-            if auth_token.trim().is_empty() {
-                return Err(crate::traits::SessionVerifyError::Invalid(
-                    "no auth token presented at handshake".to_owned(),
-                ));
-            }
-            Ok(VerifiedSession {
-                context: AuthContext::new(auth_token),
-                session_id: crate::SessionId::from_token_hash(auth_token),
-            })
-        })
-    }
-}

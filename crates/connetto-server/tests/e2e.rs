@@ -2,17 +2,21 @@
 //!
 //! Spawn the real `connetto-server` and `connetto-client` binaries as separate
 //! OS processes and drive a full sync loop over real Postgres logical
-//! replication. One test covers the read direction: each client receives the
-//! initial snapshot, then a live insert fans out to both, and after the
-//! walsender is terminated the server's reconnect loop resumes so a further
-//! insert still reaches both clients. The other covers the write direction: a
-//! client applies a local insert and pushes it, the server's write path lands
-//! it in Postgres, and it fans back out over CDC to a second client. This is
-//! the product spine end to end, unlike the in-process session tests.
+//! replication. The suite starts a loopback identity provider in-process using
+//! `oauth2-test-server`, so every spawned server carries a real OIDC
+//! configuration and every spawned client carries a minted connetto access
+//! token. One test covers the read direction: each client receives the initial
+//! snapshot, then a live insert fans out to both, and after the walsender is
+//! terminated the server's reconnect loop resumes so a further insert still
+//! reaches both clients. The other covers the write direction: a client applies
+//! a local insert and pushes it, the server's write path lands it in Postgres,
+//! and it fans back out over CDC to a second client. This is the product spine
+//! end to end, unlike the in-process session tests.
 //!
 //! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`,
 //! both binaries built in the same profile as the test, and an `app_reader`
-//! non-superuser role that the fixture creates automatically. Run it with:
+//! non-superuser role that the fixture creates automatically. The in-process
+//! identity provider requires no external setup. Run it with:
 //!
 //! ```text
 //! cargo build --release -p connetto-server --bin connetto-server
@@ -35,6 +39,9 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use connetto_client::{ReplicaKey, cipher};
+use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use openidconnect::reqwest;
+use serde_json::json;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -165,6 +172,7 @@ fn spawn_server_cfg(
     pg_ddl: &str,
     writable: &str,
     reader_url: Option<&str>,
+    auth_envs: &[(&str, &str)],
 ) -> ChildGuard {
     let mut command = Command::new(server_bin());
     command
@@ -181,13 +189,22 @@ fn spawn_server_cfg(
     } else {
         command.env_remove("CONNETTO_READER_URL");
     }
+    for (k, v) in auth_envs {
+        command.env(k, v);
+    }
     let child = command.spawn().expect("spawn server");
     ChildGuard(child)
 }
 
-fn spawn_client(ws: &str, db_path: &Path, client_id: &str, write: Option<&str>) -> ChildGuard {
+fn spawn_client(
+    ws: &str,
+    db_path: &Path,
+    client_id: &str,
+    token: &str,
+    write: Option<&str>,
+) -> ChildGuard {
     spawn_client_env(
-        ws, db_path, client_id, SQLITE_DDL, PG_DDL, "orders", QUERY, write,
+        ws, db_path, client_id, SQLITE_DDL, PG_DDL, "orders", QUERY, token, write,
     )
 }
 
@@ -202,6 +219,7 @@ fn spawn_client_env(
     schema_sql: &str,
     sub_id: &str,
     query: &str,
+    token: &str,
     write: Option<&str>,
 ) -> ChildGuard {
     let mut command = Command::new(client_bin());
@@ -213,6 +231,7 @@ fn spawn_client_env(
         // handshake schema versions match. Distinct from the SQLite replica DDL.
         .env("CONNETTO_SCHEMA_SQL", schema_sql)
         .env("CONNETTO_CLIENT_ID", client_id)
+        .env("CONNETTO_TOKEN", token)
         .env("CONNETTO_SUB_ID", sub_id)
         .env("CONNETTO_QUERY", query)
         .stdout(Stdio::null())
@@ -272,16 +291,14 @@ async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
 async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     drop_slot(pool).await;
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
-    // Stale per-client watermarks from a previous run would suppress replayed
-    // mutations (the server dedupes by them), so drop and recreate fresh.
-    // connetto emits no DDL, so the test owns this table (the server no longer
-    // provisions it); the shape matches the `ConnettoWatermark` reference.
+    // Stale per-session watermarks from a previous run would suppress replayed
+    // mutations, so drop and recreate fresh. connetto emits no DDL and the
+    // shape keys on session_id alone (R2 re-key from the old user_id+session_id pair).
     exec(pool, "DROP TABLE IF EXISTS _connetto_mutations").await;
     exec(
         pool,
-        "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-         session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
-         PRIMARY KEY (user_id, session_id))",
+        "CREATE TABLE _connetto_mutations \
+         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
     )
     .await;
     exec(pool, "DROP PUBLICATION IF EXISTS connetto_pub").await;
@@ -372,6 +389,124 @@ async fn wait_for_pg_count(
     }
 }
 
+/// A loopback identity provider plus the env pairs the server binary needs to
+/// discover and use it. Holds the `OAuthTestServer` guard alive for the test.
+struct AuthStack {
+    _idp: OAuthTestServer,
+    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_` pairs.
+    env_pairs: Vec<(String, String)>,
+    /// Base URL of the server binary's auth endpoints.
+    auth_base: String,
+}
+
+/// Start an `oauth2-test-server` identity provider, register a client against
+/// the connetto auth callback bound at `auth_port`, and return the stack.
+async fn build_auth_stack(auth_port: u16) -> AuthStack {
+    let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
+    let idp = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        ..IssuerConfig::default()
+    })
+    .await;
+    let issuer = idp.base_url.to_string();
+    let issuer = issuer.trim_end_matches('/').to_owned();
+    let client = idp
+        .register_client(json!({
+            "redirect_uris": [callback],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let secret = client.client_secret.clone().unwrap_or_default();
+    let auth_base = format!("http://127.0.0.1:{auth_port}");
+    let env_pairs = vec![
+        ("CONNETTO_AUTH".to_owned(), "in-memory".to_owned()),
+        (
+            "CONNETTO_AUTH_BIND".to_owned(),
+            format!("127.0.0.1:{auth_port}"),
+        ),
+        ("CONNETTO_OIDC_PROVIDER".to_owned(), "generic".to_owned()),
+        ("CONNETTO_OIDC_NAME".to_owned(), "mock-idp".to_owned()),
+        ("CONNETTO_OIDC_ISSUER".to_owned(), issuer),
+        ("CONNETTO_OIDC_CLIENT_ID".to_owned(), client.client_id),
+        ("CONNETTO_OIDC_CLIENT_SECRET".to_owned(), secret),
+        ("CONNETTO_OIDC_REDIRECT_URL".to_owned(), callback),
+    ];
+    AuthStack {
+        _idp: idp,
+        env_pairs,
+        auth_base,
+    }
+}
+
+/// Drive the login dance through the server binary's auth endpoints and return
+/// the minted `(access_token, user_id)` pair.
+///
+/// The identity provider auto-grants consent, so a plain GET to its authorize
+/// endpoint returns a redirect carrying the code. Without a client
+/// `redirect_uri` in the login request the callback responds with JSON.
+async fn mint_token(auth_base: &str) -> (String, String) {
+    let agent = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build token-mint HTTP client");
+
+    let login = agent
+        .get(format!("{auth_base}/auth/login"))
+        .query(&[("provider", "mock-idp")])
+        .send()
+        .await
+        .expect("GET /auth/login");
+    assert!(
+        login.status().is_redirection(),
+        "login must redirect, got {}",
+        login.status()
+    );
+    let authorize_url = login
+        .headers()
+        .get("location")
+        .expect("location on login redirect")
+        .to_str()
+        .expect("utf-8 location")
+        .to_owned();
+
+    let authorized = agent
+        .get(&authorize_url)
+        .send()
+        .await
+        .expect("GET idp authorize");
+    assert!(
+        authorized.status().is_redirection(),
+        "idp authorize must redirect, got {}",
+        authorized.status()
+    );
+    let callback_url = authorized
+        .headers()
+        .get("location")
+        .expect("location on authorize redirect")
+        .to_str()
+        .expect("utf-8 location")
+        .to_owned();
+
+    let callback_resp = agent
+        .get(&callback_url)
+        .send()
+        .await
+        .expect("GET /auth/callback");
+    let body: serde_json::Value = callback_resp.json().await.expect("callback JSON body");
+    let access_token = body["access_token"]
+        .as_str()
+        .expect("access_token in callback JSON")
+        .to_owned();
+    let user_id = body["user_id"]
+        .as_str()
+        .expect("user_id in callback JSON")
+        .to_owned();
+    (access_token, user_id)
+}
+
 #[tokio::test]
 #[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_two_clients_snapshot_live_and_reconnect() {
@@ -391,24 +526,47 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
     reset_fixture(&pool).await;
 
     let port = free_port();
+    let auth_port = free_port();
     let bind = format!("127.0.0.1:{port}");
     let ws = format!("ws://127.0.0.1:{port}/");
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_pairs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let _server = spawn_server_cfg(&url, &bind, PG_DDL, "orders", Some(&reader_url));
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &auth_pairs,
+    );
+    let secs = Duration::from_secs(20);
     assert!(
-        wait_for_port(&bind, Duration::from_secs(20)).await,
+        wait_for_port(&bind, secs).await,
         "server did not open {bind}"
     );
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    let (token_a, _) = mint_token(&auth_stack.auth_base).await;
+    let (token_b, _) = mint_token(&auth_stack.auth_base).await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db_a = dir.path().join("client-a.db");
     let db_b = dir.path().join("client-b.db");
-    let _client_a = spawn_client(&ws, &db_a, "client-a", None);
-    let _client_b = spawn_client(&ws, &db_b, "client-b", None);
+    let _client_a = spawn_client(&ws, &db_a, "client-a", &token_a, None);
+    let _client_b = spawn_client(&ws, &db_b, "client-b", &token_b, None);
 
     // Snapshot: both clients receive the pre-existing seed row.
-    let secs = Duration::from_secs(20);
     assert_eq!(wait_for_rows(&db_a, 1, secs).await, 1, "client-a snapshot");
     assert_eq!(wait_for_rows(&db_b, 1, secs).await, 1, "client-b snapshot");
 
@@ -467,24 +625,47 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
     reset_fixture(&pool).await;
 
     let port = free_port();
+    let auth_port = free_port();
     let bind = format!("127.0.0.1:{port}");
     let ws = format!("ws://127.0.0.1:{port}/");
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_pairs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let _server = spawn_server_cfg(&url, &bind, PG_DDL, "orders", Some(&reader_url));
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &auth_pairs,
+    );
+    let secs = Duration::from_secs(20);
     assert!(
-        wait_for_port(&bind, Duration::from_secs(20)).await,
+        wait_for_port(&bind, secs).await,
         "server did not open {bind}"
     );
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    let (token_reader, _) = mint_token(&auth_stack.auth_base).await;
+    let (token_writer, _) = mint_token(&auth_stack.auth_base).await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db_writer = dir.path().join("writer.db");
     let db_reader = dir.path().join("reader.db");
-    let secs = Duration::from_secs(20);
 
     // Bring the reader up first and let it snapshot the seed row, so the
     // writer's row can only reach it over CDC, not in the reader's own snapshot.
-    let _reader = spawn_client(&ws, &db_reader, "reader", None);
+    let _reader = spawn_client(&ws, &db_reader, "reader", &token_reader, None);
     assert_eq!(
         wait_for_rows(&db_reader, 1, secs).await,
         1,
@@ -494,7 +675,7 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
     // The writer subscribes, applies its local insert, and pushes it. The
     // server applies it as app_reader; orders carries no policy so the write is allowed.
     let write = "INSERT INTO orders VALUES (42, 2.5, 4, 'from-writer')";
-    let _writer = spawn_client(&ws, &db_writer, "writer", Some(write));
+    let _writer = spawn_client(&ws, &db_writer, "writer", &token_writer, Some(write));
 
     // The write reaches Postgres through the server's write path.
     assert_eq!(
@@ -533,6 +714,14 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 
     let _serial = PG_SERIAL.lock().await;
 
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_pairs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
     // Clean slate, then a non-superuser writer role, the table with an RLS
     // policy keyed on `app.user_id`, grants, the publication, and the slot. The
     // admin role is superuser and bypasses RLS, so it is used only for setup and
@@ -552,10 +741,9 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         // The exactly-once watermark table is created by the test, as a
         // deployment would: connetto emits no DDL, the restricted writer role
         // cannot CREATE in schema public on Postgres 15+ (and must not need
-        // to), and the writer only needs DML on it.
-        "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-         session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
-         PRIMARY KEY (user_id, session_id))",
+        // to), and the writer only needs DML on it. Keyed on session_id alone (R2).
+        "CREATE TABLE _connetto_mutations \
+         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
         "GRANT USAGE ON SCHEMA public TO app_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",
         "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
@@ -570,25 +758,44 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let port = free_port();
     let bind = format!("127.0.0.1:{port}");
     let ws = format!("ws://127.0.0.1:{port}/");
+    let auth_bind = format!("127.0.0.1:{auth_port}");
 
-    let _server = spawn_server_cfg(&url, &bind, OWNED_PG_DDL, "owned", Some(&reader_url));
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        OWNED_PG_DDL,
+        "owned",
+        Some(&reader_url),
+        &auth_pairs,
+    );
+    let secs = Duration::from_secs(20);
     assert!(
-        wait_for_port(&bind, Duration::from_secs(20)).await,
+        wait_for_port(&bind, secs).await,
         "server did not open {bind}"
     );
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    // Mint alice's token and derive the row owner from the resolved user_id.
+    // The in-memory store maps (issuer, subject) to a UUID v5, and the RLS
+    // policy compares owner against app.user_id, so the owner must be that UUID.
+    let (alice_token, alice_id) = mint_token(&auth_stack.auth_base).await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("alice.db");
-    let secs = Duration::from_secs(20);
 
     // Alice pushes three ordered mutations on one session: an owned insert
-    // (allowed), a foreign insert owned by bob (refused by the policy's implicit
-    // WITH CHECK), and a second owned insert. The session applies frames in
-    // order, so once the third row lands the foreign one has already been
-    // processed and refused.
-    let writes = "INSERT INTO owned VALUES (1, 'alice', 'mine')\n\
-                  INSERT INTO owned VALUES (2, 'bob', 'theirs')\n\
-                  INSERT INTO owned VALUES (3, 'alice', 'also mine')";
+    // (allowed), a foreign insert with a literal owner that does not match
+    // app.user_id (refused by the policy's implicit WITH CHECK), and a second
+    // owned insert. The session applies frames in order, so once the third row
+    // lands the foreign one has already been processed and refused.
+    let writes = format!(
+        "INSERT INTO owned VALUES (1, '{alice_id}', 'mine')\n\
+         INSERT INTO owned VALUES (2, 'bob', 'theirs')\n\
+         INSERT INTO owned VALUES (3, '{alice_id}', 'also mine')"
+    );
     let _alice = spawn_client_env(
         &ws,
         &db,
@@ -597,7 +804,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         OWNED_PG_DDL,
         "owned",
         OWNED_QUERY,
-        Some(writes),
+        &alice_token,
+        Some(writes.as_str()),
     );
 
     // The sentinel third row landing proves the foreign write ahead of it was
@@ -617,7 +825,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     // Postgres holds only alice's rows. Bob's foreign row was refused.
     assert_eq!(
         pg_owned_rows(&admin).await,
-        vec![(1, "alice".to_owned()), (3, "alice".to_owned())],
+        vec![(1, alice_id.clone()), (3, alice_id.clone())],
         "RLS did not enforce the write policy through the binaries"
     );
 }
@@ -669,7 +877,17 @@ async fn e2e_startup_refuses_without_a_reader_role() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool).await;
 
-    let output = run_server_exit_output(&url, None, &[]).await;
+    // Auth must be configured so the server reaches the reader-role check.
+    // The server exits before binding auth endpoints, so auth_port is a placeholder.
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_pairs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let output = run_server_exit_output(&url, None, &auth_pairs).await;
     assert!(
         !output.status.success(),
         "expected nonzero exit without CONNETTO_READER_URL"
@@ -742,5 +960,28 @@ async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
     assert!(
         stderr.contains("\"Google\""),
         "expected Debug-quoted \"Google\" in stderr, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_without_an_auth_store() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    // A reader URL is provided but CONNETTO_AUTH is deliberately absent.
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(&url, Some(&reader_url), &[]).await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit without CONNETTO_AUTH"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CONNETTO_AUTH"),
+        "expected CONNETTO_AUTH in stderr, got: {stderr}"
     );
 }

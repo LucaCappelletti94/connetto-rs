@@ -39,6 +39,11 @@ pub enum FatalErrorReason {
     AuthenticationFailed,
     /// Session was administratively revoked mid-connection.
     SessionRevoked,
+    /// A newer connection presented this session's durable handle, so this
+    /// older connection is closed. One live connection per session handle,
+    /// because the handle keys the per-subscription cursors and the pending
+    /// buffer, and two readers would each consume the other's changes.
+    ConnectionSuperseded,
     /// Client sent a control frame the server could not parse.
     ProtocolViolation {
         /// Human-readable detail.

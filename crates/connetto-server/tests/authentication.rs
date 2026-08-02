@@ -6,8 +6,8 @@
 //! refused with [`FatalErrorReason::AuthenticationFailed`] and the session dies
 //! before any subscription work, while a verified credential yields exactly the
 //! [`AuthContext`] the verifier resolved even when the client claims a different
-//! id. The permissive [`TrustingSessionVerifier`] keeps the Docker-free loop
-//! running with no live identity provider.
+//! id. The stand-in [`TestSessionVerifier`] is used where no live identity
+//! provider is needed.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +15,7 @@ use connetto_core::auth::AuthContext;
 use connetto_core::messages::{
     ControlMessage, FatalErrorReason, Handshake, Subscribe, SubscriptionSpec,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{
     Cursor, PROTOCOL_VERSION, SessionVerifier, SessionVerifyError, SessionVerifyFuture,
@@ -92,12 +93,12 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn absent_credential_is_rejected_with_authentication_failed() {
     let fixture = Fixture::acquire().await;
-    // The default TrustingSessionVerifier refuses an empty token as an absent
-    // credential.
+    // TestSessionVerifier refuses an empty token as an absent credential.
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -134,11 +135,11 @@ async fn forged_credential_is_rejected_with_authentication_failed() {
         Materializer::new(PG_DDL).expect("build materializer"),
         CapturingSnapshot::default(),
         PermissiveAuth,
+        Arc::new(AlwaysReject),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
-    )
-    .with_session_verifier(Arc::new(AlwaysReject));
+    );
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
 
@@ -177,11 +178,11 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
         PermissiveAuth,
+        Arc::new(FixedVerifier(resolved.clone())),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
-    )
-    .with_session_verifier(Arc::new(FixedVerifier(resolved.clone())));
+    );
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
 

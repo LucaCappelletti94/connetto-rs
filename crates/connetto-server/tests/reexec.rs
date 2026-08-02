@@ -8,10 +8,11 @@
 //! covered by the Docker-gated test in `pg_async.rs`.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -137,6 +138,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         connector,
         target,
         SessionConfig::default(),

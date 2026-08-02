@@ -7,12 +7,14 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, Ping, Subscribe, SubscriptionSpec,
     Unsubscribe,
 };
+use connetto_core::test_support::TestSessionVerifier;
 use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -158,6 +160,7 @@ async fn loopback_session_full_lifecycle() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         config,
@@ -286,6 +289,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        Arc::new(TestSessionVerifier),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

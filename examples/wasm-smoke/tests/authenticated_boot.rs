@@ -17,41 +17,35 @@
 //! the branch fired. The fourth, recovering from a refresh store that no longer
 //! decrypts, is in `authenticated_boot_recovery.rs`.
 //!
-//! **Needs the stack up.** Database, sync server, and login server:
+//! **Needs the stack up.** Database, sync server, and identity provider:
 //!
 //! ```text
 //! docker run -d --rm --name connetto-e42-pg -e POSTGRES_PASSWORD=postgres \
 //!   -p 55470:5432 postgres:16 -c wal_level=logical
-//! psql -c "$(cat examples/wasm-smoke/schema.sql)"
-//! psql -c "CREATE PUBLICATION connetto_pub FOR TABLE orders"
-//! psql -c "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')"
-//! psql -c "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-//!   session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
-//!   PRIMARY KEY (user_id, session_id))"
-//! psql -c "$(cat examples/wasm-smoke/roles.sql)"
-//!
+//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   -c "$(cat examples/wasm-smoke/schema.sql)"
+//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   -c "CREATE PUBLICATION connetto_pub FOR TABLE orders"
+//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   -c "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')"
+//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)"
+//! psql postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   -c "$(cat examples/wasm-smoke/roles.sql)"
+//! CONNETTO_AUTH_BIND=127.0.0.1:18099 \
+//!   cargo run --release -p connetto-server --example dev_idp
+//! source target/dev-idp.env
 //! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
 //!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
 //!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
+//!   CONNETTO_AUTH=in-memory CONNETTO_AUTH_BIND=127.0.0.1:18099 \
 //!   cargo run --release --all-features -p connetto-server --bin connetto-server
-//! cargo run --release --all-features -p connetto-server --example auth_stack
 //! wasm-pack test --headless --chrome examples/wasm-smoke --test authenticated_boot
 //! ```
 //!
-//! The server reads the schema from the same file the client hashes, because the
-//! handshake compares the two and a reworded copy is a different schema. It must
-//! also be started WITHOUT `CONNETTO_AUTH`, so the handshake trusts the token: the
-//! login here comes from `auth_stack`, whose sessions a database-backed server
-//! knows nothing about, and it would refuse them.
-//!
-//! One honest limit of this topology. The login server and the sync server are
-//! separate processes here, and cross-process token verification needs them to
-//! share a session store, which is what a real deployment gets by having one
-//! process do both jobs. So the sync server accepts the token without verifying
-//! it. That verification is not what this test is for. It is proven, against one
-//! `connetto-server` minting and verifying its own tokens over a Postgres session
-//! store, by `connetto-client/tests/verified_topology.rs`.
+//! The server reads the schema from the same file the client hashes, because
+//! the handshake compares them and a reworded copy is a different schema.
 
 #![cfg(target_arch = "wasm32")]
 

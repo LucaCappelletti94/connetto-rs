@@ -9,10 +9,13 @@
 //! hub's local snapshot leg, and a single mutation spanning both tiers is
 //! rejected by the hub and rolled back on the writing tab.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
+//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
+//! Run this suite with:
+//! `wasm-pack test --headless --chrome examples/wasm-smoke --test notes_fanout`
 
 #![cfg(target_arch = "wasm32")]
+
+mod common;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::Transport;
@@ -22,7 +25,7 @@ use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-wasm_bindgen_test_configure!(run_in_browser);
+wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// The local tier subscription every tab registers.
 const NOTES_QUERY: &str = "SELECT * FROM notes";
@@ -103,7 +106,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
     let transport = BroadcastTransport::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        auth_token: common::mint_token().await,
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: uuidv7_functions(),
     };

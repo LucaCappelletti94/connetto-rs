@@ -660,16 +660,18 @@ fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, Cli
 }
 
 /// Run the opening handshake over `transport`: send the hello (carrying the
-/// resume cursor when one exists) and read the ack. Returns the
-/// server-assigned session id, the server's durable mutation watermark, and
-/// the server's schema version.
+/// resume cursor and, on a resume, the durable session handle) and read the
+/// ack. Returns the server-assigned connection id, the durable session handle
+/// the server minted, the server's durable mutation watermark, and the
+/// server's schema version.
 /// Shared by the first connect and every resume.
 async fn exchange_handshake<T>(
     transport: &mut T,
     config: &ClientConfig,
     token_source: Option<&AccessTokenSource>,
     resume: Option<&Cursor>,
-) -> Result<(String, Option<u64>, Option<SchemaVersion>), ClientError>
+    session_handle: Option<&str>,
+) -> Result<(String, String, Option<u64>, Option<SchemaVersion>), ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -684,6 +686,12 @@ where
     );
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
+    }
+    // The durable handle from a previous run of this session. The server
+    // derives the authoritative handle from the verified credential, so this
+    // is the client's continuity claim rather than a trust input.
+    if let Some(handle) = session_handle {
+        handshake = handshake.with_session_token(handle.to_owned());
     }
     transport
         .send_control(ControlMessage::Handshake(handshake))
@@ -711,7 +719,12 @@ where
                 }
                 _ => {}
             }
-            Ok((ack.connection_id, ack.last_applied_seq, ack.schema_version))
+            Ok((
+                ack.connection_id,
+                ack.session_token,
+                ack.last_applied_seq,
+                ack.schema_version,
+            ))
         }
         // A rejected credential is fatal for this attempt and routes to
         // re-login, not a generic reconnect that would spin forever.
@@ -747,6 +760,11 @@ pub struct ConnettoConnection<T: Transport> {
     last_cursor: Option<Cursor>,
     next_seq: u64,
     connection_id: String,
+    /// The durable session handle the server minted at handshake, presented
+    /// again on every resume so the session's operational state (its
+    /// per-subscription cursors and pending buffer) continues rather than
+    /// starting over.
+    session_handle: String,
     /// The server's schema version from the handshake ack, kept so a relay can
     /// forward it verbatim to its tabs and (Phase 7) a stale build can be
     /// detected against the baked schema.
@@ -886,8 +904,8 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let (connection_id, watermark, schema_version) =
-            exchange_handshake(&mut transport, config, None, resume.as_ref()).await?;
+        let (connection_id, session_handle, watermark, schema_version) =
+            exchange_handshake(&mut transport, config, None, resume.as_ref(), None).await?;
 
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
         let mut conn = Self {
@@ -897,6 +915,7 @@ where
             last_cursor: resume,
             next_seq,
             connection_id,
+            session_handle,
             schema_version,
             dirty,
             changed,
@@ -938,15 +957,17 @@ where
     /// keeps its previous (dead) transport in that case, so a caller can try
     /// again with another one.
     pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
-        let (connection_id, watermark, schema_version) = exchange_handshake(
+        let (connection_id, session_handle, watermark, schema_version) = exchange_handshake(
             &mut transport,
             &self.config,
             self.token_source.as_ref(),
             self.last_cursor.as_ref(),
+            Some(self.session_handle.as_str()),
         )
         .await?;
         self.transport = transport;
         self.connection_id = connection_id;
+        self.session_handle = session_handle;
         self.schema_version = schema_version;
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
@@ -991,6 +1012,16 @@ where
     #[must_use]
     pub fn connection_id(&self) -> &str {
         &self.connection_id
+    }
+
+    /// The durable session handle from the handshake ack.
+    ///
+    /// One unbroken run of one caller, and the key the server's resume, its
+    /// per-subscription cursors, and the exactly-once watermark all address.
+    /// Unlike [`connection_id`](Self::connection_id), it survives a reconnect.
+    #[must_use]
+    pub fn session_handle(&self) -> &str {
+        &self.session_handle
     }
 
     /// The server's schema version from the handshake ack, or `None` when the

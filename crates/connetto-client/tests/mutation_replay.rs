@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
-use connetto_core::Cursor;
 use connetto_core::messages::{ControlMessage, HandshakeAck};
-use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::traits::{IncomingFrame, SessionVerifier, Transport};
+use connetto_core::{Cursor, test_support::TestSessionVerifier};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -104,6 +104,10 @@ struct Order {
 
 type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 
+fn test_verifier() -> Arc<dyn SessionVerifier> {
+    Arc::new(TestSessionVerifier)
+}
+
 /// Reset the fixture to a fresh `orders` table with the watermark provisioned.
 async fn reset_orders(fixture: &Fixture) {
     fixture
@@ -128,6 +132,7 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
+        test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),

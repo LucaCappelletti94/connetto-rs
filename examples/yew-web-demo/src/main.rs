@@ -19,12 +19,14 @@
 //! The app's [`main`] returns early in a worker context, where there is no
 //! `Window` and Yew cannot run.
 //!
-//! Run against the demo stack (server on 7777, `connetto-demo-pg` on 55456):
-//! `trunk serve` from this directory, then open the served URL in several
-//! windows.
-//! The server also requires `CONNETTO_READER_URL` set to the `connetto_reader` role that `roles.sql` provisions.
+//! Run against the demo stack (dev IdP, server on 7777, `connetto-demo-pg` on
+//! 55456): start the dev IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set,
+//! source `target/dev-idp.env`, start the server with `CONNETTO_AUTH`,
+//! `CONNETTO_AUTH_BIND`, the `CONNETTO_OIDC_*` vars, `CONNETTO_READER_URL`,
+//! `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
+//! `CONNETTO_PG_DDL_FILE`, then `trunk serve` from this directory and open
+//! the served URL in several windows.
 
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
@@ -70,14 +72,9 @@ const LEADER_LOCK: &str = "connetto-demo-leader";
 /// than a baked template, because a tier encrypted at rest cannot be seeded from
 /// a plaintext byte image.
 const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
-/// The `BroadcastChannel` the worker uses to request the auth mode from the
-/// leader page. The worker cannot access `localStorage`, so the page answers.
-const DEMO_CONFIG_CHANNEL: &str = "connetto-demo-config";
 /// The `BroadcastChannel` the worker uses to report the authenticated user_id
 /// to the page after a silent refresh, so the UI can show the account name.
 const DEMO_IDENTITY_CHANNEL: &str = "connetto-demo-identity";
-/// The `localStorage` key that marks signed-in mode. Absent means guest mode.
-const DEMO_SIGNED_IN_KEY: &str = "connetto-demo-signed-in";
 
 diesel::table! {
     orders (id) {
@@ -156,15 +153,6 @@ fn fresh_quantity() -> i64 {
     (scaled as i64 + 1) * 5
 }
 
-// Holds the page-side config responder for the DB worker's auth-mode query.
-// A dedicated worker has no localStorage, so the page answers via this channel.
-// These must outlive the whole page, and thread_local is the correct construct
-// for non-Send JS values that are meant to live until process exit.
-type ConfigResponder = (BroadcastChannel, Closure<dyn FnMut(MessageEvent)>);
-thread_local! {
-    static CONFIG_RESPONDER: RefCell<Option<ConfigResponder>> = const { RefCell::new(None) };
-}
-
 fn main() {
     // The dedicated DB worker runs this same wasm module. A worker has no
     // Window, so boot the DB tier there instead of rendering the UI.
@@ -210,38 +198,6 @@ fn main() {
         }
     }
 
-    // Config responder: the DB worker (dedicated worker context, no localStorage)
-    // asks this page for the auth mode over DEMO_CONFIG_CHANNEL. The responder
-    // lives in a thread_local for the page's whole life.
-    {
-        let signed_in = win
-            .local_storage()
-            .ok()
-            .flatten()
-            .and_then(|s| s.get_item(DEMO_SIGNED_IN_KEY).ok().flatten())
-            .is_some();
-        let origin = win
-            .location()
-            .origin()
-            .unwrap_or_else(|_| "http://127.0.0.1:9911".to_owned());
-        let response = if signed_in {
-            format!("config:auth:{origin}")
-        } else {
-            "config:none".to_owned()
-        };
-        let channel = BroadcastChannel::new(DEMO_CONFIG_CHANNEL).expect("demo config channel");
-        let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if event.data().as_string().as_deref() == Some("need-config")
-                && let Ok(ch) = BroadcastChannel::new(DEMO_CONFIG_CHANNEL)
-            {
-                let _ = ch.post_message(&JsValue::from_str(&response));
-                ch.close();
-            }
-        });
-        channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        CONFIG_RESPONDER.with(|r| *r.borrow_mut() = Some((channel, on_message)));
-    }
-
     yew::Renderer::<App>::new().render();
 }
 
@@ -251,7 +207,17 @@ fn main() {
 ///
 /// A JS string describing the VFS, upstream connect, or subscribe failure.
 async fn run_db_worker() -> Result<(), JsValue> {
-    let auth = query_worker_config().await;
+    let origin = worker_origin();
+    let auth = Some(WorkerAuthConfig {
+        // Fetch calls go through this origin's proxy, so they are same-origin
+        // and need no CORS.
+        auth_base_url: origin.clone(),
+        // The login is a navigation; trunk's proxy does not forward a request
+        // that carries a query string, so it goes straight to the auth origin.
+        login_base_url: Some(AUTH_ORIGIN.to_owned()),
+        provider: "dev-idp".to_owned(),
+        redirect_uri: format!("{origin}/"),
+    });
     // boot_db_worker returns the authenticated user_id (if any) once the hub
     // is set up and serving. Broadcast it so the page can show the account.
     if let Some(user_id) =
@@ -277,55 +243,6 @@ async fn run_db_worker() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Worker context: ask the leader page (which has `localStorage`) for the
-/// auth mode over `DEMO_CONFIG_CHANNEL`. The page has set up a responder in
-/// its `main()`. Returns `None` on timeout, defaulting to unauthenticated.
-async fn query_worker_config() -> Option<WorkerAuthConfig> {
-    let channel = BroadcastChannel::new(DEMO_CONFIG_CHANNEL).expect("demo config channel");
-    let got = Rc::new(Cell::new(false));
-    let config: Rc<RefCell<Option<WorkerAuthConfig>>> = Rc::new(RefCell::new(None));
-    let on_msg = {
-        let got = Rc::clone(&got);
-        let config = Rc::clone(&config);
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let Some(data) = event.data().as_string() else {
-                return;
-            };
-            let parsed = if let Some(origin) = data.strip_prefix("config:auth:") {
-                Some(WorkerAuthConfig {
-                    // Fetch calls go through this origin's proxy, so they are
-                    // same-origin and need no CORS.
-                    auth_base_url: origin.to_owned(),
-                    // The login is a navigation, and trunk's proxy does not forward
-                    // a request that carries a query string, so it goes straight to
-                    // the auth origin. A navigation needs no CORS either way.
-                    login_base_url: Some(AUTH_ORIGIN.to_owned()),
-                    provider: "dev-idp".to_owned(),
-                    redirect_uri: format!("{origin}/"),
-                })
-            } else if data == "config:none" {
-                None
-            } else {
-                return;
-            };
-            *config.borrow_mut() = parsed;
-            got.set(true);
-        })
-    };
-    channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-    for _ in 0..50_u32 {
-        let _ = channel.post_message(&JsValue::from_str("need-config"));
-        yield_to_event_loop().await;
-        if got.get() {
-            break;
-        }
-    }
-    channel.set_onmessage(None);
-    channel.close();
-    drop(on_msg);
-    config.borrow().clone()
-}
-
 /// Worker context: broadcast the authenticated user_id to all page tabs so
 /// each can show the account that owns the private encrypted replica.
 fn broadcast_identity(user_id: &str) {
@@ -333,20 +250,6 @@ fn broadcast_identity(user_id: &str) {
         let _ = ch.post_message(&JsValue::from_str(&format!("identity:{user_id}")));
         ch.close();
     }
-}
-
-/// Yield to the JavaScript macro-task queue so BroadcastChannel messages
-/// queued between iterations of `query_worker_config` can be delivered.
-async fn yield_to_event_loop() {
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        let global = js_sys::global();
-        if let Ok(f) = js_sys::Reflect::get(&global, &"setTimeout".into())
-            && let Ok(f) = f.dyn_into::<js_sys::Function>()
-        {
-            let _ = f.call2(&JsValue::NULL, &resolve, &JsValue::from(0_i32));
-        }
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
 /// Parse one query-string parameter from a `?key=value&...` search string.
@@ -357,15 +260,22 @@ fn query_param(search: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Page context: remove the signed-in flag and reload so the next worker boot
-/// runs in unauthenticated mode.
-fn clear_flag_and_reload() {
+/// Reload the page after logout.
+fn reload_page() {
     if let Some(win) = web_sys::window() {
-        if let Ok(Some(s)) = win.local_storage() {
-            let _ = s.remove_item(DEMO_SIGNED_IN_KEY);
-        }
         let _ = win.location().reload();
     }
+}
+
+/// The origin of the worker's own URL, e.g. `http://127.0.0.1:9911`.
+///
+/// Same as the page origin because the worker script is served from the same
+/// host. Used to build `WorkerAuthConfig` within the worker.
+fn worker_origin() -> String {
+    js_sys::eval("self.location.origin")
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
 }
 
 /// The served URL of this app's wasm-bindgen glue module, recovered from the
@@ -504,15 +414,8 @@ fn app() -> Html {
     // ref for the page's life is intended.
     let boot_hold = use_mut_ref(|| None::<Boot>);
 
-    // Read the signed-in flag from localStorage once per render. Changing the
-    // flag always reloads the page, so this value is stable for the page's life.
-    let signed_in = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(DEMO_SIGNED_IN_KEY).ok().flatten())
-        .is_some();
-
     // The worker broadcasts the user_id after a silent refresh so the UI can
-    // display the account. On fresh logins it arrives after the next reload.
+    // display the account.
     let identity = use_state(|| None::<String>);
     // The worker broadcasts the login URL when interactive auth is needed.
     // The page shows a button that opens the URL in a popup so the original
@@ -612,16 +515,6 @@ fn app() -> Html {
         });
     }
 
-    // Auth callbacks
-    let sign_in = Callback::from(|_| {
-        if let Some(win) = web_sys::window() {
-            if let Ok(Some(s)) = win.local_storage() {
-                let _ = s.set_item(DEMO_SIGNED_IN_KEY, "1");
-            }
-            let _ = win.location().reload();
-        }
-    });
-
     // Open the login URL in a popup (user gesture -> popup allowed by the browser).
     let open_popup = {
         let login_url = login_url.clone();
@@ -642,7 +535,7 @@ fn app() -> Html {
             let status = status.clone();
             spawn_local(async move {
                 match connetto_web::auth::request_logout(false, false).await {
-                    Ok(_) => clear_flag_and_reload(),
+                    Ok(_) => reload_page(),
                     Err(err) => status.set(format!("logout failed: {err}")),
                 }
             });
@@ -666,7 +559,7 @@ fn app() -> Html {
                                 // A write landed between the check and the request.
                                 refused_seqs.set(Some(seqs));
                             }
-                            Ok(_) => clear_flag_and_reload(),
+                            Ok(_) => reload_page(),
                             Err(err) => status.set(format!("logout failed: {err}")),
                         }
                     }
@@ -687,7 +580,7 @@ fn app() -> Html {
                 confirm_seqs.set(None);
                 // force=true because the user saw the count and confirmed.
                 match connetto_web::auth::request_logout(true, true).await {
-                    Ok(_) => clear_flag_and_reload(),
+                    Ok(_) => reload_page(),
                     Err(err) => status.set(format!("forced delete failed: {err}")),
                 }
             });
@@ -703,7 +596,7 @@ fn app() -> Html {
             spawn_local(async move {
                 refused_seqs.set(None);
                 match connetto_web::auth::request_logout(true, true).await {
-                    Ok(_) => clear_flag_and_reload(),
+                    Ok(_) => reload_page(),
                     Err(err) => status.set(format!("forced delete failed: {err}")),
                 }
             });
@@ -719,13 +612,13 @@ fn app() -> Html {
         })
     };
 
-    let auth_bar = if signed_in {
+    let auth_bar = {
         let account_line = match &*identity {
             Some(uid) => {
                 html! { <span>{ format!("Signed in as {} (private encrypted replica).", uid) }</span> }
             }
             None => html! {
-                <span>{ "Signed in, private encrypted replica (account loading)." }</span>
+                <span>{ "Signed in (account loading)." }</span>
             },
         };
 
@@ -787,18 +680,6 @@ fn app() -> Html {
                 { action_row }
                 { confirm_html }
                 { refused_html }
-            </div>
-        }
-    } else {
-        html! {
-            <div class="auth-bar">
-                <span>{ "Guest mode, shared unencrypted replica." }</span>
-                { " " }
-                <button onclick={sign_in}>{ "Sign in" }</button>
-                { " " }
-                <small>
-                    { "Signing in switches to a private encrypted replica for your account." }
-                </small>
             </div>
         }
     };
