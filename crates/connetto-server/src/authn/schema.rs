@@ -41,7 +41,7 @@ use diesel::query_builder::{
     IntoConflictValueClause, QueryFragment, QueryId, UndecoratedInsertRecord,
 };
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
-use diesel::sql_types::{BigInt, Binary, Bool, Jsonb, Nullable, Text, Uuid};
+use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Uuid};
 use diesel::{Insertable, QuerySource};
 use diesel_async::AsyncPgConnection;
 use diesel_async::methods::LoadQuery as AsyncLoadQuery;
@@ -124,16 +124,11 @@ where
     /// The whole opaque `SELECT (rotation columns) WHERE session_id = ? FOR
     /// UPDATE` read used by rotation. Laundered as one loadable value so the row
     /// lock composes without the generic `for_update` diverging.
-    type SessionRow: for<'q> AsyncLoadQuery<
-            'q,
-            AsyncPgConnection,
-            (Self::Id, serde_json::Value, Vec<u8>, i64, i64, bool),
-        > + Send;
+    type SessionRow: for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Self::Id, Vec<u8>, i64, i64, bool)>
+        + Send;
 
     /// `sessions.user_id`, typed as the developer's `Id` SQL type.
     type UserId: Expression + Default + Send;
-    /// `sessions.attrs`, the opaque `AuthContext` blob (`Jsonb`).
-    type Attrs: StoreColumn<Self::Sessions, Jsonb>;
     /// `sessions.current_refresh_hash` (`Binary`).
     type CurrentRefreshHash: StoreColumn<Self::Sessions, Binary>;
     /// `sessions.idle_deadline_ms` (`BigInt`).
@@ -168,11 +163,9 @@ where
 
     /// Build the insertable new-sessions row. The store cannot name a developer
     /// struct's fields, so it hands the column values here.
-    #[allow(clippy::too_many_arguments)] // reason: mirrors the fixed sessions row shape
     fn new_session(
         session_id: SessionId,
         user_id: Self::Id,
-        attrs: serde_json::Value,
         current_refresh_hash: Vec<u8>,
         idle_deadline_ms: i64,
         absolute_deadline_ms: i64,
@@ -235,12 +228,11 @@ macro_rules! connetto_auth_tables {
     ($id:ty, $id_sql:ty) => {
         diesel::table! {
             /// connetto sessions: connetto-minted session id, the developer's
-            /// typed user id, the opaque `AuthContext` blob, the rotating
-            /// refresh-secret hash, and the refresh deadlines.
+            /// typed user id, the rotating refresh-secret hash, and the refresh
+            /// deadlines.
             connetto_sessions (session_id) {
                 session_id -> diesel::sql_types::Uuid,
                 user_id -> $id_sql,
-                attrs -> diesel::sql_types::Jsonb,
                 current_refresh_hash -> diesel::sql_types::Binary,
                 idle_deadline_ms -> diesel::sql_types::BigInt,
                 absolute_deadline_ms -> diesel::sql_types::BigInt,
@@ -265,7 +257,6 @@ macro_rules! connetto_auth_tables {
         pub struct ConnettoNewSession {
             session_id: $crate::SessionId,
             user_id: $id,
-            attrs: serde_json::Value,
             current_refresh_hash: Vec<u8>,
             idle_deadline_ms: i64,
             absolute_deadline_ms: i64,
@@ -300,7 +291,6 @@ macro_rules! connetto_auth_tables {
                     >,
                     (
                         connetto_sessions::user_id,
-                        connetto_sessions::attrs,
                         connetto_sessions::current_refresh_hash,
                         connetto_sessions::idle_deadline_ms,
                         connetto_sessions::absolute_deadline_ms,
@@ -309,7 +299,6 @@ macro_rules! connetto_auth_tables {
                 >,
             >;
             type UserId = connetto_sessions::user_id;
-            type Attrs = connetto_sessions::attrs;
             type CurrentRefreshHash = connetto_sessions::current_refresh_hash;
             type IdleDeadlineMs = connetto_sessions::idle_deadline_ms;
             type AbsoluteDeadlineMs = connetto_sessions::absolute_deadline_ms;
@@ -344,7 +333,6 @@ macro_rules! connetto_auth_tables {
                     .filter(connetto_sessions::session_id.eq(session_id))
                     .select((
                         connetto_sessions::user_id,
-                        connetto_sessions::attrs,
                         connetto_sessions::current_refresh_hash,
                         connetto_sessions::idle_deadline_ms,
                         connetto_sessions::absolute_deadline_ms,
@@ -377,7 +365,6 @@ macro_rules! connetto_auth_tables {
             fn new_session(
                 session_id: $crate::SessionId,
                 user_id: Self::Id,
-                attrs: serde_json::Value,
                 current_refresh_hash: Vec<u8>,
                 idle_deadline_ms: i64,
                 absolute_deadline_ms: i64,
@@ -386,7 +373,6 @@ macro_rules! connetto_auth_tables {
                 ConnettoNewSession {
                     session_id,
                     user_id,
-                    attrs,
                     current_refresh_hash,
                     idle_deadline_ms,
                     absolute_deadline_ms,

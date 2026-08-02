@@ -88,12 +88,24 @@ pub struct MutationReject {
     pub reason: MutationRejectReason,
 }
 
+/// The server's copy of a row a client's optimistic write collided with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictRow {
+    /// The row's current version value, in the column its table versions on.
+    pub updated_at: String,
+    /// The row as a JSON object.
+    ///
+    /// JSON is the wire format here (not `MessagePack`) because the row shape is
+    /// only known at runtime. Q2.1 reserves JSON for shape-unknown-at-compile
+    /// data. The client deserialises into its `Diesel` row type.
+    pub row_json: String,
+}
+
 /// Server detects that the client's optimistic write was based on a stale row.
 ///
 /// Conflict detection uses `WHERE id = ? AND updated_at = ?` per Q3.2. When the
-/// row is now newer than the client saw, the server sends the current
-/// `updated_at` plus a JSON snapshot of the current row so the app can run its
-/// configured conflict-resolution strategy.
+/// row is now newer than the client saw, the server sends its current copy so
+/// the app can run its configured conflict-resolution strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationConflict {
     /// Sequence number of the conflicting mutation.
@@ -101,14 +113,10 @@ pub struct MutationConflict {
     /// Table name for the conflicting row. Informational: the patchset already
     /// names it, but the client may not have the patchset in hand any more.
     pub table: String,
-    /// Server's current `updated_at` value for the row, in RFC 3339 form.
-    pub server_updated_at: String,
-    /// Server's current row snapshot as a JSON object.
-    ///
-    /// JSON is the wire format here (not `MessagePack`) because the row shape is
-    /// only known at runtime. Q2.1 reserves JSON for shape-unknown-at-compile
-    /// data. The client deserialises into its `Diesel` row type.
-    pub server_row_json: String,
+    /// The server's copy of the row, absent when the row is gone: a write
+    /// against a row somebody else deleted conflicts with nothing to send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_row: Option<ConflictRow>,
 }
 
 #[cfg(test)]

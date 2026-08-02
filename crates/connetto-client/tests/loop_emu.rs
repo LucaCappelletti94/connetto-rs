@@ -909,17 +909,30 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         matches!(e, ClientEvent::MutationConflict { .. })
     })
     .await;
+    let ClientEvent::MutationConflict {
+        client_seq,
+        rows,
+        server_row,
+    } = event
+    else {
+        panic!("expected a mutation conflict");
+    };
+    assert_eq!(client_seq, 0);
     assert_eq!(
-        event,
-        ClientEvent::MutationConflict {
-            client_seq: 0,
-            rows: vec![AffectedRow {
-                table: "orders".to_owned(),
-                key: vec![KeyValue::Int(1)],
-            }],
-        },
+        rows,
+        vec![AffectedRow {
+            table: "orders".to_owned(),
+            key: vec![KeyValue::Int(1)],
+        }],
         "the conflict event names the rolled-back row by table and primary key",
     );
+    // The server's own copy reaches the application, so it can show what the
+    // other writer left rather than only that the write lost.
+    let server_row = server_row.expect("the conflicting row still exists on the server");
+    assert_eq!(server_row.updated_at, "server");
+    let current: serde_json::Value =
+        serde_json::from_str(&server_row.row_json).expect("the server row is a JSON object");
+    assert_eq!(current["status"], "server");
 
     // The conflicting write was undone locally; the stale basis is restored and
     // the server row is left for the sync stream to converge.

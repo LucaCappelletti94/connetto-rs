@@ -13,7 +13,6 @@
 //! hash does not match the stored one, on a session that still exists, is
 //! treated as reuse of a rotated-out token (theft) and revokes the session.
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use connetto_core::SessionId;
@@ -25,9 +24,7 @@ use crate::authn::identity::{IdentityResolver, ResolveError, VerifiedClaims};
 use crate::authn::token::RefreshLifetimes;
 
 /// A caller identity resolved from a verified credential, ready to mint a
-/// session for. Carries the verified provider claims (for the identity
-/// resolver) plus the session attributes connetto attaches (tenant, roles,
-/// extra claims). Human-readable fields never serve as identity: only the
+/// session for. Human-readable fields never serve as identity: only the
 /// issuer and subject do, per the identity-mapping rule.
 #[derive(Debug, Clone)]
 pub struct ResolvedIdentity {
@@ -43,25 +40,9 @@ pub struct ResolvedIdentity {
     pub amr: Vec<String>,
     /// The `acr` claim: the authentication context class reference.
     pub acr: Option<String>,
-    /// Optional tenant for multi-tenant deployments.
-    pub tenant_id: Option<String>,
-    /// Roles to attach to the session.
-    pub roles: Vec<String>,
-    /// Extra claims to carry into the session.
-    pub claims: BTreeMap<String, String>,
 }
 
 impl ResolvedIdentity {
-    /// Build the [`AuthContext`] this identity maps to under `user_id`.
-    fn into_context<Id>(self, user_id: Id) -> AuthContext<Id> {
-        AuthContext {
-            user_id,
-            tenant_id: self.tenant_id,
-            roles: self.roles,
-            claims: self.claims,
-        }
-    }
-
     /// The verified provider claims to hand the [`IdentityResolver`].
     #[must_use]
     pub fn verified_claims(&self) -> VerifiedClaims {
@@ -327,7 +308,7 @@ impl<
         now: SystemTime,
     ) -> Result<IssuedSession<Id>, AuthStoreError> {
         let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
-        let context = identity.clone().into_context(user_id);
+        let context = AuthContext { user_id };
         let session_id = new_session_id();
         let secret = new_refresh_secret();
         let record = SessionRecord {
@@ -463,7 +444,6 @@ impl<
 pub use db::DbAuthStore;
 
 mod db {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -474,7 +454,6 @@ mod db {
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-    use serde::{Deserialize, Serialize};
 
     use super::{
         AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, format_refresh,
@@ -485,26 +464,10 @@ mod db {
     use crate::authn::schema::ConnettoStoreSchema;
     use crate::authn::token::RefreshLifetimes;
 
-    /// The `sessions.attrs` blob: everything in [`AuthContext`] except the typed
-    /// `user_id`, which lives in its own column and is never duplicated here.
-    #[derive(Serialize, Deserialize)]
-    struct SessionAttrs {
-        tenant_id: Option<String>,
-        roles: Vec<String>,
-        claims: BTreeMap<String, String>,
-    }
-
     /// The rotation columns a `SELECT ... FOR UPDATE` loads: the typed
-    /// `user_id`, the `attrs` blob, the refresh hash, and the two deadlines
-    /// plus the revoked flag.
-    type SessionRow<S> = (
-        <S as ConnettoStoreSchema>::Id,
-        serde_json::Value,
-        Vec<u8>,
-        i64,
-        i64,
-        bool,
-    );
+    /// `user_id`, the refresh hash, and the two deadlines plus the revoked
+    /// flag.
+    type SessionRow<S> = (<S as ConnettoStoreSchema>::Id, Vec<u8>, i64, i64, bool);
 
     /// The Postgres auth store, generic over the deployment's schema. Durable
     /// across restart and the only variant that backs a mesh. Identity resolves
@@ -549,21 +512,6 @@ mod db {
         UNIX_EPOCH + Duration::from_millis(u64::try_from(ms).unwrap_or(0))
     }
 
-    /// Rehydrate the [`AuthContext`] from the typed `user_id` column and the
-    /// deserialized `attrs` blob.
-    fn context_from_attrs<Id>(
-        user_id: Id,
-        attrs: serde_json::Value,
-    ) -> Result<AuthContext<Id>, AuthStoreError> {
-        let attrs: SessionAttrs = serde_json::from_value(attrs).map_err(backend)?;
-        Ok(AuthContext {
-            user_id,
-            tenant_id: attrs.tenant_id,
-            roles: attrs.roles,
-            claims: attrs.claims,
-        })
-    }
-
     impl<S: ConnettoStoreSchema> AuthStore for DbAuthStore<S> {
         type Id = S::Id;
 
@@ -578,16 +526,9 @@ mod db {
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
-            let attrs = serde_json::to_value(SessionAttrs {
-                tenant_id: identity.tenant_id.clone(),
-                roles: identity.roles.clone(),
-                claims: identity.claims.clone(),
-            })
-            .map_err(backend)?;
             let row = S::new_session(
                 session_id,
                 user_id.clone(),
-                attrs,
                 refresh_hash,
                 idle,
                 absolute,
@@ -599,12 +540,7 @@ mod db {
                 .execute(&mut conn)
                 .await
                 .map_err(backend)?;
-            let context = AuthContext {
-                user_id,
-                tenant_id: identity.tenant_id.clone(),
-                roles: identity.roles.clone(),
-                claims: identity.claims.clone(),
-            };
+            let context = AuthContext { user_id };
             Ok(IssuedSession {
                 session_id,
                 context,
@@ -653,14 +589,8 @@ mod db {
                             .await
                             .optional()
                             .map_err(backend)?;
-                        let (
-                            user_id,
-                            attrs,
-                            current_hash,
-                            idle_deadline,
-                            absolute_deadline,
-                            revoked,
-                        ) = row.ok_or(AuthStoreError::NotFound)?;
+                        let (user_id, current_hash, idle_deadline, absolute_deadline, revoked) =
+                            row.ok_or(AuthStoreError::NotFound)?;
                         if revoked {
                             return Err(AuthStoreError::NotFound);
                         }
@@ -679,7 +609,7 @@ mod db {
                             .execute(conn)
                             .await
                             .map_err(backend)?;
-                        let context = context_from_attrs(user_id, attrs)?;
+                        let context = AuthContext { user_id };
                         Ok(RefreshOutcome {
                             session_id,
                             context,
@@ -727,7 +657,7 @@ mod db {
                 .await
                 .optional()
                 .map_err(backend)?;
-            let Some((_, _, current_hash, _, _, revoked)) = row else {
+            let Some((_, current_hash, _, _, revoked)) = row else {
                 return Ok(None);
             };
             if revoked || !hashes_match(&presented_hash, &current_hash) {

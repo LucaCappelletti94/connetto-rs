@@ -25,9 +25,6 @@ fn identity(subject: &str) -> ResolvedIdentity {
         name: None,
         amr: Vec::new(),
         acr: None,
-        tenant_id: Some("tenant-typed".to_owned()),
-        roles: vec!["member".to_owned()],
-        claims: std::collections::BTreeMap::new(),
     }
 }
 
@@ -79,8 +76,6 @@ async fn in_memory_store_carries_a_typed_user_id() {
     assert_eq!(first.context.user_id, expected);
     assert_eq!(first.context.user_id, second.context.user_id);
     assert_ne!(first.session_id, second.session_id, "distinct sessions");
-    assert_eq!(first.context.roles, vec!["member".to_owned()]);
-    assert_eq!(first.context.tenant_id.as_deref(), Some("tenant-typed"));
 
     // A different identity resolves to a different typed id.
     let other = store

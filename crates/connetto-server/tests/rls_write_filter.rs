@@ -28,20 +28,36 @@ use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::ConnettoWatermark;
+use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::QueryableByName;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
 const PG_DDL: &str =
     "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT);";
 
-fn admin_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
+/// Shared setup for both tests. `Fixture` holds the process-wide serialization
+/// lock, so the two do not race each other's `DROP TABLE notes`, and it
+/// provisions `_connetto_mutations` fresh, which the writer role is granted on
+/// below.
+async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS notes CASCADE",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
+             THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
+            "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT)",
+            "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY notes_p ON notes USING (owner = current_setting('app.user_id', true))",
+            "GRANT USAGE ON SCHEMA public TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
+        ])
+        .await;
+    pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await
 }
 
 /// Rewrite a Postgres URL's user info, keeping host, port, and database.
@@ -54,14 +70,6 @@ fn with_user(url: &str, user: &str, password: &str) -> String {
 async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
     Pool::builder().build(manager).await.expect("build pool")
-}
-
-async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
-    let mut conn = pool.get().await.expect("admin connection");
-    sql_query(sql)
-        .execute(&mut *conn)
-        .await
-        .unwrap_or_else(|err| panic!("statement failed ({sql}): {err}"));
 }
 
 /// The `(id, owner)` rows in `notes`, read as admin so RLS does not hide any.
@@ -118,6 +126,36 @@ fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str) -> Vec<u8
         .build()
 }
 
+/// A changeset that reassigns one row's owner, carrying the old image so the
+/// version basis and the pre-update owner both reach Postgres.
+fn reassign_changeset(id: i64, old_owner: &str, new_owner: &str, edited_at: &str) -> Vec<u8> {
+    let table = SimpleTable::new("notes", &["id", "owner", "body", "edited_at"], &[0]);
+    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table)
+        .set(0, Value::Integer(id), Value::Integer(id))
+        .expect("set id")
+        .set(
+            1,
+            Value::Text(old_owner.to_owned()),
+            Value::Text(new_owner.to_owned()),
+        )
+        .expect("set owner")
+        .set(
+            2,
+            Value::Text("mine".to_owned()),
+            Value::Text("mine".to_owned()),
+        )
+        .expect("set body")
+        .set(
+            3,
+            Value::Text(edited_at.to_owned()),
+            Value::Text(edited_at.to_owned()),
+        )
+        .expect("set edited_at");
+    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
+        .build()
+}
+
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
         Some(IncomingFrame::Control(msg)) => msg,
@@ -170,36 +208,9 @@ async fn barrier<T: Transport>(transport: &mut T, nonce: u64) -> ControlMessage 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rls_write_filter_applies_owned_and_refuses_foreign() {
-    let url = admin_url();
-    let admin = pool_for(&url).await;
-    let setup: Vec<String> = vec![
-        "DROP TABLE IF EXISTS notes CASCADE".to_owned(),
-        // Stale per-client watermarks would suppress replayed uploads.
-        "DROP TABLE IF EXISTS _connetto_mutations".to_owned(),
-        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
-         THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$"
-            .to_owned(),
-        "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT)".to_owned(),
-        "ALTER TABLE notes ENABLE ROW LEVEL SECURITY".to_owned(),
-        "CREATE POLICY notes_p ON notes USING (owner = current_setting('app.user_id', true))"
-            .to_owned(),
-        "GRANT USAGE ON SCHEMA public TO app_writer".to_owned(),
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer".to_owned(),
-    ];
-    for stmt in setup {
-        exec(&admin, &stmt).await;
-    }
-    // The watermark table is provisioned by the admin, like a deployment
-    // would: the restricted writer role cannot CREATE in schema public and
-    // only needs DML on it.
-    connetto_test_harness::provision_watermark(&admin).await;
-    exec(
-        &admin,
-        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
-    )
-    .await;
-
-    let writer_pool = pool_for(&with_user(&url, "app_writer", "app_writer")).await;
+    let fixture = Fixture::acquire().await;
+    let admin = fixture.admin().clone();
+    let writer_pool = setup(&fixture).await;
     let materializer = Materializer::with_write_catalog(
         PG_DDL,
         RuntimeWritableCatalog::builder()
@@ -249,6 +260,67 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     }
 
     // Postgres holds only the owned row.
+    assert_eq!(notes(&admin).await, vec![(1, "alice".to_owned())]);
+
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A write that moves the row out of the writer's own reach is refused.
+///
+/// Alice owns note 1 and may edit it. Reassigning its `owner` to Bob passes the
+/// policy on the row she is holding and fails it on the row she would leave
+/// behind, because a `FOR ALL` policy's `USING` clause doubles as its
+/// `WITH CHECK`. This is the update counterpart of the foreign-insert case: the
+/// insert is refused for a row she never owned, this one for a row she owns
+/// right up until the statement lands. Postgres must keep the original owner,
+/// because a half-applied handoff would strand the row with nobody able to see
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
+    let fixture = Fixture::acquire().await;
+    let admin = fixture.admin().clone();
+    let writer_pool = setup(&fixture).await;
+    let materializer = Materializer::with_write_catalog(
+        PG_DDL,
+        RuntimeWritableCatalog::builder()
+            .versioned("notes", "edited_at")
+            .build(),
+    )
+    .expect("build materializer");
+    let target =
+        pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
+    let manager = SessionManager::new(
+        materializer,
+        NoSnapshot,
+        PermissiveAuth,
+        Arc::new(TestSessionVerifier),
+        target,
+        SessionConfig::default(),
+    );
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    handshake(&mut client, "alice").await;
+
+    upload(&mut client, 1, insert_changeset(1, "alice", "mine", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
+        other => panic!("alice must be able to insert her own row, got {other:?}"),
+    }
+
+    upload(&mut client, 2, reassign_changeset(1, "alice", "bob", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 2),
+        other => panic!("handing the row to bob should be rejected, got {other:?}"),
+    }
+    match barrier(&mut client, 1).await {
+        ControlMessage::Pong(_) => {}
+        other => panic!("expected pong after the reject, got {other:?}"),
+    }
+
+    // The row is untouched, so nothing was left half-applied.
     assert_eq!(notes(&admin).await, vec![(1, "alice".to_owned())]);
 
     client.close().await.expect("close client");

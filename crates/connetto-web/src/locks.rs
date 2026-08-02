@@ -1,13 +1,12 @@
 //! Web Locks liveness for the relay topology.
 //!
-//! `SharedWorker` ports have no reliable close event, so a dead tab would
-//! leave its relay session parked forever. The protocol: a tab that wants
-//! dead-tab cleanup holds a browser lock named after its client id BEFORE
-//! connecting. At handshake the hub's owner probes the lock, and a free
-//! lock means the tab opted out and is never reaped. A held lock is
-//! watched, and the watch being granted means the holder (and with it the
-//! tab) is gone, since the browser releases web locks when their context
-//! dies.
+//! A `MessagePort` and a `BroadcastChannel` both have no reliable close event,
+//! so a dead tab would leave its relay session parked forever. The protocol: a
+//! tab that wants dead-tab cleanup holds a browser lock named after its client
+//! id BEFORE connecting. At handshake the hub's owner probes the lock, and a
+//! free lock means the tab opted out and is never reaped. A held lock is
+//! watched, and the watch being granted means the holder (and with it the tab)
+//! is gone, since the browser releases web locks when their context dies.
 
 use futures_channel::oneshot;
 use js_sys::Promise;

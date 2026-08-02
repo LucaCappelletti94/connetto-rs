@@ -25,8 +25,9 @@
 //! codec is synchronous C in the same address space as the application, so the
 //! raw key is in memory for the life of the connection. This does not defend
 //! against an attacker already resident in the process, who can drive the open
-//! connection anyway. It defends the at-rest, off-device, account-switch, and
-//! post-logout cases: a copied file, a recovered disk, a shared device.
+//! connection anyway, and it does not separate accounts on one device, which is
+//! the operating system's user boundary. It defends the at-rest, off-device and
+//! post-logout cases: a copied file, a recovered disk, a backup already taken.
 
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;

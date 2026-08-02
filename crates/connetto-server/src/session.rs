@@ -14,9 +14,9 @@
 //!
 //! The write path pairs a `MutationHeader` with the `MutationPatch` that follows
 //! it, authorizes every op, detects stale-version conflicts, applies the whole
-//! changeset in one transaction, and replies only on failure. Success is the CDC
-//! echo, so there is no dedicated ack. The write applies to the source Postgres
-//! under the caller's RLS context.
+//! changeset in one transaction, and replies on every outcome: `MutationApplied`
+//! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
+//! write applies to the source Postgres under the caller's RLS context.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -556,6 +556,26 @@ where
             }
             None => false,
         }
+    }
+
+    /// Close every live connection with
+    /// [`FatalErrorReason::ServerShuttingDown`], returning how many were told.
+    ///
+    /// A client that learns the server is going away backs off instead of
+    /// reconnecting immediately into a dying process. The registry is drained,
+    /// so a handshake racing the shutdown registers into an empty map and is
+    /// closed by the listener stopping rather than by a second frame.
+    pub async fn shutdown(&self) -> usize {
+        let live: Vec<_> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.drain().map(|(_, live)| live.tx).collect()
+        };
+        for tx in &live {
+            let _ = tx.send(Outbound::Fatal(FatalError::new(
+                FatalErrorReason::ServerShuttingDown,
+            )));
+        }
+        live.len()
     }
 
     /// Claim `session_id` for this connection, superseding whatever held it.
@@ -1193,17 +1213,12 @@ where
                 state.applied_watermark = Some(client_seq);
                 self.ack(transport, client_seq).await
             }
-            Ok(WriteOutcome::Conflict {
-                table,
-                server_updated_at,
-                server_row_json,
-            }) => {
+            Ok(WriteOutcome::Conflict { table, server_row }) => {
                 transport
                     .send_control(ControlMessage::MutationConflict(MutationConflict {
                         client_seq,
                         table,
-                        server_updated_at,
-                        server_row_json,
+                        server_row,
                     }))
                     .await
                     .map_err(transport_err)?;

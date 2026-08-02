@@ -363,8 +363,21 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationRejected { client_seq, .. } => {
             Some(format!("mutation {client_seq} rejected"))
         }
-        ClientEvent::MutationConflict { client_seq, .. } => {
-            Some(format!("mutation {client_seq} conflicted"))
+        ClientEvent::MutationConflict {
+            client_seq,
+            server_row,
+            ..
+        } => Some(server_row.as_ref().map_or_else(
+            || format!("mutation {client_seq} conflicted, the server row is gone"),
+            |row| {
+                format!(
+                    "mutation {client_seq} conflicted, the server holds {}",
+                    row.row_json
+                )
+            },
+        )),
+        ClientEvent::ServerClosed { reason } => {
+            Some(format!("server closed the session: {reason:?}"))
         }
         ClientEvent::Closed => Some("connection closed".to_owned()),
         _ => None,

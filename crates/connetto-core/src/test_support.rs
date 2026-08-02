@@ -94,6 +94,9 @@ pub struct FakeTransport {
     inbox: VecDeque<IncomingFrame>,
     /// Park on a drained inbox rather than reporting end of stream.
     silent: bool,
+    /// Delivered once, right after the handshake ack, as a deliberate server
+    /// close (a shutdown or a revocation) does.
+    closing: Option<FatalErrorReason>,
 }
 
 impl FakeTransport {
@@ -121,6 +124,17 @@ impl FakeTransport {
         }
     }
 
+    /// A transport whose handshake succeeds and which then closes the session
+    /// deliberately, carrying `reason`, as a graceful shutdown or a mid-session
+    /// revocation does.
+    #[must_use]
+    pub fn accepting_then_closing(reason: FatalErrorReason) -> Self {
+        Self {
+            closing: Some(reason),
+            ..Self::new(HandshakeReply::Accept)
+        }
+    }
+
     /// A transport answering with `reply`, whose peer looks gone once its inbox
     /// drains.
     #[must_use]
@@ -129,6 +143,7 @@ impl FakeTransport {
             reply,
             inbox: VecDeque::new(),
             silent: false,
+            closing: None,
         }
     }
 
@@ -159,6 +174,12 @@ impl Transport for FakeTransport {
         if matches!(message, ControlMessage::Handshake(_)) {
             let frame = self.answer();
             self.inbox.push_back(frame);
+            if let Some(reason) = self.closing.take() {
+                self.inbox
+                    .push_back(IncomingFrame::Control(ControlMessage::FatalError(
+                        FatalError::new(reason),
+                    )));
+            }
         }
         Ok(())
     }

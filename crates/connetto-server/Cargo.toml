@@ -26,7 +26,9 @@ subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-pa
 # Pinned to the reference-closed FK validation merge (PR #46), which sits on
 # the translation manifest (PR #45) and the read-only deny triggers (PR #44).
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
-tokio.workspace = true
+# `signal` is the binary's graceful shutdown: SIGINT and SIGTERM stop the
+# listener and close every live session with ServerShuttingDown.
+tokio = { workspace = true, features = ["signal"] }
 thiserror.workspace = true
 diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid"] }
 # Naming the Postgres dialect when building subql's catalog and engine, and the

@@ -104,7 +104,6 @@ async fn spawn_auth_server_with_service()
             redirect_url: callback,
             scopes: Vec::new(),
             assurance: AssuranceRequirement::none(),
-            tenant_id: None,
         },
         reqwest::Client::new(),
     )
@@ -177,7 +176,6 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
             redirect_url: callback.clone(),
             scopes: Vec::new(),
             assurance: AssuranceRequirement::none(),
-            tenant_id: None,
         },
         reqwest::Client::new(),
     )
@@ -214,7 +212,6 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
             redirect_url: callback,
             scopes: Vec::new(),
             assurance: AssuranceRequirement::none(),
-            tenant_id: None,
         },
         reqwest::Client::new(),
     )

@@ -23,8 +23,8 @@ mod common;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority,
+    BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
@@ -143,8 +143,10 @@ async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::U
                     .send_control(ControlMessage::MutationConflict(MutationConflict {
                         client_seq: header.client_seq,
                         table: "orders".to_owned(),
-                        server_updated_at: String::new(),
-                        server_row_json: "{}".to_owned(),
+                        server_row: Some(ConflictRow {
+                            updated_at: "v2".to_owned(),
+                            row_json: format!(r#"{{"id":"{}","quantity":99}}"#, seeded_id),
+                        }),
                     }))
                     .await
                     .expect("conflict reply");
@@ -264,9 +266,11 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
 
     // The tab must observe MutationConflict, never a plain rejection, and roll
     // the optimistic write back exactly as a direct client would.
-    let rows = loop {
+    let (rows, server_row) = loop {
         match tab.pump_one().await.expect("tab pump") {
-            ClientEvent::MutationConflict { rows, .. } => break rows,
+            ClientEvent::MutationConflict {
+                rows, server_row, ..
+            } => break (rows, server_row),
             ClientEvent::MutationRejected { .. } => {
                 panic!("the relay collapsed an upstream conflict into a rejection")
             }
@@ -277,6 +281,19 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     assert!(
         rows.iter().any(|row| row.table == "orders"),
         "the conflict names the rolled-back orders row",
+    );
+    let server_row =
+        server_row.expect("relay tab must see the server_row the upstream sent, not None");
+    assert_eq!(
+        server_row.updated_at, "v2",
+        "relay tab sees the row version the upstream sent",
+    );
+    let row_val: serde_json::Value =
+        serde_json::from_str(&server_row.row_json).expect("server_row.row_json is valid JSON");
+    assert_eq!(
+        row_val["quantity"],
+        serde_json::json!(99),
+        "relay tab sees the quantity the upstream server row reported",
     );
     assert_eq!(
         load_orders(&mut tab)

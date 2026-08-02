@@ -3,11 +3,11 @@
 //! One worker-held [`ConnettoConnection`] owns the durable replica and the
 //! server session, and any number of tabs speak the ordinary connetto wire
 //! protocol to it over their own [`Transport`]s (an in-memory loopback, or a
-//! [`PortTransport`](crate::PortTransport) over a `MessageChannel` or
-//! `SharedWorker` port). The hub is a single-task core fed by channels: each
-//! attached tab gets a shovel task that owns its transport and exchanges
-//! frames with the core, so the core never selects over a dynamic set of
-//! transports and sends toward tabs never block it.
+//! [`PortTransport`](crate::PortTransport) over a `MessageChannel` port). The
+//! hub is a single-task core fed by channels: each attached tab gets a shovel
+//! task that owns its transport and exchanges frames with the core, so the
+//! core never selects over a dynamic set of transports and sends toward tabs
+//! never block it.
 //!
 //! Snapshots are generic: a throwaway capture session diffs each subscribed
 //! table against an empty twin in an attached blank database, so values of
@@ -64,8 +64,8 @@ use connetto_client::{
     subscription_tables,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired,
-    HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
+    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
+    FullResyncRequired, HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
     MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
     Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
@@ -677,7 +677,8 @@ where
                 }
             },
             event = worker.pump_one() => match event {
-                Ok(ClientEvent::Closed) | Err(ClientError::Transport(_)) => {
+                Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
+                | Err(ClientError::Transport(_)) => {
                     let Some(driver) = reconnect.as_mut() else {
                         break;
                     };
@@ -1309,9 +1310,11 @@ where
             client_seq,
             "the upstream server rejected the forwarded mutation",
         ),
-        ClientEvent::MutationConflict { client_seq, rows } => {
-            conflict_tab_mutation(state, client_seq, &rows)
-        }
+        ClientEvent::MutationConflict {
+            client_seq,
+            rows,
+            server_row,
+        } => conflict_tab_mutation(state, client_seq, &rows, server_row),
         ClientEvent::Aggregate {
             sub_id,
             result_json,
@@ -1442,19 +1445,16 @@ fn reject_tab_mutation(
 /// `MutationConflict` rather than a plain reject, so a relay tab draws the
 /// same distinction a direct client does.
 ///
-/// The worker client already rolled the change back out of its replica and
-/// surfaces only the sequence number plus the locally rolled-back rows, so the
-/// server's own conflicting-row snapshot is not available to re-send. That is
-/// no fidelity loss over a direct client: `ClientEvent::MutationConflict`
-/// exposes only the sequence number and the tab's own rolled-back rows either
-/// way. The tab reconstructs those rows from its pending changeset when it
-/// decodes this frame, so the informational fields are left empty, save the
-/// table name carried by the rolled-back rows when present.
+/// The server's copy of the conflicting row travels through the worker client
+/// untouched, so the tab sees exactly what a direct client would. The table
+/// name comes from the locally rolled-back rows, which the worker client
+/// carries alongside it.
 #[allow(clippy::unnecessary_wraps)]
 fn conflict_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,
     rows: &[AffectedRow],
+    server_row: Option<ConflictRow>,
 ) -> Result<(), RelayError> {
     let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
         return Ok(());
@@ -1470,8 +1470,7 @@ fn conflict_tab_mutation(
                 MutationConflict {
                     client_seq: tab_seq,
                     table,
-                    server_updated_at: String::new(),
-                    server_row_json: String::new(),
+                    server_row,
                 },
             )));
     }

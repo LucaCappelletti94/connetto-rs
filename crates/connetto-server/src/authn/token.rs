@@ -1,14 +1,12 @@
 //! connetto's own session access token: lifetimes, minting, and verification.
 //!
 //! The access token is short-lived and asymmetrically signed (Ed25519 through
-//! `jsonwebtoken`, ring-backed, native backend only). It carries the full
-//! identity (`user_id`, `tenant_id`, `roles`, `claims`) plus the session id, so
-//! the handshake trusts the identity from the signature alone and checks
-//! liveness separately. Verification pins the algorithm (rejecting `none` and
-//! any symmetric algorithm), the issuer, the audience, and the expiry. See
-//! `docs/architecture/11-authentication.md`.
+//! `jsonwebtoken`, ring-backed, native backend only). It carries the identity
+//! (`user_id`) plus the session id, so the handshake trusts the identity from
+//! the signature alone and checks liveness separately. Verification pins the
+//! algorithm (rejecting `none` and any symmetric algorithm), the issuer, the
+//! audience, and the expiry. See `docs/architecture/11-authentication.md`.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
@@ -97,8 +95,8 @@ pub enum TokenError {
 }
 
 /// The claims connetto signs into its access token. `sub` is the `user_id`,
-/// `sid` names the session for the liveness check, and the identity fields
-/// rebuild the [`AuthContext`] at the handshake with no store round-trip.
+/// `sid` names the session for the liveness check, and the pair rebuilds the
+/// [`AuthContext`] at the handshake with no store round-trip.
 #[derive(Debug, Serialize, Deserialize)]
 struct AccessClaims<Id> {
     iss: String,
@@ -107,12 +105,6 @@ struct AccessClaims<Id> {
     iat: u64,
     exp: u64,
     sid: SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tid: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    roles: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    claims: BTreeMap<String, String>,
 }
 
 /// Mints and verifies connetto's own asymmetrically signed access token.
@@ -208,9 +200,6 @@ impl TokenAuthority {
             iat,
             exp,
             sid: session_id,
-            tid: context.tenant_id.clone(),
-            roles: context.roles.clone(),
-            claims: context.claims.clone(),
         };
         encode(&Header::new(Algorithm::EdDSA), &claims, &self.encoding)
             .map_err(|err| TokenError::Mint(err.to_string()))
@@ -239,9 +228,6 @@ impl TokenAuthority {
         let claims = data.claims;
         let context = AuthContext {
             user_id: claims.sub,
-            tenant_id: claims.tid,
-            roles: claims.roles,
-            claims: claims.claims,
         };
         Ok(VerifiedSession {
             context,

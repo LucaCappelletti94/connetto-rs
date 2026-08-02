@@ -28,7 +28,7 @@
 //! writes.
 
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, FatalError, FatalErrorReason, Handshake,
+    AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason, Handshake,
     MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -375,6 +375,10 @@ pub enum ClientEvent {
         client_seq: u64,
         /// Rows the conflicting write touched, rolled back locally.
         rows: Vec<AffectedRow>,
+        /// The server's copy of the row the write collided with, absent when
+        /// the row is gone. Deserialise `row_json` into the app's row type to
+        /// show what the other writer left, or to merge against it.
+        server_row: Option<ConflictRow>,
     },
     /// A keepalive reply.
     Pong {
@@ -390,6 +394,16 @@ pub enum ClientEvent {
     /// subscription. Missed changes stream in as ordinary live patches (or a
     /// full resync when the cursor fell out of the server's retention).
     Reconnected,
+    /// The server closed the session deliberately, and said why.
+    ///
+    /// Distinct from [`Closed`](Self::Closed), which is the transport simply
+    /// ending. The reconnect driver treats this as a lost connection and backs
+    /// off, so a server going away is not hammered with immediate retries. The
+    /// reason is what lets an app tell a restart from a sign-out.
+    ServerClosed {
+        /// Why the server closed the session.
+        reason: FatalErrorReason,
+    },
     /// The connection closed.
     Closed,
     /// The credential was rejected and refresh could not recover it, so the
@@ -1501,12 +1515,18 @@ where
                 Ok(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
                     rows,
+                    server_row: conflict.server_row,
                 })
             }
             ControlMessage::Pong(pong) => Ok(ClientEvent::Pong { nonce: pong.nonce }),
             ControlMessage::NonFatalError(err) => Ok(ClientEvent::NonFatal {
                 related_to: err.related_to,
                 detail: err.detail,
+            }),
+            // The server says why it is closing. Surfaced rather than treated
+            // as a violation: the server behaved exactly as the protocol says.
+            ControlMessage::FatalError(fatal) => Ok(ClientEvent::ServerClosed {
+                reason: fatal.reason,
             }),
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"

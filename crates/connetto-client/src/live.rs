@@ -1261,6 +1261,17 @@ async fn pump<T, F, S>(
         //    lock waiters (watch, with_conn, drops) get in promptly.
         let wake = Arc::clone(&shared.wake);
         match state.conn.pump_one_or(wake.notified()).await {
+            // A deliberate server close: tell the app why, then take the same
+            // path a dropped transport takes. The socket is gone either way.
+            Ok(Some(event @ ClientEvent::ServerClosed { .. })) => {
+                let _ = shared.events.send(event);
+                if reconnect.is_some() {
+                    needs_recovery = true;
+                    continue;
+                }
+                let _ = shared.events.send(ClientEvent::Closed);
+                return;
+            }
             Ok(Some(ClientEvent::Closed)) => {
                 if reconnect.is_some() {
                     needs_recovery = true;

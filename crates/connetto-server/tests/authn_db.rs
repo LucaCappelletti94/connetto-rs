@@ -6,7 +6,6 @@
 //! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use connetto_server::{
@@ -33,7 +32,7 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
         "DROP TABLE IF EXISTS connetto_provider_tokens",
         "DROP TABLE IF EXISTS connetto_sessions",
         "CREATE TABLE connetto_sessions (\
-            session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, attrs JSONB NOT NULL, \
+            session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
             current_refresh_hash BYTEA NOT NULL, idle_deadline_ms BIGINT NOT NULL, \
             absolute_deadline_ms BIGINT NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
         "CREATE TABLE connetto_provider_tokens (\
@@ -62,9 +61,6 @@ fn identity(subject: &str) -> ResolvedIdentity {
         name: None,
         amr: Vec::new(),
         acr: None,
-        tenant_id: Some("tenant-db".to_owned()),
-        roles: vec!["member".to_owned()],
-        claims: BTreeMap::new(),
     }
 }
 
@@ -104,7 +100,6 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
         "same identity resolves to one user id",
     );
     assert_ne!(first.session_id, second.session_id, "distinct sessions");
-    assert_eq!(first.context.roles, vec!["member".to_owned()]);
     assert!(
         store
             .session_is_live(first.session_id, now)

@@ -79,7 +79,6 @@ fn provider(assurance: AssuranceRequirement) -> GenericOidcProvider {
         redirect_url: "https://app.example/callback".to_owned(),
         scopes: Vec::new(),
         assurance,
-        tenant_id: None,
     };
     GenericOidcProvider::from_parts(
         config,
@@ -130,10 +129,7 @@ fn verified_id_token_maps_to_identity() {
     let identity = provider.verify_claims(&token, "nonce-1").expect("verify");
     assert_eq!(identity.subject, "user-42");
     assert_eq!(identity.issuer, TEST_ISSUER);
-    assert_eq!(
-        identity.claims.get("email"),
-        Some(&"u@example.com".to_owned()),
-    );
+    assert_eq!(identity.email.as_deref(), Some("u@example.com"));
 }
 
 #[test]
@@ -209,7 +205,6 @@ async fn service_with_real_provider() -> (
                 redirect_url: CALLBACK.to_owned(),
                 scopes: Vec::new(),
                 assurance: AssuranceRequirement::none(),
-                tenant_id: None,
             },
             reqwest::Client::new(),
         )

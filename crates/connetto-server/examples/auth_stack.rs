@@ -256,7 +256,6 @@ async fn main() -> Result<()> {
             // would refuse every login. The bar itself is covered by
             // `tests/provider.rs`.
             assurance: AssuranceRequirement::none(),
-            tenant_id: None,
         },
         &format!("{base}/authorize"),
         &format!("{base}/token"),

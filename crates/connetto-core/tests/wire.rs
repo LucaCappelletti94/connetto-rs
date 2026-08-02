@@ -13,11 +13,11 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
-        FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationConflict,
-        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, Ping,
-        Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
-        SubscriptionSpec, Unsubscribe,
+        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
+        FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
+        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
+        NonFatalError, Ping, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -110,8 +110,16 @@ fn mutation_control_frames_round_trip() {
     round_trip_control(&ControlMessage::MutationConflict(MutationConflict {
         client_seq: 17,
         table: "orders".into(),
-        server_updated_at: "2026-07-09T10:44:00Z".into(),
-        server_row_json: r#"{"id":1,"amount":42}"#.into(),
+        server_row: Some(ConflictRow {
+            updated_at: "2026-07-09T10:44:00Z".into(),
+            row_json: r#"{"id":1,"amount":42}"#.into(),
+        }),
+    }));
+    // The row is gone, which is the case an empty string used to stand in for.
+    round_trip_control(&ControlMessage::MutationConflict(MutationConflict {
+        client_seq: 18,
+        table: "orders".into(),
+        server_row: None,
     }));
 }
 
@@ -133,19 +141,10 @@ fn aggregate_update_round_trip() {
 
 #[test]
 fn resync_control_round_trips() {
-    for reason in [
-        FullResyncReason::CursorOutsideRetention,
-        FullResyncReason::SessionExpired,
-        FullResyncReason::SchemaIncompatible,
-        FullResyncReason::Other {
-            detail: "corrupt".into(),
-        },
-    ] {
-        round_trip_control(&ControlMessage::FullResyncRequired(FullResyncRequired {
-            sub_id: "sub-orders".into(),
-            reason,
-        }));
-    }
+    round_trip_control(&ControlMessage::FullResyncRequired(FullResyncRequired {
+        sub_id: "sub-orders".into(),
+        reason: FullResyncReason::CursorOutsideRetention,
+    }));
 }
 
 #[test]
@@ -155,27 +154,52 @@ fn flow_control_round_trip() {
     round_trip_control(&ControlMessage::AckCredits(AckCredits { credits: 32 }));
 }
 
+/// Every `FatalErrorReason`, each one a close the server actually performs.
+///
+/// The wildcard-free match is the guard: adding a variant to the enum stops
+/// this file compiling until it is listed here, and listing it is the moment
+/// to notice that nothing sends it. The comment beside each names where the
+/// server constructs it, so an unsendable variant cannot be added quietly.
+fn every_fatal_reason() -> Vec<FatalErrorReason> {
+    let reasons = vec![
+        // SessionManager::run_handshake, on a version the server cannot speak.
+        FatalErrorReason::ProtocolVersionMismatch {
+            expected: PROTOCOL_VERSION,
+            got: 999,
+        },
+        // SessionManager::run_handshake, when the verifier refuses.
+        FatalErrorReason::AuthenticationFailed,
+        // SessionManager::close_session, from the auth service's revoke hook.
+        FatalErrorReason::SessionRevoked,
+        // SessionManager::register_connection, on a second live handshake.
+        FatalErrorReason::ConnectionSuperseded,
+        // SessionManager::serve, on a duplicate handshake mid-session.
+        FatalErrorReason::ProtocolViolation {
+            detail: "duplicate handshake".into(),
+        },
+        // SessionManager::shutdown, walking the connection registry.
+        FatalErrorReason::ServerShuttingDown,
+    ];
+    for reason in &reasons {
+        match reason {
+            FatalErrorReason::ProtocolVersionMismatch { .. }
+            | FatalErrorReason::AuthenticationFailed
+            | FatalErrorReason::SessionRevoked
+            | FatalErrorReason::ConnectionSuperseded
+            | FatalErrorReason::ProtocolViolation { .. }
+            | FatalErrorReason::ServerShuttingDown => {}
+        }
+    }
+    reasons
+}
+
 #[test]
 fn error_control_round_trips() {
     round_trip_control(&ControlMessage::NonFatalError(NonFatalError {
         related_to: Some("sub-orders".into()),
         detail: "malformed WHERE".into(),
     }));
-    for reason in [
-        FatalErrorReason::ProtocolVersionMismatch {
-            expected: PROTOCOL_VERSION,
-            got: 999,
-        },
-        FatalErrorReason::AuthenticationFailed,
-        FatalErrorReason::SessionRevoked,
-        FatalErrorReason::ProtocolViolation {
-            detail: "unexpected control after fatal".into(),
-        },
-        FatalErrorReason::ServerShuttingDown,
-        FatalErrorReason::Other {
-            detail: "boom".into(),
-        },
-    ] {
+    for reason in every_fatal_reason() {
         round_trip_control(&ControlMessage::FatalError(FatalError::new(reason)));
     }
 }

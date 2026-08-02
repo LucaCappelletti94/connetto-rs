@@ -263,9 +263,11 @@ async fn write_path_applies_conflicts_and_dedups() {
     };
     assert_eq!(conflict.client_seq, 3);
     assert_eq!(conflict.table, "notes");
-    assert_eq!(conflict.server_updated_at, "t2");
-    let current: serde_json::Value =
-        serde_json::from_str(&conflict.server_row_json).expect("row json");
+    let row = conflict
+        .server_row
+        .expect("the conflicting row still exists");
+    assert_eq!(row.updated_at, "t2");
+    let current: serde_json::Value = serde_json::from_str(&row.row_json).expect("row json");
     assert_eq!(current["body"], "updated");
     assert_eq!(current["edited_at"], "t2");
     assert_eq!(

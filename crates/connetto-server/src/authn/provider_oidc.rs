@@ -10,7 +10,6 @@
 //! issuer matching is insufficient: the Microsoft preset accepts an any-tenant
 //! issuer pattern and validates it after verification.
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
@@ -78,17 +77,6 @@ impl IssuerMatch {
     fn is_pattern(&self) -> bool {
         matches!(self, Self::MicrosoftAnyTenant)
     }
-
-    /// The tenant carried in a Microsoft issuer, when this is the pattern match.
-    fn tenant_of(&self, issuer: &str) -> Option<String> {
-        match self {
-            Self::Exact(_) => None,
-            Self::MicrosoftAnyTenant => issuer
-                .strip_prefix(MICROSOFT_ISSUER_PREFIX)
-                .and_then(|rest| rest.strip_suffix(MICROSOFT_ISSUER_SUFFIX))
-                .map(str::to_owned),
-        }
-    }
 }
 
 /// Confidential-client configuration for one provider.
@@ -108,8 +96,6 @@ pub struct OidcProviderConfig {
     pub scopes: Vec<String>,
     /// The MFA assurance bar to request and enforce.
     pub assurance: AssuranceRequirement,
-    /// A static tenant to stamp on every resolved identity, when set.
-    pub tenant_id: Option<String>,
 }
 
 /// An OIDC identity provider driven by `openidconnect`.
@@ -120,7 +106,6 @@ pub struct GenericOidcProvider {
     scopes: Vec<Scope>,
     assurance: AssuranceRequirement,
     issuer_match: IssuerMatch,
-    tenant_id: Option<String>,
 }
 
 impl GenericOidcProvider {
@@ -201,7 +186,6 @@ impl GenericOidcProvider {
             scopes: config.scopes.into_iter().map(Scope::new).collect(),
             assurance: config.assurance,
             issuer_match,
-            tenant_id: config.tenant_id,
         })
     }
 
@@ -245,7 +229,6 @@ impl GenericOidcProvider {
             scopes: config.scopes.into_iter().map(Scope::new).collect(),
             assurance: config.assurance,
             issuer_match: IssuerMatch::Exact(config.issuer),
-            tenant_id: config.tenant_id,
         })
     }
 
@@ -302,14 +285,6 @@ impl GenericOidcProvider {
             .name()
             .and_then(|localized| localized.get(None))
             .map(|name| name.as_str().to_owned());
-        let mut claims_map = BTreeMap::new();
-        if let Some(email) = &email {
-            claims_map.insert("email".to_owned(), email.clone());
-        }
-        let tenant_id = self
-            .issuer_match
-            .tenant_of(&issuer)
-            .or_else(|| self.tenant_id.clone());
         Ok(ResolvedIdentity {
             issuer,
             subject: claims.subject().as_str().to_owned(),
@@ -317,9 +292,6 @@ impl GenericOidcProvider {
             name,
             amr: amr_owned,
             acr: acr.map(str::to_owned),
-            tenant_id,
-            roles: Vec::new(),
-            claims: claims_map,
         })
     }
 }
@@ -439,18 +411,13 @@ mod tests {
         assert!(matcher.matches("https://accounts.google.com"));
         assert!(!matcher.matches("https://evil.example"));
         assert!(!matcher.is_pattern());
-        assert_eq!(matcher.tenant_of("https://accounts.google.com"), None);
     }
 
     #[test]
-    fn microsoft_matches_any_tenant_and_extracts_it() {
+    fn microsoft_matches_any_tenant() {
         let matcher = IssuerMatch::MicrosoftAnyTenant;
         assert!(matcher.is_pattern());
         assert!(matcher.matches("https://login.microsoftonline.com/tenant-abc/v2.0"));
-        assert_eq!(
-            matcher.tenant_of("https://login.microsoftonline.com/tenant-abc/v2.0"),
-            Some("tenant-abc".to_owned()),
-        );
         // Wrong host, wrong suffix, and the empty-tenant degenerate case.
         assert!(!matcher.matches("https://login.example.com/tenant/v2.0"));
         assert!(!matcher.matches("https://login.microsoftonline.com/tenant/v1.0"));

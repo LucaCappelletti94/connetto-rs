@@ -100,6 +100,36 @@ async fn revocation_closes_an_idle_connection() {
     drop(server);
 }
 
+/// A graceful shutdown tells every live connection why it is going away, so a
+/// client backs off instead of reconnecting immediately into a dying process.
+/// Two callers, because the registry is walked rather than closed one by one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
+async fn shutdown_closes_every_live_connection() {
+    let fixture = Fixture::acquire().await;
+    let server = serve(&fixture).await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("alice-device", "alice").await;
+    let mut bob = server.connect();
+    bob.handshake_with("bob-device", "bob").await;
+
+    assert_eq!(
+        server.manager().shutdown().await,
+        2,
+        "the registry holds both live connections"
+    );
+    for client in [&mut alice, &mut bob] {
+        match client.next_control().await {
+            ControlMessage::FatalError(fatal) => {
+                assert_eq!(fatal.reason, FatalErrorReason::ServerShuttingDown);
+            }
+            other => panic!("expected the shutdown close, got {other:?}"),
+        }
+    }
+    drop(server);
+}
+
 /// The same, with the connection subscribed, which the route map could have
 /// served. Both directions are proven so a future change cannot quietly move
 /// revocation back onto the routes.

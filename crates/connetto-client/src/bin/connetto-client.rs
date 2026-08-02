@@ -138,6 +138,10 @@ async fn main() -> Result<()> {
             .await
             .map_err(|err| anyhow!("pumping frames: {err}"))?
         {
+            ClientEvent::ServerClosed { reason } => {
+                eprintln!("server closed the session: {reason:?}");
+                return Ok(());
+            }
             ClientEvent::Closed => {
                 eprintln!("server closed the connection");
                 return Ok(());

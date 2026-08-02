@@ -6,7 +6,6 @@
 //! and refresh HTTP endpoints. A login-minted token is proven to open a real
 //! handshake and then to be refused once its session is revoked.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -69,9 +68,6 @@ fn identity(subject: &str) -> ResolvedIdentity {
         name: None,
         amr: Vec::new(),
         acr: None,
-        tenant_id: Some("tenant-1".to_owned()),
-        roles: vec!["member".to_owned()],
-        claims: BTreeMap::new(),
     }
 }
 
@@ -107,7 +103,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let pair = svc.login(&identity("alice")).await.expect("login");
 
     // A login-minted access token opens the handshake, and the identity that
-    // reaches the session is the verifier's, carrying the login's roles.
+    // reaches the session is the token's, not the id the client claims.
     let snapshot = CapturingSnapshot::default();
     let seen = Arc::clone(&snapshot.seen);
     let manager = manager_with(Arc::new(svc.verifier()), snapshot, &fixture);
@@ -143,13 +139,15 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
         panic!("expected snapshot end");
     };
-    let context = seen
-        .lock()
-        .expect("lock")
-        .clone()
-        .expect("captured identity");
-    assert_eq!(context.roles, vec!["member".to_owned()]);
-    assert_eq!(context.tenant_id.as_deref(), Some("tenant-1"));
+    let captured = seen.lock().expect("capture lock").clone();
+    let minted = authority
+        .verify_access::<String>(&pair.access_token)
+        .expect("verify");
+    assert_eq!(
+        captured.expect("the snapshot read saw an identity").user_id,
+        minted.context.user_id,
+        "the session must carry the token's identity, not the client's claim"
+    );
     client.close().await.expect("close");
     server.await.expect("join").expect("session ok");
 
@@ -389,7 +387,6 @@ async fn oidc_registry(subject: &str) -> (OAuthTestServer, Arc<ProviderRegistry>
             redirect_url: CALLBACK.to_owned(),
             scopes: Vec::new(),
             assurance: AssuranceRequirement::none(),
-            tenant_id: None,
         },
         reqwest::Client::new(),
     )

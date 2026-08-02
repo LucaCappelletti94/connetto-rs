@@ -13,6 +13,7 @@ use core::marker::PhantomData;
 
 use connetto_core::SessionId;
 use connetto_core::auth::AuthContext;
+use connetto_core::messages::ConflictRow;
 use diesel::OptionalExtension;
 use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
 use diesel::sql_query;
@@ -35,14 +36,12 @@ pub(crate) enum WriteOutcome {
     /// The whole changeset applied.
     Applied,
     /// A version-bearing op found a stale or missing row. Carries the current
-    /// server row for the conflict reply.
+    /// server row for the conflict reply, absent when the row is gone.
     Conflict {
         /// Table carrying the conflicting row.
         table: String,
-        /// Current server version, rendered as text.
-        server_updated_at: String,
-        /// Current server row as JSON, or `null` when the row is gone.
-        server_row_json: String,
+        /// The server's copy of the row.
+        server_row: Option<ConflictRow>,
     },
 }
 
@@ -82,14 +81,12 @@ fn seq_storage(client_seq: u64) -> Result<i64, WriteError> {
 
 /// Build the conflict outcome for a stale op.
 fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> WriteOutcome {
-    let (server_updated_at, server_row_json) = row.map_or_else(
-        || (String::new(), "null".to_owned()),
-        |row| (row.version, row.row_json),
-    );
     WriteOutcome::Conflict {
         table: conflict.table.clone(),
-        server_updated_at,
-        server_row_json,
+        server_row: row.map(|row| ConflictRow {
+            updated_at: row.version,
+            row_json: row.row_json,
+        }),
     }
 }
 

@@ -11,6 +11,7 @@ use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
     ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper, replica_db_name,
 };
+use connetto_core::messages::FatalErrorReason;
 use connetto_core::test_support::{FakeClosed, FakeTransport};
 use diesel::prelude::*;
 
@@ -226,6 +227,54 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
             _ => {}
         }
     }
+    drop(client);
+}
+
+/// A session revoked mid-connection reaches the application as its own event
+/// carrying the reason, and the driver then routes to re-login.
+///
+/// Before this, the client classified any mid-session close as a protocol
+/// violation and its pump exited silently, so the app learned nothing and never
+/// reconnected. The reason is the whole point: it is what tells a restart apart
+/// from a sign-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mid_session_close_surfaces_its_reason_then_routes_to_relogin() {
+    let initial = FakeTransport::accepting_then_closing(FatalErrorReason::SessionRevoked);
+    let conn =
+        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+            .await
+            .expect("initial connect");
+    // A revoked session's next handshake is refused, which is what turns the
+    // close into an interactive re-login rather than an endless retry.
+    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::rejecting()) };
+    let policy = ReconnectPolicy {
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(5),
+        max_attempts: Some(5),
+    };
+    let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
+    let mut events = client.events();
+    tokio::spawn(pump);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut closed_because = None;
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the close and the re-login signal before timeout")
+            .expect("event stream open");
+        match event {
+            ClientEvent::ServerClosed { reason } => closed_because = Some(reason),
+            ClientEvent::AuthenticationRequired => break,
+            ClientEvent::Closed => panic!("the pump gave up instead of routing to re-login"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        closed_because,
+        Some(FatalErrorReason::SessionRevoked),
+        "the app is told why the server closed, not merely that it did"
+    );
     drop(client);
 }
 

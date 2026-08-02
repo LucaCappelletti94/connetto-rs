@@ -33,7 +33,7 @@
 //! already exist. The server does not create them.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::messages::FatalErrorReason;
@@ -55,6 +55,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// Whether `origin` is a loopback origin, so script served from it may read a
@@ -273,7 +274,6 @@ fn oidc_config_from_env(config: &AuthConfig) -> Result<OidcProviderConfig> {
             .context("set CONNETTO_OIDC_REDIRECT_URL")?,
         scopes,
         assurance: connetto_server::AssuranceRequirement::none(),
-        tenant_id: std::env::var("CONNETTO_OIDC_TENANT").ok(),
     })
 }
 
@@ -479,7 +479,38 @@ fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<P
     });
 }
 
-/// Start CDC ingestion and serve connections until the listener fails.
+/// How long a shutdown waits for the live sessions to flush their close frame
+/// and tear down before the process exits anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only
+/// the interrupt arm can fire.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                eprintln!("no SIGTERM handler, interrupt only: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+}
+
+/// Start CDC ingestion and serve connections until the listener fails or a
+/// shutdown signal arrives.
 async fn run(
     manager: &Arc<
         SessionManager<PgSnapshotSource, RlsAuth, ConnettoWatermark, PgAsyncDieselConnector>,
@@ -529,10 +560,17 @@ async fn run(
         .await
         .with_context(|| format!("binding {bind}"))?;
     eprintln!("connetto-server listening on {bind}");
+    let mut sessions = JoinSet::new();
     loop {
-        let (tcp, _peer) = listener.accept().await.context("accepting a connection")?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = shutdown_signal() => break,
+        };
+        let (tcp, _peer) = accepted.context("accepting a connection")?;
+        // Reap the finished ones here, so the set holds only live sessions.
+        while sessions.try_join_next().is_some() {}
         let session = manager.clone();
-        tokio::spawn(async move {
+        sessions.spawn(async move {
             let transport = match WebSocketTransport::accept(tcp).await {
                 Ok(transport) => transport,
                 Err(err) => {
@@ -545,4 +583,18 @@ async fn run(
             }
         });
     }
+
+    let told = manager.shutdown().await;
+    eprintln!("connetto-server shutting down, closed {told} session(s)");
+    // The close frame is queued, not sent: each session's own loop delivers it
+    // and then tears down, so the exit waits on those rather than racing them.
+    if tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("shutdown grace elapsed with sessions still open");
+    }
+    Ok(())
 }

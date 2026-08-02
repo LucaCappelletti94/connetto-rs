@@ -157,7 +157,6 @@ impl Stack {
                 // cannot express would test the bar rather than the spine. The
                 // bar itself is covered by `provider.rs`.
                 assurance: AssuranceRequirement::none(),
-                tenant_id: None,
             },
             reqwest::Client::new(),
         )

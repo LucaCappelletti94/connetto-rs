@@ -23,6 +23,10 @@ pub struct NonFatalError {
 }
 
 /// Reason the server is closing the session.
+///
+/// Every variant names a specific close the server performs. There is no
+/// catch-all: a reason no code path can produce is a branch a client writes
+/// and never reaches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FatalErrorReason {
     /// Wire protocol mismatch. `expected` is the server's `PROTOCOL_VERSION`.
@@ -51,11 +55,6 @@ pub enum FatalErrorReason {
     },
     /// Server is shutting down and cannot service the session.
     ServerShuttingDown,
-    /// Everything else. Prefer a specific variant when possible.
-    Other {
-        /// Human-readable detail.
-        detail: String,
-    },
 }
 
 /// Session-terminating error frame.

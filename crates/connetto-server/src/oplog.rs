@@ -147,7 +147,9 @@ pub trait Oplog: Send + Sync {
     /// Oplog-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Append one record, then prune the window.
+    /// Append one record, then drop whatever the retention window no longer
+    /// covers. Pruning is not a separate seam: an external caller would race
+    /// the append it belongs to.
     ///
     /// # Errors
     ///
@@ -178,13 +180,6 @@ pub trait Oplog: Send + Sync {
     ///
     /// Implementation-defined: a backing-store read failure.
     async fn current_lsn(&self) -> Result<Option<u64>, Self::Error>;
-
-    /// Drop entries that fall outside the retention window.
-    ///
-    /// # Errors
-    ///
-    /// Implementation-defined: a backing-store write failure.
-    async fn prune(&self) -> Result<(), Self::Error>;
 }
 
 /// Decide whether a client resuming from `resume_lsn` can catch up from the
@@ -345,14 +340,6 @@ impl Oplog for InMemoryOplog {
     async fn current_lsn(&self) -> Result<Option<u64>, Infallible> {
         Ok(self.inner.lock().max_lsn)
     }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn prune(&self) -> Result<(), Infallible> {
-        let now = self.clock.now_micros();
-        let mut inner = self.inner.lock();
-        self.prune_locked(&mut inner, now);
-        Ok(())
-    }
 }
 
 pub use pg::{PgOplog, PgOplogError};
@@ -477,6 +464,33 @@ mod pg {
             let row: LsnRow = sql_query(sql).get_result(&mut *conn).await?;
             Ok(row.lsn.map(lsn_from_i64))
         }
+
+        /// Drop whatever the retention window no longer covers. Called by
+        /// `append`, which is the only moment the window can have moved.
+        async fn prune(&self) -> Result<(), PgOplogError> {
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let table = quote_ident(&self.table);
+            // Count-based: keep the newest `max_entries` rows, drop the rest.
+            let keep = i64::try_from(self.config.max_entries).unwrap_or(i64::MAX);
+            let by_count = format!(
+                "DELETE FROM {table} WHERE lsn IN (\
+                     SELECT lsn FROM {table} ORDER BY lsn DESC OFFSET $1)",
+            );
+            sql_query(by_count)
+                .bind::<BigInt, _>(keep)
+                .execute(&mut *conn)
+                .await?;
+            // Age-based: drop rows older than the window.
+            let secs = i64::try_from(self.config.max_age.as_secs()).unwrap_or(i64::MAX);
+            let by_age = format!(
+                "DELETE FROM {table} WHERE appended_at < now() - make_interval(secs => $1)"
+            );
+            sql_query(by_age)
+                .bind::<BigInt, _>(secs)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
     }
 
     fn pool_err<E: core::fmt::Display>(err: E) -> PgOplogError {
@@ -542,31 +556,6 @@ mod pg {
 
         async fn current_lsn(&self) -> Result<Option<u64>, PgOplogError> {
             self.watermark("MAX(lsn)").await
-        }
-
-        async fn prune(&self) -> Result<(), PgOplogError> {
-            let mut conn = self.pool.get().await.map_err(pool_err)?;
-            let table = quote_ident(&self.table);
-            // Count-based: keep the newest `max_entries` rows, drop the rest.
-            let keep = i64::try_from(self.config.max_entries).unwrap_or(i64::MAX);
-            let by_count = format!(
-                "DELETE FROM {table} WHERE lsn IN (\
-                     SELECT lsn FROM {table} ORDER BY lsn DESC OFFSET $1)",
-            );
-            sql_query(by_count)
-                .bind::<BigInt, _>(keep)
-                .execute(&mut *conn)
-                .await?;
-            // Age-based: drop rows older than the window.
-            let secs = i64::try_from(self.config.max_age.as_secs()).unwrap_or(i64::MAX);
-            let by_age = format!(
-                "DELETE FROM {table} WHERE appended_at < now() - make_interval(secs => $1)"
-            );
-            sql_query(by_age)
-                .bind::<BigInt, _>(secs)
-                .execute(&mut *conn)
-                .await?;
-            Ok(())
         }
     }
 }

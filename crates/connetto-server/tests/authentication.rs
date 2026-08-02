@@ -169,9 +169,7 @@ async fn forged_credential_is_rejected_with_authentication_failed() {
 async fn verified_identity_ignores_a_spoofed_client_id() {
     let fixture = Fixture::acquire().await;
     // The verifier resolves the identity, and the client claims a different id.
-    let resolved = AuthContext::new("resolved-user")
-        .with_tenant("tenant-7")
-        .with_roles(["admin"]);
+    let resolved = AuthContext::new("resolved-user");
     let capture = CapturingSnapshot::default();
     let seen = Arc::clone(&capture.seen);
     let manager = SessionManager::new(
