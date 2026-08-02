@@ -677,12 +677,19 @@ where
                 pgoutput_patchset(self.engine.inner().database(), std::slice::from_ref(event))
                     .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
             let payload = compress(&raw)?;
+            // Fallible only in theory: usize to u64 cannot lose on any
+            // supported pointer width, and a counter saturates rather than
+            // panics regardless.
+            let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
             consumers
                 .into_iter()
-                .map(|consumer_id| MatchedPatch {
-                    consumer_id,
-                    payload_zstd: payload.clone(),
-                    cursor: cursor.clone(),
+                .map(|consumer_id| {
+                    crate::counters::add(&crate::counters::FANOUT_PAYLOAD_BYTES, payload_len);
+                    MatchedPatch {
+                        consumer_id,
+                        payload_zstd: payload.clone(),
+                        cursor: cursor.clone(),
+                    }
                 })
                 .collect()
         };

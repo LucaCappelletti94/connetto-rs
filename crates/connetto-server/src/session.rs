@@ -37,6 +37,7 @@ use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::counters;
 use crate::materializer::{
     DeltaAggregateCapture, Materializer, MaterializerError, Registration, SqliteRegistration,
     agg_value_to_json, compress, value_to_json,
@@ -574,10 +575,12 @@ where
     /// [`SessionError`] when dispatch, a cursor advance, an install, or the
     /// oplog append fails.
     pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
+        counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
         let dispatched = { self.materializer.lock().await.dispatch(event)? };
 
         // Record the event in the oplog before fan-out. The append is per event,
         // not per consumer, since reconnect catchup re-filters per client.
+        counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
         let record = { self.materializer.lock().await.oplog_record(event) };
         // The event's (table, primary key, is-delete) for the per-consumer read
         // filter below.
@@ -591,6 +594,7 @@ where
         for patch in dispatched.patches {
             let route = { self.routes.lock().await.get(&patch.consumer_id).cloned() };
             let Some(route) = route else { continue };
+            counters::add(&counters::FANOUT_ROUTE_CLONES, 1);
             // Read filter: deliver only rows the session may see. A delete
             // replays regardless (a tombstone), so a client drops a row it may
             // still hold locally even after it can no longer see it.
@@ -605,6 +609,7 @@ where
                 continue;
             }
             {
+                counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
                 self.materializer.lock().await.advance_cursor(
                     route.connection_num,
                     route.sub_id,

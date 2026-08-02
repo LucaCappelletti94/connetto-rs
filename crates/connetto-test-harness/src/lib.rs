@@ -45,6 +45,8 @@ use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::task::JoinHandle;
 
+pub mod fanout;
+
 /// The value type carried in an uploaded changeset: SQLite text keys and blob
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
 pub type RowValue = Value<String, Vec<u8>>;

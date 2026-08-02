@@ -147,6 +147,7 @@ mod rls {
             table: &str,
             pk: &[u8],
         ) -> Result<bool, RlsAuthError> {
+            crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
             let Some(pk_cols) = self.pk_columns(table) else {
                 return Ok(false);
             };

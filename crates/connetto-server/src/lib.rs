@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod authn;
+pub mod counters;
 pub mod materializer;
 pub mod oplog;
 pub mod pk;
