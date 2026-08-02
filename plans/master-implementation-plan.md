@@ -60,8 +60,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 2 | ~~R16 part A, the fan-out research~~ **DONE** | Blocked on nothing and needed no code, so it ran alongside everything early |
 | 3 | ~~R2~~ **DONE** | Gives the session layer a durable identity, which R3 consumes |
 | 4 | R8 | Independent surface cleanup, apart from one item wanting R2's registry |
-| 5 | R12 | Prerequisite for R3, because R3 makes a refusal silent on the wire |
-| 6 | R3 | Needs R2 and R12 |
+| 5 | R12 part A, the logging facility | Prerequisite for R3, because R3 makes a refusal silent on the wire |
+| 6 | R3 | Needs R2 and R12 part A |
+| 6 | R12 part B, the refused-grant line | Rides with R3, the phase that creates the silence it covers. It cannot be proven earlier: a refused credential is announced on the wire today |
 | 7 | R4 | Needs R3 |
 | 8 | R13 | Needs R3. Off the critical path, so it may slip later without blocking anything |
 | 8 | R22 | Blocked on nothing, and it should land before R19 because it shrinks what throttling must defend against |
@@ -101,8 +102,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R0 part A, connetto-only counters | **DONE** | nothing | no |
 | R2 durable session identity | **DONE** | nothing | no |
 | R8 inert surface | **DONE** | nothing, apart from one item on R2 | no |
-| R12 structured logging | NOT STARTED | nothing | no |
-| R3 grants and `Principal` | NOT STARTED | R2 and R12 | no |
+| R12 part A, the logging facility | NOT STARTED | nothing | no |
+| R3 grants and `Principal` | NOT STARTED | R2 and R12 part A | no |
+| R12 part B, the refused-grant line | NOT STARTED | R3 | no |
 | R4 capabilities | NOT STARTED | R3 | no |
 | R13 `auth_events` audit table | NOT STARTED | R3 | no |
 | R22 compile-time query set | NOT STARTED | nothing | no |
@@ -128,7 +130,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R11 shared public store | NOT STARTED | nothing | no |
 | R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
-| R32 replication slot lifecycle | NOT STARTED | R12 for the lag line only | no |
+| R32 replication slot lifecycle | NOT STARTED | R12 part A for the lag line only | no |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
 | R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
 | R30 grouped aggregates revisited | NOT STARTED, exploratory | nothing | no |
@@ -140,11 +142,12 @@ A rendering of the table above, for reading rather than for deciding. **If the t
 ```mermaid
 graph TD
   R1[R1 security defaults]
-  R12[R12 structured logging] --> R3
+  R12A[R12 part A logging facility] --> R3
   R2[R2 durable session identity] --> R3[R3 grants and Principal]
   R3 --> R4[R4 capabilities in the model]
   R3 --> R13[R13 auth_events audit table]
   R3 --> R19[R19 request throttling]
+  R3 --> R12B[R12 part B refused-grant line]
   R2 --> R19
   R22[R22 compile-time query set] -.->|should land first| R19
   R0A[R0 part A, connetto-only counters]
@@ -170,7 +173,7 @@ graph TD
   R11[R11 shared public store]
   R31[R31 application schema majors]
   R32[R32 replication slot lifecycle]
-  R12 -.->|lag line only| R32
+  R12A -.->|lag line only| R32
   U3[upstream: five diesel vacuum proposals] --> R15[R15 replica retention and trimming]
   R23[R23 user-verified unlock of local secrets]
   P[probe: webauthn-prf-probe-spec] --> R23
@@ -431,31 +434,50 @@ It puts R0's authorization counter on a seam that then never relocates, so the b
 
 ## R12: structured logging
 
-**Status.** NOT STARTED
+**Status.** Part A NOT STARTED, blocked on nothing, and a prerequisite for R3. Part B NOT STARTED, **blocked on R3** and landing with it.
 
-**Blocked on nothing, and a prerequisite for R3.** Ordered before it.
+**Split into two parts, decided with the maintainer on 2026-08-02.** The phase as originally written declared itself done when "a refused grant is visible in the log", which it cannot prove: grants arrive in R3, and R3 is the phase waiting on this one. The property the assertion rests on does not exist yet either, because a refused credential today is announced on the wire (`SessionManager::run_handshake` sends `FatalErrorReason::AuthenticationFailed` before closing) rather than being silent. So part A lands the facility, and the security assertion travels as part B with the phase that creates the silence.
 
-**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only output anywhere is unstructured `println!` and `eprintln!` in the two CLI binaries, the server binary alone carrying a dozen `eprintln!` lines (startup notices, CDC reconnect events, session errors) that this phase replaces. Meanwhile `08-authorization.md` under "Audit" records structured logging as **Decided**, the Audit paragraph of `11-authentication.md` under "Deployment shape" calls it "no new mechanism" as though one existed, `open-questions.md` Q8.6 decides it for the firehose, and the architecture diagram draws a log aggregator.
+**This phase exists because the architecture already decided logging and the code has none.** Zero uses of `tracing` or `log` in any crate's `src`, no such dependency in any `Cargo.toml`, and the only output anywhere is unstructured printing: a dozen `eprintln!` lines in the server binary (startup notices, CDC reconnect events, session errors, the R8 shutdown notices), five in the client binary, and fourteen `web_sys::console` calls in `connetto-web/src` across `leader.rs`, `relay.rs`, `storage.rs` and `workers.rs`. Meanwhile `08-authorization.md` under "Audit" records structured logging as **Decided**, the Audit paragraph of `11-authentication.md` under "Deployment shape" calls it "no new mechanism" as though one existed, `open-questions.md` Q8.6 decides it for the firehose, and the architecture diagram draws a log aggregator.
 
-**One of those dependencies is load-bearing for security.** `08-authorization.md` under "Audit", restated in R3 step 7, says that because the wire says nothing about a refused grant, "the log line is the only place the failure is visible and is therefore what makes it loud". With no logging a refused grant is visible nowhere, so R3's silent-refusal design is unsafe until this lands. That is why this is a prerequisite rather than observability polish.
+**One of those dependencies is load-bearing for security.** `08-authorization.md` under "Audit", restated in R3 step 7, says that because the wire says nothing about a refused grant, "the log line is the only place the failure is visible and is therefore what makes it loud". That is what part B asserts, and why R3 may not ship without it.
 
 ### Purpose
 
 The architecture records structured logging as decided in three chapters and in the diagram, and no logging exists anywhere in the code. R3's design depends on it, so this is a prerequisite rather than observability polish.
 
+### Decisions taken before execution
+
+Three things the phase text called settled and were not. Decided with the maintainer on 2026-08-02.
+
+1. **The facade is `tracing`.** Not recorded anywhere before now: every chapter mentioning it only observes that neither `tracing` nor `log` is present. `tracing` carries named values per event, which is what "structured" means here, where `log` is built around a formatted string.
+2. **Every crate emits, and two kinds of program install a destination.** The server writes machine-readable lines to stdout. Browser programs write to the developer console, because a browser has no stdout. Emitting where nothing collects is free, so the cost is the second destination plus converting the fourteen browser call sites, and the alternative leaves a second hand-rolled logging habit growing beside the new one. Browser messages are **not** shipped to the server: considered and rejected as a new wire path with unbounded volume and a privacy question.
+3. **Every event carries the same required values**: what happened, the durable session handle for the caller's current run, the caller's identity when there is one, and whether the thing succeeded or failed. Anything further is per-event. A log is searchable only on values that are reliably present, and part B's assertion depends on specific ones existing. Its normative home is `08-authorization.md` under "Audit", beside the log-versus-table split.
+
 ### Steps
 
-1. Add the facade and one initialization point. The decision is already recorded: structured, to stdout, aggregator chosen by the deployment. There is nothing to decide here, only to build.
-2. Emit at the call sites the architecture already names: authentication outcomes, refused grants, connection events, and change-stream connection failures. A CDC outage is a connection failure and wants a log line, not a subsystem.
-3. Keep denials out of `auth_events`, per the split in `08-authorization.md` under "Audit". High-volume goes to the log, state changes go to the table, and that table is its own later phase.
+**Part A, the logging facility. Blocked on nothing, do this first.**
+
+1. Add `tracing`, one stdout initialization point in each native binary, and one console initialization point in each browser entry point.
+2. Record the required value set from decision 3 in `08-authorization.md` under "Audit".
+3. Convert every existing `println!`, `eprintln!` and `web_sys::console` call to it. That is the whole inventory above, and it is the observable part.
+4. Emit at the call sites the architecture already names: authentication outcomes, connection events, and change-stream connection failures. A CDC outage is a connection failure and wants a log line, not a subsystem.
+5. Keep denials out of `auth_events`, per the split in `08-authorization.md` under "Audit". High-volume goes to the log, state changes go to the table, and that table is its own later phase.
+
+**Part B, the refused-grant line. Blocked on R3, and lands with it.** R3 step 6 makes a failed grant leave the connection open and step 7 keeps it off the wire, which is the moment the log line becomes the only trace. Before that there is nothing silent to make loud.
+
+6. Emit one event per refused grant, naming the caller and which grant was refused, using part A's required value set.
+7. Keep it out of `auth_events`: a rejected grant is a denial, and denials are high-volume by that same split, because a caller probing keys generates one per attempt.
 
 ### Proof
 
-Refuse a grant and assert the log line exists and names the caller and the grant. That is the one case where the log **is** the mechanism rather than a record of it, so it is the one that must be asserted rather than eyeballed.
+**Part A carries no security assertion**, deliberately, because the property that needs one does not exist until R3. What it proves instead: no hand-written print remains in any `src` tree, and one event asserted end to end on each destination, a native one read back from stdout and a browser one observed in a headless-Chrome run.
+
+**Part B is the security assertion.** Refuse a grant and assert the log line exists and names the caller and the grant. That is the one case where the log **is** the mechanism rather than a record of it, so it is the one that must be asserted rather than eyeballed.
 
 ### Done when
 
-A refused grant is visible in the log, so R3 may proceed.
+**Part A**: every program emits through one facility, every event carries the required values, and no `println!`, `eprintln!` or `web_sys::console` call is left in a `src` tree. **Part B**: a refused grant is visible in the log and nowhere else, so R3's silent-refusal design is safe.
 
 ---
 
@@ -463,7 +485,7 @@ A refused grant is visible in the log, so R3 may proceed.
 
 **Status.** NOT STARTED
 
-**Blocked on R2 and R12.** R12 because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. Supersedes the discarded E6 step-one work, which was the right vocabulary and the wrong shape.
+**Blocked on R2 and R12 part A.** R12 part A because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. That log line and its assertion are R12 part B, which lands with this phase rather than before it, because the silence it covers does not exist until step 6. Supersedes the discarded E6 step-one work, which was the right vocabulary and the wrong shape.
 
 ### Purpose
 
@@ -1319,7 +1341,7 @@ The gate condition is queryable, the trait exists with a two-major fixture, a de
 
 **Status.** NOT STARTED
 
-**Blocked on R12 for the lag line only.** The startup refusal and the invalidation response need nothing: the refusal joins an existing pattern and the response rides `FullResyncRequired`. Design recorded in `10-subscription-materializer.md` under "The replication slot", decided with the maintainer.
+**Blocked on R12 part A for the lag line only.** The startup refusal and the invalidation response need nothing: the refusal joins an existing pattern and the response rides `FullResyncRequired`. Design recorded in `10-subscription-materializer.md` under "The replication slot", decided with the maintainer.
 
 ### Purpose
 
@@ -1328,7 +1350,7 @@ A replication slot retains WAL without limit by default (`max_slot_wal_keep_size
 ### Steps
 
 1. **Refuse startup when the slot or the publication is missing**, naming which, joining the five-check startup pattern in the cross-cutting checklist.
-2. **Log the slot's lag on a cadence** through R12's facade (restart LSN distance against the current LSN), so a stalled slot is visible before the cap trips. Alerting is the aggregator's, as everywhere.
+2. **Log the slot's lag on a cadence** through R12 part A's facade (restart LSN distance against the current LSN), so a stalled slot is visible before the cap trips. Alerting is the aggregator's, as everywhere.
 3. **Detect invalidation and declare a resync epoch.** When the replication connection reports the slot invalidated or gone, record the gap boundary (the last LSN the oplog ingested), and force every session cursor at or below it through `FullResyncRequired` instead of resuming silently from a fresh slot position.
 4. **Write the deployment guidance**: provision and drop procedures, `max_slot_wal_keep_size` sizing against the primary's disk, and optionally `idle_replication_slot_timeout`.
 
