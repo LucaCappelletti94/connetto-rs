@@ -28,10 +28,12 @@
 //! psql -c "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
 //!   session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
 //!   PRIMARY KEY (user_id, session_id))"
+//! psql -c "$(cat examples/wasm-smoke/roles.sql)"
 //!
 //! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
 //!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
 //!   cargo run --release --all-features -p connetto-server --bin connetto-server
 //! cargo run --release --all-features -p connetto-server --example auth_stack
 //! wasm-pack test --headless --chrome examples/wasm-smoke --test authenticated_boot

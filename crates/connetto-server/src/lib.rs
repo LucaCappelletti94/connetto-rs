@@ -39,10 +39,10 @@ pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
     ConnettoSessionVerifier, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
     IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
-    OidcProviderConfig, PendingLogin, PendingLogins, PermissiveProvider, ProviderError,
-    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture,
-    ResolvedIdentity, RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
-    VerifiedLogin, VerifiedSession,
+    OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
+    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
+    RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims, VerifiedLogin,
+    VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
 pub use connetto_core::SessionId;

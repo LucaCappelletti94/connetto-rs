@@ -22,6 +22,7 @@
 //! Run against the demo stack (server on 7777, `connetto-demo-pg` on 55456):
 //! `trunk serve` from this directory, then open the served URL in several
 //! windows.
+//! The server also requires `CONNETTO_READER_URL` set to the `connetto_reader` role that `roles.sql` provisions.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

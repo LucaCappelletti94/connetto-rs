@@ -26,6 +26,7 @@
 //!   (default `127.0.0.1:7777`).
 //! - `CONNETTO_DEMO_PG`: Postgres conninfo for the backend writer buttons
 //!   (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
+//! - `CONNETTO_READER_URL`: conninfo for the non-owner Postgres role provisioned by `roles.sql` (required).
 
 use std::path::PathBuf;
 use std::sync::Arc;

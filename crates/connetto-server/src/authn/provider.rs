@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use uuid::Uuid;
-
 use crate::authn::store::ResolvedIdentity;
 
 /// A boxed, `Send` future, for the object-safe async provider methods.
@@ -220,82 +218,6 @@ impl ProviderRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.all.is_empty()
-    }
-}
-
-/// A stand-in [`IdentityProvider`] that resolves to a configured identity with
-/// no live provider, mirroring the permissive stand-ins elsewhere.
-///
-/// It performs no OAuth flow and verifies nothing, so it MUST NOT front a
-/// production deployment. It lets tests and local loops exercise the login path.
-pub struct PermissiveProvider {
-    name: String,
-    issuer: String,
-    identity: ResolvedIdentity,
-}
-
-impl PermissiveProvider {
-    /// Build a provider that always resolves to `identity`.
-    #[must_use]
-    pub fn new(name: impl Into<String>, identity: ResolvedIdentity) -> Self {
-        let issuer = identity.issuer.clone();
-        Self {
-            name: name.into(),
-            issuer,
-            identity,
-        }
-    }
-
-    fn retained(&self) -> RetainedProviderToken {
-        RetainedProviderToken {
-            issuer: self.issuer.clone(),
-            access_token: "permissive-access-token".to_owned(),
-            refresh_token: Some("permissive-refresh-token".to_owned()),
-            expires_at: None,
-        }
-    }
-}
-
-impl IdentityProvider for PermissiveProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn issuer(&self) -> &str {
-        &self.issuer
-    }
-
-    fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
-        let state = Uuid::new_v4().to_string();
-        Ok(LoginRedirect {
-            // Echo the state in the URL the way a real provider does, so a
-            // caller can carry it to the callback.
-            authorize_url: format!("about:blank?state={state}"),
-            state,
-            nonce: Uuid::new_v4().to_string(),
-            pkce_verifier: Uuid::new_v4().to_string(),
-        })
-    }
-
-    fn complete_login<'a>(
-        &'a self,
-        _code: &'a str,
-        _pkce_verifier: &'a str,
-        _nonce: &'a str,
-    ) -> BoxFuture<'a, Result<VerifiedLogin, ProviderError>> {
-        Box::pin(async move {
-            Ok(VerifiedLogin {
-                identity: self.identity.clone(),
-                retained: self.retained(),
-            })
-        })
-    }
-
-    fn refresh_provider_token<'a>(
-        &'a self,
-        _refresh_token: &'a str,
-    ) -> BoxFuture<'a, Result<RetainedProviderToken, ProviderError>> {
-        Box::pin(async move { Ok(self.retained()) })
     }
 }
 
@@ -509,21 +431,6 @@ mod tests {
     // signature is fixed, so the lifetime-tightening lint does not apply.
     #![allow(clippy::unnecessary_literal_bound)]
     use super::*;
-    use std::collections::BTreeMap;
-
-    fn identity(issuer: &str, subject: &str) -> ResolvedIdentity {
-        ResolvedIdentity {
-            issuer: issuer.to_owned(),
-            subject: subject.to_owned(),
-            email: None,
-            name: None,
-            amr: Vec::new(),
-            acr: None,
-            tenant_id: None,
-            roles: Vec::new(),
-            claims: BTreeMap::new(),
-        }
-    }
 
     /// A provider whose issuer matches by prefix, standing in for a pattern
     /// provider to exercise the registry's matcher fallback.
@@ -558,13 +465,47 @@ mod tests {
         }
     }
 
+    /// A provider with a fixed name and exact issuer, standing in for a
+    /// discovered provider so the by-name lookup and the exact-issuer index
+    /// are exercised against a concrete entry.
+    struct StaticProvider {
+        name: &'static str,
+        issuer: &'static str,
+    }
+
+    impl IdentityProvider for StaticProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn issuer(&self) -> &str {
+            self.issuer
+        }
+        fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
+            Err(ProviderError::Config("test".to_owned()))
+        }
+        fn complete_login<'a>(
+            &'a self,
+            _code: &'a str,
+            _pkce_verifier: &'a str,
+            _nonce: &'a str,
+        ) -> BoxFuture<'a, Result<VerifiedLogin, ProviderError>> {
+            Box::pin(async { Err(ProviderError::Config("test".to_owned())) })
+        }
+        fn refresh_provider_token<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> BoxFuture<'a, Result<RetainedProviderToken, ProviderError>> {
+            Box::pin(async { Err(ProviderError::Refresh("test".to_owned())) })
+        }
+    }
+
     #[test]
     fn registry_routes_by_name_issuer_and_matcher() {
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(PermissiveProvider::new(
-            "google",
-            identity("https://accounts.google.com", "u"),
-        )));
+        registry.register(Arc::new(StaticProvider {
+            name: "google",
+            issuer: "https://accounts.google.com",
+        }));
         registry.register(Arc::new(PatternProvider));
 
         assert_eq!(registry.len(), 2);
@@ -603,19 +544,6 @@ mod tests {
         assert!(!bar.is_satisfied(Some("high"), &["pwd"]));
         // no bar accepts anything.
         assert!(AssuranceRequirement::none().is_satisfied(None, &[]));
-    }
-
-    #[tokio::test]
-    async fn permissive_provider_resolves_its_configured_identity() {
-        let provider = PermissiveProvider::new("dev", identity("https://dev", "alice"));
-        let redirect = provider.begin_login().expect("begin");
-        assert!(redirect.authorize_url.contains("state="));
-        let login = provider
-            .complete_login("code", &redirect.pkce_verifier, &redirect.nonce)
-            .await
-            .expect("complete");
-        assert_eq!(login.identity.subject, "alice");
-        assert_eq!(login.retained.issuer, "https://dev");
     }
 
     fn sample_pending() -> PendingLogin {

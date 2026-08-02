@@ -14,14 +14,20 @@
 //!   `connetto_slot`).
 //! - `CONNETTO_PUBLICATION`: publication the slot follows (default
 //!   `connetto_pub`).
-//! - `CONNETTO_READER_URL`: optional non-superuser conninfo. When set, snapshots,
-//!   read authorization, and mutation applies run under Postgres Row-Level
-//!   Security as that role. Otherwise the server authorizes reads permissively.
-//!   The role needs `SELECT, INSERT, UPDATE` on `_connetto_mutations` (the
-//!   exactly-once watermark table). connetto emits no DDL, so the deployment
-//!   creates that table (see `docs/architecture/11-authentication.md`)
-//!   alongside the auth tables; a restricted role cannot `CREATE` in schema
-//!   `public` on Postgres 15 and later, so the admin runs the migration.
+//! - `CONNETTO_READER_URL`: required non-superuser conninfo. Snapshots, read
+//!   authorization, and mutation applies run under Postgres Row-Level Security
+//!   as that role, and the server refuses to start without it, because the
+//!   owner pool bypasses every policy (Postgres applies none to a superuser or
+//!   table owner). The role needs `SELECT, INSERT, UPDATE` on
+//!   `_connetto_mutations` (the exactly-once watermark table). connetto emits
+//!   no DDL, so the deployment creates that table (see
+//!   `docs/architecture/11-authentication.md`) alongside the auth tables. A
+//!   restricted role cannot `CREATE` in schema `public` on Postgres 15 and
+//!   later, so the admin runs the migration.
+//! - `CONNETTO_OIDC_PROVIDER`: which identity provider `CONNETTO_AUTH` logs
+//!   users in with, one of `google`, `microsoft`, or `generic` (lowercase).
+//!   Anything else, including an unset or miscapitalised value, refuses
+//!   startup.
 //!
 //! The publication and replication slot (with the `pgoutput` plugin) must
 //! already exist. The server does not create them.
@@ -30,16 +36,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_core::auth::AuthContext;
-use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
+use connetto_core::traits::SessionVerifier;
 use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
     GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
-    PermissiveAuth, PermissiveProvider, PgSnapshotSource, ProviderRegistry, ReconnectPolicy,
-    RedirectPolicy, RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RlsAuthError,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, TokenAuthority, WebSocketTransport,
-    auth_router, connetto_auth_tables, connetto_watermark_table, pg_write_target,
+    PgSnapshotSource, ProviderRegistry, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
+    ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, TokenAuthority, WebSocketTransport, auth_router, connetto_auth_tables,
+    connetto_watermark_table, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -57,52 +62,8 @@ use tokio::net::TcpListener;
 connetto_auth_tables!(String, diesel::sql_types::Text);
 connetto_watermark_table!(String, diesel::sql_types::Text);
 
-/// The read-authorization policy chosen at startup.
-///
-/// A single concrete type so the served session future stays `Send` (an
-/// `AuthPolicy`'s async-trait methods do not otherwise guarantee it for a
-/// generic parameter).
-enum ServerAuth {
-    /// Authorize every read (no `CONNETTO_READER_URL`).
-    Permissive(PermissiveAuth),
-    /// Authorize reads through Postgres Row-Level Security.
-    Rls(Box<RlsAuth>),
-}
-
-impl AuthPolicy for ServerAuth {
-    type Error = RlsAuthError;
-
-    async fn can_read(
-        &self,
-        ctx: &AuthContext,
-        table: &str,
-        pk: &[u8],
-    ) -> Result<bool, RlsAuthError> {
-        match self {
-            Self::Permissive(auth) => auth.can_read(ctx, table, pk).await.map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_read(ctx, table, pk).await,
-        }
-    }
-
-    async fn can_write(
-        &self,
-        ctx: &AuthContext,
-        table: &str,
-        pk: &[u8],
-        op: MutationOp,
-    ) -> Result<bool, RlsAuthError> {
-        match self {
-            Self::Permissive(auth) => auth
-                .can_write(ctx, table, pk, op)
-                .await
-                .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_write(ctx, table, pk, op).await,
-        }
-    }
-}
-
 /// The auth store chosen at startup. A single concrete type so the auth
-/// service and session-verifier futures stay `Send`, mirroring [`ServerAuth`].
+/// service and session-verifier futures stay `Send`.
 /// Each `async fn` erases the two arm future types through `.await`.
 enum ServerStore {
     /// Single-server, ephemeral, deterministic identity mapping.
@@ -235,10 +196,11 @@ async fn build_auth(
 
 /// Build the provider registry from `CONNETTO_OIDC_PROVIDER`.
 ///
-/// `google` and `microsoft` discover the respective provider, `generic`
-/// discovers `CONNETTO_OIDC_ISSUER`, and anything else (or unset) registers a
-/// [`PermissiveProvider`] dev stand-in that verifies nothing. A real provider
-/// reads `CONNETTO_OIDC_CLIENT_ID`, `CONNETTO_OIDC_CLIENT_SECRET` (optional),
+/// `google` and `microsoft` discover the respective provider and `generic`
+/// discovers `CONNETTO_OIDC_ISSUER`. Anything else, including an unset or
+/// miscapitalised value, refuses startup naming the value, so a typo cannot
+/// silently select a different provider. A provider reads
+/// `CONNETTO_OIDC_CLIENT_ID`, `CONNETTO_OIDC_CLIENT_SECRET` (optional),
 /// `CONNETTO_OIDC_REDIRECT_URL`, and `CONNETTO_OIDC_SCOPES` (comma-separated).
 async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
@@ -258,23 +220,16 @@ async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
             .map_err(|err| anyhow!("configuring the {kind} provider: {err}"))?;
             registry.register(Arc::new(provider));
         }
-        _ => {
-            eprintln!(
-                "connetto-server: no CONNETTO_OIDC_PROVIDER set, registering a permissive dev \
-                 provider that verifies nothing (do not use in production)"
-            );
-            let identity = ResolvedIdentity {
-                issuer: "connetto-dev".to_owned(),
-                subject: env_or("CONNETTO_DEV_SUBJECT", "dev-user"),
-                email: None,
-                name: None,
-                amr: Vec::new(),
-                acr: None,
-                tenant_id: None,
-                roles: Vec::new(),
-                claims: std::collections::BTreeMap::new(),
-            };
-            registry.register(Arc::new(PermissiveProvider::new("permissive", identity)));
+        "" => {
+            return Err(anyhow!(
+                "CONNETTO_OIDC_PROVIDER is unset, expected one of google, microsoft, or generic"
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "unrecognised CONNETTO_OIDC_PROVIDER {other:?}, expected one of google, \
+                 microsoft, or generic (names are lowercase)"
+            ));
         }
     }
     Ok(registry)
@@ -380,26 +335,24 @@ async fn main() -> Result<()> {
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
 
-    // Snapshots, read authorization, and the write apply all run under RLS when
-    // a reader role is configured. That role must be subject to RLS
-    // (non-superuser, not the table owner). Otherwise reads are permissive and
-    // writes apply under the primary role.
-    let (snapshot, auth, write) = if let Ok(reader_url) = std::env::var("CONNETTO_READER_URL") {
-        let reader_pool = build_pool(&reader_url).await?;
-        let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
-            .map_err(|err| anyhow!("building snapshot source: {err}"))?;
-        let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)
-            .map_err(|err| anyhow!("building RLS auth: {err}"))?;
-        let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
-            .map_err(|err| anyhow!("building write target: {err}"))?;
-        (snapshot, ServerAuth::Rls(Box::new(auth)), write)
-    } else {
-        let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &pg_ddl)
-            .map_err(|err| anyhow!("building snapshot source: {err}"))?;
-        let write = pg_write_target::<ConnettoWatermark>(pool.clone(), &pg_ddl)
-            .map_err(|err| anyhow!("building write target: {err}"))?;
-        (snapshot, ServerAuth::Permissive(PermissiveAuth), write)
-    };
+    // Snapshots, read authorization, and the write apply all run under RLS as
+    // the reader role, which must be subject to RLS (non-superuser, not the
+    // table owner). Postgres applies no policy to a superuser or table owner,
+    // so serving reads or writes from the owner pool would bypass RLS
+    // entirely, and the server refuses to start instead of falling back to it.
+    let reader_url = std::env::var("CONNETTO_READER_URL").map_err(|_| {
+        anyhow!(
+            "set CONNETTO_READER_URL to a non-superuser conninfo subject to Row-Level \
+             Security (the server does not serve reads or writes from the owner pool)"
+        )
+    })?;
+    let reader_pool = build_pool(&reader_url).await?;
+    let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
+        .map_err(|err| anyhow!("building snapshot source: {err}"))?;
+    let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)
+        .map_err(|err| anyhow!("building RLS auth: {err}"))?;
+    let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
+        .map_err(|err| anyhow!("building write target: {err}"))?;
 
     let manager = SessionManager::with_connector(
         materializer,
@@ -456,7 +409,7 @@ async fn main() -> Result<()> {
 /// Start CDC ingestion and serve connections until the listener fails.
 async fn run(
     manager: &Arc<
-        SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgAsyncDieselConnector>,
+        SessionManager<PgSnapshotSource, RlsAuth, ConnettoWatermark, PgAsyncDieselConnector>,
     >,
     database_url: &str,
     slot: &str,

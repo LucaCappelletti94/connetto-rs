@@ -1,11 +1,12 @@
 //! Native acquisition (Docker-free).
 //!
-//! Serves connetto-server's auth router on a real loopback port with a
-//! permissive provider, then drives the full native flow: the authenticator
-//! binds its own loopback listener and opens a browser, a fake browser walks the
-//! provider round-trip and delivers the code to that listener, the authenticator
-//! exchanges the code with its PKCE verifier, stores the refresh token, and
-//! silently refreshes. No real browser, no live provider, no Postgres.
+//! Serves connetto-server's auth router on a real loopback port with a real
+//! loopback OIDC provider (`oauth2-test-server`), then drives the full native
+//! flow: the authenticator binds its own loopback listener and opens a browser,
+//! a fake browser walks the redirect chain and delivers the code to that
+//! listener, the authenticator exchanges the code with its PKCE verifier, stores
+//! the refresh token, and silently refreshes. No real browser, no external
+//! provider, no Postgres.
 //!
 //! It also proves the typed `user_id` boundary: a deployment whose id is a
 //! `rosetta_uuid::Uuid` gets that value back from the token endpoint as its own
@@ -14,7 +15,6 @@
 
 #![cfg(feature = "native-auth")]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use connetto_client::{
@@ -24,19 +24,23 @@ use connetto_client::{
 };
 use connetto_core::traits::{SessionVerifier, SessionVerifyError};
 use connetto_server::{
-    AuthConfig, AuthService, IdentityResolver, InMemoryAuthStore, PermissiveProvider,
-    ProviderRegistry, RedirectPolicy, ResolveFuture, ResolvedIdentity, TokenAuthority,
-    VerifiedClaims, auth_router,
+    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityResolver,
+    InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, ResolveFuture,
+    TokenAuthority, VerifiedClaims, auth_router,
 };
+use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use openidconnect::reqwest;
 use rosetta_uuid::Uuid;
 
-/// A fixed namespace for the deterministic `(issuer, subject)` to `Uuid`
-/// mapping, standing in for a deployment's own [`IdentityResolver`].
+/// A fixed namespace for the deterministic `subject` to `Uuid` mapping,
+/// standing in for a deployment's own [`IdentityResolver`].
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x2b7e_1516_28ae_d2a6_abf7_1588_09cf_4f3c);
 
 /// The typed id the resolver below mints for `subject`.
+///
+/// Keys on the subject alone because the test idp mints a fresh issuer per run.
 fn typed_id(subject: &str) -> Uuid {
-    uuid::Uuid::new_v5(&NS, format!("https://dev.example|{subject}").as_bytes()).into()
+    uuid::Uuid::new_v5(&NS, subject.as_bytes()).into()
 }
 
 /// A deployment resolver mapping verified claims to its own typed id.
@@ -46,71 +50,95 @@ impl IdentityResolver for TypedResolver {
     type Id = Uuid;
 
     fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
-        let id: Uuid = uuid::Uuid::new_v5(
-            &NS,
-            format!("{}|{}", claims.issuer, claims.subject).as_bytes(),
-        )
-        .into();
+        // Key on the subject alone: the test idp mints a fresh issuer per run.
+        let id: Uuid = uuid::Uuid::new_v5(&NS, claims.subject.as_bytes()).into();
         Box::pin(async move { Ok(id) })
     }
 }
 
-/// The permissive provider `name` logs in as, resolving to its own subject so
-/// one server can mint two distinct identities.
-fn identity_named(subject: &str) -> ResolvedIdentity {
-    ResolvedIdentity {
-        subject: subject.to_owned(),
-        ..identity()
-    }
-}
-
-fn identity() -> ResolvedIdentity {
-    ResolvedIdentity {
-        issuer: "https://dev.example".to_owned(),
-        subject: "native-user".to_owned(),
-        email: None,
-        name: None,
-        amr: Vec::new(),
-        acr: None,
-        tenant_id: None,
-        roles: Vec::new(),
-        claims: BTreeMap::new(),
-    }
-}
-
-/// Serve the auth router on an ephemeral port and return the base URL.
-async fn spawn_auth_server() -> String {
-    spawn_auth_server_with_service().await.0
+/// Serve the auth router on an ephemeral port and return the base URL and idp
+/// guard.
+async fn spawn_auth_server() -> (String, OAuthTestServer) {
+    let (base, _service, idp) = spawn_auth_server_with_service().await;
+    (base, idp)
 }
 
 /// As [`spawn_auth_server`], also handing back the service so a test can ask the
 /// real handshake verifier what it makes of a token.
-async fn spawn_auth_server_with_service() -> (String, Arc<AuthService<InMemoryAuthStore>>) {
+async fn spawn_auth_server_with_service()
+-> (String, Arc<AuthService<InMemoryAuthStore>>, OAuthTestServer) {
+    // Bind connetto's listener first so the callback URL is known before
+    // registering it with the provider.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind auth server");
+    let port = listener.local_addr().expect("addr").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let callback = format!("{base}/auth/callback");
+
+    // Real OIDC provider on its own loopback socket. Host pinned to the
+    // address it is actually reachable at: the default publishes `localhost`
+    // while binding 127.0.0.1, and openidconnect refuses an issuer mismatch.
+    let idp = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        default_user_id: "native-user".into(),
+        ..IssuerConfig::default()
+    })
+    .await;
+    let idp_issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
+    let client = idp
+        .register_client(serde_json::json!({
+            "redirect_uris": [callback.clone()],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let provider = GenericOidcProvider::discover(
+        OidcProviderConfig {
+            name: "mock-idp".to_owned(),
+            client_id: client.client_id.clone(),
+            client_secret: client.client_secret.clone(),
+            issuer: idp_issuer,
+            redirect_url: callback,
+            scopes: Vec::new(),
+            assurance: AssuranceRequirement::none(),
+            tenant_id: None,
+        },
+        reqwest::Client::new(),
+    )
+    .await
+    .expect("discover provider");
+
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let service = Arc::new(AuthService::new(authority, store));
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new("permissive", identity())));
+    registry.register(Arc::new(provider));
     let router = auth_router(
         Arc::clone(&service),
         Arc::new(registry),
         RedirectPolicy::default(),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind auth server");
-    let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    (format!("http://127.0.0.1:{port}"), service)
+    (base, service, idp)
 }
 
 /// Serve an auth router whose store resolves identity to a typed
-/// `rosetta_uuid::Uuid`, with one permissive provider per identity so a single
-/// server can mint two distinct users.
-async fn spawn_typed_auth_server() -> String {
+/// `rosetta_uuid::Uuid`, with one real loopback provider per identity so a
+/// single server can mint two distinct users.
+async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind typed auth server");
+    let port = listener.local_addr().expect("addr").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let callback = format!("{base}/auth/callback");
+
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::<Uuid>::with_resolver(
@@ -119,21 +147,86 @@ async fn spawn_typed_auth_server() -> String {
     ));
     let service = Arc::new(AuthService::new(authority, store));
     let mut registry = ProviderRegistry::new();
-    for subject in ["alice", "bob"] {
-        registry.register(Arc::new(PermissiveProvider::new(
-            subject,
-            identity_named(subject),
-        )));
-    }
+
+    // Provider "alice": its own loopback idp whose default_user_id is "alice".
+    let idp_alice = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        default_user_id: "alice".into(),
+        ..IssuerConfig::default()
+    })
+    .await;
+    let alice_client = idp_alice
+        .register_client(serde_json::json!({
+            "redirect_uris": [callback.clone()],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let alice_provider = GenericOidcProvider::discover(
+        OidcProviderConfig {
+            name: "alice".to_owned(),
+            client_id: alice_client.client_id.clone(),
+            client_secret: alice_client.client_secret.clone(),
+            issuer: idp_alice
+                .base_url
+                .to_string()
+                .trim_end_matches('/')
+                .to_owned(),
+            redirect_url: callback.clone(),
+            scopes: Vec::new(),
+            assurance: AssuranceRequirement::none(),
+            tenant_id: None,
+        },
+        reqwest::Client::new(),
+    )
+    .await
+    .expect("discover alice's provider");
+    registry.register(Arc::new(alice_provider));
+
+    // Provider "bob": its own loopback idp whose default_user_id is "bob".
+    let idp_bob = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        default_user_id: "bob".into(),
+        ..IssuerConfig::default()
+    })
+    .await;
+    let bob_client = idp_bob
+        .register_client(serde_json::json!({
+            "redirect_uris": [callback.clone()],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let bob_provider = GenericOidcProvider::discover(
+        OidcProviderConfig {
+            name: "bob".to_owned(),
+            client_id: bob_client.client_id.clone(),
+            client_secret: bob_client.client_secret.clone(),
+            issuer: idp_bob
+                .base_url
+                .to_string()
+                .trim_end_matches('/')
+                .to_owned(),
+            redirect_url: callback,
+            scopes: Vec::new(),
+            assurance: AssuranceRequirement::none(),
+            tenant_id: None,
+        },
+        reqwest::Client::new(),
+    )
+    .await
+    .expect("discover bob's provider");
+    registry.register(Arc::new(bob_provider));
+
     let router = auth_router(service, Arc::new(registry), RedirectPolicy::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind typed auth server");
-    let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    format!("http://127.0.0.1:{port}")
+    (base, idp_alice, idp_bob)
 }
 
 /// Drive the full loopback login against `base` as the provider named
@@ -141,58 +234,38 @@ async fn spawn_typed_auth_server() -> String {
 async fn login_as(base: &str, subject: &str) -> AcquiredSession<Uuid> {
     let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
     NativeAuthenticator::new(base.to_owned(), subject, store)
-        .with_browser_opener(fake_browser(base.to_owned()))
+        .with_browser_opener(fake_browser())
         .login::<Uuid>()
         .await
         .expect("typed login")
 }
 
-/// A fake browser: given connetto's login URL, walk the provider round-trip the
-/// way a real browser plus provider would, then GET the loopback redirect to
-/// hand the code to the authenticator's listener.
-fn fake_browser(base: String) -> BrowserOpener {
+/// A fake browser: given connetto's login URL, walk the real OIDC redirect
+/// chain until the authenticator's loopback listener receives the code. The
+/// chain is login to the idp authorize endpoint to the connetto callback to
+/// the loopback. A redirect-disabled client follows at most five hops,
+/// stopping when a response carries no Location.
+fn fake_browser() -> BrowserOpener {
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("http client");
     Arc::new(move |login_url: &str| {
         let http = http.clone();
-        let base = base.clone();
         let login_url = login_url.to_owned();
         tokio::spawn(async move {
-            // The login redirect carries connetto's CSRF state (the permissive
-            // provider's authorize URL is about:blank?state=...).
-            let authorize = http.get(login_url).send().await.expect("login");
-            let location = authorize
-                .headers()
-                .get("location")
-                .expect("login redirect")
-                .to_str()
-                .expect("utf8")
-                .to_owned();
-            let connetto_state = location
-                .split("state=")
-                .nth(1)
-                .expect("state in login redirect")
-                .to_owned();
-            // The provider "redirects" back to connetto's callback, which
-            // redirects to the loopback with the one-time code.
-            let callback = http
-                .get(format!(
-                    "{base}/auth/callback?code=perm&state={connetto_state}"
-                ))
-                .send()
-                .await
-                .expect("callback");
-            let loopback = callback
-                .headers()
-                .get("location")
-                .expect("callback redirect")
-                .to_str()
-                .expect("utf8")
-                .to_owned();
-            // Deliver the code to the authenticator's loopback listener.
-            let _ = http.get(loopback).send().await;
+            let mut next_url = login_url;
+            for _ in 0..5 {
+                let resp = http.get(&next_url).send().await.expect("hop");
+                match resp.headers().get("location") {
+                    Some(loc) => {
+                        loc.to_str()
+                            .expect("utf8 location")
+                            .clone_into(&mut next_url);
+                    }
+                    None => break,
+                }
+            }
         });
         Ok(())
     })
@@ -200,11 +273,11 @@ fn fake_browser(base: String) -> BrowserOpener {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_login_refreshes_and_silently_reacquires() {
-    let base = spawn_auth_server().await;
+    let (base, _idp) = spawn_auth_server().await;
     let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(
-        NativeAuthenticator::new(base.clone(), "permissive", Arc::clone(&store))
-            .with_browser_opener(fake_browser(base.clone())),
+        NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store))
+            .with_browser_opener(fake_browser()),
     );
 
     // Interactive login over the loopback yields a session and stores a
@@ -239,7 +312,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
     // never opening the browser (the opener panics if called).
     let panicking: BrowserOpener =
         Arc::new(|_url: &str| panic!("browser opened during silent reacquire"));
-    let silent = NativeAuthenticator::new(base, "permissive", Arc::clone(&store))
+    let silent = NativeAuthenticator::new(base, "mock-idp", Arc::clone(&store))
         .with_browser_opener(panicking);
     let session = silent.acquire::<String>().await.expect("silent acquire");
     assert!(
@@ -254,7 +327,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
 /// same type, so nothing on the `user_id` path is text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_user_id_round_trips_and_names_the_replica() {
-    let base = spawn_typed_auth_server().await;
+    let (base, _idp_alice, _idp_bob) = spawn_typed_auth_server().await;
 
     let alice = login_as(&base, "alice").await;
     let bob = login_as(&base, "bob").await;
@@ -289,7 +362,7 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
 /// device stay isolated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
-    let base = spawn_typed_auth_server().await;
+    let (base, _idp_alice, _idp_bob) = spawn_typed_auth_server().await;
     let keys = MemoryKeyStore::default();
 
     let alice = login_as(&base, "alice").await;
@@ -347,10 +420,10 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 /// The stored refresh token is gone too, and a copy of it kept elsewhere is dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
-    let (base, service) = spawn_auth_server_with_service().await;
+    let (base, service, _idp) = spawn_auth_server_with_service().await;
     let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
-    let authenticator = NativeAuthenticator::new(base.clone(), "permissive", Arc::clone(&store))
-        .with_browser_opener(fake_browser(base.clone()));
+    let authenticator = NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store))
+        .with_browser_opener(fake_browser());
 
     let login = authenticator.login::<String>().await.expect("login");
     let refresh = store
@@ -387,10 +460,9 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     // cannot be resurrected into a fresh access token.
     let kept = MemoryRefreshStore::default();
     kept.store(&refresh).expect("seed the copy");
-    let resurrect = NativeAuthenticator::new(base, "permissive", Arc::new(kept))
-        .with_browser_opener(Arc::new(|_url: &str| {
-            panic!("no browser during a refresh attempt")
-        }));
+    let resurrect = NativeAuthenticator::new(base, "mock-idp", Arc::new(kept)).with_browser_opener(
+        Arc::new(|_url: &str| panic!("no browser during a refresh attempt")),
+    );
     match resurrect.refresh_access::<String>().await {
         Err(ClientError::Auth(_)) => {}
         Err(other) => panic!("expected a rejected credential, got {other:?}"),
@@ -415,7 +487,7 @@ async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed()
     // Port 1 is reserved and nothing listens there, which is this test's stand-in
     // for a device with no connectivity.
     let authenticator =
-        NativeAuthenticator::new("http://127.0.0.1:1", "permissive", Arc::clone(&store));
+        NativeAuthenticator::new("http://127.0.0.1:1", "mock-idp", Arc::clone(&store));
 
     match authenticator.logout().await {
         Err(ClientError::Transport(_)) => {}

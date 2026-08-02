@@ -49,7 +49,7 @@ native-auth = [
 [[bin]]
 name = "connetto-client"
 path = "src/bin/connetto-client.rs"
-required-features = ["native-transport"]
+required-features = ["native-transport", "native-auth"]
 
 [dependencies]
 # Wire types and framing. The native transports ride the feature above.
@@ -161,3 +161,7 @@ rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite", "serde"] }
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false }
+# Real loopback OIDC server for the native-auth tests.
+oauth2-test-server = { version = "0.2", default-features = false, features = ["testing", "config"] }
+# GenericOidcProvider::discover takes an openidconnect::reqwest::Client.
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }

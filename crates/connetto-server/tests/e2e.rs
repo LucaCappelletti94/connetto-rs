@@ -11,11 +11,12 @@
 //! the product spine end to end, unlike the in-process session tests.
 //!
 //! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`,
-//! and both binaries built in the same profile as the test. Run it with:
+//! both binaries built in the same profile as the test, and an `app_reader`
+//! non-superuser role that the fixture creates automatically. Run it with:
 //!
 //! ```text
 //! cargo build --release -p connetto-server --bin connetto-server
-//! cargo build --release -p connetto-client --bin connetto-client
+//! cargo build --release -p connetto-client --bin connetto-client --all-features
 //! DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 //!   cargo test --release -p connetto-server --test e2e -- --ignored
 //! ```
@@ -33,6 +34,8 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
+use connetto_client::{ReplicaKey, cipher};
+
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
@@ -44,6 +47,16 @@ const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, 
 const OWNED_SQLITE_DDL: &str =
     "CREATE TABLE owned (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
+
+// The client replica's `orders` table, typed for the poller's count query.
+diesel::table! {
+    orders (id) {
+        id -> Integer,
+        price -> Nullable<Double>,
+        quantity -> Nullable<Integer>,
+        status -> Nullable<Text>,
+    }
+}
 
 /// Serializes the Docker-gated tests. They reset the same Postgres and share one
 /// replication slot and publication name, so they must not run concurrently.
@@ -77,22 +90,39 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Row count of the `orders` table in a client's local SQLite, or 0 when the
-/// database or table does not exist yet.
+/// Row count of the `orders` table in a client's local SQLite, or 0 while the
+/// database is absent, still locked, or not yet holding the table.
+///
+/// The client keeps its replica encrypted at rest with the key in the OS
+/// keyring, under the binary's service and keyed by the database path, so the
+/// count unlocks with that same key. The path is probed before opening,
+/// because an open would create an empty file and the client refuses an
+/// existing file that has no cached key.
 fn count_orders(db_path: &Path) -> i64 {
-    #[derive(QueryableByName)]
-    struct RowCount {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
+    if !db_path.exists() {
+        return 0;
     }
-    let Ok(mut conn) = SqliteConnection::establish(&db_path.to_string_lossy()) else {
+    let path = db_path.to_string_lossy();
+    let Ok(entry) = keyring::Entry::new("connetto-client", &path) else {
         return 0;
     };
-    diesel::RunQueryDsl::get_result::<RowCount>(
-        sql_query("SELECT COUNT(*) AS n FROM orders"),
+    let Ok(hex) = entry.get_password() else {
+        return 0;
+    };
+    let Ok(key) = hex.parse::<ReplicaKey>() else {
+        return 0;
+    };
+    let Ok(mut conn) = SqliteConnection::establish(&path) else {
+        return 0;
+    };
+    if cipher::unlock(&mut conn, &key).is_err() {
+        return 0;
+    }
+    diesel::RunQueryDsl::get_result::<i64>(
+        diesel::QueryDsl::select(orders::table, diesel::dsl::count_star()),
         &mut conn,
     )
-    .map_or(0, |row| row.n)
+    .unwrap_or(0)
 }
 
 /// Poll a client's local store until it holds at least `want` rows or the
@@ -127,10 +157,6 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local addr")
         .port()
-}
-
-fn spawn_server(database_url: &str, bind: &str) -> ChildGuard {
-    spawn_server_cfg(database_url, bind, PG_DDL, "orders", None)
 }
 
 fn spawn_server_cfg(
@@ -238,8 +264,11 @@ async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
 
 /// Reset the shared Postgres fixture to a clean slate: drop the slot, table, and
 /// publication, then recreate the table with `REPLICA IDENTITY FULL`, one seed
-/// row, the publication, and the slot. The seed lands before the slot exists, so
-/// it reaches clients via snapshot and only later writes arrive over replication.
+/// row, the publication, and the slot. Also creates an `app_reader` non-superuser
+/// role (idempotent) and grants it the access the server needs. Grants die with
+/// DROP TABLE, so they are refreshed on each call. The seed lands before the slot
+/// exists, so it reaches clients via snapshot and only later writes arrive over
+/// replication.
 async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     drop_slot(pool).await;
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
@@ -258,6 +287,23 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     exec(pool, "DROP PUBLICATION IF EXISTS connetto_pub").await;
     exec(pool, PG_DDL).await;
     exec(pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
+    exec(
+        pool,
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+    )
+    .await;
+    exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
+    exec(
+        pool,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_reader",
+    )
+    .await;
+    exec(
+        pool,
+        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reader",
+    )
+    .await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
     exec(pool, "CREATE PUBLICATION connetto_pub FOR TABLE orders").await;
     exec(
@@ -348,7 +394,8 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
     let bind = format!("127.0.0.1:{port}");
     let ws = format!("ws://127.0.0.1:{port}/");
 
-    let _server = spawn_server(&url, &bind);
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let _server = spawn_server_cfg(&url, &bind, PG_DDL, "orders", Some(&reader_url));
     assert!(
         wait_for_port(&bind, Duration::from_secs(20)).await,
         "server did not open {bind}"
@@ -423,7 +470,8 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
     let bind = format!("127.0.0.1:{port}");
     let ws = format!("ws://127.0.0.1:{port}/");
 
-    let _server = spawn_server(&url, &bind);
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let _server = spawn_server_cfg(&url, &bind, PG_DDL, "orders", Some(&reader_url));
     assert!(
         wait_for_port(&bind, Duration::from_secs(20)).await,
         "server did not open {bind}"
@@ -443,8 +491,8 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
         "reader snapshot"
     );
 
-    // The writer subscribes, applies its local insert, and pushes it. Under
-    // PermissiveAuth the server applies it to Postgres with no RLS check.
+    // The writer subscribes, applies its local insert, and pushes it. The
+    // server applies it as app_reader; orders carries no policy so the write is allowed.
     let write = "INSERT INTO orders VALUES (42, 2.5, 4, 'from-writer')";
     let _writer = spawn_client(&ws, &db_writer, "writer", Some(write));
 
@@ -571,5 +619,128 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         pg_owned_rows(&admin).await,
         vec![(1, "alice".to_owned()), (3, "alice".to_owned())],
         "RLS did not enforce the write policy through the binaries"
+    );
+}
+
+/// Spawn the server with the given environment, wait up to 30 s for it to exit,
+/// and return its output. Used by startup-refusal tests where the binary exits
+/// before binding its port.
+async fn run_server_exit_output(
+    database_url: &str,
+    reader_url: Option<&str>,
+    extra_envs: &[(&str, &str)],
+) -> std::process::Output {
+    let bind = format!("127.0.0.1:{}", free_port());
+    let mut command = Command::new(server_bin());
+    command
+        .env("DATABASE_URL", database_url)
+        .env("CONNETTO_BIND", bind)
+        .env("CONNETTO_PG_DDL", PG_DDL)
+        .env("CONNETTO_WRITABLE", "orders")
+        .env("CONNETTO_SLOT", SLOT)
+        .env("CONNETTO_PUBLICATION", PUBLICATION)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(r) = reader_url {
+        command.env("CONNETTO_READER_URL", r);
+    } else {
+        command.env_remove("CONNETTO_READER_URL");
+    }
+    for (k, v) in extra_envs {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("spawn server for refusal test");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("server refusal timed out after 30 s")
+    .expect("spawn_blocking task panicked")
+    .expect("wait_with_output failed")
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_without_a_reader_role() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let output = run_server_exit_output(&url, None, &[]).await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit without CONNETTO_READER_URL"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CONNETTO_READER_URL"),
+        "expected CONNETTO_READER_URL in stderr, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(
+        &url,
+        Some(&reader_url),
+        &[
+            ("CONNETTO_AUTH", "in-memory"),
+            ("CONNETTO_OIDC_PROVIDER", "frobnicate"),
+        ],
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit for unrecognised provider"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"frobnicate\""),
+        "expected Debug-quoted provider name in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("microsoft"),
+        "expected recognised provider list in stderr, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(
+        &url,
+        Some(&reader_url),
+        &[
+            ("CONNETTO_AUTH", "in-memory"),
+            ("CONNETTO_OIDC_PROVIDER", "Google"),
+        ],
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit for miscapitalised provider"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"Google\""),
+        "expected Debug-quoted \"Google\" in stderr, got: {stderr}"
     );
 }

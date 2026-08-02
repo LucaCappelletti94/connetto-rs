@@ -17,12 +17,14 @@ use connetto_core::messages::{ControlMessage, FatalErrorReason, Handshake};
 use connetto_core::traits::{IncomingFrame, SessionVerifier, Transport};
 use connetto_core::{PROTOCOL_VERSION, SessionVerifyError};
 use connetto_server::{
-    AuthConfig, AuthService, InMemoryAuthStore, Materializer, PermissiveAuth, PermissiveProvider,
-    ProviderRegistry, RedirectPolicy, ResolvedIdentity, SessionConfig, SessionError,
-    SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
-    pg_write_target,
+    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
+    Materializer, OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy,
+    ResolvedIdentity, SessionConfig, SessionError, SessionManager, Snapshot, SnapshotSource,
+    TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
+use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use openidconnect::reqwest;
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -291,37 +293,97 @@ async fn get_request(router: &axum::Router, uri: &str) -> axum::http::Response<B
     router.clone().oneshot(request).await.expect("route")
 }
 
+/// Start a real OIDC provider with `subject` as the user id and return an Arc'd
+/// registry containing the discovered "mock-idp" provider. Keep the returned
+/// [`OAuthTestServer`] alive for the test's duration or the provider socket dies.
+async fn oidc_registry(subject: &str) -> (OAuthTestServer, Arc<ProviderRegistry>) {
+    const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
+    let idp = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        default_user_id: subject.into(),
+        ..IssuerConfig::default()
+    })
+    .await;
+    let issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
+    let client = idp
+        .register_client(json!({
+            "redirect_uris": [CALLBACK],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let provider = GenericOidcProvider::discover(
+        OidcProviderConfig {
+            name: "mock-idp".to_owned(),
+            client_id: client.client_id.clone(),
+            client_secret: client.client_secret.clone(),
+            issuer,
+            redirect_url: CALLBACK.to_owned(),
+            scopes: Vec::new(),
+            assurance: AssuranceRequirement::none(),
+            tenant_id: None,
+        },
+        reqwest::Client::new(),
+    )
+    .await
+    .expect("discover provider");
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(provider));
+    (idp, Arc::new(registry))
+}
+
+/// GET the IDP's authorize URL with redirect following disabled and return the
+/// `code` and `state` query values from the resulting redirect location.
+async fn authorize_hop(authorize_url: &str) -> (String, String) {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build http client");
+    let resp = client
+        .get(authorize_url)
+        .send()
+        .await
+        .expect("GET authorize");
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("location header")
+        .to_str()
+        .expect("utf-8")
+        .to_owned();
+    let code = query_value(&location, "code");
+    let state = query_value(&location, "state");
+    (code, state)
+}
+
 #[tokio::test]
 async fn http_oauth_flow_then_refresh_roundtrip() {
     let (_authority, svc) = service();
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new(
-        "permissive",
-        identity("erin"),
-    )));
-    let router = auth_router(svc, Arc::new(registry), RedirectPolicy::default());
+    let (_idp, registry) = oidc_registry("erin").await;
+    let router = auth_router(svc, registry, RedirectPolicy::default());
 
-    // Start: a redirect whose Location carries the CSRF state.
-    let start = get_request(&router, "/auth/login?provider=permissive").await;
+    // Start: a redirect whose Location is the IDP authorize URL.
+    let start = get_request(&router, "/auth/login?provider=mock-idp").await;
     assert_eq!(start.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = start
+    let idp_authorize_url = start
         .headers()
         .get("location")
         .expect("location header")
         .to_str()
         .expect("utf8")
         .to_owned();
-    let state = location
-        .split("state=")
-        .nth(1)
-        .expect("state in redirect")
-        .to_owned();
+    let state = query_value(&idp_authorize_url, "state");
 
-    // Callback: the permissive provider resolves the identity and connetto
-    // mints its own tokens. No provider token reaches the response.
+    // Authorize hop: GET the IDP's authorize URL to obtain the real code.
+    let (code, _) = authorize_hop(&idp_authorize_url).await;
+
+    // Callback: connetto exchanges the real code with the provider and mints its
+    // own tokens. No provider token reaches the response.
     let callback = get_request(
         &router,
-        &format!("/auth/callback?code=dummy-code&state={state}"),
+        &format!("/auth/callback?code={code}&state={state}"),
     )
     .await;
     assert_eq!(callback.status(), StatusCode::OK);
@@ -421,18 +483,19 @@ async fn location_of(router: &axum::Router, uri: &str) -> String {
 /// Drive the loopback halves (start then callback) and return the one-time
 /// connetto code delivered to the client redirect.
 async fn loopback_code(router: &axum::Router) -> String {
-    let authorize = location_of(
+    let idp_authorize_url = location_of(
         router,
         &format!(
-            "/auth/login?provider=permissive&redirect_uri=http://127.0.0.1:9999/cb\
+            "/auth/login?provider=mock-idp&redirect_uri=http://127.0.0.1:9999/cb\
              &code_challenge={PKCE_CHALLENGE}&state=client-state-xyz"
         ),
     )
     .await;
-    let connetto_state = query_value(&authorize, "state");
+    let connetto_state = query_value(&idp_authorize_url, "state");
+    let (code, _) = authorize_hop(&idp_authorize_url).await;
     let client_redirect = location_of(
         router,
-        &format!("/auth/callback?code=perm&state={connetto_state}"),
+        &format!("/auth/callback?code={code}&state={connetto_state}"),
     )
     .await;
     assert!(client_redirect.starts_with("http://127.0.0.1:9999/cb?"));
@@ -443,12 +506,8 @@ async fn loopback_code(router: &axum::Router) -> String {
 #[tokio::test]
 async fn loopback_code_exchange_with_pkce() {
     let (_authority, svc) = service();
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new(
-        "permissive",
-        identity("frank"),
-    )));
-    let router = auth_router(svc, Arc::new(registry), RedirectPolicy::default());
+    let (_idp, registry) = oidc_registry("frank").await;
+    let router = auth_router(svc, registry, RedirectPolicy::default());
 
     let code = loopback_code(&router).await;
     let (status, body) = post_json(
@@ -498,17 +557,13 @@ async fn loopback_code_exchange_with_pkce() {
 #[tokio::test]
 async fn redirect_policy_gates_the_client_redirect() {
     let (_authority, svc) = service();
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new(
-        "permissive",
-        identity("grace"),
-    )));
-    let router = auth_router(svc, Arc::new(registry), RedirectPolicy::default());
+    let (_idp, registry) = oidc_registry("grace").await;
+    let router = auth_router(svc, registry, RedirectPolicy::default());
 
     // A non-loopback redirect with no allowlist entry is refused before any mint.
     let resp = get_request(
         &router,
-        "/auth/login?provider=permissive&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge=abc&state=s",
+        "/auth/login?provider=mock-idp&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge=abc&state=s",
     )
     .await;
     assert_eq!(
@@ -520,7 +575,7 @@ async fn redirect_policy_gates_the_client_redirect() {
     // A loopback redirect is accepted: a temporary redirect to the provider.
     let resp = get_request(
         &router,
-        "/auth/login?provider=permissive&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback&code_challenge=abc&state=s",
+        "/auth/login?provider=mock-idp&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback&code_challenge=abc&state=s",
     )
     .await;
     assert_eq!(
@@ -532,7 +587,7 @@ async fn redirect_policy_gates_the_client_redirect() {
     // A redirect without its PKCE challenge is refused as a partial pair.
     let resp = get_request(
         &router,
-        "/auth/login?provider=permissive&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback",
+        "/auth/login?provider=mock-idp&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback",
     )
     .await;
     assert_eq!(
@@ -545,17 +600,13 @@ async fn redirect_policy_gates_the_client_redirect() {
 #[tokio::test]
 async fn redirect_policy_admits_an_allowlisted_https_callback() {
     let (_authority, svc) = service();
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new(
-        "permissive",
-        identity("heidi"),
-    )));
+    let (_idp, registry) = oidc_registry("heidi").await;
     let policy = RedirectPolicy::new(vec!["https://app.example/cb".to_owned()]);
-    let router = auth_router(svc, Arc::new(registry), policy);
+    let router = auth_router(svc, registry, policy);
 
     let resp = get_request(
         &router,
-        "/auth/login?provider=permissive&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&code_challenge=abc&state=s",
+        "/auth/login?provider=mock-idp&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&code_challenge=abc&state=s",
     )
     .await;
     assert_eq!(

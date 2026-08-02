@@ -1,25 +1,26 @@
 //! Phase 3 provider verification and token-retention tests (Docker-free).
 //!
 //! A locally minted, locally signed ID token exercises the real verification
-//! path: the mapping to a [`ResolvedIdentity`], the nonce and audience checks,
+//! path: the mapping to a [`ResolvedIdentity`](connetto_server::ResolvedIdentity), the nonce and audience checks,
 //! and the MFA assurance bar, all with no network. The retained-token accessor
-//! is driven through the permissive provider, so its refresh and persistence
-//! are exercised without a live provider either.
+//! is driven through a real OIDC provider on a loopback socket, so its
+//! refresh and persistence are exercised against real token responses.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
-    OidcProviderConfig, PermissiveProvider, ProviderError, ProviderRegistry, ResolvedIdentity,
-    RetainedProviderToken, TokenAuthority, VerifiedLogin,
+    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
+    InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, TokenAuthority,
+    VerifiedLogin,
 };
+use oauth2_test_server::{IssuerConfig, OAuthTestServer};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     CoreRsaPrivateSigningKey,
 };
+use openidconnect::reqwest;
 use openidconnect::{
     Audience, AuthenticationContextClass, AuthenticationMethodReference, EmptyAdditionalClaims,
     EndUserEmail, IssuerUrl, Nonce, PrivateSigningKey, StandardClaims, SubjectIdentifier,
@@ -176,76 +177,120 @@ fn mfa_assurance_requires_the_configured_amr() {
     assert_eq!(identity.subject, "user-42");
 }
 
-fn dev_identity() -> ResolvedIdentity {
-    ResolvedIdentity {
-        issuer: "https://dev.example".to_owned(),
-        subject: "alice".to_owned(),
-        email: None,
-        name: None,
-        amr: Vec::new(),
-        acr: None,
-        tenant_id: None,
-        roles: Vec::new(),
-        claims: BTreeMap::new(),
-    }
-}
-
-fn service_with_permissive_provider() -> (Arc<TokenAuthority>, AuthService<InMemoryAuthStore>) {
+async fn service_with_real_provider() -> (
+    Arc<TokenAuthority>,
+    AuthService<InMemoryAuthStore>,
+    VerifiedLogin,
+    OAuthTestServer,
+) {
+    const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
+    let idp = OAuthTestServer::start_with_config(IssuerConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        ..IssuerConfig::default()
+    })
+    .await;
+    let issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
+    let client = idp
+        .register_client(serde_json::json!({
+            "redirect_uris": [CALLBACK],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "openid",
+        }))
+        .await;
+    let provider: Arc<dyn IdentityProvider> = Arc::new(
+        GenericOidcProvider::discover(
+            OidcProviderConfig {
+                name: "mock-idp".to_owned(),
+                client_id: client.client_id.clone(),
+                client_secret: client.client_secret.clone(),
+                issuer,
+                redirect_url: CALLBACK.to_owned(),
+                scopes: Vec::new(),
+                assurance: AssuranceRequirement::none(),
+                tenant_id: None,
+            },
+            reqwest::Client::new(),
+        )
+        .await
+        .expect("discover provider"),
+    );
+    let redirect = provider.begin_login().expect("begin login");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build http client");
+    let resp = http
+        .get(&redirect.authorize_url)
+        .send()
+        .await
+        .expect("GET authorize");
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("location header")
+        .to_str()
+        .expect("utf-8")
+        .to_owned();
+    let code = location
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("code="))
+        .expect("code in location")
+        .to_owned();
+    let login = provider
+        .complete_login(&code, &redirect.pkce_verifier, &redirect.nonce)
+        .await
+        .expect("complete login");
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(PermissiveProvider::new("dev", dev_identity())));
+    registry.register(Arc::clone(&provider));
     let service = AuthService::new(Arc::clone(&authority), store).with_registry(Arc::new(registry));
-    (authority, service)
+    (authority, service, login, idp)
 }
 
 #[tokio::test]
 async fn accessor_refreshes_an_expired_provider_token() {
-    let (authority, service) = service_with_permissive_provider();
-    let login = VerifiedLogin {
-        identity: dev_identity(),
-        retained: RetainedProviderToken {
-            issuer: "https://dev.example".to_owned(),
-            access_token: "stale".to_owned(),
-            refresh_token: Some("provider-refresh".to_owned()),
-            expires_at: Some(SystemTime::now() - Duration::from_secs(60)),
-        },
-    };
+    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    login.retained.access_token = "stale".to_owned();
+    login.retained.expires_at = Some(SystemTime::now() - Duration::from_secs(60));
     let pair = service.login_with_provider(&login).await.expect("login");
     let session_id = authority
         .verify_access::<String>(&pair.access_token)
         .expect("verify")
         .session_id;
 
-    // The stored token is expired, so the accessor refreshes it through the
-    // permissive provider and persists the result.
+    // The stored token is expired, so the accessor refreshes it through the real idp.
     let refreshed = service
         .provider_access_token(session_id)
         .await
         .expect("accessor");
-    assert_eq!(refreshed.as_deref(), Some("permissive-access-token"));
+    assert!(
+        refreshed.as_deref().is_some_and(|t| !t.is_empty()),
+        "accessor returned a token",
+    );
+    assert_ne!(
+        refreshed.as_deref(),
+        Some("stale"),
+        "the expired token was refreshed",
+    );
 
-    // The refreshed token has no expiry, so a second call returns it as-is.
+    // The refreshed token has an expiry set by the real idp, so a second call
+    // returns it as-is without another refresh.
     let again = service
         .provider_access_token(session_id)
         .await
         .expect("accessor");
-    assert_eq!(again.as_deref(), Some("permissive-access-token"));
+    assert_eq!(refreshed, again, "second call returns the same token");
 }
 
 #[tokio::test]
 async fn accessor_returns_a_still_valid_token_unrefreshed() {
-    let (authority, service) = service_with_permissive_provider();
-    let login = VerifiedLogin {
-        identity: dev_identity(),
-        retained: RetainedProviderToken {
-            issuer: "https://dev.example".to_owned(),
-            access_token: "still-good".to_owned(),
-            refresh_token: Some("provider-refresh".to_owned()),
-            expires_at: Some(SystemTime::now() + Duration::from_secs(3600)),
-        },
-    };
+    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    login.retained.access_token = "still-good".to_owned();
+    login.retained.expires_at = Some(SystemTime::now() + Duration::from_secs(3600));
     let pair = service.login_with_provider(&login).await.expect("login");
     let session_id = authority
         .verify_access::<String>(&pair.access_token)

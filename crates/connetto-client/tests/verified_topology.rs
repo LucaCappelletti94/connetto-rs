@@ -19,13 +19,15 @@
 //! docker run -d --rm --name connetto-dev-pg -e POSTGRES_PASSWORD=postgres \
 //!   -p 55470:5432 postgres:16 -c wal_level=logical
 //! # apply examples/wasm-smoke/schema.sql, a publication, a slot,
-//! # _connetto_mutations, connetto_sessions, and connetto_provider_tokens
+//! # _connetto_mutations, connetto_sessions, connetto_provider_tokens,
+//! # and examples/wasm-smoke/roles.sql for the reader role
 //! cargo run --release -p connetto-server --example dev_idp
 //! set -a && . target/dev-idp.env && set +a
 //! CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \
 //!   CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
 //!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
+//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
 //!   cargo run --release -p connetto-server --bin connetto-server
 //!
 //! cargo test --release -p connetto-client --features native-auth \

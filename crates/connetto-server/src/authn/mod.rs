@@ -26,8 +26,7 @@ pub use identity::{
 };
 pub use provider::{
     AssuranceRequirement, AuthCodes, IdentityProvider, IssuedAuthCode, LoginRedirect, PendingLogin,
-    PendingLogins, PermissiveProvider, ProviderError, ProviderRegistry, RetainedProviderToken,
-    VerifiedLogin,
+    PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoSessionVerifier, TokenPair};

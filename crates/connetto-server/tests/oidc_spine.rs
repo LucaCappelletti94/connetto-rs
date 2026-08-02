@@ -10,8 +10,8 @@
 //! both.
 //!
 //! Before this test, none of it had ever run. Every other test either uses
-//! [`PermissiveProvider`](connetto_server::PermissiveProvider), which performs no
-//! I/O at all, or `GenericOidcProvider::from_parts`, which `provider.rs` uses
+//! the since-deleted permissive stand-in provider, which performed no I/O at
+//! all, or `GenericOidcProvider::from_parts`, which `provider.rs` uses
 //! precisely because it needs no network. So discovery, the token exchange, and
 //! the JWKS fetch had never executed, and the provider's authorize endpoint had
 //! never been requested by anything.
@@ -27,7 +27,7 @@
 //! What this deliberately does not cover is the user agent. An HTTP client walks
 //! the redirect chain instead of a browser, so origin and navigation semantics
 //! are absent, which is what the browser leg of E4 owes. Two defects already
-//! found by reading live in that gap: `PermissiveProvider`'s `about:blank`
+//! found by reading live in that gap: the deleted permissive stand-in's
 //! authorize URL, and the same-origin constraint on the worker's `fetch` calls.
 
 use std::sync::Arc;

@@ -109,3 +109,8 @@ oauth2-test-server = { version = "0.2", default-features = false, features = ["t
 # The CORS layer the browser-test auth stack example puts in front of the auth
 # router. Not used by the library.
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# Reading the client binary's encrypted replica in the e2e assertions: the key
+# comes from the OS keyring where the client binary stored it, and the cipher
+# unlock applies it before counting rows.
+connetto-client = { path = "../connetto-client" }
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
