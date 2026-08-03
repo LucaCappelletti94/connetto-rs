@@ -1,6 +1,6 @@
 # Master implementation plan: identity, session, capability, and the change path
 
-This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Nothing in it is implemented.
+This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. The identity half is built: R1, R0 part A, R2, R8, R12, R3, R16 part A and R4 are done, and the change path is what remains.
 
 ## How to read this
 
@@ -59,21 +59,21 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 2 | ~~R0 part A, the connetto-only counters~~ **DONE** | Cheap, and it priced the dispatch loop before R5b changes what dominates it |
 | 2 | ~~R16 part A, the fan-out research~~ **DONE** | Blocked on nothing and needed no code, so it ran alongside everything early |
 | 3 | ~~R2~~ **DONE** | Gives the session layer a durable identity, which R3 consumes |
-| 4 | R8 | Independent surface cleanup, apart from one item wanting R2's registry |
-| 5 | R12 part A, the logging facility | Prerequisite for R3, because R3 makes a refusal silent on the wire |
-| 6 | R3 | Needs R2 and R12 part A |
-| 6 | R12 part B, the refused-grant line | Rides with R3, the phase that creates the silence it covers. It cannot be proven earlier: a refused credential is announced on the wire today |
-| 7 | R4 | Needs R3 |
+| 4 | ~~R8~~ **DONE** | Independent surface cleanup, apart from one item that wanted R2's registry |
+| 5 | ~~R12 part A, the logging facility~~ **DONE** | Prerequisite for R3, because R3 makes a refusal silent on the wire |
+| 6 | ~~R3~~ **DONE** | Needed R2 and R12 part A, both of which preceded it |
+| 6 | ~~R12 part B, the refused-grant line~~ **DONE** | Rode with R3, the phase that created the silence it covers. It could not be proven earlier, because a refused credential was announced on the wire until then |
+| 7 | ~~R4~~ **DONE** | Needed R3, which is what makes a checked grant resolve to a subject that is not a person |
 | 8 | R13 | Needs R3. Off the critical path, so it may slip later without blocking anything |
 | 8 | R22 | Blocked on nothing, and it should land before R19 because it shrinks what throttling must defend against |
 | 9 | R19 | Needs R2 for the session handle it counts against, and R3 so the anonymous tier is representable |
-| 10 | R5a | Waits on the subql trait landing upstream |
+| 10 | R5a | Waits on `upstream-subql-visibility-trait.md` landing upstream. Not on rls2fga |
 | 11 | R0 part B, the full measurement | Needs R5a's seam to measure through |
-| 12 | R5b | Needs R5a, R0, and the rls2fga per-row mapping |
+| 12 | R5b | Needs R5a, R0, the rls2fga per-row mapping, and `upstream-subql-per-row-visibility.md` on top of it |
 | 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. The bulk frame decision it once had to settle before R3 shipped is settled, recorded under its inputs section |
 | 14 | R14 | Needs R0's data and R5b. **Conditional**: dropped if R0 shows the dispatch loop is not the ceiling |
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
-| 16 | R7 | Needs R4 and R6 |
+| 16 | R7 | Needs R6. R4 is done |
 | 17 | R9 | Needs R5b |
 | 18 | R27 | Needs R6 for the incremental move-in and move-out, and R22 because the filter is compiled and compilation needs the query set known in advance. Buildable before R6 only in a form that resyncs on every dependency change |
 | any | R28 | A defect, blocked on nothing. Silent data loss on every fresh subscription, so it outranks everything discretionary |
@@ -101,22 +101,22 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R1 security defaults | **DONE** | nothing | no |
 | R0 part A, connetto-only counters | **DONE** | nothing | no |
 | R2 durable session identity | **DONE** | nothing | no |
-| R8 inert surface | **DONE** | nothing, apart from one item on R2 | no |
-| R12 part A, the logging facility | NOT STARTED | nothing | no |
-| R3 grants and `Principal` | NOT STARTED | R2 and R12 part A | no |
-| R12 part B, the refused-grant line | NOT STARTED | R3 | no |
-| R4 capabilities | NOT STARTED | R3 | no |
-| R13 `auth_events` audit table | NOT STARTED | R3 | no |
+| R8 inert surface | **DONE** | nothing, and R2's registry landed first as its one item needed | no |
+| R12 part A, the logging facility | **DONE** | nothing | no |
+| R3 grants and `Principal` | **DONE** | nothing | no |
+| R12 part B, the refused-grant line | **DONE** | nothing, landed with R3 | no |
+| R4 capabilities | **DONE** | nothing, R3 was done | no |
+| R13 `auth_events` audit table | NOT STARTED | nothing, R3 is done | no |
 | R22 compile-time query set | NOT STARTED | nothing | no |
-| R19 request throttling | NOT STARTED | R2 and R3 | no |
-| R5a visibility seam | NOT STARTED | a small subql change | **yes, subql** |
+| R19 request throttling | NOT STARTED | nothing, R2 and R3 are done | no |
+| R5a visibility seam | NOT STARTED | `upstream-subql-visibility-trait.md`, the seam only | **yes, subql (the trait)** |
 | R0 part B, full measurement | NOT STARTED | R5a | yes, via R5a |
-| R5b service as executor | NOT STARTED | R5a, R0, rls2fga | **yes, rls2fga** |
+| R5b service as executor | NOT STARTED | R5a, R0, rls2fga, then `upstream-subql-per-row-visibility.md` | **yes, rls2fga then subql (per-row)** |
 | R16 part A, fan-out research | **DONE** | nothing | no |
 | R16 part B, the fan-out architecture | NOT STARTED | R0 (the bulk-frame decision is settled, see the section) | no |
 | R14 dispatch-loop cost | NOT STARTED | R0 and R5b, conditional on R0's data | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
-| R7 revocation teardown | NOT STARTED | R4 and R6 | inherited |
+| R7 revocation teardown | NOT STARTED | R6, R4 is done | inherited |
 | R9 permissive policy out of tests | NOT STARTED | R5b | inherited |
 | R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
 | R26 local data export | NOT STARTED | nothing | no |
@@ -130,7 +130,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R11 shared public store | NOT STARTED | nothing | no |
 | R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
-| R32 replication slot lifecycle | NOT STARTED | R12 part A for the lag line only | no |
+| R32 replication slot lifecycle | NOT STARTED | nothing, R12 part A is done | no |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
 | R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
 | R30 grouped aggregates revisited | NOT STARTED, exploratory | nothing | no |
@@ -141,31 +141,33 @@ A rendering of the table above, for reading rather than for deciding. **If the t
 
 ```mermaid
 graph TD
-  R1[R1 security defaults]
-  R12A[R12 part A logging facility] --> R3
-  R2[R2 durable session identity] --> R3[R3 grants and Principal]
-  R3 --> R4[R4 capabilities in the model]
+  R1[R1 security defaults, DONE]
+  R12A[R12 part A logging facility, DONE] --> R3
+  R2[R2 durable session identity, DONE] --> R3[R3 grants and Principal, DONE]
+  R3 --> R4[R4 capabilities in the model, DONE]
   R3 --> R13[R13 auth_events audit table]
   R3 --> R19[R19 request throttling]
-  R3 --> R12B[R12 part B refused-grant line]
+  R3 --> R12B[R12 part B refused-grant line, DONE]
   R2 --> R19
   R22[R22 compile-time query set] -.->|should land first| R19
-  R0A[R0 part A, connetto-only counters]
+  R0A[R0 part A, connetto-only counters, DONE]
   R5a[R5a visibility seam] --> R0B[R0 part B, full measurement]
   R5a --> R5b[R5b service as executor]
   R0B --> R5b
-  U1[upstream: rls2fga per-row records] --> R5b
-  U2[upstream: subql visibility trait] --> R5a
+  U2a[upstream subql:<br/>visibility trait] --> R5a
+  U2a --> U2b
+  U1[upstream rls2fga:<br/>per-row records] --> U2b[upstream subql:<br/>per-row visibility]
+  U1 --> R5b
+  U2b --> R5b
   R5b --> R6[R6 two-check change form]
   R5b --> R14[R14 dispatch-loop cost]
   R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture]
   R0B --> R16
-  R16 -.->|frame decision only,<br/>before R3 ships| R3
-  R0B --> R14
+  R0B -.->|conditional: dropped if<br/>the loop is not the ceiling| R14
   R4 --> R7[R7 revocation teardown]
   R6 --> R7
   R5b --> R9[R9 permissive policy out of tests]
-  R8[R8 inert surface]
+  R8[R8 inert surface, DONE]
   R21[R21 one page codec on both backends]
   R20[R20 start with no reachable server]
   R17[R17 local tier name and key scope]
@@ -187,15 +189,25 @@ graph TD
   R25[R25 device-to-device sync, exploratory]
   R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
+  classDef done fill:#d7ebd7,stroke:#4a7a4a,color:#1d3b1d
+  class R1,R0A,R2,R8,R12A,R3,R12B,R4,R16A done
 ```
 
 ## Upstream dependencies
 
-Three documents, all untracked and never to be committed.
+Four documents, all untracked and never to be committed. **One document is one filable request**, which is why the subql work is two files rather than one: the trait lands alone and before rls2fga, while everything built on it lands after. A single file would have been mostly blocked work at the moment of filing.
 
-**`docs/upstream-rls2fga-per-row-records.md`** blocks R5b, and therefore R6, R7 and R9. Self-contained and self-testable inside rls2fga: emit the per-row description beside the existing SQL, ship a reference evaluator, assert that no exclusion subtracts anything row-derived. Its acceptance is a differential test against its own whole-table SQL.
+**The order, and it is not a preference:**
 
-**`docs/upstream-subql-visibility-trait.md`** blocks R5a. The trait must live in subql, because subql calls it and subql cannot depend on connetto-core. Its per-row half is blocked on the rls2fga change, but the trait's shape is not, which is why R5a can proceed on a small subql change alone.
+1. **`docs/upstream-subql-visibility-trait.md`**, the seam alone, with Postgres RLS still behind it and no behaviour change. Blocked on nothing. R5a consumes it, and it goes first deliberately: it puts the measurement's instrumentation on a seam that then never relocates, and it reduces everything after it to substituting an implementation rather than restructuring a call path.
+2. **`docs/upstream-rls2fga-per-row-records.md`**, which lands entirely inside rls2fga and is testable with no consumer at all. Emit the per-row description beside the existing SQL, ship a reference evaluator, assert that no exclusion subtracts anything row-derived, and report per policy both whether each relation is decidable from one row and the complete set of tables the policy reads. That last report is what R5b step 7's startup refusal consumes. Its acceptance is a differential test against its own whole-table SQL. Pinned at commit `fd8fb66` rather than at a branch, because the branch moved out from under an earlier version of that document and took every line citation with it.
+3. **`docs/upstream-subql-per-row-visibility.md`**, consuming both the trait from step 1 and the evaluator and local-decidability flag from step 2. Building it against an unlanded interface is how two repositories drift.
+
+Then R5b, which needs steps 2 and 3, plus R5a and R0. R6 needs step 3's transition detection.
+
+**One trap worth naming, because it caused a wrong reading once already.** Step 3's transition detection (its requirement 5) is not blocked on rls2fga, so it reads as though it could ship with step 1. It cannot: it consults the previous version of a row, and Postgres RLS cannot answer that, so putting it in step 1 would leave a branch that always answers false. It leaves exactly one obligation on step 1, which is that the trait's signature must be able to name which version is being asked about.
+
+**Nothing in steps 8 or 9 of the Sequence gates any of this.** R5a sits at step 10 because that is where it becomes worth starting, not because R13, R22 or R19 unlock it, so upstream work may proceed in parallel with them and should.
 
 **`docs/upstream-subql-membership-term.md`** blocks R27's subql half. The shape is settled (one filter written as SQL, two executors, R27 step 1), the term is bounded to what `rls2fga` classifies, and it lands after the other two documents because its change path rides their machinery. A wanted capability rather than a defect found, recorded in the same form regardless.
 
@@ -253,6 +265,8 @@ A new or extended test in `crates/connetto-server/tests/` proving each refusal i
 ## R0: the measurement
 
 **Status.** Part A **DONE** (2026-08-01). Part B NOT STARTED, **blocked on R5a**.
+
+**One hazard R5a introduces, recorded here because this is the counter's home.** `AUTHORIZATION_CALLS` increments at `RlsAuth::can_read`'s entry (`crates/connetto-server/src/auth.rs`), which is the implementation's entry rather than the round trip. That is exact today, because one entry is one Postgres transaction. It stops being exact at R5a: the visibility trait is answered once per changed row for every watcher at once (`docs/upstream-subql-visibility-trait.md`, decision 1), so the seam is entered once per event while the RLS implementation behind it still runs K transactions in its own loop. **Left alone, the counter would read 1 per event on the day R5a ships and R5b's whole acceptance criterion would be satisfied by a phase that changed no round trips at all.** So the counter must be pinned to the backend round trip, and R5a is the phase that must move it. It is named as a step there.
 
 **Part A landed.** The counters live in `crates/connetto-server/src/counters.rs` (always-on relaxed atomics per the decision below), incremented at the three named `dispatch_event` lock sites, the per-consumer `payload_zstd` copy in `Materializer::dispatch`, the per-subscriber `Route` clone, and `RlsAuth::can_read`. The load fixture is `connetto_test_harness::fanout::fanout_run` (N subscribers over one table under the RLS policy, M admin writes, counter deltas bracketing exactly that window), and the counter test is `crates/connetto-test-harness/tests/fanout_counters.rs`, green in the gate. **Measured, exact**: at K subscribers each event costs K authorization round trips, K route clones, K plus two materializer lock takes, and K full payload copies. The test asserts that growth today and is the file where R5b flips the assertions to their negation.
 
@@ -404,7 +418,7 @@ No variant of a wire enum the server can send is unconstructed. No public trait 
 
 **Status.** NOT STARTED
 
-**Blocked on a small subql change.** The trait must live in subql, because subql calls it on the change path and subql cannot depend on connetto-core.
+**Blocked on `docs/upstream-subql-visibility-trait.md` landing, and on nothing else. Explicitly not on rls2fga.** The trait must live in subql, because subql calls it on the change path and subql cannot depend on connetto-core. What this phase lands is the seam with Postgres RLS still behind it and no behaviour change, so it needs none of the per-row machinery that waits on rls2fga.
 
 ### Purpose
 
@@ -412,11 +426,13 @@ Every authorization question on the change path goes through `AuthPolicy`, which
 
 ### Steps
 
-1. Define the visibility trait in subql. See `docs/upstream-subql-visibility-trait.md`.
-2. Move all three connetto call sites to ask through it: the change path (`SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), the catchup path (`SessionManager::subscribe_row`), and the write path (`SessionManager::every_op_authorized`).
-3. Put an implementation behind it that **still uses Postgres RLS**, so nothing about any answer changes.
+1. Define the visibility trait in subql. **Its shape is settled**, in `docs/upstream-subql-visibility-trait.md` under "The shape, decided": one question per changed row naming every watcher, carrying the row as a lazy per-column accessor rather than materialised values, answered as one verdict per watcher into a buffer the caller reuses, with the watcher an opaque associated type carrying no bound.
+2. Move all three connetto call sites to ask through it: the change path (`SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), the catchup path (`SessionManager::subscribe_row`), and the write path (`SessionManager::every_op_authorized`). The first two ask per event rather than per subscriber, which is the shape change, not just a relocation.
+3. Put an implementation behind it that **still uses Postgres RLS**, so nothing about any answer changes. It reads only the key off the accessor.
 4. Supersede `AuthPolicy` in `crates/connetto-core/src/traits.rs`.
-5. Follow the idiom subql already uses twice: query re-execution works by subql asking the caller through `Connector`, because the query and its retry belong to the caller.
+5. **Move `AUTHORIZATION_CALLS` from the seam to the round trip**, because this phase is what makes the two differ. The trait is entered once per event while the implementation behind it still runs one Postgres transaction per watcher, so a counter left at the entry would read 1 per event and R5b's acceptance criterion would be met by a phase that removed no round trips. R0's counter test must still show growth after this phase, and that is this step's proof.
+6. Two consequences of the decided shape, both local. `PlannedOp` in `crates/connetto-server/src/materializer.rs` must stop discarding the row values it keeps only a key from today, because the accessor needs them. And `crate::pk::encode`/`decode` exist solely to pass typed key values through the old opaque `&[u8]` parameter, so they lose their reason to exist on this path.
+7. Follow the idiom subql already uses twice: query re-execution works by subql asking the caller through `Connector`, because the query and its retry belong to the caller.
 
 ### Proof
 
@@ -434,7 +450,7 @@ It puts R0's authorization counter on a seam that then never relocates, so the b
 
 ## R12: structured logging
 
-**Status.** Part A NOT STARTED, blocked on nothing, and a prerequisite for R3. Part B NOT STARTED, **blocked on R3** and landing with it.
+**Status.** **DONE.** Part A (2026-08-02), part B with R3 (2026-08-02).
 
 **Split into two parts, decided with the maintainer on 2026-08-02.** The phase as originally written declared itself done when "a refused grant is visible in the log", which it cannot prove: grants arrive in R3, and R3 is the phase waiting on this one. The property the assertion rests on does not exist yet either, because a refused credential today is announced on the wire (`SessionManager::run_handshake` sends `FatalErrorReason::AuthenticationFailed` before closing) rather than being silent. So part A lands the facility, and the security assertion travels as part B with the phase that creates the silence.
 
@@ -466,7 +482,7 @@ Four things the phase text called settled and were not. Decided with the maintai
 5. Emit at the call sites the architecture already names: authentication outcomes, connection events, and change-stream connection failures. A CDC outage is a connection failure and wants a log line, not a subsystem.
 6. Keep denials out of `auth_events`, per the split in `08-authorization.md` under "Audit". High-volume goes to the log, state changes go to the table, and that table is its own later phase.
 
-**Part B, the refused-grant line. Blocked on R3, and lands with it.** R3 step 6 makes a failed grant leave the connection open and step 7 keeps it off the wire, which is the moment the log line becomes the only trace. Before that there is nothing silent to make loud.
+**Part B, the refused-grant line. DONE (2026-08-02), landed with R3.** R3 step 6 makes a failed grant leave the connection open and step 7 keeps it off the wire, which is the moment the log line becomes the only trace. One event per refused grant now carries the caller's own label, the grant's position in what it presented, and a short stable reason, inside the connection context so the run rides along. `crates/connetto-server/tests/grants.rs::a_refused_grant_names_the_caller_and_which_grant_in_the_log` asserts it, and the assertion earned its place immediately: it failed on its first run because the context was an `info_span` around a `warn` event, so an operator quieting the process would have kept the security-relevant line and lost the run it belongs to. The context is a `warn_span` now, since a span attaches its values only when its own level passes the filter.
 
 7. Emit one event per refused grant, naming the caller and which grant was refused, inside the connection context so the handle rides along.
 8. Keep it out of `auth_events`: a rejected grant is a denial, and denials are high-volume by that same split, because a caller probing keys generates one per attempt.
@@ -481,13 +497,35 @@ Four things the phase text called settled and were not. Decided with the maintai
 
 **Part A**: every program emits through one facility, every event carries the required values, and no `println!`, `eprintln!` or `web_sys::console` call is left in a `src` tree. **Part B**: a refused grant is visible in the log and nowhere else, so R3's silent-refusal design is safe.
 
+### What part A landed, 2026-08-02
+
+All thirty-nine sites converted, and ten more in the two dev helper programs beside the server, which the inventory had excluded as being outside a `src` tree. **Decided with the maintainer**: those two also install the destination and convert their banners, because they are the processes you start by hand and they run the same library that now reports login outcomes, so leaving them would have made the hand-run stack the one place the new reporting is invisible.
+
+The destination is `connetto_core::logging::init_stdout` for a native program (one JSON object per line, `RUST_LOG` over a default of `info`) and `connetto_web::logging::init_console` for a browser one. The console destination is a fifty-line `MakeWriter` over `web_sys::console` rather than a dependency: `tracing-web` and `tracing-wasm` are the two published wrappers and their last releases are 2023-11-30 and 2021-11-07, which is more risk than the code they save.
+
+**A defect the smoke test found, which no test would have.** `pg_walstream` reports every standby status update at `info`, one line per ten seconds per server whether or not anything happened. With a flat `info` default that is the entire log: over a seven-minute browser run the real server wrote six of its own events and about sixty of those. The server binary now defaults to `info,pg_walstream=warn` through `init_stdout_with_default`, which `RUST_LOG` still overrides. The knowledge of which dependency is chatty sits in the program that pulls it, not in the shared facility.
+
+Proof, all run: the format and the context-propagation contract in `crates/connetto-core/tests/logging.rs` (ungated); the real server's own stdout in `e2e_server_logs_json_to_stdout_with_the_connection_context`, which parses each line as JSON, reads the session handle and identity off the connection event, and asserts the listener event carries no session context at all; and the browser destination in `crates/connetto-web/tests/logging.rs`, which replaces `console.warn`, `console.error` and `console.info` and reads the captured text back, so it asserts the console specifically rather than settling for the capturing-writer compromise the handoff allowed.
+
+Also fixed in passing: the stack recipe in `examples/wasm-smoke/tests/authenticated_boot.rs` never created `connetto_sessions` or `connetto_provider_tokens`, which both processes need, and named a port and container already held by a stale pre-R8 database.
+
 ---
 
 ## R3: grants and `Principal`
 
-**Status.** NOT STARTED
+**Status.** **DONE.** (2026-08-02) R12 part B landed with it.
 
-**Blocked on R2 and R12 part A.** R12 part A because step 7 makes a refused grant silent on the wire and relies on a log line existing to make it loud, and no logging exists today. That log line and its assertion are R12 part B, which lands with this phase rather than before it, because the silence it covers does not exist until step 6. Supersedes the discarded E6 step-one work, which was the right vocabulary and the wrong shape.
+**Landed.** All ten steps. `Handshake` carries `grants: Vec<Grant>` in place of `auth_token`, and `session_token` on the request became `resume_token`. `SessionVerifier` became `HandshakeAuthority`, which checks one grant into a `Subject` and also mints and reads the resume credential, because both are the server's own signature under one key. `Principal` carries an optional identity plus the accepted capability subjects on a non-optional handle, and since those are two independent bits the four arrival cases are the entire space with no fifth state to leave unused. A refusal logs and does nothing else, so `FatalErrorReason::AuthenticationFailed` is deleted with no sender left. `AuthPolicy`, `SnapshotSource` and `PgWriteTarget` all take a `Principal`, and a caller with no identity leaves `app.user_id` unset for the whole transaction rather than binding an empty string. `Replica` became `Replica<'a, S>` over `InMemory` or `Encrypted` and swallowed the device-private database, so the illegal pairing is not a program.
+
+**Four decisions the step list did not carry, settled with the maintainer before any code.** First, this phase carries capability subjects and R4 makes them change what a caller sees, so the union proof moved to R4 and this phase's proof list is corrected below. Second, an unidentified run's minted handle comes back inside a credential connetto signed, because a handle a caller could invent would let it name its own write counter and take over any visit whose handle it obtained. A registry was considered and rejected as a lookup on a path that must stay arithmetic plus another table a deployment maintains. Third, the watermark table's foreign key into `connetto_sessions` goes, since every run has a handle and only a login has a row there. Widening that table and skipping the watermark for unidentified callers were both considered and rejected, and the startup shape check now refuses a table that still declares the key. Fourth, the type guard lives on the value handed to `connect` rather than on the connection, because the browser worker needs the invariant while holding no connection at all.
+
+**Three defects found, two of them real.** The refused-grant assertion failed on its first run and was right to: a span attaches its values only when its own level passes the filter, so an `info_span` around a `warn` event meant an operator quieting the process to `warn` would keep the security-relevant line and lose the run it belongs to. The context is now a `warn_span`. The browser worker was the second door onto the plaintext-tier defect, opening its device-private database by name and encrypting it only when a key happened to exist, which R3 was about to make reachable. And the documented stack recipe in `examples/wasm-smoke/tests/authenticated_boot.rs` created the watermark table with the foreign key, so it would have refused to start.
+
+**One hazard worth recording, because it is silent by construction.** The stand-in checker refuses any grant that is not `user:<id>` or `key:<subject>`, so a call site that used to pass a bare token still compiles and quietly runs unidentified. Fourteen such sites in the harness suites and one in `write_path.rs` would have passed vacuously.
+
+**Proven.** `crates/connetto-server/tests/grants.rs`, nine tests: the four arrival cases one each, a good grant beside a bad one, two logins leaving the caller unidentified whichever arrived first, an unidentified run resuming on its credential, an invented handle starting a fresh run instead, and the refused-grant log line naming the caller, the grant's position and the reason inside the connection context. The type guard is two `compile_fail` doctests on `Replica` beside a passing one for the two legal pairings. `verified_topology.rs` proves it against the real stack: a forged token no longer ends anything and lands on a fresh run of its own rather than the login's.
+
+**Gate.** All five workspaces green: `fmt`, nightly `clippy -D warnings`, rustdoc with `-D warnings`, 153 native tests, the whole Docker-gated sweep at 95 tests including `verified_topology` against a live `dev_idp` stack, 23 `connetto-web` browser tests over 6 targets, and 25 `wasm-smoke` browser tests over 20 targets. The startup refusal was smoke tested by adding the foreign key back to a running deployment's watermark table and watching the server refuse to boot, naming the constraint. A real refusal was read in a real server's stdout rather than only asserted.
 
 ### Purpose
 
@@ -508,20 +546,23 @@ Four things the phase text called settled and were not. Decided with the maintai
 
 ### Wire and schema impact
 
-Grant list replaces the single credential. No version bump pre-release, per the cross-cutting checklist. `HandshakeAck` unchanged.
+Grant list replaces the single credential, and `Handshake.session_token` becomes `resume_token`. No version bump pre-release, per the cross-cutting checklist. `HandshakeAck` gains `resume_token` beside the handle: the rule it must respect is that the reply says nothing about a refusal, and neither field does. The watermark table's foreign key into `connetto_sessions` goes, and the startup shape check refuses one that still declares it.
 
 ### Proof
 
 - **All four arrival cases**, one test each, in a new `crates/connetto-server/tests/grants.rs`.
 - A handshake presenting one valid and one invalid grant **succeeds**, sees only what the valid one grants, and receives an acknowledgement carrying **nothing** about the invalid one.
-- An unidentified session's replica is in memory, and attaching a file tier to it **fails to compile** if the guard is in the type, or fails at runtime if it is not, in which case the guard is not done.
+- Two logins on one handshake leave the caller unidentified whichever arrived first, so no order of checks decides who is calling.
+- An unidentified session's replica is in memory, and pairing a durable device-private database with it **fails to compile**. Failing only at runtime means the guard is not done.
 - The switch refuses when it holds writes it cannot send.
-- A signed-in caller holding a capability over somebody else's row sees exactly the union.
-- An unidentified session resumes on its minted handle across a reconnect without re-snapshotting, proving R2's resume machinery holds with no identity present.
+- An unidentified session resumes on its minted handle across a reconnect without re-snapshotting, proving R2's resume machinery holds with no identity present, and a handle presented without the credential that proves it starts a fresh run instead.
+- **R12 part B**: a refused grant is named in the log, with the caller, which grant, and the reason, inside the connection context.
+
+**The union proof moved to R4**, which is where a capability first changes what a caller sees. This phase carries the accepted subjects on the `Principal` and stops there, and R4's proof list already claimed the same case, so the duplication was the error rather than the boundary.
 
 ### Done when
 
-All of the above pass. A single-grant shape is not representable. `Credential::{Anonymous, Token}` does not exist. No `session_id` is optional anywhere.
+All of the above pass. A single-grant shape is not representable. No `session_id` is optional anywhere. `Credential::{Anonymous, Token}` does not exist, which was **already true** when the phase began: the symbol went with the discarded E6 tree, so the checklist entry naming it was discharged by correcting two chapters rather than by deleting code.
 
 ### Out of scope
 
@@ -533,7 +574,7 @@ All of the above pass. A single-grant shape is not representable. `Credential::{
 
 **Status.** NOT STARTED
 
-**Blocked on R3.** Nothing before it depends on it, which is what makes deferring it this far safe. In particular **R3 does not need it**: a rejected grant is a denial, and denials go to structured logging by the split in `docs/architecture/08-authorization.md`, so R3's visibility comes from R12 rather than from this table.
+**Blocked on nothing, now that R3 is done.** Nothing before it depends on it, which is what makes deferring it this far safe. In particular **R3 does not need it**: a rejected grant is a denial, and denials go to structured logging by the split in `docs/architecture/08-authorization.md`, so R3's visibility comes from R12 rather than from this table.
 
 ### Purpose
 
@@ -562,9 +603,9 @@ It spans authentication and authorization, so building it inside whichever phase
 
 ## R4: capabilities in the authorization model
 
-**Status.** NOT STARTED
+**Status.** **DONE.** (2026-08-03)
 
-**Blocked on R3.** Not on `rls2fga`. R4 works under Postgres RLS through R5a's trait, where a capability grant is an ordinary row that ordinary policies gate, so nothing needs translating. The grant pattern only has to be expressible in the model once R5b swaps the executor, and R5b step 6 already demands that every policy translate or startup refuse. So the requirement is real and it belongs to R5b.
+**Was blocked on nothing, and the rework risk stands as recorded:** R4's change-path work lands on `RlsAuth::can_read`, which R5a relocates and R5b dissolves, so that half moves once and is rewritten once, while the snapshot and write halves are permanent. The grant pattern only has to be expressible in the model when R5b swaps the executor, and R5b step 6 already demands that every policy translate or startup refuse, so that requirement is real and belongs there.
 
 ### Purpose
 
@@ -579,6 +620,14 @@ Sharing a resource today means sharing an identity. A capability names a subject
 5. The call returns the subject id it minted, and the application writes the row granting the relation to that subject, so the two agree on the name by construction.
 6. A capability carries an **expiry**, as a second bound beside withdrawal.
 
+### Five decisions taken before execution
+
+1. **How an accepted subject reaches Postgres.** A second setting beside `app.user_id`, named by the binding and defaulting to `app.subjects`, carrying the keys a caller holds joined by a separator. A policy unpacks it with `viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))`. **It is a seam, not a fixed format:** the deployment's key type implements `CapabilityKey` (`crates/connetto-server/src/capability.rs`), which names the setting, the separator, how a fresh key is minted, and how a held set is packed. `String` implements it and is the default. Connetto refuses to sign a key whose rendering contains the separator, which is the one way a delimited list can grant a neighbouring key's access.
+2. **The identity does not join that list**, so it stays bound once, at `app.user_id`. This follows from typed keys rather than being chosen separately: a list of the deployment's key type cannot also hold a user id of a different type. Every existing policy is untouched.
+3. **Keys are typed, not strings.** `CapabilitySubject<Key = String>` mirrors `AuthContext<Id>`: the key's serde encoding rides in the signed token's `sub` claim and its `Display` rendering is what reaches Postgres, so text lives at the two edges and nowhere in between. `Principal`, `Subject`, `AuthPolicy`, `SnapshotSource`, `HandshakeAuthority` and `SessionManager` each gained one defaulted `Key` parameter, so every existing mention compiles unchanged.
+4. **The expiry number lives in `AuthConfig`**, as `capability_ttl` (default seven days) beside a `capability_max_ttl` ceiling (thirty days). A mint asking for longer is refused rather than quietly shortened, so an application's own statement of when a link dies cannot be a lie.
+5. **The gap between the checked resource and the granted row is closed by the deployment's own policy, not by connetto.** Connetto checks the caller may read the resource it names and hands back a key, and the application then writes the permission row on its own connection. What stops that row naming a different resource is a `WITH CHECK` on the sharing table requiring the shared row to be visible to the sharer, which Postgres evaluates as the sharer. Connetto writing the row instead was considered and rejected: it would make connetto own the shape of the sharing model (which kind of access, one table per shareable thing or a polymorphic one, and every other column a real feature keeps there), and a connetto-owned generic table could only name a row by the `pk` encoding, which is `MessagePack` over subql's `Value` enum and which no policy can compute.
+
 ### Proof
 
 - A capability grants exactly what its subject's relations allow and nothing else, for a caller with no identity and for a signed-in caller holding a capability over another's row.
@@ -591,13 +640,23 @@ Sharing a resource today means sharing an identity. A capability names a subject
 
 All five pass. No liveness table exists for capabilities, because withdrawal is deleting the relation and there is nothing to keep alive.
 
+### What landed
+
+`crates/connetto-server/src/capability.rs` holds the whole seam: `CapabilityKey`, the `CallerBinding` every RLS transaction applies as its first statement, and `CapabilityIssuer`, the library call an application makes from its own handler. `set_config` is declared through `diesel::define_sql_function!` rather than written as a raw string, matching `greatest` in `watermark_schema.rs`. The three binding sites (`PgSnapshotSource::snapshot`, `PgWriteTarget::commit`, `RlsAuth::can_read`) all bind through `CallerBinding`, so they cannot answer differently about what a caller holds. `auth_router` gained no endpoint. The reference client binary grew `CONNETTO_KEYS`, which is what made `ClientConfig.capabilities` reachable at all.
+
+Proof lives in `crates/connetto-server/tests/capabilities.rs` (eight tests: the union with a row the key does not cover, withdrawal on both executors, the mint refusal, the ceiling refusal, the expired refusal, the claim-set inspection, and the sharing table's `WITH CHECK`), `crates/connetto-test-harness/tests/capability_live.rs` (the same key filtering a live CDC patch over real logical replication), and a third case in `crates/connetto-server/tests/rls_write_filter.rs` (an unidentified caller writes under a key and not without one).
+
+**Both executors were verified independently by breaking each one on purpose.** Blinding the packing makes the snapshot assertions fail, and blinding only the change path leaves the snapshot passing and times out the live wait. A test that passes with the subject never reaching Postgres would have proved nothing.
+
+**Read with our own eyes, out of process.** The real `connetto-server` binary over a real WebSocket, a real `connetto-client` presenting only a share key and no login: its encrypted replica held exactly the shared row. The same client with no key held nothing. With the stream live, an unshared row was inserted first and never arrived, and a shared row inserted after it arrived as the single live patch.
+
 ---
 
 ## R5b: the authorization service as the change-path executor
 
 **Status.** NOT STARTED
 
-**Blocked on R5a, on R0, and on `docs/upstream-rls2fga-per-row-records.md` landing.**
+**Blocked on R5a, on R0, on `docs/upstream-rls2fga-per-row-records.md` landing, and then on `docs/upstream-subql-per-row-visibility.md` landing on top of it.** That last document consumes the rls2fga evaluator and its local-decidability flag, so the two upstreams are sequential rather than parallel.
 
 ### Purpose
 
@@ -624,18 +683,19 @@ All five pass. No liveness table exists for capabilities, because withdrawal is 
 
    Why the rule can be absolute: dropping **narrows**, it never widens, because a dropped permissive clause grants nothing and a dropped restrictive clause becomes `no_access`. So an untranslated policy makes rows **vanish** rather than leak, since the snapshot shows a row under real RLS and the change path then withdraws it. Refusing to start prevents a deployment discovering that by watching data disappear.
 
-7. Keep the records current row by row, in subql, driven from the change stream.
-8. `RlsAuth` dissolves as a trait implementation. RLS survives, doing snapshots and gating writes through `PgSnapshotSource` and `PgWriteTarget`, which bind `app.user_id` directly (`PgSnapshotSource::snapshot` in `crates/connetto-server/src/snapshot.rs` and `PgWriteTarget::commit` in `crates/connetto-server/src/write_target.rs`) and never go through the trait.
-9. **Fail closed when the authorization service is unreachable.** Deliver no patch and accept no mutation while the answer is unknown, because a patch delivered to a caller who may not be allowed to see it cannot be recalled, whereas a stall can be recovered from. This is the failure mode R5b introduces: today the change path asks Postgres, which connetto already depends on, so there is nothing new to have a policy about.
-10. **Two wire additions follow, and the second prevents a data-loss bug.**
+7. **Refuse startup when a policy reads a table the publication does not carry.** A policy joining a grants table learns nothing when that table is not replicated, so the store goes stale silently and then answers confidently and wrongly. `rls2fga` reports the complete set of tables each policy reads (requirement 7 of `docs/upstream-rls2fga-per-row-records.md`), and the publication is known, so this is a set comparison that names the missing table. Decided rather than routed to the supplied-mapping seam, because the crate classifies these policies perfectly well and the seam is for what it cannot classify.
+8. Keep the records current row by row, in subql, driven from the change stream.
+9. `RlsAuth` dissolves as a trait implementation. RLS survives, doing snapshots and gating writes through `PgSnapshotSource` and `PgWriteTarget`, which bind `app.user_id` directly (`PgSnapshotSource::snapshot` in `crates/connetto-server/src/snapshot.rs` and `PgWriteTarget::commit` in `crates/connetto-server/src/write_target.rs`) and never go through the trait.
+10. **Fail closed when the authorization service is unreachable.** Deliver no patch and accept no mutation while the answer is unknown, because a patch delivered to a caller who may not be allowed to see it cannot be recalled, whereas a stall can be recovered from. This is the failure mode R5b introduces: today the change path asks Postgres, which connetto already depends on, so there is nothing new to have a policy about.
+11. **Two wire additions follow, and the second prevents a data-loss bug.**
     - A signal that live delivery is **paused** rather than merely quiet, otherwise an outage is indistinguishable from nothing changing and a client waits forever without telling anybody. The same signal carries a second cause: a change stream that is connected but not advancing. That case is an absence of events rather than an event, so no log line catches it, and it is the entire reason a separate operator-surface phase was considered and then rejected. `NonFatalError` in `crates/connetto-core/src/messages/error.rs` carries only `related_to` and an untyped `detail`, so a typed signal is needed rather than a string a client has to parse.
     - A `MutationRejectReason` variant meaning **cannot determine, retry**. The existing variants are `Unauthorized`, `SchemaMismatch`, `Constraint`, `Malformed` and `Other` (`MutationRejectReason` in `crates/connetto-core/src/messages/mutation.rs`). Rejecting a write as `Unauthorized` during an outage tells the client it lacks permission when the truth is that the server cannot tell, and a client that believes itself unauthorized stops retrying and may discard the mutation. **That converts a transient outage into permanent data loss**, so `Unauthorized` must not be reused here.
-11. Note the asymmetry and document it: snapshots keep working throughout, because they run on Postgres RLS permanently by design. So an outage stops live delivery and writes while a fresh connection can still read. That is correct rather than surprising, but it will surprise anybody who has not been told.
-12. **Unify the retry policy while adding the third loop.** Client reconnect, CDC reconnect and this phase's authorization-service outage each back off, and the first two were written independently with no shared policy. Adding a third divergent one is how a codebase acquires three answers to one question. Make it one policy with per-caller bounds. This is a consistency cleanup rather than a phase, and it belongs here only because this phase is what adds the third caller.
+12. Note the asymmetry and document it: snapshots keep working throughout, because they run on Postgres RLS permanently by design. So an outage stops live delivery and writes while a fresh connection can still read. That is correct rather than surprising, but it will surprise anybody who has not been told.
+13. **Unify the retry policy while adding the third loop.** Client reconnect, CDC reconnect and this phase's authorization-service outage each back off, and the first two were written independently with no shared policy. Adding a third divergent one is how a codebase acquires three answers to one question. Make it one policy with per-caller bounds. This is a consistency cleanup rather than a phase, and it belongs here only because this phase is what adds the third caller.
 
 ### Proof
 
-**R0's counter test flips from demonstrating growth to passing.** That is the whole criterion for the round-trip requirement and needs no separate interpretation. Then R0's load harness reports an absolute figure in the same order as the published state of the art, thousands of events per second rather than tens. A criterion benchmark covers the local record computation, because the design rests on it being cheap enough to run twice per changed row per event.
+**R0's counter test flips from demonstrating growth to passing.** That is the whole criterion for the round-trip requirement and needs no separate interpretation, **provided the counter measures backend round trips rather than entries to the visibility seam.** R5a step 5 is what guarantees that, and without it this criterion is satisfied by R5a alone, which removes no round trips whatsoever. Then R0's load harness reports an absolute figure in the same order as the published state of the art, thousands of events per second rather than tens. A criterion benchmark covers the local record computation, because the design rests on it being cheap enough to run twice per changed row per event.
 
 ### Done when
 
@@ -794,7 +854,7 @@ All four pass. The leak is closed in both directions, not one.
 
 **Status.** NOT STARTED
 
-**Blocked on R4 and R6.**
+**Blocked on R6. R4 is done.**
 
 ### Purpose
 
@@ -961,7 +1021,7 @@ No query outside the compiled set is served, no rejection reveals why, and a dow
 
 **Status.** NOT STARTED
 
-**Blocked on R2 and R3.** R2 because it makes the durable session handle the operational key this phase counts against. R3 because it mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable.
+**Blocked on nothing, now that R2 and R3 are done.** R2 made the durable session handle the operational key this phase counts against, and R3 mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable.
 
 ### Purpose
 
@@ -1343,7 +1403,7 @@ The gate condition is queryable, the trait exists with a two-major fixture, a de
 
 **Status.** NOT STARTED
 
-**Blocked on R12 part A for the lag line only.** The startup refusal and the invalidation response need nothing: the refusal joins an existing pattern and the response rides `FullResyncRequired`. Design recorded in `10-subscription-materializer.md` under "The replication slot", decided with the maintainer.
+**Blocked on nothing, now that R12 part A is done.** The startup refusal and the invalidation response need nothing: the refusal joins an existing pattern and the response rides `FullResyncRequired`. Design recorded in `10-subscription-materializer.md` under "The replication slot", decided with the maintainer.
 
 ### Purpose
 
@@ -1462,11 +1522,11 @@ Tick these off across the whole programme, because each is easy to lose inside a
 
 **Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
 
-**Startup checks, all five refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it.
+**Startup checks, all six refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it.
 
-**Type-enforced guards, not documentation**: R3's ephemeral replica may attach only an ephemeral tier. R3's `Principal` must make all four arrival cases representable.
+**Type-enforced guards, not documentation**: both of R3's are built. The value handed to `connect` carries a marker for what the run keeps at rest and owns the device-private database beside it, so a durable one paired with an unkeyed replica is not a program, proven by `compile_fail` doctests on `Replica`. `Principal` makes all four arrival cases representable and, being an optional identity beside a set of capabilities, has no fifth state.
 
-**Symbols that must cease to exist**: `PermissiveProvider` (R1), `TrustingSessionVerifier` (R2), `Credential::{Anonymous, Token}` (R3), `AuthPolicy` (R5a), `PermissiveAuth` (R9), `AuthContext.tenant_id`, `.roles`, `.claims` (R8).
+**Symbols that must cease to exist**: `PermissiveProvider` (R1, gone), `TrustingSessionVerifier` (R2, gone), `Credential::{Anonymous, Token}` (R3, discharged: the symbol never existed after the E6 reset, so two chapters that claimed otherwise were corrected instead), `SessionVerifier` and `FatalErrorReason::AuthenticationFailed` (R3, gone), `AuthPolicy` (R5a), `PermissiveAuth` (R9), `AuthContext.tenant_id`, `.roles`, `.claims` (R8, gone).
 
 **One sentence that is correct and must not be touched**: in `11-authentication.md` under "connetto session credential", `session_token` is the resume key doing a different job from the auth credential. R2 makes the code match a doc that has been right all along.
 
@@ -1481,13 +1541,13 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **Android as a web target.** Technically supported, verified by measurement: WebView 124 on Android 15 has every API connetto uses. What remains is a product decision, and the recorded exclusion stands until stated otherwise.
 
-**When the authorization service is unreachable, fail closed.** R5b step 9, with two wire additions and its own outage test.
+**When the authorization service is unreachable, fail closed.** R5b step 10, with two wire additions and its own outage test.
 
 **The `auth_events` audit table is phase R13, after R3.** It is a deployment-facing schema contract, because connetto emits no server DDL on any path a deployment runs, so it needs a schema trait and a convenience macro beside `ConnettoStoreSchema` and `ConnettoWatermarkSchema`. It also spans authentication and authorization events, so building it inside whichever phase happens to emit one would fragment a single contract across five phases. Nothing before it depends on it, which is what makes deferring it safe: **R3 does not need it**, because a rejected grant is a denial and denials go to structured logging, per the split at `08-authorization.md:227`.
 
 **The unsynced-data warning as a session nears expiry needs no phase.** `expiry_warning` in `crates/connetto-client/src/teardown.rs` already takes the expiry, a lead time and the unsynced sequence numbers, and `session_expires_at` already reaches the client on the auth response. Its caller is the embedding application by design.
 
-**Backoff and retry uniformity, partially owned.** R5b step 12 unifies the three backoff loops that exist by then (client reconnect, CDC reconnect, and the authorization-service outage it adds) into one policy with per-caller bounds. The fuller shared primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, covering re-execution retry, delivery back-pressure, and mutation retry as well) still has no phase and no observable criterion beyond those three loops. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
+**Backoff and retry uniformity, partially owned.** R5b step 13 unifies the three backoff loops that exist by then (client reconnect, CDC reconnect, and the authorization-service outage it adds) into one policy with per-caller bounds. The fuller shared primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, covering re-execution retry, delivery back-pressure, and mutation retry as well) still has no phase and no observable criterion beyond those three loops. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
 
 ---
 

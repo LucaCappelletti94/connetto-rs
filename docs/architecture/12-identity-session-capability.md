@@ -46,7 +46,7 @@ Fixed by **R1** (delete the permissive defaults) and **R2** (give the session la
 |---|---|---|---|---|
 | **Session** | An opaque durable handle for one client's operational state | Server, at handshake | Reconnects, restarts, leader failover | The exactly-once watermark, subscription cursors, the pending buffer |
 | **Identity** | A verified statement of who the caller is | Identity provider, mapped at login | Its refresh window | The Postgres setting the read and write paths bind, and the local replica's name |
-| **Capability. Decided (R4), not built** | A connetto-signed token asserting the bearer is a named subject | connetto, on an authenticated request | Its expiry, or until its relation is withdrawn | Nothing. The model decides what its subject may do |
+| **Capability. Built (R4)** | A connetto-signed token asserting the bearer is a named subject | connetto, on an authenticated request | Its expiry, or until its relation is withdrawn | Nothing. The model decides what its subject may do |
 
 A session always exists. An identity may or may not. A capability may be held zero or many times, with or without an identity. All four arrival cases are real, and the fourth is the one a single-credential shape cannot express: a signed-in user holding a key to somebody else's resource.
 
@@ -78,7 +78,7 @@ The write watermark needs no protection beyond this, and the mechanism is alread
 
 ### Capability
 
-**Decided (R3, R4).** A capability is a token connetto minted and signed, asserting one thing: that the bearer is a named subject, for example `key:abc123`. It says nothing about what that subject may do.
+**Built (R3, R4).** A capability is a token connetto minted and signed, asserting one thing: that the bearer is a named subject, for example `key:abc123`. It says nothing about what that subject may do.
 
 That is the whole design, and it makes a capability and a login token the same mechanism with different kinds of subject:
 
@@ -95,11 +95,23 @@ Withdrawal is immediate and needs no new machinery. Revoking a share key means d
 
 Verification is arithmetic. Every grant on a handshake is a connetto-signed token checked against connetto's own public key, with no database lookup, no probing surface for an unrecognised string, and no routing metadata on the wire. One verifier reads the subject out of the token.
 
-A share key still needs an expiry, as a second bound beside withdrawal, because a bearer token that never expires is a permanent secret.
+A share key still needs an expiry, as a second bound beside withdrawal, because a bearer token that never expires is a permanent secret. **Built (R4).** `AuthConfig` carries `capability_ttl` beside the four lifetimes it already held, and a `capability_max_ttl` ceiling. A mint asking for longer than the ceiling is refused rather than quietly shortened, which is what keeps an application's own statement of when a link dies from being a lie.
 
-**Minting is a library call, and the model authorizes the sharing.** **Decided (R4).** connetto exposes minting as a function the application calls from its own handler, so the application keeps its own routing, request shape, and rate limits, and connetto gains no sixth endpoint beside the five on `auth_router` in `crates/connetto-server/src/authn/http.rs`. Creating a share key is itself an action needing authorization, because a caller must not be able to share what it cannot read, and that check goes through the same trait that answers every other authorization question rather than being reimplemented per application. The call returns the subject id it minted, and the application writes the row that grants the relation to that subject, so the two agree on the name by construction.
+**Minting is a library call, and the model authorizes the sharing.** **Built (R4).** connetto exposes minting as a function the application calls from its own handler, so the application keeps its own routing, request shape, and rate limits, and connetto gains no sixth endpoint beside the five on `auth_router` in `crates/connetto-server/src/authn/http.rs`. Creating a share key is itself an action needing authorization, because a caller must not be able to share what it cannot read, and that check goes through the same trait that answers every other authorization question rather than being reimplemented per application. The call returns the subject id it minted, and the application writes the row that grants the relation to that subject, so the two agree on the name by construction.
 
 connetto never sees how the application delivers the token afterwards. A URL parameter, a header, a cookie, and a field in a form are all the application's business, and connetto receives only whatever the application extracted and put on the handshake.
+
+**The subject is the deployment's own type, not a string. Built (R4).** `CapabilitySubject<Key = String>` mirrors `AuthContext<Id>`: the key's serde encoding is what the signed token's `sub` claim carries and its `Display` rendering is what a policy compares against, so text lives at those two edges and nowhere in between. The type implements `CapabilityKey` (`crates/connetto-server/src/capability.rs`), which is also where the deployment says how a fresh key is minted, which Postgres setting the held keys are bound to, and how a held set is packed into that one value. `String` implements it, minting `key:` plus a version 4 UUID, and is the default.
+
+**How a held key reaches a policy. Built (R4).** A policy can only compare against a value the transaction bound, and a caller may hold several keys, so the set travels as one text value under a second setting beside `app.user_id`, `app.subjects` by default, which a policy unpacks:
+
+```sql
+viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))
+```
+
+The identity is deliberately **not** in that list. It stays bound once, at `app.user_id`, so no existing policy changes and there is no second place the identity could disagree with itself. This follows from the key being typed rather than being a separate choice: a list of the deployment's key type cannot also hold a user id of another type. A caller holding no key leaves the setting unbound, so `current_setting` yields NULL and a comparison against it is NULL rather than true, which is what makes an absent capability fail closed. Connetto refuses to sign a key whose rendering contains the separator, which is the one way a delimited list could grant a neighbouring key's access.
+
+**What connetto does not close, and what does. Built (R4).** Connetto checks the caller may read the resource the mint call names, and the application then writes the permission row on its own connection, which connetto never sees. Nothing in connetto stops that row naming a different resource. What stops it is the deployment's own policy on the sharing table: a `WITH CHECK` requiring the shared row to be visible, evaluated by Postgres as the sharer, refuses a grant over a row the sharer cannot read. That keeps the rule in the one place every other authorization rule lives. Connetto writing the row instead was considered and rejected, because it would make connetto own the shape of the sharing model, and because a connetto-owned generic table could only name a row by the `pk` encoding, which is `MessagePack` over subql's `Value` enum and which no policy can compute.
 
 ---
 
@@ -133,7 +145,7 @@ This supersedes the half of the earlier decision that had the reply name each fa
 
 ## A caller with no identity
 
-**Decided (R3).** A caller with no identity reads whatever the deployment's policy shows a caller with no identity, and writes when a capability authorizes it and not otherwise. Authorization for an unidentified caller is a capability question, never an identity question and never a watermark question.
+**Built (R3, R4).** A caller with no identity reads whatever the deployment's policy shows a caller with no identity, and writes when a capability authorizes it and not otherwise. Authorization for an unidentified caller is a capability question, never an identity question and never a watermark question.
 
 **Its local copy is in memory. Always, with no opt-in. Built (R3).** `Replica::in_memory()` is SQLite's own `:memory:` and carries no key, because there is nothing at rest to key (`crates/connetto-client/src/replica.rs`). The type's own doc comment says a caller with something at rest says `encrypted_file` and a caller with nothing at rest says `in_memory`, and there is no third choice, and phase E5 deleted the durable-plaintext case on that reasoning.
 
