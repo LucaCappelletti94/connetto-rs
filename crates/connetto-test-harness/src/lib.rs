@@ -25,10 +25,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use connetto_core::PROTOCOL_VERSION;
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::Principal;
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, MutationHeader,
-    MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, Grant, Handshake, HandshakeAck, LivePatch,
+    MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
 use connetto_server::{
@@ -252,29 +252,32 @@ impl AuthPolicy for HarnessAuth {
 
     async fn can_read(
         &self,
-        ctx: &AuthContext,
+        caller: &Principal,
         table: &str,
         pk: &[u8],
     ) -> Result<bool, RlsAuthError> {
         match self {
-            Self::Permissive(auth) => auth.can_read(ctx, table, pk).await.map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_read(ctx, table, pk).await,
+            Self::Permissive(auth) => auth
+                .can_read(caller, table, pk)
+                .await
+                .map_err(|e| match e {}),
+            Self::Rls(auth) => auth.can_read(caller, table, pk).await,
         }
     }
 
     async fn can_write(
         &self,
-        ctx: &AuthContext,
+        caller: &Principal,
         table: &str,
         pk: &[u8],
         op: MutationOp,
     ) -> Result<bool, RlsAuthError> {
         match self {
             Self::Permissive(auth) => auth
-                .can_write(ctx, table, pk, op)
+                .can_write(caller, table, pk, op)
                 .await
                 .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_write(ctx, table, pk, op).await,
+            Self::Rls(auth) => auth.can_write(caller, table, pk, op).await,
         }
     }
 }
@@ -358,17 +361,18 @@ pub fn spawn_server(
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let connector = PgAsyncDieselConnector::new(connector_pool);
-    // The manager requires a verifier with no default (R2). The harness is
-    // test-only, so it installs the `test-support` stand-in that resolves the
-    // presented token as the identity, which is what `Client::handshake`
-    // assumes. Nothing here is reachable from a production build.
-    let verifier: Arc<dyn connetto_core::traits::SessionVerifier> =
-        Arc::new(connetto_core::test_support::TestSessionVerifier);
+    // The manager requires a handshake authority with no default (R2). The
+    // harness is test-only, so it installs the `test-support` stand-in that
+    // reads the subject out of the grant string, which is what
+    // `Client::handshake` assumes. Nothing here is reachable from a production
+    // build.
+    let authority: Arc<dyn connetto_core::traits::HandshakeAuthority> =
+        Arc::new(connetto_core::test_support::TestGrantChecker);
     let manager = SessionManager::with_connector(
         materializer,
         snapshot,
         auth,
-        verifier,
+        authority,
         connector,
         write,
         session,
@@ -411,23 +415,42 @@ impl Client {
         Self { transport }
     }
 
-    /// Send the handshake and wait for its ack. The `client_id` doubles as the
-    /// auth token, which the trusting verifier maps to `app.user_id` under RLS.
+    /// Send the handshake as `client_id` and wait for its ack. The client id
+    /// doubles as the login subject, which the stand-in checker maps to
+    /// `app.user_id` under RLS.
     pub async fn handshake(&mut self, client_id: &str) {
-        self.handshake_with(client_id, client_id).await;
+        self.handshake_with(client_id, &format!("user:{client_id}"))
+            .await;
     }
 
-    /// Send a handshake with an explicit `client_id` and `auth_token`, returning
-    /// the ack. The verified token, not the client id, is the durable session id
-    /// the exactly-once watermark keys on, so a reconnect that mints a new
-    /// `client_id` but reuses the token (a worker restart) keeps its watermark.
-    pub async fn handshake_with(&mut self, client_id: &str, auth_token: &str) -> HandshakeAck {
+    /// Send a handshake presenting one grant, returning the ack. The checked
+    /// grant, not the client id, decides the durable handle the exactly-once
+    /// watermark keys on, so a reconnect that mints a new `client_id` but
+    /// presents the same grant (a worker restart) keeps its watermark.
+    pub async fn handshake_with(&mut self, client_id: &str, grant: &str) -> HandshakeAck {
+        self.handshake_presenting(client_id, &[grant], None).await
+    }
+
+    /// Send a handshake presenting no grant at all: a caller with no identity.
+    pub async fn handshake_unidentified(&mut self, client_id: &str) -> HandshakeAck {
+        self.handshake_presenting(client_id, &[], None).await
+    }
+
+    /// Send a handshake presenting `grants`, each checked on its own, plus an
+    /// optional resume credential from a previous ack.
+    pub async fn handshake_presenting(
+        &mut self,
+        client_id: &str,
+        grants: &[&str],
+        resume_token: Option<&str>,
+    ) -> HandshakeAck {
+        let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+            .with_grants(grants.iter().map(|grant| Grant::new(*grant)));
+        if let Some(token) = resume_token {
+            handshake = handshake.with_resume_token(token);
+        }
         self.transport
-            .send_control(ControlMessage::Handshake(Handshake::new(
-                PROTOCOL_VERSION,
-                client_id,
-                auth_token,
-            )))
+            .send_control(ControlMessage::Handshake(handshake))
             .await
             .expect("send handshake");
         let ControlMessage::HandshakeAck(ack) = self.next_control().await else {

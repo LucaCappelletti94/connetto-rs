@@ -21,7 +21,7 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{ControlMessage, Handshake, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, PROTOCOL_VERSION, SchemaVersion, loopback};
@@ -52,6 +52,7 @@ async fn schema_upstream(mut server: LoopbackTransport) {
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: "upstream-session".to_owned(),
             session_token: "upstream".to_owned(),
+            resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
             initial_credits: 64,
@@ -65,7 +66,6 @@ async fn schema_upstream(mut server: LoopbackTransport) {
 #[wasm_bindgen_test]
 async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     let base = unique_base();
-    let tab_token = common::mint_token().await;
     let upstream_version = SchemaVersion::from_hash(SCHEMA_HASH.to_vec());
 
     let (worker_up, fake_up) = loopback();
@@ -73,12 +73,13 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
 
     let worker_config = ClientConfig {
         client_id: format!("handshake-worker-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
             .expect("worker connect");
     assert_eq!(
@@ -98,7 +99,6 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
         format!("handshake-tab-{base}"),
-        &tab_token,
     )))
     .await
     .expect("tab handshake");

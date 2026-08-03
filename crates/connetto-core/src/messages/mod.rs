@@ -20,7 +20,7 @@ pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use control::ControlMessage;
 pub use error::{FatalError, FatalErrorReason, NonFatalError};
 pub use flow::{AckCredits, Ping, Pong};
-pub use handshake::{Handshake, HandshakeAck};
+pub use handshake::{Grant, Handshake, HandshakeAck};
 pub use mutation::{
     ConflictRow, MutationApplied, MutationConflict, MutationHeader, MutationReject,
     MutationRejectReason,

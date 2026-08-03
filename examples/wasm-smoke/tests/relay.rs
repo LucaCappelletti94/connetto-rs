@@ -21,7 +21,7 @@ mod common;
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
 };
 use connetto_core::{Transport, loopback};
 use connetto_wasm_smoke::{BrowserSocket, PortTransport, RelayHub};
@@ -84,11 +84,12 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+    ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await
         .expect("client connect")
 }
@@ -185,13 +186,15 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
     let config = ClientConfig {
         client_id: format!("relay-tab-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, SQLITE_DDL, &config, None)
-        .await
-        .expect("tab connect through relay");
+    let tab =
+        ConnettoConnection::connect(tab_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
+            .await
+            .expect("tab connect through relay");
     let (tab, pump) = ConnettoClient::with_pump(tab);
     wasm_bindgen_futures::spawn_local(pump);
     let mut orders_live: LiveQuery<Order> = orders::table
@@ -274,13 +277,14 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     let config = ClientConfig {
         client_id: format!("port-tab-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let mut tab = ConnettoConnection::connect(
         PortTransport::new(channel.port2()),
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config,
         None,

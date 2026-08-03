@@ -45,7 +45,9 @@ pub mod transport;
 pub mod version;
 pub mod write;
 
-pub use auth::{AuthContext, VerifiedSession};
+pub use auth::{
+    AmbiguousIdentity, AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession,
+};
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
@@ -53,8 +55,8 @@ pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};
 pub use traits::{
-    AuthPolicy, FileStore, IncomingFrame, MutationOp, PendingMutation, SessionVerifier,
-    SessionVerifyError, SessionVerifyFuture, Store, Transport,
+    AuthPolicy, FileStore, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
+    IncomingFrame, MutationOp, PendingMutation, Store, Transport,
 };
 #[cfg(feature = "loopback")]
 pub use transport::{LoopbackError, LoopbackTransport, loopback};

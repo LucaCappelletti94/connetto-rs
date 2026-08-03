@@ -21,54 +21,93 @@ pub fn replica_key() -> ReplicaKey {
     ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN])
 }
 
-/// A [`SessionVerifier`](crate::traits::SessionVerifier) that trusts the
-/// presented token as the identity, performing no cryptographic verification.
+/// A [`HandshakeAuthority`](crate::traits::HandshakeAuthority) that reads the
+/// subject straight out of the grant string, performing no cryptographic
+/// verification.
 ///
-/// The test replacement for the deleted production default: it refuses only an
-/// empty token (an absent credential) and otherwise resolves the identity and
-/// the session from the token, deterministically, so a reconnect on the same
-/// token keeps its watermark. It lives behind `test-support` precisely because
-/// it verifies nothing, so no production build can reach it and no constructor
-/// installs it by default.
+/// The test replacement for the deleted production default. It lives behind
+/// `test-support` precisely because it checks nothing, so no production build
+/// can reach it and no constructor installs it by default.
 ///
-/// A `user#session` token names one user holding several concurrent sessions:
-/// the part before the `#` is the `user_id` and the whole token seeds the
-/// session id. A real deployment gets this from the auth store, which mints a
-/// fresh session per login, so two devices of one person never collide. A
-/// plain token with no `#` is one user with one session, which is what most
-/// suites want.
+/// A grant is `user:<id>`, optionally `user:<id>#<run>`, or `key:<subject>`.
+/// Anything else is refused. The prefix stands in for the `knd` claim the real
+/// checker reads out of a verified token: this stand-in has no signature to
+/// carry one, so the string is all there is, and mirroring the claim keeps
+/// every test explicit about which kind of grant it presents.
+///
+/// A `user:<id>#<run>` grant names one person holding several concurrent runs:
+/// the part between the prefix and the `#` is the `user_id` and the whole
+/// string seeds the handle, deterministically, so a reconnect on the same grant
+/// keeps its watermark. A real deployment gets the handle from the auth store,
+/// which mints a fresh one per login, so two devices of one person never
+/// collide.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct TestSessionVerifier;
+pub struct TestGrantChecker;
 
-impl crate::traits::SessionVerifier<String> for TestSessionVerifier {
-    fn verify_session<'a>(
+impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
+    fn check_grant<'a>(
         &'a self,
-        auth_token: &'a str,
-    ) -> crate::traits::SessionVerifyFuture<'a, String> {
+        grant: &'a crate::messages::Grant,
+    ) -> crate::traits::GrantCheckFuture<'a, String> {
         Box::pin(async move {
-            if auth_token.trim().is_empty() {
-                return Err(crate::traits::SessionVerifyError::Invalid(
-                    "no auth token presented at handshake".to_owned(),
+            let token = grant.as_str();
+            if let Some(subject) = token.strip_prefix("key:") {
+                if subject.is_empty() {
+                    return Err(crate::traits::GrantRefused::Invalid(
+                        "a capability grant named no subject".to_owned(),
+                    ));
+                }
+                return Ok(crate::auth::Subject::Capability(
+                    crate::auth::CapabilitySubject::new(token),
                 ));
             }
-            let user_id = auth_token
-                .split_once('#')
-                .map_or(auth_token, |(user, _session)| user);
-            Ok(crate::auth::VerifiedSession {
-                context: crate::auth::AuthContext::new(user_id),
-                session_id: crate::SessionId::from_token_hash(auth_token),
-            })
+            let Some(named) = token.strip_prefix("user:") else {
+                return Err(crate::traits::GrantRefused::Invalid(format!(
+                    "a grant naming neither a user nor a key: {token:?}"
+                )));
+            };
+            let user_id = named.split_once('#').map_or(named, |(user, _run)| user);
+            if user_id.is_empty() {
+                return Err(crate::traits::GrantRefused::Invalid(
+                    "a login grant named no user".to_owned(),
+                ));
+            }
+            Ok(crate::auth::Subject::Identity(
+                crate::auth::VerifiedSession {
+                    context: crate::auth::AuthContext::new(user_id),
+                    session_id: crate::SessionId::from_token_hash(token),
+                },
+            ))
         })
+    }
+
+    /// A handle blob with no signature over it, which is why this type is
+    /// confined to `test-support`. It still refuses anything not of its own
+    /// shape, so a caller cannot present a bare handle it invented.
+    fn mint_handle(
+        &self,
+        session_id: crate::SessionId,
+    ) -> Result<String, crate::traits::HandleError> {
+        Ok(format!("run:{session_id}"))
+    }
+
+    fn read_handle(&self, blob: &str) -> Result<crate::SessionId, crate::traits::HandleError> {
+        blob.strip_prefix("run:")
+            .and_then(|handle| handle.parse().ok())
+            .ok_or_else(|| crate::traits::HandleError(format!("not a test handle: {blob:?}")))
     }
 }
 
 /// How a [`FakeTransport`] answers the handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeReply {
     /// A well-formed acknowledgement, so the handshake succeeds.
     Accept,
-    /// `FatalError(AuthenticationFailed)`, so the credential is refused.
-    Reject,
+    /// `FatalError(reason)`, so the connection never opens. No grant produces
+    /// this: a refused grant leaves the connection open and says nothing, so
+    /// the reasons a real server sends here are a version mismatch, a newer
+    /// connection on the same handle, and a shutdown.
+    Refuse(FatalErrorReason),
 }
 
 /// The typed error the transport trait requires. This fake never fails, so it
@@ -106,10 +145,13 @@ impl FakeTransport {
         Self::new(HandshakeReply::Accept)
     }
 
-    /// A transport that refuses the credential at the handshake.
+    /// A transport that closes the connection at the handshake, carrying
+    /// `reason`. No grant produces this, so the reasons a real server sends
+    /// here are a version mismatch, a newer connection on the same handle, and
+    /// a shutdown.
     #[must_use]
-    pub fn rejecting() -> Self {
-        Self::new(HandshakeReply::Reject)
+    pub fn refusing(reason: FatalErrorReason) -> Self {
+        Self::new(HandshakeReply::Refuse(reason))
     }
 
     /// A transport whose handshake succeeds and which then stays open forever
@@ -148,20 +190,21 @@ impl FakeTransport {
     }
 
     fn answer(&self) -> IncomingFrame {
-        match self.reply {
+        match &self.reply {
             HandshakeReply::Accept => {
                 IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
                     connection_id: "connection-fake".to_owned(),
-                    session_token: "token-fake".to_owned(),
+                    session_token: "00000000-0000-4000-8000-000000000000".to_owned(),
+                    resume_token: "run:00000000-0000-4000-8000-000000000000".to_owned(),
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None::<SchemaVersion>,
                     initial_credits: 64,
                     last_applied_seq: None,
                 }))
             }
-            HandshakeReply::Reject => IncomingFrame::Control(ControlMessage::FatalError(
-                FatalError::new(FatalErrorReason::AuthenticationFailed),
-            )),
+            HandshakeReply::Refuse(reason) => {
+                IncomingFrame::Control(ControlMessage::FatalError(FatalError::new(reason.clone())))
+            }
         }
     }
 }

@@ -28,7 +28,7 @@
 // these helpers, so unused ones are expected per binary.
 #![allow(dead_code)]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::leader::Membership;
 use connetto_wasm_smoke::locks::HeldLock;
@@ -115,13 +115,14 @@ pub async fn connect_tab(client_id: &str, token: String) -> ConnettoConnection<B
     let transport = BroadcastTransport::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: token,
+        login: Some(Grant::new(token)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         DEMO_SQLITE_DDL,
         &config,
         None,
@@ -141,13 +142,14 @@ pub async fn connect_server(
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: token,
+        login: Some(Grant::new(token)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         DEMO_SQLITE_DDL,
         &config,
         None,

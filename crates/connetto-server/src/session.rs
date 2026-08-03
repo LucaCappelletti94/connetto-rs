@@ -23,14 +23,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::{Principal, Subject};
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
+    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
     NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
-use connetto_core::traits::{AuthPolicy, IncomingFrame, SessionVerifier, Transport};
+use connetto_core::traits::{AuthPolicy, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
@@ -61,15 +61,15 @@ pub struct Snapshot {
 /// Phase 4 implements it over the re-exec `Connector`: run the subscription's
 /// `SELECT` against Postgres at a snapshot LSN and encode the rows into an
 /// insert-patchset with `sqlite-diff-rs`. No SQLite lives on the backend. The
-/// `auth` context lets the implementation run the read under the requesting
-/// user's Row-Level Security so the snapshot already excludes rows the user
+/// `caller` lets the implementation run the read under the requesting
+/// principal's Row-Level Security so the snapshot already excludes rows it
 /// cannot see.
 #[allow(async_fn_in_trait)]
 pub trait SnapshotSource<Id = String>: Send + Sync {
     /// Snapshot-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Produce the initial snapshot for `select_sql`, authorized as `auth`.
+    /// Produce the initial snapshot for `select_sql`, authorized as `caller`.
     ///
     /// `select_sql` is the Postgres translation of the subscription query,
     /// never the client dialect, with `$N` placeholders paired to `binds` in
@@ -82,7 +82,7 @@ pub trait SnapshotSource<Id = String>: Send + Sync {
         &self,
         select_sql: &str,
         binds: &[BindValue],
-        auth: &AuthContext<Id>,
+        caller: &Principal<Id>,
     ) -> Result<Snapshot, Self::Error>;
 }
 
@@ -208,9 +208,9 @@ pub enum SessionError {
     /// at handshake).
     #[error("write target error: {0}")]
     WriteTarget(String),
-    /// The session credential presented at handshake failed verification.
-    #[error("authentication failed: {0}")]
-    Authentication(String),
+    /// The resume credential could not be minted.
+    #[error("resume credential: {0}")]
+    Handle(String),
 }
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
@@ -232,6 +232,15 @@ fn resume_lsn_from_cursor(cursor: Option<&Cursor>) -> u64 {
             u64::from_be_bytes(buf)
         }
         _ => 0,
+    }
+}
+
+/// The word for a checked subject in the log, so a refusal can be counted and
+/// filtered by kind without parsing a sentence.
+const fn subject_kind<Id>(subject: &Subject<Id>) -> &'static str {
+    match subject {
+        Subject::Identity(_) => "user",
+        Subject::Capability(_) => "key",
     }
 }
 
@@ -274,9 +283,10 @@ struct Route<Id> {
     sub_id: SubscriptionId,
     label: String,
     tx: mpsc::UnboundedSender<Outbound>,
-    /// The subscribing session's identity, consulted per event for the read
-    /// filter before a live patch is delivered.
-    auth_ctx: AuthContext<Id>,
+    /// The subscribing session's caller, consulted per event for the read
+    /// filter before a live patch is delivered. Shared rather than copied,
+    /// because the fan-out clones one route per subscriber per event.
+    principal: Arc<Principal<Id>>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -297,12 +307,12 @@ struct LiveSession {
 /// What a completed handshake establishes for the run loop.
 struct HandshakeOutcome<Id> {
     connection_num: u64,
-    auth_ctx: AuthContext<Id>,
+    principal: Arc<Principal<Id>>,
     resume_lsn: u64,
-    /// The connetto-minted session id from the verified token, the durable
-    /// watermark key.
-    session_id: SessionId,
     applied_watermark: Option<u64>,
+    /// The logging context, opened as soon as the run has a handle so that a
+    /// refused grant is recorded inside it.
+    span: tracing::Span,
 }
 
 /// Mutable per-session state carried through the run loop.
@@ -315,8 +325,8 @@ struct SessionState<Id> {
     /// subscription id, both needed to tear the subscription down.
     delta_agg_subs: HashMap<String, (u64, SubscriptionId)>,
     outbound: mpsc::UnboundedSender<Outbound>,
-    /// Session identity, established at handshake and consulted per write.
-    auth_ctx: AuthContext<Id>,
+    /// The caller, established at handshake and consulted per read and write.
+    principal: Arc<Principal<Id>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
     /// The connetto-minted session id from the verified token. The durable
@@ -397,11 +407,12 @@ where
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
     snapshot_source: Snap,
     auth: Auth,
-    /// Turns the handshake `auth_token` into the session [`AuthContext`]. A
-    /// runtime trait object so a deployment configures identity without
-    /// changing the manager's type. Required at construction with no default,
-    /// because the deleted trusting default was itself the spoofing hole (R2).
-    verifier: Arc<dyn SessionVerifier<Id>>,
+    /// Checks the grants a handshake presents and signs the resume credential
+    /// it hands back. A runtime trait object so a deployment configures
+    /// identity without changing the manager's type. Required at construction
+    /// with no default, because the deleted trusting default was itself the
+    /// spoofing hole (R2).
+    authority: Arc<dyn HandshakeAuthority<Id>>,
     connector: C,
     oplog: O,
     target: PgWriteTarget<W>,
@@ -419,7 +430,7 @@ where
     /// Build a manager with no re-execution connector and a default in-memory
     /// oplog.
     ///
-    /// The `verifier` is required: nothing installs one by default, so a
+    /// The `authority` is required: nothing installs one by default, so a
     /// deployment chooses its identity story explicitly. Aggregate
     /// subscriptions need a connector; use
     /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
@@ -429,7 +440,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        verifier: Arc<dyn SessionVerifier>,
+        authority: Arc<dyn HandshakeAuthority>,
         target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
@@ -437,7 +448,7 @@ where
             materializer,
             snapshot_source,
             auth,
-            verifier,
+            authority,
             NoConnector,
             InMemoryOplog::default(),
             target,
@@ -461,7 +472,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        verifier: Arc<dyn SessionVerifier>,
+        authority: Arc<dyn HandshakeAuthority>,
         connector: C,
         target: PgWriteTarget<W>,
         config: SessionConfig,
@@ -470,7 +481,7 @@ where
             materializer,
             snapshot_source,
             auth,
-            verifier,
+            authority,
             connector,
             InMemoryOplog::default(),
             target,
@@ -499,7 +510,7 @@ where
         materializer: Materializer,
         snapshot_source: Snap,
         auth: Auth,
-        verifier: Arc<dyn SessionVerifier>,
+        authority: Arc<dyn HandshakeAuthority>,
         connector: C,
         oplog: O,
         target: PgWriteTarget<W>,
@@ -513,7 +524,7 @@ where
             sessions: Mutex::new(HashMap::new()),
             snapshot_source,
             auth,
-            verifier,
+            authority,
             connector,
             oplog,
             target,
@@ -693,7 +704,7 @@ where
                 && !is_delete
                 && !self
                     .auth
-                    .can_read(&route.auth_ctx, table, pk)
+                    .can_read(&route.principal, table, pk)
                     .await
                     .unwrap_or(false)
             {
@@ -919,28 +930,33 @@ where
             )));
         }
 
-        // Resolve identity and the durable session id from the verified
-        // credential, never from the client-supplied `client_id` (that stays a
-        // pure logging label on the wire). On refusal, send a fatal frame and
-        // terminate before any subscription or catchup work, so an unverifiable
-        // caller reaches no session state.
-        let (auth_ctx, token_session_id) =
-            match self.verifier.verify_session(&handshake.auth_token).await {
-                Ok(verified) => (verified.context, verified.session_id),
-                Err(err) => {
-                    tracing::warn!(
-                        client_id = %handshake.client_id,
-                        error = %err,
-                        "handshake refused, the credential did not verify"
-                    );
-                    let _ = transport
-                        .send_control(ControlMessage::FatalError(FatalError::new(
-                            FatalErrorReason::AuthenticationFailed,
-                        )))
-                        .await;
-                    return Err(SessionError::Authentication(err.to_string()));
-                }
-            };
+        let connection_num = self.next_connection_num();
+        // The handle comes before the grants on purpose: a run has one whether
+        // or not anybody is signed in, and having it first is what lets the
+        // logging context cover the grant checks below. Identity is resolved
+        // only from checked grants, never from the client-supplied `client_id`,
+        // which stays a pure correlation label.
+        let handle = self.resume_handle(handshake.resume_token.as_deref(), &handshake.client_id);
+        // A span attaches its values only when its own level passes the filter,
+        // so the context has to be at least as severe as the least verbose
+        // event that must carry it. That event is a refused grant, at warn, and
+        // it is the one line where losing the handle would matter most: an
+        // operator who quiets this process to warn would otherwise keep exactly
+        // the security-relevant line and lose the run it belongs to.
+        let span = tracing::warn_span!(
+            "connection",
+            session = %handle,
+            user = tracing::field::Empty,
+            connection = connection_num,
+        );
+        let principal = self
+            .resolve_grants(handle, &handshake)
+            .instrument(span.clone())
+            .await;
+        if let Some(identity) = principal.identity() {
+            span.record("user", tracing::field::display(&identity.user_id));
+        }
+        let session_id = principal.session_id();
 
         // Decode the resume cursor and read the server watermark for the ack. An
         // 8-byte cursor is the client's resume LSN; anything else is a fresh
@@ -954,15 +970,19 @@ where
         // at or below it and replays the rest.
         let applied_watermark = self
             .target
-            .last_applied(token_session_id)
+            .last_applied(session_id)
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        let resume_token = self
+            .authority
+            .mint_handle(session_id)
+            .map_err(|err| SessionError::Handle(err.to_string()))?;
 
-        let connection_num = self.next_connection_num();
         transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 connection_id: format!("connection-{connection_num}"),
-                session_token: token_session_id.to_string(),
+                session_token: session_id.to_string(),
+                resume_token,
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
@@ -972,11 +992,67 @@ where
             .map_err(transport_err)?;
         Ok(Some(HandshakeOutcome {
             connection_num,
-            auth_ctx,
+            principal: Arc::new(principal),
             resume_lsn,
-            session_id: token_session_id,
             applied_watermark,
+            span,
         }))
+    }
+
+    /// The handle this run continues on: the one inside a resume credential
+    /// this server signed, or a fresh one when there is none or it does not
+    /// check out. An identified run replaces it with its login grant's handle.
+    ///
+    /// Refusing an unsigned credential is what stops a caller choosing the key
+    /// to its own server-side state, or resuming as a visitor whose handle it
+    /// obtained.
+    fn resume_handle(&self, presented: Option<&str>, client_id: &str) -> SessionId {
+        let Some(blob) = presented else {
+            return SessionId::from_uuid(uuid::Uuid::new_v4());
+        };
+        self.authority.read_handle(blob).unwrap_or_else(|err| {
+            tracing::warn!(
+                client_id = %client_id,
+                error = %err,
+                "resume credential refused, starting a fresh run"
+            );
+            SessionId::from_uuid(uuid::Uuid::new_v4())
+        })
+    }
+
+    /// Check every grant on its own and fold what resolved into the caller.
+    ///
+    /// A refusal is recorded here and nowhere else. It does not end the
+    /// connection and the reply says nothing about it, so this log line is the
+    /// entire visibility story: without it a checker that refuses everything
+    /// and one that accepts everything look identical from the client.
+    async fn resolve_grants(&self, handle: SessionId, handshake: &Handshake) -> Principal<Id> {
+        let mut principal = Principal::unidentified(handle);
+        for (position, grant) in handshake.grants.iter().enumerate() {
+            let position = position as u64;
+            match self.authority.check_grant(grant).await {
+                Ok(subject) => {
+                    let kind = subject_kind(&subject);
+                    if principal.accept(subject).is_err() {
+                        tracing::warn!(
+                            client_id = %handshake.client_id,
+                            grant = position,
+                            kind,
+                            reason = "ambiguous",
+                            "grant refused"
+                        );
+                    }
+                }
+                Err(refusal) => tracing::warn!(
+                    client_id = %handshake.client_id,
+                    grant = position,
+                    reason = refusal.reason(),
+                    detail = %refusal,
+                    "grant refused"
+                ),
+            }
+        }
+        principal
     }
 
     /// Serve one connection to completion: handshake, then the run loop, then
@@ -993,16 +1069,7 @@ where
         let Some(outcome) = self.run_handshake(&mut transport).await? else {
             return Ok(());
         };
-        // Every event emitted while serving this caller picks the handle and the
-        // identity up from here, so no writing site carries them by hand. The
-        // handshake's own refusals stay outside it: no session exists yet, and a
-        // stand-in handle on them would be a fiction.
-        let span = tracing::info_span!(
-            "connection",
-            session = %outcome.session_id,
-            user = %outcome.auth_ctx.user_id,
-            connection = outcome.connection_num,
-        );
+        let span = outcome.span.clone();
         self.run_session(transport, outcome).instrument(span).await
     }
 
@@ -1014,11 +1081,12 @@ where
     ) -> Result<(), SessionError> {
         let HandshakeOutcome {
             connection_num,
-            auth_ctx,
+            principal,
             resume_lsn,
-            session_id,
             applied_watermark,
+            span: _,
         } = outcome;
+        let session_id = principal.session_id();
         tracing::info!(resume_lsn, "connection established");
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
@@ -1031,7 +1099,7 @@ where
             agg_subs: HashMap::new(),
             delta_agg_subs: HashMap::new(),
             outbound: outbound_tx,
-            auth_ctx,
+            principal,
             pending_header: None,
             session_id,
             applied_watermark,
@@ -1226,7 +1294,7 @@ where
         for op in &plan.ops {
             let allowed = self
                 .auth
-                .can_write(&state.auth_ctx, &op.table, &op.pk, op.op)
+                .can_write(&state.principal, &op.table, &op.pk, op.op)
                 .await
                 .unwrap_or(false);
             if !allowed {
@@ -1242,7 +1310,7 @@ where
         match self
             .target
             .commit(
-                &state.auth_ctx,
+                &state.principal,
                 &plan,
                 &patch.patchset_zstd,
                 state.session_id,
@@ -1432,7 +1500,7 @@ where
             .map_err(transport_err)?;
         let snapshot = self
             .snapshot_source
-            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.auth_ctx)
+            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.principal)
             .await
             .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let payload = compress(&snapshot.patchset)?;
@@ -1459,7 +1527,7 @@ where
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
-                auth_ctx: state.auth_ctx.clone(),
+                principal: Arc::clone(&state.principal),
             },
         )
         .await;
@@ -1492,7 +1560,7 @@ where
                 sub_id: reg.sub_id,
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
-                auth_ctx: state.auth_ctx.clone(),
+                principal: Arc::clone(&state.principal),
             },
         )
         .await;
@@ -1531,7 +1599,7 @@ where
             if !record.is_tombstone() {
                 let allowed = self
                     .auth
-                    .can_read(&state.auth_ctx, record.table(), record.pk())
+                    .can_read(&state.principal, record.table(), record.pk())
                     .await
                     .unwrap_or(false);
                 if !allowed {

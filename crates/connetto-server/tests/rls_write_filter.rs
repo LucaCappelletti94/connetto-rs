@@ -22,7 +22,7 @@ use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, Ping,
 };
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
@@ -100,7 +100,7 @@ impl SnapshotSource for NoSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -165,13 +165,13 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 
 async fn handshake<T: Transport>(transport: &mut T, client_id: &str) {
     transport
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            client_id,
-            // Identity is resolved from the token, so the trusting verifier
-            // maps this to app.user_id under RLS.
-            client_id,
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, client_id)
+                // The verified grant's user_id becomes app.user_id under RLS.
+                .with_grant(connetto_core::messages::Grant::new(format!(
+                    "user:{client_id}"
+                ))),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(transport).await else {
@@ -224,7 +224,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         target,
         SessionConfig::default(),
     );
@@ -295,7 +295,7 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         target,
         SessionConfig::default(),
     );

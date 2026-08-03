@@ -9,7 +9,7 @@
 //! session receives (`FullResyncRequired` then a fresh snapshot), so the test
 //! pins the client contract without an oplog or a retention window.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
@@ -104,6 +104,7 @@ fn resync_server() -> LoopbackTransport {
                 connection_id: "resync".to_owned(),
                 session_token: "resync".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
+                resume_token: "resync".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
                 last_applied_seq: None,
@@ -162,13 +163,14 @@ where
 async fn full_resync_drops_rows_deleted_during_the_outage() {
     let config = ClientConfig {
         client_id: "resync".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut conn = ConnettoConnection::connect(
         resync_server(),
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config,
         None,

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -86,7 +86,7 @@ impl SnapshotSource for NoSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -138,7 +138,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         connector,
         target,
         SessionConfig::default(),
@@ -148,11 +148,10 @@ async fn reexec_bootstraps_folds_and_retriggers() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "aggregator",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "aggregator")
+                .with_grant(connetto_core::messages::Grant::new("user:aggregator")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {

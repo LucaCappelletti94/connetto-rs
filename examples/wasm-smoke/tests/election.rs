@@ -15,7 +15,7 @@ use core::time::Duration;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
     dsl::Watchable,
 };
 use connetto_core::Transport;
@@ -93,13 +93,14 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{tag}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         DEMO_SQLITE_DDL,
         &config,
         None,
@@ -210,13 +211,14 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
         BroadcastTransport::with_peer_liveness(&wire, DB_ALIVE_LOCK).expect("boot wire");
     let config = ClientConfig {
         client_id: client_id.clone(),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         DEMO_SQLITE_DDL,
         &config,
         None,

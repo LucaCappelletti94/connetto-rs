@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Ping, Subscribe, SubscriptionSpec};
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -31,7 +31,7 @@ impl SnapshotSource for BrokenSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Err("backing store unreachable".to_owned())
     }
@@ -56,7 +56,7 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         materializer,
         BrokenSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -67,11 +67,10 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
     let serve = tokio::spawn(async move { server.serve(server_end).await });
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "nonfatal-client",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "nonfatal-client")
+                .with_grant(connetto_core::messages::Grant::new("user:nonfatal-client")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {

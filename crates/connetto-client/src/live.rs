@@ -1357,9 +1357,10 @@ enum Recovery {
     Live,
     /// The backoff policy ran out of attempts.
     Exhausted,
-    /// The credential was rejected (a refresh that could not recover it, or a
-    /// handshake `AuthenticationFailed`), so retrying is futile and the driver
-    /// routes to interactive re-login instead.
+    /// The silent refresh could not produce a login grant, so retrying is
+    /// futile and the driver routes to interactive re-login instead. The server
+    /// never signals this: a grant it refuses leaves the connection open and
+    /// says nothing, so the client learns it from its own token source.
     ReauthRequired,
 }
 

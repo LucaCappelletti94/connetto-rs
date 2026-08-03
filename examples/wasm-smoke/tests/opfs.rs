@@ -17,8 +17,8 @@
 mod common;
 
 use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Replica, ReplicaKey, cipher::cipher_url,
-    dsl::Watchable,
+    ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica, ReplicaKey,
+    cipher::cipher_url, dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
@@ -74,10 +74,7 @@ async fn connect(config: &ClientConfig, ddl: Option<&str>) -> ConnettoConnection
         .await
         .expect("connect to connetto-server");
     let url = replica_url();
-    let replica = Replica::EncryptedFile {
-        path: &url,
-        key: replica_key(),
-    };
+    let replica = Replica::encrypted_file(&url, Some(replica_key())).expect("create replica");
     match ddl {
         Some(ddl) => ConnettoConnection::connect(transport, &replica, ddl, config, None).await,
         None => ConnettoConnection::connect_existing(transport, &replica, config, None).await,
@@ -99,7 +96,8 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
 
     let config = ClientConfig {
         client_id: format!("wasm-opfs-{}", unique_id()),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

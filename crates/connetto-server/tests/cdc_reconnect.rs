@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, Subscribe, SubscriptionSpec,
 };
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -71,7 +71,7 @@ impl SnapshotSource for EmptySnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -161,7 +161,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         Materializer::new(PG_DDL).expect("build materializer"),
         EmptySnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -173,11 +173,10 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
     let _server = tokio::spawn(manager.clone().serve(server_transport));
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "reader",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "reader")
+                .with_grant(connetto_core::messages::Grant::new("user:reader")),
+        ))
         .await
         .expect("send handshake");
     client

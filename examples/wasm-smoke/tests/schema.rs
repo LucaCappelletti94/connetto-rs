@@ -18,7 +18,7 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
@@ -46,6 +46,7 @@ async fn schema_upstream(mut server: LoopbackTransport, server_version: SchemaVe
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: "upstream-session".to_owned(),
             session_token: "upstream".to_owned(),
+            resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: Some(server_version),
             initial_credits: 64,
@@ -63,14 +64,15 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
     spawn_local(schema_upstream(fake_up, server_version.clone()));
     let worker_config = ClientConfig {
         client_id: format!("schema-worker-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         // The worker presents the same version the upstream advertises, so it
         // connects and then forwards that version to tabs.
         schema_version: Some(server_version),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
             .expect("worker connect");
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
@@ -91,11 +93,13 @@ async fn stale_tab_is_rejected_through_the_relay() {
     hub.attach(relay_end);
     let stale = ClientConfig {
         client_id: format!("schema-tab-stale-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let result = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &stale, None).await;
+    let result =
+        ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &stale, None).await;
     match result {
         Err(ClientError::SchemaOutdated { server, .. }) => {
             assert_eq!(
@@ -119,11 +123,12 @@ async fn matching_tab_connects_through_the_relay() {
     hub.attach(relay_end);
     let fresh = ClientConfig {
         client_id: format!("schema-tab-fresh-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(version),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    let conn = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &fresh, None).await;
+    let conn = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &fresh, None).await;
     assert!(
         conn.is_ok(),
         "a tab whose baked version matches the server connects normally: {:?}",

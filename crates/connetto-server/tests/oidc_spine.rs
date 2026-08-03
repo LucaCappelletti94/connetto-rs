@@ -32,7 +32,8 @@
 
 use std::sync::Arc;
 
-use connetto_core::traits::SessionVerifier;
+use connetto_core::HandshakeAuthority;
+use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
@@ -212,6 +213,7 @@ fn client_pkce() -> (&'static str, String) {
 /// at the client's redirect URI, and redeeming that code yields a connetto access
 /// token whose session the real handshake verifier accepts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn the_oauth_spine_completes_against_a_real_identity_provider() {
     let stack = Stack::start().await;
     let base = &stack.connetto_base;
@@ -337,11 +339,14 @@ async fn the_oauth_spine_completes_against_a_real_identity_provider() {
     // spine.
     let verified = stack
         .service
-        .verifier()
-        .verify_session(&access_token)
+        .handshake_authority()
+        .check_grant(&Grant::new(&access_token))
         .await
         .expect("the minted session verifies at the handshake");
-    assert_eq!(verified.context.user_id, expected_user_id);
+    let connetto_core::Subject::Identity(session) = verified else {
+        panic!("expected identity subject from spine token");
+    };
+    assert_eq!(session.context.user_id, expected_user_id);
 }
 
 /// A provider code minted under one login cannot be redeemed against another

@@ -12,11 +12,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::Principal;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, Subscribe, SubscriptionSpec,
 };
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -46,7 +46,7 @@ impl AuthPolicy for DenyId2 {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_read(
         &self,
-        _ctx: &AuthContext,
+        _ctx: &Principal,
         table: &str,
         pk: &[u8],
     ) -> Result<bool, Self::Error> {
@@ -60,7 +60,7 @@ impl AuthPolicy for DenyId2 {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_write(
         &self,
-        _ctx: &AuthContext,
+        _ctx: &Principal,
         _table: &str,
         _pk: &[u8],
         _op: MutationOp,
@@ -80,7 +80,7 @@ impl SnapshotSource for EmptySnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &AuthContext,
+        _auth: &Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -141,7 +141,7 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
         materializer,
         EmptySnapshot,
         DenyId2,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -153,11 +153,10 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "client-a",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-a")
+                .with_grant(connetto_core::messages::Grant::new("user:client-a")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {

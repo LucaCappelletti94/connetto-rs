@@ -14,7 +14,7 @@
 //! is an unrecognised pragma that succeeds and encrypts nothing.
 
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, SqlFunctions, cipher,
+    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, ReplicaKey, SqlFunctions, cipher,
 };
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -55,7 +55,8 @@ diesel::allow_tables_to_appear_in_same_query!(items, notes);
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "e2".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: SqlFunctions::new(),
     }
@@ -103,10 +104,7 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
     let plaintext_url = url(&plaintext);
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &encrypted_url,
-            key: key(),
-        },
+        &Replica::encrypted_file(&encrypted_url, Some(key())).expect("key is Some"),
         SQLITE_DDL,
         &config(),
         None,
@@ -161,10 +159,7 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let path = dir.path().join("replica.sqlite");
     let db = url(&path);
-    let replica = Replica::EncryptedFile {
-        path: &db,
-        key: key(),
-    };
+    let replica = Replica::encrypted_file(&db, Some(key())).expect("key is Some");
 
     let unsynced = {
         let mut conn = ConnettoConnection::connect(
@@ -216,10 +211,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     {
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
-            &Replica::EncryptedFile {
-                path: &db,
-                key: key(),
-            },
+            &Replica::encrypted_file(&db, Some(key())).expect("key is Some"),
             SQLITE_DDL,
             &config(),
             None,
@@ -238,10 +230,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // is discard and re-sync.
     let wrong = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &db,
-            key: other_key(),
-        },
+        &Replica::encrypted_file(&db, Some(other_key())).expect("key is Some"),
         &config(),
         None,
     )
@@ -269,10 +258,7 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     connetto_client::teardown::purge_replica(&path, &[], true).expect("discard the replica");
     let mut fresh = ConnettoConnection::connect(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &db,
-            key: other_key(),
-        },
+        &Replica::encrypted_file(&db, Some(other_key())).expect("key is Some"),
         SQLITE_DDL,
         &config(),
         None,
@@ -295,14 +281,13 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     let replica_url = url(&dir.path().join("replica.sqlite"));
     let tier_path = dir.path().join("tier.sqlite");
     let tier = url(&tier_path);
-    let replica = Replica::EncryptedFile {
-        path: &replica_url,
-        key: key(),
-    };
 
     // First boot. The tier is created through the replica connection, which is
     // what makes its key salt agree with the replica's, and nothing else does.
     {
+        let replica = Replica::encrypted_file(&replica_url, Some(key()))
+            .expect("key is Some")
+            .with_tier(&tier, TIER_DDL);
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
             &replica,
@@ -312,8 +297,6 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
         )
         .await
         .expect("connect the encrypted replica");
-        conn.attach_local_tier_ddl(&tier, TIER_DDL)
-            .expect("first-boot the durable tier through the replica connection");
         assert!(conn.local_tables().contains("notes"));
         diesel::insert_into(notes::table)
             .values((notes::id.eq(1), notes::body.eq(TIER_MARKER)))
@@ -332,12 +315,13 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     // Second run: the existing tier file re-attaches with no DDL and no key
     // clause, and its rows come back. This is the resume path, and it works
     // because the first boot made the two salts agree.
+    let replica = Replica::encrypted_file(&replica_url, Some(key()))
+        .expect("key is Some")
+        .with_existing_tier(&tier);
     let mut conn =
         ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
             .await
             .expect("reopen the encrypted replica");
-    conn.attach_local_tier(&tier)
-        .expect("re-attach the tier a previous run created");
     let rows: Vec<Option<String>> = notes::table
         .select(notes::body)
         .load(conn.conn())
@@ -357,20 +341,19 @@ async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_repli
         let tier = url(&dir.path().join(name));
         let replica_url = url(&dir.path().join(format!("replica-for-{name}")));
         first_boot_standalone(&tier, tier_key.as_ref(), TIER_DDL);
-        let mut conn = ConnettoConnection::connect(
+        let replica = Replica::encrypted_file(&replica_url, Some(key()))
+            .expect("key is Some")
+            .with_existing_tier(&tier);
+        let result = ConnettoConnection::connect(
             FakeTransport::accepting(),
-            &Replica::EncryptedFile {
-                path: &replica_url,
-                key: key(),
-            },
+            &replica,
             SQLITE_DDL,
             &config(),
             None,
         )
-        .await
-        .expect("connect the encrypted replica");
+        .await;
         assert!(
-            conn.attach_local_tier(&tier).is_err(),
+            result.is_err(),
             "attaching {name} must fail rather than leaving the tier readable"
         );
     }

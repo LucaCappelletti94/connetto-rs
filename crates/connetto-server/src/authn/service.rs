@@ -1,18 +1,21 @@
 //! The authentication service: login, refresh, revoke, and the handshake
-//! session verifier.
+//! authority.
 //!
 //! [`AuthService`] mints connetto tokens at login and rotates them at refresh
-//! over an [`AuthStore`]. [`ConnettoSessionVerifier`] is the real
-//! [`SessionVerifier`] the server injects: it verifies the access token
-//! locally and checks session liveness in the same store, so a revoked session
-//! is refused on the next handshake even while its access token is time-valid.
+//! over an [`AuthStore`]. [`ConnettoHandshakeAuthority`] is the real
+//! [`HandshakeAuthority`] the server injects: it checks each grant's signature
+//! locally, confirms in the same store that a login grant's run is still live,
+//! so a revoked run is refused on the next handshake even while its token is
+//! time-valid, and it signs the resume blob a caller with no identity presents.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
-use connetto_core::traits::{SessionVerifier, SessionVerifyError, SessionVerifyFuture};
+use connetto_core::auth::Subject;
+use connetto_core::messages::Grant;
+use connetto_core::traits::{GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::authn::provider::{
@@ -29,7 +32,7 @@ use crate::authn::token::{TokenAuthority, TokenError};
 /// forwards one.
 #[derive(Debug, Clone)]
 pub struct TokenPair<Id> {
-    /// The short-lived access token, carried in `Handshake.auth_token`.
+    /// The short-lived access token, presented as a grant on the handshake.
     pub access_token: String,
     /// The rotating refresh token, presented back to the refresh endpoint.
     pub refresh_token: String,
@@ -300,27 +303,30 @@ impl<S: AuthStore> AuthService<S> {
         Ok(true)
     }
 
-    /// Build the session verifier sharing this service's authority and store.
+    /// Build the handshake authority sharing this service's token authority
+    /// and store.
     #[must_use]
-    pub fn verifier(&self) -> ConnettoSessionVerifier<S> {
-        ConnettoSessionVerifier {
+    pub fn handshake_authority(&self) -> ConnettoHandshakeAuthority<S> {
+        ConnettoHandshakeAuthority {
             authority: Arc::clone(&self.authority),
             store: Arc::clone(&self.store),
         }
     }
 }
 
-/// The real [`SessionVerifier`]: verify connetto's access token, then confirm
-/// the session is still live in the store.
+/// The real [`HandshakeAuthority`]: check each grant against connetto's own
+/// public key, confirm a login grant's run is still live in the store, and sign
+/// the resume blob an unidentified run presents.
 ///
-/// Injected into `SessionManager` through `with_session_verifier`. It closes
-/// the spoofing hole because identity comes only from a token connetto signed.
-pub struct ConnettoSessionVerifier<S: AuthStore> {
+/// It closes the spoofing hole because a caller is only ever whoever a token
+/// connetto signed says it is, and it closes the handle hole because a run with
+/// no identity resumes only on a blob connetto signed.
+pub struct ConnettoHandshakeAuthority<S: AuthStore> {
     authority: Arc<TokenAuthority>,
     store: Arc<S>,
 }
 
-impl<S: AuthStore> ConnettoSessionVerifier<S> {
+impl<S: AuthStore> ConnettoHandshakeAuthority<S> {
     /// Build over a shared token authority and store.
     #[must_use]
     pub fn new(authority: Arc<TokenAuthority>, store: Arc<S>) -> Self {
@@ -328,22 +334,42 @@ impl<S: AuthStore> ConnettoSessionVerifier<S> {
     }
 }
 
-impl<S: AuthStore + 'static> SessionVerifier<S::Id> for ConnettoSessionVerifier<S> {
-    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a, S::Id> {
+impl<S: AuthStore + 'static> HandshakeAuthority<S::Id> for ConnettoHandshakeAuthority<S> {
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id> {
         Box::pin(async move {
-            let verified = self
+            let subject = self
                 .authority
-                .verify_access::<S::Id>(auth_token)
-                .map_err(|err| SessionVerifyError::Invalid(err.to_string()))?;
+                .check_grant::<S::Id>(grant)
+                .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
+            // Only a login has something to keep alive. A capability is
+            // withdrawn by deleting the relation that grants it, which the
+            // authorization model answers per question, so asking a store here
+            // would invent a liveness concept the design deliberately has not.
+            let session = match subject {
+                Subject::Capability(subject) => return Ok(Subject::Capability(subject)),
+                Subject::Identity(session) => session,
+            };
             let live = self
                 .store
-                .session_is_live(verified.session_id, SystemTime::now())
+                .session_is_live(session.session_id, SystemTime::now())
                 .await
-                .map_err(|err| SessionVerifyError::Invalid(err.to_string()))?;
+                .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
             if !live {
-                return Err(SessionVerifyError::Revoked);
+                return Err(GrantRefused::Revoked);
             }
-            Ok(verified)
+            Ok(Subject::Identity(session))
         })
+    }
+
+    fn mint_handle(&self, session_id: SessionId) -> Result<String, HandleError> {
+        self.authority
+            .mint_resume(session_id, SystemTime::now())
+            .map_err(|err| HandleError(err.to_string()))
+    }
+
+    fn read_handle(&self, blob: &str) -> Result<SessionId, HandleError> {
+        self.authority
+            .verify_resume(blob)
+            .map_err(|err| HandleError(err.to_string()))
     }
 }

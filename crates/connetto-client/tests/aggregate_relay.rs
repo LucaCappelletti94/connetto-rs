@@ -10,7 +10,7 @@
 //! `is_full_result: false`) can only be proven with a hand-crafted frame. This
 //! test drives the client's decode with exactly that frame over a loopback.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{AggregateUpdate, ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -32,6 +32,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 connection_id: "agg".to_owned(),
                 session_token: "agg".to_owned(),
+                resume_token: "agg".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 initial_credits: 64,
@@ -49,7 +50,8 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
 fn config(client_id: &str) -> ClientConfig {
     ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     }
@@ -68,7 +70,7 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
     });
     let mut conn = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config("t"),
         None,

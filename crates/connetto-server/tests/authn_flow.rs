@@ -12,14 +12,14 @@ use std::time::{Duration, SystemTime};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use connetto_core::auth::AuthContext;
-use connetto_core::messages::{ControlMessage, FatalErrorReason, Handshake};
-use connetto_core::traits::{IncomingFrame, SessionVerifier, Transport};
-use connetto_core::{PROTOCOL_VERSION, SessionVerifyError};
+use connetto_core::messages::{ControlMessage, FatalErrorReason, Grant, Handshake};
+use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
     Materializer, OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy,
-    ResolvedIdentity, SessionConfig, SessionError, SessionManager, Snapshot, SnapshotSource,
-    TokenAuthority, auth_router, loopback, pg_write_target,
+    ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority,
+    auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
@@ -43,9 +43,9 @@ impl SnapshotSource for CapturingSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        auth: &AuthContext,
+        caller: &Principal,
     ) -> Result<Snapshot, Self::Error> {
-        *self.seen.lock().expect("capture lock") = Some(auth.clone());
+        *self.seen.lock().expect("capture lock") = caller.identity().cloned();
         Ok(Snapshot {
             patchset: Vec::new(),
             cursor: connetto_core::Cursor::new(Vec::new()),
@@ -80,7 +80,7 @@ fn service() -> (Arc<TokenAuthority>, Arc<AuthService<InMemoryAuthStore>>) {
 }
 
 fn manager_with(
-    verifier: Arc<dyn SessionVerifier>,
+    authority: Arc<dyn HandshakeAuthority>,
     snapshot: CapturingSnapshot,
     fixture: &Fixture,
 ) -> Arc<SessionManager<CapturingSnapshot, PermissiveAuth, ConnettoWatermark>> {
@@ -88,7 +88,7 @@ fn manager_with(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot,
         PermissiveAuth,
-        verifier,
+        authority,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -106,15 +106,13 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     // reaches the session is the token's, not the id the client claims.
     let snapshot = CapturingSnapshot::default();
     let seen = Arc::clone(&snapshot.seen);
-    let manager = manager_with(Arc::new(svc.verifier()), snapshot, &fixture);
+    let manager = manager_with(Arc::new(svc.handshake_authority()), snapshot, &fixture);
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "spoofer",
-            &pair.access_token,
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "spoofer").with_grant(Grant::new(&pair.access_token)),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
@@ -140,9 +138,12 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
         panic!("expected snapshot end");
     };
     let captured = seen.lock().expect("capture lock").clone();
-    let minted = authority
-        .verify_access::<String>(&pair.access_token)
-        .expect("verify");
+    let Subject::Identity(minted) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .expect("verify")
+    else {
+        panic!("expected identity subject");
+    };
     assert_eq!(
         captured.expect("the snapshot read saw an identity").user_id,
         minted.context.user_id,
@@ -151,35 +152,56 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     client.close().await.expect("close");
     server.await.expect("join").expect("session ok");
 
-    // Revoke the session. Its access token is still time-valid, but the next
-    // handshake is refused because liveness fails.
-    let session_id = authority
-        .verify_access::<String>(&pair.access_token)
+    // Revoke the session. Its access token is still time-valid, but the grant
+    // is now refused: the run continues unidentified rather than being rejected.
+    let Subject::Identity(verified) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
         .expect("verify")
-        .session_id;
-    svc.revoke(session_id).await.expect("revoke");
+    else {
+        panic!("expected identity subject");
+    };
+    svc.revoke(verified.session_id).await.expect("revoke");
 
-    let manager = manager_with(
-        Arc::new(svc.verifier()),
-        CapturingSnapshot::default(),
-        &fixture,
-    );
+    let after_revoke = CapturingSnapshot::default();
+    let seen2 = Arc::clone(&after_revoke.seen);
+    let manager = manager_with(Arc::new(svc.handshake_authority()), after_revoke, &fixture);
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "alice",
-            &pair.access_token,
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "alice").with_grant(Grant::new(&pair.access_token)),
+        ))
         .await
         .expect("send handshake");
-    let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
-        panic!("expected fatal error");
+    // The revoked grant is refused but the connection stays open.
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack after revocation");
     };
-    assert_eq!(fatal.reason, FatalErrorReason::AuthenticationFailed);
-    let outcome = server.await.expect("join");
-    assert!(matches!(outcome, Err(SessionError::Authentication(_))));
+    client
+        .send_control(ControlMessage::Subscribe(
+            connetto_core::messages::Subscribe {
+                sub_id: "items".to_owned(),
+                spec: connetto_core::messages::SubscriptionSpec::new("SELECT * FROM items"),
+            },
+        ))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    let Some(IncomingFrame::Bulk(_)) = client.recv().await.expect("recv") else {
+        panic!("expected snapshot patch");
+    };
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+    let captured2 = seen2.lock().expect("capture lock").clone();
+    assert!(
+        captured2.is_none(),
+        "a revoked grant is refused and the run is unidentified",
+    );
+    client.close().await.expect("close");
+    server.await.expect("join").expect("session ok");
 }
 
 /// R2: revoking a session closes its live connection rather than only refusing
@@ -196,7 +218,7 @@ async fn logout_closes_the_live_connection_it_revoked() {
     let (_authority, svc) = service();
     let pair = svc.login(&identity("dave")).await.expect("login");
     let manager = manager_with(
-        Arc::new(svc.verifier()),
+        Arc::new(svc.handshake_authority()),
         CapturingSnapshot::default(),
         &fixture,
     );
@@ -217,11 +239,10 @@ async fn logout_closes_the_live_connection_it_revoked() {
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(Arc::clone(&manager).serve(server_transport));
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "dave-device",
-            &pair.access_token,
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "dave-device")
+                .with_grant(Grant::new(&pair.access_token)),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
@@ -256,12 +277,18 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     let rotated = svc.refresh(&pair.refresh_token).await.expect("refresh");
     assert_ne!(rotated.refresh_token, pair.refresh_token, "token rotates");
     // The rotated access token still verifies to the same session.
-    let first = authority
-        .verify_access::<String>(&pair.access_token)
-        .expect("verify first");
-    let second = authority
-        .verify_access::<String>(&rotated.access_token)
-        .expect("verify rotated");
+    let Subject::Identity(first) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .expect("verify first")
+    else {
+        panic!("expected identity subject");
+    };
+    let Subject::Identity(second) = authority
+        .check_grant::<String>(&Grant::new(&rotated.access_token))
+        .expect("verify rotated")
+    else {
+        panic!("expected identity subject");
+    };
     assert_eq!(first.session_id, second.session_id);
 
     // Reusing the original (rotated-out) refresh token is theft: it fails and
@@ -271,10 +298,12 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     let after = svc.refresh(&rotated.refresh_token).await;
     assert!(after.is_err(), "session revoked after reuse");
 
-    // Verifier now refuses the still-signed access token: session not live.
-    let verifier = svc.verifier();
-    let refused = verifier.verify_session(&rotated.access_token).await;
-    assert_eq!(refused, Err(SessionVerifyError::Revoked));
+    // The authority now refuses the still-signed access token: session not live.
+    let refused = svc
+        .handshake_authority()
+        .check_grant(&Grant::new(&rotated.access_token))
+        .await;
+    assert_eq!(refused, Err(GrantRefused::Revoked));
 }
 
 #[tokio::test]
@@ -284,18 +313,24 @@ async fn expired_access_token_is_refused() {
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let svc = AuthService::new(Arc::clone(&authority), Arc::clone(&store));
     let pair = svc.login(&identity("carol")).await.expect("login");
-    let verified = authority
-        .verify_access::<String>(&pair.access_token)
-        .expect("verify");
+    let Subject::Identity(verified) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .expect("verify")
+    else {
+        panic!("expected identity subject");
+    };
 
     // Mint a token issued far enough in the past that it is already expired.
     let stale_issued = SystemTime::now() - (config.access_ttl + Duration::from_secs(120));
     let stale = authority
         .mint_access(&verified.context, verified.session_id, stale_issued)
         .expect("mint stale");
-    let refused = svc.verifier().verify_session(&stale).await;
+    let refused = svc
+        .handshake_authority()
+        .check_grant(&Grant::new(&stale))
+        .await;
     assert!(
-        matches!(refused, Err(SessionVerifyError::Invalid(_))),
+        matches!(refused, Err(GrantRefused::Invalid(_))),
         "an expired access token is invalid, got {refused:?}",
     );
 }
@@ -310,16 +345,22 @@ async fn a_token_from_another_key_is_refused() {
     // session id, simulating a forged credential.
     let other = TokenAuthority::generate(&config).expect("keypair b");
     let pair = svc.login(&identity("dave")).await.expect("login");
-    let verified = authority
-        .verify_access::<String>(&pair.access_token)
-        .expect("verify");
+    let Subject::Identity(verified) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .expect("verify")
+    else {
+        panic!("expected identity subject");
+    };
     let forged = other
         .mint_access(&verified.context, verified.session_id, SystemTime::now())
         .expect("mint forged");
 
-    let refused = svc.verifier().verify_session(&forged).await;
+    let refused = svc
+        .handshake_authority()
+        .check_grant(&Grant::new(&forged))
+        .await;
     assert!(
-        matches!(refused, Err(SessionVerifyError::Invalid(_))),
+        matches!(refused, Err(GrantRefused::Invalid(_))),
         "a token signed by another key is refused, got {refused:?}",
     );
 }

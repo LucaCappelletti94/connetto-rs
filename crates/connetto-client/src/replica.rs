@@ -22,56 +22,168 @@
 use crate::cipher::ReplicaKey;
 use sha2::{Digest, Sha256};
 
-/// The replica a connection is about to open.
+mod sealed {
+    /// Closes [`ReplicaStorage`](super::ReplicaStorage) so the two cases below
+    /// are the whole space and no downstream type can invent a third.
+    pub trait Sealed {}
+}
+
+/// What a run keeps at rest, as a marker the compiler can see.
 ///
-/// Storage kind and cipher are one value rather than two arguments, because the
-/// two are not independent and pretending otherwise let the dangerous case wear
-/// the harmless one's name. An ephemeral replica has nothing at rest, so a key
-/// would encrypt heap pages against an attacker who already owns the heap: it
-/// cannot carry one, and that combination is now unrepresentable. A durable
-/// replica does have something at rest, so it has to say which of the two it is,
-/// in a word that does not also mean "in memory".
+/// It exists so that the one dangerous arrangement, a durable device-private
+/// database beside a replica with no key, is not a program. The tier would
+/// inherit the replica's key through its `ATTACH`, an in-memory replica has
+/// none, and the result is the durable-plaintext variant phase E5 deleted
+/// arriving through the back door.
+pub trait ReplicaStorage: sealed::Sealed {}
+
+/// Nothing at rest: the replica is SQLite's own `:memory:` and so is anything
+/// beside it.
+#[derive(Debug, Clone, Copy)]
+pub struct InMemory;
+
+/// Something at rest, its pages encrypted under a per-replica key.
+#[derive(Debug, Clone, Copy)]
+pub struct Encrypted;
+
+impl sealed::Sealed for InMemory {}
+impl sealed::Sealed for Encrypted {}
+impl ReplicaStorage for InMemory {}
+impl ReplicaStorage for Encrypted {}
+
+/// The device-private database beside the replica, which never syncs.
+///
+/// Reachable only through the builders on [`Replica`], and those are what
+/// enforce that a durable one belongs to an encrypted replica alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Tier<'a> {
+    /// No device-private database.
+    #[default]
+    None,
+    /// Attach the one already at `path`, refusing to create it, so a missing
+    /// file fails loudly instead of materializing as an empty database.
+    Existing {
+        /// Where it lives.
+        path: &'a str,
+    },
+    /// Attach the one at `path`, creating it and applying `ddl` when empty.
+    Create {
+        /// Where it lives, `:memory:` when the replica keeps nothing at rest.
+        path: &'a str,
+        /// `CREATE TABLE` statements, each requalified into the attached schema.
+        ddl: &'a str,
+    },
+}
+
+impl<'a> Tier<'a> {
+    /// Where it lives, or `None` when there is no device-private database.
+    #[must_use]
+    pub const fn path(&self) -> Option<&'a str> {
+        match self {
+            Self::None => None,
+            Self::Existing { path } | Self::Create { path, .. } => Some(path),
+        }
+    }
+}
+
+/// Everything one run keeps at rest: the replica, whether its pages are
+/// encrypted, and the device-private database beside it.
+///
+/// One value rather than several arguments, because the parts are not
+/// independent and pretending otherwise let the dangerous case wear the
+/// harmless one's name. A run with nothing at rest has no key, because a key
+/// would encrypt heap pages against an attacker who already owns the heap, and
+/// for the same reason it cannot have a durable database beside it. Both of
+/// those combinations are unrepresentable rather than rejected: the builders
+/// that name a file exist only on [`Encrypted`].
 ///
 /// There is no `Default` and no `Option`. A caller with something at rest says
-/// [`EncryptedFile`](Self::EncryptedFile), a caller with nothing at rest says
-/// [`Ephemeral`](Self::Ephemeral), and there is no third choice.
+/// [`encrypted_file`](Self::encrypted_file), a caller with nothing at rest says
+/// [`in_memory`](Self::in_memory), and there is no third choice.
 ///
-/// A durable replica with its pages in the clear was the third variant until
-/// phase E5, and it went because the key is minted on the device
+/// A durable replica with its pages in the clear was a third case until phase
+/// E5, and it went because the key is minted on the device
 /// ([`provision_replica_key`](crate::auth::provision_replica_key)). A deployment
 /// with no authentication at all therefore still has a key: it names the
 /// key-store record after the bare replica prefix, the same way the browser's
 /// `device_key` names one after a literal to protect the store it has to read
 /// before any identity exists.
+///
+/// The legal pairings, both of which compile:
+///
+/// ```
+/// use connetto_client::{Replica, ReplicaKey};
+/// # const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY)";
+/// # let key = ReplicaKey::from_bytes([7u8; ReplicaKey::LEN]);
+/// let visitor = Replica::in_memory().with_tier(DDL);
+/// assert_eq!(visitor.tier().path(), Some(":memory:"));
+///
+/// let signed_in = Replica::encrypted_file("alice.db", Some(key))?.with_tier("alice-drafts.db", DDL);
+/// assert_eq!(signed_in.tier().path(), Some("alice-drafts.db"));
+/// # Ok::<(), connetto_client::ClientError>(())
+/// ```
+///
+/// And the one that must not be a program. A run with no identity has no key,
+/// so a device-private file beside it would be written in the clear, which is
+/// the durable-plaintext case phase E5 deleted arriving through the back door.
+/// The builder that names a path does not exist on this side:
+///
+/// ```compile_fail
+/// use connetto_client::Replica;
+/// # const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY)";
+/// let leaky = Replica::in_memory().with_tier("drafts.db", DDL);
+/// ```
+///
+/// ```compile_fail
+/// use connetto_client::Replica;
+/// let leaky = Replica::in_memory().with_existing_tier("drafts.db");
+/// ```
 #[derive(Debug, Clone)]
-pub enum Replica<'a> {
-    /// In-process and gone when the connection closes. A tab's mirror of the
-    /// worker's replica, or a throwaway in a test.
+pub struct Replica<'a, S: ReplicaStorage> {
+    path: &'a str,
+    key: Option<ReplicaKey>,
+    tier: Tier<'a>,
+    storage: core::marker::PhantomData<S>,
+}
+
+impl<'a> Replica<'a, InMemory> {
+    /// In-process and gone when the connection closes: a caller with no
+    /// identity, a tab's mirror of the worker's replica, or a throwaway in a
+    /// test.
     ///
     /// Nothing is at rest, so there is no cipher to choose. This is the case a
     /// browser tab is structurally confined to: only the DB worker holds
     /// credentials, so a tab has no key and must never be given one, the
     /// per-replica key being permanent where an access token expires.
-    Ephemeral,
-    /// A durable replica at `path`, its pages encrypted under `key`.
+    #[must_use]
+    pub const fn in_memory() -> Self {
+        Self {
+            path: ":memory:",
+            key: None,
+            tier: Tier::None,
+            storage: core::marker::PhantomData,
+        }
+    }
+
+    /// A device-private database beside it, in memory as the replica is.
     ///
-    /// `path` is a filesystem path natively. In the browser it is the codec URL
-    /// [`cipher_url`](crate::cipher::cipher_url) composes over the installed VFS,
-    /// because the browser codec intercepts as a VFS shim and a bare name would
-    /// leave it out of the stack.
-    EncryptedFile {
-        /// Where the replica lives.
-        path: &'a str,
-        /// The per-replica key, from
-        /// [`provision_replica_key`](crate::auth::provision_replica_key) or the
-        /// browser equivalent.
-        key: ReplicaKey,
-    },
+    /// There is no variant taking a path, which is the guard: durable
+    /// device-private data needs an account, because a device-wide file is
+    /// readable by everyone who uses the machine and there would be no key to
+    /// write it under.
+    #[must_use]
+    pub const fn with_tier(mut self, ddl: &'a str) -> Self {
+        self.tier = Tier::Create {
+            path: ":memory:",
+            ddl,
+        };
+        self
+    }
 }
 
-impl<'a> Replica<'a> {
-    /// The encrypted replica at `path` under the key the key store holds for it,
-    /// refusing when there is none.
+impl<'a> Replica<'a, Encrypted> {
+    /// The encrypted replica at `path` under the key the key store holds for
+    /// it, refusing when there is none.
     ///
     /// This is the check that stops a durable replica from opening without the
     /// key it was written under, and it is the only place that refusal lives, so
@@ -96,34 +208,65 @@ impl<'a> Replica<'a> {
         path: &'a str,
         resolved: Option<ReplicaKey>,
     ) -> Result<Self, crate::ClientError> {
-        match resolved {
-            Some(key) => Ok(Self::EncryptedFile { path, key }),
-            None => Err(crate::ClientError::ReplicaKeyMissing),
-        }
+        let Some(key) = resolved else {
+            return Err(crate::ClientError::ReplicaKeyMissing);
+        };
+        Ok(Self {
+            path,
+            key: Some(key),
+            tier: Tier::None,
+            storage: core::marker::PhantomData,
+        })
     }
 
-    /// The key, or `None` for [`Ephemeral`](Self::Ephemeral), which has nothing
-    /// at rest to key.
+    /// A durable device-private database at `path`, created with `ddl` when it
+    /// is empty.
+    ///
+    /// This is the only way to first-boot one, and the reason is a property of
+    /// the page codec rather than a preference. A database created through an
+    /// `ATTACH` on a keyed connection inherits the main database's key salt, and
+    /// an `ATTACH` of an existing database applies the main database's derived
+    /// key regardless of any `KEY` clause, so a file created by some other
+    /// connection carries a different salt and will not decrypt here.
+    #[must_use]
+    pub const fn with_tier(mut self, path: &'a str, ddl: &'a str) -> Self {
+        self.tier = Tier::Create { path, ddl };
+        self
+    }
+
+    /// A durable device-private database that a previous run already created.
+    ///
+    /// Attach-create is disabled around the attach, so a missing file fails
+    /// loudly rather than materializing as an empty database.
+    #[must_use]
+    pub const fn with_existing_tier(mut self, path: &'a str) -> Self {
+        self.tier = Tier::Existing { path };
+        self
+    }
+}
+
+impl<'a, S: ReplicaStorage> Replica<'a, S> {
+    /// The key, or `None` when nothing is at rest to key.
     ///
     /// For a second connection that has to match this replica's cipher, which in
     /// the browser is the device-local tier: it is its own main database, so it
     /// is unlocked separately rather than inheriting through an `ATTACH`.
     #[must_use]
     pub const fn key(&self) -> Option<&ReplicaKey> {
-        match self {
-            Self::Ephemeral => None,
-            Self::EncryptedFile { key, .. } => Some(key),
-        }
+        self.key.as_ref()
     }
 
-    /// The database URL to open. [`Ephemeral`](Self::Ephemeral) is SQLite's own
-    /// `:memory:`, which connetto supplies so the magic string appears once.
+    /// The database URL to open. Nothing at rest is SQLite's own `:memory:`,
+    /// which connetto supplies so the magic string appears once.
     #[must_use]
     pub const fn path(&self) -> &'a str {
-        match self {
-            Self::Ephemeral => ":memory:",
-            Self::EncryptedFile { path, .. } => path,
-        }
+        self.path
+    }
+
+    /// The device-private database beside it.
+    #[must_use]
+    pub const fn tier(&self) -> &Tier<'a> {
+        &self.tier
     }
 }
 
@@ -171,16 +314,28 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Replica, replica_db_name};
+    use super::{Replica, Tier, replica_db_name};
     use crate::ClientError;
     use crate::cipher::ReplicaKey;
 
     #[test]
-    fn an_ephemeral_replica_opens_sqlites_own_memory_database() {
-        assert_eq!(Replica::Ephemeral.path(), ":memory:");
+    fn a_run_with_nothing_at_rest_opens_sqlites_own_memory_database() {
+        let replica = Replica::in_memory();
+        assert_eq!(replica.path(), ":memory:");
         assert!(
-            Replica::Ephemeral.key().is_none(),
+            replica.key().is_none(),
             "nothing is at rest, so there is nothing to key"
+        );
+        assert_eq!(replica.tier(), &Tier::None);
+    }
+
+    #[test]
+    fn its_device_private_database_is_in_memory_too() {
+        let replica = Replica::in_memory().with_tier("CREATE TABLE drafts (id INTEGER)");
+        assert_eq!(
+            replica.tier().path(),
+            Some(":memory:"),
+            "a run with no key cannot name a file to write in the clear"
         );
     }
 
@@ -191,6 +346,15 @@ mod tests {
             .expect("a resolved key builds an encrypted replica");
         assert_eq!(replica.path(), "replica.sqlite");
         assert_eq!(replica.key(), Some(&key));
+    }
+
+    #[test]
+    fn an_encrypted_replica_may_name_a_durable_device_private_database() {
+        let key = ReplicaKey::from_bytes([3u8; ReplicaKey::LEN]);
+        let replica = Replica::encrypted_file("replica.sqlite", Some(key))
+            .expect("a resolved key builds an encrypted replica")
+            .with_existing_tier("frontend.sqlite");
+        assert_eq!(replica.tier().path(), Some("frontend.sqlite"));
     }
 
     #[test]

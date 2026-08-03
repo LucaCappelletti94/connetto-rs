@@ -16,7 +16,8 @@
 
 #![allow(clippy::too_many_lines)]
 
-use connetto_core::auth::AuthContext;
+use connetto_core::SessionId;
+use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_core::traits::AuthPolicy;
 use connetto_server::{RlsAuth, RlsAuthError};
 use diesel::sql_query;
@@ -53,9 +54,15 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 /// Whether `user` may read the row `key` in `table`, encoding the key exactly as
 /// the materializer's read path does.
 async fn visible(auth: &RlsAuth, user: &str, table: &str, key: &[Value<Postgres>]) -> bool {
-    let ctx = AuthContext::new(user);
+    let mut principal = Principal::unidentified(SessionId::from_token_hash(user));
+    let _ = principal.accept(Subject::Identity(VerifiedSession {
+        context: AuthContext::new(user),
+        session_id: SessionId::from_token_hash(user),
+    }));
     let pk = connetto_server::pk::encode(key);
-    auth.can_read(&ctx, table, &pk).await.expect("can_read")
+    auth.can_read(&principal, table, &pk)
+        .await
+        .expect("can_read")
 }
 
 #[tokio::test]
@@ -126,14 +133,18 @@ async fn rls_read_filter_enforces_visibility_per_user() {
 
     // A timestamp key is not bindable yet: the check fails loudly rather than
     // silently admitting or denying the row.
-    let ctx = AuthContext::new("alice");
+    let mut principal = Principal::unidentified(SessionId::from_token_hash("alice"));
+    let _ = principal.accept(Subject::Identity(VerifiedSession {
+        context: AuthContext::new("alice"),
+        session_id: SessionId::from_token_hash("alice"),
+    }));
     let occurred_at = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
         .expect("date")
         .and_hms_opt(12, 0, 0)
         .expect("time");
     let ts_key = connetto_server::pk::encode(&[Value::Timestamp(occurred_at)]);
     let err = auth
-        .can_read(&ctx, "events", &ts_key)
+        .can_read(&principal, "events", &ts_key)
         .await
         .expect_err("timestamp key must fail loudly");
     assert!(

@@ -10,7 +10,7 @@
 //! A deterministic fake server completes the handshake advertising a chosen
 //! schema version, so the test controls exactly what the client compares against.
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
@@ -33,6 +33,7 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
                 connection_id: "server".to_owned(),
                 session_token: "server".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
+                resume_token: "server".to_owned(),
                 schema_version: server_version,
                 initial_credits: 64,
                 last_applied_seq: None,
@@ -46,7 +47,8 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
 fn config(schema_version: Option<SchemaVersion>) -> ClientConfig {
     ClientConfig {
         client_id: "schema-detection".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version,
         sql_functions: connetto_client::SqlFunctions::new(),
     }
@@ -60,7 +62,7 @@ async fn stale_baked_schema_is_rejected_at_handshake() {
 
     let result = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config(Some(client_version.clone())),
         None,
@@ -91,7 +93,7 @@ async fn matching_schema_connects() {
 
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config(Some(version)),
         None,
@@ -115,7 +117,7 @@ async fn undeclared_client_rejected_by_versioned_server() {
 
     let result = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config(None),
         None,
@@ -140,7 +142,7 @@ async fn empty_server_skips_detection() {
 
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config(Some(SchemaVersion::from_source(
             "CREATE TABLE orders (id INT);",

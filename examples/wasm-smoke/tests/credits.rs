@@ -29,7 +29,7 @@
 mod common;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, NonFatalError,
     SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
@@ -125,6 +125,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: "credits-upstream".to_owned(),
             session_token: "credits".to_owned(),
+            resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: INITIAL_CREDITS,
@@ -194,7 +195,6 @@ async fn recv(tab: &mut LoopbackTransport) -> IncomingFrame {
 async fn hub_enforces_the_per_tab_credit_window() {
     let base = unique_base();
     let worker_token = common::mint_token().await;
-    let tab_token = common::mint_token().await;
 
     // The worker's upstream is a fake server we drive frame by frame. It seeds
     // one row up front, so the worker replica is non-empty before the hub runs.
@@ -204,12 +204,13 @@ async fn hub_enforces_the_per_tab_credit_window() {
 
     let worker_config = ClientConfig {
         client_id: format!("credits-worker-{base}"),
-        auth_token: worker_token,
+        login: Some(Grant::new(worker_token)),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
     let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
             .expect("worker connect");
     worker
@@ -243,7 +244,6 @@ async fn hub_enforces_the_per_tab_credit_window() {
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
         format!("credits-tab-{base}"),
-        &tab_token,
     )))
     .await
     .expect("tab handshake");

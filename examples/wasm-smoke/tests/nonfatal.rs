@@ -21,7 +21,7 @@
 mod common;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck, NonFatalError, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
@@ -57,6 +57,7 @@ async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: session.to_owned(),
             session_token: "nonfatal".to_owned(),
+            resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: 64,
@@ -138,7 +139,8 @@ where
 async fn tab_config(base: i64, tag: &str) -> ClientConfig {
     ClientConfig {
         client_id: format!("nonfatal-{tag}-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     }
@@ -152,7 +154,7 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
 
     let worker_cfg = tab_config(base, "worker").await;
     let worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_cfg, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
             .expect("worker connect");
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
@@ -163,7 +165,7 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
     let tab_cfg = tab_config(base, "tab").await;
-    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_cfg, None)
+    let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");
 
@@ -212,7 +214,7 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
 
     let worker_cfg = tab_config(base, "worker").await;
     let worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_cfg, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
             .expect("worker connect");
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
@@ -223,7 +225,7 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
     let tab_cfg = tab_config(base, "tab").await;
-    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_cfg, None)
+    let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");
 
@@ -255,7 +257,7 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
 
     let worker_cfg = tab_config(base, "worker").await;
     let worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_cfg, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
             .expect("worker connect");
 
@@ -276,7 +278,7 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
     let tab_cfg = tab_config(base, "tab").await;
-    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_cfg, None)
+    let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)

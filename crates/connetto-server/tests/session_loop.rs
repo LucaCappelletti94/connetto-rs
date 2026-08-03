@@ -14,7 +14,7 @@ use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, Ping, Subscribe, SubscriptionSpec,
     Unsubscribe,
 };
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
@@ -45,7 +45,7 @@ impl SnapshotSource for SeedSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -160,7 +160,7 @@ async fn loopback_session_full_lifecycle() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         config,
@@ -175,11 +175,10 @@ async fn loopback_session_full_lifecycle() {
 
     // Handshake.
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "client-a",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-a")
+                .with_grant(connetto_core::messages::Grant::new("user:client-a")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(ack) = next_control(&mut client).await else {
@@ -289,7 +288,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         materializer,
         SeedSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         SessionConfig::default(),
@@ -317,11 +316,10 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         .expect("ws connect");
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "client-ws",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-ws")
+                .with_grant(connetto_core::messages::Grant::new("user:client-ws")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {

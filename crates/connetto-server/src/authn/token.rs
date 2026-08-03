@@ -1,17 +1,19 @@
-//! connetto's own session access token: lifetimes, minting, and verification.
+//! connetto's own signed tokens: lifetimes, minting, and checking.
 //!
-//! The access token is short-lived and asymmetrically signed (Ed25519 through
-//! `jsonwebtoken`, ring-backed, native backend only). It carries the identity
-//! (`user_id`) plus the session id, so the handshake trusts the identity from
-//! the signature alone and checks liveness separately. Verification pins the
+//! Everything here is asymmetrically signed (Ed25519 through `jsonwebtoken`,
+//! ring-backed, native backend only) under one key. Three things carry that
+//! signature: a login grant naming a person and the run the auth store opened,
+//! a capability grant naming a subject that is not a person, and the resume
+//! blob naming the run of a caller with no identity. Checking pins the
 //! algorithm (rejecting `none` and any symmetric algorithm), the issuer, the
 //! audience, and the expiry. See `docs/architecture/11-authentication.md`.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
-use connetto_core::auth::AuthContext;
 pub use connetto_core::auth::VerifiedSession;
+use connetto_core::auth::{AuthContext, CapabilitySubject, Subject};
+use connetto_core::messages::Grant;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -24,6 +26,8 @@ const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_REFRESH_IDLE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Default absolute refresh ceiling, a hard maximum regardless of use.
 const DEFAULT_REFRESH_ABSOLUTE_CEILING: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+/// Default window in which a caller with no identity may keep resuming.
+const DEFAULT_RESUME_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Server-side authentication configuration: token identity and lifetimes.
 ///
@@ -39,6 +43,12 @@ pub struct AuthConfig {
     pub audience: String,
     /// Access-token lifetime.
     pub access_ttl: Duration,
+    /// How long a caller with no identity may keep resuming the same run.
+    ///
+    /// It bounds a bearer blob that no login backs, so it cannot be endless,
+    /// and it is the lifetime of the canonical case for an unidentified run,
+    /// a shopping cart the visitor comes back to.
+    pub resume_ttl: Duration,
     /// Sliding refresh window, extended on each online refresh.
     pub refresh_idle_window: Duration,
     /// Absolute refresh ceiling, never extended.
@@ -51,6 +61,7 @@ impl Default for AuthConfig {
             issuer: "connetto".to_owned(),
             audience: "connetto".to_owned(),
             access_ttl: DEFAULT_ACCESS_TTL,
+            resume_ttl: DEFAULT_RESUME_TTL,
             refresh_idle_window: DEFAULT_REFRESH_IDLE_WINDOW,
             refresh_absolute_ceiling: DEFAULT_REFRESH_ABSOLUTE_CEILING,
         }
@@ -94,8 +105,24 @@ pub enum TokenError {
     Clock,
 }
 
-/// The claims connetto signs into its access token. `sub` is the `user_id`,
-/// `sid` names the session for the liveness check, and the pair rebuilds the
+/// What one signed grant claims, tagged by the kind of subject it names.
+///
+/// The tag is inside the signed payload, so choosing how to read a grant is
+/// reading a checked claim rather than sniffing an opaque string, and one
+/// `decode` handles both kinds with no order of attempts.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "knd")]
+enum GrantClaims<Id> {
+    /// A login grant.
+    #[serde(rename = "user")]
+    User(AccessClaims<Id>),
+    /// A capability grant.
+    #[serde(rename = "key")]
+    Key(CapabilityClaims),
+}
+
+/// The claims connetto signs into a login grant. `sub` is the `user_id`, `sid`
+/// names the run for the liveness check, and the pair rebuilds the
 /// [`AuthContext`] at the handshake with no store round-trip.
 #[derive(Debug, Serialize, Deserialize)]
 struct AccessClaims<Id> {
@@ -107,10 +134,42 @@ struct AccessClaims<Id> {
     sid: SessionId,
 }
 
-/// Mints and verifies connetto's own asymmetrically signed access token.
+/// The claims connetto signs into a capability grant. `sub` is the subject the
+/// authorization model relates permissions to, and there is deliberately
+/// nothing else: a permission inside the token would split authorization
+/// between the token and the model.
+#[derive(Debug, Serialize, Deserialize)]
+struct CapabilityClaims {
+    iss: String,
+    aud: String,
+    sub: String,
+    iat: u64,
+    exp: u64,
+}
+
+/// The claims connetto signs into the resume blob. `sub` is the run's handle.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResumeClaims {
+    iss: String,
+    aud: String,
+    sub: SessionId,
+    iat: u64,
+    exp: u64,
+    knd: ResumeKind,
+}
+
+/// The resume blob's own tag, disjoint from every grant tag, so a grant cannot
+/// be presented as a handle and a handle cannot be presented as a grant.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum ResumeKind {
+    #[serde(rename = "run")]
+    Run,
+}
+
+/// Mints and checks everything connetto signs under one key.
 ///
-/// The algorithm is Ed25519 (`EdDSA`). Verification pins the algorithm, so a
-/// token signed with any other algorithm (or the `none` algorithm, which
+/// The algorithm is Ed25519 (`EdDSA`). Checking pins the algorithm, so a token
+/// signed with any other algorithm (or the `none` algorithm, which
 /// `jsonwebtoken` has no variant for) is refused, and it pins the issuer,
 /// audience, and expiry.
 pub struct TokenAuthority {
@@ -119,6 +178,7 @@ pub struct TokenAuthority {
     issuer: String,
     audience: String,
     access_ttl: Duration,
+    resume_ttl: Duration,
 }
 
 impl TokenAuthority {
@@ -169,6 +229,7 @@ impl TokenAuthority {
             issuer: config.issuer.clone(),
             audience: config.audience.clone(),
             access_ttl: config.access_ttl,
+            resume_ttl: config.resume_ttl,
         }
     }
 
@@ -193,46 +254,121 @@ impl TokenAuthority {
     ) -> Result<String, TokenError> {
         let iat = unix_secs(issued_at)?;
         let exp = iat.saturating_add(self.access_ttl.as_secs());
-        let claims = AccessClaims {
+        let claims = GrantClaims::User(AccessClaims {
             iss: self.issuer.clone(),
             aud: self.audience.clone(),
             sub: context.user_id.clone(),
             iat,
             exp,
             sid: session_id,
+        });
+        encode(&Header::new(Algorithm::EdDSA), &claims, &self.encoding)
+            .map_err(|err| TokenError::Mint(err.to_string()))
+    }
+
+    /// Mint a capability grant naming `subject`, expiring `ttl` after
+    /// `issued_at`.
+    ///
+    /// The raw signing primitive, the counterpart of
+    /// [`mint_access`](Self::mint_access). It carries no permission and checks
+    /// nothing about whether the caller may share: the authorization model
+    /// holds the permission as a relation on `subject`, and the check that a
+    /// caller may not share what it cannot read wraps this call rather than
+    /// living inside it.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Clock`] if `issued_at` precedes the unix epoch, or
+    /// [`TokenError::Mint`] if signing fails.
+    pub fn mint_capability(
+        &self,
+        subject: &CapabilitySubject,
+        issued_at: SystemTime,
+        ttl: Duration,
+    ) -> Result<String, TokenError> {
+        let iat = unix_secs(issued_at)?;
+        let claims = GrantClaims::<()>::Key(CapabilityClaims {
+            iss: self.issuer.clone(),
+            aud: self.audience.clone(),
+            sub: subject.as_str().to_owned(),
+            iat,
+            exp: iat.saturating_add(ttl.as_secs()),
+        });
+        encode(&Header::new(Algorithm::EdDSA), &claims, &self.encoding)
+            .map_err(|err| TokenError::Mint(err.to_string()))
+    }
+
+    /// Check one grant's signature, algorithm, issuer, audience and expiry, and
+    /// read the subject it names.
+    ///
+    /// Self-contained: it needs no store, because the signature is the proof.
+    /// A login grant's liveness is checked separately, which is what makes
+    /// revocation authoritative.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Verify`] if any check fails.
+    pub fn check_grant<Id: DeserializeOwned>(
+        &self,
+        grant: &Grant,
+    ) -> Result<Subject<Id>, TokenError> {
+        let data = decode::<GrantClaims<Id>>(grant.as_str(), &self.decoding, &self.validation())
+            .map_err(|err| TokenError::Verify(err.to_string()))?;
+        Ok(match data.claims {
+            GrantClaims::User(claims) => Subject::Identity(VerifiedSession {
+                context: AuthContext {
+                    user_id: claims.sub,
+                },
+                session_id: claims.sid,
+            }),
+            GrantClaims::Key(claims) => Subject::Capability(CapabilitySubject::new(claims.sub)),
+        })
+    }
+
+    /// Mint the resume blob naming `session_id`, expiring `resume_ttl` after
+    /// `issued_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Clock`] if `issued_at` precedes the unix epoch, or
+    /// [`TokenError::Mint`] if signing fails.
+    pub fn mint_resume(
+        &self,
+        session_id: SessionId,
+        issued_at: SystemTime,
+    ) -> Result<String, TokenError> {
+        let iat = unix_secs(issued_at)?;
+        let claims = ResumeClaims {
+            iss: self.issuer.clone(),
+            aud: self.audience.clone(),
+            sub: session_id,
+            iat,
+            exp: iat.saturating_add(self.resume_ttl.as_secs()),
+            knd: ResumeKind::Run,
         };
         encode(&Header::new(Algorithm::EdDSA), &claims, &self.encoding)
             .map_err(|err| TokenError::Mint(err.to_string()))
     }
 
-    /// Verify an access token's signature, algorithm, issuer, audience, and
-    /// expiry, and rebuild the identity it carries.
-    ///
-    /// This is self-contained: it needs no store, because the signature is the
-    /// proof. The handshake still checks session liveness separately, which is
-    /// what makes revocation authoritative.
+    /// Read the handle out of a resume blob this authority signed.
     ///
     /// # Errors
     ///
-    /// [`TokenError::Verify`] if any check fails.
-    pub fn verify_access<Id: DeserializeOwned>(
-        &self,
-        token: &str,
-    ) -> Result<VerifiedSession<Id>, TokenError> {
+    /// [`TokenError::Verify`] if the blob is not one this authority signed, has
+    /// expired, or is a grant rather than a handle.
+    pub fn verify_resume(&self, blob: &str) -> Result<SessionId, TokenError> {
+        let data = decode::<ResumeClaims>(blob, &self.decoding, &self.validation())
+            .map_err(|err| TokenError::Verify(err.to_string()))?;
+        Ok(data.claims.sub)
+    }
+
+    /// The shared check: pin the algorithm, issuer, audience and expiry.
+    fn validation(&self) -> Validation {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.audience.as_str()]);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        let data = decode::<AccessClaims<Id>>(token, &self.decoding, &validation)
-            .map_err(|err| TokenError::Verify(err.to_string()))?;
-        let claims = data.claims;
-        let context = AuthContext {
-            user_id: claims.sub,
-        };
-        Ok(VerifiedSession {
-            context,
-            session_id: claims.sid,
-        })
+        validation
     }
 }
 

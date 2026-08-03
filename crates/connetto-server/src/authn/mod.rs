@@ -29,7 +29,7 @@ pub use provider::{
     PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
-pub use service::{AuthError, AuthService, ConnettoSessionVerifier, TokenPair};
+pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, TokenPair};
 pub use store::{
     AuthStore, AuthStoreError, InMemoryAuthStore, IssuedSession, RefreshOutcome, ResolvedIdentity,
 };

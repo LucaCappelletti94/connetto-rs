@@ -146,7 +146,7 @@ pub struct LogoutRequest {
 /// device that owns the replica.
 #[derive(Debug, Serialize)]
 pub struct TokenResponse<Id> {
-    /// The short-lived access token for `Handshake.auth_token`.
+    /// The short-lived access token, presented as one grant on the handshake.
     pub access_token: String,
     /// The rotating refresh token.
     pub refresh_token: String,

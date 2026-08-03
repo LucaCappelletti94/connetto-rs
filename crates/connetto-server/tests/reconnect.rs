@@ -22,9 +22,9 @@ use std::time::Duration;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, Handshake, Subscribe, SubscriptionSpec,
 };
-use connetto_core::test_support::TestSessionVerifier;
-use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, SessionVerifier};
+use connetto_core::test_support::TestGrantChecker;
+use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
     SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -42,8 +42,8 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> std::sync::Arc<dyn HandshakeAuthority> {
+    std::sync::Arc::new(TestGrantChecker)
 }
 
 /// A snapshot source returning one seed row. Only the full-resync path delivers
@@ -58,7 +58,7 @@ impl SnapshotSource for SeedSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -185,7 +185,9 @@ async fn open_session(
     let handle = tokio::spawn(async move {
         server.serve(server_transport).await.expect("session ok");
     });
-    let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id, "token");
+    let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id).with_grant(
+        connetto_core::messages::Grant::new(format!("user:{client_id}")),
+    );
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor);
     }

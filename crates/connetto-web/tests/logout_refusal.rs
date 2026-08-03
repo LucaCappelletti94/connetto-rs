@@ -45,7 +45,8 @@ diesel::table! {
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "e43".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(connetto_client::Grant::new("user:tester")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: SqlFunctions::new(),
     }
@@ -81,10 +82,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     let url = storage.db_url(REPLICA);
     let mut worker = ConnettoConnection::connect(
         FakeTransport::accepting_but_silent(),
-        &Replica::EncryptedFile {
-            path: &url,
-            key: replica_key(),
-        },
+        &Replica::encrypted_file(&url, Some(replica_key())).expect("a resolved key"),
         SQLITE_DDL,
         &config(),
         None,

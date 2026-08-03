@@ -39,8 +39,7 @@
 //!       issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
 //!       expires_at_ms BIGINT)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY \
-//!       REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
+//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, \
 //!       last_seq BIGINT NOT NULL)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "$(cat examples/wasm-smoke/roles.sql)"
@@ -67,7 +66,11 @@
 //!
 //! Both processes select `DbAuthStore` because `DATABASE_URL` is set, so the two
 //! session tables have to exist before either starts, and `connetto_sessions` is
-//! first because the other two reference it. They belong to the deployment, not
+//! first because `connetto_provider_tokens` references it. The watermark table
+//! deliberately references nothing: every run has a handle and only a login has
+//! a row in `connetto_sessions`, so a foreign key there would fail on the first
+//! write by a caller with no identity, and the server now refuses to start
+//! against a table that still declares one. They belong to the deployment, not
 //! to connetto, which emits no server DDL: the shape is the reference SQL under
 //! "Migrations" in `docs/architecture/11-authentication.md`, over the `TEXT`
 //! `user_id` the reference binary's `String` id maps to. The reader role needs no

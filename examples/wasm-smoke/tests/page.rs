@@ -17,7 +17,7 @@ mod common;
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
 };
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
@@ -58,11 +58,12 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("{name}-{}", unique_id()),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+    ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await
         .expect("client connect")
 }

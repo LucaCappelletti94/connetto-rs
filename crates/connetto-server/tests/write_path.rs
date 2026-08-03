@@ -13,13 +13,10 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::convert::Infallible;
-use std::sync::Arc;
-
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::Principal;
 use connetto_core::messages::{ControlMessage, MutationRejectReason};
-use connetto_core::test_support::TestSessionVerifier;
-use connetto_core::traits::{AuthPolicy, MutationOp, SessionVerifier};
+use connetto_core::test_support::TestGrantChecker;
+use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
@@ -30,11 +27,12 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
+use std::convert::Infallible;
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
+    std::sync::Arc::new(TestGrantChecker)
 }
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
@@ -48,7 +46,7 @@ impl SnapshotSource for NoSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -66,7 +64,7 @@ impl AuthPolicy for DenyAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_read(
         &self,
-        _ctx: &AuthContext,
+        _ctx: &Principal,
         _table: &str,
         _pk: &[u8],
     ) -> Result<bool, Self::Error> {
@@ -76,7 +74,7 @@ impl AuthPolicy for DenyAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_write(
         &self,
-        _ctx: &AuthContext,
+        _ctx: &Principal,
         _table: &str,
         _pk: &[u8],
         _op: MutationOp,
@@ -375,7 +373,7 @@ async fn watermark_survives_reconnect_reusing_session() {
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
-    let ack = client.handshake_with("worker-boot-1", "alice").await;
+    let ack = client.handshake_with("worker-boot-1", "user:alice").await;
     assert_eq!(
         ack.last_applied_seq, None,
         "a fresh session has no watermark"
@@ -409,7 +407,7 @@ async fn watermark_survives_reconnect_reusing_session() {
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
-    let ack = client.handshake_with("worker-boot-2", "alice").await;
+    let ack = client.handshake_with("worker-boot-2", "user:alice").await;
     assert_eq!(
         ack.last_applied_seq,
         Some(2),
@@ -449,7 +447,7 @@ async fn watermark_survives_reconnect_reusing_session() {
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
-    let ack = client.handshake_with("worker-boot-3", "bob").await;
+    let ack = client.handshake_with("worker-boot-3", "user:bob").await;
     assert_eq!(
         ack.last_applied_seq, None,
         "a different session carries its own watermark"

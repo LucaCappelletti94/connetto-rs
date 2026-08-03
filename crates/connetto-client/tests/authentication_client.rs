@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper, replica_db_name,
+    Encrypted, Grant, ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper,
+    replica_db_name,
 };
 use connetto_core::messages::FatalErrorReason;
 use connetto_core::test_support::{FakeClosed, FakeTransport};
@@ -27,29 +28,36 @@ diesel::table! {
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "phase6".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: SqlFunctions::new(),
     }
 }
 
 #[tokio::test]
-async fn handshake_rejection_surfaces_as_auth_error() {
-    let transport = FakeTransport::rejecting();
-    let result =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
-            .await;
-    match result {
-        Err(ClientError::Auth(_)) => {}
-        Err(other) => panic!("expected ClientError::Auth, got {other:?}"),
-        Ok(_) => panic!("expected the handshake to be rejected"),
-    }
+async fn handshake_with_refused_grant_still_succeeds() {
+    // A refused grant changes nothing on the wire: the run simply continues
+    // unidentified and connect returns Ok.
+    let transport = FakeTransport::accepting();
+    let result = ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        SQLITE_DDL,
+        &config(),
+        None,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a refused grant must not close the connection"
+    );
 }
 
 /// First-boot `replica`, write `label`, and leave the captured mutation queued,
 /// since the fake server acknowledges the handshake and nothing else. Returns the
 /// pending sequence numbers, captured before the connection drops.
-async fn first_boot_with_a_queued_row(replica: &Replica<'_>, label: &str) -> Vec<u64> {
+async fn first_boot_with_a_queued_row(replica: &Replica<'_, Encrypted>, label: &str) -> Vec<u64> {
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
         replica,
@@ -111,14 +119,9 @@ async fn each_identity_opens_its_own_replica() {
 
     let alice_key = ReplicaKey::from_bytes([0x11; ReplicaKey::LEN]);
     let bob_key = ReplicaKey::from_bytes([0x22; ReplicaKey::LEN]);
-    let alice_replica = Replica::EncryptedFile {
-        path: &alice,
-        key: alice_key.clone(),
-    };
-    let bob_replica = Replica::EncryptedFile {
-        path: &bob,
-        key: bob_key,
-    };
+    let alice_replica =
+        Replica::encrypted_file(&alice, Some(alice_key.clone())).expect("key provided");
+    let bob_replica = Replica::encrypted_file(&bob, Some(bob_key)).expect("key provided");
 
     // Alice syncs a row into her replica and leaves a mutation queued, since the
     // fake server acknowledges the handshake and nothing else.
@@ -159,10 +162,7 @@ async fn each_identity_opens_its_own_replica() {
     // into a cross-identity resume even if the file selection were wrong.
     let crossed = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &bob,
-            key: alice_key.clone(),
-        },
+        &Replica::encrypted_file(&bob, Some(alice_key.clone())).expect("key provided"),
         &config(),
         None,
     )
@@ -198,14 +198,17 @@ async fn each_identity_opens_its_own_replica() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_routes_rejected_credential_to_relogin() {
-    // The live session drops, and every reconnect attempt is met with a
-    // rejected credential: the driver must stop retrying and signal re-login.
+    // The live session drops, and the token source returns an Auth error:
+    // the driver must stop retrying and signal re-login.
     let initial = FakeTransport::accepting();
     let conn =
-        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
             .await
-            .expect("initial connect");
-    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::rejecting()) };
+            .expect("initial connect")
+            .with_token_source(AccessTokenSource::new(|| async {
+                Err(ClientError::Auth("credential no longer valid".to_owned()))
+            }));
+    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy {
         initial_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
@@ -241,12 +244,15 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
 async fn a_mid_session_close_surfaces_its_reason_then_routes_to_relogin() {
     let initial = FakeTransport::accepting_then_closing(FatalErrorReason::SessionRevoked);
     let conn =
-        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
             .await
-            .expect("initial connect");
-    // A revoked session's next handshake is refused, which is what turns the
-    // close into an interactive re-login rather than an endless retry.
-    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::rejecting()) };
+            .expect("initial connect")
+            .with_token_source(AccessTokenSource::new(|| async {
+                Err(ClientError::Auth("credential no longer valid".to_owned()))
+            }));
+    // A revoked session causes the token source to fail on the next reconnect,
+    // routing to re-login rather than an endless retry.
+    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy {
         initial_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
@@ -287,7 +293,7 @@ async fn reconnect_retries_a_transient_refresh_fault() {
     // re-login.
     let initial = FakeTransport::accepting();
     let conn =
-        ConnettoConnection::connect(initial, &Replica::Ephemeral, SQLITE_DDL, &config(), None)
+        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
             .await
             .expect("initial connect")
             .with_token_source(AccessTokenSource::new(|| async {

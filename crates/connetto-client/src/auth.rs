@@ -359,7 +359,7 @@ struct TokenResponse<Id> {
 /// fresh replica, or to [`ReplicaKeyStore::load`] for one already on disk.
 #[derive(Debug, Clone)]
 pub struct AcquiredSession<Id> {
-    /// connetto's short-lived access token, carried in `Handshake.auth_token`.
+    /// connetto's short-lived access token, presented as one grant on the handshake.
     pub access_token: String,
     /// The typed `user_id` this session belongs to. It selects the replica
     /// file through

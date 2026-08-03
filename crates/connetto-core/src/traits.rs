@@ -13,9 +13,10 @@
 //! `MaybeSend` IS `Send`.
 
 use crate::{
-    auth::{AuthContext, VerifiedSession},
+    SessionId,
+    auth::{Principal, Subject},
     cursor::Cursor,
-    messages::{BulkMessage, ControlMessage},
+    messages::{BulkMessage, ControlMessage, Grant},
 };
 
 /// `Send` on native targets, nothing on wasm.
@@ -185,80 +186,144 @@ pub trait AuthPolicy<Id = String> {
     /// Policy-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Whether `ctx` may see the row identified by `(table, pk)`.
+    /// Whether `caller` may see the row identified by `(table, pk)`.
     async fn can_read(
         &self,
-        ctx: &AuthContext<Id>,
+        caller: &Principal<Id>,
         table: &str,
         pk: &[u8],
     ) -> Result<bool, Self::Error>;
 
-    /// Whether `ctx` may perform `op` on the row identified by `(table, pk)`.
+    /// Whether `caller` may perform `op` on the row identified by `(table, pk)`.
     async fn can_write(
         &self,
-        ctx: &AuthContext<Id>,
+        caller: &Principal<Id>,
         table: &str,
         pk: &[u8],
         op: MutationOp,
     ) -> Result<bool, Self::Error>;
 }
 
-/// Why a session credential was refused at the handshake.
+/// Why one grant was refused at the handshake.
 ///
-/// [`run_handshake`](crate::traits::SessionVerifier::verify_session) collapses
-/// every refusal to a single wire reason
-/// ([`FatalErrorReason::AuthenticationFailed`](crate::messages::FatalErrorReason::AuthenticationFailed)),
-/// so the distinction here exists for server-side logging and audit rather than
-/// for the client.
+/// A refusal never reaches the client: the connection stays open, the session
+/// proceeds on whatever else resolved, and [`HandshakeAck`] carries nothing
+/// about it, so not allowed, no longer allowed and never existed are
+/// indistinguishable on the wire. The distinction here exists for the server's
+/// structured log, which is the only place a refusal is visible.
+///
+/// [`HandshakeAck`]: crate::messages::HandshakeAck
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionVerifyError {
-    /// The credential was absent, malformed, or failed its signature or expiry
-    /// checks, so nothing about the caller can be trusted.
+pub enum GrantRefused {
+    /// The grant was malformed, or failed its signature, issuer, audience or
+    /// expiry checks, so nothing about the bearer can be trusted.
     Invalid(String),
-    /// The credential verified cryptographically, but its session is no longer
-    /// live in the auth store (revoked or expired), so it is refused.
+    /// The grant checked out cryptographically, but the login it names is no
+    /// longer live in the auth store (revoked or expired).
     Revoked,
 }
 
-impl core::fmt::Display for SessionVerifyError {
+impl core::fmt::Display for GrantRefused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Invalid(detail) => write!(f, "invalid session credential: {detail}"),
-            Self::Revoked => write!(f, "session is no longer live"),
+            Self::Invalid(detail) => write!(f, "invalid grant: {detail}"),
+            Self::Revoked => write!(f, "the login this grant names is no longer live"),
         }
     }
 }
 
-impl std::error::Error for SessionVerifyError {}
+impl GrantRefused {
+    /// A short stable word for the log, so a refusal can be counted and
+    /// filtered without parsing a sentence.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Revoked => "revoked",
+        }
+    }
+}
 
-/// Boxed future produced by [`SessionVerifier::verify_session`].
+impl std::error::Error for GrantRefused {}
+
+/// Boxed future produced by [`HandshakeAuthority::check_grant`].
 ///
-/// A trait object cannot carry an `async fn` directly, so verification returns
-/// an explicitly boxed `Send` future. Verification fires once per connection
+/// A trait object cannot carry an `async fn` directly, so checking returns an
+/// explicitly boxed `Send` future. Checking fires once per grant per connection
 /// off any hot path, so the box allocation is irrelevant.
-pub type SessionVerifyFuture<'a, Id = String> = core::pin::Pin<
-    Box<dyn Future<Output = Result<VerifiedSession<Id>, SessionVerifyError>> + Send + 'a>,
->;
+pub type GrantCheckFuture<'a, Id = String> =
+    core::pin::Pin<Box<dyn Future<Output = Result<Subject<Id>, GrantRefused>> + Send + 'a>>;
 
-/// Turns connetto's own session credential into a verified
-/// [`VerifiedSession`] (identity context plus the connetto-minted session id).
+/// A resume blob could not be minted or was not one this server signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleError(pub String);
+
+impl core::fmt::Display for HandleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "resume blob rejected: {}", self.0)
+    }
+}
+
+impl std::error::Error for HandleError {}
+
+/// Everything connetto signs and checks at the handshake: the grants a caller
+/// presents, and the resume blob it hands a caller back.
 ///
-/// The handshake resolves identity only through this seam, never from the
-/// client-supplied `client_id`. A real implementation verifies the token's
-/// signature and expiry (self-contained, no store round-trip) and checks that
-/// the session is still live in the auth store, which is what makes revocation
-/// authoritative rather than bounded by the token lifetime. See
-/// `docs/architecture/11-authentication.md`.
+/// Both halves are one seam because both are the server's own signature under
+/// one key, and no deployment would supply one without the other. They stay
+/// distinct in the model regardless: a grant says who is calling, a handle says
+/// which run this is, and `Handshake` carries them in separate fields.
 ///
-/// It is held as a runtime trait object on the server (`Arc<dyn SessionVerifier<Id>>`)
-/// rather than a generic type parameter, because verification is off any hot
-/// path so static dispatch buys nothing, and a trait object keeps the server's
-/// public type signature stable no matter how a deployment configures identity.
-/// This mirrors the [`AuthPolicy`] pattern of a real implementation plus a
-/// stand-in, with the stand-in confined to the `test-support` feature so no
-/// production build can reach it.
-pub trait SessionVerifier<Id = String>: Send + Sync {
-    /// Verify `auth_token` (connetto's own access token) and resolve the session
-    /// identity plus its session id, or refuse it with a [`SessionVerifyError`].
-    fn verify_session<'a>(&'a self, auth_token: &'a str) -> SessionVerifyFuture<'a, Id>;
+/// It is held as a runtime trait object on the server
+/// (`Arc<dyn HandshakeAuthority<Id>>`) rather than a generic type parameter,
+/// because none of this is on a hot path so static dispatch buys nothing, and a
+/// trait object keeps the server's public type signature stable no matter how a
+/// deployment configures identity.
+pub trait HandshakeAuthority<Id = String>: Send + Sync {
+    /// Check one grant and resolve the [`Subject`] it names, or refuse it.
+    ///
+    /// This half is the generalization of the old single-credential verifier,
+    /// and it is not a resolver: mapping a provider's claims to a typed user id
+    /// happens once per login and is somebody else's job. Checking is
+    /// arithmetic, a signature check against connetto's own public key, with no
+    /// database lookup, nothing sniffing the shape of a string, and no order of
+    /// checks that changes the outcome. One implementation reads either kind of
+    /// subject, because a login token and a share key are the same mechanism
+    /// differing only in whom they name.
+    ///
+    /// The one store round trip that remains is confined to the login case and
+    /// is not a lookup that recognises the grant, since the signature already
+    /// did that. It asks whether the login the grant names is still live, which
+    /// is what makes revocation authoritative rather than bounded by the
+    /// token's remaining lifetime. A capability needs no such call, because
+    /// withdrawing one is deleting the relation that grants it and there is
+    /// nothing to keep alive.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantRefused`] when the grant does not check out. A refusal never
+    /// reaches the client.
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, Id>;
+
+    /// Mint the resume blob naming `session_id`, for a caller with no identity
+    /// to present on its next connection.
+    ///
+    /// An identified run needs none: its handle rides inside its login grant.
+    ///
+    /// # Errors
+    ///
+    /// [`HandleError`] when signing fails.
+    fn mint_handle(&self, session_id: SessionId) -> Result<String, HandleError>;
+
+    /// Read the handle out of a resume blob, refusing one this server did not
+    /// sign or one that has expired.
+    ///
+    /// Refusing an unsigned blob is what stops a caller choosing the key to its
+    /// own server-side state, or resuming as another visitor whose handle it
+    /// guessed.
+    ///
+    /// # Errors
+    ///
+    /// [`HandleError`] when the blob is not one this server signed.
+    fn read_handle(&self, blob: &str) -> Result<SessionId, HandleError>;
 }

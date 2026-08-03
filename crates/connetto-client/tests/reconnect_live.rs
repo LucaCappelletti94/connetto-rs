@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery, ReconnectPolicy,
-    Replica, TokioSleeper,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery,
+    ReconnectPolicy, Replica, TokioSleeper,
 };
-use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
+use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -44,7 +44,7 @@ impl SnapshotSource for SeedSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -103,8 +103,8 @@ type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 /// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
 type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> Arc<dyn HandshakeAuthority> {
+    Arc::new(TestGrantChecker)
 }
 
 /// Rows in the Postgres write target matching `id`, read as admin.
@@ -219,7 +219,8 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
 fn config(client_id: &str) -> ClientConfig {
     ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     }
@@ -246,7 +247,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let transport = open_session(&manager, &slot).await;
     let config = config("reconnect-live");
     let conn =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
             .await
             .expect("client connect");
     let (client, pump) = ConnettoClient::with_reconnect(
@@ -353,7 +354,7 @@ async fn offline_write_reflushes_after_resume() {
     let transport = open_session(&manager, &slot).await;
     let config = config("reconnect-write");
     let conn =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
             .await
             .expect("client connect");
     let (client, pump) = ConnettoClient::with_reconnect(
@@ -439,10 +440,11 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let first = config("restart-first");
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &replica_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(
+            &replica_path,
+            Some(connetto_core::test_support::replica_key()),
+        )
+        .expect("key provided"),
         SQLITE_DDL,
         &first,
         None,
@@ -488,10 +490,11 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let second = config("restart-second");
     let conn = ConnettoConnection::connect_existing(
         transport,
-        &Replica::EncryptedFile {
-            path: &replica_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(
+            &replica_path,
+            Some(connetto_core::test_support::replica_key()),
+        )
+        .expect("key provided"),
         &second,
         None,
     )

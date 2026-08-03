@@ -107,14 +107,14 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
     // Client A subscribes to alice's notes and drains the initial snapshot of
     // the empty table (an empty snapshot may still carry an empty patch frame).
     let mut a = server.connect();
-    a.handshake_with("client-a", "alice#reader").await;
+    a.handshake_with("client-a", "user:alice#reader").await;
     a.subscribe("notes", "SELECT * FROM notes WHERE owner = 'alice'")
         .await;
     let _ = a.expect_snapshot("notes").await;
 
     // Client B applies a local insert of a row it owns.
     let mut b = server.connect();
-    b.handshake_with("client-b", "alice#writer").await;
+    b.handshake_with("client-b", "user:alice#writer").await;
     b.upload(
         1,
         insert_changeset(

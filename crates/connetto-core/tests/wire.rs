@@ -14,10 +14,10 @@ use connetto_core::{
     },
     messages::{
         AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
-        FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
-        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-        NonFatalError, Ping, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
+        LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
+        MutationRejectReason, NonFatalError, Ping, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+        Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -59,13 +59,19 @@ fn round_trip_bulk(message: &BulkMessage) {
 #[test]
 fn handshake_and_ack_round_trip() {
     round_trip_control(&ControlMessage::Handshake(
-        Handshake::new(PROTOCOL_VERSION, "client-a", "auth-token")
-            .with_session_token("prior-session")
+        Handshake::new(PROTOCOL_VERSION, "client-a")
+            .with_grants([Grant::new("login-token"), Grant::new("share-key")])
+            .with_resume_token("prior-run")
             .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef])),
     ));
+    round_trip_control(&ControlMessage::Handshake(Handshake::new(
+        PROTOCOL_VERSION,
+        "client-a",
+    )));
     round_trip_control(&ControlMessage::HandshakeAck(HandshakeAck {
         connection_id: "connection-1".into(),
-        session_token: "opaque".into(),
+        session_token: "opaque-handle".into(),
+        resume_token: "opaque-credential".into(),
         current_cursor: Cursor::new(vec![1, 2, 3, 4]),
         schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
         initial_credits: 128,
@@ -167,8 +173,6 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             expected: PROTOCOL_VERSION,
             got: 999,
         },
-        // SessionManager::run_handshake, when the verifier refuses.
-        FatalErrorReason::AuthenticationFailed,
         // SessionManager::close_session, from the auth service's revoke hook.
         FatalErrorReason::SessionRevoked,
         // SessionManager::register_connection, on a second live handshake.
@@ -183,7 +187,6 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
     for reason in &reasons {
         match reason {
             FatalErrorReason::ProtocolVersionMismatch { .. }
-            | FatalErrorReason::AuthenticationFailed
             | FatalErrorReason::SessionRevoked
             | FatalErrorReason::ConnectionSuperseded
             | FatalErrorReason::ProtocolViolation { .. }

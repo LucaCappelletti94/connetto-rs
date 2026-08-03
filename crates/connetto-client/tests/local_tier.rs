@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica, Watchable,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica, Watchable,
 };
-use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
+use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, WebSocketTransport, pg_write_target,
@@ -109,7 +109,7 @@ impl SnapshotSource for RecordingSnapshot {
         &self,
         select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         if let Ok(mut seen) = self.seen.lock() {
             seen.push(select_sql.to_owned());
@@ -121,8 +121,8 @@ impl SnapshotSource for RecordingSnapshot {
     }
 }
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> Arc<dyn HandshakeAuthority> {
+    Arc::new(TestGrantChecker)
 }
 
 /// One in-process server over a localhost WebSocket, serving `sessions`
@@ -179,18 +179,20 @@ async fn connect_with_tier(
         .expect("ws connect");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let mut client =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
-            .await
-            .expect("client connect");
-    client
-        .attach_local_tier_ddl(":memory:", NOTES_DDL)
-        .expect("attach the local tier");
-    client
+    ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory().with_tier(NOTES_DDL),
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 /// Pump the broadcast stream until an event matches `pred`, failing fast on

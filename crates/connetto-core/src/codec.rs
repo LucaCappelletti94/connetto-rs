@@ -157,6 +157,7 @@ mod tests {
         ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: "connection-abc".into(),
             session_token: "tok-abc".into(),
+            resume_token: "resume-abc".into(),
             current_cursor: Cursor::new(vec![9, 8, 7]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             initial_credits: 64,
@@ -175,7 +176,9 @@ mod tests {
     #[test]
     fn framed_round_trip_matches() {
         let msg = ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "client-a", "tok").with_session_token("prev"),
+            Handshake::new(PROTOCOL_VERSION, "client-a")
+                .with_grant(crate::messages::Grant::new("user:alice"))
+                .with_resume_token("prev"),
         );
         let framed = encode_control_framed(&msg).unwrap();
         assert!(framed.len() > FRAME_HEADER_LEN);

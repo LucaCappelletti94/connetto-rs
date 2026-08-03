@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use connetto_client::{
-    AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, KeyValue,
+    AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, KeyValue,
     LiveQuery, Replica, Watchable,
 };
-use connetto_core::{Cursor, test_support::TestSessionVerifier, traits::SessionVerifier};
+use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
     Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
@@ -41,8 +41,8 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> Arc<dyn HandshakeAuthority> {
+    Arc::new(TestGrantChecker)
 }
 
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
@@ -79,7 +79,7 @@ impl SnapshotSource for SeedSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(seed_snapshot())
     }
@@ -101,7 +101,7 @@ impl SnapshotSource for RecordingSeed {
         &self,
         select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         if let Ok(mut seen) = self.seen.lock() {
             seen.push(select_sql.to_owned());
@@ -205,7 +205,7 @@ impl SnapshotSource for GadgetSeed {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
@@ -364,16 +364,15 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -511,16 +510,15 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -644,16 +642,15 @@ async fn connection_is_a_diesel_connection() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -748,16 +745,15 @@ async fn rejected_write_rolls_back_locally() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -865,16 +861,15 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-a".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let mut client = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -959,21 +954,19 @@ async fn connect_client(
         .expect("ws connect");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        // One user, one session per client. The test verifier reads the part
-        // before the `#` as the identity, so these stay the same caller while
-        // holding distinct durable handles, which is what two devices of one
-        // person look like. Sharing a handle would make the newer connection
-        // supersede the older.
-        auth_token: format!("token#{client_id}"),
+        // One user, one session per client. TestGrantChecker reads the part
+        // between "user:" and "#" as the identity, so these stay the same caller
+        // while holding distinct durable handles, which is what two devices of
+        // one person look like. Sharing a handle would supersede the older.
+        login: Some(Grant::new(format!("user:token#{client_id}"))),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         SQLITE_DDL,
         &config,
         None,
@@ -2612,16 +2605,15 @@ async fn watch_fn_drives_a_boxed_row_query() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "client-gadgets".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         GADGETS_SQLITE_DDL,
         &config,
         None,

@@ -28,7 +28,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use connetto_client::auth::{KeyringKeyStore, ReplicaKeyStore, provision_replica_key};
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
 use tokio::net::TcpStream;
@@ -67,10 +67,10 @@ async fn main() -> Result<()> {
         .map(|source| connetto_core::SchemaVersion::from_source(&source));
     let client_id = env_or("CONNETTO_CLIENT_ID", "anonymous");
     let config = ClientConfig {
-        // The identity is carried in the token now, so a dev loop against the
-        // trusting verifier defaults the token to the client id when
-        // `CONNETTO_TOKEN` is unset.
-        auth_token: env_or("CONNETTO_TOKEN", &client_id),
+        // CONNETTO_TOKEN carries the caller's identity grant. Unset means no
+        // identity: the server accepts an anonymous caller.
+        login: std::env::var("CONNETTO_TOKEN").ok().map(Grant::new),
+        capabilities: Vec::new(),
         client_id,
         schema_version,
         sql_functions: connetto_client::SqlFunctions::new(),

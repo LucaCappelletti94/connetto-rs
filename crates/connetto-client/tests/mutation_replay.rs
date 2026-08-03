@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
-use connetto_core::traits::{IncomingFrame, SessionVerifier, Transport};
-use connetto_core::{Cursor, test_support::TestSessionVerifier};
+use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
@@ -44,7 +44,7 @@ impl SnapshotSource for SeedSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -104,8 +104,8 @@ struct Order {
 
 type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> Arc<dyn HandshakeAuthority> {
+    Arc::new(TestGrantChecker)
 }
 
 /// Reset the fixture to a fresh `orders` table with the watermark provisioned.
@@ -165,6 +165,7 @@ fn black_hole() -> LoopbackTransport {
                 connection_id: "black-hole".to_owned(),
                 session_token: "black-hole".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
+                resume_token: "black-hole".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
                 last_applied_seq: None,
@@ -227,7 +228,8 @@ where
 fn config(client_id: &str) -> ClientConfig {
     ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     }
@@ -261,7 +263,7 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
     // ever processes them.
     let mut conn = ConnettoConnection::connect(
         black_hole(),
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config("replay"),
         None,
@@ -323,7 +325,7 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
 
     let mut conn = ConnettoConnection::connect(
         client_end,
-        &Replica::Ephemeral,
+        &Replica::in_memory(),
         SQLITE_DDL,
         &config("dedupe"),
         None,
@@ -363,10 +365,11 @@ async fn restart_replays_persisted_pending() {
     {
         let mut conn = ConnettoConnection::connect(
             black_hole(),
-            &Replica::EncryptedFile {
-                path: &replica_path,
-                key: connetto_core::test_support::replica_key(),
-            },
+            &Replica::encrypted_file(
+                &replica_path,
+                Some(connetto_core::test_support::replica_key()),
+            )
+            .expect("key provided"),
             SQLITE_DDL,
             &config("restart"),
             None,
@@ -381,10 +384,11 @@ async fn restart_replays_persisted_pending() {
     // record, and the connect-time reconcile replays it.
     let mut conn = ConnettoConnection::connect_existing(
         open_session(&manager),
-        &Replica::EncryptedFile {
-            path: &replica_path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(
+            &replica_path,
+            Some(connetto_core::test_support::replica_key()),
+        )
+        .expect("key provided"),
         &config("restart"),
         None,
     )

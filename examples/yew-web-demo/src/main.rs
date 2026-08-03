@@ -326,14 +326,20 @@ async fn boot_window() -> Result<Boot, JsValue> {
         .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let config = ClientConfig {
         client_id: client_id.clone(),
-        auth_token: "token".to_owned(),
+        login: None,
+        capabilities: Vec::new(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
         sql_functions: uuidv7_functions(),
     };
-    let conn =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, DEMO_TAB_DDL, &config, None)
-            .await
-            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        DEMO_TAB_DDL,
+        &config,
+        None,
+    )
+    .await
+    .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let policy = ReconnectPolicy {
         initial_backoff: core::time::Duration::from_millis(100),
         max_backoff: core::time::Duration::from_secs(2),

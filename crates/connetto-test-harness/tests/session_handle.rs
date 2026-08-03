@@ -81,7 +81,7 @@ async fn revocation_closes_an_idle_connection() {
     let server = serve(&fixture).await;
 
     let mut client = server.connect();
-    let ack = client.handshake_with("conn-label", "alice").await;
+    let ack = client.handshake_with("conn-label", "user:alice").await;
     let handle = SessionId::from_str(&ack.session_token).expect("the ack carries the handle");
 
     assert!(
@@ -110,9 +110,9 @@ async fn shutdown_closes_every_live_connection() {
     let server = serve(&fixture).await;
 
     let mut alice = server.connect();
-    alice.handshake_with("alice-device", "alice").await;
+    alice.handshake_with("alice-device", "user:alice").await;
     let mut bob = server.connect();
-    bob.handshake_with("bob-device", "bob").await;
+    bob.handshake_with("bob-device", "user:bob").await;
 
     assert_eq!(
         server.manager().shutdown().await,
@@ -140,7 +140,7 @@ async fn revocation_closes_a_subscribed_connection() {
     let server = serve(&fixture).await;
 
     let mut client = server.connect();
-    let ack = client.handshake_with("conn-label", "alice").await;
+    let ack = client.handshake_with("conn-label", "user:alice").await;
     let handle = SessionId::from_str(&ack.session_token).expect("the ack carries the handle");
     client.subscribe("notes", "SELECT * FROM notes").await;
     let _ = client.expect_snapshot("notes").await;
@@ -170,12 +170,12 @@ async fn a_second_connection_on_one_handle_supersedes_the_first() {
     let server = serve(&fixture).await;
 
     let mut first = server.connect();
-    let first_ack = first.handshake_with("first", "alice").await;
+    let first_ack = first.handshake_with("first", "user:alice").await;
 
     // A second connection presenting the same credential resolves to the same
     // durable handle, so it takes the session over.
     let mut second = server.connect();
-    let second_ack = second.handshake_with("second", "alice").await;
+    let second_ack = second.handshake_with("second", "user:alice").await;
     assert_eq!(
         first_ack.session_token, second_ack.session_token,
         "one caller, one handle, regardless of how many sockets it opens"
@@ -209,14 +209,14 @@ async fn a_handle_does_not_survive_a_change_of_caller() {
     let server = serve(&fixture).await;
 
     let mut alice = server.connect();
-    let alice_ack = alice.handshake_with("shared-device", "alice").await;
+    let alice_ack = alice.handshake_with("shared-device", "user:alice").await;
     alice.subscribe("notes", "SELECT * FROM notes").await;
     let _ = alice.expect_snapshot("notes").await;
     alice.close().await;
 
     // The same device, the same client label, a different caller.
     let mut bob = server.connect();
-    let bob_ack = bob.handshake_with("shared-device", "bob").await;
+    let bob_ack = bob.handshake_with("shared-device", "user:bob").await;
     assert_ne!(
         alice_ack.session_token, bob_ack.session_token,
         "a change of caller starts a new run"
@@ -243,7 +243,7 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     let server = serve(&fixture).await;
 
     let mut first = server.connect();
-    let first_ack = first.handshake_with("socket-one", "alice").await;
+    let first_ack = first.handshake_with("socket-one", "user:alice").await;
     assert_eq!(
         first_ack.last_applied_seq, None,
         "a fresh session has applied nothing"
@@ -259,7 +259,7 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     // is the same, so the server reports the sequence it already applied and
     // the client retires that pending record instead of replaying it.
     let mut second = server.connect();
-    let second_ack = second.handshake_with("socket-two", "alice").await;
+    let second_ack = second.handshake_with("socket-two", "user:alice").await;
     assert_eq!(
         second_ack.session_token, first_ack.session_token,
         "the handle survives the reconnect"
@@ -273,7 +273,7 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
 
     // A different caller shares none of it.
     let mut other = server.connect();
-    let other_ack = other.handshake_with("socket-three", "carol").await;
+    let other_ack = other.handshake_with("socket-three", "user:carol").await;
     assert_eq!(
         other_ack.last_applied_seq, None,
         "another caller's watermark is its own"
@@ -345,7 +345,7 @@ async fn the_ack_carries_a_parseable_durable_handle() {
     let server = serve(&fixture).await;
 
     let mut client = server.connect();
-    let ack = client.handshake_with("labelled", "alice").await;
+    let ack = client.handshake_with("labelled", "user:alice").await;
     assert!(
         SessionId::from_str(&ack.session_token).is_ok(),
         "the handle is a durable session id, not a per-connection label: {}",

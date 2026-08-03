@@ -939,13 +939,16 @@ where
                 (Some(synced), Some(local)) => Some(synced.max(local)),
                 (synced, local) => synced.or(local),
             };
-            // The session naming is a placeholder the client does not act
-            // on today. The watermark is load-bearing: the tab retires
-            // pending mutations at or below it and replays the rest.
+            // The hub owns the one upstream run, so a tab has neither a
+            // handle of its own nor anything to resume on: both are named for
+            // the relay and the tab does not act on either. The watermark is
+            // load-bearing: the tab retires pending mutations at or below it
+            // and replays the rest.
             let _ = tab.out.send(TabOut::Control(ControlMessage::HandshakeAck(
                 HandshakeAck {
                     connection_id: format!("relay-{}", handshake.client_id),
                     session_token: "relay".to_owned(),
+                    resume_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
                     schema_version: worker.schema_version().clone(),
                     initial_credits: INITIAL_CREDITS,

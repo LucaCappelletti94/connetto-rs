@@ -21,7 +21,7 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority,
@@ -119,6 +119,7 @@ async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::U
         .send_control(ControlMessage::HandshakeAck(HandshakeAck {
             connection_id: "conflict-upstream".to_owned(),
             session_token: "conflict".to_owned(),
+            resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: 64,
@@ -202,12 +203,13 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
 
     let worker_config = ClientConfig {
         client_id: format!("conflict-worker-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
     let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::Ephemeral, DDL, &worker_config, None)
+        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
             .expect("worker connect");
     worker
@@ -229,13 +231,15 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     hub.attach(relay_end);
     let tab_config = ClientConfig {
         client_id: format!("conflict-tab-{base}"),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: uuidv7_functions(),
     };
-    let mut tab = ConnettoConnection::connect(tab_end, &Replica::Ephemeral, DDL, &tab_config, None)
-        .await
-        .expect("tab connect");
+    let mut tab =
+        ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
+            .await
+            .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)
         .await
         .expect("tab subscribe");

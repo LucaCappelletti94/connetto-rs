@@ -37,7 +37,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica, SqlFunctions};
+use connetto_client::{
+    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, SqlFunctions,
+};
 use connetto_core::transport::WebSocketTransport;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -192,8 +194,9 @@ async fn log_in() -> String {
         .to_owned()
 }
 
-/// Open a sync connection with `token` and report what the handshake decided.
-async fn handshake_with(token: &str) -> Result<(), ClientError> {
+/// Connect presenting `token` as the only grant, and report the run handle the
+/// server put on the ack.
+async fn handshake_with(token: &str) -> Result<String, ClientError> {
     let url = ws_url();
     let authority = url
         .strip_prefix("ws://")
@@ -214,46 +217,70 @@ async fn handshake_with(token: &str) -> Result<(), ClientError> {
     // does not mirror the upstream is fine when no snapshot is ever requested.
     let config = ClientConfig {
         client_id: format!("verified-topology-{}", random_token()),
-        auth_token: token.to_owned(),
+        login: Some(Grant::new(token.to_owned())),
+        capabilities: Vec::new(),
         schema_version: Some(schema_version()),
         sql_functions: SqlFunctions::new(),
     };
     ConnettoConnection::connect(
         transport,
-        &Replica::EncryptedFile {
-            path: &path,
-            key: connetto_core::test_support::replica_key(),
-        },
+        &Replica::encrypted_file(&path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided"),
         "CREATE TABLE probe (id INTEGER PRIMARY KEY)",
         &config,
         None,
     )
     .await
-    .map(drop)
+    .map(|conn| conn.session_handle().to_owned())
 }
 
 #[tokio::test]
 #[ignore = "requires the dev stack (Postgres, dev_idp, connetto-server with CONNETTO_AUTH=database)"]
-async fn the_server_verifies_the_tokens_it_mints_and_refuses_the_rest() {
-    // A token this server minted, for a session it stored, is accepted.
+async fn the_server_verifies_the_tokens_it_mints_and_the_rest_identify_nobody() {
+    // A token this server minted, for a session it stored, is accepted, and the
+    // run it opens is the one the store already knows: presenting the same
+    // token twice continues the same run rather than starting a second.
     let token = log_in().await;
-    handshake_with(&token)
+    let first = handshake_with(&token)
         .await
         .expect("a token this server minted is accepted at its own handshake");
-
-    // A forged token is refused. This is what proves the verifier is real: the
-    // trusting default would have accepted it just as happily as the one above.
-    let forged = handshake_with("not-a-token").await;
-    assert!(
-        matches!(forged, Err(ClientError::Auth(_))),
-        "a forged token must be refused, got {forged:?}"
+    let again = handshake_with(&token)
+        .await
+        .expect("the same token opens the same run");
+    assert_eq!(
+        first, again,
+        "one login is one run, however many sockets it opens"
     );
 
-    // And a well-formed token for a session this server never issued is refused
-    // too, so the check is against the store and not merely against the shape.
-    let unknown = handshake_with(&format!("{token}tampered")).await;
-    assert!(
-        matches!(unknown, Err(ClientError::Auth(_))),
-        "a tampered token must be refused, got {unknown:?}"
+    // A forged token no longer ends anything: under R3 a refused grant leaves
+    // the connection open and says nothing on the wire. What it cannot do is
+    // identify anybody, and the handle is where that shows: each refused
+    // handshake gets a freshly minted run of its own instead of the login's.
+    // This is what proves the checking is real. The trusting default would have
+    // put the forged caller on a run derived from what it claimed to be.
+    let forged = handshake_with("not-a-token")
+        .await
+        .expect("a refused grant does not close the connection");
+    let forged_again = handshake_with("not-a-token")
+        .await
+        .expect("a refused grant does not close the connection");
+    assert_ne!(
+        forged, first,
+        "a forged token must not land on the login's run"
+    );
+    assert_ne!(
+        forged, forged_again,
+        "each unidentified visit is its own run, so nothing is shared by guessing"
+    );
+
+    // And a well-formed token for a session this server never issued lands the
+    // same way, so the check is against the signature and the store rather than
+    // merely against the shape.
+    let tampered = handshake_with(&format!("{token}tampered"))
+        .await
+        .expect("a refused grant does not close the connection");
+    assert_ne!(
+        tampered, first,
+        "a tampered token must not land on the login's run"
     );
 }

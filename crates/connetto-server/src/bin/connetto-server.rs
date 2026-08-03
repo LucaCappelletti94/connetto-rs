@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::messages::FatalErrorReason;
-use connetto_core::traits::SessionVerifier;
+use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::watermark_schema::check_watermark_shape;
 use connetto_server::{
@@ -358,18 +358,18 @@ async fn main() -> Result<()> {
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
 
-    // The session verifier is a required constructor argument with no default
-    // (R2), so the auth service is built first and the server refuses to run
-    // without one: an unset CONNETTO_AUTH would otherwise mean a handshake
-    // that trusts whatever identity the client claims.
+    // The handshake authority is a required constructor argument with no
+    // default (R2), so the auth service is built first and the server refuses
+    // to run without one: an unset CONNETTO_AUTH would otherwise mean a
+    // handshake with nothing to check a grant against.
     let Some((service, registry)) = build_auth(&pool).await? else {
         return Err(anyhow!(
             "set CONNETTO_AUTH to in-memory or database: the server refuses to run \
-             without a session verifier, because the handshake would otherwise trust \
-             whatever identity the client claims"
+             without a handshake authority, because it would otherwise have no way to \
+             check a grant or to sign the credential a run resumes on"
         ));
     };
-    let verifier: Arc<dyn SessionVerifier> = Arc::new(service.verifier());
+    let authority: Arc<dyn HandshakeAuthority> = Arc::new(service.handshake_authority());
 
     // Snapshots, read authorization, and the write apply all run under RLS as
     // the reader role, which must be subject to RLS (non-superuser, not the
@@ -405,7 +405,7 @@ async fn main() -> Result<()> {
         materializer,
         snapshot,
         auth,
-        verifier,
+        authority,
         connector,
         write,
         SessionConfig {

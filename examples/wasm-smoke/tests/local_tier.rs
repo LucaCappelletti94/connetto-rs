@@ -7,10 +7,9 @@
 //! sahpool file, the attach-create dbconfig, and `json_quote` in the wasm SQLite
 //! build (the local aggregate probe rides it).
 //!
-//! The tier is created by `attach_local_tier_ddl` on the keyed replica
-//! connection rather than imported, because an `ATTACH` applies the main
-//! database's derived key regardless of any `KEY` clause: a file created
-//! anywhere else carries its own salt and would not decrypt here.
+//! The tier is named on the replica with `.with_tier` (first boot) or
+//! `.with_existing_tier` (reopen), which is the only way to create a
+//! durable tier that decrypts under the replica's derived key.
 //!
 //! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
 //! Run this suite with:
@@ -21,8 +20,8 @@
 mod common;
 
 use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Replica, ReplicaKey, cipher::cipher_url,
-    dsl::Watchable,
+    ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica, ReplicaKey,
+    cipher::cipher_url, dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
@@ -68,36 +67,32 @@ fn unique_id() -> i64 {
     50_000_000_000 + millis
 }
 
-/// Connect to the shared replica file and attach the local tier.
+/// Connect to the shared replica file with the local tier named on the replica.
 ///
-/// A first boot applies both schemas: the replica's through `connect`, the
-/// tier's through `attach_local_tier_ddl`, which is the only way to create a
-/// durable tier that decrypts under the replica's key. A reopen goes through
-/// `attach_local_tier`, which disables attach-create, so a tier file that failed
-/// to persist would fail loudly here rather than reappearing empty.
+/// A first boot applies both schemas: the replica's through `connect` and the
+/// tier's through `.with_tier`, which creates a durable tier that decrypts
+/// under the replica's key. A reopen uses `.with_existing_tier`, which refuses
+/// to create the tier file if it is missing, so a failed persist fails loudly.
 async fn connect(config: &ClientConfig, first_boot: bool) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
     let url = cipher_url(DB_NAME, "opfs-sahpool");
-    let replica = Replica::EncryptedFile {
-        path: &url,
-        key: replica_key(),
-    };
-    let mut conn = if first_boot {
-        ConnettoConnection::connect(transport, &replica, REPLICA_DDL, config, None).await
-    } else {
-        ConnettoConnection::connect_existing(transport, &replica, config, None).await
-    }
-    .expect("client connect");
     if first_boot {
-        conn.attach_local_tier_ddl(FRONTEND_DB_NAME, FRONTEND_DDL)
-            .expect("create the local tier file");
+        let replica = Replica::encrypted_file(&url, Some(replica_key()))
+            .expect("create replica")
+            .with_tier(FRONTEND_DB_NAME, FRONTEND_DDL);
+        ConnettoConnection::connect(transport, &replica, REPLICA_DDL, config, None)
+            .await
+            .expect("client connect")
     } else {
-        conn.attach_local_tier(FRONTEND_DB_NAME)
-            .expect("attach the local tier file");
+        let replica = Replica::encrypted_file(&url, Some(replica_key()))
+            .expect("create replica")
+            .with_existing_tier(FRONTEND_DB_NAME);
+        ConnettoConnection::connect_existing(transport, &replica, config, None)
+            .await
+            .expect("client connect")
     }
-    conn
 }
 
 #[wasm_bindgen_test]
@@ -114,7 +109,8 @@ async fn local_tier_placement_dispatch_and_persistence() {
 
     let config = ClientConfig {
         client_id: format!("wasm-tier-{}", unique_id()),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };

@@ -29,7 +29,7 @@ use connetto_client::auth::{
 };
 use connetto_client::replica::{Replica, replica_db_name};
 use connetto_client::teardown::{ForgetError, PurgeError, forget_device};
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, SqlFunctions};
+use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Grant, SqlFunctions};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
 use diesel::prelude::*;
@@ -387,7 +387,8 @@ async fn setup_authenticated(
         // Use the replica name as the client id so the server can correlate
         // this connection to the specific per-identity replica.
         client_id: key_name.clone(),
-        auth_token: session.access_token,
+        login: Some(Grant::new(session.access_token)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
         sql_functions: uuidv7_functions(),
     };

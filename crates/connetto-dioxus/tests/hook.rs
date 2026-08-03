@@ -7,11 +7,10 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica};
 use connetto_core::{
-    Cursor,
-    test_support::{TestSessionVerifier, replica_key},
-    traits::SessionVerifier,
+    Cursor, HandshakeAuthority,
+    test_support::{TestGrantChecker, replica_key},
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
@@ -27,8 +26,8 @@ use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 
-fn test_verifier() -> Arc<dyn SessionVerifier> {
-    Arc::new(TestSessionVerifier)
+fn test_verifier() -> Arc<dyn HandshakeAuthority> {
+    Arc::new(TestGrantChecker)
 }
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
@@ -60,7 +59,7 @@ impl SnapshotSource for EmptySnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -82,7 +81,7 @@ impl SnapshotSource for SeedOneOrder {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _caller: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -259,22 +258,15 @@ async fn use_live_renders_and_follows_cdc() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "dioxus-test".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:dioxus-test")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: replica_key(),
-        },
-        SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect");
+    let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
+    let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
     let client = ConnettoClient::start(conn);
     *CLIENT.lock().expect("client slot poisoned") = Some(client.clone());
 
@@ -344,22 +336,15 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         .expect("ws connect");
     let config = ClientConfig {
         client_id: "dioxus-fn-test".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:dioxus-fn-test")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: connetto_client::SqlFunctions::new(),
     };
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::EncryptedFile {
-            path: &db_path,
-            key: replica_key(),
-        },
-        SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect");
+    let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
+    let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
+        .await
+        .expect("client connect");
     let client = ConnettoClient::start(conn);
     *CLIENT_FN.lock().expect("client slot poisoned") = Some(client.clone());
 

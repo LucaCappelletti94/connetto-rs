@@ -45,7 +45,8 @@ diesel::table! {
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "e4".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(connetto_client::Grant::new("user:tester")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: SqlFunctions::new(),
     }
@@ -62,7 +63,7 @@ fn key_from_byte(byte: u8) -> ReplicaKey {
 async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<u64> {
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile { path: url, key },
+        &Replica::encrypted_file(url, Some(key)).expect("a resolved key"),
         SQLITE_DDL,
         &config(),
         None,
@@ -121,10 +122,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     {
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
-            &Replica::EncryptedFile {
-                path: &bob_url,
-                key: bob_key,
-            },
+            &Replica::encrypted_file(&bob_url, Some(bob_key)).expect("a resolved key"),
             SQLITE_DDL,
             &config(),
             None,
@@ -155,10 +153,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // degrade into a cross-identity resume even if the file selection were wrong.
     let crossed = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &bob_url,
-            key: alice_key.clone(),
-        },
+        &Replica::encrypted_file(&bob_url, Some(alice_key.clone())).expect("a resolved key"),
         &config(),
         None,
     )
@@ -173,10 +168,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // its queued mutation, so no snapshot leg is needed.
     let mut conn = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile {
-            path: &alice_url,
-            key: alice_key,
-        },
+        &Replica::encrypted_file(&alice_url, Some(alice_key)).expect("a resolved key"),
         &config(),
         None,
     )

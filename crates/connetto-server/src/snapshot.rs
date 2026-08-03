@@ -84,7 +84,7 @@ mod pg {
     use subql::{DatabaseLike, ParserDB, PgLsn};
 
     use connetto_core::messages::BindValue;
-    use connetto_core::{AuthContext, Cursor};
+    use connetto_core::{Cursor, Principal};
 
     use super::{SnapshotError, table_from_select};
     use crate::session::{Snapshot, SnapshotSource};
@@ -159,10 +159,10 @@ mod pg {
             &self,
             select_sql: &str,
             binds: &[BindValue],
-            auth: &AuthContext,
+            caller: &Principal,
         ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
-            let user_id = auth.user_id.clone();
+            let user_id = caller.identity().map(|identity| identity.user_id.clone());
             let binds = binds.to_vec();
             let select_sql = select_sql.to_owned();
             let mut conn = self
@@ -177,12 +177,18 @@ mod pg {
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                             .execute(c)
                             .await?;
-                        // Establish the requesting user's RLS context so the read
-                        // returns only rows that user may see.
-                        sql_query("SELECT set_config('app.user_id', $1, true)")
-                            .bind::<Text, _>(user_id)
-                            .execute(c)
-                            .await?;
+                        // Establish the requesting caller's RLS context so the
+                        // read returns only rows it may see. A caller with no
+                        // identity binds nothing, leaving the setting unset for
+                        // the whole transaction, so an owner comparison is NULL
+                        // and hides the row while a public predicate still
+                        // returns its own.
+                        if let Some(user_id) = user_id {
+                            sql_query("SELECT set_config('app.user_id', $1, true)")
+                                .bind::<Text, _>(user_id)
+                                .execute(c)
+                                .await?;
+                        }
                         // Read the subscription SELECT verbatim (no jsonb wrap) so
                         // every column comes back in Postgres binary. The
                         // translated query carries `$N` placeholders. Attach the

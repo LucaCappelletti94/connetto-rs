@@ -12,7 +12,7 @@
 use core::marker::PhantomData;
 
 use connetto_core::SessionId;
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::Principal;
 use connetto_core::messages::ConflictRow;
 use diesel::OptionalExtension;
 use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
@@ -145,13 +145,18 @@ fn is_rls_violation(text: &str) -> bool {
 
 impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     /// Probe conflicts, apply one upload, and advance the durable watermark in
-    /// the same transaction, reporting the outcome. The apply runs under
-    /// `ctx.user_id`, so Postgres RLS gates it, and the watermark is keyed by
-    /// `session_id` alone, the durable handle from the verified access token,
-    /// so a reconnect reusing the same session dedupes replayed uploads.
+    /// the same transaction, reporting the outcome. The apply runs under the
+    /// caller's identity, so Postgres RLS gates it, and the watermark is keyed
+    /// by `session_id` alone, the durable handle every run has, so a reconnect
+    /// reusing the same run dedupes replayed uploads.
+    ///
+    /// A caller with no identity binds nothing, so every owner policy's
+    /// `WITH CHECK` fails and the write is refused. That is the arrival case
+    /// working as specified rather than an oversight: an unidentified write is
+    /// authorized by a capability, which is phase R4's work.
     pub(crate) async fn commit(
         &self,
-        ctx: &AuthContext<W::Id>,
+        caller: &Principal<W::Id>,
         plan: &WritePlan,
         payload_zstd: &[u8],
         session_id: SessionId,
@@ -165,10 +170,12 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        // The RLS GUC binds `user_id` as text via `Display`; a genuine text
-        // boundary. The identity gates the APPLY only: the watermark below
-        // keys on the session handle alone.
-        let guc_user = ctx.user_id.to_string();
+        // The RLS GUC binds `user_id` as text via `Display`, a genuine text
+        // boundary. The identity gates the APPLY only: the watermark below keys
+        // on the session handle alone.
+        let guc_user = caller
+            .identity()
+            .map(|identity| identity.user_id.to_string());
         let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
@@ -177,10 +184,12 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
                 async move {
                     // set_config is a vendor function the query DSL cannot
                     // express, so this one statement stays raw.
-                    sql_query("SELECT set_config('app.user_id', $1, true)")
-                        .bind::<Text, _>(guc_user)
-                        .execute(c)
-                        .await?;
+                    if let Some(guc_user) = guc_user {
+                        sql_query("SELECT set_config('app.user_id', $1, true)")
+                            .bind::<Text, _>(guc_user)
+                            .execute(c)
+                            .await?;
+                    }
                     for op in &plan.ops {
                         let Some(conflict) = &op.conflict else {
                             continue;

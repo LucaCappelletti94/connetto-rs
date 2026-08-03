@@ -17,7 +17,7 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
 use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv7_functions};
@@ -106,13 +106,20 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
     let transport = BroadcastTransport::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: uuidv7_functions(),
     };
-    ConnettoConnection::connect(transport, &Replica::Ephemeral, DEMO_TAB_DDL, &config, None)
-        .await
-        .expect("tab connect through the wire channel")
+    ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        DEMO_TAB_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("tab connect through the wire channel")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in

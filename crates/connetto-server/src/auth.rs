@@ -5,7 +5,7 @@
 
 use std::convert::Infallible;
 
-use connetto_core::auth::AuthContext;
+use connetto_core::auth::Principal;
 use connetto_core::traits::{AuthPolicy, MutationOp};
 
 /// A permissive [`AuthPolicy`] that grants every read and write.
@@ -21,7 +21,7 @@ impl AuthPolicy for PermissiveAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_read(
         &self,
-        _ctx: &AuthContext,
+        _caller: &Principal,
         _table: &str,
         _pk: &[u8],
     ) -> Result<bool, Self::Error> {
@@ -31,7 +31,7 @@ impl AuthPolicy for PermissiveAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn can_write(
         &self,
-        _ctx: &AuthContext,
+        _caller: &Principal,
         _table: &str,
         _pk: &[u8],
         _op: MutationOp,
@@ -43,7 +43,7 @@ impl AuthPolicy for PermissiveAuth {
 pub use rls::{RlsAuth, RlsAuthError};
 
 mod rls {
-    use connetto_core::auth::AuthContext;
+    use connetto_core::auth::Principal;
     use connetto_core::traits::{AuthPolicy, MutationOp};
     use diesel::QueryableByName;
     use diesel::sql_query;
@@ -143,7 +143,7 @@ mod rls {
 
         async fn can_read(
             &self,
-            ctx: &AuthContext,
+            caller: &Principal,
             table: &str,
             pk: &[u8],
         ) -> Result<bool, RlsAuthError> {
@@ -191,7 +191,12 @@ mod rls {
                     }
                 };
             }
-            let user_id = ctx.user_id.clone();
+            // A caller with no identity leaves `app.user_id` unset for the
+            // whole transaction rather than binding an empty string, so an
+            // owner comparison is NULL and hides the row while a public
+            // predicate still returns its own. An empty string would be a real
+            // identity that happens to be blank, which a policy could match.
+            let user_id = caller.identity().map(|identity| identity.user_id.clone());
             let mut conn = self
                 .pool
                 .get()
@@ -200,10 +205,12 @@ mod rls {
             let present = conn
                 .transaction::<bool, diesel::result::Error, _>(|c| {
                     async move {
-                        sql_query("SELECT set_config('app.user_id', $1, true)")
-                            .bind::<Text, _>(user_id)
-                            .execute(c)
-                            .await?;
+                        if let Some(user_id) = user_id {
+                            sql_query("SELECT set_config('app.user_id', $1, true)")
+                                .bind::<Text, _>(user_id)
+                                .execute(c)
+                                .await?;
+                        }
                         let row: Present = query.get_result(c).await?;
                         Ok(row.present)
                     }
@@ -216,7 +223,7 @@ mod rls {
         #[allow(clippy::unused_async_trait_impl)]
         async fn can_write(
             &self,
-            _ctx: &AuthContext,
+            _caller: &Principal,
             _table: &str,
             _pk: &[u8],
             _op: MutationOp,

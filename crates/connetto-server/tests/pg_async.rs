@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
-use connetto_core::test_support::TestSessionVerifier;
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
@@ -169,7 +169,9 @@ async fn async_pg_snapshot_reads_rows() {
         .snapshot(
             "SELECT * FROM orders WHERE quantity > 0",
             &[],
-            &connetto_core::AuthContext::new("test-user"),
+            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
+                "test-user",
+            )),
         )
         .await
         .expect("produce snapshot");
@@ -253,7 +255,9 @@ async fn async_pg_snapshot_uuid_is_blob16() {
         .snapshot(
             "SELECT * FROM things",
             &[],
-            &connetto_core::AuthContext::new("test-user"),
+            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
+                "test-user",
+            )),
         )
         .await
         .expect("produce snapshot");
@@ -289,7 +293,7 @@ impl SnapshotSource for NoSnapshot {
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
-        _auth: &connetto_core::AuthContext,
+        _auth: &connetto_core::Principal,
     ) -> Result<Snapshot, Self::Error> {
         Ok(Snapshot {
             patchset: Vec::new(),
@@ -333,7 +337,7 @@ async fn async_pg_reexec_bootstraps_min() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         connector,
         target,
         SessionConfig::default(),
@@ -343,11 +347,10 @@ async fn async_pg_reexec_bootstraps_min() {
     let server = tokio::spawn(session.clone().serve(server_transport));
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "aggregator",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "aggregator")
+                .with_grant(connetto_core::messages::Grant::new("user:aggregator")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
@@ -530,7 +533,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         materializer,
         NoSnapshot,
         PermissiveAuth,
-        Arc::new(TestSessionVerifier),
+        Arc::new(TestGrantChecker),
         connector,
         target,
         SessionConfig::default(),
@@ -540,11 +543,10 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
     let server = tokio::spawn(session.clone().serve(server_transport));
 
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "aggregator",
-            "token",
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "aggregator")
+                .with_grant(connetto_core::messages::Grant::new("user:aggregator")),
+        ))
         .await
         .expect("send handshake");
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
@@ -651,7 +653,9 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
         .snapshot(
             &reg.pg_sql,
             &binds,
-            &connetto_core::AuthContext::new("test-user"),
+            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
+                "test-user",
+            )),
         )
         .await
         .expect("snapshot the translated query");

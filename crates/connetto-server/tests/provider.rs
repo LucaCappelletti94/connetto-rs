@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
+use connetto_core::Subject;
+use connetto_core::messages::Grant;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
     InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, TokenAuthority,
@@ -252,10 +254,13 @@ async fn accessor_refreshes_an_expired_provider_token() {
     login.retained.access_token = "stale".to_owned();
     login.retained.expires_at = Some(SystemTime::now() - Duration::from_secs(60));
     let pair = service.login_with_provider(&login).await.expect("login");
-    let session_id = authority
-        .verify_access::<String>(&pair.access_token)
+    let Subject::Identity(verified) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
         .expect("verify")
-        .session_id;
+    else {
+        panic!("expected identity subject");
+    };
+    let session_id = verified.session_id;
 
     // The stored token is expired, so the accessor refreshes it through the real idp.
     let refreshed = service
@@ -287,10 +292,13 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
     login.retained.access_token = "still-good".to_owned();
     login.retained.expires_at = Some(SystemTime::now() + Duration::from_secs(3600));
     let pair = service.login_with_provider(&login).await.expect("login");
-    let session_id = authority
-        .verify_access::<String>(&pair.access_token)
+    let Subject::Identity(verified) = authority
+        .check_grant::<String>(&Grant::new(&pair.access_token))
         .expect("verify")
-        .session_id;
+    else {
+        panic!("expected identity subject");
+    };
+    let session_id = verified.session_id;
 
     let token = service
         .provider_access_token(session_id)

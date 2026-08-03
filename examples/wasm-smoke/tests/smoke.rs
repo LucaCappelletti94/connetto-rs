@@ -17,7 +17,7 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_wasm_smoke::BrowserSocket;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -83,12 +83,13 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         .expect("connect to connetto-server");
     let config = ClientConfig {
         client_id: format!("wasm-smoke-{}", unique_id()),
-        auth_token: common::mint_token().await,
+        login: Some(Grant::new(common::mint_token().await)),
+        capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
         sql_functions: connetto_wasm_smoke::uuidv7_functions(),
     };
     let mut conn =
-        ConnettoConnection::connect(transport, &Replica::Ephemeral, SQLITE_DDL, &config, None)
+        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
             .await
             .expect("client connect");
 

@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use connetto_client::{
-    AcquiredSession, BrowserOpener, ClientError, MemoryKeyStore, MemoryRefreshStore,
+    AcquiredSession, BrowserOpener, ClientError, Grant, MemoryKeyStore, MemoryRefreshStore,
     NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore, provision_replica_key,
     replica_db_name,
 };
-use connetto_core::traits::{SessionVerifier, SessionVerifyError};
+use connetto_core::traits::{GrantRefused, HandshakeAuthority};
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityResolver,
     InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, ResolveFuture,
@@ -429,9 +429,9 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
         .expect("the refresh token is stored");
 
     // Before the logout the real handshake verifier accepts this token.
-    let verifier = service.verifier();
-    verifier
-        .verify_session(&login.access_token)
+    let authority = service.handshake_authority();
+    authority
+        .check_grant(&Grant::new(login.access_token.clone()))
         .await
         .expect("a live session verifies");
 
@@ -447,8 +447,11 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     // Server-side liveness is gone, which is what makes the logout mean
     // something: the access token is inside its 15 minute default TTL and its
     // signature still checks out, and the handshake refuses it anyway.
-    match verifier.verify_session(&login.access_token).await {
-        Err(SessionVerifyError::Revoked) => {}
+    match authority
+        .check_grant(&Grant::new(login.access_token.clone()))
+        .await
+    {
+        Err(GrantRefused::Revoked) => {}
         Err(other) => panic!("expected Revoked, got {other:?}"),
         Ok(_) => panic!("a logged-out session must be refused at the next handshake"),
     }

@@ -38,7 +38,7 @@ pub use auth::{RlsAuth, RlsAuthError};
 pub use authn::http::{RedirectPolicy, auth_router};
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
-    ConnettoSessionVerifier, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
+    ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
     IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
     OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
     RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,

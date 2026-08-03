@@ -20,7 +20,7 @@ use connetto_client::teardown::{
     ForgetError, PurgeError, forget_device, purge_replica, wipe_replica,
 };
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, MemoryKeyStore, MemoryRefreshStore,
+    ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
     NativeAuthenticator, RefreshTokenStore, Replica, ReplicaKey, ReplicaKeyStore, SqlFunctions,
     provision_replica_key, replica_db_name,
 };
@@ -43,7 +43,8 @@ diesel::table! {
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "e3".to_owned(),
-        auth_token: "token".to_owned(),
+        login: Some(Grant::new("user:token")),
+        capabilities: Vec::new(),
         schema_version: None,
         sql_functions: SqlFunctions::new(),
     }
@@ -69,7 +70,7 @@ async fn seed_replica(
     let key = provision_replica_key(keys, &record).expect("mint a key for a fresh replica");
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile { path: &db, key },
+        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
         SQLITE_DDL,
         &config(),
         None,
@@ -95,7 +96,7 @@ async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, 
     let db = url(path);
     let mut conn = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile { path: &db, key },
+        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
         &config(),
         None,
     )
@@ -204,7 +205,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
     let db = url(&path);
     let mut conn = ConnettoConnection::connect_existing(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile { path: &db, key },
+        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
         &config(),
         None,
     )
@@ -256,7 +257,7 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     let db = url(&path);
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
-        &Replica::EncryptedFile { path: &db, key },
+        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
         SQLITE_DDL,
         &config(),
         None,

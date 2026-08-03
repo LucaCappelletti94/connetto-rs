@@ -95,9 +95,12 @@ subtle = "2"
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [dev-dependencies]
-# The session verifier is a required constructor argument with no production
+# The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
 connetto-core = { workspace = true, features = ["test-support"] }
+# The refused-grant assertion reads the log back through its own writer, which
+# means naming the destination's own trait.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 # Minting a local ID token to verify the provider path offline, and timestamp
 # primary keys in the Docker-gated RLS test (both are normal deps too).
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }

@@ -39,7 +39,10 @@ use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType}
 use crate::relay::{HubReconnect, LocalTier};
 use crate::{BroadcastTransport, BrowserSocket, HubNotice, RelayHub, locks};
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ReplicaStorage as StorageKind,
+    Tier,
+};
 use connetto_core::messages::SubscriptionSpec;
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
@@ -407,67 +410,52 @@ where
         )
     };
 
-    let auth_token = session
+    // The login grant, when somebody signed in. Nobody signed in is a caller
+    // with no identity, which the server accepts and which keeps everything in
+    // memory below.
+    let login = session
         .as_ref()
-        .map_or_else(|| "token".to_owned(), |s| s.access_token.clone());
+        .map(|session| Grant::new(session.access_token.clone()));
+    let identified = session.is_some();
     let identity = session.map(|session| session.user_id);
     let client_config = ClientConfig {
         client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
-        auth_token,
+        login,
+        capabilities: Vec::new(),
         schema_version: Some(config.schema_version.clone()),
         sql_functions: config.sql_functions.clone(),
     };
     let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
     let replica_url = storage.db_url(&replica_db_name);
-    // Always a durable file here: OPFS, or the in-memory VFS's named file when
-    // OPFS is unavailable. Never `Ephemeral`, which is the tab's case.
-    let replica = Replica::encrypted_file(&replica_url, replica_key).map_err(to_js)?;
-    let mut worker = if existing {
-        ConnettoConnection::connect_existing(transport, &replica, &client_config, None)
-            .await
+    // One value describes everything this run keeps at rest, replica and
+    // device-private database together, so the pairing cannot be wrong. A run
+    // with an identity gets the durable pair: OPFS, or the in-memory VFS's
+    // named file when OPFS is unavailable. A run without one gets neither,
+    // because there is no identity to key a file to and a device-private file
+    // beside an unkeyed replica would be written in the clear.
+    let (mut worker, frontend) = if identified {
+        let replica = Replica::encrypted_file(&replica_url, replica_key)
             .map_err(to_js)?
-    } else {
-        ConnettoConnection::connect(
+            .with_tier(config.frontend_db_name, config.frontend_ddl);
+        open_replica_and_tier(
             transport,
             &replica,
-            config.replica_ddl,
+            existing,
+            config,
             &client_config,
-            None,
+            &storage,
         )
-        .await
-        .map_err(to_js)?
+        .await?
+    } else {
+        let replica = Replica::in_memory().with_tier(config.frontend_ddl);
+        open_replica_and_tier(transport, &replica, false, config, &client_config, &storage).await?
     };
     tracing::info!(
         replica = %replica_db_name,
         resumed = existing,
+        durable = identified,
         "db worker: replica open"
     );
-    // The local tier is a second connection whose main schema IS the tier file,
-    // because a changeset apply always targets main. The worker replica never
-    // contains these tables, so a note can never ride an upstream mutation.
-    //
-    // Being its own main database, it carries its own key salt and is unlocked
-    // independently, unlike the native tier which is attached to the replica and
-    // inherits from it. Same key either way: one device, one key.
-    let tier_is_new = !storage.exists(config.frontend_db_name);
-    let mut frontend = SqliteConnection::establish(&storage.db_url(config.frontend_db_name))
-        .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
-    if let Some(key) = replica.key() {
-        connetto_client::cipher::unlock(&mut frontend, key)
-            .map_err(|err| JsValue::from_str(&format!("unlock the frontend tier: {err}")))?;
-    }
-    // Same registrar set as the replica: connetto installs it on every
-    // connection it opens, before any DDL or insert, even where the tier
-    // schema does not call a registered function.
-    config
-        .sql_functions
-        .install(&mut frontend)
-        .map_err(|err| JsValue::from_str(&format!("register sql functions on the tier: {err}")))?;
-    if tier_is_new {
-        frontend
-            .batch_execute(config.frontend_ddl)
-            .map_err(|err| JsValue::from_str(&format!("apply the frontend tier schema: {err}")))?;
-    }
     let local = LocalTier::new(frontend).map_err(to_js)?;
     worker
         .subscribe(config.upstream_sub_id, config.upstream_query)
@@ -781,6 +769,77 @@ async fn sleep_ms(ms: i32) {
 }
 
 /// Fold any displayable error into a JS string error.
+/// Open the replica and the device-private database beside it, both described
+/// by `replica` so the pairing cannot be wrong.
+///
+/// The device-private database is a second connection whose main schema IS its
+/// own file, because a changeset apply always targets main, so the worker's
+/// replica never holds those tables and a note can never ride an upstream
+/// mutation. Being its own main database it carries its own key salt and is
+/// unlocked separately, unlike the native case where it is attached and
+/// inherits. Same key either way: one device, one key. A run with no identity
+/// has no key, and its device-private database is in memory for that reason.
+async fn open_replica_and_tier<S: StorageKind>(
+    transport: BrowserSocket,
+    replica: &Replica<'_, S>,
+    existing: bool,
+    config: &DbWorkerConfig,
+    client_config: &ClientConfig,
+    storage: &crate::storage::ReplicaStorage,
+) -> Result<(ConnettoConnection<BrowserSocket>, SqliteConnection), JsValue> {
+    let worker = if existing {
+        ConnettoConnection::connect_existing(transport, replica, client_config, None)
+            .await
+            .map_err(to_js)?
+    } else {
+        ConnettoConnection::connect(transport, replica, config.replica_ddl, client_config, None)
+            .await
+            .map_err(to_js)?
+    };
+    let (tier_path, tier_ddl) = match replica.tier() {
+        Tier::Create { path, ddl } => (*path, Some(*ddl)),
+        Tier::Existing { path } => (*path, None),
+        // Both callers name one, so this is a programming error here rather
+        // than a configuration one.
+        Tier::None => {
+            return Err(JsValue::from_str(
+                "the db worker named no device-private database",
+            ));
+        }
+    };
+    let in_memory = tier_path == ":memory:";
+    if !in_memory && tier_ddl.is_none() && !storage.exists(tier_path) {
+        return Err(JsValue::from_str(&format!(
+            "the device-private database {tier_path} does not exist"
+        )));
+    }
+    let tier_is_new = in_memory || !storage.exists(tier_path);
+    let url = if in_memory {
+        tier_path.to_owned()
+    } else {
+        storage.db_url(tier_path)
+    };
+    let mut frontend = SqliteConnection::establish(&url)
+        .map_err(|err| JsValue::from_str(&format!("open the frontend tier: {err}")))?;
+    if let Some(key) = replica.key() {
+        connetto_client::cipher::unlock(&mut frontend, key)
+            .map_err(|err| JsValue::from_str(&format!("unlock the frontend tier: {err}")))?;
+    }
+    // Same registrar set as the replica: connetto installs it on every
+    // connection it opens, before any DDL or insert, even where the tier
+    // schema does not call a registered function.
+    config
+        .sql_functions
+        .install(&mut frontend)
+        .map_err(|err| JsValue::from_str(&format!("register sql functions on the tier: {err}")))?;
+    if let (true, Some(ddl)) = (tier_is_new, tier_ddl) {
+        frontend
+            .batch_execute(ddl)
+            .map_err(|err| JsValue::from_str(&format!("apply the frontend tier schema: {err}")))?;
+    }
+    Ok((worker, frontend))
+}
+
 fn to_js(err: impl core::fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
 }

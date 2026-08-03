@@ -27,8 +27,10 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
+pub use connetto_core::messages::Grant;
+
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason, Handshake,
+    AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
     MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -75,7 +77,7 @@ pub use live::{
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
-pub use replica::{Replica, replica_db_name};
+pub use replica::{Encrypted, InMemory, Replica, ReplicaStorage, Tier, replica_db_name};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -152,6 +154,22 @@ pub enum ClientError {
     /// or with an explicit data wipe.
     #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
     ReplicaKeyMissing,
+}
+
+/// Why a sign-in switch was refused.
+///
+/// Nothing has changed when this is returned: the run is still the one it was,
+/// and the caller may retry once the connection is healthy enough to drain.
+#[derive(Debug, thiserror::Error)]
+pub enum SignInRefused {
+    /// Writes are still queued after the push, so switching would strand them
+    /// under a handle nobody presents again.
+    #[error("sign-in blocked: {} write(s) are still queued", .0.len())]
+    Unsent(Vec<u64>),
+    /// Draining the queue failed, so whether anything is still unsent is
+    /// unknown and the switch is refused rather than guessed at.
+    #[error("sign-in blocked, the queued writes could not be sent: {0}")]
+    Push(String),
 }
 
 /// Split a cipher failure by what the caller can do about it: a key that does
@@ -279,13 +297,25 @@ impl std::fmt::Debug for SqlFunctions {
     }
 }
 
-/// Client identity presented at handshake.
+/// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Stable client id, echoed for logging and correlation.
+    /// Stable client id, echoed for logging and correlation. Never a trust
+    /// input on the server.
     pub client_id: String,
-    /// Opaque auth token validated by the server at connect.
-    pub auth_token: String,
+    /// The login grant, when somebody is signed in. `None` is a caller with no
+    /// identity, which the server accepts: it reads whatever the deployment's
+    /// policy shows such a caller and writes only where a capability says it
+    /// may.
+    ///
+    /// It is separate from [`capabilities`](Self::capabilities) because only
+    /// this one refreshes: a token source, when set, replaces it on every
+    /// reconnect. On the wire the two are one undifferentiated list.
+    pub login: Option<Grant>,
+    /// Capability grants, for example share keys, presented alongside the
+    /// login. Each is checked on its own, and one that fails changes nothing
+    /// except what the caller can see.
+    pub capabilities: Vec<Grant>,
     /// The schema version this client build was compiled against, for staleness
     /// detection, or `None` to opt out. When both this and the server's ack
     /// carry a version and they differ, [`ConnettoConnection::connect`] fails
@@ -673,39 +703,47 @@ fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, Cli
         .collect())
 }
 
+/// What a completed handshake told the client.
+struct HandshakeOk {
+    connection_id: String,
+    session_handle: String,
+    resume_token: String,
+    watermark: Option<u64>,
+    schema_version: Option<SchemaVersion>,
+}
+
 /// Run the opening handshake over `transport`: send the hello (carrying the
-/// resume cursor and, on a resume, the durable session handle) and read the
-/// ack. Returns the server-assigned connection id, the durable session handle
-/// the server minted, the server's durable mutation watermark, and the
-/// server's schema version.
+/// grants, the resume cursor and, on a resume, the credential proving the
+/// previous run's handle) and read the ack.
+///
 /// Shared by the first connect and every resume.
 async fn exchange_handshake<T>(
     transport: &mut T,
     config: &ClientConfig,
     token_source: Option<&AccessTokenSource>,
     resume: Option<&Cursor>,
-    session_handle: Option<&str>,
-) -> Result<(String, String, Option<u64>, Option<SchemaVersion>), ClientError>
+    resume_token: Option<&str>,
+) -> Result<HandshakeOk, ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    let mut handshake = Handshake::new(
-        PROTOCOL_VERSION,
-        config.client_id.clone(),
-        match token_source {
-            Some(source) => source.token().await?,
-            None => config.auth_token.clone(),
-        },
-    );
+    let mut grants = Vec::with_capacity(1 + config.capabilities.len());
+    match token_source {
+        Some(source) => grants.push(Grant::new(source.token().await?)),
+        None => grants.extend(config.login.clone()),
+    }
+    grants.extend(config.capabilities.iter().cloned());
+    let mut handshake =
+        Handshake::new(PROTOCOL_VERSION, config.client_id.clone()).with_grants(grants);
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
     }
-    // The durable handle from a previous run of this session. The server
-    // derives the authoritative handle from the verified credential, so this
-    // is the client's continuity claim rather than a trust input.
-    if let Some(handle) = session_handle {
-        handshake = handshake.with_session_token(handle.to_owned());
+    // The credential proving the previous run's handle is this caller's. The
+    // server refuses one it did not sign, and an identified run takes its
+    // handle from the login grant instead.
+    if let Some(token) = resume_token {
+        handshake = handshake.with_resume_token(token.to_owned());
     }
     transport
         .send_control(ControlMessage::Handshake(handshake))
@@ -733,18 +771,14 @@ where
                 }
                 _ => {}
             }
-            Ok((
-                ack.connection_id,
-                ack.session_token,
-                ack.last_applied_seq,
-                ack.schema_version,
-            ))
+            Ok(HandshakeOk {
+                connection_id: ack.connection_id,
+                session_handle: ack.session_token,
+                resume_token: ack.resume_token,
+                watermark: ack.last_applied_seq,
+                schema_version: ack.schema_version,
+            })
         }
-        // A rejected credential is fatal for this attempt and routes to
-        // re-login, not a generic reconnect that would spin forever.
-        Some(IncomingFrame::Control(ControlMessage::FatalError(FatalError {
-            reason: FatalErrorReason::AuthenticationFailed,
-        }))) => Err(ClientError::Auth("credential rejected at handshake".into())),
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
     }
@@ -774,11 +808,14 @@ pub struct ConnettoConnection<T: Transport> {
     last_cursor: Option<Cursor>,
     next_seq: u64,
     connection_id: String,
-    /// The durable session handle the server minted at handshake, presented
-    /// again on every resume so the session's operational state (its
-    /// per-subscription cursors and pending buffer) continues rather than
-    /// starting over.
+    /// The durable handle of this run, in the clear, for the application to
+    /// read: a synced row written before anybody signed in is attributed to it.
     session_handle: String,
+    /// The credential proving that handle is this caller's, presented again on
+    /// every resume so the run's operational state (its per-subscription
+    /// cursors and pending buffer) continues rather than starting over. A
+    /// bearer secret, so it never goes into the replica.
+    resume_token: String,
     /// The server's schema version from the handshake ack, kept so a relay can
     /// forward it verbatim to its tabs and (Phase 7) a stale build can be
     /// detected against the baked schema.
@@ -800,11 +837,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
     /// Optional source of fresh access tokens, consulted on every resume so a
-    /// reconnect silently refreshes. `None` reuses `config.auth_token`.
+    /// reconnect silently refreshes. `None` reuses `config.login`.
     token_source: Option<AccessTokenSource>,
-    /// Lowercased names of the tables in the attached local tier, empty until
-    /// [`attach_local_tier`](Self::attach_local_tier) or
-    /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl) runs. Live
+    /// Lowercased names of the tables in the device-private database the
+    /// replica named, empty when it named none. Live
     /// queries dispatch on it: a local table never reaches the wire.
     local_tables: HashSet<String>,
     /// Lowercased tables backing each row subscription, keyed by sub id, so a
@@ -822,10 +858,11 @@ where
     /// Connect: open the local replica, hook the capture session, and run the
     /// handshake.
     ///
-    /// `replica` says where the replica lives and whether its pages are
-    /// encrypted, as one value, so a connection cannot exist without its opener
-    /// having stated both and cannot claim a key over storage that has nothing
-    /// at rest. `sqlite_ddl` creates the local schema. Pass `resume` to continue
+    /// `replica` says where the replica lives, whether its pages are encrypted,
+    /// and what device-private database sits beside it, as one value, so a
+    /// connection cannot exist without its opener having stated all three and
+    /// cannot pair a durable device-private database with storage that has no
+    /// key. `sqlite_ddl` creates the local schema. Pass `resume` to continue
     /// from a persisted cursor on reconnect.
     ///
     /// # Errors
@@ -833,9 +870,9 @@ where
     /// [`ClientError`] on a database, cipher, session, transport, or handshake
     /// failure. [`ClientError::ReplicaUndecryptable`] when an existing replica
     /// does not open under the key given.
-    pub async fn connect(
+    pub async fn connect<S: ReplicaStorage>(
         transport: T,
-        replica: &Replica<'_>,
+        replica: &Replica<'_, S>,
         sqlite_ddl: &str,
         config: &ClientConfig,
         resume: Option<Cursor>,
@@ -854,9 +891,9 @@ where
     /// [`ClientError`] on a database, cipher, session, transport, or handshake
     /// failure. [`ClientError::ReplicaUndecryptable`] when the replica does not
     /// open under the key given.
-    pub async fn connect_existing(
+    pub async fn connect_existing<S: ReplicaStorage>(
         transport: T,
-        replica: &Replica<'_>,
+        replica: &Replica<'_, S>,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
@@ -866,9 +903,9 @@ where
     /// Shared connect body: open the connection, unlock the page codec, apply
     /// the schema when it arrives as DDL, hook the capture session, and run the
     /// handshake.
-    async fn connect_inner(
+    async fn connect_inner<S: ReplicaStorage>(
         mut transport: T,
-        replica: &Replica<'_>,
+        replica: &Replica<'_, S>,
         sqlite_ddl: Option<&str>,
         config: &ClientConfig,
         resume: Option<Cursor>,
@@ -880,9 +917,8 @@ where
         // database later attached to this connection inherits the key from an
         // `ATTACH` with no `KEY` clause, so the local tier and the relay hub's
         // own state are covered by this one call.
-        match replica {
-            Replica::Ephemeral => {}
-            Replica::EncryptedFile { key, .. } => cipher::unlock(&mut db, key)?,
+        if let Some(key) = replica.key() {
+            cipher::unlock(&mut db, key)?;
         }
         db.batch_execute("PRAGMA journal_mode=WAL")?;
         // Register app-supplied functions before any DDL or insert, so a
@@ -918,8 +954,8 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let (connection_id, session_handle, watermark, schema_version) =
-            exchange_handshake(&mut transport, config, None, resume.as_ref(), None).await?;
+        let ack = exchange_handshake(&mut transport, config, None, resume.as_ref(), None).await?;
+        let watermark = ack.watermark;
 
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
         let mut conn = Self {
@@ -928,9 +964,10 @@ where
             db,
             last_cursor: resume,
             next_seq,
-            connection_id,
-            session_handle,
-            schema_version,
+            connection_id: ack.connection_id,
+            session_handle: ack.session_handle,
+            resume_token: ack.resume_token,
+            schema_version: ack.schema_version,
             dirty,
             changed,
             transaction_state: AnsiTransactionManager::default(),
@@ -940,15 +977,60 @@ where
             local_tables: HashSet::new(),
             sub_tables: HashMap::new(),
         };
+        conn.attach_tier(replica.tier())?;
         conn.reconcile_pending(watermark).await?;
         Ok(conn)
+    }
+
+    /// Attach the device-private database the replica named, if any.
+    ///
+    /// Driven from `connect` rather than exposed, because which one is legal
+    /// depends on what the replica keeps at rest and only the replica knows
+    /// that. The capture session is bound to `main`, so writes to these tables
+    /// are physically incapable of being uploaded, rejected, or rolled back,
+    /// and live queries over them are served locally with no subscription.
+    ///
+    /// The tier shares the replica's cipher, always: SQLite gives an attached
+    /// database the connection's VFS and the page codec gives it the main
+    /// database's derived key. One device, one key, because two would double the
+    /// lost-key failure modes and isolate nothing, since both entries would sit
+    /// in the same key store behind the same wrap.
+    fn attach_tier(&mut self, tier: &Tier<'_>) -> Result<(), ClientError> {
+        match tier {
+            Tier::None => Ok(()),
+            Tier::Existing { path } => {
+                let create_was_enabled = self.db.is_attach_create_enabled()?;
+                if create_was_enabled {
+                    self.db.set_attach_create_enabled(false)?;
+                }
+                let attached = self.db.attach_database(path, LOCAL_SCHEMA);
+                if create_was_enabled {
+                    self.db.set_attach_create_enabled(true)?;
+                }
+                attached?;
+                self.local_tables = local_tier_tables(&mut self.db)?;
+                Ok(())
+            }
+            Tier::Create { path, ddl } => {
+                self.db.attach_database(path, LOCAL_SCHEMA)?;
+                // An attached database with no tables is a fresh one, on every
+                // target and with no filesystem probe, which wasm does not have.
+                if local_tier_tables(&mut self.db)?.is_empty() {
+                    for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                        self.db.batch_execute(&qualify_create_table(statement)?)?;
+                    }
+                }
+                self.local_tables = local_tier_tables(&mut self.db)?;
+                Ok(())
+            }
+        }
     }
 
     /// Attach a source of fresh access tokens, consulted on every
     /// [`resume`](Self::resume) so a reconnect silently refreshes the access
     /// token from the stored refresh token with no user interaction. The first
-    /// connect used `config.auth_token`, so a native client sets that to a
-    /// token it acquired interactively and this to its silent-refresh source.
+    /// connect used `config.login`, so a native client sets that to a token it
+    /// acquired interactively and this to its silent-refresh source.
     #[must_use]
     pub fn with_token_source(mut self, source: AccessTokenSource) -> Self {
         self.token_source = Some(source);
@@ -971,21 +1053,22 @@ where
     /// keeps its previous (dead) transport in that case, so a caller can try
     /// again with another one.
     pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
-        let (connection_id, session_handle, watermark, schema_version) = exchange_handshake(
+        let ack = exchange_handshake(
             &mut transport,
             &self.config,
             self.token_source.as_ref(),
             self.last_cursor.as_ref(),
-            Some(self.session_handle.as_str()),
+            Some(self.resume_token.as_str()),
         )
         .await?;
         self.transport = transport;
-        self.connection_id = connection_id;
-        self.session_handle = session_handle;
-        self.schema_version = schema_version;
+        self.connection_id = ack.connection_id;
+        self.session_handle = ack.session_handle;
+        self.resume_token = ack.resume_token;
+        self.schema_version = ack.schema_version;
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
-        self.reconcile_pending(watermark).await?;
+        self.reconcile_pending(ack.watermark).await?;
         Ok(())
     }
 
@@ -1038,6 +1121,45 @@ where
         &self.session_handle
     }
 
+    /// End this run because somebody is signing in, handing back the handle it
+    /// wrote under.
+    ///
+    /// Pushes whatever is queued first and refuses the switch when anything is
+    /// still unsent, because signing in mints a new handle and the old run's
+    /// queued writes would be stranded under one nobody presents again. This is
+    /// the unsynced guard the teardown primitives already apply, moved to the
+    /// one other moment where writes can still be uploaded.
+    ///
+    /// Nothing is carried across. Synced rows are discarded and re-snapshotted
+    /// under the new identity, and the local copy is changing from in memory to
+    /// identity-named at the same moment, so a fresh snapshot happens anyway.
+    /// The caller therefore opens a new connection against the identity's own
+    /// replica rather than mutating this one, which is why no adoption
+    /// primitive exists.
+    ///
+    /// What connetto hands over is the handle, and it performs no merge. A row
+    /// the run wrote before anybody signed in, a shopping cart being the
+    /// canonical one, is attributed to this handle on the server, and only the
+    /// application knows which of its tables hold such rows, what to do when
+    /// one already exists for the incoming user, and what a cart even is.
+    ///
+    /// # Errors
+    ///
+    /// [`SignInRefused::Unsent`] when writes remain queued after the push, in
+    /// which case nothing has changed and the caller may retry once the
+    /// connection is healthy. [`SignInRefused::Push`] when the push itself
+    /// failed.
+    pub async fn end_run_for_sign_in(&mut self) -> Result<String, SignInRefused> {
+        self.push()
+            .await
+            .map_err(|err| SignInRefused::Push(err.to_string()))?;
+        let unsent = self.unsynced();
+        if !unsent.is_empty() {
+            return Err(SignInRefused::Unsent(unsent));
+        }
+        Ok(self.session_handle.clone())
+    }
+
     /// The server's schema version from the handshake ack, or `None` when the
     /// server declared none.
     #[must_use]
@@ -1063,89 +1185,6 @@ where
     #[must_use]
     pub fn unsynced(&self) -> Vec<u64> {
         self.pending.keys().copied().collect()
-    }
-
-    /// Attach the local tier database at `path`: device-private tables that
-    /// never sync. The capture session is bound to `main`, so writes to these
-    /// tables are physically incapable of being uploaded, rejected, or rolled
-    /// back, and live queries over them are served locally without a server
-    /// subscription.
-    ///
-    /// The file must already exist (a baked template written by the app or
-    /// imported through the VFS): attach-create is disabled around the
-    /// attach, so a missing file fails loudly instead of materializing as an
-    /// empty database. Attach before creating live queries, since tier
-    /// dispatch happens at registration.
-    ///
-    /// The tier shares the replica's cipher, always: SQLite gives an attached
-    /// database the connection's VFS and the page codec gives it the main
-    /// database's derived key. One device, one key, because two would double the
-    /// lost-key failure modes and isolate nothing, since both entries would sit
-    /// in the same key store behind the same wrap.
-    ///
-    /// Under an encrypted replica the tier file must have been created through a
-    /// connection keyed the same way, which in practice means a previous run's
-    /// [`attach_local_tier_ddl`](Self::attach_local_tier_ddl). A file created
-    /// elsewhere carries its own key salt and will not decrypt here, and a
-    /// plaintext baked template will not either. Both fail loudly with
-    /// [`ClientError::Db`] rather than leaving the tier in the clear.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Db`] when the file is missing, is not a database, or a
-    /// tier is already attached.
-    pub fn attach_local_tier(&mut self, path: &str) -> Result<(), ClientError> {
-        let create_was_enabled = self.db.is_attach_create_enabled()?;
-        if create_was_enabled {
-            self.db.set_attach_create_enabled(false)?;
-        }
-        let attached = self.db.attach_database(path, LOCAL_SCHEMA);
-        if create_was_enabled {
-            self.db.set_attach_create_enabled(true)?;
-        }
-        attached?;
-        self.local_tables = local_tier_tables(&mut self.db)?;
-        Ok(())
-    }
-
-    /// Attach the local tier at `path`, creating it and applying `ddl` when it
-    /// is empty. `":memory:"` gives the ephemeral tier a `:memory:` replica
-    /// wants (a tab's mirror, tests), a file path gives a durable one, and
-    /// either way a second run over an already populated tier re-attaches it
-    /// untouched.
-    ///
-    /// This is the only way to first-boot a durable tier under an encrypted
-    /// replica, and the reason is a property of the page codec rather than a
-    /// preference. A database created through an `ATTACH` on a keyed connection
-    /// inherits the main database's key salt, and an `ATTACH` of an existing
-    /// database applies the main database's derived key regardless of any `KEY`
-    /// clause, so a tier file created by some other connection carries a
-    /// different salt and will not decrypt here. Creating it through the replica
-    /// connection is what makes the salts agree, which is also why
-    /// [`attach_local_tier`](Self::attach_local_tier) works on every later run.
-    /// This is measured behaviour: see
-    /// `crates/connetto-client/tests/encrypted_replica.rs`.
-    ///
-    /// `ddl` must consist of `CREATE TABLE` statements only: each is
-    /// requalified into the attached schema, since an unqualified `CREATE
-    /// TABLE` would land in `main` and sync.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Session`] on a non-`CREATE TABLE` statement,
-    /// [`ClientError::Db`] when a statement fails or a tier is already
-    /// attached.
-    pub fn attach_local_tier_ddl(&mut self, path: &str, ddl: &str) -> Result<(), ClientError> {
-        self.db.attach_database(path, LOCAL_SCHEMA)?;
-        // An attached database with no tables is a fresh one, on every target
-        // and with no filesystem probe, which wasm does not have.
-        if local_tier_tables(&mut self.db)?.is_empty() {
-            for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                self.db.batch_execute(&qualify_create_table(statement)?)?;
-            }
-        }
-        self.local_tables = local_tier_tables(&mut self.db)?;
-        Ok(())
     }
 
     /// The lowercased names of the tables in the attached local tier, empty
