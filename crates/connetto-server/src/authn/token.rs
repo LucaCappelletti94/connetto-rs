@@ -28,6 +28,11 @@ const DEFAULT_REFRESH_IDLE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 *
 const DEFAULT_REFRESH_ABSOLUTE_CEILING: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 /// Default window in which a caller with no identity may keep resuming.
 const DEFAULT_RESUME_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Default share-key lifetime. A week is the ordinary span of a share link.
+const DEFAULT_CAPABILITY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Default ceiling on a share-key lifetime. It is what makes "a share key must
+/// expire" something the server enforces rather than advice.
+const DEFAULT_CAPABILITY_MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Server-side authentication configuration: token identity and lifetimes.
 ///
@@ -49,6 +54,12 @@ pub struct AuthConfig {
     /// and it is the lifetime of the canonical case for an unidentified run,
     /// a shopping cart the visitor comes back to.
     pub resume_ttl: Duration,
+    /// Default share-key lifetime, used when a mint names none.
+    pub capability_ttl: Duration,
+    /// Hard ceiling on a share-key lifetime. A mint asking for longer is
+    /// refused rather than quietly shortened, so an application's own statement
+    /// of when a link dies cannot be a lie.
+    pub capability_max_ttl: Duration,
     /// Sliding refresh window, extended on each online refresh.
     pub refresh_idle_window: Duration,
     /// Absolute refresh ceiling, never extended.
@@ -62,6 +73,8 @@ impl Default for AuthConfig {
             audience: "connetto".to_owned(),
             access_ttl: DEFAULT_ACCESS_TTL,
             resume_ttl: DEFAULT_RESUME_TTL,
+            capability_ttl: DEFAULT_CAPABILITY_TTL,
+            capability_max_ttl: DEFAULT_CAPABILITY_MAX_TTL,
             refresh_idle_window: DEFAULT_REFRESH_IDLE_WINDOW,
             refresh_absolute_ceiling: DEFAULT_REFRESH_ABSOLUTE_CEILING,
         }
@@ -112,13 +125,13 @@ pub enum TokenError {
 /// `decode` handles both kinds with no order of attempts.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "knd")]
-enum GrantClaims<Id> {
+enum GrantClaims<Id, Key> {
     /// A login grant.
     #[serde(rename = "user")]
     User(AccessClaims<Id>),
     /// A capability grant.
     #[serde(rename = "key")]
-    Key(CapabilityClaims),
+    Key(CapabilityClaims<Key>),
 }
 
 /// The claims connetto signs into a login grant. `sub` is the `user_id`, `sid`
@@ -139,10 +152,10 @@ struct AccessClaims<Id> {
 /// nothing else: a permission inside the token would split authorization
 /// between the token and the model.
 #[derive(Debug, Serialize, Deserialize)]
-struct CapabilityClaims {
+struct CapabilityClaims<Key> {
     iss: String,
     aud: String,
-    sub: String,
+    sub: Key,
     iat: u64,
     exp: u64,
 }
@@ -254,7 +267,7 @@ impl TokenAuthority {
     ) -> Result<String, TokenError> {
         let iat = unix_secs(issued_at)?;
         let exp = iat.saturating_add(self.access_ttl.as_secs());
-        let claims = GrantClaims::User(AccessClaims {
+        let claims = GrantClaims::<Id, ()>::User(AccessClaims {
             iss: self.issuer.clone(),
             aud: self.audience.clone(),
             sub: context.user_id.clone(),
@@ -280,17 +293,17 @@ impl TokenAuthority {
     ///
     /// [`TokenError::Clock`] if `issued_at` precedes the unix epoch, or
     /// [`TokenError::Mint`] if signing fails.
-    pub fn mint_capability(
+    pub fn mint_capability<Key: Serialize + Clone>(
         &self,
-        subject: &CapabilitySubject,
+        subject: &CapabilitySubject<Key>,
         issued_at: SystemTime,
         ttl: Duration,
     ) -> Result<String, TokenError> {
         let iat = unix_secs(issued_at)?;
-        let claims = GrantClaims::<()>::Key(CapabilityClaims {
+        let claims = GrantClaims::<(), Key>::Key(CapabilityClaims {
             iss: self.issuer.clone(),
             aud: self.audience.clone(),
-            sub: subject.as_str().to_owned(),
+            sub: subject.key().clone(),
             iat,
             exp: iat.saturating_add(ttl.as_secs()),
         });
@@ -308,12 +321,13 @@ impl TokenAuthority {
     /// # Errors
     ///
     /// [`TokenError::Verify`] if any check fails.
-    pub fn check_grant<Id: DeserializeOwned>(
+    pub fn check_grant<Id: DeserializeOwned, Key: DeserializeOwned>(
         &self,
         grant: &Grant,
-    ) -> Result<Subject<Id>, TokenError> {
-        let data = decode::<GrantClaims<Id>>(grant.as_str(), &self.decoding, &self.validation())
-            .map_err(|err| TokenError::Verify(err.to_string()))?;
+    ) -> Result<Subject<Id, Key>, TokenError> {
+        let data =
+            decode::<GrantClaims<Id, Key>>(grant.as_str(), &self.decoding, &self.validation())
+                .map_err(|err| TokenError::Verify(err.to_string()))?;
         Ok(match data.claims {
             GrantClaims::User(claims) => Subject::Identity(VerifiedSession {
                 context: AuthContext {

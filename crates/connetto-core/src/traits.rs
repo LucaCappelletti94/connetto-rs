@@ -182,14 +182,14 @@ pub enum MutationOp {
 /// batching profiles differ. Read checks fire per (row, subscription) on the
 /// CDC hot path. Write checks fire per client mutation.
 #[allow(async_fn_in_trait)]
-pub trait AuthPolicy<Id = String> {
+pub trait AuthPolicy<Id = String, Key = String> {
     /// Policy-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
     /// Whether `caller` may see the row identified by `(table, pk)`.
     async fn can_read(
         &self,
-        caller: &Principal<Id>,
+        caller: &Principal<Id, Key>,
         table: &str,
         pk: &[u8],
     ) -> Result<bool, Self::Error>;
@@ -197,7 +197,7 @@ pub trait AuthPolicy<Id = String> {
     /// Whether `caller` may perform `op` on the row identified by `(table, pk)`.
     async fn can_write(
         &self,
-        caller: &Principal<Id>,
+        caller: &Principal<Id, Key>,
         table: &str,
         pk: &[u8],
         op: MutationOp,
@@ -251,8 +251,8 @@ impl std::error::Error for GrantRefused {}
 /// A trait object cannot carry an `async fn` directly, so checking returns an
 /// explicitly boxed `Send` future. Checking fires once per grant per connection
 /// off any hot path, so the box allocation is irrelevant.
-pub type GrantCheckFuture<'a, Id = String> =
-    core::pin::Pin<Box<dyn Future<Output = Result<Subject<Id>, GrantRefused>> + Send + 'a>>;
+pub type GrantCheckFuture<'a, Id = String, Key = String> =
+    core::pin::Pin<Box<dyn Future<Output = Result<Subject<Id, Key>, GrantRefused>> + Send + 'a>>;
 
 /// A resume blob could not be minted or was not one this server signed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +279,7 @@ impl std::error::Error for HandleError {}
 /// because none of this is on a hot path so static dispatch buys nothing, and a
 /// trait object keeps the server's public type signature stable no matter how a
 /// deployment configures identity.
-pub trait HandshakeAuthority<Id = String>: Send + Sync {
+pub trait HandshakeAuthority<Id = String, Key = String>: Send + Sync {
     /// Check one grant and resolve the [`Subject`] it names, or refuse it.
     ///
     /// This half is the generalization of the old single-credential verifier,
@@ -303,7 +303,7 @@ pub trait HandshakeAuthority<Id = String>: Send + Sync {
     ///
     /// [`GrantRefused`] when the grant does not check out. A refusal never
     /// reaches the client.
-    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, Id>;
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, Id, Key>;
 
     /// Mint the resume blob naming `session_id`, for a caller with no identity
     /// to present on its next connection.

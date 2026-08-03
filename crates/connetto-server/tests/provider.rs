@@ -255,7 +255,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
     login.retained.expires_at = Some(SystemTime::now() - Duration::from_secs(60));
     let pair = service.login_with_provider(&login).await.expect("login");
     let Subject::Identity(verified) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");
@@ -293,7 +293,7 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
     login.retained.expires_at = Some(SystemTime::now() + Duration::from_secs(3600));
     let pair = service.login_with_provider(&login).await.expect("login");
     let Subject::Identity(verified) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");

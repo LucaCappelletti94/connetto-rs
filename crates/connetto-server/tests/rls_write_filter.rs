@@ -51,7 +51,13 @@ async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT)",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
-            "CREATE POLICY notes_p ON notes USING (owner = current_setting('app.user_id', true))",
+            // The union: a row you own, or a row owned by a share key you hold.
+            // A caller holding no key leaves `app.subjects` unset, so
+            // `string_to_array` yields NULL and the second disjunct is NULL
+            // rather than true.
+            "CREATE POLICY notes_p ON notes USING ( \
+               owner = current_setting('app.user_id', true) \
+               OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
             "GRANT USAGE ON SCHEMA public TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
             "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
@@ -164,13 +170,18 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 async fn handshake<T: Transport>(transport: &mut T, client_id: &str) {
+    // The verified grant's user_id becomes app.user_id under RLS.
+    handshake_with(transport, client_id, &[&format!("user:{client_id}")]).await;
+}
+
+async fn handshake_with<T: Transport>(transport: &mut T, client_id: &str, grants: &[&str]) {
     transport
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, client_id)
-                // The verified grant's user_id becomes app.user_id under RLS.
-                .with_grant(connetto_core::messages::Grant::new(format!(
-                    "user:{client_id}"
-                ))),
+            Handshake::new(PROTOCOL_VERSION, client_id).with_grants(
+                grants
+                    .iter()
+                    .map(|grant| connetto_core::messages::Grant::new(*grant)),
+            ),
         ))
         .await
         .expect("send handshake");
@@ -323,6 +334,81 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
     // The row is untouched, so nothing was left half-applied.
     assert_eq!(notes(&admin).await, vec![(1, "alice".to_owned())]);
 
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
+}
+
+/// Row two of the arrival table: a caller with no identity writes where a
+/// capability allows it, and nowhere otherwise (R4).
+///
+/// The same caller sends the same insert twice, once presenting nothing and
+/// once presenting the key. Only the difference in what was presented can
+/// explain the difference in outcome, which is what makes this an assertion
+/// about the capability rather than about the policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() {
+    const KEY: &str = "key:can-write-here";
+
+    let fixture = Fixture::acquire().await;
+    let admin = fixture.admin().clone();
+    let writer_pool = setup(&fixture).await;
+    let build = || {
+        let materializer = Materializer::with_write_catalog(
+            PG_DDL,
+            RuntimeWritableCatalog::builder()
+                .versioned("notes", "edited_at")
+                .build(),
+        )
+        .expect("build materializer");
+        SessionManager::new(
+            materializer,
+            NoSnapshot,
+            PermissiveAuth,
+            Arc::new(TestGrantChecker),
+            pg_write_target::<ConnettoWatermark>(writer_pool.clone(), PG_DDL)
+                .expect("build write target"),
+            SessionConfig::default(),
+        )
+    };
+
+    // Presenting nothing: the insert is refused, because with neither an
+    // identity nor a key bound both halves of the policy are NULL.
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(build().serve(server_transport));
+    handshake_with(&mut client, "visitor", &[]).await;
+    upload(&mut client, 1, insert_changeset(1, KEY, "shared", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 1),
+        other => panic!("a caller holding nothing must be refused, got {other:?}"),
+    }
+    assert_eq!(notes(&admin).await, Vec::new());
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
+
+    // Same caller, same row, now presenting the key: it lands.
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(build().serve(server_transport));
+    handshake_with(&mut client, "visitor", &[KEY]).await;
+    upload(&mut client, 1, insert_changeset(1, KEY, "shared", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
+        other => panic!("the key must authorize the write, got {other:?}"),
+    }
+
+    // And the key does not become a licence to write anywhere: a row owned by
+    // somebody else is still refused on the same connection.
+    upload(&mut client, 2, insert_changeset(2, "alice", "hers", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 2),
+        other => panic!("the key grants its own row only, got {other:?}"),
+    }
+    match barrier(&mut client, 1).await {
+        ControlMessage::Pong(_) => {}
+        other => panic!("expected pong after the reject, got {other:?}"),
+    }
+
+    assert_eq!(notes(&admin).await, vec![(1, KEY.to_owned())]);
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
 }

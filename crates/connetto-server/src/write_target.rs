@@ -16,8 +16,6 @@ use connetto_core::auth::Principal;
 use connetto_core::messages::ConflictRow;
 use diesel::OptionalExtension;
 use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
-use diesel::sql_query;
-use diesel::sql_types::Text;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -25,6 +23,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::ParserDB;
 use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
+use crate::capability::{CallerBinding, CapabilityKey};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 
 use crate::materializer::{
@@ -146,17 +145,18 @@ fn is_rls_violation(text: &str) -> bool {
 impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     /// Probe conflicts, apply one upload, and advance the durable watermark in
     /// the same transaction, reporting the outcome. The apply runs under the
-    /// caller's identity, so Postgres RLS gates it, and the watermark is keyed
-    /// by `session_id` alone, the durable handle every run has, so a reconnect
-    /// reusing the same run dedupes replayed uploads.
+    /// caller's identity and share keys, so Postgres RLS gates it, and the
+    /// watermark is keyed by `session_id` alone, the durable handle every run
+    /// has, so a reconnect reusing the same run dedupes replayed uploads.
     ///
-    /// A caller with no identity binds nothing, so every owner policy's
-    /// `WITH CHECK` fails and the write is refused. That is the arrival case
-    /// working as specified rather than an oversight: an unidentified write is
-    /// authorized by a capability, which is phase R4's work.
-    pub(crate) async fn commit(
+    /// A caller with neither an identity nor a capability binds nothing, so
+    /// every owner policy's `WITH CHECK` fails and the write is refused. A
+    /// caller holding a capability writes wherever that capability's relations
+    /// allow, which is the second row of the arrival table in
+    /// `docs/architecture/08-authorization.md`.
+    pub(crate) async fn commit<Key: CapabilityKey>(
         &self,
-        caller: &Principal<W::Id>,
+        caller: &Principal<W::Id, Key>,
         plan: &WritePlan,
         payload_zstd: &[u8],
         session_id: SessionId,
@@ -170,26 +170,14 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        // The RLS GUC binds `user_id` as text via `Display`, a genuine text
-        // boundary. The identity gates the APPLY only: the watermark below keys
-        // on the session handle alone.
-        let guc_user = caller
-            .identity()
-            .map(|identity| identity.user_id.to_string());
+        let binding = CallerBinding::of(caller);
         let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(|c| {
                 async move {
-                    // set_config is a vendor function the query DSL cannot
-                    // express, so this one statement stays raw.
-                    if let Some(guc_user) = guc_user {
-                        sql_query("SELECT set_config('app.user_id', $1, true)")
-                            .bind::<Text, _>(guc_user)
-                            .execute(c)
-                            .await?;
-                    }
+                    binding.apply(c).await?;
                     for op in &plan.ops {
                         let Some(conflict) = &op.conflict else {
                             continue;

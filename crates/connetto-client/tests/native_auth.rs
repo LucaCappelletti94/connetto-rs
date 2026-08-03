@@ -429,7 +429,8 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
         .expect("the refresh token is stored");
 
     // Before the logout the real handshake verifier accepts this token.
-    let authority = service.handshake_authority();
+    let concrete = service.handshake_authority();
+    let authority: &dyn HandshakeAuthority = &concrete;
     authority
         .check_grant(&Grant::new(login.access_token.clone()))
         .await

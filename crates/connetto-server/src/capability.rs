@@ -1,0 +1,314 @@
+//! Share keys: the deployment's key type, and the authorized mint call.
+//!
+//! A capability is a connetto-signed token asserting the bearer is a named
+//! subject and nothing more. The permission attached to that name is an
+//! ordinary row in the application's own table, gated by an ordinary policy, so
+//! withdrawing a share is deleting that row and nothing here is consulted at
+//! use time beyond the signature. See
+//! `docs/architecture/12-identity-session-capability.md`.
+//!
+//! [`CapabilityKey`] is the one seam: the deployment's key type implements it,
+//! naming how a fresh key is minted and how the keys a caller holds are packed
+//! into the single Postgres setting a policy compares against. `String`
+//! implements it, and is the default.
+//!
+//! [`CapabilityIssuer`] is the library call an application makes from its own
+//! handler. connetto gains no endpoint for it.
+
+use core::fmt::Display;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use connetto_core::auth::{CapabilitySubject, Principal};
+use connetto_core::traits::AuthPolicy;
+use diesel::sql_types::{Bool, Text};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::authn::token::{AuthConfig, TokenAuthority, TokenError};
+
+/// The deployment's share-key type: how one is minted, and how the keys a
+/// caller holds reach Postgres.
+///
+/// A policy can only compare against a value the transaction bound, and a
+/// caller may hold several keys, so the set travels as one text value under
+/// [`SETTING`](Self::SETTING). The default packing joins the keys with
+/// [`SEPARATOR`](Self::SEPARATOR), which a policy unpacks:
+///
+/// ```sql
+/// viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))
+/// ```
+///
+/// Whatever a deployment chooses is the contract its policies are written
+/// against, so choose before writing policies rather than after. A deployment
+/// wanting its own key type, setting, or packing implements this for that type
+/// and everything downstream follows from
+/// [`Principal`]'s key parameter.
+pub trait CapabilityKey:
+    Clone + Display + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+    /// The Postgres setting the packed keys are bound to.
+    const SETTING: &'static str = "app.subjects";
+
+    /// The character joining packed keys. A key whose rendering contains it is
+    /// refused at minting, because one that slipped through would split into
+    /// two and grant a neighbouring key's access.
+    const SEPARATOR: char = ',';
+
+    /// Mint a fresh key. It is a bearer secret, so it must be unguessable.
+    fn mint() -> Self;
+
+    /// Pack the keys a caller holds, or `None` to leave the setting unbound.
+    ///
+    /// Unbound rather than empty is what makes an absent capability fail
+    /// closed: `current_setting` yields NULL, and a comparison against NULL is
+    /// NULL rather than true.
+    fn pack(keys: &[CapabilitySubject<Self>]) -> Option<String> {
+        if keys.is_empty() {
+            return None;
+        }
+        let mut packed = String::new();
+        for key in keys {
+            if !packed.is_empty() {
+                packed.push(Self::SEPARATOR);
+            }
+            packed.push_str(&key.key().to_string());
+        }
+        Some(packed)
+    }
+}
+
+/// The default share-key: `key:` followed by a version 4 UUID.
+///
+/// 122 bits of randomness, and no rendering of it can contain the separator.
+impl CapabilityKey for String {
+    fn mint() -> Self {
+        format!("key:{}", uuid::Uuid::new_v4())
+    }
+}
+
+diesel::define_sql_function! {
+    /// Postgres `set_config`, the only way to hand a value to a policy. The
+    /// query DSL has no other spelling for a session setting, so it is declared
+    /// here as a typed function rather than written as a raw string.
+    fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
+}
+
+/// The caller rendered for one RLS transaction: the identity, and the share
+/// keys packed by the deployment's [`CapabilityKey`].
+///
+/// Built outside the transaction (the values are owned so the apply future
+/// stays `Send`) and applied as its first statement. Every path that runs SQL
+/// as a caller goes through this, so the snapshot, the write, and the per-row
+/// visibility check cannot answer differently about what the caller holds.
+pub(crate) struct CallerBinding {
+    user_id: Option<String>,
+    setting: &'static str,
+    subjects: Option<String>,
+}
+
+impl CallerBinding {
+    /// Render `caller` under the deployment's key binding.
+    pub(crate) fn of<Id: Display, Key: CapabilityKey>(caller: &Principal<Id, Key>) -> Self {
+        Self {
+            // A caller with no identity binds nothing, leaving the setting
+            // unset for the whole transaction, so an owner comparison is NULL
+            // and hides the row while a public predicate still returns its own.
+            // An empty string would be a real identity that happens to be
+            // blank, which a policy could match.
+            user_id: caller
+                .identity()
+                .map(|identity| identity.user_id.to_string()),
+            setting: Key::SETTING,
+            subjects: Key::pack(caller.capabilities()),
+        }
+    }
+
+    /// Bind both values for the rest of the transaction, in one statement.
+    pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+        const USER: &str = "app.user_id";
+        match (self.user_id, self.subjects) {
+            (None, None) => Ok(()),
+            (Some(user), None) => diesel::select(set_config(USER, user, true))
+                .execute(conn)
+                .await
+                .map(drop),
+            (None, Some(subjects)) => diesel::select(set_config(self.setting, subjects, true))
+                .execute(conn)
+                .await
+                .map(drop),
+            (Some(user), Some(subjects)) => diesel::select((
+                set_config(USER, user, true),
+                set_config(self.setting, subjects, true),
+            ))
+            .execute(conn)
+            .await
+            .map(drop),
+        }
+    }
+}
+
+/// A share key that was minted, and the token proving the bearer holds it.
+///
+/// The application writes the row granting this key access, so the two agree on
+/// the name by construction. What the application must not skip is the policy
+/// on that table: connetto checked the caller may read the resource it named,
+/// and only a `WITH CHECK` on the grant row makes the row that actually lands
+/// answer to the same rule.
+#[derive(Debug, Clone)]
+pub struct IssuedCapability<Key> {
+    /// The minted key, for the row the application writes.
+    pub key: CapabilitySubject<Key>,
+    /// The signed token, for the application to deliver however it likes.
+    pub token: String,
+    /// When the token stops checking out.
+    pub expires_at: SystemTime,
+}
+
+/// A share could not be minted.
+#[derive(Debug, thiserror::Error)]
+pub enum ShareError {
+    /// The caller may not read the resource it asked to share.
+    #[error("the caller may not read {table}, so it may not share it")]
+    Unauthorized {
+        /// The table the caller named.
+        table: String,
+    },
+    /// The authorization check itself failed.
+    #[error("authorization check failed: {0}")]
+    Policy(String),
+    /// The requested lifetime exceeds the deployment's ceiling.
+    #[error("requested lifetime {requested:?} exceeds the ceiling {ceiling:?}")]
+    TtlTooLong {
+        /// What the caller asked for.
+        requested: Duration,
+        /// The configured maximum.
+        ceiling: Duration,
+    },
+    /// The minted key's rendering contains the packing separator, so binding it
+    /// would grant a neighbouring key's access.
+    #[error("the minted key contains the packing separator {separator:?}")]
+    SeparatorInKey {
+        /// The separator the binding uses.
+        separator: char,
+    },
+    /// Signing failed.
+    #[error(transparent)]
+    Mint(#[from] TokenError),
+}
+
+/// Mints share keys, having checked the caller may read what it is sharing.
+///
+/// Held beside [`AuthService`](crate::AuthService) at startup and called from
+/// the application's own handler, so the application keeps its routing, its
+/// request shape and its rate limits.
+pub struct CapabilityIssuer<P> {
+    authority: Arc<TokenAuthority>,
+    policy: Arc<P>,
+    ttl: Duration,
+    max_ttl: Duration,
+}
+
+impl<P> CapabilityIssuer<P> {
+    /// Build over the token authority, the authorization policy, and the
+    /// lifetimes the deployment configured.
+    #[must_use]
+    pub fn new(authority: Arc<TokenAuthority>, policy: Arc<P>, config: &AuthConfig) -> Self {
+        Self {
+            authority,
+            policy,
+            ttl: config.capability_ttl,
+            max_ttl: config.capability_max_ttl,
+        }
+    }
+
+    /// Mint a share key over the row `pk` in `table`, on behalf of `caller`.
+    ///
+    /// `ttl` overrides the configured default and is refused rather than
+    /// quietly shortened when it exceeds the ceiling, so an application's own
+    /// statement of when a link dies cannot be a lie.
+    ///
+    /// The check is the same [`AuthPolicy`] every other question goes through,
+    /// because a caller must not share what it cannot read.
+    ///
+    /// # Errors
+    ///
+    /// [`ShareError`] when the caller may not read the row, the lifetime
+    /// exceeds the ceiling, or signing fails.
+    pub async fn issue<Id, Key: CapabilityKey>(
+        &self,
+        caller: &Principal<Id, Key>,
+        table: &str,
+        pk: &[u8],
+        ttl: Option<Duration>,
+    ) -> Result<IssuedCapability<Key>, ShareError>
+    where
+        P: AuthPolicy<Id, Key>,
+    {
+        let ttl = match ttl {
+            Some(requested) if requested > self.max_ttl => {
+                return Err(ShareError::TtlTooLong {
+                    requested,
+                    ceiling: self.max_ttl,
+                });
+            }
+            Some(requested) => requested,
+            None => self.ttl,
+        };
+        let allowed = self
+            .policy
+            .can_read(caller, table, pk)
+            .await
+            .map_err(|err| ShareError::Policy(err.to_string()))?;
+        if !allowed {
+            return Err(ShareError::Unauthorized {
+                table: table.to_owned(),
+            });
+        }
+        let key = CapabilitySubject::<Key>::new(Key::mint());
+        if key.key().to_string().contains(Key::SEPARATOR) {
+            return Err(ShareError::SeparatorInKey {
+                separator: Key::SEPARATOR,
+            });
+        }
+        let issued_at = SystemTime::now();
+        let token = self.authority.mint_capability(&key, issued_at, ttl)?;
+        Ok(IssuedCapability {
+            key,
+            token,
+            expires_at: issued_at + ttl,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_held_leaves_the_setting_unbound() {
+        assert!(String::pack(&[]).is_none());
+    }
+
+    #[test]
+    fn held_keys_pack_in_order_under_one_separator() {
+        let keys = [
+            CapabilitySubject::new("key:a"),
+            CapabilitySubject::new("key:b"),
+        ];
+        assert_eq!(String::pack(&keys).as_deref(), Some("key:a,key:b"));
+    }
+
+    #[test]
+    fn a_minted_key_never_contains_the_separator() {
+        for _ in 0..64 {
+            assert!(!String::mint().contains(<String as CapabilityKey>::SEPARATOR));
+        }
+    }
+
+    #[test]
+    fn two_mints_never_collide() {
+        assert_ne!(String::mint(), <String as CapabilityKey>::mint());
+    }
+}

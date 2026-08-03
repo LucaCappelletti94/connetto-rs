@@ -48,28 +48,37 @@ pub struct VerifiedSession<Id = String> {
 
 /// The subject a capability grant names, for example `key:abc123`.
 ///
+/// Generic over the deployment's own key type for the same reason
+/// [`AuthContext`] is generic over its user id: text belongs at the edges, not
+/// in the middle. The key's serde encoding is what the signed token carries,
+/// and its [`Display`](core::fmt::Display) rendering is what reaches Postgres.
+///
 /// It is not a person and it asserts nothing about what it may do: the
 /// authorization model holds the permission as a relation on this name, so
 /// withdrawing a share is deleting a row rather than revoking a token.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CapabilitySubject(String);
+pub struct CapabilitySubject<Key = String>(Key);
 
-impl CapabilitySubject {
+impl<Key> CapabilitySubject<Key> {
     /// Name a capability subject.
-    pub fn new(subject: impl Into<String>) -> Self {
-        Self(subject.into())
+    pub fn new(key: impl Into<Key>) -> Self {
+        Self(key.into())
     }
 
-    /// The subject name the authorization model relates permissions to.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
+    /// The key the authorization model relates permissions to.
+    pub const fn key(&self) -> &Key {
         &self.0
+    }
+
+    /// Take the key out.
+    pub fn into_key(self) -> Key {
+        self.0
     }
 }
 
-impl core::fmt::Display for CapabilitySubject {
+impl<Key: core::fmt::Display> core::fmt::Display for CapabilitySubject<Key> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        self.0.fmt(f)
     }
 }
 
@@ -79,11 +88,11 @@ impl core::fmt::Display for CapabilitySubject {
 /// they name, which is why one checker reads either and no order of checks is
 /// load-bearing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Subject<Id = String> {
+pub enum Subject<Id = String, Key = String> {
     /// A login grant, naming a person and the run the auth store opened.
     Identity(VerifiedSession<Id>),
     /// A capability grant, naming a subject that is not a person.
-    Capability(CapabilitySubject),
+    Capability(CapabilitySubject<Key>),
 }
 
 /// The caller an authorization check receives.
@@ -97,13 +106,13 @@ pub enum Subject<Id = String> {
 /// times, so the four cases are the entire space and there is no fifth state to
 /// leave unused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Principal<Id = String> {
+pub struct Principal<Id = String, Key = String> {
     session_id: SessionId,
     identity: Option<AuthContext<Id>>,
-    capabilities: Vec<CapabilitySubject>,
+    capabilities: Vec<CapabilitySubject<Key>>,
 }
 
-impl<Id> Principal<Id> {
+impl<Id, Key> Principal<Id, Key> {
     /// A caller carrying no identity, on the handle connetto minted for it.
     ///
     /// Capabilities are folded in afterwards with [`accept`](Self::accept), so
@@ -125,7 +134,7 @@ impl<Id> Principal<Id> {
     /// a minted one. A second identity is refused and both are dropped: a run
     /// has one identity, and keeping whichever arrived first would make the
     /// order of checks decide the caller.
-    pub fn accept(&mut self, subject: Subject<Id>) -> Result<(), AmbiguousIdentity> {
+    pub fn accept(&mut self, subject: Subject<Id, Key>) -> Result<(), AmbiguousIdentity> {
         match subject {
             Subject::Capability(subject) => {
                 self.capabilities.push(subject);
@@ -157,7 +166,7 @@ impl<Id> Principal<Id> {
 
     /// The subjects whose capability grants resolved, in no meaningful order.
     #[must_use]
-    pub fn capabilities(&self) -> &[CapabilitySubject] {
+    pub fn capabilities(&self) -> &[CapabilitySubject<Key>] {
         &self.capabilities
     }
 }

@@ -139,7 +139,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     };
     let captured = seen.lock().expect("capture lock").clone();
     let Subject::Identity(minted) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");
@@ -155,7 +155,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     // Revoke the session. Its access token is still time-valid, but the grant
     // is now refused: the run continues unidentified rather than being rejected.
     let Subject::Identity(verified) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");
@@ -278,13 +278,13 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     assert_ne!(rotated.refresh_token, pair.refresh_token, "token rotates");
     // The rotated access token still verifies to the same session.
     let Subject::Identity(first) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify first")
     else {
         panic!("expected identity subject");
     };
     let Subject::Identity(second) = authority
-        .check_grant::<String>(&Grant::new(&rotated.access_token))
+        .check_grant::<String, String>(&Grant::new(&rotated.access_token))
         .expect("verify rotated")
     else {
         panic!("expected identity subject");
@@ -299,8 +299,8 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     assert!(after.is_err(), "session revoked after reuse");
 
     // The authority now refuses the still-signed access token: session not live.
-    let refused = svc
-        .handshake_authority()
+    let authority: &dyn connetto_core::traits::HandshakeAuthority = &svc.handshake_authority();
+    let refused = authority
         .check_grant(&Grant::new(&rotated.access_token))
         .await;
     assert_eq!(refused, Err(GrantRefused::Revoked));
@@ -314,7 +314,7 @@ async fn expired_access_token_is_refused() {
     let svc = AuthService::new(Arc::clone(&authority), Arc::clone(&store));
     let pair = svc.login(&identity("carol")).await.expect("login");
     let Subject::Identity(verified) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");
@@ -325,10 +325,8 @@ async fn expired_access_token_is_refused() {
     let stale = authority
         .mint_access(&verified.context, verified.session_id, stale_issued)
         .expect("mint stale");
-    let refused = svc
-        .handshake_authority()
-        .check_grant(&Grant::new(&stale))
-        .await;
+    let authority: &dyn connetto_core::traits::HandshakeAuthority = &svc.handshake_authority();
+    let refused = authority.check_grant(&Grant::new(&stale)).await;
     assert!(
         matches!(refused, Err(GrantRefused::Invalid(_))),
         "an expired access token is invalid, got {refused:?}",
@@ -346,7 +344,7 @@ async fn a_token_from_another_key_is_refused() {
     let other = TokenAuthority::generate(&config).expect("keypair b");
     let pair = svc.login(&identity("dave")).await.expect("login");
     let Subject::Identity(verified) = authority
-        .check_grant::<String>(&Grant::new(&pair.access_token))
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
     else {
         panic!("expected identity subject");
@@ -355,10 +353,8 @@ async fn a_token_from_another_key_is_refused() {
         .mint_access(&verified.context, verified.session_id, SystemTime::now())
         .expect("mint forged");
 
-    let refused = svc
-        .handshake_authority()
-        .check_grant(&Grant::new(&forged))
-        .await;
+    let authority: &dyn connetto_core::traits::HandshakeAuthority = &svc.handshake_authority();
+    let refused = authority.check_grant(&Grant::new(&forged)).await;
     assert!(
         matches!(refused, Err(GrantRefused::Invalid(_))),
         "a token signed by another key is refused, got {refused:?}",

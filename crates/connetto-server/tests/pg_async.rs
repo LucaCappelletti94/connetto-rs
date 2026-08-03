@@ -169,9 +169,9 @@ async fn async_pg_snapshot_reads_rows() {
         .snapshot(
             "SELECT * FROM orders WHERE quantity > 0",
             &[],
-            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
-                "test-user",
-            )),
+            &connetto_core::Principal::<String, String>::unidentified(
+                connetto_core::SessionId::from_token_hash("test-user"),
+            ),
         )
         .await
         .expect("produce snapshot");
@@ -255,9 +255,9 @@ async fn async_pg_snapshot_uuid_is_blob16() {
         .snapshot(
             "SELECT * FROM things",
             &[],
-            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
-                "test-user",
-            )),
+            &connetto_core::Principal::<String, String>::unidentified(
+                connetto_core::SessionId::from_token_hash("test-user"),
+            ),
         )
         .await
         .expect("produce snapshot");
@@ -653,9 +653,9 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
         .snapshot(
             &reg.pg_sql,
             &binds,
-            &connetto_core::Principal::unidentified(connetto_core::SessionId::from_token_hash(
-                "test-user",
-            )),
+            &connetto_core::Principal::<String, String>::unidentified(
+                connetto_core::SessionId::from_token_hash("test-user"),
+            ),
         )
         .await
         .expect("snapshot the translated query");

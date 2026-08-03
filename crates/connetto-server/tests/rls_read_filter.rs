@@ -54,7 +54,7 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 /// Whether `user` may read the row `key` in `table`, encoding the key exactly as
 /// the materializer's read path does.
 async fn visible(auth: &RlsAuth, user: &str, table: &str, key: &[Value<Postgres>]) -> bool {
-    let mut principal = Principal::unidentified(SessionId::from_token_hash(user));
+    let mut principal: Principal = Principal::unidentified(SessionId::from_token_hash(user));
     let _ = principal.accept(Subject::Identity(VerifiedSession {
         context: AuthContext::new(user),
         session_id: SessionId::from_token_hash(user),
@@ -133,7 +133,7 @@ async fn rls_read_filter_enforces_visibility_per_user() {
 
     // A timestamp key is not bindable yet: the check fails loudly rather than
     // silently admitting or denying the row.
-    let mut principal = Principal::unidentified(SessionId::from_token_hash("alice"));
+    let mut principal: Principal = Principal::unidentified(SessionId::from_token_hash("alice"));
     let _ = principal.accept(Subject::Identity(VerifiedSession {
         context: AuthContext::new("alice"),
         session_id: SessionId::from_token_hash("alice"),

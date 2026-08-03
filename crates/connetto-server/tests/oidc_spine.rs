@@ -337,9 +337,8 @@ async fn the_oauth_spine_completes_against_a_real_identity_provider() {
     // And the session is live: the real handshake verifier accepts the token
     // connetto minted from a provider login, which is the whole point of the
     // spine.
-    let verified = stack
-        .service
-        .handshake_authority()
+    let authority: &dyn HandshakeAuthority = &stack.service.handshake_authority();
+    let verified = authority
         .check_grant(&Grant::new(&access_token))
         .await
         .expect("the minted session verifies at the handshake");

@@ -193,7 +193,7 @@ async fn presenting_a_key_arrives_with_a_capability_and_no_identity() {
         .caller
         .capabilities()
         .iter()
-        .map(connetto_core::auth::CapabilitySubject::as_str)
+        .map(|subject| subject.key().as_str())
         .collect();
     assert_eq!(held, ["key:abc123"]);
 }

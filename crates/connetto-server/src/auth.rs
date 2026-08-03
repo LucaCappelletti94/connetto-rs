@@ -55,6 +55,8 @@ mod rls {
     use subql::backend::Value;
     use subql::{ParserDB, catalog_helpers};
 
+    use crate::capability::{CallerBinding, CapabilityKey};
+
     /// Failure surfaced by [`RlsAuth`].
     #[derive(Debug, thiserror::Error)]
     pub enum RlsAuthError {
@@ -83,8 +85,9 @@ mod rls {
     /// An [`AuthPolicy`] that enforces reads through Postgres Row-Level Security.
     ///
     /// A read check runs `SELECT EXISTS(...)` for the row's primary key inside a
-    /// transaction that first sets `app.user_id` to the requesting identity, so
-    /// RLS policies keyed on `current_setting('app.user_id')` decide visibility.
+    /// transaction that first binds the caller (`app.user_id` for the identity,
+    /// and the packed share keys under the binding's own setting), so RLS
+    /// policies keyed on `current_setting` decide visibility.
     /// The key arrives as [`crate::pk`] bytes, decoded back into typed values and
     /// bound as indexed `"col" = $n` equality per key column, so the row's own
     /// primary-key index answers the check. A key of a type the bind path does
@@ -138,12 +141,12 @@ mod rls {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 
-    impl AuthPolicy for RlsAuth {
+    impl<Key: CapabilityKey> AuthPolicy<String, Key> for RlsAuth {
         type Error = RlsAuthError;
 
         async fn can_read(
             &self,
-            caller: &Principal,
+            caller: &Principal<String, Key>,
             table: &str,
             pk: &[u8],
         ) -> Result<bool, RlsAuthError> {
@@ -191,12 +194,7 @@ mod rls {
                     }
                 };
             }
-            // A caller with no identity leaves `app.user_id` unset for the
-            // whole transaction rather than binding an empty string, so an
-            // owner comparison is NULL and hides the row while a public
-            // predicate still returns its own. An empty string would be a real
-            // identity that happens to be blank, which a policy could match.
-            let user_id = caller.identity().map(|identity| identity.user_id.clone());
+            let binding = CallerBinding::of(caller);
             let mut conn = self
                 .pool
                 .get()
@@ -205,12 +203,7 @@ mod rls {
             let present = conn
                 .transaction::<bool, diesel::result::Error, _>(|c| {
                     async move {
-                        if let Some(user_id) = user_id {
-                            sql_query("SELECT set_config('app.user_id', $1, true)")
-                                .bind::<Text, _>(user_id)
-                                .execute(c)
-                                .await?;
-                        }
+                        binding.apply(c).await?;
                         let row: Present = query.get_result(c).await?;
                         Ok(row.present)
                     }
@@ -223,7 +216,7 @@ mod rls {
         #[allow(clippy::unused_async_trait_impl)]
         async fn can_write(
             &self,
-            _caller: &Principal,
+            _caller: &Principal<String, Key>,
             _table: &str,
             _pk: &[u8],
             _op: MutationOp,

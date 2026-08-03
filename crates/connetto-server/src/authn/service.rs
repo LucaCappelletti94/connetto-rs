@@ -16,6 +16,7 @@ use connetto_core::SessionId;
 use connetto_core::auth::Subject;
 use connetto_core::messages::Grant;
 use connetto_core::traits::{GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority};
+use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::authn::provider::{
@@ -334,12 +335,16 @@ impl<S: AuthStore> ConnettoHandshakeAuthority<S> {
     }
 }
 
-impl<S: AuthStore + 'static> HandshakeAuthority<S::Id> for ConnettoHandshakeAuthority<S> {
-    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id> {
+impl<S, Key> HandshakeAuthority<S::Id, Key> for ConnettoHandshakeAuthority<S>
+where
+    S: AuthStore + 'static,
+    Key: DeserializeOwned + Send + 'static,
+{
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id, Key> {
         Box::pin(async move {
             let subject = self
                 .authority
-                .check_grant::<S::Id>(grant)
+                .check_grant::<S::Id, Key>(grant)
                 .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
             // Only a login has something to keep alive. A capability is
             // withdrawn by deleting the relation that grants it, which the

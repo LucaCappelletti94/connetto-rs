@@ -74,6 +74,8 @@ fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
 pub use pg::PgSnapshotSource;
 
 mod pg {
+    use core::fmt::Display;
+
     use diesel::row::{Field, NamedRow, Row};
     use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
     use diesel::{QueryableByName, sql_query};
@@ -87,6 +89,7 @@ mod pg {
     use connetto_core::{Cursor, Principal};
 
     use super::{SnapshotError, table_from_select};
+    use crate::capability::{CallerBinding, CapabilityKey};
     use crate::session::{Snapshot, SnapshotSource};
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a
@@ -152,17 +155,22 @@ mod pg {
         lsn: String,
     }
 
-    impl<DB: DatabaseLike + Send + Sync> SnapshotSource for PgSnapshotSource<DB> {
+    impl<DB, Id, Key> SnapshotSource<Id, Key> for PgSnapshotSource<DB>
+    where
+        DB: DatabaseLike + Send + Sync,
+        Id: Display + Send + Sync,
+        Key: CapabilityKey,
+    {
         type Error = SnapshotError;
 
         async fn snapshot(
             &self,
             select_sql: &str,
             binds: &[BindValue],
-            caller: &Principal,
+            caller: &Principal<Id, Key>,
         ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
-            let user_id = caller.identity().map(|identity| identity.user_id.clone());
+            let binding = CallerBinding::of(caller);
             let binds = binds.to_vec();
             let select_sql = select_sql.to_owned();
             let mut conn = self
@@ -178,17 +186,8 @@ mod pg {
                             .execute(c)
                             .await?;
                         // Establish the requesting caller's RLS context so the
-                        // read returns only rows it may see. A caller with no
-                        // identity binds nothing, leaving the setting unset for
-                        // the whole transaction, so an owner comparison is NULL
-                        // and hides the row while a public predicate still
-                        // returns its own.
-                        if let Some(user_id) = user_id {
-                            sql_query("SELECT set_config('app.user_id', $1, true)")
-                                .bind::<Text, _>(user_id)
-                                .execute(c)
-                                .await?;
-                        }
+                        // read returns only rows it may see.
+                        binding.apply(c).await?;
                         // Read the subscription SELECT verbatim (no jsonb wrap) so
                         // every column comes back in Postgres binary. The
                         // translated query carries `$N` placeholders. Attach the

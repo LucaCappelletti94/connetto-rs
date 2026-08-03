@@ -38,6 +38,7 @@ use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
+use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::materializer::{
     DeltaAggregateCapture, Materializer, MaterializerError, Registration, SqliteRegistration,
@@ -65,7 +66,7 @@ pub struct Snapshot {
 /// principal's Row-Level Security so the snapshot already excludes rows it
 /// cannot see.
 #[allow(async_fn_in_trait)]
-pub trait SnapshotSource<Id = String>: Send + Sync {
+pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// Snapshot-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
@@ -82,7 +83,7 @@ pub trait SnapshotSource<Id = String>: Send + Sync {
         &self,
         select_sql: &str,
         binds: &[BindValue],
-        caller: &Principal<Id>,
+        caller: &Principal<Id, Key>,
     ) -> Result<Snapshot, Self::Error>;
 }
 
@@ -237,7 +238,7 @@ fn resume_lsn_from_cursor(cursor: Option<&Cursor>) -> u64 {
 
 /// The word for a checked subject in the log, so a refusal can be counted and
 /// filtered by kind without parsing a sentence.
-const fn subject_kind<Id>(subject: &Subject<Id>) -> &'static str {
+const fn subject_kind<Id, Key>(subject: &Subject<Id, Key>) -> &'static str {
     match subject {
         Subject::Identity(_) => "user",
         Subject::Capability(_) => "key",
@@ -276,7 +277,7 @@ enum Outbound {
 /// Route from a `subql` consumer id back to the owning session's outbound
 /// channel.
 #[derive(Clone)]
-struct Route<Id> {
+struct Route<Id, Key> {
     /// The durable handle folded to the `u64` subql keys this session's
     /// per-subscription cursors on, stable across reconnects.
     session_key: u64,
@@ -286,7 +287,7 @@ struct Route<Id> {
     /// The subscribing session's caller, consulted per event for the read
     /// filter before a live patch is delivered. Shared rather than copied,
     /// because the fan-out clones one route per subscriber per event.
-    principal: Arc<Principal<Id>>,
+    principal: Arc<Principal<Id, Key>>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -305,9 +306,9 @@ struct LiveSession {
 }
 
 /// What a completed handshake establishes for the run loop.
-struct HandshakeOutcome<Id> {
+struct HandshakeOutcome<Id, Key> {
     connection_num: u64,
-    principal: Arc<Principal<Id>>,
+    principal: Arc<Principal<Id, Key>>,
     resume_lsn: u64,
     applied_watermark: Option<u64>,
     /// The logging context, opened as soon as the run has a handle so that a
@@ -316,7 +317,7 @@ struct HandshakeOutcome<Id> {
 }
 
 /// Mutable per-session state carried through the run loop.
-struct SessionState<Id> {
+struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<BulkMessage>,
     subs: HashMap<String, (u64, SubscriptionId)>,
@@ -326,7 +327,7 @@ struct SessionState<Id> {
     delta_agg_subs: HashMap<String, (u64, SubscriptionId)>,
     outbound: mpsc::UnboundedSender<Outbound>,
     /// The caller, established at handshake and consulted per read and write.
-    principal: Arc<Principal<Id>>,
+    principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
     /// The connetto-minted session id from the verified token. The durable
@@ -386,16 +387,23 @@ impl AsyncConnector for NoConnector {
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against an [`AuthPolicy`], a SQLite write target, and a
 /// re-execution connector for aggregate subscriptions.
-pub struct SessionManager<Snap, Auth, W, C = NoConnector, O = InMemoryOplog, Id = String>
-where
-    Snap: SnapshotSource<Id>,
-    Auth: AuthPolicy<Id> + Send + Sync,
+pub struct SessionManager<
+    Snap,
+    Auth,
+    W,
+    C = NoConnector,
+    O = InMemoryOplog,
+    Id = String,
+    Key = String,
+> where
+    Snap: SnapshotSource<Id, Key>,
+    Auth: AuthPolicy<Id, Key> + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
     materializer: Arc<Mutex<Materializer>>,
-    routes: Mutex<HashMap<u64, Route<Id>>>,
+    routes: Mutex<HashMap<u64, Route<Id, Key>>>,
     agg_routes: Mutex<HashMap<u64, AggRoute>>,
     /// Delta aggregate routes keyed by consumer id. Kept separate from
     /// `agg_routes` (keyed by re-execution query id) because the two u64
@@ -412,7 +420,7 @@ where
     /// identity without changing the manager's type. Required at construction
     /// with no default, because the deleted trusting default was itself the
     /// spoofing hole (R2).
-    authority: Arc<dyn HandshakeAuthority<Id>>,
+    authority: Arc<dyn HandshakeAuthority<Id, Key>>,
     connector: C,
     oplog: O,
     target: PgWriteTarget<W>,
@@ -535,14 +543,15 @@ where
     }
 }
 
-impl<Snap, Auth, C, O, Id, W> SessionManager<Snap, Auth, W, C, O, Id>
+impl<Snap, Auth, C, O, Id, Key, W> SessionManager<Snap, Auth, W, C, O, Id, Key>
 where
-    Snap: SnapshotSource<Id>,
-    Auth: AuthPolicy<Id> + Send + Sync,
+    Snap: SnapshotSource<Id, Key>,
+    Auth: AuthPolicy<Id, Key> + Send + Sync,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
+    Key: CapabilityKey,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
     fn next_connection_num(&self) -> u64 {
@@ -638,7 +647,7 @@ where
         }
     }
 
-    async fn add_route(&self, consumer_id: u64, route: Route<Id>) {
+    async fn add_route(&self, consumer_id: u64, route: Route<Id, Key>) {
         self.routes.lock().await.insert(consumer_id, route);
     }
 
@@ -901,7 +910,7 @@ where
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
-    ) -> Result<Option<HandshakeOutcome<Id>>, SessionError> {
+    ) -> Result<Option<HandshakeOutcome<Id, Key>>, SessionError> {
         let handshake = match transport.recv().await.map_err(transport_err)? {
             Some(IncomingFrame::Control(ControlMessage::Handshake(hs))) => hs,
             Some(_) => return Err(SessionError::Protocol("expected handshake first".into())),
@@ -1026,7 +1035,7 @@ where
     /// connection and the reply says nothing about it, so this log line is the
     /// entire visibility story: without it a checker that refuses everything
     /// and one that accepts everything look identical from the client.
-    async fn resolve_grants(&self, handle: SessionId, handshake: &Handshake) -> Principal<Id> {
+    async fn resolve_grants(&self, handle: SessionId, handshake: &Handshake) -> Principal<Id, Key> {
         let mut principal = Principal::unidentified(handle);
         for (position, grant) in handshake.grants.iter().enumerate() {
             let position = position as u64;
@@ -1077,7 +1086,7 @@ where
     async fn run_session<T: Transport>(
         self: Arc<Self>,
         mut transport: T,
-        outcome: HandshakeOutcome<Id>,
+        outcome: HandshakeOutcome<Id, Key>,
     ) -> Result<(), SessionError> {
         let HandshakeOutcome {
             connection_num,
@@ -1182,7 +1191,7 @@ where
         &self,
         transport: &mut T,
         msg: ControlMessage,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
@@ -1246,7 +1255,7 @@ where
         &self,
         transport: &mut T,
         patch: MutationPatch,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let client_seq = patch.client_seq;
         let Some(header) = state.pending_header.take() else {
@@ -1386,7 +1395,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let consumer_id = self.next_consumer_id();
         let SqliteRegistration {
@@ -1459,7 +1468,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
         reg: RowRegistration,
     ) -> Result<(), SessionError> {
         if state.resume_lsn != 0 {
@@ -1488,7 +1497,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         transport
@@ -1550,7 +1559,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
         self.add_route(
@@ -1639,7 +1648,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
         capture: crate::materializer::AggregateCapture,
     ) -> Result<(), SessionError> {
         let value = match self
@@ -1698,7 +1707,7 @@ where
         &self,
         transport: &mut T,
         sub: Subscribe,
-        state: &mut SessionState<Id>,
+        state: &mut SessionState<Id, Key>,
         capture: DeltaAggregateCapture,
     ) -> Result<(), SessionError> {
         let row = match self

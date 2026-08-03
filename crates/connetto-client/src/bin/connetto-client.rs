@@ -8,7 +8,10 @@
 //!   rest under a key kept in the OS keyring, one entry per path.
 //! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: local schema DDL.
 //! - `CONNETTO_CLIENT_ID`: identity presented at handshake (default `anonymous`).
-//! - `CONNETTO_TOKEN`: opaque auth token (default empty).
+//! - `CONNETTO_TOKEN`: the login grant (default none, so no identity).
+//! - `CONNETTO_KEYS`: share-key grants, comma separated (default none). Each is
+//!   checked on its own, so an expired one costs the caller only what that key
+//!   opened.
 //! - `CONNETTO_SCHEMA_SQL` or `CONNETTO_SCHEMA_SQL_FILE`: the shared canonical
 //!   schema source this build is compiled against, hashed into the handshake
 //!   schema version for staleness detection. It must be the SAME source the
@@ -70,7 +73,13 @@ async fn main() -> Result<()> {
         // CONNETTO_TOKEN carries the caller's identity grant. Unset means no
         // identity: the server accepts an anonymous caller.
         login: std::env::var("CONNETTO_TOKEN").ok().map(Grant::new),
-        capabilities: Vec::new(),
+        capabilities: std::env::var("CONNETTO_KEYS")
+            .ok()
+            .iter()
+            .flat_map(|keys| keys.split(','))
+            .filter(|key| !key.is_empty())
+            .map(Grant::new)
+            .collect(),
         client_id,
         schema_version,
         sql_functions: connetto_client::SqlFunctions::new(),

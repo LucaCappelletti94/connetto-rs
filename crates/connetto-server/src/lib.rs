@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod authn;
+pub mod capability;
 pub mod counters;
 pub mod materializer;
 pub mod oplog;
@@ -32,6 +33,7 @@ pub mod write_target;
 
 pub use auth::PermissiveAuth;
 pub use auth::{RlsAuth, RlsAuthError};
+pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError};
 // Re-exported so the `connetto_auth_tables!` macro can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
