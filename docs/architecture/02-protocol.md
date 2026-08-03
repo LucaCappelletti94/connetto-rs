@@ -98,15 +98,15 @@ The protocol has two planes. The **control plane** carries typed, MessagePack-en
 
 ## Grants and the handshake
 
-**Decided (R3).** A grant is a connetto-signed token asserting that the bearer is a named subject, either a person (`user:alice`) or a key (`key:abc123`). It is opaque to the client, which never parses it and only stores and presents it. It says nothing about what the subject may do: `08-authorization.md` answers that from the authorization model. The list may be empty, and each grant is checked independently.
+**Built (R3).** A grant is a connetto-signed token asserting that the bearer is a named subject, either a person (`user:alice`) or a key (`key:abc123`). It is opaque to the client, which never parses it and only stores and presents it. It says nothing about what the subject may do: `08-authorization.md` answers that from the authorization model. The list may be empty, and each grant is checked independently.
 
 **Every grant is checked by arithmetic.** Because both kinds are connetto-signed, checking one is a signature verification against connetto's own public key, with no database lookup. So the list carries no routing metadata, nothing sniffs the shape of a string, no order of checks is load-bearing, and an unrecognised string costs arithmetic and nothing more.
 
 A grant that fails to resolve does not end the connection. The session proceeds on whatever resolved. A caller who presents an expired key beside a valid login is signed in and sees less, which is the ordinary case.
 
-The reply (`HandshakeAck`) says nothing about a failure: no reason, and not which grant it was. Not-allowed, no-longer-allowed, and never-existed are indistinguishable, on the same reasoning that a service does not distinguish an authorization failure from a missing resource. Failures are recorded in the server's audit trail and silent on the wire.
+The reply (`HandshakeAck`) says nothing about a failure: no reason, and not which grant it was. Not-allowed, no-longer-allowed, and never-existed are indistinguishable, on the same reasoning that a service does not distinguish an authorization failure from a missing resource. Failures are recorded in the server's structured log and nowhere else, which is what makes them loud, and `FatalErrorReason::AuthenticationFailed` is deleted because nothing can send it any more.
 
-This replaces a single credential field (`Credential::{Anonymous, Token}`) with a variable-length list and is a breaking wire change (no bump before the first release, see the version-bump decision under Decisions).
+This replaces the single `auth_token` field with a variable-length list and is a breaking wire change (no bump before the first release, see the version-bump decision under Decisions). `HandshakeAck` also gained `resume_token` beside `session_token`, which are two different things: the handle in the clear, which the application reads because a synced row written before anybody signed in is attributed to it, and the bearer secret proving that handle is this caller's.
 
 See `12-identity-session-capability.md` for the full model.
 
@@ -114,7 +114,7 @@ See `12-identity-session-capability.md` for the full model.
 
 ## Session token
 
-**Built, defective.** `session_token` exists on the wire (on `Handshake` and `HandshakeAck` in `crates/connetto-core/src/messages/handshake.rs`). The server stubs it as `format!("token-{connection_num}")` and never reads the client's value back. No client persists it.
+**Built (R2, R3).** The request field is `resume_token`, the credential a run presents to continue, and the reply carries both `session_token`, the handle in the clear, and `resume_token`, the credential for next time. The server refuses a credential it did not sign, so a caller can neither invent a handle nor resume as a visitor whose handle it obtained. An identified run takes its handle from its login grant instead and ignores the field.
 
 **Decided (R2).** Under R2 the server mints a real opaque durable handle at handshake. The client persists it outside the local replica (because an unidentified session's replica is in memory and would not survive a reload) and presents it on reconnect. The exactly-once mutation watermark is re-keyed from `(user_id, session_id)` onto the session handle alone.
 
@@ -168,8 +168,8 @@ This is a simple stop-and-wait variant. A sliding-window variant may be needed f
 
 ## Decisions
 
-- **Grant list shape (R3)**: `Handshake` carries zero or more opaque grants, not one credential. Each resolves independently into an identity, capabilities, or a refusal. This supersedes `Credential::{Anonymous, Token}` and is a breaking wire change.
-- **Silent rejection (R3)**: a grant that fails to resolve does not end the connection and produces no field on `HandshakeAck`. Not-allowed, no-longer-allowed, and never-existed are indistinguishable on the wire.
+- **Grant list shape (R3, built)**: `Handshake` carries zero or more opaque grants, not one credential. Each resolves independently into an identity, capabilities, or a refusal, and two logins on one handshake leave the caller unidentified so no order of checks decides who is calling.
+- **Silent rejection (R3, built)**: a grant that fails to resolve does not end the connection and produces no field on `HandshakeAck`. Not-allowed, no-longer-allowed, and never-existed are indistinguishable on the wire, and `FatalErrorReason::AuthenticationFailed` is deleted.
 - **Session token (R2)**: the server mints a real durable handle at handshake and the client persists it outside the local replica. The current implementation is a non-functional stub (**Built, defective**).
 - **Enum-variant wire change**: adding a variant to `FullResyncReason` or `FatalErrorReason` is a wire-breaking change. Neither enum has a forward-compatible fallback for an unknown value.
 - **Version bumps (decided)**: `PROTOCOL_VERSION` stays frozen at 1 until the first release, wire changes land freely before then, and the first release performs one deliberate bump. Per-phase bumps were considered and rejected as ceremony while nothing is published. A mismatch stays detectable throughout.

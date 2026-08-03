@@ -29,7 +29,7 @@ Wraps the capture-managed `SqliteConnection` and implements diesel's `Connection
 
 ### The browser split: the worker owns, tabs speak the wire protocol
 
-In WASM the elected DB worker (Web Locks election, `spawn_db_worker` and `boot_db_worker` in `crates/connetto-web/src/workers.rs`) owns the single OPFS connection and the upstream WebSocket. A tab holds no connection to the replica itself. It runs its own unmodified `ConnettoConnection` with an in-memory mirror (`Replica::Ephemeral`), reaching the worker over the same binary wire protocol the server speaks, `ControlMessage` and `BulkMessage` frames over `PortTransport` or `BroadcastTransport` (`crates/connetto-web/src/port.rs`, Q2.1 below), served worker-side by `RelayHub` (`crates/connetto-web/src/relay.rs`) from the worker-held replica. The tab subscribes like any client, the mirror holds its subscribed rows, and application code runs plain diesel and the typed live layer against it, the "tab mirror" of the smoke topology.
+In WASM the elected DB worker (Web Locks election, `spawn_db_worker` and `boot_db_worker` in `crates/connetto-web/src/workers.rs`) owns the single OPFS connection and the upstream WebSocket. A tab holds no connection to the replica itself. It runs its own unmodified `ConnettoConnection` with an in-memory mirror (`Replica::in_memory()`), reaching the worker over the same binary wire protocol the server speaks, `ControlMessage` and `BulkMessage` frames over `PortTransport` or `BroadcastTransport` (`crates/connetto-web/src/port.rs`, Q2.1 below), served worker-side by `RelayHub` (`crates/connetto-web/src/relay.rs`) from the worker-held replica. The tab subscribes like any client, the mirror holds its subscribed rows, and application code runs plain diesel and the typed live layer against it, the "tab mirror" of the smoke topology.
 
 **Status note.** An earlier draft named two further connection types, `ConnettoWorkerConnection` and `ConnettoProxyConnection`. Neither exists, and nothing is missing: the worker side is plain `ConnettoConnection` over OPFS, and the tab side is plain `ConnettoConnection` over the relay with the in-memory mirror, proven end to end by the wasm-smoke suites (`relay.rs` for both snapshot and live-patch legs, `parity.rs` for direct-versus-relay transparency, `notes_fanout.rs` for tab writes through the hub, `election.rs` and `failover.rs` for reconnect across worker death, `credits.rs` for flow control, `nonfatal.rs` for scoped rejection). The accepted cost is that each tab mirrors its subscribed rows in memory, fine for screen-sized subscriptions. A per-query forwarding connection (Q9.4's superseded mechanism in `09-wasm.md`) stays parked for a tab wanting a dataset too large to mirror, with no evidence of need today.
 
@@ -37,7 +37,7 @@ In WASM the elected DB worker (Web Locks election, `spawn_db_worker` and `boot_d
 |---|---|---|
 | Native | in-process `ConnettoConnection` | direct |
 | WASM dedicated worker | `ConnettoConnection` over OPFS | direct, worker-side |
-| WASM tab | in-memory mirror (`Replica::Ephemeral`) | wire protocol to the worker's `RelayHub` |
+| WASM tab | in-memory mirror (`Replica::in_memory()`) | wire protocol to the worker's `RelayHub` |
 
 ---
 

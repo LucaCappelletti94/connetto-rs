@@ -309,7 +309,7 @@ The mechanism by which permission changes as Postgres rows reach the authorizati
 
 **Decision: structured logging for the firehose, PostgreSQL table for critical events.** High-volume operational events (auth check denials, connection events, CDC visibility checks) go to structured logging (stdout to an external aggregator). Critical state changes (permission changes, session invalidations, model changes) are persisted to a PostgreSQL `auth_events` table for application-level querying. OpenFGA's own audit log covers tuple/model changes on the authorization side.
 
-**Decided, not built.** Structured logging has no implementation today: no `tracing` or `log` dependency anywhere in the workspace. Phase R12 in `plans/master-implementation-plan.md` builds it, and R3 requires it because a refused grant is otherwise visible nowhere. The `auth_events` table is also unbuilt, with its own phase after R3.
+**Built (R12 part A).** Structured logging exists: the facade is `tracing`, every crate emits, a native program installs the stdout destination in `connetto_core::logging` and a browser program installs the developer-console destination in `connetto_web::logging`. The `auth_events` table is still unbuilt and has its own phase.
 
 Note on log aggregators: the application writes structured logs to stdout. The aggregator is a deployment choice. Common options:
 - **ELK** (Elasticsearch + Logstash + Kibana): full-text indexes all log content. Mature, powerful queries, but resource-heavy (Java-based).

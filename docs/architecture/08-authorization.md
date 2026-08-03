@@ -28,7 +28,7 @@ Define how permissions are enforced on reads (snapshot delivery and change deliv
 
 ## The caller
 
-**Decided (R3).** Every check takes a `Principal`, which carries an optional identity plus whatever capabilities resolved from the grants the caller presented. Three of the four arrival cases have a policy consequence:
+**Built (R3).** Every check takes a `Principal`, which carries an optional identity plus whatever capability subjects resolved from the grants the caller presented, on a handle that is never absent. Three of the four arrival cases have a policy consequence:
 
 | Identity | Capabilities | May read | May write |
 |---|---|---|---|
@@ -37,7 +37,7 @@ Define how permissions are enforced on reads (snapshot delivery and change deliv
 | yes | none | whatever the identity grants | where the identity grants it |
 | yes | some | the union | the union |
 
-**Built, defective.** Today the caller is an `AuthContext` with a mandatory user id, and a caller with no identity is impossible to express, so one is invented from the client's own handshake string. Chapter 12 describes the defect. Fixed by R1 (landed) and R2.
+**Fixed (R1, R2, R3).** The caller used to be an `AuthContext` with a mandatory user id, so a caller with no identity was impossible to express and one was invented from the client's own handshake string. `AuthPolicy`, `SnapshotSource` and the write target all take a `Principal` now. The second row of the table above, no identity with capabilities, is representable but not yet load-bearing: R3 carries the accepted subjects and R4 is what makes them change which rows a caller sees.
 
 **Decided (R8).** An identity carries a user id and nothing else. `tenant_id`, `roles`, and `claims` are deleted, because they were written and never read, and because tenant and role both belong in the authorization model rather than on the session. `open-questions.md:283` decided the first and `rls2fga` requires the second, emitting a `pg_role` type with a `member` relation and stating that the deployment must load records mapping users to Postgres roles.
 
@@ -275,7 +275,9 @@ And a refused write must **not** be reported as unauthorized. Rejecting it that 
 
 ## Audit
 
-**Decided.** High-volume operational events (denials, connection events, per-row visibility questions) go to structured logging on stdout, and the aggregator is a deployment choice. **Decided, not built:** no crate declares `tracing` or `log` and no `src` uses either, so every claim about structured logging in these chapters describes an intended mechanism. Phase R12 builds it, and R3 is blocked on it because a refused grant is silent on the wire and the log line is what makes it loud. State changes that matter (permission changes, session invalidations, model changes) are persisted to an `auth_events` table for application-level querying. OpenFGA's own audit log covers model and record changes on the authorization side.
+**Decided.** High-volume operational events (denials, connection events, per-row visibility questions) go to structured logging on stdout, and the aggregator is a deployment choice. Phase R12 part A built it: the facade is `tracing`, every crate emits through it, a native program installs `connetto_core::logging::init_stdout` and a browser program installs `connetto_web::logging::init_console`, because a browser has no stdout. Browser events stay on the device and are never shipped to the server. R3 is blocked on part A because a refused grant is silent on the wire and the log line is what makes it loud, and part B carries that assertion. State changes that matter (permission changes, session invalidations, model changes) are persisted to an `auth_events` table for application-level querying. OpenFGA's own audit log covers model and record changes on the authorization side.
+
+**The values an event carries.** Every event carries what happened, and that is the only value required of it. Work serving one caller runs inside a named context opened once the handshake succeeds, carrying the durable session handle, the caller's identity, and the connection number, so every event emitted while serving that caller picks them up without the writing site naming them. An event outside any such context, which is where the server spends most of its life (startup, shutdown, the change stream, and every handshake refusal, since no session exists until a handshake succeeds), simply carries none of the three. **An absent value means absent, never a placeholder**: a stand-in handle on an event that belongs to no session is a fiction, and one this codebase has already paid to delete once. An event that has an outcome carries it.
 
 **Naming correction.** An earlier version of this chapter defined the table as `auth_log` while the Audit paragraph under "Deployment shape" in `11-authentication.md` and `open-questions.md` Q8.6 both call it `auth_events` and the first of them cites this chapter as the definition. `auth_events` is the name. The shape:
 

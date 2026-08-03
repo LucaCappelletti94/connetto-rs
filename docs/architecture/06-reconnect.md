@@ -36,7 +36,7 @@ The client persists the following in local SQLite across process restarts:
 
 The `last_applied_lsn` is the client's resume cursor. It is updated atomically with each applied `LivePatch` frame.
 
-**Decided (R3).** A caller with no identity has an in-memory local copy (`Replica::Ephemeral`) and no persistent cursor. It has no offline resume and always starts from a fresh snapshot. See chapter 12.
+**Built (R3).** A caller with no identity has an in-memory local copy (`Replica::in_memory()`) and no persistent cursor. It has no offline resume and always starts from a fresh snapshot. See chapter 12.
 
 ---
 
