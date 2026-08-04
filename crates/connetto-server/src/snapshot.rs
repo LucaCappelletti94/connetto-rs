@@ -22,9 +22,12 @@
 //! the boundary intends. No SQLite lives on the backend: the catalog supplies
 //! the column order and primary key for the patchset shape.
 
+use connetto_core::Principal;
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use subql::TableId;
+use subql::backend::{Postgres, Value};
 
 /// Failure surfaced while producing a snapshot.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +74,35 @@ fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
     }
 }
 
+/// One row of the source database, read back completely.
+pub struct SourceRow {
+    /// Catalog id of the table the row belongs to.
+    pub table_id: TableId,
+    /// The row's values, in catalog column order.
+    pub values: Vec<Value<Postgres>>,
+}
+
+/// Reads one row of the source database, completely, as the caller.
+///
+/// The minting path is handed a key rather than a row, and the visibility
+/// question is about the row, so the row is read before the question is asked.
+/// The read runs as the caller, so a row the caller may not see is
+/// indistinguishable from one that is not there and minting cannot be turned
+/// into a probe for rows.
+#[allow(async_fn_in_trait)]
+pub trait RowSource<Id = String, Key = String> {
+    /// Failure to reach the row, as distinct from not finding one.
+    type Error: core::fmt::Display;
+
+    /// The row `key` names in `table`, or [`None`] when the caller sees none.
+    async fn read_row(
+        &self,
+        caller: &Principal<Id, Key>,
+        table: &str,
+        key: &[Value<Postgres>],
+    ) -> Result<Option<SourceRow>, Self::Error>;
+}
+
 pub use pg::PgSnapshotSource;
 
 mod pg {
@@ -82,14 +114,17 @@ mod pg {
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp};
     use sqlparser::dialect::PostgreSqlDialect;
-    use subql::{DatabaseLike, ParserDB, PgLsn};
+    use subql::backend::{Postgres, Value};
+    use subql::{ColumnId, DatabaseLike, ParserDB, PgLsn, catalog_helpers};
 
     use connetto_core::messages::BindValue;
     use connetto_core::{Cursor, Principal};
 
-    use super::{SnapshotError, table_from_select};
+    use super::{RowSource, SnapshotError, SourceRow, table_from_select};
     use crate::capability::{CallerBinding, CapabilityKey};
+    use crate::key_filter::{KeyFilter, quote_ident};
     use crate::session::{Snapshot, SnapshotSource};
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a
@@ -153,6 +188,100 @@ mod pg {
     struct LsnRow {
         #[diesel(sql_type = Text)]
         lsn: String,
+    }
+
+    impl<DB, Id, Key> RowSource<Id, Key> for PgSnapshotSource<DB>
+    where
+        DB: DatabaseLike + Send + Sync,
+        Id: Display + Send + Sync,
+        Key: CapabilityKey,
+    {
+        type Error = SnapshotError;
+
+        async fn read_row(
+            &self,
+            caller: &Principal<Id, Key>,
+            table: &str,
+            key: &[Value<Postgres>],
+        ) -> Result<Option<SourceRow>, SnapshotError> {
+            let Some(table_id) = catalog_helpers::table_id(&self.catalog, table) else {
+                return Ok(None);
+            };
+            let filter = KeyFilter::build(&self.catalog, table_id, table, |position, _| {
+                Ok(key.get(position).cloned().unwrap_or(Value::Missing))
+            })
+            .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let Some(filter) = filter else {
+                return Ok(None);
+            };
+            let arity = catalog_helpers::table_arity(&self.catalog, table_id).unwrap_or_default();
+            let mut columns = Vec::with_capacity(arity);
+            for ordinal in 0..arity {
+                let Ok(column) = ColumnId::try_from(ordinal) else {
+                    return Ok(None);
+                };
+                let Some(name) = catalog_helpers::column_name(&self.catalog, table_id, column)
+                else {
+                    return Ok(None);
+                };
+                columns.push(quote_ident(&name));
+            }
+            if columns.is_empty() {
+                return Ok(None);
+            }
+            // Raw SQL for the same reason the read filter is: the table and its
+            // columns come from the deployment's runtime DDL, so no `table!`
+            // schema names them.
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {}",
+                columns.join(", "),
+                quote_ident(table),
+                filter.predicate(),
+            );
+            let query = filter.bind(sql_query(sql).into_boxed::<diesel::pg::Pg>());
+            let binding = CallerBinding::of(caller);
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let rows = conn
+                .transaction::<Vec<BinaryRow>, diesel::result::Error, _>(|c| {
+                    async move {
+                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                        binding.apply(c).await?;
+                        query.load(c).await
+                    }
+                    .scope_boxed()
+                })
+                .await
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let Some(row) = rows.as_slice().first() else {
+                return Ok(None);
+            };
+            // Lower through the same encoder the snapshot uses, so a value read
+            // here and the same value delivered to a client are one value.
+            let names: Vec<&str> = row.names.iter().map(String::as_str).collect();
+            let cells: Vec<Option<&[u8]>> = row.cells.iter().map(|c| c.as_deref()).collect();
+            let patchset = subql::emit::pgbinary_patchset(&self.catalog, table, &names, &[cells])
+                .map_err(|err| SnapshotError::Encode(err.to_string()))?;
+            let parsed = ParsedDiffSet::parse(&patchset)
+                .map_err(|err| SnapshotError::Encode(format!("{err}")))?;
+            let ParsedDiffSet::Patchset(diff) = parsed else {
+                return Err(SnapshotError::Encode(
+                    "the row encoder produced a changeset".into(),
+                ));
+            };
+            let Some(PatchsetOp::Insert { values, .. }) = diff.iter().next() else {
+                return Err(SnapshotError::Encode(
+                    "the row encoder produced no insert".into(),
+                ));
+            };
+            Ok(Some(SourceRow {
+                table_id,
+                values: values.iter().map(crate::pk::from_wire).collect(),
+            }))
+        }
     }
 
     impl<DB, Id, Key> SnapshotSource<Id, Key> for PgSnapshotSource<DB>

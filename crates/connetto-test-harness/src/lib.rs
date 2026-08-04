@@ -30,7 +30,7 @@ use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Grant, Handshake, HandshakeAck, LivePatch,
     MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
-use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
+use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth,
     RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
@@ -41,7 +41,9 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
 use subql::reexec::PgAsyncDieselConnector;
+use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::task::JoinHandle;
 
@@ -247,37 +249,44 @@ impl HarnessAuth {
     }
 }
 
-impl AuthPolicy for HarnessAuth {
+impl VisibilityPolicy for HarnessAuth {
+    type Watcher = std::sync::Arc<Principal>;
     type Error = RlsAuthError;
+    type Backend = Postgres;
 
-    async fn can_read(
+    async fn may_see<R>(
         &self,
-        caller: &Principal,
-        table: &str,
-        pk: &[u8],
-    ) -> Result<bool, RlsAuthError> {
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> Result<(), RlsAuthError>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
         match self {
             Self::Permissive(auth) => auth
-                .can_read(caller, table, pk)
+                .may_see(row, watchers, verdicts)
                 .await
                 .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_read(caller, table, pk).await,
+            Self::Rls(auth) => auth.may_see(row, watchers, verdicts).await,
         }
     }
 
-    async fn can_write(
+    async fn may_write<R>(
         &self,
-        caller: &Principal,
-        table: &str,
-        pk: &[u8],
-        op: MutationOp,
-    ) -> Result<bool, RlsAuthError> {
+        row: &R,
+        watcher: &Self::Watcher,
+        op: WriteOp,
+    ) -> Result<Verdict, RlsAuthError>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
         match self {
             Self::Permissive(auth) => auth
-                .can_write(caller, table, pk, op)
+                .may_write(row, watcher, op)
                 .await
                 .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.can_write(caller, table, pk, op).await,
+            Self::Rls(auth) => auth.may_write(row, watcher, op).await,
         }
     }
 }

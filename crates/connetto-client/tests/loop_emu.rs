@@ -34,6 +34,7 @@ use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -226,6 +227,48 @@ impl SnapshotSource for GadgetSeed {
     }
 }
 
+/// A snapshot source that reports when its read starts and holds it open until
+/// the test releases it, so a change can commit inside the subscribe window.
+/// Carried over from the R28 reproduction: the window is controlled rather
+/// than raced.
+struct GatedSnapshot {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    rows: Vec<Order>,
+}
+
+impl SnapshotSource for GatedSnapshot {
+    type Error = std::convert::Infallible;
+
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<Snapshot, Self::Error> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+        for row in &self.rows {
+            let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+            let insert = Insert::<_, String, Vec<u8>>::from(table)
+                .set(0, Value::Integer(row.id))
+                .expect("set id")
+                .set(1, Value::Real(row.price))
+                .expect("set price")
+                .set(2, Value::Integer(row.quantity))
+                .expect("set quantity")
+                .set(3, Value::Text(row.status.clone()))
+                .expect("set status");
+            patchset = patchset.insert(insert);
+        }
+        Ok(Snapshot {
+            patchset: patchset.build(),
+            cursor: Cursor::new(Vec::new()),
+        })
+    }
+}
+
 fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
     pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), GADGETS_PG_DDL)
         .expect("build write target")
@@ -321,6 +364,23 @@ async fn pump_until(
         if pred(&event) {
             return event;
         }
+    }
+}
+
+/// Apply every frame that arrives within `window`, then stop. For assertions
+/// about what did or did not reach the replica, where waiting for a named
+/// event would hang precisely in the failing case.
+async fn pump_for(
+    client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
+    window: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + window;
+    while let Ok(event) = tokio::time::timeout_at(deadline, client.pump_one()).await {
+        assert_ne!(
+            event.expect("client pump failed"),
+            ClientEvent::Closed,
+            "connection closed early"
+        );
     }
 }
 
@@ -2815,4 +2875,168 @@ async fn watch_fn_rejects_an_aggregate_query() {
 
     drop(client);
     server.await.expect("join server");
+}
+
+/// Build a manager whose snapshot read is held open by `release` and whose
+/// snapshot carries `rows`, plus the socket serving one connection from it.
+async fn gated_server(
+    fixture: &Fixture,
+    entered: &Arc<Notify>,
+    release: &Arc<Notify>,
+    rows: Vec<Order>,
+) -> (
+    Arc<SessionManager<GatedSnapshot, PermissiveAuth, ConnettoWatermark>>,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+) {
+    reset_orders(fixture).await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let manager = SessionManager::new(
+        materializer,
+        GatedSnapshot {
+            entered: Arc::clone(entered),
+            release: Arc::clone(release),
+            rows,
+        },
+        PermissiveAuth,
+        test_verifier(),
+        server_write_target(fixture),
+        SessionConfig::default(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+    (manager, addr, server)
+}
+
+/// Drive `sql` through the emulator and fan every resulting event out, exactly
+/// as the standing CDC ingestor does.
+async fn drive_cdc(
+    source: &mut PgSqliteEmuSource,
+    manager: &SessionManager<GatedSnapshot, PermissiveAuth, ConnettoWatermark>,
+    sql: &str,
+) {
+    source.execute_sql(sql).expect("execute dml");
+    while let Some(event) = source.next_event().await.expect("poll source") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+}
+
+/// R28 part A. A change committed while the snapshot is in flight must reach
+/// the subscribing client. It did not: the consumer was registered with the
+/// materializer up front but its route was installed only after `SnapshotEnd`,
+/// so `dispatch_event` built the patch and dropped it, and nothing replayed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_change_committed_during_the_snapshot_reaches_the_replica() {
+    let fixture = Fixture::acquire().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    // The contested row commits inside the window, so the snapshot is taken
+    // before it exists and deliberately does not carry it.
+    let (manager, addr, server) =
+        gated_server(&fixture, &entered, &release, vec![order(1, 1.0, 3, "seed")]).await;
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    entered.notified().await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')",
+    )
+    .await;
+
+    release.notify_one();
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 5, "paid")],
+        "the change committed during the snapshot reached the replica",
+    );
+
+    drop(client);
+    server.abort();
+}
+
+/// The overlap the route-first order deliberately creates is safe to re-apply.
+/// Two changes to one row commit inside the window and the snapshot, read after
+/// both, already carries the later value. The client applies the snapshot and
+/// then both patches. Patches arrive in commit order, so the row settles on the
+/// later value and appears exactly once, which is why no discard rule is
+/// needed. See `04-subscriptions.md`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn the_snapshot_overlap_converges_on_the_later_value() {
+    let fixture = Fixture::acquire().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (manager, addr, server) = gated_server(
+        &fixture,
+        &entered,
+        &release,
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 6, "v2")],
+    )
+    .await;
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    entered.notified().await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'v1')",
+    )
+    .await;
+    drive_cdc(
+        &mut source,
+        &manager,
+        "UPDATE orders SET quantity = 6, status = 'v2' WHERE id = 7",
+    )
+    .await;
+
+    release.notify_one();
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 6, "v2")],
+        "the row the snapshot and the overlap both carry appears once, at the later value",
+    );
+
+    drop(client);
+    server.abort();
 }

@@ -16,7 +16,6 @@
 use connetto_core::auth::Principal;
 use connetto_core::messages::{ControlMessage, MutationRejectReason};
 use connetto_core::test_support::TestGrantChecker;
-use connetto_core::traits::{AuthPolicy, MutationOp};
 use connetto_server::{
     Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
@@ -28,6 +27,8 @@ use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 use std::convert::Infallible;
+use subql::backend::Postgres;
+use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
@@ -55,31 +56,38 @@ impl SnapshotSource for NoSnapshot {
     }
 }
 
-/// An auth policy that denies every write, to exercise the reject path.
+/// A policy that denies every write, to exercise the reject path.
 struct DenyAuth;
 
-impl AuthPolicy for DenyAuth {
+impl VisibilityPolicy for DenyAuth {
+    type Watcher = std::sync::Arc<Principal>;
     type Error = Infallible;
+    type Backend = Postgres;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn can_read(
+    async fn may_see<R>(
         &self,
-        _ctx: &Principal,
-        _table: &str,
-        _pk: &[u8],
-    ) -> Result<bool, Self::Error> {
-        Ok(false)
+        _row: &R,
+        _watchers: &[Self::Watcher],
+        _verdicts: &mut [Verdict],
+    ) -> Result<(), Infallible>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(())
     }
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn can_write(
+    async fn may_write<R>(
         &self,
-        _ctx: &Principal,
-        _table: &str,
-        _pk: &[u8],
-        _op: MutationOp,
-    ) -> Result<bool, Self::Error> {
-        Ok(false)
+        _row: &R,
+        _watcher: &Self::Watcher,
+        _op: WriteOp,
+    ) -> Result<Verdict, Infallible>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Deny)
     }
 }
 

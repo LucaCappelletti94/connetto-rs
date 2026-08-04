@@ -1,9 +1,10 @@
 //! Docker-gated Row-Level Security read-filter test.
 //!
-//! Verifies that [`RlsAuth::can_read`] enforces a Postgres RLS policy keyed on
-//! `current_setting('app.user_id')`. The check decodes the primary-key bytes,
-//! binds them typed and indexed as `col = $n`, and runs `EXISTS` under the
-//! requesting identity, so the row's own primary-key index answers visibility.
+//! Verifies that the row-level-security policy enforces a Postgres RLS policy
+//! keyed on `current_setting('app.user_id')`. The check reads the key off the
+//! row view, binds it typed and indexed as `col = $n`, and runs `EXISTS` under
+//! the requesting identity, so the row's own primary-key index answers
+//! visibility.
 //! Covers a single integer key, a composite key, a uuid key, and the loud
 //! failure raised for a key type the bind path does not cover yet.
 //!
@@ -18,13 +19,15 @@
 
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
-use connetto_core::traits::AuthPolicy;
-use connetto_server::{RlsAuth, RlsAuthError};
+use connetto_server::{RlsAuth, RlsAuthError, ValuesRow};
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use std::sync::Arc;
 use subql::backend::{Postgres, Value};
+use subql::visibility::{Verdict, VisibilityPolicy};
+use subql::{ParserDB, catalog_helpers};
 
 /// Catalog DDL handed to [`RlsAuth`]. Only `CREATE TABLE`, so it parses cleanly;
 /// the RLS wiring runs against Postgres separately.
@@ -51,18 +54,37 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
     Pool::builder().build(manager).await.expect("build pool")
 }
 
-/// Whether `user` may read the row `key` in `table`, encoding the key exactly as
-/// the materializer's read path does.
-async fn visible(auth: &RlsAuth, user: &str, table: &str, key: &[Value<Postgres>]) -> bool {
+/// Ask the policy about one row, as the change path does.
+///
+/// `key` is the row's leading columns, which is all the filter reads: this
+/// exercises the key path specifically, so the rest of the row is not supplied.
+async fn ask(
+    auth: &RlsAuth,
+    user: &str,
+    table: &str,
+    key: &[Value<Postgres>],
+) -> Result<bool, RlsAuthError> {
     let mut principal: Principal = Principal::unidentified(SessionId::from_token_hash(user));
     let _ = principal.accept(Subject::Identity(VerifiedSession {
         context: AuthContext::new(user),
         session_id: SessionId::from_token_hash(user),
     }));
-    let pk = connetto_server::pk::encode(key);
-    auth.can_read(&principal, table, &pk)
+    let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(CATALOG_DDL)
+        .expect("the catalog parses");
+    let table_id = catalog_helpers::table_id(&catalog, table).expect("the table is in the catalog");
+    let row = ValuesRow::new(table_id, key);
+    let watchers = [Arc::new(principal)];
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+    auth.may_see(&row, &watchers, &mut verdicts).await?;
+    Ok(matches!(verdicts.as_slice(), [Verdict::Allow, ..]))
+}
+
+/// Whether `user` may read the row `key` names in `table`.
+async fn visible(auth: &RlsAuth, user: &str, table: &str, key: &[Value<Postgres>]) -> bool {
+    ask(auth, user, table, key)
         .await
-        .expect("can_read")
+        .expect("the visibility question")
 }
 
 #[tokio::test]
@@ -133,18 +155,11 @@ async fn rls_read_filter_enforces_visibility_per_user() {
 
     // A timestamp key is not bindable yet: the check fails loudly rather than
     // silently admitting or denying the row.
-    let mut principal: Principal = Principal::unidentified(SessionId::from_token_hash("alice"));
-    let _ = principal.accept(Subject::Identity(VerifiedSession {
-        context: AuthContext::new("alice"),
-        session_id: SessionId::from_token_hash("alice"),
-    }));
     let occurred_at = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
         .expect("date")
         .and_hms_opt(12, 0, 0)
         .expect("time");
-    let ts_key = connetto_server::pk::encode(&[Value::Timestamp(occurred_at)]);
-    let err = auth
-        .can_read(&principal, "events", &ts_key)
+    let err = ask(&auth, "alice", "events", &[Value::Timestamp(occurred_at)])
         .await
         .expect_err("timestamp key must fail loudly");
     assert!(

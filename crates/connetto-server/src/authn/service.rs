@@ -73,8 +73,7 @@ pub enum AuthError {
 /// Mints and rotates connetto tokens over an [`AuthStore`].
 ///
 /// Generic over the store so the concrete choice (in-memory or database) is
-/// made once at startup, mirroring the `AuthPolicy` enum pattern, and every
-/// awaited store future stays `Send`.
+/// made once at startup, and every awaited store future stays `Send`.
 pub struct AuthService<S: AuthStore> {
     authority: Arc<TokenAuthority>,
     store: Arc<S>,

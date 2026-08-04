@@ -14,7 +14,7 @@
 
 use crate::{
     SessionId,
-    auth::{Principal, Subject},
+    auth::Subject,
     cursor::Cursor,
     messages::{BulkMessage, ControlMessage, Grant},
 };
@@ -163,45 +163,6 @@ pub trait FileStore {
 
     /// Whether a chunk is present locally.
     async fn has_chunk(&self, hash: &[u8]) -> Result<bool, Self::Error>;
-}
-
-/// Verb the auth policy is being asked to authorise on a row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MutationOp {
-    /// Insert a new row.
-    Insert,
-    /// Update an existing row.
-    Update,
-    /// Delete a row.
-    Delete,
-}
-
-/// Authorization seam. The server binds this to `OpenFGA` via `rls2fga` (Q8.1).
-///
-/// Read visibility and write authority are checked separately because their
-/// batching profiles differ. Read checks fire per (row, subscription) on the
-/// CDC hot path. Write checks fire per client mutation.
-#[allow(async_fn_in_trait)]
-pub trait AuthPolicy<Id = String, Key = String> {
-    /// Policy-specific error.
-    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
-
-    /// Whether `caller` may see the row identified by `(table, pk)`.
-    async fn can_read(
-        &self,
-        caller: &Principal<Id, Key>,
-        table: &str,
-        pk: &[u8],
-    ) -> Result<bool, Self::Error>;
-
-    /// Whether `caller` may perform `op` on the row identified by `(table, pk)`.
-    async fn can_write(
-        &self,
-        caller: &Principal<Id, Key>,
-        table: &str,
-        pk: &[u8],
-        op: MutationOp,
-    ) -> Result<bool, Self::Error>;
 }
 
 /// Why one grant was refused at the handshake.

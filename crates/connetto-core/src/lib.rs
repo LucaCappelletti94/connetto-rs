@@ -5,9 +5,9 @@
 //! * [`messages`] holds every control-plane and bulk-plane wire type.
 //! * [`codec`] serialises those types to `MessagePack` and wraps them in the
 //!   length-prefixed framing documented in `docs/architecture/02-protocol.md`.
-//! * [`traits`] defines the [`Transport`], [`Store`], [`FileStore`], and
-//!   [`AuthPolicy`] seams the server, native client, and
-//!   `WASM` client each fill with a platform-specific implementation.
+//! * [`traits`] defines the [`Transport`], [`Store`], and [`FileStore`] seams
+//!   the server, native client, and `WASM` client each fill with a
+//!   platform-specific implementation.
 //!
 //! Consumer crates in this workspace depend on `connetto-core` only. They never
 //! depend on each other.
@@ -55,8 +55,8 @@ pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};
 pub use traits::{
-    AuthPolicy, FileStore, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
-    IncomingFrame, MutationOp, PendingMutation, Store, Transport,
+    FileStore, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority, IncomingFrame,
+    PendingMutation, Store, Transport,
 };
 #[cfg(feature = "loopback")]
 pub use transport::{LoopbackError, LoopbackTransport, loopback};

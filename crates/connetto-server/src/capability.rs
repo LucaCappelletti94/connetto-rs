@@ -20,13 +20,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use connetto_core::auth::{CapabilitySubject, Principal};
-use connetto_core::traits::AuthPolicy;
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use subql::backend::{Postgres, Value};
+use subql::visibility::{Verdict, VisibilityPolicy};
 
 use crate::authn::token::{AuthConfig, TokenAuthority, TokenError};
+use crate::row_view::ValuesRow;
+use crate::snapshot::RowSource;
 
 /// The deployment's share-key type: how one is minted, and how the keys a
 /// caller holds reach Postgres.
@@ -175,6 +178,10 @@ pub enum ShareError {
         /// The table the caller named.
         table: String,
     },
+    /// The row could not be reached at all, which is not the same as the
+    /// caller not being allowed to share it.
+    #[error("reading the row to share failed: {0}")]
+    Read(String),
     /// The authorization check itself failed.
     #[error("authorization check failed: {0}")]
     Policy(String),
@@ -203,48 +210,65 @@ pub enum ShareError {
 /// Held beside [`AuthService`](crate::AuthService) at startup and called from
 /// the application's own handler, so the application keeps its routing, its
 /// request shape and its rate limits.
-pub struct CapabilityIssuer<P> {
+pub struct CapabilityIssuer<P, R> {
     authority: Arc<TokenAuthority>,
     policy: Arc<P>,
+    rows: Arc<R>,
     ttl: Duration,
     max_ttl: Duration,
 }
 
-impl<P> CapabilityIssuer<P> {
-    /// Build over the token authority, the authorization policy, and the
-    /// lifetimes the deployment configured.
+impl<P, R> CapabilityIssuer<P, R> {
+    /// Build over the token authority, the visibility policy, the row source
+    /// the shared row is read through, and the lifetimes the deployment
+    /// configured.
     #[must_use]
-    pub fn new(authority: Arc<TokenAuthority>, policy: Arc<P>, config: &AuthConfig) -> Self {
+    pub fn new(
+        authority: Arc<TokenAuthority>,
+        policy: Arc<P>,
+        rows: Arc<R>,
+        config: &AuthConfig,
+    ) -> Self {
         Self {
             authority,
             policy,
+            rows,
             ttl: config.capability_ttl,
             max_ttl: config.capability_max_ttl,
         }
     }
 
-    /// Mint a share key over the row `pk` in `table`, on behalf of `caller`.
+    /// Mint a share key over the row `key` names in `table`, on behalf of
+    /// `caller`.
     ///
     /// `ttl` overrides the configured default and is refused rather than
     /// quietly shortened when it exceeds the ceiling, so an application's own
     /// statement of when a link dies cannot be a lie.
     ///
-    /// The check is the same [`AuthPolicy`] every other question goes through,
+    /// The row is read before the question is asked, because the question is
+    /// about the row and the caller named only its key. That read runs as the
+    /// caller, so a row it may not see and a row that does not exist are the
+    /// same refusal and minting cannot be turned into a probe. The question
+    /// itself is the same visibility seam every other path goes through,
     /// because a caller must not share what it cannot read.
     ///
     /// # Errors
     ///
-    /// [`ShareError`] when the caller may not read the row, the lifetime
-    /// exceeds the ceiling, or signing fails.
-    pub async fn issue<Id, Key: CapabilityKey>(
+    /// [`ShareError`] when the caller may not read the row, the row cannot be
+    /// reached, the lifetime exceeds the ceiling, or signing fails.
+    pub async fn issue<Id, Key>(
         &self,
         caller: &Principal<Id, Key>,
         table: &str,
-        pk: &[u8],
+        key: &[Value<Postgres>],
         ttl: Option<Duration>,
     ) -> Result<IssuedCapability<Key>, ShareError>
     where
-        P: AuthPolicy<Id, Key>,
+        Id: Clone,
+        Key: CapabilityKey,
+        P: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
+        P::Error: Display,
+        R: RowSource<Id, Key>,
     {
         let ttl = match ttl {
             Some(requested) if requested > self.max_ttl => {
@@ -256,15 +280,25 @@ impl<P> CapabilityIssuer<P> {
             Some(requested) => requested,
             None => self.ttl,
         };
-        let allowed = self
-            .policy
-            .can_read(caller, table, pk)
+        let row = self
+            .rows
+            .read_row(caller, table, key)
+            .await
+            .map_err(|err| ShareError::Read(err.to_string()))?;
+        let unauthorized = || ShareError::Unauthorized {
+            table: table.to_owned(),
+        };
+        let row = row.ok_or_else(unauthorized)?;
+        let view = ValuesRow::new(row.table_id, &row.values);
+        let watchers = [Arc::new(caller.clone())];
+        let mut verdicts = Vec::new();
+        Verdict::reset(&mut verdicts, watchers.len());
+        self.policy
+            .may_see(&view, &watchers, &mut verdicts)
             .await
             .map_err(|err| ShareError::Policy(err.to_string()))?;
-        if !allowed {
-            return Err(ShareError::Unauthorized {
-                table: table.to_owned(),
-            });
+        if !matches!(verdicts.as_slice(), [Verdict::Allow, ..]) {
+            return Err(unauthorized());
         }
         let key = CapabilitySubject::<Key>::new(Key::mint());
         if key.key().to_string().contains(Key::SEPARATOR) {

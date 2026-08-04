@@ -25,9 +25,10 @@ pub static FANOUT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// carrying an owned identity context.
 pub static FANOUT_ROUTE_CLONES: AtomicU64 = AtomicU64::new(0);
 
-/// Authorization questions asked on the change path. Until R5a this sits on
-/// `RlsAuth::can_read` and relocates onto the subql visibility trait with it,
-/// after which it never moves again.
+/// Round trips the change path spends asking whether a row is visible: one per
+/// `SELECT EXISTS` sent, not one per trait call. R5a answers the trait once per
+/// event for every watcher at once while still running a query per watcher, so
+/// a counter on the call would read 1 and hide the round trips R5b removes.
 pub static AUTHORIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Increment `counter` by `n`, relaxed.

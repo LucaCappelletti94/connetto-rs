@@ -12,7 +12,7 @@
 //!
 //! Both executors are covered, because they can disagree and the divergence is
 //! silent: a snapshot runs one policy-filtered `SELECT`, while the change path
-//! asks [`RlsAuth::can_read`] per row in its own transaction. Binding the
+//! asks the visibility policy per row in its own transaction. Binding the
 //! subject in one and forgetting the other would show a shared row once and
 //! then never update it.
 //!
@@ -27,17 +27,20 @@ use std::time::{Duration, SystemTime};
 
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession};
-use connetto_core::traits::AuthPolicy;
 use connetto_server::{
     AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
-    ShareError, SnapshotSource, TokenAuthority,
+    RowSource, ShareError, SnapshotSource, SourceRow, TokenAuthority,
 };
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl as AsyncRunQueryDsl};
+use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres as PgValues, Value};
+use subql::testing::TestEvent;
+use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
+use subql::{ParserDB, catalog_helpers};
 
 /// The catalog both the read filter and the snapshot encoder parse. Table DDL
 /// only, so it parses cleanly. The policies are installed separately.
@@ -157,17 +160,34 @@ fn caller(user: Option<&str>, keys: &[&str]) -> Principal {
     principal
 }
 
+/// The fixture's three rows, complete, so the view handed to the policy is the
+/// row rather than only its key.
+const PAPERS: [(i32, &str, &str); 3] = [(1, "alice", "a"), (2, "bob", "b"), (3, "bob", "c")];
+
 /// Which papers the change path would deliver, asked one row at a time exactly
-/// as the fan-out does.
+/// as the fan-out does, through the same row view a replication event carries.
 async fn visible_on_change_path(auth: &RlsAuth, caller: &Principal) -> Vec<i32> {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).expect("the catalog parses");
+    let table = catalog_helpers::table_id(&catalog, "papers").expect("papers is in the catalog");
+    let watchers = [Arc::new(caller.clone())];
+    let mut verdicts = Vec::new();
     let mut seen = Vec::new();
-    for id in 1..=3 {
-        let pk = connetto_server::pk::encode(&[Value::<PgValues>::Int(i64::from(id))]);
-        if auth
-            .can_read(caller, "papers", &pk)
+    for (id, owner, body) in PAPERS {
+        let event = TestEvent::<PgValues>::insert(
+            table,
+            vec![
+                Value::Int(i64::from(id)),
+                Value::String(owner.to_owned()),
+                Value::String(body.to_owned()),
+            ],
+        )
+        .with_pk_columns([0u16]);
+        let row = EventRow::current(&event, &catalog).expect("an insert carries a post-image");
+        Verdict::reset(&mut verdicts, watchers.len());
+        auth.may_see(&row, &watchers, &mut verdicts)
             .await
-            .expect("can_read")
-        {
+            .expect("the visibility question");
+        if matches!(verdicts.as_slice(), [Verdict::Allow, ..]) {
             seen.push(id);
         }
     }
@@ -291,12 +311,14 @@ async fn deleting_the_relation_removes_the_access() {
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     let reader = setup().await;
-    let auth = Arc::new(RlsAuth::from_ddl(reader, CATALOG_DDL).expect("build RlsAuth"));
+    let auth = Arc::new(RlsAuth::from_ddl(reader.clone(), CATALOG_DDL).expect("build RlsAuth"));
+    let rows =
+        Arc::new(PgSnapshotSource::from_ddl(reader, CATALOG_DDL).expect("build snapshot source"));
     let authority = Arc::new(TokenAuthority::generate(&AuthConfig::default()).expect("keypair"));
-    let issuer = CapabilityIssuer::new(authority, auth, &AuthConfig::default());
+    let issuer = CapabilityIssuer::new(authority, auth, rows, &AuthConfig::default());
 
-    let alice_paper = connetto_server::pk::encode(&[Value::<PgValues>::Int(1)]);
-    let bob_paper = connetto_server::pk::encode(&[Value::<PgValues>::Int(3)]);
+    let alice_paper = [Value::<PgValues>::Int(1)];
+    let bob_paper = [Value::<PgValues>::Int(3)];
 
     // Alice may share her own paper.
     issuer
@@ -325,7 +347,7 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     // Holding the key over paper 2 is enough to pass on paper 2 alone, so the
     // check is the same read question every other caller asks.
     let bearer = caller(None, &[SHARED_KEY]);
-    let shared_paper = connetto_server::pk::encode(&[Value::<PgValues>::Int(2)]);
+    let shared_paper = [Value::<PgValues>::Int(2)];
     issuer
         .issue(&bearer, "papers", &shared_paper, None)
         .await
@@ -407,6 +429,27 @@ async fn an_expired_capability_is_refused() {
     );
 }
 
+/// A row source that always finds the row, so the lifetime assertions need no
+/// database.
+struct AlwaysFound;
+
+impl RowSource for AlwaysFound {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn read_row(
+        &self,
+        _caller: &Principal,
+        _table: &str,
+        _key: &[Value<PgValues>],
+    ) -> Result<Option<SourceRow>, Self::Error> {
+        Ok(Some(SourceRow {
+            table_id: 0,
+            values: Vec::new(),
+        }))
+    }
+}
+
 #[tokio::test]
 async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
     let config = AuthConfig {
@@ -418,6 +461,7 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
     let issuer = CapabilityIssuer::new(
         authority,
         Arc::new(connetto_server::PermissiveAuth),
+        Arc::new(AlwaysFound),
         &config,
     );
     let caller = caller(Some("alice"), &[]);

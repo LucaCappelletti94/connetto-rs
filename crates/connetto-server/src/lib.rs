@@ -23,9 +23,11 @@ pub mod auth;
 pub mod authn;
 pub mod capability;
 pub mod counters;
+mod key_filter;
 pub mod materializer;
 pub mod oplog;
 pub mod pk;
+pub mod row_view;
 pub mod session;
 pub mod snapshot;
 pub mod watermark_schema;
@@ -59,14 +61,15 @@ pub use materializer::{
     SqliteRegistration,
 };
 pub use oplog::{
-    CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, OplogConfig, catchup_decision,
+    CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, InMemoryOplog, Oplog,
+    OplogConfig, catchup_decision,
 };
 pub use oplog::{PgOplog, PgOplogError};
+pub use row_view::ValuesRow;
 pub use session::{
     NoConnector, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError, SessionManager,
     Snapshot, SnapshotSource,
 };
-pub use snapshot::PgSnapshotSource;
-pub use snapshot::SnapshotError;
+pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
 pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};

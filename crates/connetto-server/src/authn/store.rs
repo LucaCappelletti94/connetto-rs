@@ -120,7 +120,7 @@ impl From<diesel::result::Error> for AuthStoreError {
 /// Methods return `impl Future + Send` (not `async fn`) so a generic caller
 /// (the session verifier boxed into a `Send` future, the async endpoints) stays
 /// `Send` on the multi-threaded runtime. The concrete store is chosen at
-/// startup, mirroring the `AuthPolicy` enum pattern in the server binary.
+/// startup, the same way the server binary chooses its visibility policy.
 pub trait AuthStore: Send + Sync {
     /// The developer-defined distributed user id this store resolves identities
     /// to and keys sessions on. connetto serializes it into the access-token

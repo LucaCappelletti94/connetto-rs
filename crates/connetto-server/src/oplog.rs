@@ -31,9 +31,14 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use diesel::deserialize::{self, FromSql, FromSqlRow};
+use diesel::expression::AsExpression;
+use diesel::pg::{Pg, PgValue};
+use diesel::serialize::{self, IsNull, Output, ToSql};
 use parking_lot::Mutex;
 use subql::backend::CdcEvent;
 use subql::{ChangeEvent, ClockHandle, EventKind, StdClock};
@@ -125,14 +130,88 @@ impl ChangeRecord {
         matches!(self.event.kind(), EventKind::Delete)
     }
 
-    /// The change verb as a lowercase token, for the Postgres oplog `op` column.
+    /// The change verb, for the Postgres oplog `op` column.
     #[must_use]
-    pub fn op(&self) -> &'static str {
-        match self.event.kind() {
-            EventKind::Insert => "insert",
-            EventKind::Update => "update",
-            EventKind::Delete => "delete",
-            EventKind::Truncate => "truncate",
+    pub fn op(&self) -> ChangeOp {
+        ChangeOp::from(self.event.kind())
+    }
+}
+
+/// The Postgres enum type name the oplog's `op` column carries. Declared here
+/// so the DDL, the `postgres_type` attribute and the documented shape cannot
+/// drift apart.
+pub const CHANGE_OP_TYPE: &str = "connetto_change_op";
+
+/// The Postgres enum type backing the oplog's `op` column.
+///
+/// A deployment creates it beside the table (see `06-reconnect.md`). Naming it
+/// here is what lets the column bind as its own type rather than as text.
+#[derive(diesel::SqlType, diesel::query_builder::QueryId)]
+#[diesel(postgres_type(name = "connetto_change_op"))]
+pub struct ChangeOpSql;
+
+/// The verb a retained change carries.
+///
+/// A closed set of four, so it is an enum on both sides: a value outside it is
+/// unrepresentable in Rust and rejected by Postgres. The column used to be
+/// `TEXT` carrying one of four words, which is a contract nothing enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsExpression, FromSqlRow)]
+#[diesel(sql_type = ChangeOpSql)]
+pub enum ChangeOp {
+    /// The row was created.
+    Insert,
+    /// The row's values were replaced.
+    Update,
+    /// The row was removed.
+    Delete,
+    /// The whole table was emptied.
+    Truncate,
+}
+
+impl ChangeOp {
+    /// The label this verb carries in Postgres, and the one the enum type
+    /// declares.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Truncate => "truncate",
+        }
+    }
+}
+
+impl From<EventKind> for ChangeOp {
+    fn from(kind: EventKind) -> Self {
+        match kind {
+            EventKind::Insert => Self::Insert,
+            EventKind::Update => Self::Update,
+            EventKind::Delete => Self::Delete,
+            EventKind::Truncate => Self::Truncate,
+        }
+    }
+}
+
+impl ToSql<ChangeOpSql, Pg> for ChangeOp {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        out.write_all(self.label().as_bytes())?;
+        Ok(IsNull::No)
+    }
+}
+
+impl FromSql<ChangeOpSql, Pg> for ChangeOp {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        match bytes.as_bytes() {
+            b"insert" => Ok(Self::Insert),
+            b"update" => Ok(Self::Update),
+            b"delete" => Ok(Self::Delete),
+            b"truncate" => Ok(Self::Truncate),
+            other => Err(format!(
+                "unrecognised connetto_change_op label {:?}",
+                String::from_utf8_lossy(other)
+            )
+            .into()),
         }
     }
 }
@@ -351,7 +430,7 @@ mod pg {
     use diesel_async::pooled_connection::bb8::Pool;
     use subql::ChangeEvent;
 
-    use super::{ChangeRecord, Oplog, OplogConfig};
+    use super::{CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig};
 
     /// Failure surfaced by [`PgOplog`].
     #[derive(Debug, thiserror::Error)]
@@ -432,18 +511,34 @@ mod pg {
             }
         }
 
-        /// Create the oplog table if it is absent.
+        /// Create the `op` enum type and the oplog table if either is absent.
+        ///
+        /// Postgres has no `CREATE TYPE IF NOT EXISTS`, so the type goes in
+        /// through a `DO` block that swallows only `duplicate_object`.
         ///
         /// # Errors
         ///
         /// [`PgOplogError`] when the pool or the DDL fails.
         pub async fn ensure_schema(&self) -> Result<(), PgOplogError> {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let labels = [
+                ChangeOp::Insert,
+                ChangeOp::Update,
+                ChangeOp::Delete,
+                ChangeOp::Truncate,
+            ]
+            .map(|op| format!("'{}'", op.label()))
+            .join(", ");
+            let create_type = format!(
+                "DO $$ BEGIN CREATE TYPE {CHANGE_OP_TYPE} AS ENUM ({labels}); \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            );
+            sql_query(create_type).execute(&mut *conn).await?;
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
                      lsn BIGINT PRIMARY KEY, \
                      table_name TEXT NOT NULL, \
-                     op TEXT NOT NULL, \
+                     op {CHANGE_OP_TYPE} NOT NULL, \
                      pk BYTEA NOT NULL, \
                      is_tombstone BOOLEAN NOT NULL, \
                      event BYTEA NOT NULL, \
@@ -517,7 +612,7 @@ mod pg {
             sql_query(sql)
                 .bind::<BigInt, _>(lsn)
                 .bind::<Text, _>(record.table().to_owned())
-                .bind::<Text, _>(record.op())
+                .bind::<ChangeOpSql, _>(record.op())
                 .bind::<Binary, _>(record.pk().to_vec())
                 .bind::<Bool, _>(record.is_tombstone())
                 .bind::<Binary, _>(event_bytes)

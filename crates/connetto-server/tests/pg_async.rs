@@ -13,8 +13,9 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, Oplog, OplogConfig, PermissiveAuth, PgOplog, PgSnapshotSource, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PermissiveAuth,
+    PgOplog, PgSnapshotSource, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::ConnettoWatermark;
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -385,6 +386,21 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     }
 }
 
+/// One `op` cell read back from the oplog table, decoded as the enum rather
+/// than as text.
+#[derive(diesel::QueryableByName)]
+struct OpRow {
+    #[diesel(sql_type = ChangeOpSql)]
+    op: ChangeOp,
+}
+
+/// The `pg_typeof` of a column, as text.
+#[derive(diesel::QueryableByName)]
+struct TypeNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
 #[tokio::test]
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn pg_oplog_appends_and_reads_back() {
@@ -463,7 +479,45 @@ async fn pg_oplog_appends_and_reads_back() {
         "entries_since is strictly greater than the lsn"
     );
 
+    // Nothing in the read path consults the verb column, so these three
+    // assertions are the only thing standing between it and going back to
+    // text. Each pins something the others do not: the values written, the
+    // column's declared type, and the refusal.
     let mut conn = pool.get().await.expect("get connection");
+    let ops: Vec<OpRow> = sql_query("SELECT op FROM connetto_oplog_test ORDER BY lsn")
+        .load(&mut *conn)
+        .await
+        .expect("read the verbs back");
+    assert_eq!(
+        ops.iter().map(|row| row.op).collect::<Vec<_>>(),
+        vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
+        "each record carries the verb of the change it retains",
+    );
+    // Postgres sends an enum label as its text, so decoding alone would pass
+    // against a text column. Only the declared type separates the two.
+    let declared: Vec<TypeNameRow> =
+        sql_query("SELECT pg_typeof(op)::text AS name FROM connetto_oplog_test LIMIT 1")
+            .load(&mut *conn)
+            .await
+            .expect("read the column type");
+    assert_eq!(
+        declared.as_slice().first().map(|row| row.name.as_str()),
+        Some(CHANGE_OP_TYPE),
+        "the verb column is the enum type rather than text",
+    );
+    // No cast, so the column's own type is what rejects this.
+    let refused = sql_query(
+        "INSERT INTO connetto_oplog_test \
+         (lsn, table_name, op, pk, is_tombstone, event) \
+         VALUES (9999, 'orders', 'nonsense', '\\x00', false, '\\x00')",
+    )
+    .execute(&mut *conn)
+    .await;
+    assert!(
+        refused.is_err(),
+        "a verb outside the set is refused, which is what the enum buys over text",
+    );
+
     sql_query("DROP TABLE IF EXISTS connetto_oplog_test")
         .execute(&mut *conn)
         .await

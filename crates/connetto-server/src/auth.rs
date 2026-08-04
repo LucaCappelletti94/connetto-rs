@@ -1,61 +1,80 @@
-//! Authorization policies for the write and read paths.
+//! Visibility policies for the change, catchup, write and minting paths.
 //!
-//! The server gates every mutation through an [`AuthPolicy`]. Until `OpenFGA` and
-//! `rls2fga` land, [`PermissiveAuth`] is the stand-in.
+//! Every authorization question goes through subql's [`VisibilityPolicy`], so
+//! what answers it is an implementation detail rather than a structural
+//! commitment. Until `OpenFGA` and `rls2fga` land, [`PermissiveAuth`] is the
+//! stand-in and [`RlsAuth`] is the real one.
+//!
+//! [`VisibilityPolicy`]: subql::visibility::VisibilityPolicy
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use connetto_core::auth::Principal;
-use connetto_core::traits::{AuthPolicy, MutationOp};
+use subql::backend::Postgres;
+use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
 
-/// A permissive [`AuthPolicy`] that grants every read and write.
+/// A permissive policy that grants every read and write.
 ///
 /// The stand-in until `OpenFGA` and `rls2fga` land. It authorizes
 /// unconditionally, so it must not front a production deployment.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PermissiveAuth;
 
-impl AuthPolicy for PermissiveAuth {
+impl VisibilityPolicy for PermissiveAuth {
+    type Watcher = Arc<Principal>;
     type Error = Infallible;
+    type Backend = Postgres;
 
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn can_read(
+    fn may_see<R>(
         &self,
-        _caller: &Principal,
-        _table: &str,
-        _pk: &[u8],
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+        _row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> impl Future<Output = Result<(), Infallible>> + Send
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        for verdict in verdicts.iter_mut().take(watchers.len()) {
+            *verdict = Verdict::Allow;
+        }
+        async { Ok(()) }
     }
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn can_write(
+    async fn may_write<R>(
         &self,
-        _caller: &Principal,
-        _table: &str,
-        _pk: &[u8],
-        _op: MutationOp,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+        _row: &R,
+        _watcher: &Self::Watcher,
+        _op: WriteOp,
+    ) -> Result<Verdict, Infallible>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
     }
 }
 
 pub use rls::{RlsAuth, RlsAuthError};
 
 mod rls {
+    use std::marker::PhantomData;
+    use std::sync::Arc;
+
     use connetto_core::auth::Principal;
-    use connetto_core::traits::{AuthPolicy, MutationOp};
     use diesel::QueryableByName;
     use diesel::sql_query;
-    use diesel::sql_types::{BigInt, Binary, Bool, Double, Text};
+    use diesel::sql_types::Bool;
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use sqlparser::dialect::PostgreSqlDialect;
-    use subql::backend::Value;
-    use subql::{ParserDB, catalog_helpers};
+    use subql::backend::Postgres;
+    use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+    use subql::{DatabaseLike, ParserDB, TableLike};
 
     use crate::capability::{CallerBinding, CapabilityKey};
+    use crate::key_filter::{KeyError, KeyFilter, quote_ident};
 
     /// Failure surfaced by [`RlsAuth`].
     #[derive(Debug, thiserror::Error)]
@@ -69,9 +88,9 @@ mod rls {
         /// A visibility query failed.
         #[error(transparent)]
         Query(#[from] diesel::result::Error),
-        /// The primary-key bytes did not decode.
-        #[error("primary-key decode failed: {0}")]
-        PkDecode(String),
+        /// A primary-key cell of the row could not be read.
+        #[error(transparent)]
+        KeyValue(subql::ValueError),
         /// A primary-key column has a type the read filter cannot bind yet.
         #[error("unsupported primary-key type {kind} on table {table}")]
         UnsupportedKeyType {
@@ -82,30 +101,46 @@ mod rls {
         },
     }
 
-    /// An [`AuthPolicy`] that enforces reads through Postgres Row-Level Security.
+    impl From<KeyError> for RlsAuthError {
+        fn from(err: KeyError) -> Self {
+            match err {
+                KeyError::Value(err) => Self::KeyValue(err),
+                KeyError::Unsupported { table, kind } => Self::UnsupportedKeyType { table, kind },
+            }
+        }
+    }
+
+    /// A visibility policy that enforces reads through Postgres Row-Level
+    /// Security.
     ///
     /// A read check runs `SELECT EXISTS(...)` for the row's primary key inside a
     /// transaction that first binds the caller (`app.user_id` for the identity,
     /// and the packed share keys under the binding's own setting), so RLS
-    /// policies keyed on `current_setting` decide visibility.
-    /// The key arrives as [`crate::pk`] bytes, decoded back into typed values and
-    /// bound as indexed `"col" = $n` equality per key column, so the row's own
-    /// primary-key index answers the check. A key of a type the bind path does
-    /// not cover yet (timestamp, date, time, decimal, json) fails loudly.
+    /// policies keyed on `current_setting` decide visibility. The key is read
+    /// off the row view a column at a time and bound as indexed `"col" = $n`
+    /// equality per key column, so the row's own primary-key index answers the
+    /// check. A key of a type the bind path does not cover yet (timestamp,
+    /// date, time, decimal, json) fails loudly.
+    ///
+    /// One question names every watcher, and RLS binds one caller per
+    /// transaction, so the round trips stay one per watcher until the executor
+    /// changes.
     ///
     /// The pool must connect as a role that is itself subject to RLS, meaning a
     /// non-superuser that does not own the table. Postgres bypasses every policy
     /// for a superuser or the table owner, so such a connection would silently
     /// make every read visible.
     ///
-    /// Write authorization is not gated here yet: it lands when the mutation
-    /// applies under the same RLS context against Postgres, so the database
-    /// itself rejects a policy violation. Until that write path exists,
-    /// [`can_write`](RlsAuth::can_write) passes and reads are the enforced
-    /// surface.
-    pub struct RlsAuth {
+    /// Write authorization is not gated here: the mutation applies under the
+    /// same RLS context against Postgres, so the database itself rejects a
+    /// policy violation, and [`may_write`](RlsAuth::may_write) passes.
+    ///
+    /// `Key` is the deployment's share-key type, carried only so the caller
+    /// this binds is the same one every other path carries.
+    pub struct RlsAuth<Key = String> {
         pool: Pool<AsyncPgConnection>,
         catalog: ParserDB,
+        key: PhantomData<Key>,
     }
 
     #[derive(QueryableByName)]
@@ -114,7 +149,15 @@ mod rls {
         present: bool,
     }
 
-    impl RlsAuth {
+    /// The existence question for one row, built once and asked per watcher.
+    ///
+    /// [`None`] where the row is unanswerable at all: a table the catalog does
+    /// not know, a table with no primary key, or a key cell carrying no value.
+    /// Every watcher is denied in those cases, which is what asking the
+    /// database would have returned for each of them.
+    type Question = Option<(String, KeyFilter)>;
+
+    impl<Key> RlsAuth<Key> {
         /// Build over a connection pool and a Postgres DDL catalog.
         ///
         /// # Errors
@@ -123,77 +166,52 @@ mod rls {
         pub fn from_ddl(pool: Pool<AsyncPgConnection>, pg_ddl: &str) -> Result<Self, RlsAuthError> {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| RlsAuthError::Catalog(format!("{err:?}")))?;
-            Ok(Self { pool, catalog })
+            Ok(Self {
+                pool,
+                catalog,
+                key: PhantomData,
+            })
         }
 
-        /// Primary-key column names for `table`, in key order.
-        fn pk_columns(&self, table: &str) -> Option<Vec<String>> {
-            let table_id = catalog_helpers::table_id(&self.catalog, table)?;
-            catalog_helpers::primary_key_columns(&self.catalog, table_id)?
-                .into_iter()
-                .map(|col| catalog_helpers::column_name(&self.catalog, table_id, col))
-                .collect()
-        }
-    }
-
-    /// Quote a SQL identifier, doubling embedded quotes.
-    fn quote_ident(name: &str) -> String {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
-
-    impl<Key: CapabilityKey> AuthPolicy<String, Key> for RlsAuth {
-        type Error = RlsAuthError;
-
-        async fn can_read(
-            &self,
-            caller: &Principal<String, Key>,
-            table: &str,
-            pk: &[u8],
-        ) -> Result<bool, RlsAuthError> {
-            crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
-            let Some(pk_cols) = self.pk_columns(table) else {
-                return Ok(false);
+        /// Build the `SELECT EXISTS` for `row`, reading its key off the view.
+        fn question<R>(&self, row: &R) -> Result<Question, RlsAuthError>
+        where
+            R: RowView<Backend = Postgres> + ?Sized,
+        {
+            let table_id = row.table_id();
+            let Some(index) = usize::try_from(table_id).ok() else {
+                return Ok(None);
             };
-            if pk_cols.is_empty() {
-                return Ok(false);
-            }
-            let key =
-                crate::pk::decode(pk).map_err(|err| RlsAuthError::PkDecode(err.to_string()))?;
-            if key.len() != pk_cols.len() {
-                return Ok(false);
-            }
-            // Typed, indexed equality per key column: "col" = $n. Identifiers come
-            // from the parsed catalog and values bind positionally, so the row's
-            // own primary-key index answers the check.
-            let predicate = pk_cols
-                .iter()
-                .enumerate()
-                .map(|(i, col)| format!("{} = ${}", quote_ident(col), i + 1))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            let sql = format!(
-                "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
-                quote_ident(table),
-                predicate,
-            );
-            let mut query = sql_query(sql).into_boxed::<diesel::pg::Pg>();
-            for value in &key {
-                query = match value {
-                    Value::Bool(b) => query.bind::<Bool, _>(*b),
-                    Value::Int(int) => query.bind::<BigInt, _>(*int),
-                    Value::Float(float) => query.bind::<Double, _>(*float),
-                    Value::String(text) => query.bind::<Text, _>(text.clone()),
-                    Value::Bytes(bytes) => query.bind::<Binary, _>(bytes.clone()),
-                    Value::Uuid(uuid) => query.bind::<diesel::sql_types::Uuid, _>(*uuid),
-                    Value::Null | Value::Missing => return Ok(false),
-                    other => {
-                        return Err(RlsAuthError::UnsupportedKeyType {
-                            table: table.to_owned(),
-                            kind: format!("{:?}", other.scalar_kind()),
-                        });
-                    }
-                };
-            }
+            let Some(table) = self.catalog.table_by_id(index) else {
+                return Ok(None);
+            };
+            let table = table.table_name().to_owned();
+            let Some(filter) = KeyFilter::build(&self.catalog, table_id, &table, |_, column| {
+                row.value_at(column)
+            })?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((
+                format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
+                    quote_ident(&table),
+                    filter.predicate(),
+                ),
+                filter,
+            )))
+        }
+    }
+
+    impl<Key: CapabilityKey> RlsAuth<Key> {
+        /// Ask Postgres whether `caller` can see the row the question names.
+        async fn visible(
+            &self,
+            sql: &str,
+            filter: &KeyFilter,
+            caller: &Principal<String, Key>,
+        ) -> Result<bool, RlsAuthError> {
+            let query = filter.bind(sql_query(sql.to_owned()).into_boxed::<diesel::pg::Pg>());
             let binding = CallerBinding::of(caller);
             let mut conn = self
                 .pool
@@ -204,6 +222,7 @@ mod rls {
                 .transaction::<bool, diesel::result::Error, _>(|c| {
                     async move {
                         binding.apply(c).await?;
+                        crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
                         let row: Present = query.get_result(c).await?;
                         Ok(row.present)
                     }
@@ -212,16 +231,55 @@ mod rls {
                 .await?;
             Ok(present)
         }
+    }
 
-        #[allow(clippy::unused_async_trait_impl)]
-        async fn can_write(
+    impl<Key: CapabilityKey> VisibilityPolicy for RlsAuth<Key> {
+        type Watcher = Arc<Principal<String, Key>>;
+        type Error = RlsAuthError;
+        type Backend = Postgres;
+
+        fn may_see<R>(
             &self,
-            _caller: &Principal<String, Key>,
-            _table: &str,
-            _pk: &[u8],
-            _op: MutationOp,
-        ) -> Result<bool, RlsAuthError> {
-            Ok(true)
+            row: &R,
+            watchers: &[Self::Watcher],
+            verdicts: &mut [Verdict],
+        ) -> impl Future<Output = Result<(), RlsAuthError>> + Send
+        where
+            R: RowView<Backend = Postgres> + Sync + ?Sized,
+        {
+            // The row is read here rather than inside the future, so nothing
+            // holds the view across an await.
+            let question = self.question(row);
+            async move {
+                let Some((sql, filter)) = question? else {
+                    return Ok(());
+                };
+                for (watcher, verdict) in watchers.iter().zip(verdicts.iter_mut()) {
+                    // A pool or query failure denies this watcher and no other.
+                    // Returning here instead would leave every later watcher on
+                    // its pre-filled denial, which is a wider denial than one
+                    // failed round trip earns.
+                    if let Ok(true) = self.visible(&sql, &filter, watcher).await {
+                        *verdict = Verdict::Allow;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        /// The write applies under the caller's own RLS context, so Postgres
+        /// `WITH CHECK` is the gate. Nothing to add here.
+        #[allow(clippy::unused_async_trait_impl)]
+        async fn may_write<R>(
+            &self,
+            _row: &R,
+            _watcher: &Self::Watcher,
+            _op: WriteOp,
+        ) -> Result<Verdict, RlsAuthError>
+        where
+            R: RowView<Backend = Postgres> + Sync + ?Sized,
+        {
+            Ok(Verdict::Allow)
         }
     }
 }

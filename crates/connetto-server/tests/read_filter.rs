@@ -17,7 +17,7 @@ use connetto_core::messages::{
     BulkMessage, ControlMessage, Handshake, Subscribe, SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
-use connetto_core::traits::{AuthPolicy, IncomingFrame, MutationOp, Transport};
+use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     Materializer, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
@@ -26,7 +26,8 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
-use subql::backend::Value;
+use subql::backend::{Postgres, Value};
+use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
 use subql::{CdcSource, PgSqliteEmuSource};
 
 const PG_DDL: &str =
@@ -35,37 +36,46 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 
 /// Denies reads of the `orders` row whose primary key is id 2, allows the rest,
-/// and allows every write. The materializer encodes the pk with the shared
-/// [`connetto_server::pk`] codec, so this decodes the bytes and matches the
-/// single `Int(2)` component.
+/// and allows every write. The key is read straight off the row view, which is
+/// how the row-level-security policy reads it too.
 struct DenyId2;
 
-impl AuthPolicy for DenyId2 {
+impl VisibilityPolicy for DenyId2 {
+    type Watcher = Arc<Principal>;
     type Error = std::convert::Infallible;
+    type Backend = Postgres;
 
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn can_read(
+    fn may_see<R>(
         &self,
-        _ctx: &Principal,
-        table: &str,
-        pk: &[u8],
-    ) -> Result<bool, Self::Error> {
-        if table != "orders" {
-            return Ok(true);
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        let denied = matches!(row.value_at(0), Ok(Value::Int(2)));
+        async move {
+            if !denied {
+                for verdict in verdicts.iter_mut().take(watchers.len()) {
+                    *verdict = Verdict::Allow;
+                }
+            }
+            Ok(())
         }
-        let key = connetto_server::pk::decode(pk).expect("pk decodes");
-        Ok(!matches!(key.as_slice(), [Value::Int(2)]))
     }
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn can_write(
+    async fn may_write<R>(
         &self,
-        _ctx: &Principal,
-        _table: &str,
-        _pk: &[u8],
-        _op: MutationOp,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+        _row: &R,
+        _watcher: &Self::Watcher,
+        _op: WriteOp,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
     }
 }
 

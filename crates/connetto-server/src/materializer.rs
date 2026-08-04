@@ -29,7 +29,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use connetto_core::MutationOp;
 use connetto_core::messages::{BindValue, MutationPatch};
 use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -44,10 +43,11 @@ use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
 use subql::emit::pgoutput_patchset;
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
+use subql::visibility::WriteOp;
 use subql::{
     AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, DatabaseLike, DefaultIds,
-    OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableLike,
-    catalog_helpers,
+    OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId,
+    TableLike, catalog_helpers,
 };
 
 use crate::oplog::ChangeRecord;
@@ -57,6 +57,12 @@ use subql::patchset::PgAdapter;
 
 /// The wire `Value` flavor a parsed upload carries: owned text and blobs.
 type WireValue = Value<String, Vec<u8>>;
+
+/// Map a full uploaded row image to the canonical value shape the row view
+/// hands to the authorization seam.
+fn row_image(values: &[WireValue]) -> Vec<PgValue<Postgres>> {
+    values.iter().map(crate::pk::from_wire).collect()
+}
 
 /// Zstd level for bulk payloads. Level 3 is the library default: a sound size
 /// versus speed tradeoff for patchset-sized blobs.
@@ -207,12 +213,17 @@ impl RuntimeWritableCatalogBuilder {
 /// One op parsed from a mutation upload, ready for the session write path.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedOp {
-    /// Target table.
-    pub table: String,
+    /// Catalog id of the target table, naming the row the write check asks
+    /// about.
+    pub table_id: TableId,
     /// The verb, for the authorization check.
-    pub op: MutationOp,
-    /// Encoded primary key, for the authorization check.
-    pub pk: Vec<u8>,
+    pub op: WriteOp,
+    /// The row the op writes, in catalog column order. An insert and a delete
+    /// carry a full image. A changeset update carries the new value where the
+    /// upload changed the column and the old one otherwise, so a column the
+    /// upload left out of both slots reads as absent, the same residual an
+    /// event carries under `REPLICA IDENTITY DEFAULT`.
+    pub row: Vec<PgValue<Postgres>>,
     /// Present when this op must be conflict-checked (a version-bearing update
     /// or delete).
     pub conflict: Option<PlannedConflict>,
@@ -511,6 +522,15 @@ where
     DB: DatabaseLike + 'static,
     W: WritableCatalog,
 {
+    /// The parsed catalog this materializer matches against.
+    ///
+    /// The visibility seam needs it to read column values off a change event,
+    /// and it holds the row across an await, so it takes a clone at
+    /// construction rather than reaching through the materializer's mutex.
+    pub const fn catalog(&self) -> &DB {
+        self.engine.inner().database()
+    }
+
     /// Register a subscription for `consumer_id` from a SQL `SELECT`.
     ///
     /// A row subscription returns [`Registration::Row`] with its
@@ -846,6 +866,12 @@ where
         Ok(WritePlan { ops })
     }
 
+    /// Resolve `table` in the catalog, or report the schema mismatch.
+    fn table_id(&self, table: &str) -> Result<TableId, MaterializerError> {
+        catalog_helpers::table_id(self.engine.inner().database(), table)
+            .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))
+    }
+
     fn plan_changeset_op(
         &self,
         op: &ChangesetOp<'_, TableSchema<String>, String, Vec<u8>>,
@@ -855,25 +881,34 @@ where
         if !self.write.is_writable(&table) {
             return Err(MaterializerError::NotWritable(table));
         }
+        let table_id = self.table_id(&table)?;
         let pk_values = op.primary_key();
-        let (verb, conflict) = match op {
-            ChangesetOp::Insert { .. } => (MutationOp::Insert, None),
+        let (verb, row, conflict) = match op {
+            ChangesetOp::Insert { values, .. } => (WriteOp::Insert, row_image(values), None),
             ChangesetOp::Update { values, .. } => {
                 let conflict = self.plan_conflict(schema, &pk_values, |idx| {
                     values.get(idx).and_then(|cell| cell.0.clone())
                 })?;
-                (MutationOp::Update, conflict)
+                // New over old, so the row is the one the update leaves behind.
+                let row = values
+                    .iter()
+                    .map(|(old, new)| match new.as_ref().or(old.as_ref()) {
+                        Some(value) => crate::pk::from_wire(value),
+                        None => PgValue::Missing,
+                    })
+                    .collect();
+                (WriteOp::Update, row, conflict)
             }
             ChangesetOp::Delete { old_values, .. } => {
                 let conflict =
                     self.plan_conflict(schema, &pk_values, |idx| old_values.get(idx).cloned())?;
-                (MutationOp::Delete, conflict)
+                (WriteOp::Delete, row_image(old_values), conflict)
             }
         };
         Ok(PlannedOp {
-            table,
+            table_id,
             op: verb,
-            pk: crate::pk::encode_wire(&pk_values),
+            row,
             conflict,
         })
     }
@@ -887,10 +922,10 @@ where
             return Err(MaterializerError::NotWritable(table));
         }
         match op {
-            PatchsetOp::Insert { .. } => Ok(PlannedOp {
-                table,
-                op: MutationOp::Insert,
-                pk: crate::pk::encode_wire(&op.primary_key()),
+            PatchsetOp::Insert { values, .. } => Ok(PlannedOp {
+                table_id: self.table_id(&table)?,
+                op: WriteOp::Insert,
+                row: row_image(values),
                 conflict: None,
             }),
             // A patchset carries no prior image, so an update or delete cannot

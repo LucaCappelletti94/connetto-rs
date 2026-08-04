@@ -1,10 +1,10 @@
 //! Session manager, per-session state machine, the snapshot seam, and the
 //! write path.
 //!
-//! One [`SessionManager`] fronts a shared [`Materializer`], a routing table, an
-//! [`AuthPolicy`], and the server's write target. Each connection is driven by
-//! [`SessionManager::serve`], which runs the handshake, then a select loop over
-//! inbound control frames and outbound live patches. CDC events reach
+//! One [`SessionManager`] fronts a shared [`Materializer`], a routing table, a
+//! visibility policy, and the server's write target. Each connection is driven
+//! by [`SessionManager::serve`], which runs the handshake, then a select loop
+//! over inbound control frames and outbound live patches. CDC events reach
 //! subscribed sessions through [`SessionManager::dispatch_event`].
 //!
 //! Flow control charges a credit only to bulk-plane frames
@@ -30,11 +30,12 @@ use connetto_core::messages::{
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
     NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
 };
-use connetto_core::traits::{AuthPolicy, HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
-use subql::{AggAccumulator, CdcSource, ChangeEvent, PgLsn, SubscriptionId};
+use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
+use subql::{AggAccumulator, CdcSource, ChangeEvent, ParserDB, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -45,6 +46,7 @@ use crate::materializer::{
     agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::row_view::ValuesRow;
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
@@ -385,7 +387,7 @@ impl AsyncConnector for NoConnector {
 }
 
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
-/// write path against an [`AuthPolicy`], a SQLite write target, and a
+/// write path against a visibility policy, the Postgres write target, and a
 /// re-execution connector for aggregate subscriptions.
 pub struct SessionManager<
     Snap,
@@ -397,12 +399,16 @@ pub struct SessionManager<
     Key = String,
 > where
     Snap: SnapshotSource<Id, Key>,
-    Auth: AuthPolicy<Id, Key> + Send + Sync,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
     materializer: Arc<Mutex<Materializer>>,
+    /// The parsed catalog, cloned out of the materializer at construction.
+    /// The visibility question holds a row view across an await, so it cannot
+    /// borrow one through the materializer's mutex.
+    catalog: Arc<ParserDB>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
     agg_routes: Mutex<HashMap<u64, AggRoute>>,
     /// Delta aggregate routes keyed by consumer id. Kept separate from
@@ -432,7 +438,7 @@ pub struct SessionManager<
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
 where
     Snap: SnapshotSource,
-    Auth: AuthPolicy + Send + Sync,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
     W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with no re-execution connector and a default in-memory
@@ -468,7 +474,7 @@ where
 impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
 where
     Snap: SnapshotSource,
-    Auth: AuthPolicy + Send + Sync,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     W: ConnettoWatermarkSchema<Id = String>,
@@ -501,7 +507,7 @@ where
 impl<Snap, Auth, C, O, W> SessionManager<Snap, Auth, W, C, O>
 where
     Snap: SnapshotSource,
-    Auth: AuthPolicy + Send + Sync,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
@@ -525,6 +531,7 @@ where
         config: SessionConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
+            catalog: Arc::new(materializer.catalog().clone()),
             materializer: Arc::new(Mutex::new(materializer)),
             routes: Mutex::new(HashMap::new()),
             agg_routes: Mutex::new(HashMap::new()),
@@ -546,7 +553,7 @@ where
 impl<Snap, Auth, C, O, Id, Key, W> SessionManager<Snap, Auth, W, C, O, Id, Key>
 where
     Snap: SnapshotSource<Id, Key>,
-    Auth: AuthPolicy<Id, Key> + Send + Sync,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
@@ -693,30 +700,43 @@ where
         // not per consumer, since reconnect catchup re-filters per client.
         counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
         let record = { self.materializer.lock().await.oplog_record(event) };
-        // The event's (table, primary key, is-delete) for the per-consumer read
-        // filter below.
-        let identity = record
-            .as_ref()
-            .map(|r| (r.table().to_owned(), r.pk().to_vec(), r.is_tombstone()));
         if let Some(record) = record {
             self.oplog.append(record).await.map_err(oplog_err)?;
         }
 
+        // Every patch this event produced, paired with the route it goes to.
+        // Collected before the visibility question because that question names
+        // every watcher at once.
+        let mut deliveries = Vec::with_capacity(dispatched.patches.len());
         for patch in dispatched.patches {
             let route = { self.routes.lock().await.get(&patch.consumer_id).cloned() };
             let Some(route) = route else { continue };
             counters::add(&counters::FANOUT_ROUTE_CLONES, 1);
-            // Read filter: deliver only rows the session may see. A delete
-            // replays regardless (a tombstone), so a client drops a row it may
-            // still hold locally even after it can no longer see it.
-            if let Some((table, pk, is_delete)) = identity.as_ref()
-                && !is_delete
-                && !self
-                    .auth
-                    .can_read(&route.principal, table, pk)
-                    .await
-                    .unwrap_or(false)
-            {
+            deliveries.push((patch, route));
+        }
+
+        // Read filter: deliver only rows a session may see. A delete or a
+        // truncate carries no post-image, which is what `EventRow::current`
+        // reports by answering `None`, and those replay regardless so a client
+        // drops a row it may still hold locally even after it can no longer see
+        // it.
+        let mut verdicts = Vec::new();
+        if let Some(row) = EventRow::current(event, self.catalog.as_ref()) {
+            let watchers: Vec<_> = deliveries
+                .iter()
+                .map(|(_, route)| Arc::clone(&route.principal))
+                .collect();
+            Verdict::reset(&mut verdicts, watchers.len());
+            // The buffer arrived pre-filled with denials, so whatever the
+            // policy could not reach stays denied.
+            let _ = self.auth.may_see(&row, &watchers, &mut verdicts).await;
+        } else {
+            // Nothing to ask about, so nothing is filtered.
+            verdicts.resize(deliveries.len(), Verdict::Allow);
+        }
+
+        for ((patch, route), verdict) in deliveries.into_iter().zip(verdicts) {
+            if !verdict.allowed() {
                 continue;
             }
             {
@@ -1116,6 +1136,10 @@ where
         };
 
         loop {
+            // One task, two arms. The transport arm awaits a whole subscribe,
+            // snapshot included, so the outbound arm cannot interleave a live
+            // patch into it and a client never sees one before SnapshotEnd.
+            // Moving either arm onto its own task breaks that silently.
             tokio::select! {
                 incoming = transport.recv() => {
                     match incoming.map_err(transport_err)? {
@@ -1301,11 +1325,12 @@ where
 
         // Authorize every op, fail closed on a denial or an auth error.
         for op in &plan.ops {
+            let row = ValuesRow::new(op.table_id, &op.row);
             let allowed = self
                 .auth
-                .can_write(&state.principal, &op.table, &op.pk, op.op)
+                .may_write(&row, &state.principal, op.op)
                 .await
-                .unwrap_or(false);
+                .is_ok_and(Verdict::allowed);
             if !allowed {
                 return self
                     .reject(transport, client_seq, MutationRejectReason::Unauthorized)
@@ -1433,6 +1458,7 @@ where
                     // every sibling subscription) stays alive. Transport and
                     // oplog failures stay fatal.
                     Err(SessionError::Snapshot(detail)) => {
+                        state.subs.remove(&sub_label);
                         self.remove_route(consumer_id).await;
                         self.materializer.lock().await.unregister(sub_id);
                         transport
@@ -1492,7 +1518,42 @@ where
         self.snapshot_row(transport, sub, state, &reg).await
     }
 
-    /// Snapshot a row subscription: begin, patch, end, then route live patches.
+    /// Install the live route and record the subscription, so `dispatch_event`
+    /// starts delivering to this consumer.
+    ///
+    /// Both row paths call this before reading anything. Until the route
+    /// exists every patch produced for the consumer is discarded, and the
+    /// snapshot read plus its bulk transfer is long enough to lose commits.
+    async fn attach_row_route(
+        &self,
+        sub_label: &str,
+        state: &mut SessionState<Id, Key>,
+        reg: &RowRegistration,
+    ) {
+        self.add_route(
+            reg.consumer_id,
+            Route {
+                session_key: state.session_id.as_u64_key(),
+                sub_id: reg.sub_id,
+                label: sub_label.to_owned(),
+                tx: state.outbound.clone(),
+                principal: Arc::clone(&state.principal),
+            },
+        )
+        .await;
+        state
+            .subs
+            .insert(sub_label.to_owned(), (reg.consumer_id, reg.sub_id));
+    }
+
+    /// Snapshot a row subscription: route first, then begin, patch, end.
+    ///
+    /// Live delivery runs throughout the snapshot, so a change committed while
+    /// it is in flight reaches the client as a patch queued behind
+    /// `SnapshotEnd`. Such a patch may repeat a row the snapshot already
+    /// carries, which is harmless: patches arrive in commit order, so the last
+    /// one applied for a row is that row's current value. Filtering the
+    /// overlap by LSN was considered and rejected, see `04-subscriptions.md`.
     async fn snapshot_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -1500,6 +1561,7 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
+        self.attach_row_route(&sub.sub_id, state, reg).await;
         transport
             .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub.sub_id.clone(),
@@ -1523,24 +1585,11 @@ where
         .map_err(transport_err)?;
         transport
             .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                sub_id: sub.sub_id.clone(),
+                sub_id: sub.sub_id,
                 cursor: snapshot.cursor,
             }))
             .await
             .map_err(transport_err)?;
-
-        self.add_route(
-            reg.consumer_id,
-            Route {
-                session_key: state.session_id.as_u64_key(),
-                sub_id: reg.sub_id,
-                label: sub.sub_id.clone(),
-                tx: state.outbound.clone(),
-                principal: Arc::clone(&state.principal),
-            },
-        )
-        .await;
-        state.subs.insert(sub.sub_id, (reg.consumer_id, reg.sub_id));
         Ok(())
     }
 
@@ -1562,20 +1611,7 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
-        self.add_route(
-            reg.consumer_id,
-            Route {
-                session_key: state.session_id.as_u64_key(),
-                sub_id: reg.sub_id,
-                label: sub.sub_id.clone(),
-                tx: state.outbound.clone(),
-                principal: Arc::clone(&state.principal),
-            },
-        )
-        .await;
-        state
-            .subs
-            .insert(sub.sub_id.clone(), (reg.consumer_id, reg.sub_id));
+        self.attach_row_route(&sub.sub_id, state, reg).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
@@ -1591,6 +1627,10 @@ where
             .entries_since(state.resume_lsn)
             .await
             .map_err(oplog_err)?;
+        // One watcher, this session's caller, so the buffer is one verdict and
+        // is reused across the whole replay.
+        let watchers = [Arc::clone(&state.principal)];
+        let mut verdicts = Vec::new();
         for record in entries {
             if record.lsn() > ceiling {
                 continue;
@@ -1605,13 +1645,13 @@ where
             if !matched {
                 continue;
             }
-            if !record.is_tombstone() {
-                let allowed = self
-                    .auth
-                    .can_read(&state.principal, record.table(), record.pk())
-                    .await
-                    .unwrap_or(false);
-                if !allowed {
+            // A delete or a truncate has no post-image and so no question, and
+            // replays regardless, which is what lets a client drop a row it may
+            // still hold.
+            if let Some(row) = EventRow::current(record.event(), self.catalog.as_ref()) {
+                Verdict::reset(&mut verdicts, watchers.len());
+                let _ = self.auth.may_see(&row, &watchers, &mut verdicts).await;
+                if !verdicts.first().copied().unwrap_or_default().allowed() {
                     continue;
                 }
             }

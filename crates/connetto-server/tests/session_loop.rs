@@ -15,7 +15,7 @@ use connetto_core::messages::{
     Unsubscribe,
 };
 use connetto_core::test_support::TestGrantChecker;
-use connetto_core::traits::{AuthPolicy, IncomingFrame, Transport};
+use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
@@ -25,6 +25,8 @@ use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+use subql::backend::Postgres;
+use subql::visibility::VisibilityPolicy;
 use subql::{CdcSource, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -133,7 +135,10 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 
 /// Insert `sql` into the emulated backend and route every resulting CDC event
 /// to the sessions through the manager.
-async fn drive_cdc<S: SnapshotSource, A: AuthPolicy + Send + Sync>(
+async fn drive_cdc<
+    S: SnapshotSource,
+    A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>,
+>(
     source: &mut PgSqliteEmuSource,
     manager: &SessionManager<S, A, ConnettoWatermark>,
     sql: &str,
