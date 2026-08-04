@@ -29,12 +29,12 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main (95f7005 bumps sqlite-diff-rs to 0.9.0 and adds the PgBinary wire
-# source plus subql::emit::pgbinary_patchset, on top of 5858f50's 0.8.0 blob
-# render): native SQL-plus-binds registration with Value::Bytes placeholder
-# resolution, and the diesel-typed SQLite render accepting blob binds. The base
-# features stay minimal here, each crate states the feature set it consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "95f7005560e6db0c53a5616bba07ba35ad428fb5", default-features = false, features = ["std"] }
+# on main. c1f725a makes an UPDATE notify every row subscription whose
+# predicate the row satisfies, whichever columns changed, which is what stops a
+# replica keeping a stale value for any column its query does not filter on. It
+# also carries the visibility trait R5a builds on. The base features stay
+# minimal here, each crate states the feature set it consumes.
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "c1f725a907af94d8cb5d846840e6529dd09f9426", default-features = false, features = ["std"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"
