@@ -99,8 +99,17 @@ pub enum AuthStoreError {
     Expired,
     /// A rotated-out refresh token was presented for a live session. The
     /// session was revoked as a theft response.
+    ///
+    /// It names the session so the layer holding the revocation observer can
+    /// close whatever connection that session still has open. Without the id
+    /// the theft response could only refuse the next handshake, leaving the
+    /// live socket streaming, which is the opposite of what a stolen
+    /// credential warrants.
     #[error("refresh token reuse detected, session revoked")]
-    Reuse,
+    Reuse {
+        /// The session the replayed token named, now revoked.
+        session_id: SessionId,
+    },
     /// The identity resolver failed to map the verified claims to a user id.
     #[error(transparent)]
     Resolve(#[from] ResolveError),
@@ -365,7 +374,7 @@ impl<
         if !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
             // A rotated-out token for a live session: treat as theft.
             record.revoked = true;
-            return Err(AuthStoreError::Reuse);
+            return Err(AuthStoreError::Reuse { session_id });
         }
         let new_secret = new_refresh_secret();
         record.current_refresh_hash = hash_secret(&new_secret);
@@ -606,7 +615,7 @@ mod db {
                             // not revoke inside the transaction: returning an
                             // error rolls it back, so the revoke lands below in
                             // its own committed statement.
-                            return Err(AuthStoreError::Reuse);
+                            return Err(AuthStoreError::Reuse { session_id });
                         }
                         let capped_idle = idle.min(absolute_deadline);
                         S::rotation_update(session_id, new_hash, capped_idle)
@@ -625,7 +634,7 @@ mod db {
                 })
                 .await
             };
-            if matches!(outcome, Err(AuthStoreError::Reuse)) {
+            if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
                 S::revoke_update(session_id)
                     .execute(&mut conn)
                     .await

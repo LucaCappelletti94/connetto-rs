@@ -119,8 +119,8 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
 
     let reuse = store.rotate_refresh(&first.refresh_token, now).await;
     assert!(
-        matches!(reuse, Err(AuthStoreError::Reuse)),
-        "reused refresh token is theft, got {reuse:?}",
+        matches!(reuse, Err(AuthStoreError::Reuse { session_id }) if session_id == first.session_id),
+        "reused refresh token is theft naming its own session, got {reuse:?}",
     );
     assert!(
         !store

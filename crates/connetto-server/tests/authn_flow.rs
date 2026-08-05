@@ -269,6 +269,70 @@ async fn logout_closes_the_live_connection_it_revoked() {
     let _ = server.await.expect("join");
 }
 
+/// The theft defence must close the live connection, exactly as a logout does.
+///
+/// A replayed refresh token means somebody holds a stolen credential, so it is
+/// the case where leaving the socket open matters most. It went through the
+/// store rather than through `AuthService::revoke`, so it never reached the
+/// revocation observer and the caller kept streaming until it chose to
+/// reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn token_reuse_closes_the_live_connection_it_revoked() {
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service();
+    let pair = svc.login(&identity("mallory")).await.expect("login");
+    let manager = manager_with(
+        Arc::new(svc.handshake_authority()),
+        CapturingSnapshot::default(),
+        &fixture,
+    );
+    {
+        let revoke_manager = Arc::clone(&manager);
+        svc.set_revocation_hook(Arc::new(move |session_id| {
+            let manager = Arc::clone(&revoke_manager);
+            tokio::spawn(async move {
+                manager
+                    .close_session(session_id, FatalErrorReason::SessionRevoked)
+                    .await;
+            });
+        }));
+    }
+
+    let rotated = svc.refresh(&pair.refresh_token).await.expect("refresh");
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(Arc::clone(&manager).serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "mallory-device")
+                .with_grant(Grant::new(&rotated.access_token)),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+
+    // Replaying the rotated-out token is theft. It revokes the session, and
+    // that must reach the connection the thief's victim still holds.
+    assert!(
+        svc.refresh(&pair.refresh_token).await.is_err(),
+        "a replayed refresh token is refused"
+    );
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let ControlMessage::FatalError(fatal) = next_control(&mut client).await {
+                return fatal;
+            }
+        }
+    })
+    .await
+    .expect("the theft response must close the connection, not leave it streaming");
+    assert_eq!(closed.reason, FatalErrorReason::SessionRevoked);
+    let _ = server.await.expect("join");
+}
+
 #[tokio::test]
 async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     let (authority, svc) = service();

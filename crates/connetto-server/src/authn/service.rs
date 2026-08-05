@@ -247,7 +247,22 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the token is invalid, expired, reused, or the mint fails.
     pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
-        let outcome = self.store.rotate_refresh(refresh_token, now).await?;
+        let outcome = match self.store.rotate_refresh(refresh_token, now).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // The store revokes on theft but cannot close anything: the
+                // observer lives here. Without this the stolen-credential case
+                // was the one case that left the socket streaming.
+                if let AuthStoreError::Reuse { session_id } = &err {
+                    tracing::warn!(
+                        session = %session_id,
+                        "refresh token reuse detected, session revoked as theft"
+                    );
+                    self.notify_revoked(*session_id);
+                }
+                return Err(err.into());
+            }
+        };
         let access_token = self
             .authority
             .mint_access(&outcome.context, outcome.session_id, now)?;
@@ -273,10 +288,17 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
         self.store.revoke_session(session_id).await?;
         tracing::info!(session = %session_id, "session revoked");
+        self.notify_revoked(session_id);
+        Ok(())
+    }
+
+    /// Tell the deployment's observer that a session died, so it can close the
+    /// connection that session still holds. Every revocation path goes through
+    /// here, which is what keeps the theft response and the logout equivalent.
+    fn notify_revoked(&self, session_id: SessionId) {
         if let Some(hook) = self.revocation_hook.get() {
             hook(session_id);
         }
-        Ok(())
     }
 
     /// Log out the session the presented refresh token names: verify the token,
