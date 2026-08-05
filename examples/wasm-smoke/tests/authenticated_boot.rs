@@ -31,13 +31,13 @@
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "CREATE TABLE connetto_sessions (session_id UUID PRIMARY KEY, \
 //!       user_id TEXT NOT NULL, current_refresh_hash BYTEA NOT NULL, \
-//!       idle_deadline_ms BIGINT NOT NULL, absolute_deadline_ms BIGINT NOT NULL, \
+//!       idle_deadline TIMESTAMPTZ NOT NULL, absolute_deadline TIMESTAMPTZ NOT NULL, \
 //!       revoked BOOLEAN NOT NULL DEFAULT FALSE)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "CREATE TABLE connetto_provider_tokens (session_id UUID PRIMARY KEY \
 //!       REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
 //!       issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
-//!       expires_at_ms BIGINT)"
+//!       expires_at TIMESTAMPTZ)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, \
 //!       last_seq BIGINT NOT NULL)"

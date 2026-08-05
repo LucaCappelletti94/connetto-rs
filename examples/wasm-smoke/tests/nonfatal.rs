@@ -41,13 +41,6 @@ const BAD_QUERY: &str = "@@@ this is not a valid query @@@";
 /// The worker's row upstream subscription id, matching the hub reconnect spec.
 const UPSTREAM_SUB: &str = "db-upstream";
 
-/// Ids unique across smoke runs, in this test's own band.
-fn unique_base() -> i64 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let millis = js_sys::Date::now() as i64;
-    92_000_000_000 + millis
-}
-
 /// Send the handshake ack the worker's `connect` waits for.
 async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
     let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await else {
@@ -136,23 +129,22 @@ where
     }
 }
 
-async fn tab_config(base: i64, tag: &str) -> ClientConfig {
+async fn tab_config() -> ClientConfig {
     ClientConfig {
-        client_id: format!("nonfatal-{tag}-{base}"),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     }
 }
 
 #[wasm_bindgen_test]
 async fn bad_tab_subscription_yields_scoped_nonfatal() {
-    let base = unique_base();
     let (worker_up, fake_up) = loopback();
     spawn_local(quiet_upstream(fake_up));
 
-    let worker_cfg = tab_config(base, "worker").await;
+    let worker_cfg = tab_config().await;
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
@@ -164,7 +156,7 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_cfg = tab_config(base, "tab").await;
+    let tab_cfg = tab_config().await;
     let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");
@@ -208,11 +200,10 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
 
 #[wasm_bindgen_test]
 async fn aggregate_upstream_nonfatal_reaches_the_tab() {
-    let base = unique_base();
     let (worker_up, fake_up) = loopback();
     spawn_local(reject_every_subscribe(fake_up));
 
-    let worker_cfg = tab_config(base, "worker").await;
+    let worker_cfg = tab_config().await;
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
@@ -224,7 +215,7 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_cfg = tab_config(base, "tab").await;
+    let tab_cfg = tab_config().await;
     let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");
@@ -250,12 +241,11 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
 
 #[wasm_bindgen_test]
 async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
-    let base = unique_base();
     let (worker_up, fake_up) = loopback();
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(nonfatal_row_upstream(fake_up, trigger_rx));
 
-    let worker_cfg = tab_config(base, "worker").await;
+    let worker_cfg = tab_config().await;
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
@@ -277,7 +267,7 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_cfg = tab_config(base, "tab").await;
+    let tab_cfg = tab_config().await;
     let mut tab = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_cfg, None)
         .await
         .expect("tab connect");

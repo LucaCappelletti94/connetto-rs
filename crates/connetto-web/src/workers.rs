@@ -92,8 +92,8 @@ pub struct DbWorkerConfig {
     pub upstream_query: &'static str,
     /// The attached database file holding the hub's own durable state.
     pub hub_meta_name: &'static str,
-    /// The prefix of the worker's client id (a timestamp is appended).
-    pub client_id_prefix: &'static str,
+    // The tab's own id is not configurable: it is a fresh UUID per worker,
+    // because the hub keys a durable write counter and a lock on it.
     /// The schema version this app build was compiled against. The worker
     /// presents it to the server at handshake (a mismatch is a stale build)
     /// and the hub forwards the server's version to tabs for the same check.
@@ -419,7 +419,7 @@ where
     let identified = session.is_some();
     let identity = session.map(|session| session.user_id);
     let client_config = ClientConfig {
-        client_id: format!("{}-{}", config.client_id_prefix, js_sys::Date::now()),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login,
         capabilities: Vec::new(),
         schema_version: Some(config.schema_version.clone()),

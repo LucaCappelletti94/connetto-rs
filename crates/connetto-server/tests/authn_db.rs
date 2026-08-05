@@ -33,11 +33,11 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
         "DROP TABLE IF EXISTS connetto_sessions",
         "CREATE TABLE connetto_sessions (\
             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
-            current_refresh_hash BYTEA NOT NULL, idle_deadline_ms BIGINT NOT NULL, \
-            absolute_deadline_ms BIGINT NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+            current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
+            absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
         "CREATE TABLE connetto_provider_tokens (\
             session_id UUID PRIMARY KEY, issuer TEXT NOT NULL, access_token TEXT NOT NULL, \
-            refresh_token TEXT, expires_at_ms BIGINT)",
+            refresh_token TEXT, expires_at TIMESTAMPTZ)",
     ] {
         sql_query(stmt).execute(&mut conn).await.expect("ddl");
     }

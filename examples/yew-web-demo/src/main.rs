@@ -55,10 +55,10 @@ const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 /// version at handshake and is not rejected as stale.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// The synced replica schema (worker first boot). Matches `schema.sql`.
-const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT;";
 /// The tab mirror schema: both tiers in the tab's main schema, because every
 /// relayed patch applies to main. The hub, not the tab, keeps the tiers apart.
-const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT; \
+const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
      CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
@@ -106,23 +106,23 @@ struct Note {
     body: String,
 }
 
-// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
+// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
 // tab write omits the id and this registered function mints it. The impl is
-// `rosetta_uuid::Uuid::utc_v7`, the same strongly typed key the `orders` schema
+// `rosetta_uuid::Uuid::new_v4`, the same strongly typed key the `orders` schema
 // uses on SQLite and Postgres.
 #[diesel::declare_sql_function]
 extern "SQL" {
-    /// Client-authored primary key: a 16-byte UUID v7, stored as a BLOB.
-    fn uuidv7() -> diesel::sql_types::Binary;
+    /// Client-authored primary key: a 16-byte UUID v4, stored as a BLOB.
+    fn uuidv4() -> diesel::sql_types::Binary;
 }
 
 /// The registrar connetto installs on every connection it opens for this app.
-/// Nondeterministic, so SQLite calls `uuidv7()` per row instead of folding the
+/// Nondeterministic, so SQLite calls `uuidv4()` per row instead of folding the
 /// DEFAULT to a constant.
-fn uuidv7_functions() -> connetto_client::SqlFunctions {
+fn uuidv4_functions() -> connetto_client::SqlFunctions {
     connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
         |conn: &mut diesel::SqliteConnection| {
-            uuidv7_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::utc_v7)
+            uuidv4_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::new_v4)
         },
     ))
 }
@@ -231,9 +231,8 @@ async fn run_db_worker() -> Result<(), JsValue> {
             upstream_sub_id: "db-upstream",
             upstream_query: DEMO_QUERY,
             hub_meta_name: "connetto-hub-meta.sqlite",
-            client_id_prefix: "db-worker",
             schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
-            sql_functions: uuidv7_functions(),
+            sql_functions: uuidv4_functions(),
             auth,
             auth_db_name: "connetto-auth.sqlite",
         })
@@ -329,7 +328,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
         login: None,
         capabilities: Vec::new(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let conn = ConnettoConnection::connect(
         transport,

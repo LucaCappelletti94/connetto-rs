@@ -93,6 +93,12 @@ zeroize = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
+# Per-tab durable write counter: the tab's SQLite watermark table keys on a
+# UUID blob column, mirroring the server's session_id UUID primary key.
+# getrandom with the js feature (already present above) is what makes v4 mint
+# in a browser context.
+rosetta-uuid = { version = "0.1.3", features = ["serde", "sqlite"] }
+
 # The replica key store is exercised in a dedicated worker against real
 # IndexedDB and real WebCrypto, and the at-rest assertion reads the stored
 # record straight out of the database rather than through the store.

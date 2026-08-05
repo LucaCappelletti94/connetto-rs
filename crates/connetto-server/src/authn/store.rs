@@ -445,7 +445,7 @@ pub use db::DbAuthStore;
 
 mod db {
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     use connetto_core::SessionId;
     use connetto_core::auth::AuthContext;
@@ -461,13 +461,19 @@ mod db {
     };
     use crate::authn::identity::IdentityResolver;
     use crate::authn::provider::RetainedProviderToken;
-    use crate::authn::schema::ConnettoStoreSchema;
+    use crate::authn::schema::{ConnettoStoreSchema, Instant};
     use crate::authn::token::RefreshLifetimes;
 
     /// The rotation columns a `SELECT ... FOR UPDATE` loads: the typed
     /// `user_id`, the refresh hash, and the two deadlines plus the revoked
     /// flag.
-    type SessionRow<S> = (<S as ConnettoStoreSchema>::Id, Vec<u8>, i64, i64, bool);
+    type SessionRow<S> = (
+        <S as ConnettoStoreSchema>::Id,
+        Vec<u8>,
+        Instant,
+        Instant,
+        bool,
+    );
 
     /// The Postgres auth store, generic over the deployment's schema. Durable
     /// across restart and the only variant that backs a mesh. Identity resolves
@@ -499,17 +505,15 @@ mod db {
         AuthStoreError::Backend(err.to_string())
     }
 
-    fn unix_ms(time: SystemTime) -> i64 {
-        i64::try_from(
-            time.duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_millis(),
-        )
-        .unwrap_or(i64::MAX)
+    /// The instant a `Timestamptz` column carries, from the `SystemTime` the
+    /// [`AuthStore`] API speaks. Total and lossless in both directions, unlike
+    /// the count of milliseconds these columns used to hold.
+    fn to_instant(time: SystemTime) -> Instant {
+        Instant::from(time)
     }
 
-    fn time_from_ms(ms: i64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(u64::try_from(ms).unwrap_or(0))
+    fn from_instant(instant: Instant) -> SystemTime {
+        instant.into()
     }
 
     impl<S: ConnettoStoreSchema> AuthStore for DbAuthStore<S> {
@@ -521,8 +525,8 @@ mod db {
             now: SystemTime,
         ) -> Result<IssuedSession<S::Id>, AuthStoreError> {
             let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
-            let idle = unix_ms(now + self.lifetimes.idle_window);
-            let absolute = unix_ms(now + self.lifetimes.absolute_ceiling);
+            let idle = to_instant(now + self.lifetimes.idle_window);
+            let absolute = to_instant(now + self.lifetimes.absolute_ceiling);
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
@@ -545,7 +549,7 @@ mod db {
                 session_id,
                 context,
                 refresh_token: format_refresh(session_id, &secret),
-                session_expires_at: time_from_ms(idle.min(absolute)),
+                session_expires_at: from_instant(idle.min(absolute)),
             })
         }
 
@@ -555,15 +559,15 @@ mod db {
             now: SystemTime,
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let now_ms = unix_ms(now);
+            let now = to_instant(now);
             let base = FilterDsl::filter(S::SessionsQuery::default(), S::session_pk(session_id));
             let query = SelectDsl::select(
                 base,
-                (S::Revoked::default(), S::AbsoluteDeadlineMs::default()),
+                (S::Revoked::default(), S::AbsoluteDeadline::default()),
             );
-            let live: Option<(bool, i64)> =
+            let live: Option<(bool, Instant)> =
                 query.first(&mut conn).await.optional().map_err(backend)?;
-            Ok(live.is_some_and(|(revoked, absolute)| !revoked && now_ms <= absolute))
+            Ok(live.is_some_and(|(revoked, absolute)| !revoked && now <= absolute))
         }
 
         async fn rotate_refresh(
@@ -574,8 +578,8 @@ mod db {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
             let presented_hash = hash_secret(secret).to_vec();
-            let now_ms = unix_ms(now);
-            let idle = unix_ms(now + self.lifetimes.idle_window);
+            let idle = to_instant(now + self.lifetimes.idle_window);
+            let now = to_instant(now);
             let new_secret = new_refresh_secret();
             let new_hash = hash_secret(&new_secret).to_vec();
             let mut conn = self.pool.get().await.map_err(backend)?;
@@ -594,7 +598,7 @@ mod db {
                         if revoked {
                             return Err(AuthStoreError::NotFound);
                         }
-                        if now_ms > absolute_deadline || now_ms > idle_deadline {
+                        if now > absolute_deadline || now > idle_deadline {
                             return Err(AuthStoreError::Expired);
                         }
                         if !hashes_match(&presented_hash, &current_hash) {
@@ -614,7 +618,7 @@ mod db {
                             session_id,
                             context,
                             refresh_token: format_refresh(session_id, &new_secret),
-                            session_expires_at: time_from_ms(capped_idle),
+                            session_expires_at: from_instant(capped_idle),
                         })
                     }
                     .scope_boxed()
@@ -673,13 +677,13 @@ mod db {
             _now: SystemTime,
         ) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let expires_at_ms = token.expires_at.map(unix_ms);
+            let expires_at = token.expires_at.map(to_instant);
             let row = S::new_provider_token(
                 session_id,
                 token.issuer.clone(),
                 token.access_token.clone(),
                 token.refresh_token.clone(),
-                expires_at_ms,
+                expires_at,
             );
             diesel::insert_into(S::ProviderTokens::default())
                 .values(row)
@@ -689,7 +693,7 @@ mod db {
                     S::PtIssuer::default().eq(token.issuer.clone()),
                     S::PtAccessToken::default().eq(token.access_token.clone()),
                     S::PtRefreshToken::default().eq(token.refresh_token.clone()),
-                    S::PtExpiresAtMs::default().eq(expires_at_ms),
+                    S::PtExpiresAt::default().eq(expires_at),
                 ))
                 .execute(&mut conn)
                 .await
@@ -709,21 +713,19 @@ mod db {
                     S::PtIssuer::default(),
                     S::PtAccessToken::default(),
                     S::PtRefreshToken::default(),
-                    S::PtExpiresAtMs::default(),
+                    S::PtExpiresAt::default(),
                 ),
             );
-            let row: Option<(String, String, Option<String>, Option<i64>)> =
+            let row: Option<(String, String, Option<String>, Option<Instant>)> =
                 query.first(&mut conn).await.optional().map_err(backend)?;
-            Ok(
-                row.map(|(issuer, access_token, refresh_token, expires_at_ms)| {
-                    RetainedProviderToken {
-                        issuer,
-                        access_token,
-                        refresh_token,
-                        expires_at: expires_at_ms.map(time_from_ms),
-                    }
-                }),
-            )
+            Ok(row.map(
+                |(issuer, access_token, refresh_token, expires_at)| RetainedProviderToken {
+                    issuer,
+                    access_token,
+                    refresh_token,
+                    expires_at: expires_at.map(from_instant),
+                },
+            ))
         }
     }
 }

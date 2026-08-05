@@ -41,10 +41,18 @@ use diesel::query_builder::{
     IntoConflictValueClause, QueryFragment, QueryId, UndecoratedInsertRecord,
 };
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
-use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Uuid};
+use diesel::sql_types::{Binary, Bool, Nullable, Text, Timestamptz, Uuid};
 use diesel::{Insertable, QuerySource};
 use diesel_async::AsyncPgConnection;
 use diesel_async::methods::LoadQuery as AsyncLoadQuery;
+
+/// The zone-aware instant a `Timestamptz` column carries.
+///
+/// Named once so the trait, the macro and the store cannot disagree about it.
+/// Deadlines used to be a bare count of milliseconds in a `BigInt`, which put
+/// the unit in the column name and left seconds and milliseconds
+/// indistinguishable to the compiler.
+pub type Instant = chrono::DateTime<chrono::Utc>;
 
 /// A column marker usable in the `WHERE`, `SET`, and `SELECT` clauses of table
 /// `Tab`, carrying the fixed SQL type `St`. This is the shape every
@@ -79,12 +87,12 @@ where
     <Self::Sessions as QuerySource>::FromClause: QueryFragment<Pg> + Send,
     // shape 2: session liveness SELECT
     Self::SessionsQuery: FilterDsl<Self::SessionPk>,
-    Filter<Self::SessionsQuery, Self::SessionPk>: SelectDsl<(Self::Revoked, Self::AbsoluteDeadlineMs)>,
-    Select<Filter<Self::SessionsQuery, Self::SessionPk>, (Self::Revoked, Self::AbsoluteDeadlineMs)>:
+    Filter<Self::SessionsQuery, Self::SessionPk>: SelectDsl<(Self::Revoked, Self::AbsoluteDeadline)>,
+    Select<Filter<Self::SessionsQuery, Self::SessionPk>, (Self::Revoked, Self::AbsoluteDeadline)>:
         LimitDsl,
     for<'q> Limit<
-        Select<Filter<Self::SessionsQuery, Self::SessionPk>, (Self::Revoked, Self::AbsoluteDeadlineMs)>,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, (bool, i64)> + Send,
+        Select<Filter<Self::SessionsQuery, Self::SessionPk>, (Self::Revoked, Self::AbsoluteDeadline)>,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, (bool, Instant)> + Send,
     // shape 3 (the FOR UPDATE rotate read) is laundered whole as `SessionRow`.
     // shape 6: provider-token upsert
     Self::NewProviderToken: Insertable<Self::ProviderTokens>,
@@ -96,17 +104,17 @@ where
     // shape 7: provider-token SELECT
     Self::ProviderTokensQuery: FilterDsl<Self::PtPk>,
     Filter<Self::ProviderTokensQuery, Self::PtPk>:
-        SelectDsl<(Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAtMs)>,
+        SelectDsl<(Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAt)>,
     Select<
         Filter<Self::ProviderTokensQuery, Self::PtPk>,
-        (Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAtMs),
+        (Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAt),
     >: LimitDsl,
     for<'q> Limit<
         Select<
             Filter<Self::ProviderTokensQuery, Self::PtPk>,
-            (Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAtMs),
+            (Self::PtIssuer, Self::PtAccessToken, Self::PtRefreshToken, Self::PtExpiresAt),
         >,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, (String, String, Option<String>, Option<i64>)> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, (String, String, Option<String>, Option<Instant>)> + Send,
 {
     /// The developer's typed distributed user id, the `sessions.user_id` value.
     type Id: serde::Serialize
@@ -124,17 +132,17 @@ where
     /// The whole opaque `SELECT (rotation columns) WHERE session_id = ? FOR
     /// UPDATE` read used by rotation. Laundered as one loadable value so the row
     /// lock composes without the generic `for_update` diverging.
-    type SessionRow: for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Self::Id, Vec<u8>, i64, i64, bool)>
+    type SessionRow: for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Self::Id, Vec<u8>, Instant, Instant, bool)>
         + Send;
 
     /// `sessions.user_id`, typed as the developer's `Id` SQL type.
     type UserId: Expression + Default + Send;
     /// `sessions.current_refresh_hash` (`Binary`).
     type CurrentRefreshHash: StoreColumn<Self::Sessions, Binary>;
-    /// `sessions.idle_deadline_ms` (`BigInt`).
-    type IdleDeadlineMs: StoreColumn<Self::Sessions, BigInt>;
-    /// `sessions.absolute_deadline_ms` (`BigInt`).
-    type AbsoluteDeadlineMs: StoreColumn<Self::Sessions, BigInt>;
+    /// `sessions.idle_deadline` (`Timestamptz`).
+    type IdleDeadline: StoreColumn<Self::Sessions, Timestamptz>;
+    /// `sessions.absolute_deadline` (`Timestamptz`).
+    type AbsoluteDeadline: StoreColumn<Self::Sessions, Timestamptz>;
     /// `sessions.revoked` (`Bool`).
     type Revoked: StoreColumn<Self::Sessions, Bool>;
     /// The insertable new-sessions row.
@@ -142,7 +150,7 @@ where
     /// The opaque `sessions.session_id = ?` predicate.
     type SessionPk: Send;
     /// The whole opaque `UPDATE sessions SET current_refresh_hash = ?,
-    /// idle_deadline_ms = ? WHERE session_id = ?` statement.
+    /// idle_deadline = ? WHERE session_id = ?` statement.
     type RotationUpdate: QueryFragment<Pg> + QueryId + Send;
     /// The whole opaque `UPDATE sessions SET revoked = true WHERE session_id = ?`
     /// statement.
@@ -156,7 +164,7 @@ where
     fn rotation_update(
         session_id: SessionId,
         current_refresh_hash: Vec<u8>,
-        idle_deadline_ms: i64,
+        idle_deadline: Instant,
     ) -> Self::RotationUpdate;
     /// Build the revoke UPDATE statement (`revoked = true`).
     fn revoke_update(session_id: SessionId) -> Self::RevokeUpdate;
@@ -167,8 +175,8 @@ where
         session_id: SessionId,
         user_id: Self::Id,
         current_refresh_hash: Vec<u8>,
-        idle_deadline_ms: i64,
-        absolute_deadline_ms: i64,
+        idle_deadline: Instant,
+        absolute_deadline: Instant,
         revoked: bool,
     ) -> Self::NewSession;
 
@@ -185,8 +193,8 @@ where
     type PtAccessToken: StoreColumn<Self::ProviderTokens, Text>;
     /// `provider_tokens.refresh_token` (`Nullable<Text>`).
     type PtRefreshToken: StoreColumn<Self::ProviderTokens, Nullable<Text>>;
-    /// `provider_tokens.expires_at_ms` (`Nullable<BigInt>`).
-    type PtExpiresAtMs: StoreColumn<Self::ProviderTokens, Nullable<BigInt>>;
+    /// `provider_tokens.expires_at` (`Nullable<Timestamptz>`).
+    type PtExpiresAt: StoreColumn<Self::ProviderTokens, Nullable<Timestamptz>>;
     /// The insertable new-provider-token row.
     type NewProviderToken: Send;
     /// The opaque `provider_tokens.session_id = ?` predicate.
@@ -202,7 +210,7 @@ where
         issuer: String,
         access_token: String,
         refresh_token: Option<String>,
-        expires_at_ms: Option<i64>,
+        expires_at: Option<Instant>,
     ) -> Self::NewProviderToken;
 }
 
@@ -234,8 +242,8 @@ macro_rules! connetto_auth_tables {
                 session_id -> diesel::sql_types::Uuid,
                 user_id -> $id_sql,
                 current_refresh_hash -> diesel::sql_types::Binary,
-                idle_deadline_ms -> diesel::sql_types::BigInt,
-                absolute_deadline_ms -> diesel::sql_types::BigInt,
+                idle_deadline -> diesel::sql_types::Timestamptz,
+                absolute_deadline -> diesel::sql_types::Timestamptz,
                 revoked -> diesel::sql_types::Bool,
             }
         }
@@ -247,7 +255,7 @@ macro_rules! connetto_auth_tables {
                 issuer -> diesel::sql_types::Text,
                 access_token -> diesel::sql_types::Text,
                 refresh_token -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-                expires_at_ms -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                expires_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
             }
         }
 
@@ -258,8 +266,8 @@ macro_rules! connetto_auth_tables {
             session_id: $crate::SessionId,
             user_id: $id,
             current_refresh_hash: Vec<u8>,
-            idle_deadline_ms: i64,
-            absolute_deadline_ms: i64,
+            idle_deadline: $crate::authn::schema::Instant,
+            absolute_deadline: $crate::authn::schema::Instant,
             revoked: bool,
         }
 
@@ -271,7 +279,7 @@ macro_rules! connetto_auth_tables {
             issuer: String,
             access_token: String,
             refresh_token: Option<String>,
-            expires_at_ms: Option<i64>,
+            expires_at: Option<$crate::authn::schema::Instant>,
         }
 
         /// The default connetto auth schema over the developer's `Id` type.
@@ -292,16 +300,16 @@ macro_rules! connetto_auth_tables {
                     (
                         connetto_sessions::user_id,
                         connetto_sessions::current_refresh_hash,
-                        connetto_sessions::idle_deadline_ms,
-                        connetto_sessions::absolute_deadline_ms,
+                        connetto_sessions::idle_deadline,
+                        connetto_sessions::absolute_deadline,
                         connetto_sessions::revoked,
                     ),
                 >,
             >;
             type UserId = connetto_sessions::user_id;
             type CurrentRefreshHash = connetto_sessions::current_refresh_hash;
-            type IdleDeadlineMs = connetto_sessions::idle_deadline_ms;
-            type AbsoluteDeadlineMs = connetto_sessions::absolute_deadline_ms;
+            type IdleDeadline = connetto_sessions::idle_deadline;
+            type AbsoluteDeadline = connetto_sessions::absolute_deadline;
             type Revoked = connetto_sessions::revoked;
             type NewSession = ConnettoNewSession;
             type SessionPk = diesel::dsl::Eq<connetto_sessions::session_id, $crate::SessionId>;
@@ -312,7 +320,10 @@ macro_rules! connetto_auth_tables {
                 >,
                 (
                     diesel::dsl::Eq<connetto_sessions::current_refresh_hash, Vec<u8>>,
-                    diesel::dsl::Eq<connetto_sessions::idle_deadline_ms, i64>,
+                    diesel::dsl::Eq<
+                        connetto_sessions::idle_deadline,
+                        $crate::authn::schema::Instant,
+                    >,
                 ),
             >;
             type RevokeUpdate = diesel::helper_types::Update<
@@ -334,8 +345,8 @@ macro_rules! connetto_auth_tables {
                     .select((
                         connetto_sessions::user_id,
                         connetto_sessions::current_refresh_hash,
-                        connetto_sessions::idle_deadline_ms,
-                        connetto_sessions::absolute_deadline_ms,
+                        connetto_sessions::idle_deadline,
+                        connetto_sessions::absolute_deadline,
                         connetto_sessions::revoked,
                     ))
                     .for_update()
@@ -343,7 +354,7 @@ macro_rules! connetto_auth_tables {
             fn rotation_update(
                 session_id: $crate::SessionId,
                 current_refresh_hash: Vec<u8>,
-                idle_deadline_ms: i64,
+                idle_deadline: $crate::authn::schema::Instant,
             ) -> Self::RotationUpdate {
                 use diesel::{ExpressionMethods as _, QueryDsl as _};
                 diesel::update(
@@ -351,7 +362,7 @@ macro_rules! connetto_auth_tables {
                 )
                 .set((
                     connetto_sessions::current_refresh_hash.eq(current_refresh_hash),
-                    connetto_sessions::idle_deadline_ms.eq(idle_deadline_ms),
+                    connetto_sessions::idle_deadline.eq(idle_deadline),
                 ))
             }
             fn revoke_update(session_id: $crate::SessionId) -> Self::RevokeUpdate {
@@ -366,16 +377,16 @@ macro_rules! connetto_auth_tables {
                 session_id: $crate::SessionId,
                 user_id: Self::Id,
                 current_refresh_hash: Vec<u8>,
-                idle_deadline_ms: i64,
-                absolute_deadline_ms: i64,
+                idle_deadline: $crate::authn::schema::Instant,
+                absolute_deadline: $crate::authn::schema::Instant,
                 revoked: bool,
             ) -> Self::NewSession {
                 ConnettoNewSession {
                     session_id,
                     user_id,
                     current_refresh_hash,
-                    idle_deadline_ms,
-                    absolute_deadline_ms,
+                    idle_deadline,
+                    absolute_deadline,
                     revoked,
                 }
             }
@@ -386,7 +397,7 @@ macro_rules! connetto_auth_tables {
             type PtIssuer = connetto_provider_tokens::issuer;
             type PtAccessToken = connetto_provider_tokens::access_token;
             type PtRefreshToken = connetto_provider_tokens::refresh_token;
-            type PtExpiresAtMs = connetto_provider_tokens::expires_at_ms;
+            type PtExpiresAt = connetto_provider_tokens::expires_at;
             type NewProviderToken = ConnettoNewProviderToken;
             type PtPk = diesel::dsl::Eq<connetto_provider_tokens::session_id, $crate::SessionId>;
 
@@ -400,14 +411,14 @@ macro_rules! connetto_auth_tables {
                 issuer: String,
                 access_token: String,
                 refresh_token: Option<String>,
-                expires_at_ms: Option<i64>,
+                expires_at: Option<$crate::authn::schema::Instant>,
             ) -> Self::NewProviderToken {
                 ConnettoNewProviderToken {
                     session_id,
                     issuer,
                     access_token,
                     refresh_token,
-                    expires_at_ms,
+                    expires_at,
                 }
             }
         }

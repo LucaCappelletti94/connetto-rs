@@ -25,7 +25,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 
 diesel::table! {
     orders (id) {
@@ -61,7 +61,7 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await

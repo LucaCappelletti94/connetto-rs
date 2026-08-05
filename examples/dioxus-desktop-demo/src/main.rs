@@ -61,6 +61,12 @@ diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
         quantity -> diesel::sql_types::BigInt,
+        // Postgres holds this as `timestamptz`, which is an absolute instant,
+        // and the replica as the text `datetime('now')` writes, which is UTC.
+        // Both decode to the same instant. The declared type is the naive
+        // `Timestamp` because one `table!` serves both backends here and
+        // diesel's SQLite backend has no `Timestamptz`.
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -70,29 +76,34 @@ diesel::table! {
 struct Order {
     id: Uuid,
     quantity: i64,
+    /// When the row was created, in UTC. The key cannot answer that: a v4 UUID
+    /// is random, so ordering by it is arbitrary. Postgres fills this with
+    /// `now()` and the replica with `datetime('now')`, which is second
+    /// resolution, so two rows made in the same second tie.
+    created_at: chrono::NaiveDateTime,
 }
 
-// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv7())`, so a
+// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
 // local write omits the id and this registered function mints it.
 #[diesel::declare_sql_function]
 extern "SQL" {
-    /// Client-authored primary key: a 16-byte UUID v7 blob.
-    fn uuidv7() -> diesel::sql_types::Binary;
+    /// Client-authored primary key: a 16-byte UUID v4 blob.
+    fn uuidv4() -> diesel::sql_types::Binary;
 }
 
-/// The registrar connetto installs on the replica connection: `uuidv7()` mints
+/// The registrar connetto installs on the replica connection: `uuidv4()` mints
 /// a fresh `rosetta_uuid::Uuid` (the same strongly typed key the `orders`
 /// schema uses on SQLite and Postgres). Nondeterministic, so SQLite calls it
 /// per row instead of folding the DEFAULT to a constant.
-fn uuidv7_functions() -> SqlFunctions {
+fn uuidv4_functions() -> SqlFunctions {
     SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
-        uuidv7_utils::register_nondeterministic_impl(conn, Uuid::utc_v7)
+        uuidv4_utils::register_nondeterministic_impl(conn, Uuid::new_v4)
     }))
 }
 
 /// A positive demo quantity, varied by the wall clock so successive rows
 /// differ. The key is minted separately (the DEFAULT on a local write, an
-/// explicit v7 bind in the backend writer), so quantity is never keyed off
+/// explicit bind in the backend writer), so quantity is never keyed off
 /// the id.
 fn demo_quantity() -> i64 {
     let millis = std::time::SystemTime::now()
@@ -266,10 +277,9 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
 
     // Backend writer: DML straight into Postgres through the SAME typed
     // `orders` schema the frontend live query uses, echoed to every window by
-    // the server's logical replication stream. Postgres `gen_random_uuid()` is
-    // v4, which would break "delete newest via MAX(id)", so the insert mints an
-    // explicit v7 `rosetta_uuid::Uuid`. `on_conflict_do_nothing` keeps
-    // concurrent button presses harmless.
+    // the server's logical replication stream. The insert lets Postgres mint
+    // both the key and `created_at`. `on_conflict_do_nothing` keeps concurrent
+    // button presses harmless.
     let (tx, mut rx) = mpsc::unbounded_channel::<DemoCmd>();
     tokio::spawn(async move {
         use diesel_async::AsyncConnection;
@@ -282,30 +292,32 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
             let run: diesel::QueryResult<()> = match cmd {
                 DemoCmd::Insert => diesel_async::RunQueryDsl::execute(
                     diesel::insert_into(orders::table)
-                        .values((
-                            orders::id.eq(Uuid::utc_v7()),
-                            orders::quantity.eq(demo_quantity()),
-                        ))
+                        .values(orders::quantity.eq(demo_quantity()))
                         .on_conflict_do_nothing(),
                     &mut pg,
                 )
                 .await
                 .map(|_| ()),
-                // The newest row is the one with the greatest v7 id (time-ordered).
                 DemoCmd::DeleteNewest => {
-                    match diesel_async::RunQueryDsl::get_result::<Option<Uuid>>(
-                        orders::table.select(diesel::dsl::max(orders::id)),
+                    // The key is random, so `created_at` is the only thing that
+                    // orders rows. It is second resolution on a row the client
+                    // made, so the id breaks a tie and exactly one row goes.
+                    match diesel_async::RunQueryDsl::get_result::<Uuid>(
+                        orders::table
+                            .select(orders::id)
+                            .order((orders::created_at.desc(), orders::id.desc()))
+                            .limit(1),
                         &mut pg,
                     )
                     .await
                     {
-                        Ok(Some(newest)) => diesel_async::RunQueryDsl::execute(
+                        Ok(newest) => diesel_async::RunQueryDsl::execute(
                             diesel::delete(orders::table.filter(orders::id.eq(newest))),
                             &mut pg,
                         )
                         .await
                         .map(|_| ()),
-                        Ok(None) => Ok(()),
+                        Err(diesel::result::Error::NotFound) => Ok(()),
                         Err(err) => Err(err),
                     }
                 }
@@ -390,7 +402,7 @@ async fn setup_authenticated(
         login: Some(Grant::new(session.access_token)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
 
     let conn = if existing {
@@ -438,7 +450,10 @@ fn app() -> Element {
     let backend = use_context::<Backend>();
     let auth_ctx = use_context::<AuthCtx>();
 
-    let rows = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
+    let rows = use_live::<_, _, Order>(
+        &client,
+        orders::table.order((orders::created_at.asc(), orders::id.asc())),
+    );
     let count = use_live(&client, orders::table.count());
 
     let display_rows: Vec<(Uuid, i64)> = rows

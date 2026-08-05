@@ -25,7 +25,7 @@ fn translate(document: &str, ddl_out: &std::path::Path) {
         .translate_to_sql(
             &Pg2SqliteOptions::default()
                 .with_uuid_representation(UuidRepresentation::Blob)
-                .with_uuid_function_name("uuidv7"),
+                .with_uuid_function_name("uuidv4"),
         )
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");

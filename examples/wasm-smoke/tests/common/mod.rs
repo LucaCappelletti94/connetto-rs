@@ -49,9 +49,8 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         upstream_sub_id: "e42-upstream",
         upstream_query: DEMO_QUERY,
         hub_meta_name: "e42-hub-meta.sqlite",
-        client_id_prefix: "e42-worker",
         schema_version: connetto_wasm_smoke::demo_schema_version(),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
         auth,
         auth_db_name: REFRESH_DB,
     }

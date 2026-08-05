@@ -36,7 +36,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv7_functions};
+use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -45,7 +45,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id: it must match the hub's reconnect
 /// spec so the upstream `NonFatalError` maps to the tab subscriptions reading
@@ -142,7 +142,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
     }
     // Seed one row so the worker replica is non-empty: the tab's own snapshot
     // patch then consumes exactly one credit.
-    send_snapshot(&mut server, rosetta_uuid::Uuid::utc_v7(), 5, 0).await;
+    send_snapshot(&mut server, rosetta_uuid::Uuid::new_v4(), 5, 0).await;
     if trigger.await.is_err() {
         return;
     }
@@ -151,7 +151,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
                 UPSTREAM_SUB.to_owned(),
                 Cursor::new(i.to_be_bytes().to_vec()),
-                insert_payload(rosetta_uuid::Uuid::utc_v7(), 5),
+                insert_payload(rosetta_uuid::Uuid::new_v4(), 5),
             )))
             .await
             .expect("live patch");
@@ -207,7 +207,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
         login: Some(Grant::new(worker_token)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
@@ -243,7 +243,7 @@ async fn hub_enforces_the_per_tab_credit_window() {
     hub.attach(relay_end);
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
-        format!("credits-tab-{base}"),
+        rosetta_uuid::Uuid::new_v4().to_string(),
     )))
     .await
     .expect("tab handshake");

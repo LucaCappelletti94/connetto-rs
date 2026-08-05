@@ -184,9 +184,9 @@ struct TabState {
     /// Sequence number announced by a `MutationHeader`, awaiting its bulk
     /// patchset frame.
     pending_write: Option<u64>,
-    /// The client id from the tab's handshake, keying its durable mutation
-    /// watermark in the hub meta schema.
-    client_id: String,
+    /// The tab's own id, set by its handshake, keying its durable mutation
+    /// watermark. Absent until the handshake, never a stand-in value.
+    client_id: Option<rosetta_uuid::Uuid>,
     /// Highest tab sequence applied to the worker replica for this client
     /// id, from the hub meta schema at handshake and advanced per apply. A
     /// replayed sequence at or below it is re-acknowledged, never
@@ -222,13 +222,26 @@ impl From<diesel::result::Error> for TabApplyError {
 /// ATTACHED schema: the worker's capture session tracks only `main`, so
 /// watermark writes never ride the worker's own uploads.
 const HUB_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_hub._tab_mutations \
-    (client_id TEXT NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
+    (client_id BLOB NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
 /// DDL for the local tier's durable per-tab mutation watermark. It lives
 /// in the tier database itself so it advances in the same transaction as
 /// the apply, mirroring the server's `_connetto_mutations` design.
 const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_tab_mutations \
-    (client_id TEXT NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
+    (client_id BLOB NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
+
+/// Typed schema for the local tier watermark table. The hub meta watermark
+/// lives in `connetto_hub._tab_mutations` (an ATTACHED schema), which
+/// `diesel::table!` does not model for SQLite, so only this table gets the
+/// typed declaration and the typed DSL; the hub meta queries use `sql_query`.
+mod local_schema {
+    diesel::table! {
+        _connetto_tab_mutations (client_id) {
+            client_id -> rosetta_uuid::sql_types::Uuid,
+            last_seq -> diesel::sql_types::BigInt,
+        }
+    }
+}
 
 /// One registered tab subscription and the tables its query reads.
 struct TabSub {
@@ -642,7 +655,7 @@ where
                         handshaken: false,
                         subs: Vec::new(),
                         pending_write: None,
-                        client_id: String::new(),
+                        client_id: None,
                         applied_watermark: None,
                         local_watermark: None,
                         credits: INITIAL_CREDITS,
@@ -925,11 +938,15 @@ where
             if tab.handshaken {
                 return Err(TabFault::Close("second handshake".to_owned()));
             }
+            let client_uuid = handshake
+                .client_id
+                .parse::<rosetta_uuid::Uuid>()
+                .map_err(|_| TabFault::Close("client_id is not a valid UUID".to_owned()))?;
             tab.handshaken = true;
-            tab.client_id.clone_from(&handshake.client_id);
-            tab.applied_watermark = tab_watermark(worker, &handshake.client_id)?;
+            tab.client_id = Some(client_uuid);
+            tab.applied_watermark = tab_watermark(worker, client_uuid)?;
             tab.local_watermark = match state.local.as_mut() {
-                Some(local) => local_tab_watermark(local, &handshake.client_id)?,
+                Some(local) => local_tab_watermark(local, client_uuid)?,
                 None => None,
             };
             // The hub handles a tab's mutations in order and each lands in
@@ -1103,7 +1120,12 @@ fn handle_local_mutation(
         let Some(tab) = state.tabs.get(&id) else {
             return Ok(());
         };
-        (tab.client_id.clone(), tab.out.clone(), tab.local_watermark)
+        // A mutation frame is only accepted after the handshake, which is what
+        // sets the id, so no id means a tab that cannot be keyed.
+        let Some(client_id) = tab.client_id else {
+            return Ok(());
+        };
+        (client_id, tab.out.clone(), tab.local_watermark)
     };
     if watermark.is_some_and(|watermark| tab_seq <= watermark) {
         // Already applied to the tier by an earlier delivery. The hub is
@@ -1124,14 +1146,21 @@ fn handle_local_mutation(
     let applied = local.conn.transaction::<_, TabApplyError, _>(|conn| {
         conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
             .map_err(|err| TabApplyError::Apply(err.to_string()))?;
-        diesel::sql_query(
-            "INSERT INTO _connetto_tab_mutations (client_id, last_seq) VALUES (?, ?) \
-             ON CONFLICT (client_id) DO UPDATE SET \
-             last_seq = MAX(last_seq, excluded.last_seq)",
-        )
-        .bind::<diesel::sql_types::Text, _>(&client_id)
-        .bind::<diesel::sql_types::BigInt, _>(seq)
-        .execute(conn)?;
+        {
+            use local_schema::_connetto_tab_mutations::dsl as wm;
+            // MAX(a, b) as a 2-arg scalar is not in diesel's aggregate DSL;
+            // raw fragment used only for that one update expression.
+            diesel::insert_into(wm::_connetto_tab_mutations)
+                .values((wm::client_id.eq(client_id), wm::last_seq.eq(seq)))
+                .on_conflict(wm::client_id)
+                .do_update()
+                .set(
+                    wm::last_seq.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                        "MAX(last_seq, excluded.last_seq)",
+                    )),
+                )
+                .execute(conn)?;
+        }
         Ok(())
     });
     match applied {
@@ -1197,11 +1226,10 @@ where
         let Some(tab) = state.tabs.get(&id) else {
             return Ok(());
         };
-        (
-            tab.client_id.clone(),
-            tab.out.clone(),
-            tab.applied_watermark,
-        )
+        let Some(client_id) = tab.client_id else {
+            return Ok(());
+        };
+        (client_id, tab.out.clone(), tab.applied_watermark)
     };
     if watermark.is_some_and(|watermark| tab_seq <= watermark) {
         // Already applied to the replica by an earlier delivery. The worker
@@ -1220,12 +1248,14 @@ where
     let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
         conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
             .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+        // sql_query is kept because connetto_hub._tab_mutations is in an
+        // ATTACHED schema that diesel's table! macro does not model for SQLite.
         diesel::sql_query(
             "INSERT INTO connetto_hub._tab_mutations (client_id, last_seq) VALUES (?, ?) \
              ON CONFLICT (client_id) DO UPDATE SET \
              last_seq = MAX(last_seq, excluded.last_seq)",
         )
-        .bind::<diesel::sql_types::Text, _>(&client_id)
+        .bind::<rosetta_uuid::diesel_impls::Uuid, _>(client_id)
         .bind::<diesel::sql_types::BigInt, _>(seq)
         .execute(conn)?;
         Ok(())
@@ -1726,12 +1756,14 @@ fn changeset_tables(bytes: &[u8]) -> Result<HashSet<String>, RelayError> {
 /// attached hub meta schema.
 fn tab_watermark<U>(
     worker: &mut ConnettoConnection<U>,
-    client_id: &str,
+    client_id: rosetta_uuid::Uuid,
 ) -> Result<Option<u64>, RelayError>
 where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    // sql_query is kept here because connetto_hub._tab_mutations lives in an
+    // ATTACHED schema that diesel's table! macro does not model for SQLite.
     #[derive(diesel::QueryableByName)]
     struct WatermarkRow {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -1739,7 +1771,7 @@ where
     }
     let rows: Vec<WatermarkRow> =
         diesel::sql_query("SELECT last_seq FROM connetto_hub._tab_mutations WHERE client_id = ?")
-            .bind::<diesel::sql_types::Text, _>(client_id)
+            .bind::<rosetta_uuid::diesel_impls::Uuid, _>(client_id)
             .load(worker.conn())?;
     Ok(rows
         .into_iter()
@@ -1748,20 +1780,17 @@ where
 }
 
 /// The local tier's durable watermark for one tab client id, if any.
-fn local_tab_watermark(local: &mut LocalTier, client_id: &str) -> Result<Option<u64>, RelayError> {
-    #[derive(diesel::QueryableByName)]
-    struct WatermarkRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        last_seq: i64,
-    }
-    let rows: Vec<WatermarkRow> =
-        diesel::sql_query("SELECT last_seq FROM _connetto_tab_mutations WHERE client_id = ?")
-            .bind::<diesel::sql_types::Text, _>(client_id)
-            .load(&mut local.conn)?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| u64::try_from(row.last_seq).ok()))
+fn local_tab_watermark(
+    local: &mut LocalTier,
+    client_id: rosetta_uuid::Uuid,
+) -> Result<Option<u64>, RelayError> {
+    use local_schema::_connetto_tab_mutations::dsl as wm;
+    let result = wm::_connetto_tab_mutations
+        .filter(wm::client_id.eq(client_id))
+        .select(wm::last_seq)
+        .first::<i64>(&mut local.conn)
+        .optional()?;
+    Ok(result.and_then(|v| u64::try_from(v).ok()))
 }
 
 /// The worker's resume cursor, or an empty placeholder before the first

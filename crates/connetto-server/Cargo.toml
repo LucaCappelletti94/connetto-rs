@@ -30,7 +30,11 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d02
 # listener and close every live session with ServerShuttingDown.
 tokio = { workspace = true, features = ["signal"] }
 thiserror.workspace = true
-diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid"] }
+diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid", "chrono"] }
+# Session deadlines and provider-token expiries are zone-aware timestamp columns,
+# and diesel maps those to chrono rather than to `std::time::SystemTime`, which it
+# only offers for a zone-less timestamp. Already in the build through subql.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Naming the Postgres dialect when building subql's catalog and engine, and the
 # visitor pass that substitutes subscription bind placeholders in the parsed
 # statement. Version and rev follow subql via the root [patch] blocks.
@@ -101,10 +105,9 @@ connetto-core = { workspace = true, features = ["test-support"] }
 # The refused-grant assertion reads the log back through its own writer, which
 # means naming the destination's own trait.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
-# Minting a local ID token to verify the provider path offline, and timestamp
-# primary keys in the Docker-gated RLS test (both are normal deps too).
+# Minting a local ID token to verify the provider path offline. `chrono` is a
+# normal dependency now, so the RLS test's timestamp keys need no entry here.
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
-chrono = "0.4"
 # Driving the axum auth router without a socket in the Docker-free auth test.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

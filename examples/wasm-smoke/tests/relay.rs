@@ -34,7 +34,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// only in the worker replica and the tab mirrors, giving the routing tests a
 /// second table the server never sees.
 const SQLITE_DDL: &str = "\
-CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;\
+CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;\
 CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
@@ -87,7 +87,7 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await
@@ -185,11 +185,11 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     hub.attach(relay_end);
 
     let config = ClientConfig {
-        client_id: format!("relay-tab-{base}"),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
@@ -276,11 +276,11 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     stage("hub attached");
 
     let config = ClientConfig {
-        client_id: format!("port-tab-{base}"),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let mut tab = ConnettoConnection::connect(
         PortTransport::new(channel.port2()),

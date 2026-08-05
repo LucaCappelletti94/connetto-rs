@@ -44,7 +44,7 @@ diesel::table! {
 
 fn config() -> ClientConfig {
     ClientConfig {
-        client_id: "e43".to_owned(),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(connetto_client::Grant::new("user:tester")),
         capabilities: Vec::new(),
         schema_version: None,

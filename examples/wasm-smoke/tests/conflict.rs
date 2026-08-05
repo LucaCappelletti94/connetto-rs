@@ -28,7 +28,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv7_functions};
+use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use wasm_bindgen_futures::spawn_local;
@@ -36,7 +36,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id.
 const UPSTREAM_SUB: &str = "db-upstream";
@@ -194,7 +194,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     // Generate the seeded row id up front so both the fake upstream and the
     // conflicting tab write reference the exact same 16 bytes. The conflict
     // requires an identical PK on both sides.
-    let seeded_id = rosetta_uuid::Uuid::utc_v7();
+    let seeded_id = rosetta_uuid::Uuid::new_v4();
 
     // The worker's upstream is a fake server driven frame by frame.
     let (worker_up, fake_up) = loopback();
@@ -206,7 +206,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
@@ -230,11 +230,11 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
     let tab_config = ClientConfig {
-        client_id: format!("conflict-tab-{base}"),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let mut tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)

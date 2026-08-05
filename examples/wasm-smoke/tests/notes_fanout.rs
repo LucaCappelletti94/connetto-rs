@@ -20,7 +20,7 @@ mod common;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
-use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv7_functions};
+use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv4_functions};
 use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -109,7 +109,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -190,13 +190,13 @@ async fn local_tier_notes_fan_out_across_tabs() {
     await_db_worker_ready().await;
     stage("db worker ready");
 
-    let client_a = format!("notes-tab-a-{base}");
+    let client_a = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_a = locks::hold_lock(&locks::tab_lock_name(&client_a)).await;
     let mut tab_a = connect_tab(&client_a).await;
     subscribe_notes(&mut tab_a, "tab-a-notes").await;
     stage("tab a subscribed");
 
-    let client_b = format!("notes-tab-b-{base}");
+    let client_b = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_b = locks::hold_lock(&locks::tab_lock_name(&client_b)).await;
     let mut tab_b = connect_tab(&client_b).await;
     subscribe_notes(&mut tab_b, "tab-b-notes").await;
@@ -226,7 +226,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
 
     // A tab connecting later: the note reaches it through the hub's local
     // snapshot leg, served from the durable tier file.
-    let client_c = format!("notes-tab-c-{base}");
+    let client_c = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_c = locks::hold_lock(&locks::tab_lock_name(&client_c)).await;
     let mut tab_c = connect_tab(&client_c).await;
     subscribe_notes(&mut tab_c, "tab-c-notes").await;

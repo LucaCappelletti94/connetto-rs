@@ -99,7 +99,7 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let conn = connect(&config, Some(REPLICA_DDL)).await;
 

@@ -76,7 +76,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
@@ -98,7 +98,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     hub.attach(relay_end);
     tab.send_control(ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
-        format!("handshake-tab-{base}"),
+        rosetta_uuid::Uuid::new_v4().to_string(),
     )))
     .await
     .expect("tab handshake");

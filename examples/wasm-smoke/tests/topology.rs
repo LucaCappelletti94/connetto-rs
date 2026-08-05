@@ -103,7 +103,7 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> 
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -125,7 +125,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -232,7 +232,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
 
     // Tab A holds its liveness lock BEFORE connecting, the protocol the
     // reaper requires.
-    let client_a = format!("tab-a-{base}");
+    let client_a = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_a = locks::hold_lock(&locks::tab_lock_name(&client_a)).await;
     let mut tab_a = connect_tab(&client_a).await;
     stage("tab a connected");
@@ -248,7 +248,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     stage("tab a snapshot verified");
 
     // A second tab client into the SAME DB worker.
-    let client_b = format!("tab-b-{base}");
+    let client_b = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_b = locks::hold_lock(&locks::tab_lock_name(&client_b)).await;
     let mut tab_b = connect_tab(&client_b).await;
     tab_b

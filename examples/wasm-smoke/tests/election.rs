@@ -96,7 +96,7 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -203,7 +203,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
 
     // The tab reconnects through the factory: fresh wire channel per attempt,
     // dead-worker detection through the alive lock.
-    let client_id = format!("election-tab-{base}");
+    let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
     announce_tab(&wire).await;
@@ -214,7 +214,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let conn = ConnettoConnection::connect(
         transport,

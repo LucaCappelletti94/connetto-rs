@@ -32,7 +32,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv7_functions};
+use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
 use connetto_web::relay::HubReconnect;
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -42,7 +42,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv7()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
+const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id: it must match the hub's reconnect
 /// spec so the resync fan-out maps it to the affected tab subscriptions.
@@ -213,8 +213,8 @@ async fn full_resync_is_relay_transparent() {
 
     // Generate UUIDs for both rows up front so the fake upstream and the
     // post-resync assertion reference the exact same values. rosetta_uuid::Uuid is Copy.
-    let doomed_id = rosetta_uuid::Uuid::utc_v7();
-    let survivor_id = rosetta_uuid::Uuid::utc_v7();
+    let doomed_id = rosetta_uuid::Uuid::new_v4();
+    let survivor_id = rosetta_uuid::Uuid::new_v4();
 
     // The worker's upstream is a fake server we drive frame by frame.
     let (worker_up, fake_up) = loopback();
@@ -226,7 +226,7 @@ async fn full_resync_is_relay_transparent() {
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
@@ -260,11 +260,11 @@ async fn full_resync_is_relay_transparent() {
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
     let tab_config = ClientConfig {
-        client_id: format!("resync-tab-{base}"),
+        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
         login: Some(Grant::new(common::mint_token().await)),
         capabilities: Vec::new(),
         schema_version: None,
-        sql_functions: uuidv7_functions(),
+        sql_functions: uuidv4_functions(),
     };
     let mut tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
@@ -277,8 +277,8 @@ async fn full_resync_is_relay_transparent() {
         matches!(event, ClientEvent::SnapshotEnd { .. })
     })
     .await;
-    // Two uuidv7 ids generated in rapid succession differ only in random low
-    // bytes, so their sort order is unpredictable. Use set membership.
+    // A version 4 id is entirely random, so two of them have no meaningful
+    // order at all. Use set membership.
     let pre_ids: std::collections::HashSet<rosetta_uuid::Uuid> =
         load_orders(&mut tab).into_iter().map(|o| o.id).collect();
     assert!(

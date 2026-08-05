@@ -118,7 +118,7 @@ pub async fn connect_tab(client_id: &str, token: String) -> ConnettoConnection<B
         login: Some(Grant::new(token)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -145,7 +145,7 @@ pub async fn connect_server(
         login: Some(Grant::new(token)),
         capabilities: Vec::new(),
         schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv7_functions(),
+        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     ConnettoConnection::connect(
         transport,
@@ -296,7 +296,7 @@ impl ParityFixture {
 
         // The relay tab client: holds its liveness lock before connecting, the
         // protocol the hub's reaper requires.
-        let client_id = format!("parity-tab-{base}");
+        let client_id = rosetta_uuid::Uuid::new_v4().to_string();
         let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
         let mut relay = connect_tab(&client_id, relay_token).await;
         relay
