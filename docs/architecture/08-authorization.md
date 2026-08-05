@@ -295,7 +295,12 @@ And a refused write must **not** be reported as unauthorized. Rejecting it that 
 
 ```sql
 CREATE TYPE connetto_auth_op AS ENUM (
-    'permission_change', 'session_revoked', 'model_change', 'banned', 'ban_lifted'
+    -- a login ended, and why matters more than the fact
+    'logged_out', 'session_revoked', 'token_replayed',
+    -- authorization
+    'capability_minted', 'permission_change', 'model_change',
+    -- abuse response
+    'banned', 'ban_lifted'
 );
 
 CREATE TABLE auth_events (
@@ -305,7 +310,6 @@ CREATE TABLE auth_events (
     op         connetto_auth_op NOT NULL,
     table_name TEXT,
     pk         BYTEA,
-    allowed    BOOLEAN NOT NULL,
     reason     TEXT
 );
 ```
@@ -318,9 +322,13 @@ CREATE TABLE auth_events (
 
 `op` is a Postgres enum type rather than text with the legal values written in a comment. The values are a closed set, connetto's own side is a Rust enum, and the point of a typed contract is that a value outside the set cannot be written by either end. A comment enumerating the legal values is a check nothing performs.
 
+**A login ending is three values, not one, decided 2026-08-05.** An earlier version had a single `session_revoked`, and the code has three quite different reasons a login dies: `logged_out` is the caller ending it themselves through the logout endpoint, `session_revoked` is the embedding application calling `AuthService::revoke` for its own reasons, and `token_replayed` is the theft defence in `rotate_refresh` noticing a rotated-out refresh token being presented and killing the session. Collapsed into one value the table cannot tell an ordinary logout from a stolen credential, which is the single most interesting thing it could report. The information exists at the moment the row is written and was simply being discarded. A closed set of causes belongs in the type rather than in prose, the same call this project made for the oplog verb.
+
+**`capability_minted` was added 2026-08-05** for the successful share mint R13 records. It had no value to write itself as: the mint is connetto's own act of issuing a key, whereas `permission_change` belongs to the grant-change watcher in R7, and collapsing them would have erased the distinction and left one value meaning two things produced by two phases. `table_name` and `pk` name the shared row, which is what those two nullable columns are for.
+
 **`banned` and `ban_lifted` were added on 2026-08-05**, for R36, which bans an identity when a caller repeatedly names something and is told no. A ban is a rare change to who can reach what, which is this table's definition, and it belongs here rather than only in R36's own ban table because that table holds current state with an expiry while this one is the append-only history, so an expired or lifted ban would otherwise leave no trace. **This is not a denial arriving after all**: the refusals that led to the ban still go to the log, one per attempt, and what is recorded here is the single durable decision they produced.
 
-`allowed` is `BOOLEAN`, replacing a `decision TEXT` holding one of two words. **Its presence is worth questioning rather than only its type**: denials do not come here by the split above, so every row would carry `true`, which is the shape of a column that is written and never read. The two ban values do not change that, since imposing and lifting are both changes that happened. R13 settles whether it survives.
+**`allowed` is deleted, decided 2026-08-05.** It was `BOOLEAN NOT NULL`, itself already a correction of a `decision TEXT` holding one of two words. Every value in `op` names something that happened, denials never reach this table by the split above, and imposing or lifting a ban are both changes that occurred, so the column read `true` on every row forever. A column written and never read is noise, and worse, its presence implied refusals were recorded here, which is the exact misreading the split exists to prevent. `reason` stays and carries what varies.
 
 `table_name` stays text and `pk` stays bytes. A table name in an audit row is read by a person, so the catalog id it corresponds to would be both unreadable and unstable across a catalog change, and a primary key here is opaque bytes by construction. Both are nullable, because an invalidated login names neither.
 

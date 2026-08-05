@@ -707,15 +707,21 @@ All of the above pass. A single-grant shape is not representable. No `session_id
 
 ### Decided before execution, 2026-08-04
 
-**Only one of the three event kinds has a producer, and the phase records what exists rather than waiting.** The `op` column names `permission_change`, `session_revoked` and `model_change`. Session invalidation has two producers today, `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs`) behind both logout and an explicit revoke, and the stolen-token defence that revokes on reuse inside `DbAuthStore::rotate_refresh` (`authn/store.rs`). A permission change is noticed by the grant-change watcher, which is R7 and unbuilt. A model change needs an authorization model, which is R5b and unbuilt.
+**Only some event kinds have a producer, and the phase records what exists rather than waiting.** Three do: the logout endpoint and the embedding application's own `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs`), and the theft defence in `DbAuthStore::rotate_refresh` (`authn/store.rs`). A permission change is noticed by the grant-change watcher, which is R7 and unbuilt. A model change needs an authorization model, which is R5b and unbuilt. A ban comes from R36, which is unbuilt and depends on this phase.
 
 **So this phase also records a successful share mint**, which is the one thing connetto itself does today that changes who can reach something. That is arguable and the maintainer took it deliberately: the permission is really the row the application writes afterwards, which connetto never sees, so what is recorded is connetto's own act of minting rather than the grant landing. Its cost is that `CapabilityIssuer` gains a fifth collaborator to write with. **Recording only the two invalidations was considered and rejected**, because the table would then carry nothing at all from the authorization half of the system, which is half of what it was specified for. **Waiting for R7 and R5b was considered and rejected**, because the phase exists precisely so this one contract does not arrive in pieces across five phases.
 
-**The shape is the corrected one in `08-authorization.md`**, retyped on 2026-08-04: `at TIMESTAMPTZ`, `session UUID`, `user_id` as the deployment's own id type, `op` as a Postgres enum rather than text, `allowed BOOLEAN`, and nullable `table_name` and `pk`. **Question `allowed` before building it**: denials do not come to this table by the split, so every row would carry `true`, which is a column written and never read.
+**The shape is in `08-authorization.md`**, retyped on 2026-08-04 and settled on 2026-08-05: `at TIMESTAMPTZ`, `session UUID`, `user_id` as the deployment's own id type, `op` as a Postgres enum rather than text, nullable `table_name`, `pk` and `reason`.
 
-**Decided 2026-08-05: a fourth kind, for a ban being imposed or lifted.** R36 bans an identity, which is a rare change to who can reach what, so it is this table's definition exactly. It is recorded here rather than left to R36's own ban table because that table holds current state with an expiry, while this one is the append-only history, and an expired or lifted ban would otherwise leave no trace. It goes in now rather than when R36 arrives, because R13 exists precisely so this contract does not accumulate one producer at a time. **R36 depends on this**, so the two are linked in the graph.
+**Decided 2026-08-05, three changes to the event kinds, and the `op` enum is now eight values.**
 
-**That does not revive `allowed`.** A ban imposed and a ban lifted are both changes that happened, so both carry `true`, exactly like the other kinds. The column's fate is unchanged by the addition.
+1. **A login ending is three values, not one.** `logged_out` for the logout endpoint, `session_revoked` for the embedding application calling `AuthService::revoke` itself, and `token_replayed` for the theft defence. As one value the table cannot distinguish an ordinary logout from a stolen credential, which is the most interesting thing it could report, and the information is present at the moment the row is written. A closed set of causes belongs in the type, the same call made for the oplog verb.
+2. **The share mint gets `capability_minted`.** It previously had no value to write itself as, which was a hole: the 2026-08-04 decision to record mints named no `op` for them, and `permission_change` belongs to R7's grant-change watcher. Reusing that value would have left one value meaning two things from two phases, and erased the distinction the 2026-08-04 decision rests on.
+3. **`allowed` is deleted.** Every value in `op` names something that happened, denials never arrive by the split, and a ban imposed or lifted are both changes that occurred, so it read `true` on every row forever. Its presence also implied refusals were recorded here, the exact misreading the split prevents. `reason` already existed and carries what varies.
+
+**And `banned` and `ban_lifted`, for R36.** A ban is a rare change to who can reach what, so it is this table's definition exactly, and it is recorded here rather than only in R36's ban table because that table holds current state with an expiry while this one is the append-only history. It goes in now rather than when R36 arrives, because R13 exists precisely so this contract does not accumulate one producer at a time. **R36 depends on this**, so the two are linked in the graph.
+
+**A defect found while checking the producers, fixed on 2026-08-05 before this phase started.** The theft defence revoked inside the store, one layer below the revocation observer, and `AuthStoreError::Reuse` was a unit variant carrying no session id, so `AuthService::refresh` had nothing to close. A logout closed the live connection and a detected stolen token did not, which is backwards. `Reuse` now names its session and every revocation path fires the observer through one private `notify_revoked`. It landed on its own rather than inside this phase, so it is revertable alone.
 
 ### Purpose
 
@@ -726,17 +732,17 @@ Authentication and authorization state changes (permission changes, session inva
 1. **It is a deployment-facing schema contract, so it needs a schema trait**, beside `ConnettoStoreSchema` in `crates/connetto-server/src/authn/schema.rs` and `ConnettoWatermarkSchema` in `crates/connetto-server/src/watermark_schema.rs`, with the convenience macro those two already establish. connetto emits **zero** server DDL, so the deployment owns the table and connetto owns only the shape it requires.
 2. Follow the column list in `docs/architecture/08-authorization.md`, which is the specification and was retyped for this phase.
 3. **State changes only.** Denials do not go here at any volume, because a caller probing keys generates one per attempt and this table is not a firehose.
-4. Emit from every producer that exists: the two session invalidations, and the share mint. Name the two absent kinds and the phases that create them, in the phase's own record, so their absence reads as sequencing rather than oversight.
+4. Emit from every producer that exists: the three ways a login ends, each writing its own value, and the share mint. Name the absent kinds and the phases that create them, in the phase's own record, so their absence reads as sequencing rather than oversight.
 
 ### Proof
 
-A state change of **each kind that has a producer** reaches the table and is queryable: a logout, a stolen-token revocation, and a share mint. The earlier wording asked for each of the three kinds, which no amount of work in this phase can satisfy, since two of them have nothing that creates them. That is the same error R12 made and had to be split over.
+A state change of **each kind that has a producer** reaches the table and is queryable, and **the three ways a login ends are distinguishable in the row**: an ordinary logout writes `logged_out`, an application's own revoke writes `session_revoked`, and a replayed refresh token writes `token_replayed`. That last assertion is the point of the split, since telling a stolen credential from a user clicking log out is the most valuable thing the table does. A share mint writes `capability_minted` and names the row it shared. The earlier wording asked for each of the three original kinds, which no amount of work in this phase can satisfy, since some have nothing that creates them. That is the same error R12 made and had to be split over.
 
 A denial does **not** reach it, asserted rather than assumed, because that is the half of the split a future change is most likely to break.
 
 ### Done when
 
-The trait and macro exist beside the other two, a deployment can create the table from the documented shape, every producer that exists emits through it, the two that do not exist are named against their phases, and the denial exclusion is pinned by a test.
+The trait and macro exist beside the other two, a deployment can create the table from the documented shape, every producer that exists emits through it with its own `op` value, the kinds that do not exist are named against their phases, and the denial exclusion is pinned by a test.
 
 ### Why it is one phase rather than a step inside several
 
