@@ -65,9 +65,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 6 | ~~R12 part B, the refused-grant line~~ **DONE** | Rode with R3, the phase that created the silence it covers. It could not be proven earlier, because a refused credential was announced on the wire until then |
 | 7 | ~~R4~~ **DONE** | Needed R3, which is what makes a checked grant resolve to a subject that is not a person |
 | 8 | R13 | Needs R3. Off the critical path, so it may slip later without blocking anything |
-| 8 | R22 | Blocked on nothing, and it should land before R19 because it shrinks what throttling must defend against |
+| done | ~~R22~~ **DELETED** | The compile-time query set. Deleted 2026-08-05: a curated set of permitted queries is refused on principle, since authorization is row-level security, OpenFGA and roles. Its leak moved to R19, its cost concern to R19, its compilation requirement to R27 |
 | 9 | R19 | Needs R2 for the session handle it counts against, and R3 so the anonymous tier is representable |
-| 10 | R5a | Waits on `upstream-subql-visibility-trait.md` landing upstream. Not on rls2fga |
+| 9 | R36 | Needs R19's counters. Nothing reacts to *what* a caller asked for, only to how much, so a prober under the rate limits is unopposed |
+| any | R37 | Needs R36, which establishes the configuration style by being the first to use it. Consistency work, so it slots wherever it is wanted |
+| 10 | ~~R5a~~ **DONE** | Waited on `upstream-subql-visibility-trait.md` landing upstream, which it did at subql `8e9b2df`. Not on rls2fga |
 | 11 | R0 part B, the full measurement | Needs R5a's seam to measure through |
 | 12 | R5b | Needs R5a, R0, the rls2fga per-row mapping, and `upstream-subql-per-row-visibility.md` on top of it |
 | 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. The bulk frame decision it once had to settle before R3 shipped is settled, recorded under its inputs section |
@@ -75,13 +77,17 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R6. R4 is done |
 | 17 | R9 | Needs R5b |
-| 18 | R27 | Needs R6 for the incremental move-in and move-out, and R22 because the filter is compiled and compilation needs the query set known in advance. Buildable before R6 only in a form that resyncs on every dependency change |
-| any | R28 | A defect, blocked on nothing. Silent data loss on every fresh subscription, so it outranks everything discretionary |
+| 18 | R27 | Needs R6 for the incremental move-in and move-out, and a subql change. Compiling the filter needs the query set known in advance, which R27 now establishes for itself since R22 is deleted. Buildable before R6 only in a form that resyncs on every dependency change |
+| done | R28 part A | **DONE 2026-08-03.** The route now precedes the snapshot read. Its step 2, the client-side discard rule, was dropped after measuring that it loses data, and the overlap is re-applied instead |
+| any | R28 part B | The two aggregate subscribe paths, read and excluded by part A. An ordering question rather than a demonstrated defect, so it follows part A and may conclude nothing needs changing |
+| any | R33 | Found while reading the same function for R28 part A, and separated because the cause and the consequence both differ. Reasoned, not demonstrated, so its first step is to demonstrate it |
 | any | R29 | A defect plus its missing mechanism, blocked on nothing. Two subscriptions over one table lose each other's rows today, and R15 cannot be built without what this delivers |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
 | any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it |
+| any | R34 | Blocked on nothing. R5a put the write question on the same seam as the read one, so this is the mint call learning to ask it |
+| done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
 | any | R17 | A defect, blocked on nothing. Land it whenever, and before anything else relies on the local tier |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
@@ -107,21 +113,27 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R12 part B, the refused-grant line | **DONE** | nothing, landed with R3 | no |
 | R4 capabilities | **DONE** | nothing, R3 was done | no |
 | R13 `auth_events` audit table | NOT STARTED | nothing, R3 is done | no |
-| R22 compile-time query set | NOT STARTED | nothing | no |
+| ~~R22 compile-time query set~~ | **DELETED** (2026-08-05) | n/a | no |
 | R19 request throttling | NOT STARTED | nothing, R2 and R3 are done | no |
-| R5a visibility seam | NOT STARTED | `upstream-subql-visibility-trait.md`, the seam only | **yes, subql (the trait)** |
-| R0 part B, full measurement | NOT STARTED | R5a | yes, via R5a |
-| R5b service as executor | NOT STARTED | R5a, R0, rls2fga, then `upstream-subql-per-row-visibility.md` | **yes, rls2fga then subql (per-row)** |
+| R36 abuse detection and identity bans | NOT STARTED | R19 | no |
+| R37 one configuration style | NOT STARTED | R36 | no |
+| R5a visibility seam | **DONE** (2026-08-04) | nothing, the trait landed upstream at subql `8e9b2df` and the pin is past it | landed |
+| R0 part B, full measurement | NOT STARTED | nothing, R5a is done | landed with R5a |
+| R5b service as executor | NOT STARTED | R0, rls2fga, then `upstream-subql-per-row-visibility.md`. R5a is done | **yes, rls2fga then subql (per-row)** |
 | R16 part A, fan-out research | **DONE** | nothing | no |
 | R16 part B, the fan-out architecture | NOT STARTED | R0 (the bulk-frame decision is settled, see the section) | no |
 | R14 dispatch-loop cost | NOT STARTED | R0 and R5b, conditional on R0's data | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R6, R4 is done | inherited |
 | R9 permissive policy out of tests | NOT STARTED | R5b | inherited |
+| R34 a write-level share | NOT STARTED | nothing, R5a put the write question on the same seam | no |
+| R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
 | R26 local data export | NOT STARTED | nothing | no |
-| R27 membership term in the subscription language | NOT STARTED | R6, R22, and a subql change | **yes, subql** |
-| R28 subscribe-time delivery gap | NOT STARTED | nothing | no |
+| R27 membership term in the subscription language | NOT STARTED | R6 and a subql change | **yes, subql** |
+| R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
+| R28 part B, the aggregate subscribe paths | NOT STARTED | nothing, follows part A | no |
+| R33 completion frame overtakes its data | NOT STARTED | nothing | no |
 | R29 client-side coverage | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | NOT STARTED | nothing | no |
@@ -149,7 +161,9 @@ graph TD
   R3 --> R19[R19 request throttling]
   R3 --> R12B[R12 part B refused-grant line, DONE]
   R2 --> R19
-  R22[R22 compile-time query set] -.->|should land first| R19
+  R19 --> R36[R36 abuse detection and identity bans]
+  R13 --> R36
+  R36 --> R37[R37 one configuration style]
   R0A[R0 part A, connetto-only counters, DONE]
   R5a[R5a visibility seam] --> R0B[R0 part B, full measurement]
   R5a --> R5b[R5b service as executor]
@@ -182,8 +196,8 @@ graph TD
   R26[R26 local data export]
   R6 --> R27[R27 membership term in the subscription language]
   U4[upstream: subql subquery membership term] --> R27
-  R22 --> R27
-  R28[R28 subscribe-time delivery gap]
+  R28[R28 part A subscribe-time delivery gap] --> R28B[R28 part B aggregate subscribe paths]
+  R33[R33 completion frame overtakes its data]
   R29[R29 client-side coverage] --> R15
   R24[R24 file-sync integration, exploratory]
   R25[R25 device-to-device sync, exploratory]
@@ -207,7 +221,7 @@ Then R5b, which needs steps 2 and 3, plus R5a and R0. R6 needs step 3's transiti
 
 **One trap worth naming, because it caused a wrong reading once already.** Step 3's transition detection (its requirement 5) is not blocked on rls2fga, so it reads as though it could ship with step 1. It cannot: it consults the previous version of a row, and Postgres RLS cannot answer that, so putting it in step 1 would leave a branch that always answers false. It leaves exactly one obligation on step 1, which is that the trait's signature must be able to name which version is being asked about.
 
-**Nothing in steps 8 or 9 of the Sequence gates any of this.** R5a sits at step 10 because that is where it becomes worth starting, not because R13, R22 or R19 unlock it, so upstream work may proceed in parallel with them and should.
+**Nothing in steps 8 or 9 of the Sequence gates any of this.** R5a sits at step 10 because that is where it becomes worth starting, not because R13 or R19 unlock it, so upstream work may proceed in parallel with them and should.
 
 **`docs/upstream-subql-membership-term.md`** blocks R27's subql half. The shape is settled (one filter written as SQL, two executors, R27 step 1), the term is bounded to what `rls2fga` classifies, and it lands after the other two documents because its change path rides their machinery. A wanted capability rather than a defect found, recorded in the same form regardless.
 
@@ -266,9 +280,9 @@ A new or extended test in `crates/connetto-server/tests/` proving each refusal i
 
 **Status.** Part A **DONE** (2026-08-01). Part B NOT STARTED, **blocked on R5a**.
 
-**One hazard R5a introduces, recorded here because this is the counter's home.** `AUTHORIZATION_CALLS` increments at `RlsAuth::can_read`'s entry (`crates/connetto-server/src/auth.rs`), which is the implementation's entry rather than the round trip. That is exact today, because one entry is one Postgres transaction. It stops being exact at R5a: the visibility trait is answered once per changed row for every watcher at once (`docs/upstream-subql-visibility-trait.md`, decision 1), so the seam is entered once per event while the RLS implementation behind it still runs K transactions in its own loop. **Left alone, the counter would read 1 per event on the day R5a ships and R5b's whole acceptance criterion would be satisfied by a phase that changed no round trips at all.** So the counter must be pinned to the backend round trip, and R5a is the phase that must move it. It is named as a step there.
+**One hazard R5a introduces, recorded here because this is the counter's home. Closed 2026-08-03.** `AUTHORIZATION_CALLS` used to increment at `RlsAuth::can_read`'s entry, which is the implementation's entry rather than the round trip. That was exact only while one entry meant one Postgres transaction. It stops being exact at R5a: the visibility trait is answered once per changed row for every watcher at once (`docs/upstream-subql-visibility-trait.md`, decision 1), so the seam is entered once per event while the RLS implementation behind it still runs K transactions in its own loop. **Left alone, the counter would have read 1 per event on the day R5a ships and R5b's whole acceptance criterion would have been satisfied by a phase that changed no round trips at all.** The increment now sits on the `SELECT EXISTS` inside the transaction (`crates/connetto-server/src/auth.rs`), which is the round trip itself, so R5a can move the trait without moving the counter. Behaviour-preserving today by construction, and `crates/connetto-test-harness/tests/fanout_counters.rs` still reading K at K subscribers is the proof.
 
-**Part A landed.** The counters live in `crates/connetto-server/src/counters.rs` (always-on relaxed atomics per the decision below), incremented at the three named `dispatch_event` lock sites, the per-consumer `payload_zstd` copy in `Materializer::dispatch`, the per-subscriber `Route` clone, and `RlsAuth::can_read`. The load fixture is `connetto_test_harness::fanout::fanout_run` (N subscribers over one table under the RLS policy, M admin writes, counter deltas bracketing exactly that window), and the counter test is `crates/connetto-test-harness/tests/fanout_counters.rs`, green in the gate. **Measured, exact**: at K subscribers each event costs K authorization round trips, K route clones, K plus two materializer lock takes, and K full payload copies. The test asserts that growth today and is the file where R5b flips the assertions to their negation.
+**Part A landed.** The counters live in `crates/connetto-server/src/counters.rs` (always-on relaxed atomics per the decision below), incremented at the three named `dispatch_event` lock sites, the per-consumer `payload_zstd` copy in `Materializer::dispatch`, the per-subscriber `Route` clone, and the `SELECT EXISTS` round trip inside `RlsAuth::can_read`. The load fixture is `connetto_test_harness::fanout::fanout_run` (N subscribers over one table under the RLS policy, M admin writes, counter deltas bracketing exactly that window), and the counter test is `crates/connetto-test-harness/tests/fanout_counters.rs`, green in the gate. **Measured, exact**: at K subscribers each event costs K authorization round trips, K route clones, K plus two materializer lock takes, and K full payload copies. The test asserts that growth today and is the file where R5b flips the assertions to their negation.
 
 **Part A deviations.** The two subscriber counts are 10 and 100 rather than the example's 10 and 1000: the requirement is one order of magnitude, and 100 keeps the run inside two seconds where 1000 would put a thousand snapshot reads and five thousand sequential RLS round trips in the gate for no additional signal. The lock-take assertion is a difference lower bound between the two runs rather than an absolute equality, because the fixed per-event takes (and any time-based source events) cancel in the difference while per-subscriber takes cannot hide in it. The baseline events-per-second figure and the lock-wait fraction remain part B deliverables.
 
@@ -284,13 +298,13 @@ Nothing in this repository has ever been measured. Every performance figure in t
 
 1. Add an atomic counter for materializer mutex acquisitions. `dispatch_event` takes the lock three times per event (in `SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`, at the `dispatch`, `oplog_record`, and `advance_cursor` calls) and **the third is inside the per-subscriber loop**, so it is taken once per subscriber per event on the shared ingestion path.
 2. Add an atomic counter for **bytes copied per event in the fan-out**, covering the compressed payload clone in `Materializer::dispatch` (one full copy of `payload_zstd` per consumer) and the `Route` clone in `SessionManager::dispatch_event`. Count bytes rather than clones: a clone count hides that the payload copy scales with patch size as well as with subscriber count, which is the interaction that matters. Add a counter for `Route` clones in the fan-out (in `SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), each of which carries an `AuthContext<Id>`, so this is per-subscriber allocation on the same path.
-3. Add an atomic counter for authorization calls. Before R5a this sits on `RlsAuth::can_read` and will relocate. After R5a it sits on the trait and never moves again, which is why R5a should precede part B.
+3. Add an atomic counter for authorization calls. It sits on the `SELECT EXISTS` round trip inside the row-level-security implementation, not on the seam above it, and it stays there. An earlier version of this step said it would move onto the trait after R5a, which the hazard note above corrects and part B's struck step 6 records.
 4. Create the benchmark and load-harness scaffolding, which does not exist: no `benches` directory, no `[[bench]]` target, no criterion anywhere in the workspace. `crates/connetto-test-harness` already spins Postgres, so extend it rather than starting over.
 5. Build a fixture that connects N subscribers to one table and writes rows at a known rate.
 
 **Part B, after R5a.**
 
-6. Move the authorization counter onto the trait.
+6. ~~Move the authorization counter onto the trait.~~ **Struck, 2026-08-04, with R5a.** It was resolved in the opposite direction on 2026-08-03: the counter went onto the `SELECT EXISTS` round trip rather than onto the seam, for the reason the hazard note above gives. Answering the trait once per event for every watcher would have made a counter on the seam read 1 while the implementation behind it still ran a query per watcher, and R5b's acceptance criterion would then have been satisfied by a phase that removed nothing. `crates/connetto-test-harness/tests/fanout_counters.rs` reading K at K subscribers after R5a landed is the evidence it stayed put. Nothing is left for part B here.
 7. Add the fixed-duration load harness reporting events per second.
 8. **Measure lock wait, not just lock count.** A count cannot answer whether the mutex hurts, because a mutex fails through contention: an uncontended acquisition costs tens of nanoseconds, so `3 + K` acquisitions per event can look alarming and be free. Record the time spent **waiting** to acquire the materializer lock, as a total per run, and report it beside the count. That is the only number that decides the trigger in Out of scope below, and without it the trigger is not decidable from this phase's own output.
 
@@ -416,9 +430,29 @@ No variant of a wire enum the server can send is unconstructed. No public trait 
 
 ## R5a: the visibility seam into subql
 
-**Status.** NOT STARTED
+**Status.** **DONE.** (2026-08-04)
 
-**Blocked on `docs/upstream-subql-visibility-trait.md` landing, and on nothing else. Explicitly not on rls2fga.** The trait must live in subql, because subql calls it on the change path and subql cannot depend on connetto-core. What this phase lands is the seam with Postgres RLS still behind it and no behaviour change, so it needs none of the per-row machinery that waits on rls2fga.
+**Was blocked on `docs/upstream-subql-visibility-trait.md` landing, and on nothing else. Explicitly not on rls2fga.** The trait must live in subql, because subql calls it on the change path and subql cannot depend on connetto-core. What this phase landed is the seam with Postgres RLS still behind it and no behaviour change, so it needed none of the per-row machinery that waits on rls2fga.
+
+### What landed, against what the step list predicted
+
+**All six remaining steps.** Step 1 shipped upstream at subql `8e9b2df` and step 6 was struck ahead of the phase, on 2026-08-03, when the counter moved onto the round trip.
+
+**The four call sites all ask through `subql::visibility::VisibilityPolicy`,** and `AuthPolicy` and `MutationOp` are deleted from `crates/connetto-core/src/traits.rs` with no caller left. `RlsAuth` became `RlsAuth<Key = String>` carrying `PhantomData<Key>`, the shape R4 established for `Principal`, so every existing mention still compiles. `Watcher` is `Arc<Principal<Id, Key>>`, which is what `Route` already holds, so the change path builds its watcher slice with no principal cloned. `SessionManager` takes `Arc::new(materializer.catalog().clone())` in `with_oplog` and stores it, because `may_see` holds a row view across an await and cannot borrow through the materializer's mutex.
+
+**The change path asks once per event.** `dispatch_event` collects each patch with the route it goes to, asks one question naming every watcher, and then delivers by verdict. The per-watcher granularity of a failure is preserved inside `RlsAuth::may_see`, which writes the grant on a true answer and carries on past a failed one rather than returning, so a pool or query failure denies that watcher and no other, exactly as `unwrap_or(false)` did per subscriber. Its `Err` is reserved for what is identical for every watcher: a key cell that will not decode, or a key type the bind path cannot bind. A table the catalog does not know, a table with no primary key and a key cell carrying no value all leave every watcher on its pre-filled denial, which is what the old `Ok(false)` produced.
+
+**Three things the step list did not predict.**
+
+1. **One row view, not two.** The write path and the minting path both end up holding a row as values in catalog column order, so `crate::row_view::ValuesRow` serves both and subql's own `EventRow` serves the change and catchup paths. Two views would have been two spellings of one thing.
+2. **The minting path needed a row source, and which role reads matters.** `CapabilityIssuer::issue` takes typed key values in place of opaque bytes, as step 3 said, and reads the row before asking. **Decided with the maintainer on 2026-08-04: that read runs as the caller.** A read through a role that sees every row would make a row that is hidden and a row that is absent two different code paths, separable by the number of queries they run and therefore by timing, which turns minting into a probe for rows. As the caller they are one query and one refusal. The read goes through a new `RowSource` seam implemented by `PgSnapshotSource`, which already holds the pool and the catalog and already binds the caller, so a value read for the mint check and the same value delivered in a snapshot are lowered by one encoder. The consequence to keep in view: with row-level security on both sides, the fetch enforces the read and the question behind it can only agree, so on this one path the seam earns its place at R5b rather than today.
+3. **`ChangeRecord::table` and `pk` lost their only reader.** They were resolved at append time for the catchup read filter, which now reads the event through `EventRow` instead. Both are still written to and read back from the Postgres oplog's own columns, so nothing is unpopulated, but no logic consults them. That is R8's business rather than this phase's, because removing them is a change to a deployment-owned table.
+
+**One residual, recorded rather than fixed.** `PlannedOp` now carries the row image, and for a changeset update it is the new value where the upload changed the column and the old one otherwise. A column the upload touched in neither slot reads as absent. That is the same shape an event carries under `REPLICA IDENTITY DEFAULT`, and it is invisible today because the row-level-security implementation reads only the key. A policy that evaluates a row's own columns on the write path would need the client to upload full images.
+
+**Proof.** The full existing suite, unchanged and green, with no test modified for a behavioural reason. 160 native tests, the whole Docker-gated sweep at 101 plus `verified_topology` on its own stack, 23 `connetto-web` browser tests over 6 targets, 25 `wasm-smoke` browser tests over 20 targets, and `fmt`, nightly `clippy -D warnings` and rustdoc with `-D warnings` on all six workspaces. `crates/connetto-test-harness/tests/fanout_counters.rs` still reads K authorization round trips at K subscribers, which is the assertion that would have gone quietly wrong had the counter moved to the seam. Five test policies moved with the trait (`PermissiveAuth`, `RlsAuth`, `HarnessAuth`, `DenyId2`, `DenyAuth`), each rewritten for the trait's shape and none for a behavioural reason.
+
+**One thing the maintainer raised that is not in this phase.** A share should carry a level: a caller with read access shares read, one with write access may share write. The mint call would have to say which level it is minting and ask the write question for a write share, which is new observable behaviour and this phase's only proof is that none exists. It is R34 in the tables above.
 
 ### Purpose
 
@@ -426,13 +460,14 @@ Every authorization question on the change path goes through `AuthPolicy`, which
 
 ### Steps
 
-1. Define the visibility trait in subql. **Its shape is settled**, in `docs/upstream-subql-visibility-trait.md` under "The shape, decided": one question per changed row naming every watcher, carrying the row as a lazy per-column accessor rather than materialised values, answered as one verdict per watcher into a buffer the caller reuses, with the watcher an opaque associated type carrying no bound.
-2. Move all three connetto call sites to ask through it: the change path (`SessionManager::dispatch_event` in `crates/connetto-server/src/session.rs`), the catchup path (`SessionManager::subscribe_row`), and the write path (`SessionManager::every_op_authorized`). The first two ask per event rather than per subscriber, which is the shape change, not just a relocation.
-3. Put an implementation behind it that **still uses Postgres RLS**, so nothing about any answer changes. It reads only the key off the accessor.
-4. Supersede `AuthPolicy` in `crates/connetto-core/src/traits.rs`.
-5. **Move `AUTHORIZATION_CALLS` from the seam to the round trip**, because this phase is what makes the two differ. The trait is entered once per event while the implementation behind it still runs one Postgres transaction per watcher, so a counter left at the entry would read 1 per event and R5b's acceptance criterion would be met by a phase that removed no round trips. R0's counter test must still show growth after this phase, and that is this step's proof.
-6. Two consequences of the decided shape, both local. `PlannedOp` in `crates/connetto-server/src/materializer.rs` must stop discarding the row values it keeps only a key from today, because the accessor needs them. And `crate::pk::encode`/`decode` exist solely to pass typed key values through the old opaque `&[u8]` parameter, so they lose their reason to exist on this path.
-7. Follow the idiom subql already uses twice: query re-execution works by subql asking the caller through `Connector`, because the query and its retry belong to the caller.
+1. Define the visibility trait in subql, **and nothing behind it**. Its shape is settled in `docs/upstream-subql-visibility-trait.md` under "The shape, decided": one question per changed row naming every watcher, carrying the row as a lazy per-column accessor rather than materialised values, answered as one verdict per watcher into a buffer the caller reuses, with the watcher an opaque associated type carrying no bound, and a second method for writes taking one caller, one verb and one row. subql ships no implementation here: it is `no_std`-capable, so an authorization-service client is a network dependency that belongs with the executor swap at R5b, and the row-level-security implementation this phase supplies lives in connetto because binding a caller into a database session is deployment-specific.
+2. Move **all four** connetto call sites to ask through it. Three are in `crates/connetto-server/src/session.rs`: the change path (`SessionManager::dispatch_event`), the catchup path (`SessionManager::catch_up_row`), and the write path (the per-op loop in `SessionManager::handle_mutation`, which an earlier version of this line called `every_op_authorized` after a function that no longer exists). The fourth is `CapabilityIssuer::issue` in `crates/connetto-server/src/capability.rs`, which R4 added and which asks whether a caller may read the row it is about to share. The first two ask per event rather than per subscriber, which is the shape change rather than a relocation.
+3. **Two consequences of the fourth site**, both local and both free because R4's code is unreleased. `CapabilityIssuer::issue` takes the key as opaque bytes only because the trait it calls did, so under the decided shape it takes typed key values instead. And because it holds a key rather than a row, it reads the row before asking: the accessor's contract is that it is always complete, so that "no round trip" never depends on which caller asked.
+4. Put an implementation behind it that **still uses Postgres RLS**, so nothing about any answer changes. It reads only the key off the accessor.
+5. Supersede `AuthPolicy` in `crates/connetto-core/src/traits.rs`.
+6. ~~**Move `AUTHORIZATION_CALLS` from the seam to the round trip.**~~ **Done ahead of this phase, 2026-08-03, alongside R28 part A.** The counter sits on the `SELECT EXISTS` inside the transaction the row-level-security implementation opens per watcher (`RlsAuth::may_see` since this phase, `can_read` when the counter moved) rather than on the function entry, so answering the trait once per event for every watcher cannot make it read 1 while the implementation still runs a query per watcher. Nothing is left for R5a to do here.
+7. Two consequences of the decided shape, both local. `PlannedOp` in `crates/connetto-server/src/materializer.rs` must stop discarding the row values it keeps only a key from today, because the accessor needs them. And `crate::pk::encode`/`decode` exist solely to pass typed key values through the old opaque `&[u8]` parameter, so they lose their reason to exist on this path.
+8. Follow the idiom subql already uses twice: query re-execution works by subql asking the caller through `Connector`, because the query and its retry belong to the caller.
 
 ### Proof
 
@@ -445,6 +480,100 @@ All three paths ask through the trait. `AuthPolicy` has no callers. The gate pas
 ### Why
 
 It puts R0's authorization counter on a seam that then never relocates, so the baseline and the acceptance measurement are taken at the same point. And it reduces R5b from restructuring a call path to substituting an implementation.
+
+---
+
+## R34: a write-level share
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** R5a put the write question on the same seam as the read one, so what is missing is the mint call saying which level it is minting.
+
+### Purpose
+
+Raised by the maintainer on 2026-08-04, while settling how R5a's minting path reaches the row. A caller with read access to a row may share reading it. A caller who may also write it may share writing it. Today `CapabilityIssuer::issue` asks the read question only, so a share carries whatever the application's own permission row happens to grant, and connetto has checked the wrong thing whenever that row grants more than reading.
+
+### Steps
+
+1. The mint call names the level it is minting.
+2. A read-level share asks `may_see`, as it does today. A write-level share asks `may_write` as well, and both must allow.
+3. The level travels to the application in `IssuedCapability`, because the application writes the permission row and the two must agree.
+
+### Proof
+
+A caller who may read but not write a row can mint a read share over it and is refused a write share. A caller who may do both gets both.
+
+### Done when
+
+No caller can mint a share granting more than it holds itself.
+
+### Why it is not part of R5a
+
+R5a's only proof is that nothing observable changed, which a new refusal would end.
+
+---
+
+## R35: narrow the over-broad column types
+
+**Status.** **DONE.** (2026-08-05)
+
+**Was blocked on nothing.** Found by a sweep the maintainer asked for on 2026-08-04, after the same sweep for text columns turned up four sketches and one built table.
+
+**Landed.** The three deadline columns are `TIMESTAMPTZ` carrying `chrono::DateTime<Utc>` and have lost the `_ms` suffix along with the unit, through `ConnettoStoreSchema`, the `connetto_auth_tables!` macro, `authn/store.rs`, the reference SQL, and the two stack recipes that create those tables. A tab mints `rosetta_uuid::Uuid::new_v4()`, both browser watermark tables key on it as a 16-byte blob, and the relay refuses a handshake that does not parse. `client_id_prefix` is deleted from `ReplicaConfig` with its four setters. The demo `quantity` is required and non-negative. The refresh store is untouched on purpose, recorded in R17 step 2.
+
+**Decided 2026-08-05, closing the one thing this phase left open: both ends mint version 4.** The demo's Postgres default and its client-side generator disagreed, v4 against v7, and matching on v7 would have needed Postgres 18, which first shipped a built-in `uuidv7()`, against a test stack on 16. So the client moves to v4 rather than the server to v7: the registered SQLite function, the baked column default and the four demos are renamed with it. What that gives up is the time ordering a v7 key carries.
+
+**That ordering turned out to be read, so the desktop demo gained a `created_at`.** Its "delete newest" button found the newest row by `MAX(id)`, and its list sorted by id, both of which only worked because the key was time ordered. A comment at the insert said so and the rename walked straight past it. The column is `TIMESTAMPTZ NOT NULL DEFAULT now()`, the delete orders by `(created_at DESC, id DESC)` and takes one row, and the list orders by `(created_at ASC, id ASC)`. The tiebreak is not decoration: the replica default is `datetime('now')`, which is second resolution, so two rows a client makes in the same second tie. **Rejected: renaming the button** to admit it deletes an arbitrary row, which costs the demo its clearest gesture, adding a row and deleting that same row to watch it vanish from every window. **Rejected: keeping v7 in this one writer**, which restores the split just closed and only half works, since rows made any other way still take the v4 default.
+
+**The shared `table!` types it `Timestamp`, not `Timestamptz`, and that is diesel's constraint rather than a choice.** One `table!` serves both the async Postgres connection and the SQLite replica here, and diesel's SQLite backend has no `Timestamptz`. Postgres still stores an absolute instant and the replica still stores UTC text, so both decode to the same instant, verified against a real Postgres rather than reasoned about.
+
+**An upstream defect was found on the way and is written up in `upstream/pg2sqlite-at-time-zone.md`.** pg2sqlite translates `AT TIME ZONE` into SQLite's `'utc'` modifier, which converts from localtime, so applying it to an already-UTC expression skews every value by the machine's offset, and a named zone other than UTC is silently discarded. It does not block this phase, because `TIMESTAMPTZ DEFAULT now()` needs no `AT TIME ZONE` and translates correctly, but it bars the explicit form.
+
+**Proof.** Both writers exercised against a real Postgres 16 in Docker: an insert naming neither the key nor the timestamp, creation order read back through the shared schema, the decoded instant within a second of what Postgres itself reports as UTC now, delete-newest picking the newest and removing exactly one row, and the same `Order` decoding a purely local write where `uuidv4()` and `datetime('now')` filled both columns.
+
+Then the gate, all green: `fmt` and nightly `clippy -D warnings` on the four demo workspaces, 160 native tests, all 101 Docker-gated tests, 25 `wasm-smoke` browser tests over all 20 targets, 23 `connetto-web` browser tests over all 6, and `verified_topology` against a live server and dev identity provider.
+
+**Getting the Docker-gated set to run exposed a defect in this repo's own suite, now fixed.** Each `e2e` run minted a replica key through `provision_replica_key` into the Linux kernel's *persistent* keyring, named after a `/tmp` directory the run then deleted, and nothing called the `ReplicaKeyStore::clear` that already existed. The entries accumulated for the life of the login. `/proc/key-users` showed uid 1000 at 19999 of 20000 bytes across 169 such entries at about 118 bytes each, every one naming a directory that was gone. Past that ceiling the mint fails: the four `e2e` tests needing a replica failed on "minting the replica key" while the four startup-refusal cases, which never mint one, passed. Nothing in R35 caused it, and `e2e` reads nothing under `examples/`, but running the suite repeatedly is what crossed the line.
+
+**The fix is a `ReplicaDir` guard in `crates/connetto-server/tests/e2e.rs`**, holding the temp directory and the replica paths taken from it, deleting each keyring entry on drop. Drop rather than an explicit call at the end of each test, for the same reason the neighbouring `ChildGuard` kills its child on drop: the runs that leak most are the ones whose assertions panic, which is exactly when explicit cleanup is skipped. The `Drop` body stays panic-free, matching `rs-no-panic-in-drop`. The client binary is unchanged and should be, since a real client's key has to outlive the process or the replica stops opening; only a test throws its replica away. The keyring service name, which the binary keeps private, is one const in the test file beside the `count_orders` helper that already needed it. Sharing it from the library instead would mean adding `native-auth` to the server's dev-dependency on `connetto-client` and pulling the OAuth stack into the server's test build, which is not worth it for one string.
+
+**Proof, mutation tested.** From a cleared keyring, a full `e2e` run passes 8 of 8 and leaves zero entries, with `/proc/key-users` identical before and after. With the `Drop` body neutralised, the same run leaves exactly six, one per replica path across the four tests. The full gated sweep is 101 passed, 0 failed, and finishes in 35 seconds against the 325 it took while the keyring was thrashing.
+
+Two things about the one-off recovery are worth keeping, because the obvious move does not work. **`keyctl purge` cannot remove these keys, as root or as their owner.** A stale entry's permissions are possessor-all, user view-only, nothing for group or other, so the owner lacks the search permission `KEYCTL_INVALIDATE` requires and root falls in "other" with no access at all; `CAP_SYS_ADMIN` only covers keys specially flagged for root, which ordinary `user` keys are not. **What works is gaining possession**: with the quota raised, `keyctl get_persistent` links the persistent keyring into a fresh session, and a possessor does hold write permission on it, so `keyctl clear` drops every link and the keys are collected. That reclaimed all 169, taking uid 1000 from 181 keys and 20000 bytes to 12 and 98, after which `e2e` passed 8 of 8 in 8 seconds against the 83 it spent failing. The quota was also raised to 1000 keys and 200000 bytes on this machine, which the fix makes unnecessary but which does no harm.
+
+One transient to know about: `loop_emu` hit a 300 second per-binary timeout in one sweep and passed its 24 tests in 7.7 seconds run alone, so a slow sweep entry there is contention on this machine, not a hang.
+
+**A real hang has a specific and non-obvious cause, worth writing down because it cost two hours here.** Driving the gated binaries from a shell loop that captures output with `$(...)` hangs forever on `e2e`, showing a zombie `timeout` child and a blocked `sh`. Command substitution waits for the write end of the pipe to close, not for the child to exit, and `e2e` forks a `connetto-server` that inherits the pipe and outlives the test binary, so `timeout` reaps the binary while the grandchild holds the pipe open. Redirecting each binary to a file instead, with `</dev/null` on the input, turns the same sweep into under four minutes. A leftover server holding port 7777 is a second, unrelated way to stall `e2e`, and killing stray `target/release/connetto-server` processes between sweeps avoids it.
+
+**Four things went wrong and are recorded because each is instructive.** A cost quoted an order of magnitude low. A subagent's change that compiled and could never have worked. A premise of mine that was false and broke every local write until a browser test caught it. And this phase's own record, written on 2026-08-05, claiming the demo `quantity` change had landed when `git diff` showed the four schema files untouched: the script that was to apply it had been written but never run, and the claim was believed rather than checked.
+
+### Purpose
+
+A column whose type is wider than the values it holds is a contract nothing enforces. The unit or the legal set ends up in the column's name or in a comment beside it, where the compiler and the database both ignore it. This phase closes the instances the sweep found. The text-column half of the same sweep already landed: four documents corrected, and the oplog's verb turned into a Postgres enum with the column's declared type asserted.
+
+### Decisions, taken with the maintainer on 2026-08-04, and two costs I got wrong
+
+1. **Three columns hold a moment in time as a plain 64-bit count of milliseconds** and become zone-aware timestamps with a real date type in Rust: `connetto_sessions.idle_deadline_ms`, `connetto_sessions.absolute_deadline_ms` and `connetto_provider_tokens.expires_at_ms` (`crates/connetto-server/src/authn/schema.rs`, and the reference SQL in `11-authentication.md`). The unit lives in the column name because the type refuses to carry it, and seconds and milliseconds are indistinguishable to the compiler because both are `i64`. The columns lose the `_ms` suffix with the unit. **Verified before deciding**: the pinned diesel maps `std::time::SystemTime` to a zone-less timestamp only, so a zone-aware column needs `chrono`, which was a test-only dependency of `connetto-server` and is already in the build through subql. Diesel's own integer wrapper was considered and rejected: the column would be right and the Rust side would still carry a bare integer. **One claim I made while asking was too strong**: I said this deletes a conversion boundary. It does not. The `AuthStore` API speaks `SystemTime` and keeps doing so, so `unix_ms` and `time_from_ms` become `to_instant` and `from_instant`. What goes is the lossiness and the unit hazard, since both new conversions are total and between two instant types.
+2. **A browser tab identifies itself with a wall-clock reading**, `format!("{prefix}-{}", js_sys::Date::now())` at `crates/connetto-web/src/workers.rs:422`, and that string is the primary key of its durable write counter and the name of its lock. Two tabs opened in the same millisecond share both. It becomes a bare `rosetta_uuid::Uuid::new_v4()`, and the relay refuses a handshake whose client id does not parse as one. **That crate rather than `uuid`**, because the browser's counter is a SQLite table mirroring a Postgres one and `rosetta-uuid` is one type with diesel bindings for both, where plain `uuid` has no SQLite mapping and would have meant a hand-rolled encoding on one side. Already a dependency of `connetto-server`, already the demo's key type, and its own suite asserts v4 generation on `wasm32-unknown-unknown`.
+   **The cost I quoted was wrong and the maintainer re-decided on the corrected figure.** I said roughly three places. It is thirteen call sites across the browser tests and `crates/connetto-web`'s own tests, plus `client_id_prefix` deleted from `ReplicaConfig` and its four setters, because one value serving both jobs means the value cannot carry a prefix and still parse. It also makes the wire label an identity, so `11-authentication.md` principle 1 needed rewriting to name the relay as the one place that keys on it. A third shape was offered on the corrected costs, deriving the key from the label with a version 5 uuid so no call site changes, and was rejected in favour of the strict requirement.
+3. **The browser's refresh store keeps one row by call-site convention**, three sites hardcoding `1`, where its sibling `_connetto_meta` states it as a check constraint. **Deliberately left alone**: there is no live defect, nothing else writes that table, and R17 step 2 re-keys it on the identity, which deletes the one-row idea entirely. Recorded in R17 so whoever does that phase knows the invariant currently rests on call sites.
+4. **The demo schema's `quantity` becomes required and non-negative**, because the demo's own subscription is `SELECT * FROM orders WHERE quantity > 0`, so a null row silently never syncs.
+   **The other half of this decision was taken on a premise of mine that was false, and is reverted.** I reported that `DEFAULT gen_random_uuid()` never fires, having checked that all 53 inserts in the tree name the key, and proposed dropping it. That check only covered the server. On the client the default is the key generator: `build.rs` translates it through pg2sqlite with `with_uuid_function_name("uuidv7")` into the replica's own `DEFAULT (uuidv7())`, which is what mints the key when a local write omits it, exactly as `dioxus-desktop-demo/src/main.rs:75` says. Dropping it broke every local write, caught by `opfs.rs` failing with `NOT NULL constraint failed: orders.id`. The default is restored and the comment above it now says what it is really for. **The version disagreement it caused is real and unresolved**: Postgres mints v4 here and the client v7, and closing that needs either Postgres 18, which first shipped a built-in `uuidv7()`, or an extension, against a test stack on 16.
+
+### Steps
+
+1. Move the three deadline columns to `TIMESTAMPTZ`, carrying `chrono::DateTime<Utc>` through `ConnettoStoreSchema`'s associated types, the `connetto_auth_tables!` macro, and `authn/store.rs`. Delete `unix_ms` and `time_from_ms`. Turn on diesel's `chrono` feature and promote `chrono` to a real dependency of `connetto-server`.
+2. Update every documented stack recipe that creates those tables, in `11-authentication.md` and in the test file headers that carry the `psql` commands.
+3. Mint the tab id with `rosetta_uuid::Uuid::new_v4()`, key `_tab_mutations` and `_connetto_tab_mutations` on it with the crate's own diesel type, and derive the lock name from it.
+4. Drop the Postgres `DEFAULT` and tighten `quantity` in the four demo schemas, then regenerate what `build.rs` translates from them.
+
+### Proof
+
+A deadline round-trips through Postgres as an instant and the two conversion helpers no longer exist. Two tabs created in the same millisecond get different ids and different watermark rows. An insert omitting a demo key is refused rather than inventing one, and a null quantity cannot be written.
+
+### Done when
+
+No column in a table connetto owns or specifies is wider than the values it holds, except where the value genuinely is free text or opaque bytes, which the sweep listed and left alone: an issuer URL, a provider token, a hash, a serialized payload, a counter, and a table name read by a person.
 
 ---
 
@@ -576,6 +705,18 @@ All of the above pass. A single-grant shape is not representable. No `session_id
 
 **Blocked on nothing, now that R3 is done.** Nothing before it depends on it, which is what makes deferring it this far safe. In particular **R3 does not need it**: a rejected grant is a denial, and denials go to structured logging by the split in `docs/architecture/08-authorization.md`, so R3's visibility comes from R12 rather than from this table.
 
+### Decided before execution, 2026-08-04
+
+**Only one of the three event kinds has a producer, and the phase records what exists rather than waiting.** The `op` column names `permission_change`, `session_revoked` and `model_change`. Session invalidation has two producers today, `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs`) behind both logout and an explicit revoke, and the stolen-token defence that revokes on reuse inside `DbAuthStore::rotate_refresh` (`authn/store.rs`). A permission change is noticed by the grant-change watcher, which is R7 and unbuilt. A model change needs an authorization model, which is R5b and unbuilt.
+
+**So this phase also records a successful share mint**, which is the one thing connetto itself does today that changes who can reach something. That is arguable and the maintainer took it deliberately: the permission is really the row the application writes afterwards, which connetto never sees, so what is recorded is connetto's own act of minting rather than the grant landing. Its cost is that `CapabilityIssuer` gains a fifth collaborator to write with. **Recording only the two invalidations was considered and rejected**, because the table would then carry nothing at all from the authorization half of the system, which is half of what it was specified for. **Waiting for R7 and R5b was considered and rejected**, because the phase exists precisely so this one contract does not arrive in pieces across five phases.
+
+**The shape is the corrected one in `08-authorization.md`**, retyped on 2026-08-04: `at TIMESTAMPTZ`, `session UUID`, `user_id` as the deployment's own id type, `op` as a Postgres enum rather than text, `allowed BOOLEAN`, and nullable `table_name` and `pk`. **Question `allowed` before building it**: denials do not come to this table by the split, so every row would carry `true`, which is a column written and never read.
+
+**Decided 2026-08-05: a fourth kind, for a ban being imposed or lifted.** R36 bans an identity, which is a rare change to who can reach what, so it is this table's definition exactly. It is recorded here rather than left to R36's own ban table because that table holds current state with an expiry, while this one is the append-only history, and an expired or lifted ban would otherwise leave no trace. It goes in now rather than when R36 arrives, because R13 exists precisely so this contract does not accumulate one producer at a time. **R36 depends on this**, so the two are linked in the graph.
+
+**That does not revive `allowed`.** A ban imposed and a ban lifted are both changes that happened, so both carry `true`, exactly like the other kinds. The column's fate is unchanged by the addition.
+
 ### Purpose
 
 Authentication and authorization state changes (permission changes, session invalidations, model changes) are persisted for the application to query, as distinct from the high-volume operational stream that goes to the log. `docs/architecture/08-authorization.md` and `docs/architecture/11-authentication.md` both name the table and specify the split, and nothing builds it.
@@ -583,17 +724,19 @@ Authentication and authorization state changes (permission changes, session inva
 ### Steps
 
 1. **It is a deployment-facing schema contract, so it needs a schema trait**, beside `ConnettoStoreSchema` in `crates/connetto-server/src/authn/schema.rs` and `ConnettoWatermarkSchema` in `crates/connetto-server/src/watermark_schema.rs`, with the convenience macro those two already establish. connetto emits **zero** server DDL, so the deployment owns the table and connetto owns only the shape it requires.
-2. Follow the column list in `docs/architecture/08-authorization.md`, which is the specification.
-3. **State changes only.** Permission changes, session invalidations, model changes. Denials do not go here at any volume, because a caller probing keys generates one per attempt and this table is not a firehose.
-4. Emit from both subsystems that produce such events, authentication and authorization, through the one contract.
+2. Follow the column list in `docs/architecture/08-authorization.md`, which is the specification and was retyped for this phase.
+3. **State changes only.** Denials do not go here at any volume, because a caller probing keys generates one per attempt and this table is not a firehose.
+4. Emit from every producer that exists: the two session invalidations, and the share mint. Name the two absent kinds and the phases that create them, in the phase's own record, so their absence reads as sequencing rather than oversight.
 
 ### Proof
 
-A state change of each kind reaches the table and is queryable. A denial does **not** reach it, asserted rather than assumed, because that is the half of the split a future change is most likely to break.
+A state change of **each kind that has a producer** reaches the table and is queryable: a logout, a stolen-token revocation, and a share mint. The earlier wording asked for each of the three kinds, which no amount of work in this phase can satisfy, since two of them have nothing that creates them. That is the same error R12 made and had to be split over.
+
+A denial does **not** reach it, asserted rather than assumed, because that is the half of the split a future change is most likely to break.
 
 ### Done when
 
-The trait and macro exist beside the other two, a deployment can create the table from the documented shape, both subsystems emit through it, and the denial exclusion is pinned by a test.
+The trait and macro exist beside the other two, a deployment can create the table from the documented shape, every producer that exists emits through it, the two that do not exist are named against their phases, and the denial exclusion is pinned by a test.
 
 ### Why it is one phase rather than a step inside several
 
@@ -660,7 +803,7 @@ Proof lives in `crates/connetto-server/tests/capabilities.rs` (eight tests: the 
 
 ### Purpose
 
-`RlsAuth::can_read` asks the live table, so it can only answer about a row as it is now, and for a deleted row it answers no for everyone. The change path needs an executor that can answer about a row as it was.
+`RlsAuth::may_see` asks the live table, so it can only answer about a row as it is now, and for a deleted row it answers no for everyone. The change path needs an executor that can answer about a row as it was.
 
 ### Steps
 
@@ -695,7 +838,7 @@ Proof lives in `crates/connetto-server/tests/capabilities.rs` (eight tests: the 
 
 ### Proof
 
-**R0's counter test flips from demonstrating growth to passing.** That is the whole criterion for the round-trip requirement and needs no separate interpretation, **provided the counter measures backend round trips rather than entries to the visibility seam.** R5a step 5 is what guarantees that, and without it this criterion is satisfied by R5a alone, which removes no round trips whatsoever. Then R0's load harness reports an absolute figure in the same order as the published state of the art, thousands of events per second rather than tens. A criterion benchmark covers the local record computation, because the design rests on it being cheap enough to run twice per changed row per event.
+**R0's counter test flips from demonstrating growth to passing.** That is the whole criterion for the round-trip requirement and needs no separate interpretation, **provided the counter measures backend round trips rather than entries to the visibility seam.** R5a step 6 is what guarantees that, and without it this criterion is satisfied by R5a alone, which removes no round trips whatsoever. Then R0's load harness reports an absolute figure in the same order as the published state of the art, thousands of events per second rather than tens. A criterion benchmark covers the local record computation, because the design rests on it being cheap enough to run twice per changed row per event.
 
 ### Done when
 
@@ -707,7 +850,7 @@ The counter test passes. A policy with no translation and no supplied mapping re
 
 ### Why
 
-`RlsAuth::can_read` in `crates/connetto-server/src/auth.rs` runs `SELECT EXISTS` against the live table, so it can only answer about the row as it is now, and for a deletion it answers false for everyone. R6 needs an answer about the row as it was. **No measurement can veto this phase**, only decide whether it is sufficient.
+`RlsAuth::may_see` in `crates/connetto-server/src/auth.rs` runs `SELECT EXISTS` against the live table, so it can only answer about the row as it is now, and for a deletion it answers false for everyone. R6 needs an answer about the row as it was. **No measurement can veto this phase**, only decide whether it is sufficient.
 
 ---
 
@@ -818,7 +961,7 @@ R5b changes the authorization executor and this changes the dispatch loop's own 
 
 **Status.** NOT STARTED
 
-**Blocked on R5b**, and hard-blocked rather than cost-blocked: `RlsAuth::can_read` in `crates/connetto-server/src/auth.rs` queries the live table, so it cannot answer about a row that has changed or gone, which is exactly what this phase needs.
+**Blocked on R5b**, and hard-blocked rather than cost-blocked: `RlsAuth::may_see` in `crates/connetto-server/src/auth.rs` queries the live table, so it cannot answer about a row that has changed or gone, which is exactly what this phase needs.
 
 ### Purpose
 
@@ -969,6 +1112,7 @@ An application embedding connetto starts, runs, and serves local reads with no s
    Native already does this. `KeyringStore` is keyed on `(service, user)` (`crates/connetto-client/src/auth.rs`), so one instance per account gives each its own keyring entry, and nothing needs to change.
    The browser does not. `RefreshStore` creates `connetto_refresh (id INTEGER PRIMARY KEY, token TEXT NOT NULL)` and keeps a single row, so each login overwrites the last (`crates/connetto-web/src/auth.rs`). Key that table on the identity instead of holding one row. **The encryption already supports this**: the store is opened under a device-scoped key from `device_key`, not a per-identity one, so several accounts' tokens can coexist in it without a key change.
    Note the security cost and accept it deliberately: a found device can resume any account whose token is still stored, rather than only the last one. That follows from the threat model rather than contradicting it, since those accounts belong to one person and the operating system boundary is what separates people.
+   **What you are replacing rests on call sites, not on the schema (R35, 2026-08-04).** Three places hardcode `id = 1`, the load, the save and nothing at all in the clear, which deletes every row. The sibling table `_connetto_meta` states the same invariant as a `CHECK (id = 1)` in its DDL, and this one does not. Deliberately left that way rather than adding the constraint, because this step deletes the one-row idea outright. Nothing else writes the table today, so there is no live defect to inherit.
 3. Make the account-switch path consistent with whatever step 1 decides, since it currently removes the replica and leaves the tier.
 4. **Give the decision in chapter 12 a status marker** naming this phase, so the same silence cannot recur.
 
@@ -983,45 +1127,31 @@ A tier's name and its key have the same scope, that scope matches what chapter 1
 ---
 
 
-## R22: the accepted query set is fixed at compile time
+## R22: deleted, 2026-08-05
 
-**Status.** NOT STARTED
+**Status.** **DELETED.** Never started, and it should not be.
 
-**Blocked on nothing.** It should precede R19, because it changes what throttling has to defend against.
+It proposed fixing the set of queries the server accepts at compile time, with a trait through which a deployment supplies its own permitted set.
 
-### Purpose
+**Why it is gone.** A hand-maintained list of permitted requests is refused outright, and so is any enum or equivalent closed menu of application programming interfaces. It defeats the point of the stack. When a caller must not run something, "must not" is decided by row-level security, by OpenFGA and by database roles, never by whether the request appears on a list somebody keeps up to date. The phase argued from security, and that argument was wrong: restricting which questions may be asked is not how this system decides who may see what.
 
-**The server accepts arbitrary query text from the wire.** `SubscriptionSpec` carries `query: String` and `binds`, and `SessionManager::handle_subscribe` in `crates/connetto-server/src/session.rs` passes that string straight into `Materializer::register_sqlite`. The only thing that rejects a query is the materializer failing to parse or register it. So a caller is not restricted to the queries the application was built to serve.
+**Its three parts went three ways.**
 
-**Two problems, and the second is easy to miss.** The first is cost: a new subscription takes a snapshot, so an accepted query is a full read of whatever it matches. The second is disclosure: the rejection path returns `detail: format!("subscription rejected: {err}")`, which hands the caller the materializer's own error text, so failed attempts teach an attacker about the schema. That is a probing oracle.
+The **disclosure leak is real and moves to R19**, which is the phase about what a caller can do to the server. Four sites in `crates/connetto-server/src/session.rs` return the backend's own error text to the caller: `:1439` `subscription rejected: {err}`, `:1467` `snapshot failed: {detail}`, and `:1708` and `:1767` `aggregate bootstrap failed: {err}`. At the first of those, `err` is subql's `RegisterError`, which renders `Unknown table: {0}`, `Unknown column '{column}' in table {table_id}` and `AggregatorOnRlsTable`, so a caller can enumerate the schema one guess at a time and learn which tables carry row-level security. It is not an authorization hole, since a policy still decides what is readable, but the shape of the database leaks before any policy is consulted.
 
-**An application knows its queries at build time.** They are written in its source, so the set is finite and known before anything runs. Fixing the accepted set at compile time removes arbitrary query submission as a category rather than limiting it, and it makes R19's job tractable: throttling a known menu with known costs is a different and much easier problem than bounding arbitrary cost.
+The **cost concern also belongs to R19** and needs no query set: a new subscription takes a full snapshot, which is what throttling has to bound.
 
-**This does not reverse the decision to carry SQL text rather than a predicate tree** (`docs/architecture/open-questions.md`, Q4.1). The developer still writes SQL. What changes is that the *set* of accepted strings is closed at build time instead of open at runtime.
+The **advance knowledge of the query set belongs to R27**, which is the only thing that ever needed it. A membership term naming a relationship must be compiled into relationship checks for the change path, and `docs/architecture/04-subscriptions.md` records that this compilation needs the query set known ahead of time. If R27 needs it, R27 derives it automatically from what the application already wrote, and designs it against a concrete use rather than in the abstract.
 
-### Steps
-
-1. **A trait carries the permitted set, with a generic seam so a downstream implementer supplies their own.** Same shape as the other deployment-facing contracts in this codebase rather than a new mechanism.
-2. **Decide what identifies a permitted query.** The rendered SQL text is the obvious candidate, and the client already renders deterministically from a typed expression, so the same expression yields the same string. Confirm that determinism holds for the shapes actually used, including boxed and dynamically built queries, because those are exactly the ones that cannot carry a compile-time marker.
-3. **Binds stay dynamic.** The shape is fixed, the values are not, or the feature is useless.
-4. **A query outside the set is refused without saying why.** No error text, nothing distinguishing not-permitted from never-existed, consistent with the refusal discipline R3 applies to grants. Fix the existing leak in the same change.
-5. **Say what happens to a query the application legitimately needs but did not compile in.** If the answer is that it cannot be served, that is a real constraint on the application and belongs in the documentation rather than being discovered at runtime.
-
-### Proof
-
-A query in the set is served. A query outside it is refused, and the refusal is byte-identical to the refusal for a query naming a table that does not exist, asserted rather than assumed, since indistinguishability is the property being bought. Binds still vary freely within a permitted shape.
-
-### Done when
-
-No query outside the compiled set is served, no rejection reveals why, and a downstream implementer can supply their own set through the trait without patching connetto.
-
----
+**Consequences to carry.** R19 no longer has a prerequisite here and can start whenever. R27's dependency on R22 is void and must be restated as a requirement R27 satisfies for itself, in this plan and in `04-subscriptions.md`, which names R22 twice. Step 8 loses one of its two entries, leaving R13.
 
 ## R19: request throttling, tiered by identity
 
 **Status.** NOT STARTED
 
-**Blocked on nothing, now that R2 and R3 are done.** R2 made the durable session handle the operational key this phase counts against, and R3 mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable.
+**Blocked on nothing, now that R2 and R3 are done.** R2 made the durable session handle the operational key this phase counts against, and R3 mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable. It no longer waits on R22, which was deleted on 2026-08-05.
+
+**It inherited two things from that deletion**: the error-text disclosure at four sites, now step 6, and the fact that step 5's backstop must be judged against arbitrary-cost work rather than a known menu.
 
 ### Purpose
 
@@ -1037,15 +1167,18 @@ One thing already in the codebase is easy to mistake for throttling and is not: 
 2. Meter connection and handshake rate next, then the auth endpoints, which today count no attempts at all.
 3. **Tier by whether the caller has an identity, and treat that as the design rather than a refinement.** An authenticated caller is accountable: there is a `user_id` to attribute cost to, a session to revoke, and a login that already cost them something. An anonymous caller has none of that by definition.
 4. **Count against R2's durable session handle, for both tiers.** A session is established on connect whether or not anyone is logged in, so the handle is the natural key and needs no special case for an anonymous caller. Do **not** use `connection_num`: it is a process-local counter reset on every reconnect, so it caps one connection and not a reconnect loop.
-5. **Decide whether a coarse backstop is needed**, and this is the phase's one remaining decision. A handle is discardable: someone who throws it away gets a fresh allowance. A ceiling on something the caller does not choose, their network address being the only real candidate, closes that at the cost of punishing everyone behind a shared address. Judge it against R22: once only the application's own compiled-in queries can run, the worst an attacker can do is volume of known-cost work, which may make a backstop unnecessary. Decide it with that in hand rather than before.
+5. **Decide whether a coarse backstop is needed**, and this is the phase's one remaining decision. A handle is discardable: someone who throws it away gets a fresh allowance. A ceiling on something the caller does not choose, their network address being the only real candidate, closes that at the cost of punishing everyone behind a shared address. It used to say to judge this against R22, on the grounds that only compiled-in queries would run and the worst case would be volume of known-cost work. R22 is deleted, so **the worst case is arbitrary-cost work and the backstop has to be judged on its own merits.**
+6. **Stop returning the backend's own error text to the caller**, inherited from R22 when that phase was deleted and placed here because it is the same subject, what a caller can extract from the server. Four sites in `crates/connetto-server/src/session.rs`: `:1439` `subscription rejected: {err}`, `:1467` `snapshot failed: {detail}`, `:1708` and `:1767` `aggregate bootstrap failed: {err}`. At the first, `err` is subql's `RegisterError`, rendering `Unknown table: {0}`, `Unknown column '{column}' in table {table_id}` and `AggregatorOnRlsTable`, so a caller enumerates the schema one guess at a time and learns which tables carry row-level security. **Not an authorization hole**, since a policy still decides what is readable, but the shape of the database leaks before any policy is consulted. The refusal must not distinguish absent from present, matching the discipline R3 applies to a refused grant.
 
 ### Proof
 
 A caller exceeding the subscription-creation limit is refused rather than served slowly, asserted per tier. **The limit holds across a reconnection**, which is the property `connection_num` would fail and therefore the test that pins step 4.
 
+For step 6, a subscription naming a table that does not exist and one naming a table that does but fails for another reason produce a **byte-identical** refusal, asserted rather than assumed, since indistinguishability is the whole property. No `RegisterError` text reaches the wire from any of the four sites.
+
 ### Done when
 
-Subscription creation, connection rate and the auth endpoints are all metered, the two tiers are distinguishable in a test, and the anonymous key survives reconnection.
+Subscription creation, connection rate and the auth endpoints are all metered, the two tiers are distinguishable in a test, the anonymous key survives reconnection, and no refusal carries backend error text.
 
 ---
 
@@ -1126,7 +1259,9 @@ Import, and device-to-device transfer. The latter is `R25`, exploratory and expl
 
 **Status.** NOT STARTED
 
-**Blocked on R6, R22, and a subql change (`docs/upstream-subql-membership-term.md`).** R22 is a new dependency: the evaluation question is now settled as one filter compiled to two executors, and compiling a subscription filter requires the query set to be known ahead of time, which is what R22 establishes. Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
+**Blocked on R6 and a subql change (`docs/upstream-subql-membership-term.md`).** Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
+
+**It used to be blocked on R22 as well, and that dependency is void since R22 was deleted on 2026-08-05.** The underlying requirement is unchanged and is now R27's own: the evaluation question is settled as one filter compiled to two executors, and compiling a subscription filter needs the query set known ahead of time. What is refused is the mechanism R22 proposed, a curated set somebody maintains. R27 derives what it needs automatically from the queries the application already wrote, designed against this concrete use rather than in the abstract, which is the only reason the requirement exists at all.
 
 ### Purpose
 
@@ -1160,9 +1295,13 @@ Output-shape joins. The single-table boundary is a decision, not a limitation to
 
 ## R28: the subscribe-time delivery gap
 
-**Status.** NOT STARTED. **Demonstrated 2026-08-01 against `2e671a8`**: a failing test committed a change while a gated snapshot was in flight and the client never received it (the control variant, dispatched after `SnapshotEnd`, passed). Test preserved at `~/github/connetto-r28-snapshot-delivery-gap.rs`, rerunnable by dropping it into `crates/connetto-server/tests/` with the usual throwaway Postgres.
+**Status.** Part A **DONE** (2026-08-03). Part B NOT STARTED.
 
-**Blocked on nothing.** A defect, found while pinning open question 1 of `docs/architecture/10-subscription-materializer.md`. It loses data on every fresh subscription, so it is not discretionary.
+**Split into two parts on 2026-08-03.** Part A is the row subscription's route ordering, which is the demonstrated defect and everything below unless a step says otherwise. Part B is the two aggregate subscribe paths, which part A reads and deliberately leaves alone: they install their route before sending the initial value, so they do **not** have part A's defect, but that means an aggregate's initial value can be preceded on the wire by a folded update, and whether that matters depends on how the client treats a partial result against a full one. Part A states that in place rather than leaving the omission to be read as an oversight.
+
+**Part A is demonstrated, 2026-08-01 against `2e671a8`**: a failing test committed a change while a gated snapshot was in flight and the client never received it, while the control variant, dispatched after `SnapshotEnd`, passed. Test preserved at `~/github/connetto-r28-snapshot-delivery-gap.rs`, rerunnable by dropping it into `crates/connetto-server/tests/` with the usual throwaway Postgres. **It no longer compiles against `72a6c91`**, with three mechanical breaks from R2, R3 and R4: `SnapshotSource::snapshot` takes a `Principal` rather than an `AuthContext`, `Handshake::new` takes two arguments rather than three, and `SessionManager::new` takes six rather than five because the authority has no default.
+
+**Both parts are blocked on nothing.** Part A is a defect, found while pinning open question 1 of `docs/architecture/10-subscription-materializer.md`. It loses data on every fresh subscription, so it is not discretionary. Part B is an ordering question rather than a demonstrated defect, so it is sequenced after part A and may conclude that nothing needs changing.
 
 ### Purpose
 
@@ -1176,23 +1315,66 @@ Output-shape joins. The single-table boundary is a decision, not a limitation to
 
 ### Steps
 
-1. **Install the route before reading the snapshot** in `snapshot_row`, mirroring `catch_up_row`.
-2. **Discard the overlap on the client.** Step 1 deliberately produces live patches for changes the snapshot already contains, which is exactly the case `04-subscriptions.md` covers with "any `LivePatch` frames with `lsn <= snapshot_lsn` are discarded". The client does not implement this: `pump_one` applies every `LivePatch` unconditionally. **These two steps must land together**, because either alone is wrong: step 1 without step 2 double-applies, step 2 without step 1 changes nothing.
-3. **Reconcile `04-subscriptions.md` with whichever buffering the client actually adopts.** That chapter also says the client "buffers updates received during snapshot delivery and applies them after `SnapshotEnd`", which is a second unimplemented claim in the same paragraph, and the discard rule alone may make the buffer unnecessary.
+1. **Install the route before reading the snapshot** in `snapshot_row`, mirroring `catch_up_row`. **Done.** Both row paths now share `SessionManager::attach_row_route`, which installs the route and records the subscription, so the two cannot drift apart again. Installing it first means a snapshot failure can now leave a live route behind, so `handle_subscribe`'s `SessionError::Snapshot` arm drops the `state.subs` entry alongside the route it already removed.
+2. ~~**Discard the overlap on the client.**~~ **Dropped, and deliberately so. Decided with the maintainer 2026-08-03 after measuring that the rule loses data.** The rule this step called for, discard any `LivePatch` at or below the snapshot's LSN, cannot be implemented correctly with the numbers the two sides carry. `SnapshotEnd.cursor` is `pg_current_wal_lsn()` read after the rows inside a `REPEATABLE READ` transaction (`crates/connetto-server/src/snapshot.rs:181-217`), and a `LivePatch` cursor is the change record's WAL position (`materializer.rs:633-636`). Neither orders by visibility. **Measured on a throwaway Postgres 16**: writer A opened a transaction and inserted row 1, writer B inserted row 2 and committed, a subscriber snapshotted and saw only row 2 while reporting `0/151BA18`, then A committed and the stream reported A's insert at `0/151B868`. The filter would have discarded row 1 permanently, so step 2 as written relocates R28's own defect from the server to the client rather than completing the fix. The overlap is re-applied instead: patches arrive in commit order, so the last one applied for a row carries its current value and the replica converges. Cost accepted: a row can briefly show an older value, and the resume cursor moves backwards for that moment, which replays rather than loses. Making the filter correct would need the change stream to report commit positions (an upstream change to `pg_walstream` and `subql`) and the snapshot paired with a replication slot's consistent point, which buys only the removal of the flicker.
+3. **Delete the client-buffer sentence from `04-subscriptions.md`, and record why.** **Done.** No buffer is needed and none is built. Ordering is guaranteed by the shape of the run loop, which is a single two-armed `tokio::select!` whose transport arm awaits the snapshot delivery, so the arm draining outbound live patches is not polled meanwhile and overlapping patches reach the wire only after `SnapshotEnd`, in order. The chapter says so and the loop now carries the comment, because a future change moving the snapshot send onto its own task would break the guarantee with no test failing.
+4. **Read both aggregate subscribe paths and state in the phase that they are out of scope, with the reason.** **Done, and confirmed by reading.** `subscribe_aggregate` installs its route before sending the initial value, and `subscribe_delta_aggregate` does the same, so neither carries part A's defect and neither was touched. The residual ordering question, whether an aggregate's initial value can be preceded on the wire by a folded update, is part B's. **The relay was read too and is also clean**: `handle_tab_subscribe` in `crates/connetto-web/src/relay.rs` calls the synchronous `serve_snapshot` and then `tab.subs.push` with no await between them, so the window is zero by construction rather than by care.
 
 ### Proof
 
-Commit a change while a snapshot is in flight and prove the subscribing client ends with it. The test has to hold the snapshot open long enough for the write to land inside the window, so the snapshot source needs a delay seam. **Run it against the current code first and watch it fail**, because a race test that has never failed proves nothing.
+Both proofs live in `crates/connetto-client/tests/loop_emu.rs`, asserting on the client's replica rather than on wire frames, because a re-applied insert resolves silently under the `server_wins` conflict policy and only the row contents show it. `GatedSnapshot`, carried over from the preserved reproduction, holds the snapshot read open so the window is controlled rather than raced.
 
-Then prove the overlap is not double-applied, by committing a change after the route exists but before the snapshot is read and asserting the row appears exactly once.
+`a_change_committed_during_the_snapshot_reaches_the_replica` commits a change inside the window and asserts the row reaches the replica. **Run against `72a6c91` first and watched fail**, with the replica holding only the seed row and the contested row absent. It passes with the route installed first.
+
+`the_snapshot_overlap_converges_on_the_later_value` changes one row twice inside the window against a snapshot that already carries the later value, so the client applies the snapshot and then both patches. The row appears exactly once, at the later value. This one passes before the fix as well, by arriving vacuously: its job is to guard the re-application step 2 chose, not to demonstrate the gap.
 
 ### Done when
 
-A change committed at any point during subscription setup reaches the client exactly once, proved by a test that fails before the fix. `04-subscriptions.md` describes what the code does.
+**Met.** A change committed at any point during subscription setup reaches the client exactly once, proved by a test that fails before the fix. `04-subscriptions.md` describes what the code does, including why no discard rule exists.
+
+### Found while proving this, and not folded in
+
+**A live update touching only columns absent from the subscription's `WHERE` clause is never delivered.** Under `SELECT * FROM orders WHERE quantity > 0`, `UPDATE orders SET status = 'v2'` produced no matched consumer at all, so no patch was built and the replica kept the stale value. The same statement also touching `quantity` arrives normally. `Materializer::dispatch` does no column filtering, taking `engine.inserted()`, `engine.updated()` and `engine.deleted()` verbatim from `subql`'s `consumers(event)` (`materializer.rs:666-695`), so the empty list comes out of `subql`. Observed through the full stack. A minimal `Materializer`-only reproduction needing no Postgres is preserved at `~/github/connetto-subql-nonpredicate-update.rs` but **has not been run**, and it is not established whether `subql` intends this or whether it survives real `pgoutput` rather than the emulator's `REPLICA IDENTITY FULL` shape. The convergence test above was written onto a predicate column because of it.
+
+**Delivered cursors are not monotonic across interleaved transactions.** The same Postgres probe showed transaction 733 delivered at `0/151B958` before transaction 732 at `0/151B868`, because the stream is ordered by commit while the positions are change-record ones. `Materializer::advance_cursor` rejects a non-monotonic advance and `dispatch_event` propagates that with `?`, which would end the whole ingest loop. Reasoned from the code, not demonstrated.
 
 ### Why this is separate from R6
 
 R6 is about which version of a row is authorized on the change path. This is about a route that does not exist yet, so it drops rows nobody disputes the client may see. Same file, same loop, unrelated causes, and this one needs neither R5b nor the change log.
+
+---
+
+## R33: the snapshot completion frame overtakes its own data
+
+**Status.** NOT STARTED. **Reasoned from the code on 2026-08-03, not demonstrated.** The client half in particular is inference: the paths were read, nothing was run.
+
+**Blocked on nothing.** Found while reading `snapshot_row` for R28 part A, and separated from it deliberately. Same function, different cause and different consequence: R28 part A drops live patches because a route does not exist yet, this one persists a resume position ahead of the data it names. That is a durability failure rather than a delivery one, and the two fixes share no test.
+
+### Purpose
+
+**The frame announcing that a snapshot is complete can reach the client before the snapshot does.** `SnapshotPatch` travels on the bulk plane through `enqueue_and_flush` (`crates/connetto-server/src/session.rs`), which pushes onto `pending` and releases frames only while credits remain. Credits start at `SessionConfig::initial_credits`, 64 by default, and are replenished only by the client's own `AckCredits`. `SnapshotEnd` is a control frame and goes out through `send_control` immediately, bypassing that queue by design, because flow control bounds bulk data rather than control.
+
+So a client that has fallen 64 bulk frames behind is told the snapshot is complete while its rows are still queued behind its own acknowledgements.
+
+**On the client that is worse than an ordering oddity.** The `SnapshotEnd` arm of `handle_control` in `crates/connetto-client/src/lib.rs` persists the cursor and sets `last_cursor`, so the resume position lands before the rows it claims. A process dying in that window restarts from a position naming changes it never applied, and nothing detects it, which is the same silent shape as R28 part A by a different route.
+
+### Steps
+
+1. **Demonstrate it first.** Hold a client below its credit limit, subscribe, and assert the frame order and then the durability consequence. If the reasoning is wrong the phase dissolves, which is the cheapest possible outcome and worth buying before anything is designed.
+2. Decide the fix from what the demonstration shows. The obvious candidates: flush `pending` to completion before sending `SnapshotEnd`, or withhold `SnapshotEnd` until the subscription's own snapshot frames have left. **Do not route `SnapshotEnd` through the bulk queue**, which would make a control frame consume credits and change what flow control means.
+3. Whatever the fix, the client must never persist a resume position for data it has not applied. State that as an invariant wherever the cursor is written, because it is the property that makes this a defect rather than a latency question.
+
+### Proof
+
+A client held below its credit limit receives its snapshot rows before it is told the snapshot ended, proved by a test that fails before the fix. And the invariant in step 3 is asserted rather than described.
+
+### Done when
+
+The completion frame cannot precede the data it completes, and no path persists a resume position ahead of the rows it names.
+
+### Why this is separate from R28
+
+R28 part A is about a route that does not exist yet, so patches are produced and thrown away. This is about two planes with different flow-control rules, so a frame that exists is delivered too early. Same file, same function, unrelated causes, and R28's own separation from R6 rests on exactly that distinction.
 
 ---
 
@@ -1423,6 +1605,74 @@ A server started against a database with no slot refuses and names it. With a ca
 ### Done when
 
 A deployment following the guidance cannot lose changes silently to a slot invalidation, and cannot discover a missing slot any way except the startup refusal naming it.
+
+---
+
+## R36: abuse detection, identity bans, and the enforcement callback
+
+**Status.** NOT STARTED
+
+**Blocked on R19**, which builds the counters this phase reads. Designed with the maintainer on 2026-08-05, and every decision below is taken.
+
+### Purpose
+
+R19 bounds how *much* a caller may ask for. Nothing anywhere reacts to *what* they asked for. A caller who stays under the rate limits may name one nonexistent table after another indefinitely, and probing is precisely the behaviour that produces refusals, so the one signal that says "this caller is doing something they should not" is the one signal nothing reads. Banning does not exist in any form: no table, no check, no concept.
+
+### Decided 2026-08-05
+
+1. **What counts as a refusal is four events, and reads are deliberately excluded.** An invalid share key (`resolve_grants` in `session.rs`, already logged as `grant refused`), a subscription naming a table or column that does not resolve, a write the policy rejects (`WriteError::Unauthorized`), and a failed login. Each is an act of naming something precise and being told no. **Rows omitted from a read never count.** A read denial is silent by principle 4 of `08-authorization.md`, it happens to everyone constantly, and its volume scales with how much data exists rather than with anyone's behaviour, so counting it would measure the database and ban every honest user. Accepted cost: a caller who probes only by reading, watching rows appear and vanish within what they may already see, generates nothing countable and is invisible here.
+2. **The application is asked, not told, and the default answer accepts what connetto proposes.** One trait method, given the caller, the signal, the threshold crossed and the counts, returning the verdict. It has a **default body** that returns connetto's own proposal, so an application that does not care gets automatic behaviour with nothing to implement, and one that does care overrides one method. This is the "both" outcome without two code paths: there is one path, and the default is the automatic one. **A veto-shaped variant was considered and rejected** as being this option wearing a disguise, plus a rarely-run second path.
+3. **The verdict carries the duration**, because the application is asked rather than told, so it can make the ban fit the offence.
+4. **A ban takes effect immediately and is refused at the door afterwards.** The live connection closes the moment the ban lands, reusing `SessionManager::close_session(id, FatalErrorReason::...)` exactly as the revocation hook already does from `connetto-server.rs:421`, fired on a spawned task so nothing blocks. Later connections are refused at handshake. **Next-connection-only was rejected**: connections here are long-lived by design, so a ban the target outlasts by simply not reconnecting is useless against the case it exists for.
+5. **Bans name identities only. connetto never bans an address.** An address ban must be enforced at the highest level possible or it is worthless: by the time connetto could consult a list it has accepted the connection, completed the WebSocket upgrade and allocated a session, which is the whole cost the attacker wanted to impose. That work belongs to the edge, which drops it before it costs anything. **An earlier version of this decision had connetto capture addresses and ban them, and it was reversed on 2026-08-05.** What killed it: the socket address is the proxy's when anything sits in front, the real address arrives only in a header, a header is text anyone can write, and believing one would let a stranger get an arbitrary third party blocked at the edge. That is an amplification attack built by us. The plumbing is also non-trivial, since `transport.rs` uses `accept_async`, which discards headers, so it would mean moving to `accept_hdr_async` plus a trusted-proxy configuration. Against all that, the payoff largely evaporates once R19 step 6 lands: anonymous probing is only attractive because refusals currently say `Unknown table: {0}`, and uniform refusals mean probing teaches nothing. So volume and addresses are the edge's job, identities are connetto's, and the callback is how an address reaches the edge if an application wants that.
+6. **Imposing or lifting a ban is recorded in `auth_events` as a fourth `op` value.** It is a rare change to who can reach what, which is that table's definition, and R13 exists precisely so this history is not scattered across the features that produce it.
+7. **The configuration is a chain of calls, and that is the codebase's new direction.** The maintainer chose it over the plain struct that all five existing configuration types use, on the strength of this one being nested rather than flat: thresholds per signal across two tiers of caller. Converting the existing five is R37 and deliberately not this phase.
+8. **Grounds stay a bounded set of named signals with numeric thresholds.** Refusals, subscriptions, handshakes and failed logins, each per window, per tier. **Not a predicate language.** A chain of calls invites growing into arbitrary expressions, and that is a policy engine, which this project already decided lives in RLS and OpenFGA. A second rule language beside them is the thing to avoid.
+
+### Steps
+
+1. Count the four signals from decision 1, in memory, keyed by the same session handle R19 step 4 already chose, per tier.
+2. The configuration type from decisions 7 and 8, with the chain of calls, refusing a contradictory combination when it is finished rather than at use.
+3. The enforcement trait from decisions 2 and 3, with its defaulted method. **Off the synchronous path**, on a spawned task, for the reason `08-authorization.md` already gives for audit writing: an application's slow answer must not delay the caller, and an attacker triggering many enforcement events must not be able to turn the defence into the amplifier.
+4. The ban table as a deployment-facing schema contract: a trait and a convenience macro beside `ConnettoStoreSchema`, `ConnettoWatermarkSchema` and R13's. connetto emits no server DDL. Columns: the identity in the deployment's own id type, the reason, when it started, and a **nullable** expiry, where null is permanent, so a timed ban lapses declaratively and connetto needs no scheduler.
+5. Check the ban at handshake, and close live connections on impose, per decision 4.
+6. Emit the fourth `auth_events` op on impose and on lift, per decision 6.
+
+### Proof
+
+A caller crossing a configured threshold is banned, its live connection closes, and its next handshake is refused. An application overriding the trait method changes the outcome, and one that does not gets connetto's proposal. A ban with an expiry stops applying once it passes, with nothing having run to lift it. **Filtered reads drive no counter**, asserted rather than assumed, since that is the assertion standing between this feature and banning every honest user. Both the impose and the lift appear in `auth_events`.
+
+### Done when
+
+All of the above pass, and no path in connetto bans or blocks an address.
+
+---
+
+## R37: one configuration style across the codebase
+
+**Status.** NOT STARTED
+
+**Blocked on R36**, which establishes the style by being the first to use it.
+
+### Purpose
+
+R36 introduces a chain of calls for its settings, chosen deliberately by the maintainer on 2026-08-05 as the codebase's direction. The five configuration types that exist today are all the other shape, a plain struct of public fields with a `Default`, written by naming only what changes: `SessionConfig` and `ReconnectPolicy` (`session.rs`), `OplogConfig` (`oplog.rs`), `AuthConfig` (`authn/token.rs`) and `OidcProviderConfig` (`authn/provider_oidc.rs`). Two styles for one job means every later settings type has to pick a side with no rule saying which, and that ambiguity is what persists.
+
+**Decided 2026-08-05: convert all five, in a phase of its own rather than opportunistically.** Converting them as files happen to be touched was considered and rejected: nothing forces it, so it is easy to forget and the two styles coexist indefinitely. Doing it inside R36 was also rejected, because it expands a phase about abuse detection into a rewrite of unrelated working code.
+
+### Steps
+
+1. Convert the five, keeping every default identical.
+2. Update every construction site, including tests and the example programs.
+3. `OidcProviderConfig` is the one that most benefits, with seven fields, one optional, one a list and one an enum, so do it first and let it shake out the pattern.
+
+### Proof
+
+The gate passes with no behaviour change. No `..Default::default()` construction of these five remains, and no plain-struct configuration type is left in the server or the client.
+
+### Done when
+
+One configuration style exists in the codebase.
 
 ---
 

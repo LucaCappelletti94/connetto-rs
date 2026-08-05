@@ -28,12 +28,12 @@ Authentication answers "who is this caller." Its output is a `Principal` carryin
 
 ## Principles
 
-1. **Identity is derived from a credential the server can verify, never from a client-supplied string.** The client id stays a logging and correlation label only.
+1. **Identity is derived from a credential the server can verify, never from a client-supplied string.** The client id is a logging and correlation label to the server, which keys nothing on it. **One exception, and it is not the server (R35).** The browser relay hub keys each tab's durable write counter and its lock on the tab's client id, so there it is an identity and the hub requires a UUID, refusing a handshake that does not parse as one. A tab that cannot name itself uniquely would otherwise share another tab's write counter, which decides whether its writes count as already applied.
 2. **connetto is the OAuth client, not the browser or the native app.** The backend runs the OAuth flow and mints its own session credential. Provider tokens never reach the frontend.
 3. **Authentication gates sync, never local reads.** The local replica is readable and writable offline with no valid credential. Only the server connection requires authentication.
 4. **Token expiry while offline is a designed state, not an error.** The app keeps working locally, and re-authentication resumes sync.
 5. **Asymmetric algorithms only, with issuer and audience pinned.** The `none` algorithm is rejected, and a symmetric algorithm verified with a public key is rejected. Issuer and audience are always checked.
-6. **The verification seam is pluggable and mirrors `AuthPolicy`.** A trait with a real implementation and a permissive stand-in, so tests and local loops need no live identity provider.
+6. **The verification seam is pluggable and mirrors the authorization one.** A trait with a real implementation and a permissive stand-in, so tests and local loops need no live identity provider.
 
 ---
 
@@ -99,8 +99,8 @@ CREATE TABLE connetto_sessions (
     session_id           UUID PRIMARY KEY,
     user_id              <IdSqlType> NOT NULL REFERENCES your_users (id),
     current_refresh_hash BYTEA NOT NULL,
-    idle_deadline_ms     BIGINT NOT NULL,
-    absolute_deadline_ms BIGINT NOT NULL,
+    idle_deadline        TIMESTAMPTZ NOT NULL,
+    absolute_deadline    TIMESTAMPTZ NOT NULL,
     revoked              BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -109,7 +109,7 @@ CREATE TABLE connetto_provider_tokens (
     issuer        TEXT NOT NULL,
     access_token  TEXT NOT NULL,
     refresh_token TEXT,
-    expires_at_ms BIGINT
+    expires_at    TIMESTAMPTZ
 );
 
 CREATE TABLE _connetto_mutations (
@@ -132,7 +132,7 @@ OIDC standardizes assurance signaling. A deployment can require step-up authenti
 
 ## Server verification seam
 
-Two seams, both mirroring the `AuthPolicy` pattern of a trait plus a permissive stand-in.
+Two seams, both mirroring the authorization pattern of a trait plus a permissive stand-in.
 
 At the login callback, the `IdentityProvider` registry verifies the provider token and the mapper resolves the identity. **Built (R1).** `PermissiveProvider` is deleted. The replacements are the `oauth2-test-server` fixture and the `dev_idp` example. An unrecognised `CONNETTO_OIDC_PROVIDER`, including an unset or miscapitalised one, is a startup error rather than a fall-through to a permissive default, because the old fall-through meant a capitalised provider name yielded a deployment that minted real signed tokens in which every user was the same dev identity.
 
@@ -298,6 +298,6 @@ See `open-questions.md` section 11, where Q11.1 through Q11.4 are resolved: cons
 
 ## Notes
 
-- The verifier seam mirrors `AuthPolicy` deliberately, so authentication and authorization share one pluggability idiom (a trait, a real implementation, a permissive stand-in) even though authentication is resolved once per connection and authorization fires per row.
+- The verifier seam mirrors the authorization seam deliberately, so authentication and authorization share one pluggability idiom (a trait, a real implementation, a permissive stand-in) even though authentication is resolved once per connection and authorization fires per row.
 - The two store variants are not only a storage-location choice, they are the single-server-ephemeral versus durable-and-mesh-capable choice, and the deterministic-mapping versus account-linking choice. A single-provider or simple deployment uses the in-memory store and deterministic mapping. The moment one human may hold several logins, or the deployment needs durability or a mesh, the database store is required, which is why both ship.
 - Putting connetto on the OAuth-client side is what makes the browser story simple. Every hard part (secrets, provider verification, token minting, JWKS handling) lives on the backend where it is trivial, and the frontend holds only a credential connetto can revoke by deleting a row.

@@ -37,7 +37,7 @@ Define how permissions are enforced on reads (snapshot delivery and change deliv
 | yes | none | whatever the identity grants | where the identity grants it |
 | yes | some | the union | the union |
 
-**Fixed (R1, R2, R3, R4).** The caller used to be an `AuthContext` with a mandatory user id, so a caller with no identity was impossible to express and one was invented from the client's own handshake string. `AuthPolicy`, `SnapshotSource` and the write target all take a `Principal` now. Every row of the table above is load-bearing: R3 carries the accepted subjects and R4 binds them into the read, the write and the change path, so a caller with no identity and one share key reads and writes exactly what that key's relations allow.
+**Fixed (R1, R2, R3, R4).** The caller used to be an `AuthContext` with a mandatory user id, so a caller with no identity was impossible to express and one was invented from the client's own handshake string. The visibility policy, `SnapshotSource` and the write target all take a `Principal` now. Every row of the table above is load-bearing: R3 carries the accepted subjects and R4 binds them into the read, the write and the change path, so a caller with no identity and one share key reads and writes exactly what that key's relations allow.
 
 **Decided (R8).** An identity carries a user id and nothing else. `tenant_id`, `roles`, and `claims` are deleted, because they were written and never read, and because tenant and role both belong in the authorization model rather than on the session. `open-questions.md:283` decided the first and `rls2fga` requires the second, emitting a `pg_role` type with a `member` relation and stating that the deployment must load records mapping users to Postgres roles.
 
@@ -81,15 +81,17 @@ The direction of the failure is what makes the rule absolute rather than advisor
 
 ### Where the check lives
 
-**Decided (R5a).** The visibility trait is defined in `subql`, which holds the replication connection and already computes previous-versus-current transitions per subscriber. `subql` ships a ready-made implementation backed by OpenFGA, and a downstream user may implement the trait itself. connetto's `AuthPolicy` (`crates/connetto-core/src/traits.rs`) is superseded by it.
+**Decided (R5a).** The visibility trait is defined in `subql`, which holds the replication connection and already computes previous-versus-current transitions per subscriber. connetto's `AuthPolicy` (`crates/connetto-core/src/traits.rs`) is superseded by it. **R5a lands the trait and nothing behind it:** `subql` is `no_std`-capable, so an authorization-service client is a network dependency it does not take on for a seam relocation, and the implementation R5a puts behind the trait uses Postgres row-level security and lives here, because binding a caller into a database session is deployment-specific identity policy. **Decided (R5b):** the OpenFGA-backed implementation `subql` ships arrives with the executor swap, not with the seam. An earlier version of this paragraph attributed it to R5a, which contradicted R5a's own step 3.
 
 **Decided (R5a).** The seam relocation is a separate phase from the executor swap (R5b). It is blocked on nothing, and the implementation behind the trait initially still uses Postgres RLS, so the phase changes no behaviour. It goes first because the measurement (R0) instruments a seam that must not then relocate, and because relocating first reduces R5b to substituting an implementation rather than restructuring a call path.
 
 **And the measurement must count the round trip, not the seam.** The trait is answered once per changed row for every watcher at once rather than once per watcher, so from R5a onward one entry to the seam is not one question to the backend: the RLS implementation behind it still opens one transaction per watcher inside its own loop. A counter left at the seam would read one per event from the day R5a ships, and R5b's entire acceptance criterion, that the counter stops growing with subscriber count, would then be satisfied by a phase that removed no round trips at all. This is the concrete form of the sentence above about instrumenting a seam that must not relocate, and it is easier to get wrong than that sentence suggests.
 
-That direction is chosen because the trait has callers on both sides. `SessionManager::dispatch_event` and `SessionManager::catch_up_row` in `crates/connetto-server/src/session.rs` are on the change and catchup paths and the first moves into subql, while `SessionManager::every_op_authorized` in `crates/connetto-server/src/session.rs` is on the write path and stays in connetto. Defining the trait low and consuming it upward serves both. It also follows an idiom subql already uses twice: query re-execution works by subql asking the caller through a `Connector`, because the query and its retry belong to the caller (`subql.md:13`).
+That direction is chosen because the trait has callers on both sides, and there are four rather than three. On the change path, `SessionManager::dispatch_event` asks one question naming every watcher of the event. On the catchup path, `SessionManager::catch_up_row` asks about one watcher per replayed record. On the write path, the per-op loop in `SessionManager::handle_mutation` asks the write question. And the minting path, `CapabilityIssuer::issue`, asks the read question about the row it is being asked to share. All four are in `crates/connetto-server`. Defining the trait low and consuming it upward serves them all, and it follows an idiom subql already uses twice: query re-execution works by subql asking the caller through a `Connector`, because the query and its retry belong to the caller (`subql.md:13`).
 
-`RlsAuth` does not survive as an implementation of that trait, which refines an earlier reading. RLS survives, `RlsAuth` does not. Its `can_read` exists only for the change path that is moving, and its `can_write` returns true unconditionally. RLS continues to filter the snapshot through `PgSnapshotSource` and to gate the write through `PgWriteTarget`, both of which bind `app.user_id` directly (`PgSnapshotSource::snapshot` in `crates/connetto-server/src/snapshot.rs`, `PgWriteTarget::commit` in `crates/connetto-server/src/write_target.rs`) and never go through the trait.
+**Built (R5a, 2026-08-04).** The trait is `subql::visibility::VisibilityPolicy`, with `may_see` over many watchers and `may_write` over one, and the row arriving as a `RowView` bound to one version. connetto's `AuthPolicy` is deleted. `RlsAuth` implements the trait as the row-level-security answer and is what R5b dissolves, so the earlier reading that R5a itself dissolves it was wrong: RLS survives either way, and `RlsAuth` survives until the executor changes. RLS also continues to filter the snapshot through `PgSnapshotSource` and to gate the write through `PgWriteTarget`, both of which bind the caller directly and never go through the trait.
+
+**A failure denies one watcher, not the event.** The caller pre-fills the verdict buffer with denials, and `RlsAuth::may_see` writes only the grants, carrying on past a watcher whose round trip failed rather than returning. It returns an error only for what is identical for every watcher, a key cell that will not decode or a key type it cannot bind. That reproduces exactly the granularity the per-subscriber check had, which is what makes the relocation behaviour-preserving.
 
 **The architecture diagram is stale on this point.** It labels the OpenFGA integration as living in connetto-server's materializer.
 
@@ -124,7 +126,7 @@ Forwarding every tombstone is what actually withdraws deleted rows, so the withd
 
 The other direction is the worse one. An update whose current version is invisible is silently dropped, so **a caller who loses access to a row keeps the last version it saw, in its local copy, forever.** Nothing withdraws it. That is a leak rather than a missing feature, and it is why R6 is not merely a documentation mismatch.
 
-**The previous version has to come from somewhere, and RLS cannot supply the answer at all.** `RlsAuth::can_read` runs `SELECT EXISTS(SELECT 1 FROM tbl WHERE pk = ..)` against the live table (`crates/connetto-server/src/auth.rs`), so for an update it can only answer about the current version, and for a deletion the row is gone and it answers false for everyone. R6 is therefore hard-blocked on R5b rather than merely expensive without it. `AuthPolicy::can_read(principal, table, pk)` also has no way to say which version is meant, which is a second reason the trait changes.
+**The previous version has to come from somewhere, and RLS cannot supply the answer at all.** `RlsAuth::may_see` runs `SELECT EXISTS(SELECT 1 FROM tbl WHERE pk = ..)` against the live table (`crates/connetto-server/src/auth.rs`), so for an update it can only answer about the current version, and for a deletion the row is gone and it answers false for everyone. R6 is therefore hard-blocked on R5b rather than merely expensive without it. The trait itself does name the version, since R5a: a question is asked about whichever `RowView` the caller hands over, and `EventRow::previous` builds the one bound to the pre-image. What is missing is a backend that can answer about it.
 
 **Decided (R6).** The previous version comes from the change log, which requires `REPLICA IDENTITY FULL` on every replicated table. `DEFAULT` records only the primary key columns and records nothing at all when a table has no primary key. This becomes a deployment requirement checked at startup in R6, with a refusal to start when a replicated table lacks it. Every existing test fixture already sets it (`cdc_ingest_reconnects_after_walsender_drop` in `crates/connetto-server/tests/cdc_reconnect.rs`, `reset_fixture` and `e2e_rls_write_enforced_owned_lands_foreign_refused` in `crates/connetto-server/tests/e2e.rs`, and `Fixture::start_replication` in `crates/connetto-test-harness/src/lib.rs`) and nothing checks it, so the change is turning an accident into a requirement. The alternative, keeping a server-side copy of every replicated row, trades a schema requirement for a second copy of the customer's data and is rejected.
 
@@ -172,7 +174,7 @@ Two constraints, both verified. The preference is chosen per request and not per
 
 ## Write authorization
 
-**Built, defective.** `AuthPolicy::can_write` returns `Ok(true)` while ignoring all four of its arguments, in both production implementations (`PermissiveAuth::can_write` and `RlsAuth::can_write` in `crates/connetto-server/src/auth.rs`). The call path is live: `crates/connetto-server/src/session.rs` calls it once per operation inside `every_op_authorized`, and a test policy that denies proves a denial yields `Unauthorized`. So it is a wired, tested hook with no policy behind it.
+**Built, defective.** `VisibilityPolicy::may_write` returns allowed while ignoring every argument, in both production implementations (`PermissiveAuth` and `RlsAuth` in `crates/connetto-server/src/auth.rs`). The call path is live: the per-op loop in `SessionManager::handle_mutation` calls it once per operation, and a test policy that denies proves a denial yields `Unauthorized`. So it is a wired, tested hook with no policy behind it.
 
 **It is not vestigial and must not be deleted.** It is the seam OpenFGA attaches to, and R5b is what puts a policy behind it.
 
@@ -194,7 +196,9 @@ A rejection returns a reason code and nothing about why beyond it.
 
 **Minting is a library call and this chapter authorizes it.** Creating a capability over a resource is itself an action needing authorization, because a caller must not share what it cannot read, and that check goes through the same trait as every other question here rather than being reimplemented by each application. Chapter 12 covers the wire shape, the grant list, and what the reply says about a refusal.
 
-**How the subject reaches a policy, on all three paths.** A policy compares against values the transaction bound, so the caller's identity and the keys it holds are bound as its first statement, by one shared `CallerBinding` (`crates/connetto-server/src/capability.rs`) that `PgSnapshotSource::snapshot`, `PgWriteTarget::commit` and `RlsAuth::can_read` all go through. One binding rather than three is the point: the snapshot and the change path are different executors and a caller bound in one but not the other would see a shared row once and never see it update, which is exactly the divergence "Why two executors is safe" warns about. The identity keeps `app.user_id` unchanged, and the keys travel as one packed value under a second setting, `app.subjects` by default, named and packed by the deployment's own key type through `CapabilityKey`. Chapter 12 has the shape and the reasoning.
+**Decided (R5a, 2026-08-04): the mint call reads the row, as the caller.** The question is about a row and the caller names only its key, so `CapabilityIssuer::issue` reads the row through a `RowSource` before asking, and hands the values over as the view. Two things follow, and the second is why the choice is not free. Values supplied by the caller are refused outright, because a caller that can state the row's contents can get an answer about a row that does not exist. And the read runs as the caller rather than through a role that sees everything, because otherwise a hidden row and an absent row are two different code paths, one running one query and the other two, which separates them by timing and turns minting into a probe for rows. The cost is that on this one path the fetch enforces the read and the question behind it can only agree, so the seam earns its place there at R5b rather than today.
+
+**How the subject reaches a policy, on all four paths.** A policy compares against values the transaction bound, so the caller's identity and the keys it holds are bound as its first statement, by one shared `CallerBinding` (`crates/connetto-server/src/capability.rs`) that `PgSnapshotSource::snapshot`, `PgSnapshotSource::read_row`, `PgWriteTarget::commit` and `RlsAuth::may_see` all go through. One binding rather than four is the point: the snapshot and the change path are different executors and a caller bound in one but not the other would see a shared row once and never see it update, which is exactly the divergence "Why two executors is safe" warns about. The identity keeps `app.user_id` unchanged, and the keys travel as one packed value under a second setting, `app.subjects` by default, named and packed by the deployment's own key type through `CapabilityKey`. Chapter 12 has the shape and the reasoning.
 
 **The row that grants a capability is authorized like any other row.** Connetto checks the caller may read the resource the mint call names, but the application writes the permission row itself, on its own connection, so what stops that row naming a different resource is a `WITH CHECK` on the sharing table requiring the shared row to be visible to the sharer. That is one policy source deciding both halves, which is this chapter's first principle rather than an extra mechanism.
 
@@ -212,7 +216,7 @@ File content authorization uses a short-lived signed token so that fetching a ch
 
 ## Cost on the change path
 
-**Built, defective, and this is the current scalability wall.** `can_read` fires once per row per subscriber (`SessionManager::dispatch_event` and `SessionManager::catch_up_row` in `crates/connetto-server/src/session.rs`), and each call takes a pooled connection, opens a transaction, runs `set_config`, runs a `SELECT EXISTS`, and commits, awaited one after another inside the fan-out loop.
+**Built, defective, and this is the current scalability wall.** The row-level-security implementation still runs one round trip per watcher, inside its own loop behind one question per event (`SessionManager::dispatch_event` and `SessionManager::catch_up_row` in `crates/connetto-server/src/session.rs`), and each one takes a pooled connection, opens a transaction, runs `set_config`, runs a `SELECT EXISTS`, and commits, awaited one after another.
 
 **The quantity that is most wrong is network round trips, but it is not the only one.** Authorization is currently K four-statement Postgres transactions, sequential, on the shared ingestion path, and that is the dominant term by three orders of magnitude. Delivery is K in-process channel sends, which is inherent. **What R16 part A established is that the work attached to those K sends is not.** Today each one carries a payload clone, a MessagePack re-serialization of that payload, and a second copy into the outgoing frame, so three full copies of the compressed patch per subscriber per event. Those scale with patch size as well as with K, which the round-trip comparison hides: at K=500 and a one megabyte patch they are three 500 MB passes against the 190 ms attributed to authorization. Both terms are worth fixing, and R16 part B chooses the shape for the second.
 
@@ -226,7 +230,7 @@ Caching then matters for the group questions rather than the per-row ones. A que
 
 **Precomputing a materialised permission set is not part of this design.** OpenFGA does not offer it, the two systems that do are unavailable to an open-source project (one is internal to its author and the other is a commercial early-access product), and demand-driven caching with changelog invalidation is a different and sufficient mechanism. If measurement ever shows a problem, the smallest correct addition is a local negative filter consulted before calling out, safe in exactly one direction because a probabilistic set has false positives and no false negatives, so it can only cause a redundant question and never a wrongful grant. Recorded as a contingency with a trigger: a measured change-path throughput below the deployment's requirement with batching and both caches enabled. Not before.
 
-**R5b is a correctness prerequisite, not a performance option.** `RlsAuth::can_read` runs `SELECT EXISTS` against the live table and can only answer about the row as it is now, while R6 needs an answer about the row as it was. No measurement can veto the swap, only decide whether R5b is sufficient.
+**R5b is a correctness prerequisite, not a performance option.** `RlsAuth::may_see` runs `SELECT EXISTS` against the live table and can only answer about the row as it is now, while R6 needs an answer about the row as it was. No measurement can veto the swap, only decide whether R5b is sufficient.
 
 ### An open dependency that blocks R5b
 
@@ -287,20 +291,38 @@ And a refused write must **not** be reported as unauthorized. Rejecting it that 
 
 **The values an event carries.** Every event carries what happened, and that is the only value required of it. Work serving one caller runs inside a named context opened once the handshake succeeds, carrying the durable session handle, the caller's identity, and the connection number, so every event emitted while serving that caller picks them up without the writing site naming them. An event outside any such context, which is where the server spends most of its life (startup, shutdown, the change stream, and every handshake refusal, since no session exists until a handshake succeeds), simply carries none of the three. **An absent value means absent, never a placeholder**: a stand-in handle on an event that belongs to no session is a fiction, and one this codebase has already paid to delete once. An event that has an outcome carries it.
 
-**Naming correction.** An earlier version of this chapter defined the table as `auth_log` while the Audit paragraph under "Deployment shape" in `11-authentication.md` and `open-questions.md` Q8.6 both call it `auth_events` and the first of them cites this chapter as the definition. `auth_events` is the name. The shape:
+**Naming correction.** An earlier version of this chapter defined the table as `auth_log` while the Audit paragraph under "Deployment shape" in `11-authentication.md` and `open-questions.md` Q8.6 both call it `auth_events` and the first of them cites this chapter as the definition. `auth_events` is the name. The shape, following the conventions the two built contracts in `11-authentication.md` already established:
 
+```sql
+CREATE TYPE connetto_auth_op AS ENUM (
+    'permission_change', 'session_revoked', 'model_change', 'banned', 'ban_lifted'
+);
+
+CREATE TABLE auth_events (
+    at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    session    UUID NOT NULL,
+    user_id    <IdSqlType>,
+    op         connetto_auth_op NOT NULL,
+    table_name TEXT,
+    pk         BYTEA,
+    allowed    BOOLEAN NOT NULL,
+    reason     TEXT
+);
 ```
-auth_events(
-  timestamp    TIMESTAMPTZ,
-  session      TEXT,     -- the durable session handle
-  user_id      TEXT,     -- absent for a caller with no identity
-  op           TEXT,     -- 'permission_change' | 'session_revoked' | 'model_change'
-  table_name   TEXT,
-  pk           BYTEA,
-  decision     TEXT,     -- 'allow' | 'deny'
-  reason       TEXT
-)
-```
+
+**Every column type here is a correction, and the reasons are worth keeping.** An earlier version of this block gave eight columns of which five were `TEXT`, including the two that hold closed sets. That was a sketch written before there was code to check it against, and it disagreed with the two contracts it says to sit beside.
+
+`session` is `UUID`, because the durable session handle is a `SessionId` and both tables that already store one declare it `UUID`. As `TEXT` it would need a cast to join against either of them.
+
+`user_id` is the deployment's own `<IdSqlType>`, the same placeholder `connetto_sessions` uses, because the identity type has been the deployment's choice since R8 and a second opinion about it here would be a second contract. Nullable, because a caller may have no identity.
+
+`op` is a Postgres enum type rather than text with the legal values written in a comment. The values are a closed set, connetto's own side is a Rust enum, and the point of a typed contract is that a value outside the set cannot be written by either end. A comment enumerating the legal values is a check nothing performs.
+
+**`banned` and `ban_lifted` were added on 2026-08-05**, for R36, which bans an identity when a caller repeatedly names something and is told no. A ban is a rare change to who can reach what, which is this table's definition, and it belongs here rather than only in R36's own ban table because that table holds current state with an expiry while this one is the append-only history, so an expired or lifted ban would otherwise leave no trace. **This is not a denial arriving after all**: the refusals that led to the ban still go to the log, one per attempt, and what is recorded here is the single durable decision they produced.
+
+`allowed` is `BOOLEAN`, replacing a `decision TEXT` holding one of two words. **Its presence is worth questioning rather than only its type**: denials do not come here by the split above, so every row would carry `true`, which is the shape of a column that is written and never read. The two ban values do not change that, since imposing and lifting are both changes that happened. R13 settles whether it survives.
+
+`table_name` stays text and `pk` stays bytes. A table name in an audit row is read by a person, so the catalog id it corresponds to would be both unreadable and unstable across a catalog change, and a primary key here is opaque bytes by construction. Both are nullable, because an invalidated login names neither.
 
 **A rejected grant goes to structured logging, not to this table.** It is a denial, and denials are high-volume by the split above, because a caller probing keys generates one per attempt. R3 makes the wire say nothing about a failed grant, so the log line is the only place the failure is visible and is therefore what makes it loud. An earlier version of this chapter listed `grant_rejected` in the column above, which contradicted the split in the same section. The split wins: it was a decision, the column list was a sketch.
 
@@ -324,11 +346,11 @@ No benchmark infrastructure exists in the workspace: no `benches` directory, no 
 
 - **Postgres RLS policy text is the source language, and there are two executors.** RLS answers set-shaped questions at snapshot time, permanently and by design. OpenFGA answers point-shaped questions on the change and write paths. `rls2fga` compiles both from one source, which is what makes two executors safe and makes the compilation load-bearing.
 - **Every policy translates, or the deployment supplied a mapping, or startup refuses.** No degradation and no tolerated divergence. `rls2fga` closes its coverage gaps upstream and exposes a seam for what it cannot classify. Dropping narrows rather than widens, so what this prevents is rows vanishing, not rows leaking.
-- **The visibility trait is defined in `subql`**, which ships an OpenFGA-backed implementation while leaving the trait open to downstream implementations. connetto's `AuthPolicy` is superseded. `RlsAuth` dissolves, RLS does not.
+- **The visibility trait is defined in `subql`**, which ships an OpenFGA-backed implementation while leaving the trait open to downstream implementations. connetto's `AuthPolicy` is gone (R5a). `RlsAuth` dissolves with the executor swap, RLS does not.
 - **Change-time authorization checks both versions of the row**, with the previous-version check conditional on the current version being absent or invisible. The current single check leaks in both directions.
 - **The previous version comes from the change log**, so `REPLICA IDENTITY FULL` is a startup-checked deployment requirement.
 - **And every table a policy reads must be in the publication**, startup-checked for the same reason: a permission change the stream does not carry is one the change-path executor never hears about, so it would answer from a store that quietly stopped being current.
-- **`AuthPolicy::can_write` survives** as the attachment point despite being inert today.
+- **The write question survives** as the attachment point despite being inert today.
 - **Capabilities are model relations, not a Postgres setting**, and are backed by Postgres rows like every other permission.
 - **A grant change is noticed on the Postgres change log** and answered with a per-subscription resync, never a synthesized deletion. Nothing polls the authorization service and it is never a notice source.
 - **Round trips per change event must not grow with subscriber count.** Authorization must not be K network round trips, so the question is asked once per distinct group or role the changed row grants to, cached with invalidation from the notice stream, and each subscriber is then decided locally. Batching alone does not satisfy this, because a cap of 50 turns K round trips into K over 50 and stays linear.

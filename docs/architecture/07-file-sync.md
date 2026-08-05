@@ -34,7 +34,7 @@ CREATE TABLE files (
   file_id      UUID PRIMARY KEY,
   path         TEXT NOT NULL,
   size_bytes   BIGINT NOT NULL,
-  content_hash TEXT NOT NULL,   -- e.g. SHA-256 hex or Blake3
+  content_hash BYTEA NOT NULL,   -- the digest itself, not its hex rendering
   version      BIGINT NOT NULL, -- monotonically increasing per file
   created_at   TIMESTAMPTZ NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL,

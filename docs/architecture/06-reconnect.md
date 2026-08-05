@@ -46,19 +46,23 @@ The server maintains an **oplog**: an ordered log of `ChangeRecord`s. The oplog 
 
 ### Structure
 
-```
-oplog(
-  lsn        BIGINT PRIMARY KEY,
-  table_name TEXT NOT NULL,
-  op         TEXT NOT NULL,
-  pk         BYTEA NOT NULL,
-  old_row    BYTEA,            -- NULL for inserts
-  new_row    BYTEA,            -- NULL for deletes
-  is_tombstone BOOLEAN NOT NULL DEFAULT FALSE
-)
+```sql
+CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
+
+CREATE TABLE oplog (
+    lsn          BIGINT PRIMARY KEY,
+    table_name   TEXT NOT NULL,
+    op           connetto_change_op NOT NULL,
+    pk           BYTEA NOT NULL,
+    is_tombstone BOOLEAN NOT NULL DEFAULT FALSE,
+    event        BYTEA NOT NULL,
+    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
-Rows deleted from the underlying table are retained in the oplog as tombstones (`is_tombstone = TRUE`, `new_row = NULL`). This allows the server to replay deletes to reconnecting clients.
+**Built, and two corrections against an earlier version of this block** (`PgOplog::ensure_schema` in `crates/connetto-server/src/oplog.rs`). The row images are one `event` blob, the serialized `ChangeEvent`, rather than the separate `old_row` and `new_row` that block named, because catchup replays the whole event through the same encoder the live path uses and never reads the two images apart. And `op` is a closed set of four, so it is an enum type rather than text carrying one of four words. `ensure_schema` creates the type and the column, `ChangeRecord::op` returns a `ChangeOp` rather than a string, and `crates/connetto-server/tests/pg_async.rs::pg_oplog_appends_and_reads_back` asserts the column's declared type and that Postgres refuses a verb outside the set, because nothing on the read path consults that column and it would otherwise be free to drift back.
+
+Rows deleted from the underlying table are retained in the oplog as tombstones (`is_tombstone = TRUE`, the retained `event` being a delete). This allows the server to replay deletes to reconnecting clients.
 
 **Decided (R6).** The catchup path carries the same two-version authorization obligation as the live path: the oplog must carry whatever those checks need, or the confidentiality leak moves to reconnect. What exactly the oplog must carry is an open question recorded in `08-authorization.md`.
 

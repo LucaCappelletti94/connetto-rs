@@ -19,7 +19,7 @@ A structured inventory of every component that must exist. This is not a depende
 | `ChangeRecord` | Server-originated change pushed to clients (table, pk, op, new values, server-LSN or clock). |
 | `SubscriptionSpec` | How a client describes what it wants: query shape, parameters, subscription ID. |
 | `SchemaVersion` | Versioned description of the tables and columns the client should maintain locally. |
-| Core traits | `Transport`, `Store` (local SQLite), `AuthPolicy`, `SubscriptionMatcher` — the seams the rest of the system plugs into. |
+| Core traits | `Transport`, `Store` (local SQLite), `SubscriptionMatcher` — the seams the rest of the system plugs into. Authorization is not one of them: that question goes through `subql`'s visibility trait. |
 
 ---
 
@@ -137,7 +137,7 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Policy source | PostgreSQL RLS definitions (or a derived equivalent) compiled into a fast in-process policy engine. |
 | Auth context | Per-session identity and claims passed to every policy evaluation. |
-| Read filter | **Built.** Applied to every row before delivery, at snapshot time and on CDC push, and it fails closed: an error denies rather than allows (`RlsAuth::can_read` reached through `unwrap_or(false)` in `SessionManager::dispatch_event`). The authorization-service form of this is R5b and is not built. |
+| Read filter | **Built.** Applied to every row before delivery, at snapshot time and on CDC push, and it fails closed: the verdict buffer arrives pre-filled with denials, so a policy that cannot answer denies rather than allows (`RlsAuth::may_see` in `SessionManager::dispatch_event`). The authorization-service form of this is R5b and is not built. |
 | Write gate | Applied to every mutation before it is executed. *(Reliability: see §10.)* |
 | Auth batching | Policies are evaluated in batch per CDC event to avoid per-row round-trips. |
 | File session token | Short-lived token issued for a specific file; gates chunk upload/download without per-chunk auth calls. |
@@ -170,7 +170,7 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Crate | Role | Status |
 |---|---|---|
-| `connetto-core` | Shared types, traits, and codec (`Transport`, `AuthPolicy`, `ControlMessage`, `BulkMessage`, `SubscriptionSpec`). Both `connetto-server` and `connetto-client` depend on it. Neither depends on the other. | **Built** |
+| `connetto-core` | Shared types, traits, and codec (`Transport`, `ControlMessage`, `BulkMessage`, `SubscriptionSpec`). Both `connetto-server` and `connetto-client` depend on it. Neither depends on the other. | **Built** |
 | `connetto-server` | Server binary and library: session manager, CDC ingest, subscription materializer, auth stack, and mutation handler. | **Built** |
 | `connetto-client` | Native client library: `ConnettoConnection`, `ConnettoClient`, and the live-query API (`LiveQuery`, `LiveValue`, `Watchable`). | **Built** |
 | `connetto-web` | Browser platform for wasm32: `BrowserSocket` (a `Transport` over `web_sys::WebSocket`), dedicated-worker relay topology, leader election, and multi-tab routing. | **Built** |

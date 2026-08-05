@@ -20,21 +20,18 @@ The local write is tagged with a `pending` flag and the `client_seq`.
 
 ### 2. Local mutation queue
 
-The mutation is persisted to a local queue table in SQLite:
+The mutation is persisted to a local queue table in SQLite (`META_DDL` in `crates/connetto-client/src/lib.rs`):
 
-```
-mutation_queue(
-  client_seq   INTEGER PRIMARY KEY,
-  table_name   TEXT NOT NULL,
-  op           TEXT NOT NULL,   -- 'insert' | 'update' | 'delete'
-  pk           BLOB NOT NULL,   -- serialized primary key
-  payload      BLOB,            -- serialized column values (NULL for delete)
-  base_version BLOB,            -- server version the client last saw for this row
-  queued_at    INTEGER NOT NULL
-)
+```sql
+CREATE TABLE _connetto_pending (
+    seq       INTEGER PRIMARY KEY,
+    changeset BLOB NOT NULL
+);
 ```
 
 The queue survives process restart and network interruption.
+
+**This replaces a seven-column sketch, and the difference is the design rather than the detail.** That sketch gave a row per operation, carrying the table name, the verb as one of three words in a text column, the key, the values and the base version as separate columns. What is built stores one sqlite-diff changeset per client sequence, which already carries the table, the verb, the key, the new values and the old image, in the same encoding the upload rides in. So the queue holds exactly what it sends rather than a parallel description of it, nothing has to be re-encoded on the way out, and the verb is a decoded value rather than a string nothing checks.
 
 ### 3. Sending
 
