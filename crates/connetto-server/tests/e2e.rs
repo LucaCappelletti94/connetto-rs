@@ -37,6 +37,7 @@ use diesel::{Connection, QueryableByName};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
@@ -97,6 +98,48 @@ impl Drop for ChildGuard {
     }
 }
 
+/// The keyring service the client binary provisions replica keys under.
+const CLIENT_KEYRING_SERVICE: &str = "connetto-client";
+
+/// A directory for client replicas that also removes their OS keyring entries
+/// on drop, for the same reason [`ChildGuard`] kills its child.
+///
+/// The client binary mints a key per replica path and never deletes it, which is
+/// right for a real client: the key has to outlive the process or the replica
+/// stops opening. A test throws its replica away with the directory, so the
+/// entry is left naming a path that no longer exists, and enough of them exhaust
+/// the per-user keyring quota until every later mint fails.
+struct ReplicaDir {
+    dir: TempDir,
+    replicas: Vec<String>,
+}
+
+impl ReplicaDir {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().expect("tempdir"),
+            replicas: Vec::new(),
+        }
+    }
+
+    /// A replica path inside the directory, registered for keyring cleanup.
+    fn replica(&mut self, name: &str) -> PathBuf {
+        let path = self.dir.path().join(name);
+        self.replicas.push(path.to_string_lossy().into_owned());
+        path
+    }
+}
+
+impl Drop for ReplicaDir {
+    fn drop(&mut self) {
+        for path in &self.replicas {
+            if let Ok(entry) = keyring::Entry::new(CLIENT_KEYRING_SERVICE, path) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+}
+
 /// Row count of the `orders` table in a client's local SQLite, or 0 while the
 /// database is absent, still locked, or not yet holding the table.
 ///
@@ -110,7 +153,7 @@ fn count_orders(db_path: &Path) -> i64 {
         return 0;
     }
     let path = db_path.to_string_lossy();
-    let Ok(entry) = keyring::Entry::new("connetto-client", &path) else {
+    let Ok(entry) = keyring::Entry::new(CLIENT_KEYRING_SERVICE, &path) else {
         return 0;
     };
     let Ok(hex) = entry.get_password() else {
@@ -560,9 +603,9 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
     let (token_a, _) = mint_token(&auth_stack.auth_base).await;
     let (token_b, _) = mint_token(&auth_stack.auth_base).await;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_a = dir.path().join("client-a.db");
-    let db_b = dir.path().join("client-b.db");
+    let mut dir = ReplicaDir::new();
+    let db_a = dir.replica("client-a.db");
+    let db_b = dir.replica("client-b.db");
     let _client_a = spawn_client(&ws, &db_a, "client-a", &token_a, None);
     let _client_b = spawn_client(&ws, &db_b, "client-b", &token_b, None);
 
@@ -659,9 +702,9 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
     let (token_reader, _) = mint_token(&auth_stack.auth_base).await;
     let (token_writer, _) = mint_token(&auth_stack.auth_base).await;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_writer = dir.path().join("writer.db");
-    let db_reader = dir.path().join("reader.db");
+    let mut dir = ReplicaDir::new();
+    let db_writer = dir.replica("writer.db");
+    let db_reader = dir.replica("reader.db");
 
     // Bring the reader up first and let it snapshot the seed row, so the
     // writer's row can only reach it over CDC, not in the reader's own snapshot.
@@ -783,8 +826,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     // policy compares owner against app.user_id, so the owner must be that UUID.
     let (alice_token, alice_id) = mint_token(&auth_stack.auth_base).await;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = dir.path().join("alice.db");
+    let mut dir = ReplicaDir::new();
+    let db = dir.replica("alice.db");
 
     // Alice pushes three ordered mutations on one session: an owned insert
     // (allowed), a foreign insert with a literal owner that does not match
@@ -1038,8 +1081,8 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     );
 
     let (token, user_id) = mint_token(&auth_stack.auth_base).await;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = dir.path().join("log-probe.db");
+    let mut dir = ReplicaDir::new();
+    let db = dir.replica("log-probe.db");
     let client = spawn_client(&ws, &db, "log-probe", &token, None);
     assert_eq!(
         wait_for_rows(&db, 1, secs).await,
