@@ -66,8 +66,8 @@ use connetto_client::{
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
     FullResyncRequired, HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
-    MutationRejectReason, NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    Subscribe, SubscriptionPriority, SubscriptionSpec,
+    MutationRejectReason, NonFatalError, Pong, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport};
@@ -875,11 +875,8 @@ where
 {
     match subscription_is_aggregate(&subscribe.spec.query) {
         Err(err) => {
-            send_tab_nonfatal(
-                tab,
-                &subscribe.sub_id,
-                &format!("subscription rejected: {err}"),
-            );
+            tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, error = %err, "tab subscription refused");
+            send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
             Ok(())
         }
         Ok(true) => register_tab_aggregate(worker, agg_routes, id, subscribe).await,
@@ -887,11 +884,8 @@ where
             let tables = match subscription_tables(&subscribe.spec.query) {
                 Ok(tables) => tables,
                 Err(err) => {
-                    send_tab_nonfatal(
-                        tab,
-                        &subscribe.sub_id,
-                        &format!("subscription rejected: {err}"),
-                    );
+                    tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, error = %err, "tab subscription refused");
+                    send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                     return Ok(());
                 }
             };
@@ -904,7 +898,8 @@ where
                 subscribe.spec.priority,
                 &tables,
             ) {
-                send_tab_nonfatal(tab, &subscribe.sub_id, &format!("snapshot failed: {err}"));
+                tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, error = %err, "tab snapshot failed");
+                send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                 return Ok(());
             }
             tab.subs.retain(|sub| sub.sub_id != subscribe.sub_id);
@@ -1553,6 +1548,10 @@ fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &
 /// Answer one tab subscription: a snapshot from the worker replica for
 /// synced tables, from the tier database for local tables, both between
 /// one begin and end pair.
+///
+/// Both payloads are built and compressed before any frame goes out. A begin
+/// ahead of a failing read would mark the refusal as one that got as far as
+/// the replica, and a refusal must not vary by cause.
 fn serve_snapshot<U>(
     worker: &mut ConnettoConnection<U>,
     blank: &mut BlankState,
@@ -1566,25 +1565,36 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    let local_tables: HashSet<String> = local.as_ref().map_or_else(HashSet::new, |tier| {
+        tables.intersection(&tier.tables).cloned().collect()
+    });
+    let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    if !synced.is_empty() {
+        let patchset = snapshot_patchset(worker.conn(), &synced, blank)?;
+        if !patchset.is_empty() {
+            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
+        }
+    }
+    if !local_tables.is_empty()
+        && let Some(tier) = local.as_mut()
+    {
+        let patchset = snapshot_patchset(&mut tier.conn, &local_tables, &mut tier.blank)?;
+        if !patchset.is_empty() {
+            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
+        }
+    }
     let _ = tab.out.send(TabOut::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: sub_id.to_owned(),
             priority,
         },
     )));
-    let local_tables: HashSet<String> = local.as_ref().map_or_else(HashSet::new, |tier| {
-        tables.intersection(&tier.tables).cloned().collect()
-    });
-    let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
-    if !synced.is_empty() {
-        let patchset = snapshot_patchset(worker.conn(), &synced, blank)?;
-        send_snapshot_patch(tab, sub_id, &patchset)?;
-    }
-    if !local_tables.is_empty()
-        && let Some(tier) = local.as_mut()
-    {
-        let patchset = snapshot_patchset(&mut tier.conn, &local_tables, &mut tier.blank)?;
-        send_snapshot_patch(tab, sub_id, &patchset)?;
+    for payload in payloads {
+        enqueue_tab_bulk(
+            tab,
+            BulkMessage::SnapshotPatch(SnapshotPatch::new(sub_id.to_owned(), payload)),
+        );
     }
     let _ = tab
         .out
@@ -1592,24 +1602,6 @@ where
             sub_id: sub_id.to_owned(),
             cursor: relay_cursor(worker),
         })));
-    Ok(())
-}
-
-/// Compress and send one snapshot patchset toward a tab, skipping empty
-/// payloads.
-fn send_snapshot_patch(
-    tab: &mut TabState,
-    sub_id: &str,
-    patchset: &[u8],
-) -> Result<(), RelayError> {
-    if patchset.is_empty() {
-        return Ok(());
-    }
-    let payload = zstd::encode_all(patchset, ZSTD_LEVEL)?;
-    enqueue_tab_bulk(
-        tab,
-        BulkMessage::SnapshotPatch(SnapshotPatch::new(sub_id.to_owned(), payload)),
-    );
     Ok(())
 }
 

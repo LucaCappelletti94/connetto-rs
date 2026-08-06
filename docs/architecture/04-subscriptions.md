@@ -121,13 +121,13 @@ Server:
 2. Records the subscription in the registry: `(session_id, sub_id) → (spec, principal, lsn=None)`.
 3. Begins snapshot delivery (see below).
 
-On validation failure, server sends `Error(sub_id, reason)` and does not add the subscription.
+On any failure, before or after registration, the server sends one `Error` frame whose `detail` is the fixed refusal text and does not add the subscription. The cause never reaches the wire and goes to the structured log instead (R38): a detail or a frame sequence that varied with the cause told a caller which stage refused, and so whether the table or column it guessed exists.
 
 ### Snapshot delivery
 
 After registration, the server delivers an initial snapshot. `SnapshotBegin { sub_id }` and `SnapshotEnd { sub_id, lsn: u64 }` are control-plane frames that bracket the snapshot. The row data travels on the bulk plane as one or more `SnapshotPatch` frames, each carrying `sub_id` and `patchset_zstd` (a Zstd-compressed SQLite patchset).
 
-The snapshot is read after the route is installed, so live delivery runs throughout it. A change committed while the snapshot is in flight reaches the client as a `LivePatch` queued behind `SnapshotEnd`, which is what keeps it from being lost. Installing the route afterwards dropped every such change silently, which was phase R28 part A.
+The snapshot is read after the route is installed, so live delivery runs throughout it. A change committed while the snapshot is in flight reaches the client as a `LivePatch` queued behind `SnapshotEnd`, which is what keeps it from being lost. Installing the route afterwards dropped every such change silently, which was phase R28 part A. Since R38 no frame goes out until that read has succeeded, so a subscription failing at the snapshot refuses as bare as one refused at registration.
 
 **The overlap is re-applied, not filtered. Decided (R28 part A, 2026-08-03), and this paragraph replaces one that said any `LivePatch` at or below the snapshot's LSN is discarded.** Such a filter looks obvious and loses data. The `lsn` in `SnapshotEnd` is `pg_current_wal_lsn()` read after the rows inside a `REPEATABLE READ` transaction, and a `LivePatch` carries the WAL position of the change record. Neither number orders by visibility: a writer that starts before the snapshot and commits after it produces a change whose position is below the snapshot's, while the snapshot cannot contain its row. Measured on Postgres 16: two writers, the snapshot saw only the committed one and reported `0/151BA18`, and the other writer's row arrived at `0/151B868`. Discarding it would have deleted a row permanently, which is the defect R28 exists to remove.
 

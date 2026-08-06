@@ -21,6 +21,7 @@ use connetto_client::{
     AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, KeyValue,
     LiveQuery, Replica, Watchable,
 };
+use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -1424,9 +1425,9 @@ async fn unsupported_subscription_is_rejected_without_closing() {
         unreachable!()
     };
     assert_eq!(related_to.as_deref(), Some("grouped"));
-    assert!(
-        detail.contains("subscription rejected"),
-        "detail should explain the rejection, got {detail:?}",
+    assert_eq!(
+        detail, SUBSCRIPTION_REFUSED,
+        "the refusal carries the fixed text and not the cause",
     );
 
     // The session survives the rejection: a ping still round-trips.
@@ -1629,13 +1630,9 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
         unreachable!()
     };
     assert_eq!(related_to.as_deref(), Some("total"));
-    assert!(
-        detail.contains("subscription rejected"),
-        "detail should explain the rejection, got {detail:?}",
-    );
-    assert!(
-        detail.contains("RLS-protected"),
-        "detail should name the RLS cause, got {detail:?}",
+    assert_eq!(
+        detail, SUBSCRIPTION_REFUSED,
+        "the refusal must not disclose that the table carries RLS",
     );
 
     // The session survives the rejection: a ping still round-trips.
@@ -1695,9 +1692,9 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
         unreachable!()
     };
     assert_eq!(related_to.as_deref(), Some("count"));
-    assert!(
-        detail.contains("aggregate bootstrap failed"),
-        "detail should explain the bootstrap failure, got {detail:?}",
+    assert_eq!(
+        detail, SUBSCRIPTION_REFUSED,
+        "the refusal carries the fixed text and not the cause",
     );
 
     // The session survives the failed bootstrap: a ping still round-trips.

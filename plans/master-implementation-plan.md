@@ -66,6 +66,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 7 | ~~R4~~ **DONE** | Needed R3, which is what makes a checked grant resolve to a subject that is not a person |
 | done | ~~R13~~ **DONE** | The `auth_events` contract and its four producers. Landed 2026-08-06 |
 | done | ~~R22~~ **DELETED** | The compile-time query set. Deleted 2026-08-05: a curated set of permitted queries is refused on principle, since authorization is row-level security, OpenFGA and roles. Its leak moved to R19, its cost concern to R19, its compilation requirement to R27 |
+| done | ~~R38~~ **DONE** | The refusal leak. Landed 2026-08-06: one fixed refusal text on server and relay, `SnapshotBegin` deferred behind the read, causes to the log |
 | 9 | R19 | Needs R2 for the session handle it counts against, and R3 so the anonymous tier is representable |
 | 9 | R36 | Needs R19's counters. Nothing reacts to *what* a caller asked for, only to how much, so a prober under the rate limits is unopposed |
 | any | R37 | Needs R36, which establishes the configuration style by being the first to use it. Consistency work, so it slots wherever it is wanted |
@@ -114,6 +115,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R4 capabilities | **DONE** | nothing, R3 was done | no |
 | R13 `auth_events` audit table | **DONE** (2026-08-06) | nothing | no |
 | ~~R22 compile-time query set~~ | **DELETED** (2026-08-05) | n/a | no |
+| R38 a refusal stops disclosing what exists | **DONE** (2026-08-06) | nothing | no |
 | R19 request throttling | NOT STARTED | nothing, R2 and R3 are done | no |
 | R36 abuse detection and identity bans | NOT STARTED | R19 | no |
 | R37 one configuration style | NOT STARTED | R36 | no |
@@ -1159,7 +1161,7 @@ It proposed fixing the set of queries the server accepts at compile time, with a
 
 **Its three parts went three ways.**
 
-The **disclosure leak is real and moves to R19**, which is the phase about what a caller can do to the server. Four sites in `crates/connetto-server/src/session.rs` return the backend's own error text to the caller: `:1439` `subscription rejected: {err}`, `:1467` `snapshot failed: {detail}`, and `:1708` and `:1767` `aggregate bootstrap failed: {err}`. At the first of those, `err` is subql's `RegisterError`, which renders `Unknown table: {0}`, `Unknown column '{column}' in table {table_id}` and `AggregatorOnRlsTable`, so a caller can enumerate the schema one guess at a time and learn which tables carry row-level security. It is not an authorization hole, since a policy still decides what is readable, but the shape of the database leaks before any policy is consulted.
+The **disclosure leak was real and became R38**, having spent a day as R19's step 6 before being split out on 2026-08-06: it depended on nothing in throttling and was the only exploitable thing in the queue. Four sites in `crates/connetto-server/src/session.rs` returned the backend's own error text to the caller, and `connetto-web/src/relay.rs` rebuilt the same strings for tabs. R38 carries the detail and closed it the same day.
 
 The **cost concern also belongs to R19** and needs no query set: a new subscription takes a full snapshot, which is what throttling has to bound.
 
@@ -1167,13 +1169,56 @@ The **advance knowledge of the query set belongs to R27**, which is the only thi
 
 **Consequences to carry.** R19 no longer has a prerequisite here and can start whenever. R27's dependency on R22 is void and must be restated as a requirement R27 satisfies for itself, in this plan and in `04-subscriptions.md`, which names R22 twice. Step 8 loses one of its two entries, leaving R13.
 
+## R38: a refusal stops disclosing what exists
+
+**Status.** **DONE** (2026-08-06)
+
+**Blocked on nothing, and it is the only exploitable thing in the queue.** Split out of R19 on 2026-08-06, where it had been step 6 since R22's deletion, because it depends on nothing in throttling and should not wait behind metering.
+
+### Purpose
+
+**This is a defect against a settled rule, not a design question.** Chapter 8's principle 4 is that a denial is silent and silence includes existence. The logout endpoint already obeys it, deliberately: a token naming no live session is indistinguishable from success, because an endpoint whose only effect is revocation must not report whether a guessed credential existed. R3 made a refused grant silent on the wire for the same reason.
+
+The subscribe path does not follow it. A refusal carries the backend's own error text, and subql's `RegisterError` renders `Unknown table: {0}`, `Unknown column '{column}' in table {table_id}` and `AggregatorOnRlsTable`. So anyone holding a socket enumerates the schema one guess at a time and learns which tables carry row-level security, which is a map of where the sensitive data is.
+
+**Not an authorization hole.** A policy still decides what is readable and it holds. What leaks is the shape of the database, before any policy is consulted.
+
+### Steps
+
+1. Four sites in `crates/connetto-server/src/session.rs`: `:1439` subscription rejected, `:1467` snapshot failed, `:1708` and `:1767` aggregate bootstrap failed. Every refusal reads the same regardless of cause.
+2. **`crates/connetto-web/src/relay.rs` rebuilds the same strings for tabs** (`:881`, `:893`, `:907`). Fixing only the server closes the leak on the direct path and leaves it open on the relayed one, which is the shape of defect nobody re-checks.
+3. Three tests assert the old wording and change with it: `connetto-server/tests/snapshot_nonfatal.rs`, `connetto-client/tests/loop_emu.rs`, `examples/wasm-smoke/tests/nonfatal.rs`.
+4. The operator still needs the cause, so what the caller loses goes to the structured log, by the split in `08-authorization.md`. R12 part A built the destination.
+
+### Built, and one deviation the tree forced
+
+The fixed text is `SUBSCRIPTION_REFUSED` (`subscription refused`) in `connetto-core/src/messages/error.rs`, one constant shared by the server and the relay so byte identity across the two paths holds by construction. All four `session.rs` sites and the three `relay.rs` sites send it and log the cause at `warn` with the sub id, reusing the JSON log destination and the `grants.rs` capture pattern.
+
+**The deviation: no frame precedes a refusal, which took two ordering moves the steps above did not name.** First, `SnapshotBegin` goes out only after the snapshot read succeeds, in `SessionManager::snapshot_row` and in the relay's `serve_snapshot` (which also compresses before sending, so nothing after the first frame can fail). A failed read used to emit `SnapshotBegin` before its refusal while a registration refusal emitted nothing, so the two causes stayed distinguishable by the preceding frame with the refusal text already identical. Second, found by the post-landing review: the resume path had the same hole one frame earlier. A cursor outside the retained window drew `FullResyncRequired` before the read, so during a snapshot outage an existing table answered with two frames and an unknown one with one, and the client had already discarded its local rows for a snapshot that never arrived. The notice now rides behind the successful read, in `snapshot_row` via an `Option<FullResyncReason>` parameter. On success both wire orders are unchanged (`FullResyncRequired` when resuming, then `Begin`, patch, `End`), the client treats `Begin` as a plain event, and a failure neither dangles a `Begin` nor costs the client data.
+
+### Proven
+
+`refusals_are_byte_identical_across_causes` in `snapshot_nonfatal.rs` (Docker-gated) drives three causes under one sub id, an unknown table, a known table whose snapshot fails, and a known table whose aggregate bootstrap fails, and asserts the three `NonFatalError` frames are equal through `encode_control` bytes with nothing preceding any of them, while the log names each cause. Both mutations were run and both fail the test: restoring cause text at one site trips the equality, and restoring `Begin` before the read trips the first-reply assertion. `loop_emu` dropped its `RLS-protected` wording assertion, and the wasm `nonfatal.rs` fake upstream now speaks the fixed text with the tab test asserting it.
+
+`a_resuming_refusal_is_as_bare_as_a_fresh_one` in the same file pins the resume flavor: four events through a two-entry oplog window, a handshake cursor at the pruned first event, then the same unknown-versus-broken probe pair, asserting bare byte-identical refusals. Its mutation was run too: moving the resync notice back ahead of the read fails the test on the leaked `FullResyncRequired` frame. `reconnect.rs`'s `cursor_outside_window_forces_full_resync` keeps pinning the success order.
+
+### Proof
+
+A subscription naming a table that does not exist and one naming a table that does but fails for another reason produce a **byte-identical** refusal, asserted rather than assumed, since indistinguishability is the whole property. No `RegisterError` text reaches the wire from any of the four sites, and none reaches a tab through the relay. The log still names the cause.
+
+### Done when
+
+No refusal on any path tells a caller whether what it named exists.
+
+---
+
 ## R19: request throttling, tiered by identity
 
 **Status.** NOT STARTED
 
 **Blocked on nothing, now that R2 and R3 are done.** R2 made the durable session handle the operational key this phase counts against, and R3 mints a handle for an unidentified caller, which is what makes the anonymous tier representable and countable. It no longer waits on R22, which was deleted on 2026-08-05.
 
-**It inherited two things from that deletion**: the error-text disclosure at four sites, now step 6, and the fact that step 5's backstop must be judged against arbitrary-cost work rather than a known menu.
+**It inherited two things from that deletion, and both have since moved on.** The error-text disclosure left again on 2026-08-06 for its own change, because it is a defect against a settled rule rather than part of throttling, and it is the only exploitable thing in the queue. And step 5's backstop, which R22's deletion left to stand on its own merits, is now ruled out entirely by R36. **So this phase has no open decision.**
 
 ### Purpose
 
@@ -1189,18 +1234,16 @@ One thing already in the codebase is easy to mistake for throttling and is not: 
 2. Meter connection and handshake rate next, then the auth endpoints, which today count no attempts at all.
 3. **Tier by whether the caller has an identity, and treat that as the design rather than a refinement.** An authenticated caller is accountable: there is a `user_id` to attribute cost to, a session to revoke, and a login that already cost them something. An anonymous caller has none of that by definition.
 4. **Count against R2's durable session handle, for both tiers.** A session is established on connect whether or not anyone is logged in, so the handle is the natural key and needs no special case for an anonymous caller. Do **not** use `connection_num`: it is a process-local counter reset on every reconnect, so it caps one connection and not a reconnect loop.
-5. **Decide whether a coarse backstop is needed**, and this is the phase's one remaining decision. A handle is discardable: someone who throws it away gets a fresh allowance. A ceiling on something the caller does not choose, their network address being the only real candidate, closes that at the cost of punishing everyone behind a shared address. It used to say to judge this against R22, on the grounds that only compiled-in queries would run and the worst case would be volume of known-cost work. R22 is deleted, so **the worst case is arbitrary-cost work and the backstop has to be judged on its own merits.**
-6. **Stop returning the backend's own error text to the caller**, inherited from R22 when that phase was deleted and placed here because it is the same subject, what a caller can extract from the server. Four sites in `crates/connetto-server/src/session.rs`: `:1439` `subscription rejected: {err}`, `:1467` `snapshot failed: {detail}`, `:1708` and `:1767` `aggregate bootstrap failed: {err}`. At the first, `err` is subql's `RegisterError`, rendering `Unknown table: {0}`, `Unknown column '{column}' in table {table_id}` and `AggregatorOnRlsTable`, so a caller enumerates the schema one guess at a time and learns which tables carry row-level security. **Not an authorization hole**, since a policy still decides what is readable, but the shape of the database leaks before any policy is consulted. The refusal must not distinguish absent from present, matching the discipline R3 applies to a refused grant.
+5. **No coarse backstop. Settled by R36, not left open.** This step used to ask whether one was needed, naming the caller's network address as the only real candidate, because a session handle is discardable and someone who throws it away gets a fresh allowance. R36 then decided connetto never acts on an address, and the reasoning is stronger here than there: by the time connetto could consult any ceiling it has accepted the connection, completed the upgrade and allocated a session, which is the whole cost the attacker wanted to impose. That belongs to the edge, which drops it before it costs anything. So a discarded handle is answered the way an anonymous abuser is, by throttling what connetto can see and handing the rest to R36's callback.
+6. **The error-text disclosure left this phase on 2026-08-06** and landed on its own, before this one (R38, done). It was a defect against a settled rule rather than part of throttling: chapter 8's principle 4 says a denial must not disclose existence, the logout endpoint and a refused grant both already obeyed it, and the subscribe path did not.
 
 ### Proof
 
 A caller exceeding the subscription-creation limit is refused rather than served slowly, asserted per tier. **The limit holds across a reconnection**, which is the property `connection_num` would fail and therefore the test that pins step 4.
 
-For step 6, a subscription naming a table that does not exist and one naming a table that does but fails for another reason produce a **byte-identical** refusal, asserted rather than assumed, since indistinguishability is the whole property. No `RegisterError` text reaches the wire from any of the four sites.
-
 ### Done when
 
-Subscription creation, connection rate and the auth endpoints are all metered, the two tiers are distinguishable in a test, the anonymous key survives reconnection, and no refusal carries backend error text.
+Subscription creation, connection rate and the auth endpoints are all metered, the two tiers are distinguishable in a test, and the anonymous key survives reconnection.
 
 ---
 

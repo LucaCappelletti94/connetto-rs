@@ -89,7 +89,7 @@ The protocol has two planes. The **control plane** carries typed, MessagePack-en
 | `MutationConflict` | Conflict detected: client sequence number, table, and the server's current copy of the row. **Built (R8).** The row is optional, because a write against a row somebody else deleted conflicts with nothing to send, and it reaches the application rather than being discarded by the client. |
 | `FullResyncRequired` | Server requires the client to re-snapshot a subscription. **Built (R8).** `FullResyncReason` carries exactly the one variant anything sends, `CursorOutsideRetention`. It gains a variant for authorization change in phase R7. Adding a variant is a wire change: the enum has no forward-compatible fallback for an unknown value. |
 | `Pong` | Keepalive reply |
-| `Error` | Non-fatal error associated with a specific request |
+| `Error` | Non-fatal error associated with a specific request. **Built (R38, 2026-08-06).** A refusal on the subscribe path carries one fixed `detail` (`subscription refused`) whatever the cause, on the direct server and through the relay alike, because a detail that varied told a caller which stage refused and so whether the table or column it guessed exists. The cause goes to the structured log. |
 | `FatalError` | Server is closing the session: reason code. **Built (R2, R8).** Every variant names a close the server performs, there is no catch-all, and `crates/connetto-core/tests/wire.rs` guards that with a wildcard-free match. R2 wired `SessionRevoked` and `ConnectionSuperseded`, R8 sends `ServerShuttingDown` on SIGINT or SIGTERM by walking the connection registry, and the client surfaces the reason as `ClientEvent::ServerClosed` instead of treating it as a protocol violation, so it backs off rather than dying silently. |
 
 **Decided (R5b): a delivery-paused signal.** When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to distinguish that from nothing changing. `NonFatalError` carries only `related_to` and an untyped `detail`, so this needs a typed signal rather than a string a client parses. Snapshots are unaffected throughout, because they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
@@ -140,9 +140,10 @@ See `12-identity-session-capability.md` for the session model.
 ### Snapshot before updates
 
 - After a `Subscribe`, the server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames, then `SnapshotEnd(lsn)` (control).
+- No frame goes out until the snapshot read has succeeded (R38). A subscription the server cannot serve draws exactly one `Error` frame, bare and byte-identical whatever the cause, so a refusal never discloses whether the name passed registration.
 - The LSN in `SnapshotEnd` is the point at which the snapshot was taken.
 - Any `LivePatch` frames with LSN > snapshot LSN that arrive after `SnapshotEnd` are applied on top.
-- Any `LivePatch` frames with LSN <= snapshot LSN that arrive before `SnapshotEnd` are buffered and discarded after the snapshot is complete (they are already reflected in the snapshot).
+- `LivePatch` frames overlapping the snapshot are re-applied, not filtered. Neither the snapshot LSN nor a change's WAL position orders by visibility, so a discard rule loses data. Decided at R28 part A, see `04-subscriptions.md`.
 
 ---
 

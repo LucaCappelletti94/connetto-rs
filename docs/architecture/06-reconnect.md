@@ -129,6 +129,8 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
    - Server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames carrying the matching rows, then `SnapshotEnd(current_lsn)` (control).
 4. The client applies the snapshot as a full replacement (not a merge).
 
+The notice waits for the read (R38). `FullResyncRequired` is sent only once the fresh snapshot has been read, immediately ahead of its frames, because it is also the instruction to discard local rows. A read that fails instead draws the same single bare refusal as any other cause, so the caller learns nothing about the name it guessed and keeps its rows for a snapshot that never arrived.
+
 **Decided (R7).** `FullResyncReason` gains a variant for an authorization change: a permission row appearing or disappearing on the Postgres change log triggers a per-subscription resync. Adding that variant is itself a wire change because `FullResyncReason` has no fallback for an unknown value. See `08-authorization.md` for the mechanism.
 
 ### Case 3: Schema changed while offline

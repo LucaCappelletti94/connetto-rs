@@ -6,6 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The one detail text a refused subscription carries.
+///
+/// Every refusal on the subscribe path reads exactly like this, whatever the
+/// cause. A detail that varied would tell the caller which stage refused, and
+/// so whether the table or column it guessed exists. The cause goes to the
+/// structured log instead.
+pub const SUBSCRIPTION_REFUSED: &str = "subscription refused";
+
 /// Non-fatal error attached to a specific client request.
 ///
 /// The server keeps the session alive after sending this. Typical uses:

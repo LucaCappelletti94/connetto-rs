@@ -22,7 +22,9 @@ mod common;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
-use connetto_core::messages::{ControlMessage, HandshakeAck, NonFatalError, SubscriptionSpec};
+use connetto_core::messages::{
+    ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED, SubscriptionSpec,
+};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
 use connetto_wasm_smoke::RelayHub;
@@ -82,7 +84,7 @@ async fn reject_every_subscribe(mut server: LoopbackTransport) {
                 server
                     .send_control(ControlMessage::NonFatalError(NonFatalError {
                         related_to: Some(sub.sub_id),
-                        detail: "aggregate bootstrap failed: rejected upstream".to_owned(),
+                        detail: SUBSCRIPTION_REFUSED.to_owned(),
                     }))
                     .await
                     .expect("nonfatal reply");
@@ -105,7 +107,7 @@ async fn nonfatal_row_upstream(mut server: LoopbackTransport, trigger: oneshot::
     server
         .send_control(ControlMessage::NonFatalError(NonFatalError {
             related_to: Some(UPSTREAM_SUB.to_owned()),
-            detail: "subscription rejected: upstream retention".to_owned(),
+            detail: SUBSCRIPTION_REFUSED.to_owned(),
         }))
         .await
         .expect("nonfatal reply");
@@ -175,9 +177,9 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
     tab.subscribe("tab-bad", BAD_QUERY)
         .await
         .expect("bad subscribe send");
-    let related = loop {
+    let (related, detail) = loop {
         match tab.pump_one().await.expect("tab pump") {
-            ClientEvent::NonFatal { related_to, .. } => break related_to,
+            ClientEvent::NonFatal { related_to, detail } => break (related_to, detail),
             ClientEvent::Closed => panic!("a bad subscription tore the whole tab down"),
             _ => {}
         }
@@ -186,6 +188,10 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
         related.as_deref(),
         Some("tab-bad"),
         "the non-fatal error is scoped to the rejected subscription",
+    );
+    assert_eq!(
+        detail, SUBSCRIPTION_REFUSED,
+        "the hub's own refusal carries the fixed text and not the cause",
     );
 
     // The session and its sibling subscription are still alive: a ping

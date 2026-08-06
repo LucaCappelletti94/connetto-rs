@@ -28,7 +28,8 @@ use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    NonFatalError, Pong, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+    Subscribe,
 };
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
@@ -1433,10 +1434,11 @@ where
         ) {
             Ok(registration) => registration,
             Err(err) => {
+                tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 transport
                     .send_control(ControlMessage::NonFatalError(NonFatalError {
                         related_to: Some(sub.sub_id),
-                        detail: format!("subscription rejected: {err}"),
+                        detail: SUBSCRIPTION_REFUSED.to_owned(),
                     }))
                     .await
                     .map_err(transport_err)?;
@@ -1458,13 +1460,14 @@ where
                     // every sibling subscription) stays alive. Transport and
                     // oplog failures stay fatal.
                     Err(SessionError::Snapshot(detail)) => {
+                        tracing::warn!(sub_id = %sub_label, error = %detail, "snapshot failed");
                         state.subs.remove(&sub_label);
                         self.remove_route(consumer_id).await;
                         self.materializer.lock().await.unregister(sub_id);
                         transport
                             .send_control(ControlMessage::NonFatalError(NonFatalError {
                                 related_to: Some(sub_label),
-                                detail: format!("snapshot failed: {detail}"),
+                                detail: SUBSCRIPTION_REFUSED.to_owned(),
                             }))
                             .await
                             .map_err(transport_err)?;
@@ -1488,8 +1491,10 @@ where
     ///
     /// A fresh session snapshots. A resuming session (nonzero `resume_lsn`)
     /// whose cursor is still inside the retained window catches up from the
-    /// oplog instead of re-snapshotting; one outside the window is told to
-    /// full-resync and then snapshots.
+    /// oplog instead of re-snapshotting. One outside the window snapshots
+    /// afresh, and the resync notice goes out with the new data rather than
+    /// here, so a failing read reads like any other refusal and costs the
+    /// client nothing.
     async fn subscribe_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -1497,6 +1502,7 @@ where
         state: &mut SessionState<Id, Key>,
         reg: RowRegistration,
     ) -> Result<(), SessionError> {
+        let mut resync = None;
         if state.resume_lsn != 0 {
             let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
             let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
@@ -1505,17 +1511,11 @@ where
                     return self.catch_up_row(transport, sub, state, &reg).await;
                 }
                 CatchupDecision::FullResync => {
-                    transport
-                        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
-                            sub_id: sub.sub_id.clone(),
-                            reason: FullResyncReason::CursorOutsideRetention,
-                        }))
-                        .await
-                        .map_err(transport_err)?;
+                    resync = Some(FullResyncReason::CursorOutsideRetention);
                 }
             }
         }
-        self.snapshot_row(transport, sub, state, &reg).await
+        self.snapshot_row(transport, sub, state, &reg, resync).await
     }
 
     /// Install the live route and record the subscription, so `dispatch_event`
@@ -1546,7 +1546,8 @@ where
             .insert(sub_label.to_owned(), (reg.consumer_id, reg.sub_id));
     }
 
-    /// Snapshot a row subscription: route first, then begin, patch, end.
+    /// Snapshot a row subscription: route first, then read, then resync
+    /// notice, begin, patch, end.
     ///
     /// Live delivery runs throughout the snapshot, so a change committed while
     /// it is in flight reaches the client as a patch queued behind
@@ -1554,14 +1555,35 @@ where
     /// carries, which is harmless: patches arrive in commit order, so the last
     /// one applied for a row is that row's current value. Filtering the
     /// overlap by LSN was considered and rejected, see `04-subscriptions.md`.
+    ///
+    /// No frame goes out until the read succeeds. A `SnapshotBegin` or a
+    /// `FullResyncRequired` ahead of a failing read would mark the refusal as
+    /// one that passed registration, and a refusal must not vary by cause.
+    /// The resync notice is also what makes the client discard the rows it
+    /// holds, so it must not go out before the replacement data exists.
     async fn snapshot_row<T: Transport>(
         &self,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
+        resync: Option<FullResyncReason>,
     ) -> Result<(), SessionError> {
         self.attach_row_route(&sub.sub_id, state, reg).await;
+        let snapshot = self
+            .snapshot_source
+            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.principal)
+            .await
+            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
+        if let Some(reason) = resync {
+            transport
+                .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                    sub_id: sub.sub_id.clone(),
+                    reason,
+                }))
+                .await
+                .map_err(transport_err)?;
+        }
         transport
             .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub.sub_id.clone(),
@@ -1569,11 +1591,6 @@ where
             }))
             .await
             .map_err(transport_err)?;
-        let snapshot = self
-            .snapshot_source
-            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.principal)
-            .await
-            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let payload = compress(&snapshot.patchset)?;
         enqueue_and_flush(
             transport,
@@ -1698,6 +1715,7 @@ where
         {
             Ok((value, _lsn)) => value,
             Err(err) => {
+                tracing::warn!(sub_id = %sub.sub_id, error = %err, "aggregate bootstrap failed");
                 self.materializer
                     .lock()
                     .await
@@ -1705,7 +1723,7 @@ where
                 transport
                     .send_control(ControlMessage::NonFatalError(NonFatalError {
                         related_to: Some(sub.sub_id),
-                        detail: format!("aggregate bootstrap failed: {err}"),
+                        detail: SUBSCRIPTION_REFUSED.to_owned(),
                     }))
                     .await
                     .map_err(transport_err)?;
@@ -1757,6 +1775,7 @@ where
         {
             Ok((row, _lsn)) => row,
             Err(err) => {
+                tracing::warn!(sub_id = %sub.sub_id, error = %err, "delta aggregate bootstrap failed");
                 self.materializer
                     .lock()
                     .await
@@ -1764,7 +1783,7 @@ where
                 transport
                     .send_control(ControlMessage::NonFatalError(NonFatalError {
                         related_to: Some(sub.sub_id),
-                        detail: format!("aggregate bootstrap failed: {err}"),
+                        detail: SUBSCRIPTION_REFUSED.to_owned(),
                     }))
                     .await
                     .map_err(transport_err)?;
