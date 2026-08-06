@@ -144,6 +144,8 @@ At the handshake, the seam used to turn one access token into an `AuthContext`. 
 
 **Built (R3).** The concrete shape at `run_handshake`: derive the run's handle first, then check every grant inside that logging context, fold what resolved into a `Principal`, and continue. A grant that fails to check does **not** end the connection and produces no field on the reply. The earlier version of this paragraph said the opposite, that no resolved grant should send a `FatalError` and terminate. That was wrong twice over: it contradicted the resolution rule in `12-identity-session-capability.md`, and it made an empty grant list illegal, which would have erased the unidentified caller the whole phase is built around. `FatalErrorReason::AuthenticationFailed` is deleted, because after this nothing can send it.
 
+**A capability grant is checked for signature, issuer, audience and expiry, and nothing else. Stated explicitly 2026-08-06, because a phase was designed against the opposite.** There is no store call, deliberately, since withdrawing a capability is deleting the relation that grants it. So **revoking a share produces no grant refusal**: the token still checks out, the subject still enters the `Principal`, and the rows simply stop matching the policy. Only expiry, a bad signature, or a wrong issuer or audience make a capability fail here.
+
 ---
 
 ## connetto session credential

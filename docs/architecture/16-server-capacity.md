@@ -62,6 +62,10 @@ Connetto's obligation is the narrow one, and the same book states it: a task pro
 
 **Challenge-based defences are unavailable rather than declined.** Proof-of-work and interstitial challenges need JavaScript running in a browser document. Connetto's transport is a socket that carries native clients too, so a challenge would deny the callers it cannot test instead of testing them.
 
+**Nor does connetto fingerprint a caller. Decided (R36), examined on its own merits rather than inherited from the address decision.** The two were argued as one and only the address half had reasoning behind it, so the survey in `docs/research-client-fingerprinting.md` tested the other half. A TLS fingerprint is unavailable by construction, since JA3 and JA4 come from the ClientHello and only the process terminating TLS ever sees one, which connetto never does. It would not identify a caller in any case: a fingerprint names a library version, so every user of one browser build shares it, and spoofing it is a one-line library switch, which the caller it targets is the one most likely to make. Zero of eleven surveyed peer systems fingerprint an unauthenticated connection. Beyond effectiveness there is a shape argument: EDPB Guidelines 2/2023 place fingerprinting inside ePrivacy Article 5(3) with no general security exemption, so a default-on fingerprint in a library would transfer that exposure to everybody who deploys it.
+
+**One address mechanism survives the forgeability argument and was still declined.** The PROXY protocol frames the client address in the TCP stream ahead of any HTTP, so a client cannot forge it when the backend is not directly reachable, and it needs neither TLS termination nor a vendor tier. It would have supplied a per-caller key for callers with no identity. It was declined on 2026-08-06 in favour of identities as the only key, with the reserve above bounding the rest. **The accepted cost:** connetto cannot tell two unnamed callers apart, so a slow, patient prober stays invisible to abuse detection however long it persists. That is a known limit of this design, not an oversight.
+
 ---
 
 ## Not decided
