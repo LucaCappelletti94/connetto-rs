@@ -64,7 +64,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 6 | ~~R3~~ **DONE** | Needed R2 and R12 part A, both of which preceded it |
 | 6 | ~~R12 part B, the refused-grant line~~ **DONE** | Rode with R3, the phase that created the silence it covers. It could not be proven earlier, because a refused credential was announced on the wire until then |
 | 7 | ~~R4~~ **DONE** | Needed R3, which is what makes a checked grant resolve to a subject that is not a person |
-| 8 | R13 | Needs R3. Off the critical path, so it may slip later without blocking anything |
+| done | ~~R13~~ **DONE** | The `auth_events` contract and its four producers. Landed 2026-08-06 |
 | done | ~~R22~~ **DELETED** | The compile-time query set. Deleted 2026-08-05: a curated set of permitted queries is refused on principle, since authorization is row-level security, OpenFGA and roles. Its leak moved to R19, its cost concern to R19, its compilation requirement to R27 |
 | 9 | R19 | Needs R2 for the session handle it counts against, and R3 so the anonymous tier is representable |
 | 9 | R36 | Needs R19's counters. Nothing reacts to *what* a caller asked for, only to how much, so a prober under the rate limits is unopposed |
@@ -112,7 +112,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R3 grants and `Principal` | **DONE** | nothing | no |
 | R12 part B, the refused-grant line | **DONE** | nothing, landed with R3 | no |
 | R4 capabilities | **DONE** | nothing, R3 was done | no |
-| R13 `auth_events` audit table | NOT STARTED | nothing, R3 is done | no |
+| R13 `auth_events` audit table | **DONE** (2026-08-06) | nothing | no |
 | ~~R22 compile-time query set~~ | **DELETED** (2026-08-05) | n/a | no |
 | R19 request throttling | NOT STARTED | nothing, R2 and R3 are done | no |
 | R36 abuse detection and identity bans | NOT STARTED | R19 | no |
@@ -701,9 +701,25 @@ All of the above pass. A single-grant shape is not representable. No `session_id
 
 ## R13: the `auth_events` audit table
 
-**Status.** NOT STARTED
+**Status.** **DONE.** (2026-08-06)
 
-**Blocked on nothing, now that R3 is done.** Nothing before it depends on it, which is what makes deferring it this far safe. In particular **R3 does not need it**: a rejected grant is a denial, and denials go to structured logging by the split in `docs/architecture/08-authorization.md`, so R3's visibility comes from R12 rather than from this table.
+**Was blocked on nothing** once R3 was done, and nothing before it depended on it.
+
+**Landed.** `crates/connetto-server/src/audit.rs`: `ConnettoAuditSchema`, the `connetto_audit_table!` macro, `AuthOp` as a Postgres enum on both sides, `AuthEvent`, the `AuditHook` seam and the ready-made `pg_audit_hook`. `AuthService` gained the hook beside its revocation observer, and `revoke_as` gives the three ways a login ends their own value. `CapabilityIssuer` gained `Id` and `with_audit`, and its row names both the user and the shared row, which the revocations cannot. `CONNETTO_AUDIT=database` switches recording on in the reference binary, off by default, and refuses startup when asked for without `CONNETTO_AUTH`.
+
+**Proof.** Five native producer tests, four gated contract tests, the mint assertions folded into the existing capability test against real RLS, and one end-to-end test driving a real logout through a real server. Two mutations confirm the tests are load-bearing: collapsing `logged_out` into `session_revoked` fails two, and removing `CONNETTO_AUDIT=database` fails the end-to-end one with the exact symptom that shipped. Gate green on 165 native and 109 Docker-gated.
+
+**Two startup checks were deleted along the way, and the reason is worth keeping.** The phase first grew a `check_audit_shape` that read Postgres's catalogue at boot and refused a table whose columns did not match. It was incoherent: generic over any `ConnettoAuditSchema` while hardcoding the default's column names, so a deployment implementing the trait against its own table, which is the entire point of the trait, would have been refused. **The trait is the contract.** `audit_insert` builds a real diesel statement against the deployment's real declaration with their real types, and the compiler settles it.
+
+The same reasoning then applied to `check_watermark_shape`, which this one was copied from, and it went too, with `ConnettoWatermarkSchema::table_name`, the two `information_schema` declarations and `startup_refuses_a_pre_r2_watermark_table`. Its stated rationale was false: it claimed to prevent "a failure that stays silent until a replay happens", and both shapes it caught fail loudly on the first write, verified against Postgres. The pre-R2 two-column key gives `there is no unique or exclusion constraint matching the ON CONFLICT specification` and a missing table gives `relation "_connetto_mutations" does not exist`. The check bought nothing the first write did not, and charged the trait's genericity for it.
+
+**Two more of the same mistake were found by review and fixed.** Both are connetto deciding something the application owns, next to a case where connetto had already decided it should not.
+
+`pk` was `BYTEA` holding a `MessagePack` encoding of the key values. That is right in the oplog, where connetto writes it and connetto decodes it, and wrong here, where the reader is a person or the application's SQL and a blob is neither readable nor joinable back to the row, in a table whose neighbouring column is text for exactly that reason. `ConnettoAuditSchema` gained `RowKey` and `row_key`, the values now travel untyped to the application's own impl, and the column is `<RowKeySqlType>` beside `<IdSqlType>` where it always belonged. The compiler enforced it immediately: the contract test would no longer accept `vec![1, 2, 3]`.
+
+`app.user_id` was a `const` in a function body while the key setting had been `CapabilityKey::SETTING` since R4, so an application could rename one and not the other. It is `DEFAULT_USER_SETTING` with `with_user_setting` on `RlsAuth`, `PgSnapshotSource` and `PgWriteTarget`, proven by `a_policy_may_name_its_own_identity_setting` whose negative half shows the default binding hides every row when the policy reads another name.
+
+**And the oplog's key was never asserted.** `pg_oplog_appends_and_reads_back` compared the LSN, the table and the tombstone flag, so a key that came back empty or wrong would have passed. It compares the key now, and `pg_oplog_round_trips_a_composite_key` drives a two-column key through real CDC, mutation tested by encoding only the first column, which collapses two distinct rows and fails.
 
 ### Decided before execution, 2026-08-04
 
@@ -711,7 +727,7 @@ All of the above pass. A single-grant shape is not representable. No `session_id
 
 **So this phase also records a successful share mint**, which is the one thing connetto itself does today that changes who can reach something. That is arguable and the maintainer took it deliberately: the permission is really the row the application writes afterwards, which connetto never sees, so what is recorded is connetto's own act of minting rather than the grant landing. Its cost is that `CapabilityIssuer` gains a fifth collaborator to write with. **Recording only the two invalidations was considered and rejected**, because the table would then carry nothing at all from the authorization half of the system, which is half of what it was specified for. **Waiting for R7 and R5b was considered and rejected**, because the phase exists precisely so this one contract does not arrive in pieces across five phases.
 
-**The shape is in `08-authorization.md`**, retyped on 2026-08-04 and settled on 2026-08-05: `at TIMESTAMPTZ`, `session UUID`, `user_id` as the deployment's own id type, `op` as a Postgres enum rather than text, nullable `table_name`, `pk` and `reason`.
+**The shape is in `08-authorization.md`**, retyped on 2026-08-04 and settled on 2026-08-05: `at TIMESTAMPTZ`, `session UUID`, `user_id` as the deployment's own id type, `op` as a Postgres enum rather than text, and nullable `table_name` and `pk`. Six columns. `allowed` and `reason` were both removed on the same argument, that nothing writes them.
 
 **Decided 2026-08-05, three changes to the event kinds, and the `op` enum is now eight values.**
 
