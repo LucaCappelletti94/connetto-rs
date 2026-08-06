@@ -247,7 +247,7 @@ fn format_refresh(session_id: SessionId, secret: &str) -> String {
 ///
 /// A malformed id half is not found rather than an error shape of its own: a
 /// caller may present anything here, and an unparseable id names no session.
-fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
+pub(crate) fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
     let (id, secret) = token.split_once('.')?;
     Some((id.parse().ok()?, secret))
 }

@@ -22,8 +22,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
-use crate::authn::store::{AuthStore, AuthStoreError, ResolvedIdentity};
+use crate::authn::store::{AuthStore, AuthStoreError, ResolvedIdentity, split_refresh};
 use crate::authn::token::{TokenAuthority, TokenError};
+use crate::throttle::{AuthThrottle, ThrottleConfig};
 
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
@@ -68,6 +69,9 @@ pub enum AuthError {
     /// A provider operation (a retained-token refresh) failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// The caller's refresh quota is exhausted. Wait at least this long before retrying.
+    #[error("rate limited")]
+    RateLimited(Duration),
 }
 
 /// Mints and rotates connetto tokens over an [`AuthStore`].
@@ -91,6 +95,11 @@ pub struct AuthService<S: AuthStore> {
     /// Sink for the durable record of access changes, set once at startup.
     /// `None` records nothing, which is what an in-memory deployment wants.
     audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
+    /// Refresh-endpoint counters. Keyed by `String` (the `Display` rendering of
+    /// `S::Id`) rather than by `S::Id` directly, because `Id` does not guarantee
+    /// `Eq + Hash` and widening that public associated-type bound would impose on
+    /// every application that owns the type.
+    throttle: AuthThrottle<String>,
 }
 
 /// Observes a session revocation. Fired synchronously after the store revoke
@@ -108,6 +117,7 @@ impl<S: AuthStore> AuthService<S> {
             refresh_locks: Mutex::new(HashMap::new()),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
+            throttle: AuthThrottle::new(ThrottleConfig::default()),
         }
     }
 
@@ -115,6 +125,15 @@ impl<S: AuthStore> AuthService<S> {
     #[must_use]
     pub fn with_registry(mut self, registry: Arc<ProviderRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Replace the throttle built in [`Self::new`] with one for `config`.
+    /// Supply tight limits in tests or in deployments that diverge from the
+    /// default generous limits.
+    #[must_use]
+    pub fn with_throttle(mut self, config: ThrottleConfig) -> Self {
+        self.throttle = AuthThrottle::new(config);
         self
     }
 
@@ -157,6 +176,8 @@ impl<S: AuthStore> AuthService<S> {
             user = %issued.context.user_id,
             "login succeeded, session created"
         );
+        self.throttle
+            .learn_owner(issued.session_id, &issued.context.user_id.to_string());
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -192,6 +213,8 @@ impl<S: AuthStore> AuthService<S> {
             issuer = %login.retained.issuer,
             "login succeeded, session created with retained provider tokens"
         );
+        self.throttle
+            .learn_owner(issued.session_id, &issued.context.user_id.to_string());
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -267,10 +290,32 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// [`AuthError`] if the token is invalid, expired, reused, or the mint fails.
     pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
+        // Parse the session id before touching the store. A token that does not
+        // parse names nothing, so skip all metering and let the store return its
+        // own error unchanged.
+        let named_session = split_refresh(refresh_token).map(|(sid, _)| sid);
+        if let Some(session_id) = named_session
+            && let Some(wait) = self.throttle.refresh_blocked(session_id)
+        {
+            return Err(AuthError::RateLimited(wait));
+        }
         let now = SystemTime::now();
         let outcome = match self.store.rotate_refresh(refresh_token, now).await {
             Ok(outcome) => outcome,
             Err(err) => {
+                // Only a credential failure counts. A store that is down fails
+                // the honest attempts too, and charging those would turn an
+                // outage into a lockout outliving it.
+                if let Some(session_id) = named_session
+                    && matches!(
+                        err,
+                        AuthStoreError::NotFound
+                            | AuthStoreError::Expired
+                            | AuthStoreError::Reuse { .. }
+                    )
+                {
+                    let _ = self.throttle.refresh_failed(session_id);
+                }
                 // The store revokes on theft but cannot close anything: the
                 // observer lives here. Without this the stolen-credential case
                 // was the one case that left the socket streaming.
@@ -295,6 +340,8 @@ impl<S: AuthStore> AuthService<S> {
         let access_token = self
             .authority
             .mint_access(&outcome.context, outcome.session_id, now)?;
+        self.throttle
+            .learn_owner(outcome.session_id, &outcome.context.user_id.to_string());
         tracing::info!(
             session = %outcome.session_id,
             user = %outcome.context.user_id,

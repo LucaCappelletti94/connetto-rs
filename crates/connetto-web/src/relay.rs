@@ -66,8 +66,8 @@ use connetto_client::{
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
     FullResyncRequired, HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
-    MutationRejectReason, NonFatalError, Pong, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
+    MutationRejectReason, NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport};
@@ -1386,6 +1386,13 @@ where
             forward_worker_nonfatal(state, related_to.as_deref(), &detail);
             Ok(())
         }
+        ClientEvent::RateLimited {
+            related_to,
+            retry_after_ms,
+        } => {
+            forward_worker_rate_limited(state, related_to.as_deref(), retry_after_ms);
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1517,6 +1524,18 @@ fn send_tab_nonfatal(tab: &TabState, related_to: &str, detail: &str) {
     )));
 }
 
+/// Send a rate-limit refusal to one tab, correlated to the tab's own sub id.
+///
+/// The session stays alive. The tab may retry after `retry_after_ms`.
+fn send_tab_rate_limited(tab: &TabState, related_to: &str, retry_after_ms: u64) {
+    let _ = tab
+        .out
+        .send(TabOut::Control(ControlMessage::RateLimited(RateLimited {
+            related_to: Some(related_to.to_owned()),
+            retry_after_ms,
+        })));
+}
+
 /// Forward the worker's own non-fatal error to the tab subscriptions it
 /// concerns. An aggregate upstream (`agg-{tab}-{sub}`) maps to its one owning
 /// tab subscription. A row upstream maps to every tab subscription reading one
@@ -1540,6 +1559,33 @@ fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &
         for sub in &tab.subs {
             if !sub.tables.is_disjoint(tables) {
                 send_tab_nonfatal(tab, &sub.sub_id, detail);
+            }
+        }
+    }
+}
+
+/// Forward the worker's own rate-limit refusal to the tab subscriptions it
+/// concerns, mirroring the logic of [`forward_worker_nonfatal`]. An aggregate
+/// upstream maps to its one owning tab subscription. A row upstream maps to
+/// every tab subscription reading one of its tables. An uncorrelated refusal
+/// is dropped.
+fn forward_worker_rate_limited(state: &HubState, related_to: Option<&str>, retry_after_ms: u64) {
+    let Some(upstream) = related_to else {
+        return;
+    };
+    if let Some(route) = state.agg_routes.get(upstream) {
+        if let Some(tab) = state.tabs.get(&route.tab) {
+            send_tab_rate_limited(tab, &route.tab_sub, retry_after_ms);
+        }
+        return;
+    }
+    let Some(tables) = state.resync_tables.get(upstream) else {
+        return;
+    };
+    for tab in state.tabs.values() {
+        for sub in &tab.subs {
+            if !sub.tables.is_disjoint(tables) {
+                send_tab_rate_limited(tab, &sub.sub_id, retry_after_ms);
             }
         }
     }

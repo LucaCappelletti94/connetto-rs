@@ -90,7 +90,8 @@ The protocol has two planes. The **control plane** carries typed, MessagePack-en
 | `FullResyncRequired` | Server requires the client to re-snapshot a subscription. **Built (R8).** `FullResyncReason` carries exactly the one variant anything sends, `CursorOutsideRetention`. It gains a variant for authorization change in phase R7. Adding a variant is a wire change: the enum has no forward-compatible fallback for an unknown value. |
 | `Pong` | Keepalive reply |
 | `Error` | Non-fatal error associated with a specific request. **Built (R38, 2026-08-06).** A refusal on the subscribe path carries one fixed `detail` (`subscription refused`) whatever the cause, on the direct server and through the relay alike, because a detail that varied told a caller which stage refused and so whether the table or column it guessed exists. The cause goes to the structured log. |
-| `FatalError` | Server is closing the session: reason code. **Built (R2, R8).** Every variant names a close the server performs, there is no catch-all, and `crates/connetto-core/tests/wire.rs` guards that with a wildcard-free match. R2 wired `SessionRevoked` and `ConnectionSuperseded`, R8 sends `ServerShuttingDown` on SIGINT or SIGTERM by walking the connection registry, and the client surfaces the reason as `ClientEvent::ServerClosed` instead of treating it as a protocol violation, so it backs off rather than dying silently. |
+| `RateLimited` | Server refuses one request for asking too often, correlated by `related_to` and carrying `retry_after_ms`. **Built (R19, 2026-08-06).** Typed rather than a detail string, and deliberately not folded into `Error`: a caller must be able to tell "retry later" from "this will never work", because a reconnect re-declares every subscription at once and can trip a limit while perfectly well behaved. Saying so discloses nothing, since a caller already knows how fast it was asking. |
+| `FatalError` | Server is closing the session: reason code. **Built (R2, R8, R19).** Every variant names a close the server performs, there is no catch-all, and `crates/connetto-core/tests/wire.rs` guards that with a wildcard-free match. R2 wired `SessionRevoked` and `ConnectionSuperseded`, R8 sends `ServerShuttingDown` on SIGINT or SIGTERM by walking the connection registry, R19 added `RateLimited` with its `retry_after_ms` for a caller over its connection or credential-refusal limit, and the client surfaces the reason as `ClientEvent::ServerClosed` instead of treating it as a protocol violation, so it backs off rather than dying silently. |
 
 **Decided (R5b): a delivery-paused signal.** When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to distinguish that from nothing changing. `NonFatalError` carries only `related_to` and an untyped `detail`, so this needs a typed signal rather than a string a client parses. Snapshots are unaffected throughout, because they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
 
@@ -154,6 +155,18 @@ The client maintains a **receive credit** budget. On connect, the server is gran
 The server pauses delivery when credits reach zero and resumes when credits are replenished.
 
 This is a simple stop-and-wait variant. A sliding-window variant may be needed for high-throughput scenarios.
+
+---
+
+## Rate limiting
+
+**Built (R19, 2026-08-06), and it is a different job from flow control.** Credits bound how much undelivered data a session accumulates. They do not bound what a caller may ask for, so before this nothing did: a caller could declare subscriptions as fast as it liked, and each one costs a full snapshot of the subscribed shape.
+
+Three signals are metered on the sync path, subscription creation, connections, and refused grants, each per window and each **tiered by whether the handshake resolved an identity**. An authenticated caller is accountable, there is a user to attribute cost to and a session to revoke, and an unidentified one has neither by definition, so its allowance is smaller rather than absent. Everything counts against the durable session handle rather than a per-connection counter, which is what makes a limit survive a reconnect instead of capping one connection.
+
+Over the limit, a subscription draws `RateLimited` and the session stays open, while a connection or a flood of refused grants is closed with `FatalErrorReason::RateLimited`. Nothing is served slowly: connetto refuses rather than queues, because a queue is the cost the caller wanted to impose.
+
+**connetto never meters a network address.** By the time it could consult one it has accepted the connection, completed the upgrade and allocated a session, which is the whole cost. That belongs to the edge. The consequence is accepted rather than hidden: a caller that discards its handle every connection gets a fresh allowance, and answering that is the edge's job and R36's. See `08-authorization.md` for the same reasoning applied to bans.
 
 ---
 

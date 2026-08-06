@@ -386,6 +386,17 @@ pub enum ClientEvent {
         /// Human-readable detail.
         detail: String,
     },
+    /// The server refused this request because the caller asked too often.
+    ///
+    /// The session stays alive and the caller may retry after the stated delay.
+    /// This is not a permanent refusal: an honest client backs off and retries.
+    RateLimited {
+        /// The request or subscription id this refusal refers to, when the server
+        /// correlated it to a specific request.
+        related_to: Option<String>,
+        /// How long to wait before retrying, in milliseconds.
+        retry_after_ms: u64,
+    },
     /// The server confirmed a mutation as durably applied. Its pending
     /// record is retired, so it will never replay.
     MutationApplied {
@@ -1561,6 +1572,10 @@ where
             ControlMessage::NonFatalError(err) => Ok(ClientEvent::NonFatal {
                 related_to: err.related_to,
                 detail: err.detail,
+            }),
+            ControlMessage::RateLimited(limited) => Ok(ClientEvent::RateLimited {
+                related_to: limited.related_to,
+                retry_after_ms: limited.retry_after_ms,
             }),
             // The server says why it is closing. Surfaced rather than treated
             // as a violation: the server behaved exactly as the protocol says.

@@ -16,8 +16,8 @@ use connetto_core::{
         AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
         FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
         LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-        MutationRejectReason, NonFatalError, Ping, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-        Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        MutationRejectReason, NonFatalError, Ping, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
+        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -183,6 +183,11 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         },
         // SessionManager::shutdown, walking the connection registry.
         FatalErrorReason::ServerShuttingDown,
+        // SessionManager::run_handshake, on a caller over its connection or
+        // credential-refusal limit (R19).
+        FatalErrorReason::RateLimited {
+            retry_after_ms: 30_000,
+        },
     ];
     for reason in &reasons {
         match reason {
@@ -190,7 +195,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::SessionRevoked
             | FatalErrorReason::ConnectionSuperseded
             | FatalErrorReason::ProtocolViolation { .. }
-            | FatalErrorReason::ServerShuttingDown => {}
+            | FatalErrorReason::ServerShuttingDown
+            | FatalErrorReason::RateLimited { .. } => {}
         }
     }
     reasons
@@ -201,6 +207,14 @@ fn error_control_round_trips() {
     round_trip_control(&ControlMessage::NonFatalError(NonFatalError {
         related_to: Some("sub-orders".into()),
         detail: "malformed WHERE".into(),
+    }));
+    round_trip_control(&ControlMessage::RateLimited(RateLimited {
+        related_to: Some("sub-orders".into()),
+        retry_after_ms: 1_500,
+    }));
+    round_trip_control(&ControlMessage::RateLimited(RateLimited {
+        related_to: None,
+        retry_after_ms: 0,
     }));
     for reason in every_fatal_reason() {
         round_trip_control(&ControlMessage::FatalError(FatalError::new(reason)));

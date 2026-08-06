@@ -1,8 +1,9 @@
-//! Non-fatal and fatal server error frames.
+//! Non-fatal, rate-limit and fatal server error frames.
 //!
-//! Non-fatal errors are correlated with a specific client request via
-//! `related_to`. The session keeps running. Fatal errors terminate the session
-//! immediately after being sent. The client must reconnect (fresh handshake).
+//! Non-fatal errors and rate-limit refusals are correlated with a specific
+//! client request via `related_to`. The session keeps running. Fatal errors
+//! terminate the session immediately after being sent. The client must
+//! reconnect (fresh handshake).
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,29 @@ pub struct NonFatalError {
     pub related_to: Option<String>,
     /// Human-readable detail.
     pub detail: String,
+}
+
+/// The caller asked for something too often, and this one is refused.
+///
+/// Distinct from [`NonFatalError`] on purpose, and typed rather than a detail
+/// string a client would parse. A caller that is over a limit must be able to
+/// tell "retry later" from "this will never work", because a client reconnects
+/// by re-declaring every subscription at once and can trip a limit while
+/// perfectly well behaved. Saying so discloses nothing: a caller already knows
+/// how fast it was asking.
+///
+/// This is not a refusal of what was named, so it never merges with
+/// [`SUBSCRIPTION_REFUSED`], which stays byte-identical across causes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimited {
+    /// Identifier of the request this refusal refers to, the `sub_id` of a
+    /// refused `Subscribe`. Absent when the refusal belongs to no single
+    /// request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_to: Option<String>,
+    /// How long until the limit's window rolls over, so a client waits once
+    /// rather than probing for the answer.
+    pub retry_after_ms: u64,
 }
 
 /// Reason the server is closing the session.
@@ -59,6 +83,12 @@ pub enum FatalErrorReason {
     },
     /// Server is shutting down and cannot service the session.
     ServerShuttingDown,
+    /// The caller opened connections or presented credentials faster than the
+    /// configured limit, so this one is closed rather than served.
+    RateLimited {
+        /// How long until the limit's window rolls over.
+        retry_after_ms: u64,
+    },
 }
 
 /// Session-terminating error frame.

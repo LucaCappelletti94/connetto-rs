@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -236,7 +236,19 @@ impl AuthApiError {
 impl IntoResponse for AuthApiError {
     fn into_response(self) -> Response {
         let detail = self.detail();
+        // Extract the Retry-After value before consuming self. Ceiling in whole
+        // seconds, minimum 1, so the client always backs off at least a little.
+        let retry_after = if let Self::Service(AuthError::RateLimited(wait)) = &self {
+            Some(
+                wait.as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() > 0))
+                    .max(1),
+            )
+        } else {
+            None
+        };
         let status = match self {
+            Self::Service(AuthError::RateLimited(_)) => StatusCode::TOO_MANY_REQUESTS,
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
                 | AuthError::Token(_),
@@ -256,7 +268,16 @@ impl IntoResponse for AuthApiError {
             }
         };
         tracing::warn!(status = status.as_u16(), detail = %detail, "authentication failed");
-        (status, "authentication failed").into_response()
+        if let Some(secs) = retry_after {
+            (
+                status,
+                [(header::RETRY_AFTER, secs.to_string())],
+                "authentication failed",
+            )
+                .into_response()
+        } else {
+            (status, "authentication failed").into_response()
+        }
     }
 }
 

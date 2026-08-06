@@ -30,14 +30,17 @@
 //! found by reading live in that gap: the deleted permissive stand-in's
 //! authorize URL, and the same-origin constraint on the worker's `fetch` calls.
 
+use core::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use connetto_core::HandshakeAuthority;
 use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
-    OidcProviderConfig, ProviderRegistry, RedirectPolicy, TokenAuthority, auth_router,
+    AssuranceRequirement, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
+    GenericOidcProvider, InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy,
+    ThrottleConfig, TokenAuthority, auth_router,
 };
 // The same path `provider_oidc.rs` uses: `reqwest` is not a direct dependency of
 // this crate, it arrives through `openidconnect`, so the test client is built
@@ -479,4 +482,183 @@ async fn the_login_endpoint_refuses_an_unknown_provider_and_an_offsite_redirect(
         reqwest::StatusCode::BAD_REQUEST,
         "an off-origin redirect is refused before the provider lookup"
     );
+}
+
+/// Guessing a refresh secret is answered with `429` and a `Retry-After` once
+/// the session it names is out of allowance (R19).
+///
+/// The presented token is `<session>.<secret>`, so a caller guessing the secret
+/// still says which session it is guessing at, and that name is the key. The
+/// second attempt never reaches the store: a caller past its limit must not be
+/// able to interleave guesses with valid attempts to keep going.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind connetto's auth endpoints");
+    let connetto_base = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("addr").port()
+    );
+
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let service = Arc::new(AuthService::new(authority, store).with_throttle(
+        ThrottleConfig::new().refresh_failures_per_session(1, Duration::from_secs(300)),
+    ));
+    let router = auth_router(
+        service,
+        Arc::new(ProviderRegistry::new()),
+        RedirectPolicy::default(),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+
+    let agent = user_agent();
+    let target = uuid::Uuid::new_v4();
+    let guess = |secret: &str| {
+        agent
+            .post(format!("{connetto_base}/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": format!("{target}.{secret}") }))
+            .send()
+    };
+
+    let first = guess("wrong-once").await.expect("POST /auth/refresh");
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the first guess is answered like any other bad credential"
+    );
+
+    let second = guess("wrong-twice").await.expect("POST /auth/refresh");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the session named by the token is out of allowance"
+    );
+    let retry_after = second
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .expect("a 429 tells the caller how long to wait")
+        .to_str()
+        .expect("ascii header")
+        .parse::<u64>()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=300).contains(&retry_after),
+        "seconds, not milliseconds: {retry_after}"
+    );
+
+    // A different session is untouched by the first one's exhaustion.
+    let other = agent
+        .post(format!("{connetto_base}/auth/refresh"))
+        .json(&serde_json::json!({
+            "refresh_token": format!("{}.wrong", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("POST /auth/refresh");
+    assert_eq!(
+        other.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the limit is per named session, not a shared bucket everyone can exhaust"
+    );
+}
+
+/// A store whose rotation is broken the way a database outage breaks it, and
+/// which behaves normally otherwise.
+struct OutageStore(InMemoryAuthStore);
+
+impl AuthStore for OutageStore {
+    type Id = String;
+
+    fn create_session(
+        &self,
+        identity: &connetto_server::ResolvedIdentity,
+        now: std::time::SystemTime,
+    ) -> impl Future<Output = Result<connetto_server::IssuedSession<Self::Id>, AuthStoreError>> + Send
+    {
+        self.0.create_session(identity, now)
+    }
+
+    fn session_is_live(
+        &self,
+        session_id: connetto_server::SessionId,
+        now: std::time::SystemTime,
+    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send {
+        self.0.session_is_live(session_id, now)
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn rotate_refresh(
+        &self,
+        _refresh_token: &str,
+        _now: std::time::SystemTime,
+    ) -> Result<connetto_server::RefreshOutcome<Self::Id>, AuthStoreError> {
+        Err(AuthStoreError::Backend("connection refused".to_owned()))
+    }
+
+    fn revoke_session(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send {
+        self.0.revoke_session(session_id)
+    }
+
+    fn session_for_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> impl Future<Output = Result<Option<connetto_server::SessionId>, AuthStoreError>> + Send
+    {
+        self.0.session_for_refresh(refresh_token)
+    }
+
+    fn set_retained_provider_token(
+        &self,
+        session_id: connetto_server::SessionId,
+        token: &connetto_server::RetainedProviderToken,
+        now: std::time::SystemTime,
+    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send {
+        self.0.set_retained_provider_token(session_id, token, now)
+    }
+
+    fn retained_provider_token(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<Output = Result<Option<connetto_server::RetainedProviderToken>, AuthStoreError>>
+    + Send {
+        self.0.retained_provider_token(session_id)
+    }
+}
+
+/// A store outage must not spend anybody's refresh allowance.
+///
+/// The counter exists to slow credential guessing. A database that is down
+/// fails every attempt including the honest ones, so counting those would turn
+/// an outage into a lockout that outlives it, refusing real users for the whole
+/// window after the store comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_outage_does_not_spend_the_refresh_allowance() {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let store = Arc::new(OutageStore(InMemoryAuthStore::new(
+        config.refresh_lifetimes(),
+    )));
+    let service = AuthService::new(authority, store).with_throttle(
+        ThrottleConfig::new().refresh_failures_per_session(1, Duration::from_secs(300)),
+    );
+
+    let token = format!("{}.secret", uuid::Uuid::new_v4());
+    for attempt in 0..4 {
+        let err = service
+            .refresh(&token)
+            .await
+            .expect_err("the store is down, so every attempt fails");
+        assert!(
+            !matches!(err, AuthError::RateLimited(_)),
+            "attempt {attempt} was charged to the caller for the store's failure: {err:?}"
+        );
+    }
 }

@@ -31,6 +31,7 @@ pub mod pk;
 pub mod row_view;
 pub mod session;
 pub mod snapshot;
+pub mod throttle;
 pub mod watermark_schema;
 pub mod write_target;
 
@@ -72,5 +73,6 @@ pub use session::{
     Snapshot, SnapshotSource,
 };
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
+pub use throttle::{AuthThrottle, HandleThrottle, Limit, ThrottleConfig, Tier, TierLimits};
 pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};

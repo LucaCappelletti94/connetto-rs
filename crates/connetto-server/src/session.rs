@@ -28,8 +28,8 @@ use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError, Pong, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    Subscribe,
+    NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
@@ -48,6 +48,7 @@ use crate::materializer::{
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::row_view::ValuesRow;
+use crate::throttle::{HandleThrottle, ThrottleConfig, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
@@ -110,6 +111,9 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     pub schema_version: Option<SchemaVersion>,
+    /// Limits this manager enforces on connections, subscriptions, and
+    /// credential failures, per tier.
+    pub throttle: ThrottleConfig,
 }
 
 impl Default for SessionConfig {
@@ -117,6 +121,7 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
+            throttle: ThrottleConfig::default(),
         }
     }
 }
@@ -434,6 +439,7 @@ pub struct SessionManager<
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
+    throttle: HandleThrottle,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -531,6 +537,7 @@ where
         target: PgWriteTarget<W>,
         config: SessionConfig,
     ) -> Arc<Self> {
+        let throttle = HandleThrottle::new(config.throttle);
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
             materializer: Arc::new(Mutex::new(materializer)),
@@ -547,6 +554,7 @@ where
             next_session: AtomicU64::new(1),
             next_consumer: AtomicU64::new(1),
             config,
+            throttle,
         })
     }
 }
@@ -568,6 +576,15 @@ where
 
     fn next_consumer_id(&self) -> u64 {
         self.next_consumer.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Map a principal to its throttle tier.
+    fn principal_tier(principal: &Principal<Id, Key>) -> Tier {
+        if principal.identity().is_some() {
+            Tier::Identified
+        } else {
+            Tier::Anonymous
+        }
     }
 
     /// Close `session_id`'s live connection, if one exists, sending `reason`
@@ -979,7 +996,7 @@ where
             user = tracing::field::Empty,
             connection = connection_num,
         );
-        let principal = self
+        let (principal, grant_wait) = self
             .resolve_grants(handle, &handshake)
             .instrument(span.clone())
             .await;
@@ -987,6 +1004,36 @@ where
             span.record("user", tracing::field::display(&identity.user_id));
         }
         let session_id = principal.session_id();
+        let tier = Self::principal_tier(&principal);
+        // Refuse over-limit callers before any store work. The credential count
+        // short-circuits, so a caller already being turned away for it does not
+        // also spend a connection.
+        let refused_wait = grant_wait
+            .map(|wait| ("credential refusal limit", wait))
+            .or_else(|| {
+                self.throttle
+                    .connection(session_id, tier)
+                    .map(|wait| ("connection limit", wait))
+            });
+        if let Some((limit, wait)) = refused_wait {
+            let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+            // Inside the connection context, so the line names the handle it
+            // refused. Unlike the version mismatch above, a run exists here.
+            span.in_scope(|| {
+                tracing::warn!(
+                    retry_after_ms,
+                    limit,
+                    "connection refused, rate limit reached"
+                );
+            });
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::RateLimited { retry_after_ms },
+                )))
+                .await;
+            // None: no session to run, so `serve` completes cleanly.
+            return Ok(None);
+        }
 
         // Decode the resume cursor and read the server watermark for the ack. An
         // 8-byte cursor is the client's resume LSN; anything else is a fresh
@@ -1056,14 +1103,25 @@ where
     /// connection and the reply says nothing about it, so this log line is the
     /// entire visibility story: without it a checker that refuses everything
     /// and one that accepts everything look identical from the client.
-    async fn resolve_grants(&self, handle: SessionId, handshake: &Handshake) -> Principal<Id, Key> {
+    ///
+    /// Tripping the refusal limit stops the loop. One handshake carries as many
+    /// grants as fit in a frame, so continuing would buy the caller every
+    /// remaining signature check after the limit already said no, and the
+    /// connection is closed on the returned wait regardless.
+    async fn resolve_grants(
+        &self,
+        handle: SessionId,
+        handshake: &Handshake,
+    ) -> (Principal<Id, Key>, Option<Duration>) {
         let mut principal = Principal::unidentified(handle);
+        let mut refusal_wait: Option<Duration> = None;
         for (position, grant) in handshake.grants.iter().enumerate() {
-            let position = position as u64;
-            match self.authority.check_grant(grant).await {
+            let position = u64::try_from(position).unwrap_or(u64::MAX);
+            let refused = match self.authority.check_grant(grant).await {
                 Ok(subject) => {
                     let kind = subject_kind(&subject);
-                    if principal.accept(subject).is_err() {
+                    let ambiguous = principal.accept(subject).is_err();
+                    if ambiguous {
                         tracing::warn!(
                             client_id = %handshake.client_id,
                             grant = position,
@@ -1072,17 +1130,28 @@ where
                             "grant refused"
                         );
                     }
+                    ambiguous
                 }
-                Err(refusal) => tracing::warn!(
-                    client_id = %handshake.client_id,
-                    grant = position,
-                    reason = refusal.reason(),
-                    detail = %refusal,
-                    "grant refused"
-                ),
+                Err(refusal) => {
+                    tracing::warn!(
+                        client_id = %handshake.client_id,
+                        grant = position,
+                        reason = refusal.reason(),
+                        detail = %refusal,
+                        "grant refused"
+                    );
+                    true
+                }
+            };
+            // A refused grant never establishes an identity, so the refusal is
+            // metered at the tier that has not proved one.
+            if refused && let Some(wait) = self.throttle.credential_refusal(handle, Tier::Anonymous)
+            {
+                refusal_wait = Some(wait);
+                break;
             }
         }
-        principal
+        (principal, refusal_wait)
     }
 
     /// Serve one connection to completion: handshake, then the run loop, then
@@ -1423,6 +1492,23 @@ where
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
+        let tier = Self::principal_tier(&state.principal);
+        if let Some(wait) = self.throttle.subscription(state.session_id, tier) {
+            let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+            tracing::warn!(
+                sub_id = %sub.sub_id,
+                retry_after_ms,
+                "subscription refused, rate limit reached"
+            );
+            transport
+                .send_control(ControlMessage::RateLimited(RateLimited {
+                    related_to: Some(sub.sub_id),
+                    retry_after_ms,
+                }))
+                .await
+                .map_err(transport_err)?;
+            return Ok(());
+        }
         let consumer_id = self.next_consumer_id();
         let SqliteRegistration {
             registration,

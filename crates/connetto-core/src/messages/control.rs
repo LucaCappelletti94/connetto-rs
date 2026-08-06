@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     aggregate::AggregateUpdate,
-    error::{FatalError, NonFatalError},
+    error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
@@ -65,6 +65,9 @@ pub enum ControlMessage {
 
     /// Non-fatal error attached to a specific request.
     NonFatalError(NonFatalError),
+    /// Server refuses one request for exceeding a rate limit. The session
+    /// stays open and the caller may retry after the stated delay.
+    RateLimited(RateLimited),
     /// Session-terminating error.
     FatalError(FatalError),
 }
