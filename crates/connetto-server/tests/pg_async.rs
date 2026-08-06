@@ -5,6 +5,11 @@
 //! `#[ignore]` by default because it needs a running Postgres. Point
 //! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
+// A Docker-gated test that stands up a database, drives DML and asserts several
+// properties of one round trip is legitimately long, and splitting it would
+// duplicate the fixture on a suite that already costs a container. Seven test
+// files here take the same allow.
+#![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 
@@ -424,7 +429,7 @@ async fn pg_oplog_appends_and_reads_back() {
     // test-side stamping is needed.
     let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
-    let mut expected: Vec<(u64, String, bool)> = Vec::new();
+    let mut expected: Vec<(u64, String, bool, Vec<u8>)> = Vec::new();
     for sql in [
         "INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'paid')",
         "UPDATE orders SET quantity = 7 WHERE id = 1",
@@ -437,6 +442,7 @@ async fn pg_oplog_appends_and_reads_back() {
                 record.lsn(),
                 record.table().to_owned(),
                 record.is_tombstone(),
+                record.pk().to_vec(),
             ));
             oplog.append(record).await.expect("append record");
         }
@@ -452,19 +458,24 @@ async fn pg_oplog_appends_and_reads_back() {
     );
 
     let entries = oplog.entries_since(0).await.expect("read entries");
-    let got: Vec<(u64, String, bool)> = entries
+    let got: Vec<(u64, String, bool, Vec<u8>)> = entries
         .iter()
         .map(|record| {
             (
                 record.lsn(),
                 record.table().to_owned(),
                 record.is_tombstone(),
+                record.pk().to_vec(),
             )
         })
         .collect();
     assert_eq!(
         got, expected,
-        "records round-trip through Postgres in LSN order",
+        "records round-trip through Postgres in LSN order, key included",
+    );
+    assert!(
+        entries.iter().all(|record| !record.pk().is_empty()),
+        "an empty key would round-trip unnoticed without this",
     );
     assert!(
         entries.last().expect("has entries").is_tombstone(),
@@ -519,6 +530,79 @@ async fn pg_oplog_appends_and_reads_back() {
     );
 
     sql_query("DROP TABLE IF EXISTS connetto_oplog_test")
+        .execute(&mut *conn)
+        .await
+        .expect("drop oplog table");
+}
+
+/// A two-column key survives the oplog, and two rows differing only in the
+/// second column stay distinct.
+///
+/// The key is one `BYTEA` holding an encoding of every key value, which is
+/// reasonable because connetto is the only reader, but a composite key is where
+/// a single opaque blob has to carry the most. Every other oplog test uses a
+/// single-column key, and until this one the stored key was written, read back,
+/// and never compared to anything.
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn pg_oplog_round_trips_a_composite_key() {
+    const PAIRS_DDL: &str = "CREATE TABLE pairs (tenant TEXT NOT NULL, id INT NOT NULL, note TEXT, \
+         PRIMARY KEY (tenant, id));";
+
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    {
+        let mut conn = pool.get().await.expect("get connection");
+        sql_query("DROP TABLE IF EXISTS connetto_oplog_composite")
+            .execute(&mut *conn)
+            .await
+            .expect("drop oplog table");
+    }
+    let oplog = PgOplog::new(
+        pool.clone(),
+        "connetto_oplog_composite",
+        OplogConfig::default(),
+    );
+    oplog.ensure_schema().await.expect("ensure schema");
+
+    let mat = Materializer::new(PAIRS_DDL).expect("build materializer");
+    let mut source = PgSqliteEmuSource::open_in_memory(PAIRS_DDL).expect("open emu source");
+    let mut appended: Vec<Vec<u8>> = Vec::new();
+    for sql in [
+        "INSERT INTO pairs (tenant, id, note) VALUES ('acme', 1, 'first')",
+        // Same second column, different first: the encoding must not collapse
+        // them, which a key carrying only one column would.
+        "INSERT INTO pairs (tenant, id, note) VALUES ('other', 1, 'second')",
+        // Same first column, different second.
+        "INSERT INTO pairs (tenant, id, note) VALUES ('acme', 2, 'third')",
+    ] {
+        source.execute_sql(sql).expect("execute dml");
+        while let Some(event) = source.next_event().await.expect("poll source") {
+            let record = mat.oplog_record(&event).expect("build oplog record");
+            appended.push(record.pk().to_vec());
+            oplog.append(record).await.expect("append record");
+        }
+    }
+    assert_eq!(appended.len(), 3, "one record per insert");
+
+    let entries = oplog.entries_since(0).await.expect("read entries");
+    let read_back: Vec<Vec<u8>> = entries.iter().map(|r| r.pk().to_vec()).collect();
+    assert_eq!(
+        read_back, appended,
+        "a two-column key round-trips through Postgres unchanged"
+    );
+
+    let distinct: std::collections::HashSet<&Vec<u8>> = read_back.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "three different key pairs must encode to three different keys, got {read_back:?}"
+    );
+
+    let mut conn = pool.get().await.expect("get connection");
+    sql_query("DROP TABLE IF EXISTS connetto_oplog_composite")
         .execute(&mut *conn)
         .await
         .expect("drop oplog table");

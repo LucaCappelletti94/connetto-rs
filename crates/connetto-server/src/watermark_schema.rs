@@ -30,9 +30,7 @@ use connetto_core::SessionId;
 use diesel::helper_types::{Filter, Limit, Select};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
 use diesel::sql_types::BigInt;
-use diesel::{BoolExpressionMethods as _, ExpressionMethods as _};
 use diesel_async::AsyncPgConnection;
-use diesel_async::RunQueryDsl;
 use diesel_async::methods::{ExecuteDsl, LoadQuery as AsyncLoadQuery};
 
 diesel::define_sql_function! {
@@ -84,102 +82,6 @@ where
     fn watermark_upsert(session_id: SessionId, last_seq: i64) -> Self::Upsert;
     /// Build the `session_id = ?` predicate.
     fn wm_pk(session_id: SessionId) -> Self::WmPk;
-    /// The table's SQL name, for the startup shape check.
-    fn table_name() -> &'static str;
-}
-
-diesel::table! {
-    /// The Postgres catalog view of table columns, read only by the startup
-    /// watermark shape check.
-    information_schema.columns (table_name, column_name) {
-        table_name -> diesel::sql_types::Text,
-        column_name -> diesel::sql_types::Text,
-    }
-}
-
-diesel::table! {
-    /// The Postgres catalog view of table constraints, read only by the
-    /// startup watermark shape check.
-    information_schema.table_constraints (constraint_name) {
-        constraint_name -> diesel::sql_types::Text,
-        table_name -> diesel::sql_types::Text,
-        constraint_type -> diesel::sql_types::Text,
-    }
-}
-
-/// The watermark table does not match the shape this build keys exactly-once
-/// records on.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct WatermarkShapeError(pub String);
-
-/// Refuse to run against a watermark table whose shape mismatches the trait.
-///
-/// connetto emits no server DDL, so the trait is the only contract, and an
-/// unchecked contract lets a server run while mis-keying its exactly-once
-/// records, a failure that stays silent until a replay happens. Same treatment
-/// R6 gives `REPLICA IDENTITY`.
-///
-/// # Errors
-///
-/// [`WatermarkShapeError`] naming the missing table, a missing required
-/// column, a leftover `user_id` column from the older two-column key, or a
-/// foreign key from the older shape that pointed the watermark at the table of
-/// logins.
-pub async fn check_watermark_shape<W: ConnettoWatermarkSchema>(
-    conn: &mut AsyncPgConnection,
-) -> Result<(), WatermarkShapeError> {
-    let table = W::table_name();
-    let filtered = FilterDsl::filter(columns::table, columns::table_name.eq(table));
-    let query = SelectDsl::select(filtered, columns::column_name);
-    let names: Vec<String> = query
-        .load(conn)
-        .await
-        .map_err(|err| WatermarkShapeError(format!("reading the shape of {table}: {err}")))?;
-    if names.is_empty() {
-        return Err(WatermarkShapeError(format!(
-            "the watermark table {table} does not exist: create it as \
-             (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)"
-        )));
-    }
-    for required in ["session_id", "last_seq"] {
-        if !names.iter().any(|name| name == required) {
-            return Err(WatermarkShapeError(format!(
-                "the watermark table {table} has no {required} column, expected \
-                 (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)"
-            )));
-        }
-    }
-    if names.iter().any(|name| name == "user_id") {
-        return Err(WatermarkShapeError(format!(
-            "the watermark table {table} still carries a user_id column: the \
-             watermark keys on session_id alone, so drop it"
-        )));
-    }
-    // Every run has a handle, and only a login has a row in the table of
-    // logins, so a foreign key from here into that table breaks the first write
-    // by a caller with no identity. It is dropped rather than widened because
-    // the watermark does not need to know who the caller is.
-    let constrained = FilterDsl::filter(
-        table_constraints::table,
-        table_constraints::table_name
-            .eq(table)
-            .and(table_constraints::constraint_type.eq("FOREIGN KEY")),
-    );
-    let foreign_keys: Vec<String> =
-        SelectDsl::select(constrained, table_constraints::constraint_name)
-            .load(conn)
-            .await
-            .map_err(|err| {
-                WatermarkShapeError(format!("reading the constraints on {table}: {err}"))
-            })?;
-    if let Some(name) = foreign_keys.into_iter().next() {
-        return Err(WatermarkShapeError(format!(
-            "the watermark table {table} has the foreign key {name}: a caller with no \
-             identity has a handle but no row in the table of logins, so drop it"
-        )));
-    }
-    Ok(())
 }
 
 /// Generate the default connetto watermark table and its
@@ -271,9 +173,6 @@ macro_rules! connetto_watermark_table {
             fn wm_pk(session_id: $crate::SessionId) -> Self::WmPk {
                 use diesel::ExpressionMethods as _;
                 _connetto_mutations::session_id.eq(session_id)
-            }
-            fn table_name() -> &'static str {
-                "_connetto_mutations"
             }
         }
     };

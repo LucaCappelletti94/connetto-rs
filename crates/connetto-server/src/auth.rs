@@ -140,6 +140,8 @@ mod rls {
     pub struct RlsAuth<Key = String> {
         pool: Pool<AsyncPgConnection>,
         catalog: ParserDB,
+        /// The setting a policy reads the caller's identity from.
+        user_setting: std::sync::Arc<str>,
         key: PhantomData<Key>,
     }
 
@@ -158,6 +160,17 @@ mod rls {
     type Question = Option<(String, KeyFilter)>;
 
     impl<Key> RlsAuth<Key> {
+        /// Read the caller's identity from `setting` rather than the default.
+        ///
+        /// The share-key setting has been the application's choice since R4; this
+        /// is its counterpart, so an application fitting connetto into rules that
+        /// already name things its own way can rename both.
+        #[must_use]
+        pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
+            self.user_setting = setting.into();
+            self
+        }
+
         /// Build over a connection pool and a Postgres DDL catalog.
         ///
         /// # Errors
@@ -167,6 +180,7 @@ mod rls {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| RlsAuthError::Catalog(format!("{err:?}")))?;
             Ok(Self {
+                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
                 pool,
                 catalog,
                 key: PhantomData,
@@ -212,7 +226,7 @@ mod rls {
             caller: &Principal<String, Key>,
         ) -> Result<bool, RlsAuthError> {
             let query = filter.bind(sql_query(sql.to_owned()).into_boxed::<diesel::pg::Pg>());
-            let binding = CallerBinding::of(caller);
+            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
             let mut conn = self
                 .pool
                 .get()

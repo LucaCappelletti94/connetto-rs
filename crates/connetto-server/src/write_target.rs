@@ -98,6 +98,8 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
 pub struct PgWriteTarget<W> {
     pool: Pool<AsyncPgConnection>,
     catalog: ParserDB,
+    /// The setting a policy reads the caller's identity from.
+    user_setting: std::sync::Arc<str>,
     /// The deployment's watermark schema, carried only in the type system so
     /// `commit`/`last_applied` name its table. `fn() -> W` keeps the target
     /// `Send`/`Sync` regardless of `W`.
@@ -116,6 +118,7 @@ pub fn pg_write_target<W: ConnettoWatermarkSchema>(
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
     Ok(PgWriteTarget {
+        user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
         pool,
         catalog,
         _watermark: PhantomData,
@@ -143,6 +146,17 @@ fn is_rls_violation(text: &str) -> bool {
 }
 
 impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
+    /// Read the caller's identity from `setting` rather than the default.
+    ///
+    /// The share-key setting has been the application's choice since R4; this
+    /// is its counterpart, so an application fitting connetto into rules that
+    /// already name things its own way can rename both.
+    #[must_use]
+    pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
+        self.user_setting = setting.into();
+        self
+    }
+
     /// Probe conflicts, apply one upload, and advance the durable watermark in
     /// the same transaction, reporting the outcome. The apply runs under the
     /// caller's identity and share keys, so Postgres RLS gates it, and the
@@ -170,7 +184,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .get()
             .await
             .map_err(|err| WriteError::Backend(err.to_string()))?;
-        let binding = CallerBinding::of(caller);
+        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
         let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;

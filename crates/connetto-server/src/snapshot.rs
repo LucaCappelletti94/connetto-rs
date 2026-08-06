@@ -132,6 +132,8 @@ mod pg {
     pub struct PgSnapshotSource<DB = ParserDB> {
         pool: Pool<AsyncPgConnection>,
         catalog: DB,
+        /// The setting a policy reads the caller's identity from.
+        user_setting: std::sync::Arc<str>,
     }
 
     impl PgSnapshotSource<ParserDB> {
@@ -146,14 +148,36 @@ mod pg {
         ) -> Result<Self, SnapshotError> {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| SnapshotError::Catalog(format!("{err:?}")))?;
-            Ok(Self { pool, catalog })
+            Ok(Self {
+                pool,
+                catalog,
+                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+            })
         }
     }
 
     impl<DB> PgSnapshotSource<DB> {
+        /// Read the caller's identity from `setting` rather than the default.
+        ///
+        /// The share-key setting has been the application's choice since R4; this
+        /// is its counterpart, so an application fitting connetto into rules that
+        /// already name things its own way can rename both.
+        #[must_use]
+        pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
+            self.user_setting = setting.into();
+            self
+        }
+
         /// Build over a connection pool and an existing catalog.
-        pub const fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Self {
-            Self { pool, catalog }
+        ///
+        /// Not `const`: the default identity setting is a shared string, which
+        /// cannot be built in a constant. This runs once at startup.
+        pub fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Self {
+            Self {
+                pool,
+                catalog,
+                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+            }
         }
     }
 
@@ -239,7 +263,7 @@ mod pg {
                 filter.predicate(),
             );
             let query = filter.bind(sql_query(sql).into_boxed::<diesel::pg::Pg>());
-            let binding = CallerBinding::of(caller);
+            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
             let mut conn = self
                 .pool
                 .get()
@@ -299,7 +323,7 @@ mod pg {
             caller: &Principal<Id, Key>,
         ) -> Result<Snapshot, Self::Error> {
             let table = table_from_select(select_sql)?;
-            let binding = CallerBinding::of(caller);
+            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
             let binds = binds.to_vec();
             let select_sql = select_sql.to_owned();
             let mut conn = self

@@ -39,14 +39,14 @@ use anyhow::{Context, Result, anyhow};
 use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
-use connetto_server::watermark_schema::check_watermark_shape;
+use connetto_server::audit::pg_audit_hook;
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
     GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
     PgSnapshotSource, ProviderRegistry, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
     RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog,
     SessionConfig, SessionManager, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_auth_tables, connetto_watermark_table, pg_write_target,
+    connetto_audit_table, connetto_auth_tables, connetto_watermark_table, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -82,6 +82,12 @@ fn is_loopback_origin(origin: &str) -> bool {
 // `ConnettoWatermark`. connetto emits no DDL; the deployment runs the migration.
 connetto_auth_tables!(String, diesel::sql_types::Text);
 connetto_watermark_table!(String);
+connetto_audit_table!(
+    String,
+    diesel::sql_types::Text,
+    uuid::Uuid,
+    diesel::sql_types::Uuid,
+);
 
 /// The auth store chosen at startup. A single concrete type so the auth
 /// service and session-verifier futures stay `Send`.
@@ -184,8 +190,19 @@ impl AuthStore for ServerStore {
 async fn build_auth(
     pool: &Pool<AsyncPgConnection>,
 ) -> Result<Option<(Arc<AuthService<ServerStore>>, Arc<ProviderRegistry>)>> {
+    // Parsed before anything else, so a bad value fails on the spot rather
+    // than behind identity-provider discovery, and so that asking for records
+    // without asking for logins is refused instead of silently doing nothing.
+    let audit = audit_enabled()?;
     let mode = env_or("CONNETTO_AUTH", "");
     if mode.is_empty() {
+        if audit {
+            return Err(anyhow!(
+                "CONNETTO_AUDIT is set but CONNETTO_AUTH is not: every access change \
+                 recorded here comes from the login machinery, so there would be \
+                 nothing to record"
+            ));
+        }
         return Ok(None);
     }
     let config = AuthConfig::default();
@@ -212,7 +229,26 @@ async fn build_auth(
     let service = Arc::new(
         AuthService::new(Arc::new(authority), Arc::new(store)).with_registry(Arc::clone(&registry)),
     );
+    if audit {
+        service.set_audit_hook(pg_audit_hook::<ConnettoAudit>(pool.clone()));
+        tracing::info!("recording access changes to auth_events");
+    }
     Ok(Some((service, registry)))
+}
+
+/// Whether `CONNETTO_AUDIT` asks for the durable record of access changes.
+///
+/// Off unless switched on, because the table belongs to the application and
+/// connetto emits no DDL, so a server pointed at a database without it must
+/// not attempt writes.
+fn audit_enabled() -> Result<bool> {
+    match env_or("CONNETTO_AUDIT", "").as_str() {
+        "" => Ok(false),
+        "database" => Ok(true),
+        other => Err(anyhow!(
+            "unknown CONNETTO_AUDIT mode {other:?}, expected database"
+        )),
+    }
 }
 
 /// Build the provider registry from `CONNETTO_OIDC_PROVIDER`.
@@ -383,17 +419,6 @@ async fn main() -> Result<()> {
         )
     })?;
     let reader_pool = build_pool(&reader_url).await?;
-    // Refuse a watermark table whose shape mismatches this build's key: a
-    // mis-keyed exactly-once record stays silent until a replay happens.
-    {
-        let mut conn = reader_pool
-            .get()
-            .await
-            .map_err(|err| anyhow!("connecting as the reader role: {err}"))?;
-        check_watermark_shape::<ConnettoWatermark>(&mut conn)
-            .await
-            .map_err(|err| anyhow!("{err}"))?;
-    }
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?;
     let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)

@@ -22,11 +22,12 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession};
+use connetto_server::audit::{AuthEvent, AuthOp};
 use connetto_server::{
     AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
     RowSource, ShareError, SnapshotSource, SourceRow, TokenAuthority,
@@ -315,7 +316,15 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     let rows =
         Arc::new(PgSnapshotSource::from_ddl(reader, CATALOG_DDL).expect("build snapshot source"));
     let authority = Arc::new(TokenAuthority::generate(&AuthConfig::default()).expect("keypair"));
-    let issuer = CapabilityIssuer::new(authority, auth, rows, &AuthConfig::default());
+    // Every successful mint is recorded, every refusal is not. The refusals
+    // below are authorization denials, which go to the log by the split in
+    // `08-authorization.md`, so this asserts the half of that split a future
+    // change is most likely to break.
+    let recorded: Arc<Mutex<Vec<AuthEvent<String>>>> = Arc::default();
+    let sink = Arc::clone(&recorded);
+    let issuer = CapabilityIssuer::new(authority, auth, rows, &AuthConfig::default()).with_audit(
+        Arc::new(move |event| sink.lock().expect("sink").push(event)),
+    );
 
     let alice_paper = [Value::<PgValues>::Int(1)];
     let bob_paper = [Value::<PgValues>::Int(3)];
@@ -359,6 +368,31 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     assert!(
         matches!(refused, ShareError::Unauthorized { .. }),
         "expected Unauthorized, got {refused:?}"
+    );
+
+    let recorded = recorded.lock().expect("sink");
+    assert_eq!(
+        recorded.len(),
+        2,
+        "two mints succeeded and three were refused, so two rows: {recorded:?}"
+    );
+    for event in recorded.iter() {
+        assert_eq!(event.op, AuthOp::CapabilityMinted);
+        assert_eq!(
+            event.table_name.as_deref(),
+            Some("papers"),
+            "a mint names the table it shared"
+        );
+        assert!(event.pk.is_some(), "a mint names the row it shared");
+    }
+    assert_eq!(
+        recorded[0].user_id.as_deref(),
+        Some("alice"),
+        "the mint runs as the caller, so the row names them"
+    );
+    assert_eq!(
+        recorded[1].user_id, None,
+        "a key holder with no identity mints without one"
     );
 }
 

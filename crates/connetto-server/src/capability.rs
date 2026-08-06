@@ -107,13 +107,18 @@ diesel::define_sql_function! {
 /// visibility check cannot answer differently about what the caller holds.
 pub(crate) struct CallerBinding {
     user_id: Option<String>,
+    user_setting: Arc<str>,
     setting: &'static str,
     subjects: Option<String>,
 }
 
 impl CallerBinding {
-    /// Render `caller` under the deployment's key binding.
-    pub(crate) fn of<Id: Display, Key: CapabilityKey>(caller: &Principal<Id, Key>) -> Self {
+    /// Render `caller` under the deployment's key binding, naming the identity
+    /// setting `user_setting`.
+    pub(crate) fn of<Id: Display, Key: CapabilityKey>(
+        caller: &Principal<Id, Key>,
+        user_setting: Arc<str>,
+    ) -> Self {
         Self {
             // A caller with no identity binds nothing, leaving the setting
             // unset for the whole transaction, so an owner comparison is NULL
@@ -123,6 +128,7 @@ impl CallerBinding {
             user_id: caller
                 .identity()
                 .map(|identity| identity.user_id.to_string()),
+            user_setting,
             setting: Key::SETTING,
             subjects: Key::pack(caller.capabilities()),
         }
@@ -130,10 +136,10 @@ impl CallerBinding {
 
     /// Bind both values for the rest of the transaction, in one statement.
     pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
-        const USER: &str = "app.user_id";
+        let user_setting = self.user_setting.to_string();
         match (self.user_id, self.subjects) {
             (None, None) => Ok(()),
-            (Some(user), None) => diesel::select(set_config(USER, user, true))
+            (Some(user), None) => diesel::select(set_config(user_setting, user, true))
                 .execute(conn)
                 .await
                 .map(drop),
@@ -142,7 +148,7 @@ impl CallerBinding {
                 .await
                 .map(drop),
             (Some(user), Some(subjects)) => diesel::select((
-                set_config(USER, user, true),
+                set_config(user_setting, user, true),
                 set_config(self.setting, subjects, true),
             ))
             .execute(conn)
@@ -151,6 +157,15 @@ impl CallerBinding {
         }
     }
 }
+
+/// The setting an application's policies read the caller's identity from,
+/// unless it names another.
+///
+/// The share-key setting has been the application's choice since R4, through
+/// [`CapabilityKey::SETTING`]. This one was fixed in connetto's source until
+/// 2026-08-06, for no reason beyond the key setting having somewhere obvious to
+/// live and this one not.
+pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 
 /// A share key that was minted, and the token proving the bearer holds it.
 ///
@@ -210,15 +225,18 @@ pub enum ShareError {
 /// Held beside [`AuthService`](crate::AuthService) at startup and called from
 /// the application's own handler, so the application keeps its routing, its
 /// request shape and its rate limits.
-pub struct CapabilityIssuer<P, R> {
+pub struct CapabilityIssuer<P, R, Id> {
     authority: Arc<TokenAuthority>,
     policy: Arc<P>,
     rows: Arc<R>,
     ttl: Duration,
     max_ttl: Duration,
+    /// Sink for the durable record of a successful mint. `None` records
+    /// nothing. It also fixes `Id`, so no separate marker is needed.
+    audit: Option<crate::audit::AuditHook<Id>>,
 }
 
-impl<P, R> CapabilityIssuer<P, R> {
+impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     /// Build over the token authority, the visibility policy, the row source
     /// the shared row is read through, and the lifetimes the deployment
     /// configured.
@@ -235,7 +253,18 @@ impl<P, R> CapabilityIssuer<P, R> {
             rows,
             ttl: config.capability_ttl,
             max_ttl: config.capability_max_ttl,
+            audit: None,
         }
+    }
+
+    /// Record every successful mint through `hook`.
+    ///
+    /// Unlike the revocation paths, this row names its user: the mint runs as
+    /// the caller and so already holds the identity, with no extra round trip.
+    #[must_use]
+    pub fn with_audit(mut self, hook: crate::audit::AuditHook<Id>) -> Self {
+        self.audit = Some(hook);
+        self
     }
 
     /// Mint a share key over the row `key` names in `table`, on behalf of
@@ -256,7 +285,7 @@ impl<P, R> CapabilityIssuer<P, R> {
     ///
     /// [`ShareError`] when the caller may not read the row, the row cannot be
     /// reached, the lifetime exceeds the ceiling, or signing fails.
-    pub async fn issue<Id, Key>(
+    pub async fn issue<Key>(
         &self,
         caller: &Principal<Id, Key>,
         table: &str,
@@ -300,6 +329,12 @@ impl<P, R> CapabilityIssuer<P, R> {
         if !matches!(verdicts.as_slice(), [Verdict::Allow, ..]) {
             return Err(unauthorized());
         }
+        // Paired with the hook below in one `Option`, so the captured row and
+        // the decision to record cannot disagree. Captured here because `key` is
+        // shadowed by the minted subject on the next line. The values travel as
+        // read: what type the audit table stores a row key as is the
+        // application's, through `ConnettoAuditSchema::row_key`.
+        let recording = self.audit.as_ref().map(|hook| (hook, key.to_vec()));
         let key = CapabilitySubject::<Key>::new(Key::mint());
         if key.key().to_string().contains(Key::SEPARATOR) {
             return Err(ShareError::SeparatorInKey {
@@ -308,6 +343,18 @@ impl<P, R> CapabilityIssuer<P, R> {
         }
         let issued_at = SystemTime::now();
         let token = self.authority.mint_capability(&key, issued_at, ttl)?;
+        // After the mint, so a refused request records nothing: this table
+        // holds what happened, and denials go to the log.
+        if let Some((hook, shared_row)) = recording {
+            hook(
+                crate::audit::AuthEvent::new(
+                    caller.session_id(),
+                    caller.identity().map(|ctx| ctx.user_id.clone()),
+                    crate::audit::AuthOp::CapabilityMinted,
+                )
+                .about_row(table, shared_row),
+            );
+        }
         Ok(IssuedCapability {
             key,
             token,

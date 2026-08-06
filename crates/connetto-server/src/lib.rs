@@ -19,6 +19,7 @@
 //! See `docs/architecture/10-subscription-materializer.md` for the normative
 //! boundary and `docs/architecture/subql.md` for the shipped `subql` surface.
 
+pub mod audit;
 pub mod auth;
 pub mod authn;
 pub mod capability;

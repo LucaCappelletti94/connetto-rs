@@ -344,6 +344,25 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
          (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
     )
     .await;
+    // The audit table the server appends access changes to when
+    // `CONNETTO_AUDIT=database`. Dropped and recreated per run so a previous
+    // run's rows cannot be mistaken for this one's.
+    exec(pool, "DROP TABLE IF EXISTS auth_events").await;
+    exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
+    exec(
+        pool,
+        "CREATE TYPE connetto_auth_op AS ENUM (\
+         'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
+         'permission_change', 'model_change', 'banned', 'ban_lifted')",
+    )
+    .await;
+    exec(
+        pool,
+        "CREATE TABLE auth_events (\
+         at TIMESTAMPTZ NOT NULL DEFAULT now(), session UUID NOT NULL, user_id TEXT, \
+         op connetto_auth_op NOT NULL, table_name TEXT, pk UUID)",
+    )
+    .await;
     exec(pool, "DROP PUBLICATION IF EXISTS connetto_pub").await;
     exec(pool, PG_DDL).await;
     exec(pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
@@ -548,6 +567,54 @@ async fn mint_token(auth_base: &str) -> (String, String) {
         .expect("user_id in callback JSON")
         .to_owned();
     (access_token, user_id)
+}
+
+/// The refresh token from the same login dance, which `mint_token` discards.
+///
+/// Only the audit test needs it, because logging out is the one producer
+/// reachable from outside the process.
+async fn mint_refresh_token(auth_base: &str) -> String {
+    let agent = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build token-mint HTTP client");
+    let login = agent
+        .get(format!("{auth_base}/auth/login"))
+        .query(&[("provider", "mock-idp")])
+        .send()
+        .await
+        .expect("GET /auth/login");
+    let authorize_url = login
+        .headers()
+        .get("location")
+        .expect("location on login redirect")
+        .to_str()
+        .expect("utf-8 location")
+        .to_owned();
+    let authorized = agent
+        .get(&authorize_url)
+        .send()
+        .await
+        .expect("GET idp authorize");
+    let callback_url = authorized
+        .headers()
+        .get("location")
+        .expect("location on authorize redirect")
+        .to_str()
+        .expect("utf-8 location")
+        .to_owned();
+    let body: serde_json::Value = agent
+        .get(&callback_url)
+        .send()
+        .await
+        .expect("GET /auth/callback")
+        .json()
+        .await
+        .expect("callback JSON body");
+    body["refresh_token"]
+        .as_str()
+        .expect("refresh_token in callback JSON")
+        .to_owned()
 }
 
 #[tokio::test]
@@ -976,6 +1043,64 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
     );
 }
 
+/// Asking for records without asking for logins refuses startup.
+///
+/// Every access change recorded comes from the login machinery, so with logins
+/// off there is nothing to record. The first version of this wiring sat behind
+/// the early return for no logins, so the setting was accepted and silently
+/// did nothing, which is the failure this pins.
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_audit_without_auth() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output =
+        run_server_exit_output(&url, Some(&reader_url), &[("CONNETTO_AUDIT", "database")]).await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit for records without logins"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CONNETTO_AUTH"),
+        "the refusal must name the missing setting, got: {stderr}"
+    );
+}
+
+/// An unrecognised recording mode refuses startup, matching every other mode
+/// setting the binary reads.
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
+    let _serial = PG_SERIAL.lock().await;
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(
+        &url,
+        Some(&reader_url),
+        &[("CONNETTO_AUTH", "in-memory"), ("CONNETTO_AUDIT", "sqlite")],
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit for an unrecognised audit mode"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"sqlite\""),
+        "expected the Debug-quoted mode in stderr, got: {stderr}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
@@ -1136,4 +1261,100 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
             .is_some_and(|session| !session.is_empty()),
         "the connection context lost the durable session handle: {established}"
     );
+}
+
+/// A real logout against a real server leaves exactly one row saying so.
+///
+/// The two audit suites beside this one each attach their own collector, so
+/// they prove the parts and never the whole. That is how the reference server
+/// shipped without ever switching recording on: every test supplied its own
+/// sink, so a green run said nothing about the wiring. This is the only test
+/// that exercises the switch, the startup shape check, the ready-made writer,
+/// and the table together, through a process nobody handed a collector to.
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
+    let _serial = PG_SERIAL.lock().await;
+
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool).await;
+
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let auth_stack = build_auth_stack(auth_port).await;
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let mut command = Command::new(server_bin());
+    command
+        .env("DATABASE_URL", &url)
+        .env("CONNETTO_BIND", &bind)
+        .env("CONNETTO_PG_DDL", PG_DDL)
+        .env("CONNETTO_WRITABLE", "orders")
+        .env("CONNETTO_SLOT", SLOT)
+        .env("CONNETTO_PUBLICATION", PUBLICATION)
+        .env("CONNETTO_READER_URL", &reader_url)
+        // The switch under test. Without it the server records nothing, which
+        // is the default and is what shipped by accident.
+        .env("CONNETTO_AUDIT", "database")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (key, value) in &auth_stack.env_pairs {
+        command.env(key, value);
+    }
+    let _server = ChildGuard(command.spawn().expect("spawn server"));
+
+    let secs = Duration::from_secs(20);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}: with CONNETTO_AUDIT=database it refuses to \
+         start unless the audit table matches"
+    );
+
+    assert_eq!(
+        audit_ops(&pool).await,
+        Vec::<String>::new(),
+        "logging in changes nobody's access, so it records nothing"
+    );
+
+    let refresh_token = mint_refresh_token(&auth_stack.auth_base).await;
+    let agent = reqwest::Client::new();
+    let logout = agent
+        .post(format!("{}/auth/logout", auth_stack.auth_base))
+        .json(&json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .expect("POST /auth/logout");
+    assert!(logout.status().is_success(), "logout: {}", logout.status());
+
+    // The write is spawned, so it lands shortly after the response.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ops = audit_ops(&pool).await;
+    while ops.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ops = audit_ops(&pool).await;
+    }
+    assert_eq!(
+        ops,
+        vec!["logged_out".to_owned()],
+        "a real logout leaves exactly one row, saying it was a logout"
+    );
+}
+
+/// Every `op` recorded so far, in order.
+async fn audit_ops(pool: &Pool<AsyncPgConnection>) -> Vec<String> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        op: String,
+    }
+    let mut conn = pool.get().await.expect("connection");
+    let rows: Vec<Row> =
+        sql_query("SELECT CAST(op AS TEXT) AS op FROM auth_events ORDER BY at, op")
+            .get_results(&mut conn)
+            .await
+            .expect("read auth_events");
+    rows.into_iter().map(|row| row.op).collect()
 }

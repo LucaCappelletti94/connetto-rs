@@ -14,11 +14,9 @@ use std::time::Duration;
 
 use connetto_core::SessionId;
 use connetto_core::messages::{ControlMessage, FatalErrorReason};
-use connetto_server::watermark_schema::check_watermark_shape;
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog, SessionConfig};
 use connetto_test_harness::{
-    ConnettoWatermark, Fixture, HarnessAuth, Server, ServerConfig, insert_changeset, pool_for,
-    provision_watermark, spawn_server,
+    Fixture, HarnessAuth, Server, ServerConfig, insert_changeset, provision_watermark, spawn_server,
 };
 use sqlite_diff_rs::Value;
 
@@ -280,60 +278,6 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     );
     other.close().await;
     drop(server);
-}
-
-/// connetto emits no server DDL, so the watermark trait is the only contract,
-/// and an unchecked contract lets a server run while mis-keying its
-/// exactly-once records, silently, until a replay happens. Starting against
-/// the pre-R2 table refuses and names what is wrong.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker)"]
-async fn startup_refuses_a_pre_r2_watermark_table() {
-    let fixture = Fixture::acquire().await;
-    let pool = pool_for(fixture.admin_url()).await;
-
-    // The shape this build keys on passes.
-    {
-        let mut conn = pool.get().await.expect("admin connection");
-        check_watermark_shape::<ConnettoWatermark>(&mut conn)
-            .await
-            .expect("the current shape is accepted");
-    }
-
-    // The pre-R2 shape, keyed on (user_id, session_id), is refused by name.
-    fixture
-        .exec("DROP TABLE IF EXISTS _connetto_mutations")
-        .await;
-    fixture
-        .exec(
-            "CREATE TABLE _connetto_mutations (user_id TEXT NOT NULL, \
-             session_id UUID NOT NULL, last_seq BIGINT NOT NULL, \
-             PRIMARY KEY (user_id, session_id))",
-        )
-        .await;
-    let mut conn = pool.get().await.expect("admin connection");
-    let err = check_watermark_shape::<ConnettoWatermark>(&mut conn)
-        .await
-        .expect_err("the pre-R2 shape must refuse startup");
-    let message = err.to_string();
-    assert!(
-        message.contains("user_id"),
-        "the refusal names the leftover column, got: {message}"
-    );
-
-    // A missing table refuses too, and says who owns it.
-    fixture
-        .exec("DROP TABLE IF EXISTS _connetto_mutations")
-        .await;
-    let err = check_watermark_shape::<ConnettoWatermark>(&mut conn)
-        .await
-        .expect_err("a missing watermark table must refuse startup");
-    let message = err.to_string();
-    assert!(
-        message.contains("does not exist"),
-        "the refusal names the missing table, got: {message}"
-    );
-    provision_watermark(fixture.admin()).await;
 }
 
 /// The handle the ack carries is the one the client presents on reconnect, so

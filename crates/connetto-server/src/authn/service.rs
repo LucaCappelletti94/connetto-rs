@@ -88,6 +88,9 @@ pub struct AuthService<S: AuthStore> {
     /// deployment points it at the session manager so revocation closes the
     /// session's live connection rather than only refusing its next handshake.
     revocation_hook: std::sync::OnceLock<SessionRevocationHook>,
+    /// Sink for the durable record of access changes, set once at startup.
+    /// `None` records nothing, which is what an in-memory deployment wants.
+    audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
 }
 
 /// Observes a session revocation. Fired synchronously after the store revoke
@@ -104,6 +107,7 @@ impl<S: AuthStore> AuthService<S> {
             registry: None,
             refresh_locks: Mutex::new(HashMap::new()),
             revocation_hook: std::sync::OnceLock::new(),
+            audit_hook: std::sync::OnceLock::new(),
         }
     }
 
@@ -118,6 +122,23 @@ impl<S: AuthStore> AuthService<S> {
     /// is ignored, which suits the one startup wiring point this exists for.
     pub fn set_revocation_hook(&self, hook: SessionRevocationHook) {
         let _ = self.revocation_hook.set(hook);
+    }
+
+    /// Attach the audit sink, once, after construction. A second call is
+    /// ignored, matching the revocation observer beside it.
+    ///
+    /// Unset, connetto records nothing, which is the right default: the table
+    /// is the deployment's and connetto emits no DDL, so a deployment that has
+    /// not created it must not have writes attempted against it.
+    pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<S::Id>) {
+        let _ = self.audit_hook.set(hook);
+    }
+
+    /// Record one access change, if a sink is attached.
+    fn record(&self, event: crate::audit::AuthEvent<S::Id>) {
+        if let Some(hook) = self.audit_hook.get() {
+            hook(event);
+        }
     }
 
     /// Create a session for a verified identity and mint its first token pair.
@@ -259,6 +280,14 @@ impl<S: AuthStore> AuthService<S> {
                         "refresh token reuse detected, session revoked as theft"
                     );
                     self.notify_revoked(*session_id);
+                    // Not `revoke_as`: the store already revoked inside the
+                    // rotation, so going back through it would write the row a
+                    // second time.
+                    self.record(crate::audit::AuthEvent::new(
+                        *session_id,
+                        None,
+                        crate::audit::AuthOp::TokenReplayed,
+                    ));
                 }
                 return Err(err.into());
             }
@@ -286,9 +315,28 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// [`AuthError`] if the store fails.
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
+        self.revoke_as(session_id, crate::audit::AuthOp::SessionRevoked)
+            .await
+    }
+
+    /// Revoke, and record the cause. Three causes reach here and they are not
+    /// interchangeable: an audit row saying only that a login ended cannot tell
+    /// an ordinary logout from a stolen credential, which is the most valuable
+    /// thing this table reports.
+    ///
+    /// The row names no user. Every producer here holds a session and not an
+    /// identity, and `session` joins `connetto_sessions`, which has the user,
+    /// so the alternative was a store round trip per revocation to denormalise
+    /// a column the join already answers.
+    async fn revoke_as(
+        &self,
+        session_id: SessionId,
+        op: crate::audit::AuthOp,
+    ) -> Result<(), AuthError> {
         self.store.revoke_session(session_id).await?;
-        tracing::info!(session = %session_id, "session revoked");
+        tracing::info!(session = %session_id, cause = op.label(), "session revoked");
         self.notify_revoked(session_id);
+        self.record(crate::audit::AuthEvent::new(session_id, None, op));
         Ok(())
     }
 
@@ -321,7 +369,8 @@ impl<S: AuthStore> AuthService<S> {
         let Some(session_id) = self.store.session_for_refresh(refresh_token).await? else {
             return Ok(false);
         };
-        self.revoke(session_id).await?;
+        self.revoke_as(session_id, crate::audit::AuthOp::LoggedOut)
+            .await?;
         Ok(true)
     }
 

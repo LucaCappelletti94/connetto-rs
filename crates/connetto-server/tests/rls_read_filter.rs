@@ -167,3 +167,52 @@ async fn rls_read_filter_enforces_visibility_per_user() {
         "expected UnsupportedKeyType, got {err:?}"
     );
 }
+
+/// A policy naming its own identity setting is honoured.
+///
+/// The share-key setting has been the application's choice since R4 and this
+/// one was fixed in connetto's source until 2026-08-06. The assertion that
+/// matters is the negative: with the default name the policy sees nothing,
+/// because connetto would be binding a setting nobody reads.
+#[tokio::test]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_policy_may_name_its_own_identity_setting() {
+    const OURS: &str = "myapp.current_user";
+
+    let admin = pool_for(&admin_url()).await;
+    let mut conn = admin.get().await.expect("admin connection");
+    for stmt in [
+        // The role is this test's own to provision: depending on the other test
+        // having run first is an ordering dependency, and it bit once already.
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        "DROP TABLE IF EXISTS docs",
+        "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT NOT NULL)",
+        "INSERT INTO docs VALUES (1, 'alice'), (2, 'bob')",
+        "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+        // The policy reads the application's own name, not connetto's default.
+        "CREATE POLICY docs_p ON docs USING (owner = current_setting('myapp.current_user', true))",
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON docs TO app_reader",
+    ] {
+        sql_query(stmt)
+            .execute(&mut *conn)
+            .await
+            .expect("setup statement");
+    }
+    drop(conn);
+
+    let reader = pool_for(&with_user(&admin_url(), "app_reader", "app_reader")).await;
+    let renamed = RlsAuth::from_ddl(reader.clone(), CATALOG_DDL)
+        .expect("build RlsAuth")
+        .with_user_setting(OURS);
+    assert!(visible(&renamed, "alice", "docs", &[Value::Int(1)]).await);
+    assert!(!visible(&renamed, "alice", "docs", &[Value::Int(2)]).await);
+    assert!(visible(&renamed, "bob", "docs", &[Value::Int(2)]).await);
+
+    // Left at the default, connetto binds a setting this policy never reads, so
+    // the owner comparison is NULL and every row is hidden. Without this the
+    // test above would pass even if the rename did nothing.
+    let defaulted = RlsAuth::from_ddl(reader, CATALOG_DDL).expect("build RlsAuth");
+    assert!(!visible(&defaulted, "alice", "docs", &[Value::Int(1)]).await);
+}
