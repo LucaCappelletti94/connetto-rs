@@ -24,6 +24,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `13-client-connection.md` | The client-side Diesel connection, reactivity, and the two framework adapters |
 | `14-at-rest-encryption.md` | The replica page codec, key custody, ordering constraints, and what the encryption does and does not defend |
 | `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming. **Decided, not built**, and blocked on upstream diesel work |
+| `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers. **Decided, not built** |
 
 ## Not chapters
 
