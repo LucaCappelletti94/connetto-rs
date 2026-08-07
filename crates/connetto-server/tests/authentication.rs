@@ -18,8 +18,8 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession};
 use connetto_server::{
-    Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 
@@ -122,6 +122,7 @@ async fn absent_grant_yields_an_unidentified_run() {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();
@@ -183,6 +184,7 @@ async fn refused_grant_yields_an_unidentified_run() {
         Arc::new(AlwaysReject),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();
@@ -245,6 +247,7 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
         Arc::new(FixedVerifier(resolved.clone())),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();

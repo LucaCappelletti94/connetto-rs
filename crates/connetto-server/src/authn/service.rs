@@ -24,7 +24,7 @@ use crate::authn::provider::{
 };
 use crate::authn::store::{AuthStore, AuthStoreError, ResolvedIdentity, split_refresh};
 use crate::authn::token::{TokenAuthority, TokenError};
-use crate::throttle::{AuthThrottle, ThrottleConfig};
+use crate::guard::RequestGuard;
 
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
@@ -95,11 +95,10 @@ pub struct AuthService<S: AuthStore> {
     /// Sink for the durable record of access changes, set once at startup.
     /// `None` records nothing, which is what an in-memory deployment wants.
     audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
-    /// Refresh-endpoint counters. Keyed by `String` (the `Display` rendering of
-    /// `S::Id`) rather than by `S::Id` directly, because `Id` does not guarantee
-    /// `Eq + Hash` and widening that public associated-type bound would impose on
-    /// every application that owns the type.
-    throttle: AuthThrottle<String>,
+    /// Every counter connetto keeps about a caller, shared with the session
+    /// manager because the failed-renewal signal fires here and the other three
+    /// fire there.
+    guard: Arc<RequestGuard<S::Id>>,
 }
 
 /// Observes a session revocation. Fired synchronously after the store revoke
@@ -108,8 +107,15 @@ pub type SessionRevocationHook = Arc<dyn Fn(SessionId) + Send + Sync>;
 
 impl<S: AuthStore> AuthService<S> {
     /// Build over a shared token authority and store, with no provider registry.
+    ///
+    /// The `guard` is the same instance the session manager holds, so a person's
+    /// abuse tally spans both surfaces.
     #[must_use]
-    pub fn new(authority: Arc<TokenAuthority>, store: Arc<S>) -> Self {
+    pub fn new(
+        authority: Arc<TokenAuthority>,
+        store: Arc<S>,
+        guard: Arc<RequestGuard<S::Id>>,
+    ) -> Self {
         Self {
             authority,
             store,
@@ -117,7 +123,7 @@ impl<S: AuthStore> AuthService<S> {
             refresh_locks: Mutex::new(HashMap::new()),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
-            throttle: AuthThrottle::new(ThrottleConfig::default()),
+            guard,
         }
     }
 
@@ -128,13 +134,10 @@ impl<S: AuthStore> AuthService<S> {
         self
     }
 
-    /// Replace the throttle built in [`Self::new`] with one for `config`.
-    /// Supply tight limits in tests or in deployments that diverge from the
-    /// default generous limits.
+    /// The counters this service shares with the session manager.
     #[must_use]
-    pub fn with_throttle(mut self, config: ThrottleConfig) -> Self {
-        self.throttle = AuthThrottle::new(config);
-        self
+    pub fn guard(&self) -> &Arc<RequestGuard<S::Id>> {
+        &self.guard
     }
 
     /// Attach the revocation observer, once, after construction. A second call
@@ -176,8 +179,8 @@ impl<S: AuthStore> AuthService<S> {
             user = %issued.context.user_id,
             "login succeeded, session created"
         );
-        self.throttle
-            .learn_owner(issued.session_id, &issued.context.user_id.to_string());
+        self.guard
+            .learn_owner(issued.session_id, &issued.context.user_id);
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -213,8 +216,8 @@ impl<S: AuthStore> AuthService<S> {
             issuer = %login.retained.issuer,
             "login succeeded, session created with retained provider tokens"
         );
-        self.throttle
-            .learn_owner(issued.session_id, &issued.context.user_id.to_string());
+        self.guard
+            .learn_owner(issued.session_id, &issued.context.user_id);
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -295,7 +298,7 @@ impl<S: AuthStore> AuthService<S> {
         // own error unchanged.
         let named_session = split_refresh(refresh_token).map(|(sid, _)| sid);
         if let Some(session_id) = named_session
-            && let Some(wait) = self.throttle.refresh_blocked(session_id)
+            && let Some(wait) = self.guard.refresh_blocked(session_id)
         {
             return Err(AuthError::RateLimited(wait));
         }
@@ -314,7 +317,7 @@ impl<S: AuthStore> AuthService<S> {
                             | AuthStoreError::Reuse { .. }
                     )
                 {
-                    let _ = self.throttle.refresh_failed(session_id);
+                    let _ = self.guard.refresh_failed(session_id);
                 }
                 // The store revokes on theft but cannot close anything: the
                 // observer lives here. Without this the stolen-credential case
@@ -340,8 +343,8 @@ impl<S: AuthStore> AuthService<S> {
         let access_token = self
             .authority
             .mint_access(&outcome.context, outcome.session_id, now)?;
-        self.throttle
-            .learn_owner(outcome.session_id, &outcome.context.user_id.to_string());
+        self.guard
+            .learn_owner(outcome.session_id, &outcome.context.user_id);
         tracing::info!(
             session = %outcome.session_id,
             user = %outcome.context.user_id,

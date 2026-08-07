@@ -32,8 +32,9 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy, RlsAuth,
-    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
+    LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy,
+    RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -307,6 +308,9 @@ pub struct ServerConfig {
     pub admin_url: String,
     /// Per-session server configuration.
     pub session: SessionConfig,
+    /// The counters the server meters and tallies against. Supply one built
+    /// from tight thresholds to trip a limit or a ban inside a test.
+    pub guard: Arc<RequestGuard<String>>,
 }
 
 /// A running harness server: a [`SessionManager`] wired to the full production
@@ -364,6 +368,7 @@ pub fn spawn_server(
         writable,
         admin_url,
         session,
+        guard,
     } = config;
     let materializer =
         Materializer::with_write_catalog(&pg_ddl, writable).expect("build materializer");
@@ -384,6 +389,7 @@ pub fn spawn_server(
         authority,
         connector,
         write,
+        guard,
         session,
     );
 

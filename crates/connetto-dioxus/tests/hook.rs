@@ -14,8 +14,8 @@ use connetto_core::{
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -235,6 +235,7 @@ async fn use_live_renders_and_follows_cdc() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -313,9 +314,9 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();

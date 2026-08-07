@@ -18,8 +18,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, loopback, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, WebSocketTransport, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -168,6 +168,7 @@ async fn loopback_session_full_lifecycle() {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         config,
     );
 
@@ -296,6 +297,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 

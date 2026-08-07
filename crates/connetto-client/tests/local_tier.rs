@@ -21,8 +21,8 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -149,6 +149,7 @@ async fn spawn_server(
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

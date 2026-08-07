@@ -19,8 +19,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PermissiveAuth,
-    PgOplog, PgSnapshotSource, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
-    pg_write_target,
+    PgOplog, PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::ConnettoWatermark;
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -346,6 +346,7 @@ async fn async_pg_reexec_bootstraps_min() {
         Arc::new(TestGrantChecker),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -674,6 +675,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         Arc::new(TestGrantChecker),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 

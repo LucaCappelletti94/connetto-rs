@@ -19,11 +19,14 @@
 //! See `docs/architecture/10-subscription-materializer.md` for the normative
 //! boundary and `docs/architecture/subql.md` for the shipped `subql` surface.
 
+pub mod abuse;
 pub mod audit;
 pub mod auth;
 pub mod authn;
+pub mod ban;
 pub mod capability;
 pub mod counters;
+pub mod guard;
 mod key_filter;
 pub mod materializer;
 pub mod oplog;
@@ -35,9 +38,15 @@ pub mod throttle;
 pub mod watermark_schema;
 pub mod write_target;
 
+pub use abuse::{
+    AbuseConfig, AbuseConfigError, AbuseLimits, ConnectionLimits, Crossing, Enforcement,
+    EnforcementFuture, EnforcementPolicy, PersonLimits, Signal,
+};
 pub use auth::PermissiveAuth;
 pub use auth::{RlsAuth, RlsAuthError};
+pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
 pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError};
+pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported so the `connetto_auth_tables!` macro can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
@@ -73,6 +82,6 @@ pub use session::{
     Snapshot, SnapshotSource,
 };
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
-pub use throttle::{AuthThrottle, HandleThrottle, Limit, ThrottleConfig, Tier, TierLimits};
+pub use throttle::{Limit, ThrottleConfig, Tier, TierLimits};
 pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};

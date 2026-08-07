@@ -38,9 +38,9 @@ use connetto_core::HandshakeAuthority;
 use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
-    GenericOidcProvider, InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy,
-    ThrottleConfig, TokenAuthority, auth_router,
+    AbuseConfig, AssuranceRequirement, AuthConfig, AuthError, AuthService, AuthStore,
+    AuthStoreError, GenericOidcProvider, InMemoryAuthStore, OidcProviderConfig, ProviderRegistry,
+    RedirectPolicy, RequestGuard, ThrottleConfig, TokenAuthority, auth_router,
 };
 // The same path `provider_oidc.rs` uses: `reqwest` is not a direct dependency of
 // this crate, it arrives through `openidconnect`, so the test client is built
@@ -170,7 +170,11 @@ impl Stack {
         let config = AuthConfig::default();
         let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
         let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-        let service = Arc::new(AuthService::new(authority, store));
+        let service = Arc::new(AuthService::new(
+            authority,
+            store,
+            Arc::new(RequestGuard::default()),
+        ));
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(provider));
         let router = auth_router(
@@ -444,7 +448,11 @@ async fn the_login_endpoint_refuses_an_unknown_provider_and_an_offsite_redirect(
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let service = Arc::new(AuthService::new(authority, store));
+    let service = Arc::new(AuthService::new(
+        authority,
+        store,
+        Arc::new(RequestGuard::default()),
+    ));
     let router = auth_router(
         service,
         Arc::new(ProviderRegistry::new()),
@@ -504,9 +512,11 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let service = Arc::new(AuthService::new(authority, store).with_throttle(
+    let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::new().refresh_failures_per_session(1, Duration::from_secs(300)),
+        AbuseConfig::default(),
     ));
+    let service = Arc::new(AuthService::new(authority, store, guard));
     let router = auth_router(
         service,
         Arc::new(ProviderRegistry::new()),
@@ -646,9 +656,11 @@ async fn a_store_outage_does_not_spend_the_refresh_allowance() {
     let store = Arc::new(OutageStore(InMemoryAuthStore::new(
         config.refresh_lifetimes(),
     )));
-    let service = AuthService::new(authority, store).with_throttle(
+    let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::new().refresh_failures_per_session(1, Duration::from_secs(300)),
-    );
+        AbuseConfig::default(),
+    ));
+    let service = AuthService::new(authority, store, guard);
 
     let token = format!("{}.secret", uuid::Uuid::new_v4());
     for attempt in 0..4 {

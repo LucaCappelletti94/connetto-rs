@@ -19,8 +19,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, OplogConfig, PermissiveAuth, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, OplogConfig, PermissiveAuth, RequestGuard,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use subql::backend::CdcEvent;
@@ -70,6 +70,7 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -155,6 +156,7 @@ async fn refusals_are_byte_identical_across_causes() {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -266,6 +268,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         oplog,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 

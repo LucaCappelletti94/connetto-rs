@@ -11,7 +11,7 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::{
-    AuthConfig, AuthService, InMemoryAuthStore, ResolvedIdentity, TokenAuthority,
+    AuthConfig, AuthService, InMemoryAuthStore, RequestGuard, ResolvedIdentity, TokenAuthority,
 };
 
 /// Collects what connetto emitted, in order.
@@ -47,7 +47,11 @@ fn service() -> (
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let svc = Arc::new(AuthService::new(Arc::clone(&authority), store));
+    let svc = Arc::new(AuthService::new(
+        Arc::clone(&authority),
+        store,
+        Arc::new(RequestGuard::default()),
+    ));
     let captured = Captured::default();
     svc.set_audit_hook(captured.hook());
     (authority, svc, captured)

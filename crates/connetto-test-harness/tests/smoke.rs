@@ -10,10 +10,13 @@
 //! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
 //! Run under Docker with `DATABASE_URL` pointed at it and `-- --ignored`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::ControlMessage;
-use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{
+    PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+};
 use connetto_test_harness::{
     Fixture, HarnessAuth, ServerConfig, insert_changeset, pool_for, spawn_server, with_user,
 };
@@ -97,6 +100,7 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
                 .build(),
             admin_url: fixture.admin_url().to_owned(),
             session: SessionConfig::default(),
+            guard: Arc::new(RequestGuard::default()),
         },
         snapshot,
         auth,

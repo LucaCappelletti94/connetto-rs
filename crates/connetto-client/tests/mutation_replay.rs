@@ -19,8 +19,8 @@ use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -135,6 +135,7 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     )
 }

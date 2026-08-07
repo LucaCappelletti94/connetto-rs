@@ -205,6 +205,13 @@ impl ThrottleConfig {
         self
     }
 
+    /// How many distinct keys any one counter tracks, which the abuse tallies
+    /// share so one setting bounds every map connetto keeps about a caller.
+    #[must_use]
+    pub(crate) const fn key_cap(&self) -> usize {
+        self.max_tracked
+    }
+
     /// The limits for `tier`.
     #[must_use]
     const fn tier(&self, tier: Tier) -> TierLimits {
@@ -267,6 +274,24 @@ impl Window {
         None
     }
 
+    /// Count one event over `window`, returning the running total.
+    ///
+    /// Nothing is refused, so an over-threshold event still counts: a tally
+    /// reports what a caller did, where a limit decides what it may do. `None`
+    /// never rolls over, which is what a per-connection tally wants because the
+    /// connection is the window.
+    fn add(&mut self, window: Option<Duration>, now: Instant) -> u32 {
+        if let Some(window) = window
+            && now.saturating_duration_since(self.started) >= window
+        {
+            self.started = now;
+            self.count = 1;
+            return self.count;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count
+    }
+
     /// A fresh window already holding this event.
     const fn opened(now: Instant) -> Self {
         Self {
@@ -299,12 +324,12 @@ struct CounterState<K> {
 /// Fixed-window counters for one signal, keyed by whatever identifies the
 /// caller or the target.
 #[derive(Debug)]
-struct Counters<K> {
+pub(crate) struct Counters<K> {
     state: Mutex<CounterState<K>>,
 }
 
 impl<K: Eq + Hash + Clone> Counters<K> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(CounterState {
                 windows: HashMap::new(),
@@ -363,6 +388,41 @@ impl<K: Eq + Hash + Clone> Counters<K> {
         }
         None
     }
+
+    /// Count one event for `key` over `window`, returning the running total.
+    ///
+    /// The same three bounds as [`Counters::take`], and the same eviction
+    /// direction for the same reason. A `None` window never rolls over, so
+    /// `retain` should be [`Duration::MAX`] beside it and the caller is
+    /// responsible for [`Counters::forget`] when the key dies.
+    pub(crate) fn tally(
+        &self,
+        key: &K,
+        window: Option<Duration>,
+        retain: Duration,
+        cap: usize,
+        now: Instant,
+    ) -> u32 {
+        let mut state = self.state.lock().expect("throttle counters poisoned");
+        if now.saturating_duration_since(state.last_sweep) >= retain {
+            state.sweep(retain, now);
+        }
+        if let Some(mut tracked) = state.windows.get(key).copied() {
+            let count = tracked.window.add(window, now);
+            state.touch(key, &mut tracked);
+            return count;
+        }
+        state.admit(key, cap, now);
+        1
+    }
+
+    /// Stop tracking `key`.
+    pub(crate) fn forget(&self, key: &K) {
+        let mut state = self.state.lock().expect("throttle counters poisoned");
+        if let Some(tracked) = state.windows.remove(key) {
+            state.order.remove(&tracked.touched);
+        }
+    }
 }
 
 impl<K: Eq + Hash + Clone> CounterState<K> {
@@ -414,8 +474,12 @@ impl<K: Eq + Hash + Clone> CounterState<K> {
 /// Not keyed by the per-connection counter: that resets on every reconnect, so
 /// it would cap one connection and not a reconnect loop, which is the shape of
 /// abuse worth bounding.
+///
+/// Reached through [`RequestGuard`](crate::guard::RequestGuard) rather than on
+/// its own, so one call per site defines the moment for both the limiter and
+/// the abuse detector behind it.
 #[derive(Debug)]
-pub struct HandleThrottle {
+pub(crate) struct HandleThrottle {
     config: ThrottleConfig,
     retain: Duration,
     subscriptions: Counters<SessionId>,
@@ -423,16 +487,9 @@ pub struct HandleThrottle {
     credential_refusals: Counters<SessionId>,
 }
 
-impl Default for HandleThrottle {
-    fn default() -> Self {
-        Self::new(ThrottleConfig::default())
-    }
-}
-
 impl HandleThrottle {
     /// Build the counters for `config`.
-    #[must_use]
-    pub fn new(config: ThrottleConfig) -> Self {
+    pub(crate) fn new(config: ThrottleConfig) -> Self {
         Self {
             retain: config.handle_retain(),
             config,
@@ -443,8 +500,7 @@ impl HandleThrottle {
     }
 
     /// Take one subscription creation, returning the wait when refused.
-    #[must_use]
-    pub fn subscription(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
+    pub(crate) fn subscription(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
         self.subscriptions.take(
             &handle,
             self.config.tier(tier).subscriptions,
@@ -455,8 +511,7 @@ impl HandleThrottle {
     }
 
     /// Take one connection, returning the wait when refused.
-    #[must_use]
-    pub fn connection(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
+    pub(crate) fn connection(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
         self.connections.take(
             &handle,
             self.config.tier(tier).connections,
@@ -468,8 +523,7 @@ impl HandleThrottle {
 
     /// Record one refused grant, returning the wait when the handle has had
     /// too many.
-    #[must_use]
-    pub fn credential_refusal(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
+    pub(crate) fn credential_refusal(&self, handle: SessionId, tier: Tier) -> Option<Duration> {
         self.credential_refusals.take(
             &handle,
             self.config.tier(tier).credential_refusals,
@@ -485,58 +539,58 @@ impl HandleThrottle {
 /// Two keys, because the two attacks differ. A caller guessing the secret of one
 /// session is opposed by the per-session key, which the presented token names
 /// even when the secret is wrong. A caller working through several sessions of
-/// one person is opposed by the per-account key, which is learned from the
-/// sessions this process has seen succeed rather than by asking the store, since
-/// a store lookup per guess is the cost the limit exists to avoid.
+/// one person is opposed by the per-account key, which the caller supplies from
+/// the sessions this process has seen succeed rather than by asking the store,
+/// since a store lookup per guess is the cost the limit exists to avoid.
+///
+/// The account arrives as its [`Display`](core::fmt::Display) rendering rather
+/// than typed, because an `Id` guarantees no `Eq + Hash` and widening that
+/// public bound would impose on every application that owns the type. Remembering
+/// which account a session belongs to is [`RequestGuard`](crate::guard::RequestGuard)'s
+/// job, since the enforcement callback beside this needs the typed id too.
 #[derive(Debug)]
-pub struct AuthThrottle<Id> {
+pub(crate) struct AuthThrottle {
     config: ThrottleConfig,
     retain: Duration,
     per_session: Counters<SessionId>,
-    per_account: Counters<Id>,
-    owners: Mutex<HashMap<SessionId, (Id, Instant)>>,
+    per_account: Counters<String>,
 }
 
-impl<Id: Eq + Hash + Clone> Default for AuthThrottle<Id> {
-    fn default() -> Self {
-        Self::new(ThrottleConfig::default())
-    }
-}
-
-impl<Id: Eq + Hash + Clone> AuthThrottle<Id> {
+impl AuthThrottle {
     /// Build the counters for `config`.
-    #[must_use]
-    pub fn new(config: ThrottleConfig) -> Self {
+    pub(crate) fn new(config: ThrottleConfig) -> Self {
         Self {
             retain: config.auth_retain(),
             config,
             per_session: Counters::new(),
             per_account: Counters::new(),
-            owners: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record that `session` belongs to `account`, learned from an attempt that
-    /// succeeded, so a later failure naming it can be attributed.
-    pub fn learn_owner(&self, session: SessionId, account: &Id) {
-        let now = Instant::now();
-        let mut owners = self.owners.lock().expect("throttle owners poisoned");
-        owners.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < self.retain);
-        owners.insert(session, (account.clone(), now));
+    /// How long this surface keeps a key, which is how long an owner memory
+    /// feeding it has to last to be read.
+    pub(crate) const fn retain(&self) -> Duration {
+        self.retain
     }
 
     /// Whether attempts naming `session` are already refused, checked before
     /// the attempt so a caller past its limit cannot interleave guesses with
     /// valid attempts to keep going.
-    #[must_use]
-    pub fn refresh_blocked(&self, session: SessionId) -> Option<Duration> {
+    pub(crate) fn refresh_blocked(
+        &self,
+        session: SessionId,
+        account: Option<&str>,
+    ) -> Option<Duration> {
         let now = Instant::now();
         let by_session =
             self.per_session
                 .peek(&session, self.config.refresh_failures_per_session, now);
-        let by_account = self.owner_of(session, now).and_then(|account| {
-            self.per_account
-                .peek(&account, self.config.refresh_failures_per_account, now)
+        let by_account = account.and_then(|account| {
+            self.per_account.peek(
+                &account.to_owned(),
+                self.config.refresh_failures_per_account,
+                now,
+            )
         });
         match (by_session, by_account) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -546,8 +600,11 @@ impl<Id: Eq + Hash + Clone> AuthThrottle<Id> {
 
     /// Record one failed attempt naming `session`, returning the wait when
     /// either its own limit or its owner's is now exhausted.
-    #[must_use]
-    pub fn refresh_failed(&self, session: SessionId) -> Option<Duration> {
+    pub(crate) fn refresh_failed(
+        &self,
+        session: SessionId,
+        account: Option<&str>,
+    ) -> Option<Duration> {
         let now = Instant::now();
         let by_session = self.per_session.take(
             &session,
@@ -556,9 +613,9 @@ impl<Id: Eq + Hash + Clone> AuthThrottle<Id> {
             self.config.max_tracked,
             now,
         );
-        let by_account = self.owner_of(session, now).and_then(|account| {
+        let by_account = account.and_then(|account| {
             self.per_account.take(
-                &account,
+                &account.to_owned(),
                 self.config.refresh_failures_per_account,
                 self.retain,
                 self.config.max_tracked,
@@ -569,15 +626,6 @@ impl<Id: Eq + Hash + Clone> AuthThrottle<Id> {
             (Some(a), Some(b)) => Some(a.max(b)),
             (wait, None) | (None, wait) => wait,
         }
-    }
-
-    /// The account `session` belongs to, when this process has seen it succeed.
-    fn owner_of(&self, session: SessionId, now: Instant) -> Option<Id> {
-        let owners = self.owners.lock().expect("throttle owners poisoned");
-        owners
-            .get(&session)
-            .filter(|(_, seen)| now.saturating_duration_since(*seen) < self.retain)
-            .map(|(account, _)| account.clone())
     }
 }
 
@@ -751,15 +799,13 @@ mod tests {
         let config = ThrottleConfig::new()
             .refresh_failures_per_session(10, MINUTE)
             .refresh_failures_per_account(2, MINUTE);
-        let throttle: AuthThrottle<String> = AuthThrottle::new(config);
+        let throttle = AuthThrottle::new(config);
         let (first, second) = (handle(), handle());
-        throttle.learn_owner(first, &"alice".to_owned());
-        throttle.learn_owner(second, &"alice".to_owned());
 
-        assert!(throttle.refresh_failed(first).is_none());
-        assert!(throttle.refresh_failed(second).is_none());
+        assert!(throttle.refresh_failed(first, Some("alice")).is_none());
+        assert!(throttle.refresh_failed(second, Some("alice")).is_none());
         assert!(
-            throttle.refresh_failed(first).is_some(),
+            throttle.refresh_failed(first, Some("alice")).is_some(),
             "two of alice's sessions share her account allowance"
         );
     }
@@ -769,12 +815,12 @@ mod tests {
         let config = ThrottleConfig::new()
             .refresh_failures_per_session(1, MINUTE)
             .refresh_failures_per_account(1, MINUTE);
-        let throttle: AuthThrottle<String> = AuthThrottle::new(config);
+        let throttle = AuthThrottle::new(config);
         let guessed = handle();
 
-        assert!(throttle.refresh_failed(guessed).is_none());
+        assert!(throttle.refresh_failed(guessed, None).is_none());
         assert!(
-            throttle.refresh_failed(guessed).is_some(),
+            throttle.refresh_failed(guessed, None).is_some(),
             "a session naming nobody still spends its own allowance"
         );
     }

@@ -40,15 +40,17 @@ use subql::{AggAccumulator, CdcSource, ChangeEvent, ParserDB, PgLsn, Subscriptio
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
+use crate::abuse::{Caller, Reaction};
 use crate::capability::CapabilityKey;
 use crate::counters;
+use crate::guard::RequestGuard;
 use crate::materializer::{
     DeltaAggregateCapture, Materializer, MaterializerError, Registration, SqliteRegistration,
     agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::row_view::ValuesRow;
-use crate::throttle::{HandleThrottle, ThrottleConfig, Tier};
+use crate::throttle::Tier;
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
@@ -104,6 +106,10 @@ struct RowRegistration {
 }
 
 /// Per-session server configuration.
+///
+/// Limits and abuse thresholds live on [`RequestGuard`] rather than here,
+/// because one instance of it is shared with the auth service and this type is
+/// cloned per manager.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Delivery credits granted to the server at handshake.
@@ -111,9 +117,6 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     pub schema_version: Option<SchemaVersion>,
-    /// Limits this manager enforces on connections, subscriptions, and
-    /// credential failures, per tier.
-    pub throttle: ThrottleConfig,
 }
 
 impl Default for SessionConfig {
@@ -121,7 +124,6 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
-            throttle: ThrottleConfig::default(),
         }
     }
 }
@@ -217,6 +219,10 @@ pub enum SessionError {
     /// at handshake).
     #[error("write target error: {0}")]
     WriteTarget(String),
+    /// The ban list could not be read, so the handshake failed closed rather
+    /// than admitting a caller whose ban might not have been seen.
+    #[error("ban list error: {0}")]
+    BanList(String),
     /// The resume credential could not be minted.
     #[error("resume credential: {0}")]
     Handle(String),
@@ -280,6 +286,9 @@ enum Outbound {
     /// A fatal close: the pump sends it as a control frame and ends the
     /// session (revocation and supersession arrive this way).
     Fatal(FatalError),
+    /// End the session without sending anything. A ban tells the caller
+    /// nothing, so it draws no frame and no reason.
+    Drop,
 }
 
 /// Route from a `subql` consumer id back to the owning session's outbound
@@ -307,10 +316,13 @@ struct AggRoute {
 }
 
 /// A live connection in the session registry: the socket counter that owns
-/// the entry and the outbound channel a fatal close is delivered on.
+/// the entry, the outbound channel a close is delivered on, and who holds it.
 struct LiveSession {
     connection_num: u64,
     tx: mpsc::UnboundedSender<Outbound>,
+    /// The identity's rendering, absent for a caller with no identity, so a ban
+    /// can find every connection one person holds.
+    user: Option<String>,
 }
 
 /// What a completed handshake establishes for the run loop.
@@ -319,6 +331,9 @@ struct HandshakeOutcome<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     resume_lsn: u64,
     applied_watermark: Option<u64>,
+    /// How many grants were refused, tallied for abuse once the run is
+    /// registered so a crossing can close the connection it happened on.
+    refused_grants: u32,
     /// The logging context, opened as soon as the run has a handle so that a
     /// refused grant is recorded inside it.
     span: tracing::Span,
@@ -348,6 +363,10 @@ struct SessionState<Id, Key> {
     /// Resume LSN decoded from the handshake cursor. 0 means a fresh session, so
     /// every re-declared subscription replays from here on reconnect.
     resume_lsn: u64,
+    /// Set when a per-connection abuse threshold crossed, so the run loop ends
+    /// after the frame that crossed it. A caller with no identity has no name
+    /// to ban, so closing the socket is the whole outcome.
+    closing: bool,
 }
 
 /// An [`AsyncConnector`] that fails every call: the default when a manager runs
@@ -439,7 +458,9 @@ pub struct SessionManager<
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
-    throttle: HandleThrottle,
+    /// Every counter connetto keeps about a caller, shared with the auth
+    /// service so the four abuse signals are defined once each.
+    guard: Arc<RequestGuard<Id>>,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -456,6 +477,7 @@ where
     /// subscriptions need a connector; use
     /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
     /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         materializer: Materializer,
@@ -463,6 +485,7 @@ where
         auth: Auth,
         authority: Arc<dyn HandshakeAuthority>,
         target: PgWriteTarget<W>,
+        guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -473,6 +496,7 @@ where
             NoConnector,
             InMemoryOplog::default(),
             target,
+            guard,
             config,
         )
     }
@@ -488,6 +512,7 @@ where
 {
     /// Build a manager with a re-execution connector and a default in-memory
     /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_connector(
         materializer: Materializer,
@@ -496,6 +521,7 @@ where
         authority: Arc<dyn HandshakeAuthority>,
         connector: C,
         target: PgWriteTarget<W>,
+        guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
     ) -> Arc<Self> {
         Self::with_oplog(
@@ -506,6 +532,7 @@ where
             connector,
             InMemoryOplog::default(),
             target,
+            guard,
             config,
         )
     }
@@ -535,9 +562,9 @@ where
         connector: C,
         oplog: O,
         target: PgWriteTarget<W>,
+        guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
     ) -> Arc<Self> {
-        let throttle = HandleThrottle::new(config.throttle);
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
             materializer: Arc::new(Mutex::new(materializer)),
@@ -554,7 +581,7 @@ where
             next_session: AtomicU64::new(1),
             next_consumer: AtomicU64::new(1),
             config,
-            throttle,
+            guard,
         })
     }
 }
@@ -587,6 +614,15 @@ where
         }
     }
 
+    /// Who a signal is attributed to: the handle for the rate limit, the person
+    /// for the abuse tally.
+    fn caller(principal: &Principal<Id, Key>) -> Caller<'_, Id> {
+        Caller {
+            session: principal.session_id(),
+            user: principal.identity().map(|identity| &identity.user_id),
+        }
+    }
+
     /// Close `session_id`'s live connection, if one exists, sending `reason`
     /// as a fatal frame first. Returns whether a live connection was found.
     ///
@@ -603,6 +639,38 @@ where
             }
             None => false,
         }
+    }
+
+    /// Close every live connection the identity rendering as `user` holds,
+    /// telling them nothing, and report how many. A person may hold one per
+    /// device, so a ban that closed only the connection it was detected on
+    /// would leave the others streaming.
+    ///
+    /// The registry is small and a ban is rare, so this scans rather than
+    /// keeping a second index to fall out of step.
+    pub async fn close_person(&self, user: &str) -> usize {
+        let closing: Vec<_> = {
+            let mut sessions = self.sessions.lock().await;
+            let handles: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, live)| live.user.as_deref() == Some(user))
+                .map(|(handle, _)| *handle)
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| sessions.remove(&handle))
+                .collect()
+        };
+        for live in &closing {
+            let _ = live.tx.send(Outbound::Drop);
+        }
+        if !closing.is_empty() {
+            tracing::info!(
+                closed = closing.len(),
+                "closing a banned identity's connections"
+            );
+        }
+        closing.len()
     }
 
     /// Close every live connection with
@@ -636,6 +704,7 @@ where
         &self,
         session_id: SessionId,
         connection_num: u64,
+        user: Option<String>,
         tx: &mpsc::UnboundedSender<Outbound>,
     ) {
         let superseded = {
@@ -645,6 +714,7 @@ where
                 LiveSession {
                     connection_num,
                     tx: tx.clone(),
+                    user,
                 },
             )
         };
@@ -996,7 +1066,7 @@ where
             user = tracing::field::Empty,
             connection = connection_num,
         );
-        let (principal, grant_wait) = self
+        let (principal, refused_grants, grant_wait) = self
             .resolve_grants(handle, &handshake)
             .instrument(span.clone())
             .await;
@@ -1005,33 +1075,30 @@ where
         }
         let session_id = principal.session_id();
         let tier = Self::principal_tier(&principal);
-        // Refuse over-limit callers before any store work. The credential count
-        // short-circuits, so a caller already being turned away for it does not
-        // also spend a connection.
-        let refused_wait = grant_wait
-            .map(|wait| ("credential refusal limit", wait))
-            .or_else(|| {
-                self.throttle
-                    .connection(session_id, tier)
-                    .map(|wait| ("connection limit", wait))
+        if self
+            .refuse_over_limit(transport, session_id, tier, grant_wait, &span)
+            .await
+        {
+            // The refusals still count. A rate limit caps how fast a signal can
+            // accumulate and must never erase what it already saw, or the caller
+            // spraying keys fast enough to trip it would be the one caller this
+            // phase cannot see. The reaction is ignored because this connection
+            // is ending either way, and a ban that lands closes the caller's
+            // other connections through the hook.
+            //
+            // This and the announcement in `run_session` are the two ends of one
+            // count and are mutually exclusive. The ban refusal below needs
+            // neither: that caller is already banned, so tallying more would only
+            // re-ask the application about a decision it has taken.
+            let _ = span.in_scope(|| {
+                self.guard
+                    .refused_grants(Self::caller(&principal), refused_grants)
             });
-        if let Some((limit, wait)) = refused_wait {
-            let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-            // Inside the connection context, so the line names the handle it
-            // refused. Unlike the version mismatch above, a run exists here.
-            span.in_scope(|| {
-                tracing::warn!(
-                    retry_after_ms,
-                    limit,
-                    "connection refused, rate limit reached"
-                );
-            });
-            let _ = transport
-                .send_control(ControlMessage::FatalError(FatalError::new(
-                    FatalErrorReason::RateLimited { retry_after_ms },
-                )))
-                .await;
             // None: no session to run, so `serve` completes cleanly.
+            return Ok(None);
+        }
+
+        if self.refuse_if_banned(&principal, &span).await? {
             return Ok(None);
         }
 
@@ -1072,8 +1139,82 @@ where
             principal: Arc::new(principal),
             resume_lsn,
             applied_watermark,
+            refused_grants,
             span,
         }))
+    }
+    /// Refuse a caller that is over a rate limit, reporting whether it was.
+    ///
+    /// The credential count short-circuits the connection one, so a caller
+    /// already being turned away for it does not also spend a connection, and
+    /// the check runs before any store work.
+    async fn refuse_over_limit<T: Transport>(
+        &self,
+        transport: &mut T,
+        session_id: SessionId,
+        tier: Tier,
+        grant_wait: Option<Duration>,
+        span: &tracing::Span,
+    ) -> bool {
+        let refused = grant_wait
+            .map(|wait| ("credential refusal limit", wait))
+            .or_else(|| {
+                self.guard
+                    .connection(session_id, tier)
+                    .map(|wait| ("connection limit", wait))
+            });
+        let Some((limit, wait)) = refused else {
+            return false;
+        };
+        let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        // Inside the connection context, so the line names the handle it
+        // refused. Unlike a version mismatch, a run exists here.
+        span.in_scope(|| {
+            tracing::warn!(
+                retry_after_ms,
+                limit,
+                "connection refused, rate limit reached"
+            );
+        });
+        let _ = transport
+            .send_control(ControlMessage::FatalError(FatalError::new(
+                FatalErrorReason::RateLimited { retry_after_ms },
+            )))
+            .await;
+        true
+    }
+
+    /// Whether the caller is banned, checked one frame after the grant that
+    /// named them because nothing identifies a caller earlier and a browser
+    /// cannot read the status of a refused upgrade anyway.
+    ///
+    /// A banned caller is told nothing: no frame and no reason, with the ban
+    /// going to the structured log. A ban list that cannot be read refuses the
+    /// connection, so a ban never lapses because a table was briefly unreadable
+    /// and an attacker who can cause an outage cannot suspend their own ban.
+    async fn refuse_if_banned(
+        &self,
+        principal: &Principal<Id, Key>,
+        span: &tracing::Span,
+    ) -> Result<bool, SessionError> {
+        let Some(identity) = principal.identity() else {
+            return Ok(false);
+        };
+        let ban = span
+            .in_scope(|| self.guard.banned(&identity.user_id))
+            .await
+            .map_err(|err| SessionError::BanList(err.detail().to_owned()))?;
+        let Some(ban) = ban else {
+            return Ok(false);
+        };
+        span.in_scope(|| {
+            tracing::warn!(
+                reason = %ban.reason,
+                permanent = ban.expires_at.is_none(),
+                "handshake refused, identity banned"
+            );
+        });
+        Ok(true)
     }
 
     /// The handle this run continues on: the one inside a resume credential
@@ -1097,12 +1238,17 @@ where
         })
     }
 
-    /// Check every grant on its own and fold what resolved into the caller.
+    /// Check every grant on its own and fold what resolved into the caller,
+    /// returning how many were refused and the wait the rate limit imposed.
     ///
     /// A refusal is recorded here and nowhere else. It does not end the
     /// connection and the reply says nothing about it, so this log line is the
     /// entire visibility story: without it a checker that refuses everything
     /// and one that accepts everything look identical from the client.
+    ///
+    /// The count travels rather than being tallied here, because a login grant
+    /// may follow a bad key in the list, so who to attribute the refusals to is
+    /// not known until the loop finishes.
     ///
     /// Tripping the refusal limit stops the loop. One handshake carries as many
     /// grants as fit in a frame, so continuing would buy the caller every
@@ -1112,9 +1258,10 @@ where
         &self,
         handle: SessionId,
         handshake: &Handshake,
-    ) -> (Principal<Id, Key>, Option<Duration>) {
+    ) -> (Principal<Id, Key>, u32, Option<Duration>) {
         let mut principal = Principal::unidentified(handle);
         let mut refusal_wait: Option<Duration> = None;
+        let mut refusals: u32 = 0;
         for (position, grant) in handshake.grants.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
             let refused = match self.authority.check_grant(grant).await {
@@ -1143,15 +1290,18 @@ where
                     true
                 }
             };
+            if !refused {
+                continue;
+            }
+            refusals = refusals.saturating_add(1);
             // A refused grant never establishes an identity, so the refusal is
             // metered at the tier that has not proved one.
-            if refused && let Some(wait) = self.throttle.credential_refusal(handle, Tier::Anonymous)
-            {
+            if let Some(wait) = self.guard.credential_refusal(handle, Tier::Anonymous) {
                 refusal_wait = Some(wait);
                 break;
             }
         }
-        (principal, refusal_wait)
+        (principal, refusals, refusal_wait)
     }
 
     /// Serve one connection to completion: handshake, then the run loop, then
@@ -1183,14 +1333,28 @@ where
             principal,
             resume_lsn,
             applied_watermark,
+            refused_grants,
             span: _,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(resume_lsn, "connection established");
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
-        self.register_connection(session_id, connection_num, &outbound_tx)
-            .await;
+        self.register_connection(
+            session_id,
+            connection_num,
+            principal
+                .identity()
+                .map(|identity| identity.user_id.to_string()),
+            &outbound_tx,
+        )
+        .await;
+        // The refusals the handshake collected are tallied here rather than as
+        // they happened, because only now is the caller resolved, and only now
+        // is the connection registered so a ban can close it.
+        let refused = self
+            .guard
+            .refused_grants(Self::caller(&principal), refused_grants);
         let mut state = SessionState {
             credits: self.config.initial_credits,
             pending: VecDeque::new(),
@@ -1203,9 +1367,10 @@ where
             session_id,
             applied_watermark,
             resume_lsn,
+            closing: refused == Reaction::Close,
         };
 
-        loop {
+        while !state.closing {
             // One task, two arms. The transport arm awaits a whole subscribe,
             // snapshot included, so the outbound arm cannot interleave a live
             // patch into it and a client never sees one before SnapshotEnd.
@@ -1252,13 +1417,24 @@ where
                                 .await;
                             break;
                         }
+                        Outbound::Drop => break,
                     }
                 }
             }
         }
 
         self.unregister_connection(session_id, connection_num).await;
+        // The connection is the window for a caller with no identity, so its
+        // tallies die here and nothing else expires them.
+        self.guard.forget_connection(session_id);
 
+        self.unsubscribe_all(state).await;
+        tracing::info!("connection closed");
+        Ok(())
+    }
+
+    /// Drop every route and registration this connection held.
+    async fn unsubscribe_all(&self, state: SessionState<Id, Key>) {
         for (consumer_id, sub_id) in state.subs.into_values() {
             self.remove_route(consumer_id).await;
             self.materializer.lock().await.unregister(sub_id);
@@ -1277,8 +1453,6 @@ where
                 .await
                 .unregister_delta_aggregate(consumer_id, sub_id);
         }
-        tracing::info!("connection closed");
-        Ok(())
     }
 
     async fn handle_control<T: Transport>(
@@ -1402,9 +1576,7 @@ where
                 .await
                 .is_ok_and(Verdict::allowed);
             if !allowed {
-                return self
-                    .reject(transport, client_seq, MutationRejectReason::Unauthorized)
-                    .await;
+                return self.reject_unauthorized(transport, client_seq, state).await;
             }
         }
 
@@ -1438,8 +1610,7 @@ where
                 Ok(())
             }
             Err(WriteError::Unauthorized) => {
-                self.reject(transport, client_seq, MutationRejectReason::Unauthorized)
-                    .await
+                self.reject_unauthorized(transport, client_seq, state).await
             }
             Err(WriteError::Materializer(err)) => {
                 self.reject(transport, client_seq, reject_reason(&err))
@@ -1454,6 +1625,25 @@ where
                 .await
             }
         }
+    }
+
+    /// Refuse one write the policy rejected, and report it as an abuse signal.
+    ///
+    /// Naming a row and being told no is the phase's definition of a signal.
+    /// This is the one signal no rate limit sits above, so its threshold does
+    /// all its own work.
+    async fn reject_unauthorized<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let reaction = self.guard.rejected_write(Self::caller(&state.principal));
+        if reaction == Reaction::Close {
+            state.closing = true;
+        }
+        self.reject(transport, client_seq, MutationRejectReason::Unauthorized)
+            .await
     }
 
     async fn reject<T: Transport>(
@@ -1493,7 +1683,7 @@ where
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let tier = Self::principal_tier(&state.principal);
-        if let Some(wait) = self.throttle.subscription(state.session_id, tier) {
+        if let Some(wait) = self.guard.subscription(state.session_id, tier) {
             let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
             tracing::warn!(
                 sub_id = %sub.sub_id,
@@ -1521,6 +1711,16 @@ where
             Ok(registration) => registration,
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
+                // Naming something that does not resolve is one of the four
+                // abuse signals. The snapshot failure below is not: there the
+                // table exists and the read failed, which says nothing about
+                // what the caller named.
+                let reaction = self
+                    .guard
+                    .unresolvable_subscription(Self::caller(&state.principal));
+                if reaction == Reaction::Close {
+                    state.closing = true;
+                }
                 transport
                     .send_control(ControlMessage::NonFatalError(NonFatalError {
                         related_to: Some(sub.sub_id),

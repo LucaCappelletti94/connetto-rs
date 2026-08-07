@@ -27,7 +27,8 @@ use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -224,6 +225,7 @@ async fn catchup_within_window_streams_missed_ops() {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -335,6 +337,7 @@ async fn cursor_outside_window_forces_full_resync() {
         oplog,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -391,6 +394,7 @@ async fn tombstone_replays_the_delete() {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 

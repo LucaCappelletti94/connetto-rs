@@ -25,8 +25,8 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::QueryableByName;
@@ -237,6 +237,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
         PermissiveAuth,
         Arc::new(TestGrantChecker),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -308,6 +309,7 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
         PermissiveAuth,
         Arc::new(TestGrantChecker),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -368,6 +370,7 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
             Arc::new(TestGrantChecker),
             pg_write_target::<ConnettoWatermark>(writer_pool.clone(), PG_DDL)
                 .expect("build write target"),
+            Arc::new(RequestGuard::default()),
             SessionConfig::default(),
         )
     };

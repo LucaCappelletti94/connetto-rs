@@ -24,8 +24,8 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, Oplog, PermissiveAuth, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, Oplog, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -400,6 +400,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         PermissiveAuth,
         test_verifier(),
         server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -548,6 +549,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         PermissiveAuth,
         test_verifier(),
         server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -680,6 +682,7 @@ async fn connection_is_a_diesel_connection() {
         PermissiveAuth,
         test_verifier(),
         server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -783,6 +786,7 @@ async fn rejected_write_rolls_back_locally() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -899,6 +903,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1056,6 +1061,7 @@ async fn conflicting_write_converges_to_server_after_rollback() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1310,6 +1316,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1394,6 +1401,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1509,6 +1517,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1602,6 +1611,7 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1664,6 +1674,7 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1728,6 +1739,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1827,6 +1839,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -1931,6 +1944,7 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2054,6 +2068,7 @@ async fn live_value_tracks_a_server_aggregate() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2180,6 +2195,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2264,6 +2280,7 @@ async fn identical_row_watches_share_one_subscription() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2410,6 +2427,7 @@ async fn distinct_row_queries_do_not_collapse() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2490,6 +2508,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         test_verifier(),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2637,6 +2656,7 @@ async fn watch_fn_drives_a_boxed_row_query() {
         PermissiveAuth,
         test_verifier(),
         gadgets_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2759,6 +2779,7 @@ async fn watch_fn_shares_a_subscription_with_watch() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2839,6 +2860,7 @@ async fn watch_fn_rejects_an_aggregate_query() {
         PermissiveAuth,
         test_verifier(),
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 
@@ -2898,6 +2920,7 @@ async fn gated_server(
         PermissiveAuth,
         test_verifier(),
         server_write_target(fixture),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

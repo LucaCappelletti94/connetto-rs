@@ -25,8 +25,8 @@ use connetto_client::{
 use connetto_core::traits::{GrantRefused, HandshakeAuthority};
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityResolver,
-    InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, ResolveFuture,
-    TokenAuthority, VerifiedClaims, auth_router,
+    InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard,
+    ResolveFuture, TokenAuthority, VerifiedClaims, auth_router,
 };
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
 use openidconnect::reqwest;
@@ -113,7 +113,11 @@ async fn spawn_auth_server_with_service()
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let service = Arc::new(AuthService::new(authority, store));
+    let service = Arc::new(AuthService::new(
+        authority,
+        store,
+        Arc::new(RequestGuard::default()),
+    ));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(provider));
     let router = auth_router(
@@ -144,7 +148,11 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
         config.refresh_lifetimes(),
         Arc::new(TypedResolver),
     ));
-    let service = Arc::new(AuthService::new(authority, store));
+    let service = Arc::new(AuthService::new(
+        authority,
+        store,
+        Arc::new(RequestGuard::default()),
+    ));
     let mut registry = ProviderRegistry::new();
 
     // Provider "alice": its own loopback idp whose default_user_id is "alice".

@@ -14,8 +14,8 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
-    InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, TokenAuthority,
-    VerifiedLogin,
+    InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, RequestGuard,
+    TokenAuthority, VerifiedLogin,
 };
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
 use openidconnect::core::{
@@ -244,7 +244,12 @@ async fn service_with_real_provider() -> (
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::clone(&provider));
-    let service = AuthService::new(Arc::clone(&authority), store).with_registry(Arc::new(registry));
+    let service = AuthService::new(
+        Arc::clone(&authority),
+        store,
+        Arc::new(RequestGuard::default()),
+    )
+    .with_registry(Arc::new(registry));
     (authority, service, login, idp)
 }
 

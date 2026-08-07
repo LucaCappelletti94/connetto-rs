@@ -10,11 +10,12 @@
 //! `-- --ignored`.
 
 use std::str::FromStr as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::SessionId;
 use connetto_core::messages::{ControlMessage, FatalErrorReason};
-use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{PgSnapshotSource, RequestGuard, RuntimeWritableCatalog, SessionConfig};
 use connetto_test_harness::{
     Fixture, HarnessAuth, Server, ServerConfig, insert_changeset, provision_watermark, spawn_server,
 };
@@ -46,6 +47,7 @@ async fn serve(fixture: &Fixture) -> Server {
                 .build(),
             admin_url: fixture.admin_url().to_owned(),
             session: SessionConfig::default(),
+            guard: Arc::new(RequestGuard::default()),
         },
         snapshot,
         HarnessAuth::permissive(),

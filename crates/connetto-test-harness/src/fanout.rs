@@ -7,10 +7,13 @@
 //! remove. The reader role sees every row (the table carries no policy), so
 //! every subscriber receives every event and the per-event counts are exact.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_server::counters::{self, CountersSnapshot};
-use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{
+    PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+};
 
 use crate::{
     Fixture, HarnessAuth, PUBLICATION, ServerConfig, drop_slot, pool_for, spawn_server, with_user,
@@ -69,6 +72,7 @@ pub async fn fanout_run(fixture: &Fixture, subscribers: u64, events: u64) -> Fan
             writable: RuntimeWritableCatalog::default(),
             admin_url: fixture.admin_url().to_owned(),
             session: SessionConfig::default(),
+            guard: Arc::new(RequestGuard::default()),
         },
         snapshot,
         auth,

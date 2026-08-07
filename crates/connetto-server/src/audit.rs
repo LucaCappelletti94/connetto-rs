@@ -66,9 +66,11 @@ pub enum AuthOp {
     PermissionChange,
     /// The authorization model changed. Produced by R5b.
     ModelChange,
-    /// An identity was banned. Produced by R36.
+    /// An identity was banned, on crossing an abuse threshold.
     Banned,
-    /// A ban was lifted or expired. Produced by R36.
+    /// A ban was lifted through [`BanStore::lift`](crate::ban::BanStore::lift),
+    /// which is the only thing that produces this. An expiry that merely lapses
+    /// leaves its row behind and no record.
     BanLifted,
 }
 

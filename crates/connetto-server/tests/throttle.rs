@@ -15,6 +15,10 @@
 //! * **a limit that trips stops the work it bounds**, rather than being noted
 //!   and then paid for anyway.
 //!
+//! Every limit is reached through [`RequestGuard`], which owns the counters
+//! since R36 so one call per site defines the moment for the rate limit and the
+//! abuse tally alike.
+//!
 //! `#[ignore]` by default: the write target needs a running Postgres.
 
 use std::sync::Arc;
@@ -30,8 +34,9 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    AbuseConfig, LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, ThrottleConfig, TierLimits, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -87,10 +92,8 @@ fn manager(fixture: &Fixture, throttle: ThrottleConfig) -> Manager {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        SessionConfig {
-            throttle,
-            ..Default::default()
-        },
+        Arc::new(RequestGuard::new(throttle, AbuseConfig::default())),
+        SessionConfig::default(),
     )
 }
 
@@ -442,11 +445,12 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
         Arc::new(CountingAuthority(Arc::clone(&checked))),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        SessionConfig {
-            throttle: ThrottleConfig::new()
+        Arc::new(RequestGuard::new(
+            ThrottleConfig::new()
                 .anonymous(TierLimits::anonymous().credential_refusals(LIMIT, WINDOW)),
-            ..Default::default()
-        },
+            AbuseConfig::default(),
+        )),
+        SessionConfig::default(),
     );
 
     let (server_end, mut client) = loopback();

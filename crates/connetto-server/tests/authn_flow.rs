@@ -18,8 +18,8 @@ use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
     Materializer, OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy,
-    ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority,
-    auth_router, loopback, pg_write_target,
+    RequestGuard, ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
@@ -75,7 +75,11 @@ fn service() -> (Arc<TokenAuthority>, Arc<AuthService<InMemoryAuthStore>>) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let svc = Arc::new(AuthService::new(Arc::clone(&authority), store));
+    let svc = Arc::new(AuthService::new(
+        Arc::clone(&authority),
+        store,
+        Arc::new(RequestGuard::default()),
+    ));
     (authority, svc)
 }
 
@@ -91,6 +95,7 @@ fn manager_with(
         authority,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     )
 }
@@ -375,7 +380,11 @@ async fn expired_access_token_is_refused() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
-    let svc = AuthService::new(Arc::clone(&authority), Arc::clone(&store));
+    let svc = AuthService::new(
+        Arc::clone(&authority),
+        Arc::clone(&store),
+        Arc::new(RequestGuard::default()),
+    );
     let pair = svc.login(&identity("carol")).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
@@ -402,7 +411,11 @@ async fn a_token_from_another_key_is_refused() {
     let config = AuthConfig::default();
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair a"));
-    let svc = AuthService::new(Arc::clone(&authority), Arc::clone(&store));
+    let svc = AuthService::new(
+        Arc::clone(&authority),
+        Arc::clone(&store),
+        Arc::new(RequestGuard::default()),
+    );
     // A different authority (different signing key) mints a token for the same
     // session id, simulating a forged credential.
     let other = TokenAuthority::generate(&config).expect("keypair b");

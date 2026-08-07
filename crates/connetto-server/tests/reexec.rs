@@ -15,8 +15,8 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
@@ -141,6 +141,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         Arc::new(TestGrantChecker),
         connector,
         target,
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
 

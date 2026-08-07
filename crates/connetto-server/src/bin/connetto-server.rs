@@ -28,6 +28,12 @@
 //!   users in with, one of `google`, `microsoft`, or `generic` (lowercase).
 //!   Anything else, including an unset or miscapitalised value, refuses
 //!   startup.
+//! - `CONNETTO_BANS`: set to `database` to ban an identity that crosses an
+//!   abuse threshold, reading and writing `connetto_bans` on the owner pool.
+//!   Unset, a crossing is logged and nothing is banned, because the table is
+//!   the deployment's and connetto emits no DDL. Reading it on the reader pool
+//!   would be worse than not checking at all, since row-level security makes an
+//!   invisible row zero rows rather than an error.
 //!
 //! The publication and replication slot (with the `pgoutput` plugin) must
 //! already exist. The server does not create them.
@@ -41,12 +47,13 @@ use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::audit::pg_audit_hook;
 use connetto_server::{
-    AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
-    GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer, OidcProviderConfig,
-    PgSnapshotSource, ProviderRegistry, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
-    RefreshOutcome, ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_audit_table, connetto_auth_tables, connetto_watermark_table, pg_write_target,
+    AbuseConfig, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
+    DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
+    OidcProviderConfig, PgSnapshotSource, ProviderRegistry, ReconnectEvent, ReconnectPolicy,
+    RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RlsAuth,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TokenAuthority,
+    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
+    connetto_ban_table, connetto_watermark_table, pg_ban_store, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -88,6 +95,7 @@ connetto_audit_table!(
     uuid::Uuid,
     diesel::sql_types::Uuid,
 );
+connetto_ban_table!(String, diesel::sql_types::Text);
 
 /// The auth store chosen at startup. A single concrete type so the auth
 /// service and session-verifier futures stay `Send`.
@@ -183,12 +191,46 @@ impl AuthStore for ServerStore {
     }
 }
 
+/// Build the guard both surfaces share: the request limits and the abuse
+/// thresholds, plus the ban list when `CONNETTO_BANS` asks for one.
+///
+/// The ban list reads and writes on the **owner** pool. On the reader pool an
+/// invisible row is zero rows rather than an error, so the fail-closed check
+/// would never fire and a ban would silently not apply.
+fn build_guard(pool: &Pool<AsyncPgConnection>) -> Result<Arc<RequestGuard<String>>> {
+    let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default());
+    let guard = if bans_enabled()? {
+        tracing::info!("banning identities that cross an abuse threshold");
+        guard.with_bans(pg_ban_store::<ConnettoBans>(pool.clone()))
+    } else {
+        guard
+    };
+    Ok(Arc::new(guard))
+}
+
+/// Whether `CONNETTO_BANS` asks for the ban list.
+///
+/// Off unless switched on, for the same reason the audit table is: the table
+/// belongs to the application and connetto emits no DDL, so a server pointed at
+/// a database without it must not attempt reads or writes. Without it a crossed
+/// threshold is logged and nothing is banned.
+fn bans_enabled() -> Result<bool> {
+    match env_or("CONNETTO_BANS", "").as_str() {
+        "" => Ok(false),
+        "database" => Ok(true),
+        other => Err(anyhow!(
+            "unknown CONNETTO_BANS mode {other:?}, expected database"
+        )),
+    }
+}
+
 /// Build the auth service and provider registry when `CONNETTO_AUTH` selects a
 /// store (`in-memory` or `database`). Unset leaves the trusting verifier and no
 /// auth endpoints, which suits dev and the pre-acquisition client loops until
 /// phases 4 and 5.
 async fn build_auth(
     pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
 ) -> Result<Option<(Arc<AuthService<ServerStore>>, Arc<ProviderRegistry>)>> {
     // Parsed before anything else, so a bad value fails on the spot rather
     // than behind identity-provider discovery, and so that asking for records
@@ -227,10 +269,15 @@ async fn build_auth(
     let authority = build_token_authority(&config)?;
     let registry = Arc::new(build_registry(&config).await?);
     let service = Arc::new(
-        AuthService::new(Arc::new(authority), Arc::new(store)).with_registry(Arc::clone(&registry)),
+        AuthService::new(Arc::new(authority), Arc::new(store), guard)
+            .with_registry(Arc::clone(&registry)),
     );
     if audit {
-        service.set_audit_hook(pg_audit_hook::<ConnettoAudit>(pool.clone()));
+        let hook = pg_audit_hook::<ConnettoAudit>(pool.clone());
+        // The same sink on both, because a ban is detected in the guard and
+        // every other access change is produced here.
+        service.guard().set_audit_hook(Arc::clone(&hook));
+        service.set_audit_hook(hook);
         tracing::info!("recording access changes to auth_events");
     }
     Ok(Some((service, registry)))
@@ -398,7 +445,8 @@ async fn main() -> Result<()> {
     // default (R2), so the auth service is built first and the server refuses
     // to run without one: an unset CONNETTO_AUTH would otherwise mean a
     // handshake with nothing to check a grant against.
-    let Some((service, registry)) = build_auth(&pool).await? else {
+    let guard = build_guard(&pool)?;
+    let Some((service, registry)) = build_auth(&pool, Arc::clone(&guard)).await? else {
         return Err(anyhow!(
             "set CONNETTO_AUTH to in-memory or database: the server refuses to run \
              without a handshake authority, because it would otherwise have no way to \
@@ -433,6 +481,7 @@ async fn main() -> Result<()> {
         authority,
         connector,
         write,
+        Arc::clone(&guard),
         SessionConfig {
             schema_version: Some(SchemaVersion::from_source(&pg_ddl)),
             ..SessionConfig::default()
@@ -449,6 +498,16 @@ async fn main() -> Result<()> {
                 manager
                     .close_session(session_id, FatalErrorReason::SessionRevoked)
                     .await;
+            });
+        }));
+    }
+    // A ban closes every connection the person holds, telling them nothing.
+    {
+        let ban_manager = Arc::clone(&manager);
+        guard.set_close_hook(Arc::new(move |user| {
+            let manager = Arc::clone(&ban_manager);
+            tokio::spawn(async move {
+                manager.close_person(&user).await;
             });
         }));
     }

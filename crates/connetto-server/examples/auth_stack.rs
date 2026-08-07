@@ -40,8 +40,8 @@ use connetto_core::SessionId;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, OidcProviderConfig,
-    ProviderRegistry, RedirectPolicy, RefreshOutcome, ResolvedIdentity, RetainedProviderToken,
-    TokenAuthority, auth_router, connetto_auth_tables,
+    ProviderRegistry, RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity,
+    RetainedProviderToken, TokenAuthority, auth_router, connetto_auth_tables,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -190,6 +190,7 @@ async fn build_service(
             Arc::new(ServerStore::InMemory(InMemoryAuthStore::new(
                 config.refresh_lifetimes(),
             ))),
+            Arc::new(RequestGuard::default()),
         )));
     };
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
@@ -204,6 +205,7 @@ async fn build_service(
             config.refresh_lifetimes(),
             Arc::new(DefaultUuidResolver),
         ))),
+        Arc::new(RequestGuard::default()),
     )))
 }
 

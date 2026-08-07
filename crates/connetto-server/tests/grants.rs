@@ -21,8 +21,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    Materializer, PermissiveAuth, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, pg_write_target,
+    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 
@@ -98,6 +98,7 @@ async fn arrive(
         authority,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();

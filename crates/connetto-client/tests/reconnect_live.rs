@@ -18,8 +18,8 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -238,6 +238,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -346,6 +347,7 @@ async fn offline_write_reflushes_after_resume() {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let slot: ServeSlot = Arc::new(Mutex::new(None));
@@ -429,6 +431,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
+        Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
