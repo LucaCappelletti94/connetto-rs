@@ -238,9 +238,9 @@ Caching then matters for the group questions rather than the per-row ones. A que
 
 ### An open dependency that blocks R5b
 
-`rls2fga` generates whole-table queries that load every permission record from scratch and nothing that produces the change for one row. So keeping OpenFGA current row by row is unbuilt, and without it no answer on the change path has a stated freshness.
+`rls2fga` used to generate whole-table queries alone, loading every permission record from scratch with nothing that produces the change for one row. It now describes a row's records without a database, so what is still unbuilt is the consumer that drives those descriptions from the change stream, and until that exists no answer on the change path has a stated freshness.
 
-**Decided.** That upkeep lives in `subql`, driven from the change stream, because subql holds the replication connection and is the only place that sees every change with both row versions in hand, and removing a record requires knowing the value it was built from. `rls2fga` supplies the per-row mapping, which is upstream work it does not have today. R5b is blocked on it.
+**Decided.** That upkeep lives in `subql`, driven from the change stream, because subql holds the replication connection and is the only place that sees every change with both row versions in hand, and removing a record requires knowing the value it was built from. `rls2fga` supplies the per-row mapping, and **it has since landed** (`851b861` and `40217f0` on its `main`, as `RecordDescription` with a reference evaluator beside it and a per-relation report of what is decidable from one row). What R5b still waits on is the consuming half in subql, `docs/upstream-subql-per-row-visibility.md`, which is unblocked and unbuilt.
 
 ## The per-client floor
 

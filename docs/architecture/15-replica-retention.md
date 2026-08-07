@@ -1,6 +1,6 @@
 # 15: Replica retention, eviction, and physical trimming
 
-**Status**: normative. This is the design document referenced as "the retention design" by `docs/upstream-diesel-auto-vacuum-mode.md`, `docs/upstream-diesel-incremental-vacuum.md`, `docs/upstream-diesel-vacuum-into.md`, `docs/upstream-diesel-page-counters.md`, and `docs/upstream-diesel-wal-checkpoint.md`. Every mechanism this chapter decides is unbuilt. Paragraphs marked **Built.** describe adjacent machinery that already exists and that the decisions lean on. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The trimming mechanisms are blocked on the five upstream diesel proposals landing. Filing them is the first action of R15.
+**Status**: normative. Every mechanism this chapter decides is unbuilt. Paragraphs marked **Built.** describe adjacent machinery that already exists and that the decisions lean on. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. Four of the five diesel APIs the trimming pass needs landed upstream and are reachable from this workspace since 2026-08-07, so what R15 waits on now is the fifth. See "Upstream dependency".
 
 ---
 
@@ -116,31 +116,31 @@ A deletion and a departure from a subscription's window are indistinguishable on
 
 **Decided (R15).** The `INCREMENTAL` auto-vacuum mode keeps freelist bookkeeping up to date at every commit without reclaiming pages at commit time. `FULL` mode reclaims pages at every commit, which would stall the pump on every server patch. `INCREMENTAL` defers reclamation to an explicit `PRAGMA incremental_vacuum` call, which the trimming pass controls.
 
-The critical constraint, documented in `docs/upstream-diesel-auto-vacuum-mode.md` and verified on SQLite 3.51.1: `auto_vacuum` is stored in the file, not the connection. Changing from `NONE` on a populated database silently does nothing until a full `VACUUM` rewrites the entire file. The mode must be set before the first table exists.
+The critical constraint, verified on SQLite 3.51.1: `auto_vacuum` is stored in the file, not the connection. Changing from `NONE` on a populated database silently does nothing until a full `VACUUM` rewrites the entire file. The mode must be set before the first table exists.
 
 This constraint has no urgency today. The workspace is at `version = "0.0.0"`, unpublished, with no deployment, so no user file exists to foreclose. It becomes irreversible at the first release, which is the actual deadline.
 
 ### The trimming pass
 
-**Decided (R15).** The trimming pass runs after each eviction. The five upstream proposals carry verified SQLite facts, version floors, and traps. They are the specification for each mechanism. This chapter records only the policy that drives them.
+**Decided (R15).** The trimming pass runs after each eviction. This chapter records only the policy that drives it. The mechanisms themselves are diesel's, and the verified SQLite facts, version floors and traps that justified each one now live in its merged pull request rather than in this repository.
 
-1. Read `freelist_count` and `page_count` via helpers proposed in `docs/upstream-diesel-page-counters.md`. If the ratio of free pages to total pages is below a threshold, skip the pass. Triggering on ratio rather than a schedule avoids reclaiming a file that has no slack.
+1. Read `SqliteConnection::freelist_count` and `SqliteConnection::page_count` (diesel #5129). If the ratio of free pages to total pages is below a threshold, skip the pass. Triggering on ratio rather than a schedule avoids reclaiming a file that has no slack.
 
-2. Run bounded `incremental_vacuum` via the helper proposed in `docs/upstream-diesel-incremental-vacuum.md`. The page-limit parameter is a latency control: a large freelist does not stall the pump in a single step. The proposal pins the drive-to-completion behavior: the underlying pragma frees one page per step, and a consumer that does not drive every result row to completion silently reclaims only one page regardless of what it passed.
+2. Run bounded `SqliteConnection::incremental_vacuum` (diesel #5145). The page-limit parameter is a latency control: a large freelist does not stall the pump in a single step. The helper drives the pragma to completion, which matters because the pragma frees one page per result row, so a consumer that steps it once reclaims one page regardless of the limit it passed.
 
-3. Run `wal_checkpoint(None, WalCheckpointMode::Truncate)` via the helper proposed in `docs/upstream-diesel-wal-checkpoint.md`. Pages reclaimed by `incremental_vacuum` could otherwise reappear inside a grown WAL file, leaving the file occupying the same space at the filesystem level. The `Truncate` mode moves WAL frames into the database file and shrinks the WAL file to zero bytes.
+3. Run `wal_checkpoint(None, WalCheckpointMode::Truncate)`, still a proposal in `docs/upstream-diesel-wal-checkpoint.md` and the one mechanism here that has not landed. Pages reclaimed by `incremental_vacuum` could otherwise reappear inside a grown WAL file, leaving the file occupying the same space at the filesystem level. The `Truncate` mode moves WAL frames into the database file and shrinks the WAL file to zero bytes.
 
 4. Inspect `WalCheckpointOutcome.busy`. A checkpoint blocked by an open reader reports the blockage through the `busy` field and does not fail. The pass records that it did not complete fully and defers to the next maintenance window rather than retrying in a tight loop.
 
 ### When the mode is NONE
 
-**Decided (R15).** A replica opened on a file created before R15 may have `auto_vacuum = NONE`. The `auto_vacuum` helper proposed in `docs/upstream-diesel-auto-vacuum-mode.md` lets the trimming pass read the mode defensively before running, so it can detect this case rather than issuing `incremental_vacuum` against a file that cannot shrink incrementally. If the mode is `NONE` and a full compaction is requested, `vacuum` or `vacuum_into` (proposed in `docs/upstream-diesel-vacuum-into.md`) can rewrite the file. `vacuum_into` writes a compacted copy to a new path without modifying the source, which suits an offline background operation whose output the caller then swaps in.
+**Decided (R15).** A replica opened on a file created before R15 may have `auto_vacuum = NONE`. `SqliteConnection::auto_vacuum` (diesel #5130) lets the trimming pass read the mode defensively before running, so it can detect this case rather than issuing `incremental_vacuum` against a file that cannot shrink incrementally. If the mode is `NONE` and a full compaction is requested, `vacuum` or `vacuum_into` (diesel #5146) can rewrite the file. `vacuum_into` writes a compacted copy to a new path without modifying the source, which suits an offline background operation whose output the caller then swaps in.
 
 ---
 
 ## The create path
 
-**Decided (R15).** The five upstream proposals state that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim is stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `connect_inner` in `crates/connetto-client/src/lib.rs`.
+**Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `connect_inner` in `crates/connetto-client/src/lib.rs`.
 
 **Built.** The existing pragma sequence in `connect_inner`, documented in `docs/architecture/14-at-rest-encryption.md`, is:
 
@@ -160,9 +160,7 @@ Chapter 14 is the authoritative source for the unlock ordering constraint. This 
 
 **Decided (R15).** OPFS quota is the scarce resource in the browser. A replica that grows large faces a higher eviction risk under storage pressure. Physical trimming is therefore more consequential in the browser than natively.
 
-A full `VACUUM` rewrite is expensive in the browser. As `docs/upstream-diesel-vacuum-into.md` documents, it requires up to twice the file size in temporary space and must complete before a new write can land. Bounded `incremental_vacuum` is the appropriate tool for foreground maintenance: it reclaims a configurable number of pages per call and does not block the pump.
-
-**Built.** `sqlite-wasm-rs` allows one connection per database, as recorded in `docs/architecture/14-at-rest-encryption.md`. The sahpool VFS keys its open-file bookkeeping by filename, and a second live connection to the same OPFS file trips a `debug_assert` inside it. The trimming pass must run on the existing replica connection and cannot open a side connection to the same file.
+A full `VACUUM` rewrite is expensive in the browser: it requires up to twice the file size in temporary space and must complete before a new write can land. Bounded `incremental_vacuum` is the appropriate tool for foreground maintenance, since it reclaims a configurable number of pages per call and does not block the pump.
 
 `vacuum_into` is the natural candidate for a full offline compaction in the browser, since it writes to a new path rather than modifying the source. Whether OPFS permits an atomic rename or swap to bring the compacted file into service in place of the original is an open question.
 
@@ -170,17 +168,17 @@ A full `VACUUM` rewrite is expensive in the browser. As `docs/upstream-diesel-va
 
 ## Upstream dependency
 
-All five mechanisms that implement this design are proposed in `docs/` but not yet filed. Filing them is the first action of R15 and everything else is blocked on them landing. Each proposal is deliberately small and self-contained so it reviews quickly.
+**Four of the five landed upstream, and the fifth was never filed.** The proposal documents are deleted: a merged pull request is a better record than a copy of its own argument, and the API each one asked for is now diesel's public surface.
 
-| Proposal | Mechanism |
+| Mechanism | Where it is |
 |---|---|
-| `docs/upstream-diesel-auto-vacuum-mode.md` | `SqliteConnection::set_auto_vacuum`, `SqliteConnection::auto_vacuum`, `AutoVacuumMode` |
-| `docs/upstream-diesel-page-counters.md` | `SqliteConnection::page_count`, `SqliteConnection::freelist_count` |
-| `docs/upstream-diesel-incremental-vacuum.md` | `SqliteConnection::incremental_vacuum` |
-| `docs/upstream-diesel-wal-checkpoint.md` | `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` |
-| `docs/upstream-diesel-vacuum-into.md` | `SqliteConnection::vacuum`, `SqliteConnection::vacuum_into` |
+| `SqliteConnection::auto_vacuum`, `set_auto_vacuum`, `AutoVacuumMode` | diesel #5130, merged 2026-08-02 |
+| `SqliteConnection::page_count`, `freelist_count` | diesel #5129, merged 2026-08-02 |
+| `SqliteConnection::incremental_vacuum` | diesel #5145, merged 2026-08-05 |
+| `SqliteConnection::vacuum`, `vacuum_into` | diesel #5146, merged 2026-08-07 |
+| `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` | unfiled, `docs/upstream-diesel-wal-checkpoint.md` |
 
----
+**The pin reaches the merges since 2026-08-07.** All six workspace locks moved to the rebased fork branch, so the four landed APIs are callable here and both test baselines held. Clearing the pin cost one thing worth knowing: the rebase dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is now documented and a new table must be too. `docs/upstream-diesel-future-branch-sync.md` is the record.
 
 ## Open questions
 
