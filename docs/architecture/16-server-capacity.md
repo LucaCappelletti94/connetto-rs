@@ -40,6 +40,8 @@ The guarantee is arithmetic rather than behavioural. It detects nothing, has no 
 
 **This is what reaches a caller a ban cannot.** A ban needs a durable name, and a caller presenting no resume credential is minted a fresh one every connection (R36, and `12-identity-session-capability.md` for what a handle is). A reservation never asks who is calling, so the number of identities a caller cycles through does not enter into it. No source surveyed closes that gap by detection, and the literature treats it as a load problem rather than an abuse problem.
 
+**Built (R36, 2026-08-06): what a caller with no identity gets instead is a per-connection tally.** Three refusal counts within one socket, no window because the connection is the window, and the outcome is that socket closing with no durable record and nothing reported to the application. It ends a runaway loop inside the connection it is happening in and nothing more, since a reconnect starts over. The gap this chapter names is therefore narrower than it was and still open: a prober that reconnects between crossings stays invisible, and only the reservation below bounds it.
+
 ---
 
 ## Why a reservation rather than a cap on the unidentified tier
