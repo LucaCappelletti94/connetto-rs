@@ -72,7 +72,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R37 | Needs R36, so one sweep converts every remaining plain struct at once. The style itself enters with R19 (decided 2026-08-06). Consistency work, so it slots wherever it is wanted |
 | 10 | ~~R5a~~ **DONE** | Waited on `upstream-subql-visibility-trait.md` landing upstream, which it did at subql `8e9b2df`. Not on rls2fga |
 | 11 | R0 part B, the full measurement | Needs R5a's seam to measure through |
-| 12 | R5b | Needs R5a, R0, the rls2fga per-row mapping, and `upstream-subql-per-row-visibility.md` on top of it |
+| 12 | R5b | Needs R5a, R0, and `upstream-subql-per-row-visibility.md`. The rls2fga per-row mapping landed on 2026-08-07, so that half is no longer waiting |
 | 13 | R16 part B, the fan-out architecture | Needs R0's numbers, and part A's findings which it has. The bulk frame decision it once had to settle before R3 shipped is settled, recorded under its inputs section |
 | 14 | R14 | Needs R0's data and R5b. **Conditional**: dropped if R0 shows the dispatch loop is not the ceiling |
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
@@ -92,7 +92,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R17 | A defect, blocked on nothing. Land it whenever, and before anything else relies on the local tier |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
-| any | R15 | Off the critical path. Gated on five upstream diesel proposals landing |
+| any | R15 | Off the critical path. Gated on R29 and on the one remaining diesel proposal, `wal_checkpoint`. The other four landed and the pin reaches them |
 | any | R31 | Application schema majors: the drain gate, the resync boundary, and the local-tier migration trait. Deadline is the first deployment intending to survive a schema change |
 | any | R32 | The replication slot lifecycle: startup refusal, lag logging, and the invalidation resync epoch. Deadline is any production deployment |
 | last | R24 | Exploratory. How connetto integrates a file-sync stack it does not own |
@@ -141,9 +141,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | NOT STARTED | nothing | no |
 | R17 local tier name and key scope | NOT STARTED | nothing | no |
-| R18 SQLite hardening surface | NOT STARTED | nothing here, `diesel-rs/diesel#5128` for unpinned diesel | no |
+| R18 SQLite hardening surface | NOT STARTED | nothing, `diesel-rs/diesel#5128` is merged and the pin reaches it | no |
 | R11 shared public store | NOT STARTED | nothing | no |
-| R15 replica retention and trimming | NOT STARTED | R29, and five diesel proposals landing | **yes, diesel** |
+| R15 replica retention and trimming | NOT STARTED | R29 and one diesel proposal (`wal_checkpoint`), the pin now reaching the four merges | **yes, diesel** |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
 | R32 replication slot lifecycle | NOT STARTED | nothing, R12 part A is done | no |
 | R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
@@ -193,7 +193,7 @@ graph TD
   R31[R31 application schema majors]
   R32[R32 replication slot lifecycle]
   R12A -.->|lag line only| R32
-  U3[upstream: five diesel vacuum proposals] --> R15[R15 replica retention and trimming]
+  U3[upstream: diesel wal_checkpoint, four siblings merged and pinned] --> R15[R15 replica retention and trimming]
   R23[R23 user-verified unlock of local secrets]
   P[probe: webauthn-prf-probe-spec] --> R23
   R26[R26 local data export]
@@ -281,7 +281,7 @@ A new or extended test in `crates/connetto-server/tests/` proving each refusal i
 
 ## R0: the measurement
 
-**Status.** Part A **DONE** (2026-08-01). Part B NOT STARTED, **blocked on R5a**.
+**Status.** Part A **DONE** (2026-08-01). Part B NOT STARTED and **blocked on nothing, corrected 2026-08-07**. This line said blocked on R5a, which landed on 2026-08-04, so the seam part B measures through exists. The sequence table already had it unblocked at position 11 and the two disagreed.
 
 **One hazard R5a introduces, recorded here because this is the counter's home. Closed 2026-08-03.** `AUTHORIZATION_CALLS` used to increment at `RlsAuth::can_read`'s entry, which is the implementation's entry rather than the round trip. That was exact only while one entry meant one Postgres transaction. It stops being exact at R5a: the visibility trait is answered once per changed row for every watcher at once (`docs/upstream-subql-visibility-trait.md`, decision 1), so the seam is entered once per event while the RLS implementation behind it still runs K transactions in its own loop. **Left alone, the counter would have read 1 per event on the day R5a ships and R5b's whole acceptance criterion would have been satisfied by a phase that changed no round trips at all.** The increment now sits on the `SELECT EXISTS` inside the transaction (`crates/connetto-server/src/auth.rs`), which is the round trip itself, so R5a can move the trait without moving the counter. Behaviour-preserving today by construction, and `crates/connetto-test-harness/tests/fanout_counters.rs` still reading K at K subscribers is the proof.
 
@@ -726,7 +726,7 @@ The same reasoning then applied to `check_watermark_shape`, which this one was c
 
 ### Decided before execution, 2026-08-04
 
-**Only some event kinds have a producer, and the phase records what exists rather than waiting.** Three do: the logout endpoint and the embedding application's own `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs`), and the theft defence in `DbAuthStore::rotate_refresh` (`authn/store.rs`). A permission change is noticed by the grant-change watcher, which is R7 and unbuilt. A model change needs an authorization model, which is R5b and unbuilt. A ban comes from R36, which is unbuilt and depends on this phase.
+**Only some event kinds have a producer, and the phase records what exists rather than waiting.** Three do: the logout endpoint and the embedding application's own `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs`), and the theft defence in `DbAuthStore::rotate_refresh` (`authn/store.rs`). A permission change is noticed by the grant-change watcher, which is R7 and unbuilt. A model change needs an authorization model, which is R5b and unbuilt. A ban comes from R36, which was unbuilt when this phase landed and has since shipped both of its producers.
 
 **So this phase also records a successful share mint**, which is the one thing connetto itself does today that changes who can reach something. That is arguable and the maintainer took it deliberately: the permission is really the row the application writes afterwards, which connetto never sees, so what is recorded is connetto's own act of minting rather than the grant landing. Its cost is that `CapabilityIssuer` gains a fifth collaborator to write with. **Recording only the two invalidations was considered and rejected**, because the table would then carry nothing at all from the authorization half of the system, which is half of what it was specified for. **Waiting for R7 and R5b was considered and rejected**, because the phase exists precisely so this one contract does not arrive in pieces across five phases.
 
@@ -1527,7 +1527,7 @@ Subscriptions survive a restart and are re-declared from the replica. No delete 
 
 ### Why this is not part of R15
 
-R15 is retention: deciding what to discard and returning the space. This is the question R15's eviction asks and cannot currently answer, and two of its consequences are live defects that have nothing to do with retention. R15 is additionally blocked on five upstream diesel proposals, and none of this is.
+R15 is retention: deciding what to discard and returning the space. This is the question R15's eviction asks and cannot currently answer, and two of its consequences are live defects that have nothing to do with retention. R15 is additionally blocked on the diesel `wal_checkpoint` proposal, and none of this is.
 
 ---
 
@@ -1622,9 +1622,9 @@ Public rows are stored once per device rather than once per identity, the switch
 
 **Status.** NOT STARTED
 
-**Blocked on R29, and on five upstream diesel proposals landing.** R29 first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. The proposals, in `docs/`: `upstream-diesel-auto-vacuum-mode.md`, `upstream-diesel-incremental-vacuum.md`, `upstream-diesel-vacuum-into.md`, `upstream-diesel-page-counters.md`, `upstream-diesel-wal-checkpoint.md`. **The maintainer is driving those PRs**, so that dependency is tracked rather than owned here. Off the critical path.
+**Blocked on R29 and on one remaining upstream diesel proposal. Corrected 2026-08-07.** This line used to say five proposals. Four are merged upstream and **reachable**: `auto_vacuum` mode control (diesel #5130), the `page_count` and `freelist_count` readers (#5129), `incremental_vacuum` (#5145), and `vacuum` with `vacuum_into` (#5146). Their proposal documents are deleted, because a merged pull request is a better record than a copy of its own argument. R29 still comes first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. Off the critical path.
 
-**The diesel API surface still missing, listed so the blockers are not forgotten.** From `upstream-diesel-auto-vacuum-mode.md`: `SqliteConnection::set_auto_vacuum`, `SqliteConnection::auto_vacuum`, `AutoVacuumMode`. From `upstream-diesel-page-counters.md`: `SqliteConnection::page_count`, `SqliteConnection::freelist_count`. From `upstream-diesel-incremental-vacuum.md`: `SqliteConnection::incremental_vacuum`. From `upstream-diesel-wal-checkpoint.md`: `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome`. From `upstream-diesel-vacuum-into.md`: `SqliteConnection::vacuum`, `SqliteConnection::vacuum_into`. The PRs land serially because real stacked PRs are not an option, which is why the wait is long. The OPFS atomic-swap probe (`15-replica-retention.md`, open questions) waits specifically on `vacuum_into`, since the meaningful probe swaps a real compacted file under the sahpool VFS.
+**The pin blocker is gone, and clearing it cost something worth knowing.** The fork's `future` branch was rebased on upstream `main` on 2026-08-07 and every workspace lock moved to it, so the four APIs are callable here. The rebase dropped a commit this workspace turned out to depend on: `diesel::table!` generates public items carrying only the caller's doc comments, and the dropped commit hid the undocumented ones from `missing_docs`, which the root `Cargo.toml` sets to `forbid`. The maintainer chose to document instead, so **all 141 columns across 45 `diesel::table!` blocks now carry doc comments and any new table must too**. `docs/upstream-diesel-future-branch-sync.md` is the record. What is left for this phase is the fifth proposal alone, `docs/upstream-diesel-wal-checkpoint.md`, unfiled, wanting `SqliteConnection::wal_checkpoint`, `WalCheckpointMode` and `WalCheckpointOutcome` for step 5's `TRUNCATE` checkpoint. The OPFS atomic-swap probe (`15-replica-retention.md`, open questions) waited on `vacuum_into` and is unblocked.
 
 ### Purpose
 
@@ -1632,7 +1632,7 @@ The replica holds the union of subscribed query results, so it grows with what i
 
 ### Steps
 
-1. **The five upstream proposals are being driven by the maintainer**, so this phase does not file them. It waits for them to land and then uses the typed API rather than reaching for raw SQL, which is the whole reason for waiting.
+1. **Four of the five upstream proposals have landed and the pin reaches them** (diesel #5130, #5129, #5145, #5146), so this phase files only the fifth, `wal_checkpoint`. It then uses the typed API rather than reaching for raw SQL, which is the whole reason for waiting.
 2. **Settle `auto_vacuum` in the replica create path.** It is the one pragma that must be set **before the first table exists**, because the mode lives in the file and changing it later needs a full `VACUUM` rewrite. There is no replica template any more (E5 deleted `connect_with_plaintext_template`), so connetto creates the file and connetto sets it. It joins the ordered pragma sequence in `docs/architecture/14-at-rest-encryption.md`, after the key pragma.
 3. Rotating time-windowed subscriptions: a standing predicate fixes its bound at registration, so rotation means re-subscribing with a fresh bound.
 4. Local eviction of rows no active subscription covers, where active means a watch-backed subscription within its grace or a pin. The pass runs by itself when a subscription ends (grace expiry or unpin), scoped to that subscription's tables, and a callable tidy pass exists besides. **Two guards, decided with the maintainer.** Rows referenced by a pending, un-acknowledged mutation are never evicted: write-time interest marks over the durable pending queue (set at capture, cleared on ack, rebuilt at boot, keys extractable by the `affected_rows` decode) exclude their keys from the complement delete, bounded by the queue's cap. And the pass does not run while the transport is down, because a row discarded offline cannot be re-fetched until connectivity returns. Grace clocks keep running offline, only the pass waits. **Local-tier rows are never evictable**, and that holds structurally rather than by rule, because no `SubscriptionSpec` can carry a frontend-tier table.
@@ -2012,7 +2012,7 @@ Tick these off across the whole programme, because each is easy to lose inside a
 
 **Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R19 added `ControlMessage::RateLimited` and `FatalErrorReason::RateLimited` (**landed**). R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
 
-**Startup checks, all six refusing to start**: R1 on an unrecognised provider and on a missing reader role. R2 on a stale watermark table shape. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it.
+**Startup checks, all six refusing to start**: R1 on an unrecognised provider and on a missing reader role. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it. **Corrected 2026-08-07**: this list also named an R2 refusal on a stale watermark table shape, which does not exist. R13 deleted that check along with the audit shape check it was written beside, because hardcoding connetto's own column names while being generic over a schema trait would refuse exactly the application-owned table the trait exists to permit, and the shapes it caught fail loudly on the first write anyway. Six is now the count for the right reason, and it matches R36's own arithmetic, which called a threshold-confirmation refusal the seventh.
 
 **Type-enforced guards, not documentation**: both of R3's are built. The value handed to `connect` carries a marker for what the run keeps at rest and owns the device-private database beside it, so a durable one paired with an unkeyed replica is not a program, proven by `compile_fail` doctests on `Replica`. `Principal` makes all four arrival cases representable and, being an optional identity beside a set of capabilities, has no fifth state.
 
