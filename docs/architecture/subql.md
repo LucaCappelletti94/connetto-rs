@@ -26,6 +26,23 @@ The items below track the finer-grained responsibilities and their status.
 
 ---
 
+## Visibility
+
+### The visibility trait (R5a)
+**Shipped**, subql `8e9b2df`, as `src/visibility.rs`. `VisibilityPolicy` with associated `Watcher`, `Error` and `Backend`. Its `may_see(row, watchers, verdicts)` answers one changed row for every watcher at once, writing one `Verdict` per watcher positionally into a caller-owned buffer sized by `Verdict::reset`, and `may_write(row, watcher, op)` answers one caller for one row. Both are async and both take `R: RowView`. `EventRow` is the shipped `RowView` over a change event bound to one `RowKind`. connetto consumed it in R5a on 2026-08-04, moving all four call sites onto it and deleting its own `AuthPolicy`. **subql ships the trait and nothing underneath it**, deliberately, so the executor stays an implementation detail.
+
+### Per-row visibility and permission-record upkeep (R5b, R6)
+**Underway**, on subql branch `feat/visibility-from-the-row`. The design is `docs/upstream-subql-per-row-visibility.md`, a process artifact. Six requirements: answer visibility from the changed row with no round trip by calling `rls2fga`'s `records_from_row`, ask once per distinct group rather than once per subscriber, keep the permission records current from the change stream because subql is the only place holding both row versions, route by the per-relation decidable-from-one-row flag rather than by inference, and detect visibility transitions across the two versions of a row, which is what connetto R6 consumes.
+
+What exists so far: `src/visibility.rs` promoted to `src/visibility/mod.rs`, and `rls2fga` entered as an optional dependency behind a `visibility-records` feature with `default-features = false`, which is the condition that keeps a `no_std`-capable subql one. The `openfga-client` integration is still ahead.
+
+**subql does not reimplement the mapping semantics.** It adapts its own value type to `rls2fga`'s `RowValues` abstraction and calls that crate's evaluator. Two implementations of one mapping in two repositories is the divergence a single policy source exists to prevent, one level down.
+
+### ~~Expose the tables each policy reads~~ (withdrawn same day)
+**Assigned and withdrawn on 2026-08-07, recorded so it is not re-raised.** connetto's startup refuses to serve when a policy reads a table the publication does not carry. For a few hours the table list was believed to come only from `rls2fga`, which connetto does not depend on, so `subql` was going to re-export it. That was wrong. `sql-traits` already models policies, so `DatabaseLike::policies()` with `PolicyLike::using_expression()` and `check_expression()` answers it from the catalog connetto already parses. **subql owes nothing here.** See `08-authorization.md` and R5b step 7.
+
+---
+
 ## Resource Management
 
 ### Subscription registry limits (Q4.2)
