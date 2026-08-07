@@ -89,7 +89,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it |
 | any | R34 | Blocked on nothing. R5a put the write question on the same seam as the read one, so this is the mint call learning to ask it |
 | done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
-| any | R17 | A defect, blocked on nothing. Land it whenever, and before anything else relies on the local tier |
+| done | ~~R41~~ **DONE** | One seam for the two secret stores. Landed 2026-08-07: one trait per secret in `connetto-core`, both name-addressed, the browser key store renamed off the collision |
+| any | R17 | A defect, blocked on nothing now that R41 is done. Land it before anything else relies on the local tier |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
 | any | R15 | Off the critical path. Gated on R29 and on the one remaining diesel proposal, `wal_checkpoint`. The other four landed and the pin reaches them |
@@ -141,7 +142,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R29 client-side coverage | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | NOT STARTED | nothing | no |
-| R17 local tier name and key scope | NOT STARTED | nothing | no |
+| R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
+| R17 local tier name and key scope | NOT STARTED | nothing, R41 reshaped the store this phase re-keys and is done | no |
 | R18 SQLite hardening surface | NOT STARTED | nothing, `diesel-rs/diesel#5128` is merged and the pin reaches it | no |
 | R11 shared public store | NOT STARTED | nothing | no |
 | R15 replica retention and trimming | NOT STARTED | R29 and one diesel proposal (`wal_checkpoint`), the pin now reaching the four merges | **yes, diesel** |
@@ -191,7 +193,7 @@ graph TD
   R38[R38 a refusal stops disclosing what exists, DONE]
   R21[R21 one page codec on both backends]
   R20[R20 start with no reachable server]
-  R17[R17 local tier name and key scope]
+  R41[R41 one seam for the two secret stores, DONE] --> R17[R17 local tier name and key scope]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
   R31[R31 application schema majors]
@@ -213,7 +215,7 @@ graph TD
   R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
   classDef done fill:#d7ebd7,stroke:#4a7a4a,color:#1d3b1d
-  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R19,R28,R35,R36,R38 done
+  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R19,R28,R35,R36,R38,R41 done
 ```
 
 ## Upstream dependencies
@@ -1199,11 +1201,70 @@ An application embedding connetto starts, runs, and serves local reads with no s
 
 ---
 
+## R41: one seam for the two secret stores
+
+**Status.** **DONE** (2026-08-07)
+
+**Blocked on nothing, and it precedes R17.** Decided with the maintainer on 2026-08-07, which is also why it exists: R17 changes the browser refresh store's keying, and doing that against today's divergence means writing the same file twice.
+
+### Purpose
+
+connetto keeps two kinds of secret and stores each one twice, once per target, with no shared abstraction between the pairs.
+
+| Secret | Native | Browser |
+|---|---|---|
+| refresh token | `RefreshTokenStore` trait, synchronous, `ClientError`, implemented by `KeyringStore` and `MemoryRefreshStore` | `RefreshStore` struct, synchronous, `AuthError`, no trait |
+| replica keys | `ReplicaKeyStore` trait, synchronous, `ClientError`, implemented by `KeyringKeyStore` and `MemoryKeyStore` | `ReplicaKeyStore` struct, **asynchronous**, `AuthError`, no trait |
+
+**Two different things are named `ReplicaKeyStore`**, a trait in `crates/connetto-client/src/auth.rs` and a struct in `crates/connetto-web/src/auth.rs`, in crates where the second depends on the first. A citation naming it is therefore ambiguous, and R11's own text cites the trait while a reader in browser code finds the struct. The value type already crossed the boundary and the abstraction did not: `connetto_core::ReplicaKey` is shared by both.
+
+### The decisions, taken 2026-08-07
+
+1. **This phase precedes R17.** Rejected: recording it as future work and keeping R17 narrow, whose only argument was that the alternative costs more effort now, and effort is not a blocker. Rejected: deciding the shape now and building it later, because a design recorded ahead of its code is the failure this repository already lived through once, which is what the status-marker discipline exists to hold.
+2. **One awaiting trait for the key store, shared by both targets.** The browser must await `IndexedDB` and `SubtleCrypto` and cannot be synchronous, so the native implementation wears an awaiting signature over a keychain call that returns immediately. **This is the house style rather than a new pattern**: `connetto_core::traits::Transport` is already an awaiting trait carrying a `MaybeSend` bound that absorbs the same native-versus-wasm difference. Accepted cost, stated rather than hidden: the keychain call blocks whoever polls it, bounded because key custody runs when a database is opened or an account is logged out rather than per change. Rejected: two traits sharing an error and a vocabulary, which tidies the duplication without removing it. Rejected: moving the native blocking call to a background thread, which buys threading machinery against an unmeasured cost and has no browser counterpart.
+3. **The refresh-token store is in scope too**, not the key store alone. It follows from decision 1, since R17's change is to the refresh store and excluding it would make building the shape first buy nothing. It stays **synchronous** on both targets, because neither needs to await and forcing symmetry would be a false await on both sides. Only its construction is asynchronous in the browser, because the device key it opens under comes from the key store.
+4. **Both stores address the account on every call**: `load(name)`, `store(name, ..)`, `clear(name)`. The key store already does. The refresh store does not, since `KeyringStore` carries `(service, user)` in its own fields. **The browser bootstrap is what decides it**: something must be readable before any account is known, because the refresh token is what reveals the account, and that secret already lives in the same store under the literal `connetto-device-key` beside the derived per-account names. Rejected: one store object per account, which leaves that pre-login secret needing a second mechanism of its own, or a store constructed for an account nobody has identified yet.
+5. **The error is an associated type on each trait**, following `Transport::Error`, so neither target's error type has to move and no shared error is invented.
+6. **Both traits live in `connetto-core`**, where `ReplicaKey` already is and which `connetto-web` already depends on.
+7. **The browser key store is renamed** to backend plus role, matching `KeyringKeyStore` and `MemoryKeyStore`, which retires the collision.
+
+### Steps
+
+1. Move both traits into `connetto-core`, each carrying an associated error and each addressing the account by name. The key-store methods return awaiting futures carrying `MaybeSend`, exactly as `Transport`'s do.
+2. Reshape the native implementations onto the name-addressed form. `KeyringStore` stops carrying the account in its own fields and takes it per call.
+3. Implement both traits on the browser types, renaming the key store off the collision.
+4. Migrate every caller. `device_key` in `crates/connetto-web/src/storage.rs` and `provision_replica_key`, which exists once per target, are the two to check first.
+5. Delete the superseded declarations. No trait, alias, or re-export survives in `connetto-client` for a shape that now lives in `connetto-core`.
+
+### Proof
+
+Two accounts on one device, where each store returns each account's own secret and neither account's call reaches the other's. Then the browser reads the pre-login secret under its literal name before any account is known, which is the case decision 4 turns on. And one caller written generically against each trait compiles and runs on both targets, which is the property the phase exists to buy and the one no test can express today.
+
+### Built, and what the steps did not name
+
+`connetto_core::traits::RefreshTokenStore` and `connetto_core::traits::ReplicaKeyStore` are the two traits, each with an associated `Error`, each addressing the account per call, and the key store's three methods returning `impl Future + MaybeSend`. The native side is `KeyringStore` (now `new(service)` alone) and `MemoryRefreshStore` for the token, `KeyringKeyStore` and `MemoryKeyStore` for the keys. The browser side is `RefreshStore` and `IdbKeyStore`, which is decision 7's rename. `connetto-client` re-exports neither trait any more.
+
+**One thing decision 4 implied and no step named: the browser refresh table had to move.** A `load(name)` the implementation ignores is a lie in the interface and would fail the proof's first clause, so `connetto_refresh` went from `(id INTEGER PRIMARY KEY, token)` holding one row to `(account TEXT PRIMARY KEY NOT NULL, token)` holding one row per name. That is the shape only. **R17 still owns the keying**, which is the separate question of which name a caller passes: today every caller passes the literal `connetto_web::auth::REFRESH_RECORD`, because the token is what reveals the identity and nothing knows an identity at boot. R17 decides what replaces that literal and how a cold boot picks among several, and it now touches call sites rather than the schema.
+
+**Two smaller consequences, both forced rather than chosen.** The key-store trait is not dyn-compatible once its methods return `impl Future`, so `provision_replica_key`, `teardown::wipe_replica` and `teardown::forget_device` took a type parameter in place of `&dyn ReplicaKeyStore`, and the two teardown functions became awaiting. And both authenticators now hold the record name rather than taking one per call, because `NativeAuthenticator::token_source` captures a closure that has to know it anyway, and because one field cannot disagree with itself the way five call sites can.
+
+**Proof, as the section above asks for it.** `two_accounts_keep_their_own_token` and `two_accounts_keep_their_own_key` live in `connetto_core::test_support`, are written against the traits and know nothing about a keyring, `IndexedDB`, or an encrypted file. `crates/connetto-client/tests/secret_stores.rs` runs both against the in-memory stores and, behind `--ignored`, against the real OS keyring. `crates/connetto-web/tests/secret_stores.rs` runs the same two against `IdbKeyStore` and `RefreshStore` under headless Chrome, and adds the pre-login case decision 4 turns on: the device key reads under its literal before any account exists, and clearing an account's record leaves it alone.
+
+### Done when
+
+One trait per secret, in `connetto-core`, implemented by every native and browser store, addressed by account name, with nothing named `ReplicaKeyStore` in two crates. R17 can then change the refresh store's keying once.
+
+### Why it is not folded into R17
+
+R17 is one scope mismatch, a file named device-wide and keyed per account. This crosses the wasm and native boundary and decides a trait shape. Landing both together would put a cross-platform design decision inside a defect fix and make neither attributable.
+
+---
+
 ## R17: the local tier is device-named and identity-keyed
 
 **Status.** NOT STARTED
 
-**Blocked on nothing.** Independent of every other phase. It is a defect rather than an improvement, so it does not wait on a measurement.
+**Blocked on nothing.** It was blocked on R41, which landed on 2026-08-07 and reshaped the refresh store this phase re-keys. It is a defect rather than an improvement, so it does not wait on a measurement either.
 
 ### Purpose
 
@@ -1217,10 +1278,11 @@ An application embedding connetto starts, runs, and serves local reads with no s
 
 1. **Decide which scope the tier actually has, and make name and key agree.** The recorded decision says identity, which means deriving the tier name from the identity exactly as `replica_db_name` does, so each identity gets its own tier under its own key. The alternative is a genuinely device-scoped tier, which then cannot use a per-identity key and needs the device-scoped key that R11 introduces. **These are different products, not different implementations**: the first is a private draft, the second is a shared catalogue, and chapter 12 already argues for the first.
 2. **Several accounts stay signed in at once, and only the browser needs changing. Decided.** Blocking at one is not wanted: a person with a work account and a personal one should switch instantly rather than logging in each time, which is what the accounts-belong-to-one-person model already assumes.
-   Native already does this. `KeyringStore` is keyed on `(service, user)` (`crates/connetto-client/src/auth.rs`), so one instance per account gives each its own keyring entry, and nothing needs to change.
-   The browser does not. `RefreshStore` creates `connetto_refresh (id INTEGER PRIMARY KEY, token TEXT NOT NULL)` and keeps a single row, so each login overwrites the last (`crates/connetto-web/src/auth.rs`). Key that table on the identity instead of holding one row. **The encryption already supports this**: the store is opened under a device-scoped key from `device_key`, not a per-identity one, so several accounts' tokens can coexist in it without a key change.
+   **R41 moved the shape, and this step now moves only the keying.** Both stores address the account per call, natively through `KeyringStore::load(account)` and in the browser through a `connetto_refresh (account TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL)` holding one row per name. So neither the trait nor the schema is what is left. What is left is which name a caller passes: every caller passes the literal `connetto_web::auth::REFRESH_RECORD` today, because the refresh token is what reveals the identity and nothing knows one at boot. Native passes its own literal, `"refresh"` in the desktop demo.
+   **The two questions this step has to answer, and neither is settled.** Which name replaces the literal, and how a cold boot chooses among several stored accounts when no identity is known yet. The second is the harder one and it is why R41 stopped short: a store keyed on the identity has nothing to look up before a login, so something else has to name the account to resume, and that something does not exist. Settle both before writing code, per the standing rule on an under-defined section.
+   **The encryption already supports several accounts**: the store is opened under a device-scoped key from `device_key`, not a per-identity one, so several accounts' tokens coexist in it without a key change.
    Note the security cost and accept it deliberately: a found device can resume any account whose token is still stored, rather than only the last one. That follows from the threat model rather than contradicting it, since those accounts belong to one person and the operating system boundary is what separates people.
-   **What you are replacing rests on call sites, not on the schema (R35, 2026-08-04).** Three places hardcode `id = 1`, the load, the save and nothing at all in the clear, which deletes every row. The sibling table `_connetto_meta` states the same invariant as a `CHECK (id = 1)` in its DDL, and this one does not. Deliberately left that way rather than adding the constraint, because this step deletes the one-row idea outright. Nothing else writes the table today, so there is no live defect to inherit.
+   **The `id = 1` call sites are gone (R41, 2026-08-07).** The three places that hardcoded them, the load, the save, and a clear that deleted every row, now address `account`, and the clear deletes one row. The note that the sibling `_connetto_meta` states its one-row invariant as a `CHECK (id = 1)` while this table never did is now moot: the one-row idea is gone rather than unenforced.
 3. Make the account-switch path consistent with whatever step 1 decides, since it currently removes the replica and leaves the tier.
 4. **Give the decision in chapter 12 a status marker** naming this phase, so the same silence cannot recur.
 

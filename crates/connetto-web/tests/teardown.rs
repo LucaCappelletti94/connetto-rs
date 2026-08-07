@@ -13,7 +13,10 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_client::cipher::ReplicaKey;
-use connetto_web::auth::{AuthError, RefreshStore, ReplicaKeyStore, provision_replica_key};
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_web::auth::{
+    AuthError, IdbKeyStore, REFRESH_RECORD, RefreshStore, provision_replica_key,
+};
 use connetto_web::storage::{
     ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
     wipe_replica,
@@ -88,7 +91,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Leave no trace of `name` from an earlier run, so each test starts from nothing
 /// rather than from whatever the last one left in this origin's OPFS.
-async fn reset(storage: &ReplicaStorage, keys: &ReplicaKeyStore, name: &str) {
+async fn reset(storage: &ReplicaStorage, keys: &IdbKeyStore, name: &str) {
     storage.delete_db(name).expect("clear any earlier file");
     keys.clear(name).await.expect("clear any earlier key");
 }
@@ -98,7 +101,7 @@ async fn reset(storage: &ReplicaStorage, keys: &ReplicaKeyStore, name: &str) {
 #[wasm_bindgen_test]
 async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let alice = "e3-wipe-alice.sqlite";
     let bob = "e3-wipe-bob.sqlite";
     reset(&storage, &keys, alice).await;
@@ -160,7 +163,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 #[wasm_bindgen_test]
 async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e3-guard.sqlite";
     reset(&storage, &keys, name).await;
 
@@ -196,7 +199,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
 #[wasm_bindgen_test]
 async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reopen() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e3-refresh.sqlite";
     storage.delete_db(name).expect("clear any earlier file");
     clear_device_key(&keys)
@@ -207,9 +210,11 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
     let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store.save(REFRESH_TOKEN).expect("save the token");
+        store
+            .store(REFRESH_RECORD, REFRESH_TOKEN)
+            .expect("save the token");
         assert_eq!(
-            store.load().expect("load").as_deref(),
+            store.load(REFRESH_RECORD).expect("load").as_deref(),
             Some(REFRESH_TOKEN),
             "the token round-trips through the encrypted store"
         );
@@ -236,7 +241,7 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
     );
     let store = RefreshStore::open(&url, &cached).expect("reopen the refresh store");
     assert_eq!(
-        store.load().expect("load").as_deref(),
+        store.load(REFRESH_RECORD).expect("load").as_deref(),
         Some(REFRESH_TOKEN),
         "the stored credential survives a cold reopen"
     );
@@ -248,7 +253,7 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
 #[wasm_bindgen_test]
 async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discardable() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e3-refresh-shred.sqlite";
     storage.delete_db(name).expect("clear any earlier file");
     clear_device_key(&keys)
@@ -259,7 +264,9 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
     let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store.save(REFRESH_TOKEN).expect("save the token");
+        store
+            .store(REFRESH_RECORD, REFRESH_TOKEN)
+            .expect("save the token");
     }
 
     clear_device_key(&keys).await.expect("shred the device key");
@@ -279,7 +286,7 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
     storage.delete_db(name).expect("discard the store");
     let store = RefreshStore::open(&url, &reminted).expect("a fresh store opens");
     assert_eq!(
-        store.load().expect("load"),
+        store.load(REFRESH_RECORD).expect("load"),
         None,
         "the discarded credential is gone, so the next boot must log in"
     );
@@ -373,7 +380,7 @@ async fn marking_a_wipe_refuses_to_discard_unsynced_writes() {
 #[wasm_bindgen_test]
 async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e4c-deferred.sqlite";
     reset(&storage, &keys, name).await;
     take_pending_wipes().await.expect("drain");

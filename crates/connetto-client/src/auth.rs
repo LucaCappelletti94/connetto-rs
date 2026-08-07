@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -29,57 +30,34 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{AccessTokenSource, ClientError};
 
-/// Where a native client persists its rotating refresh token between runs.
-pub trait RefreshTokenStore: Send + Sync {
-    /// The stored refresh token, or `None` when none was stored.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be read.
-    fn load(&self) -> Result<Option<String>, ClientError>;
-
-    /// Persist `token`, replacing any prior one.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be written.
-    fn store(&self, token: &str) -> Result<(), ClientError>;
-
-    /// Remove the stored token, if any.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be cleared.
-    fn clear(&self) -> Result<(), ClientError>;
-}
-
 /// OS secure storage for the refresh token: Keychain on macOS, Credential
 /// Manager on Windows, and the kernel keyutils keyring on Linux (daemon-free,
 /// session-scoped by default).
+///
+/// One service holds one entry per account, exactly as [`KeyringKeyStore`]
+/// holds one per replica record.
 pub struct KeyringStore {
     service: String,
-    user: String,
 }
 
 impl KeyringStore {
-    /// Store the refresh token under `service` and `user` in the OS keyring.
+    /// Store refresh tokens under `service` in the OS keyring.
     #[must_use]
-    pub fn new(service: impl Into<String>, user: impl Into<String>) -> Self {
+    pub fn new(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
-            user: user.into(),
         }
     }
 
-    /// The keyring entry, or `None` when this platform's backend reports that no
-    /// such entry exists.
+    /// The keyring entry for `account`, or `None` when this platform's backend
+    /// reports that no such entry exists.
     ///
     /// Some backends resolve the credential when the entry is constructed rather
     /// than when it is read, so "not stored yet" can surface here instead of from
     /// [`get_password`](keyring::Entry::get_password). Reporting that as an error
     /// would make a first run fatal, when it only means there is nothing to load.
-    fn entry(&self) -> Result<Option<keyring::Entry>, ClientError> {
-        match keyring::Entry::new(&self.service, &self.user) {
+    fn entry(&self, account: &str) -> Result<Option<keyring::Entry>, ClientError> {
+        match keyring::Entry::new(&self.service, account) {
             Ok(entry) => Ok(Some(entry)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
@@ -88,8 +66,10 @@ impl KeyringStore {
 }
 
 impl RefreshTokenStore for KeyringStore {
-    fn load(&self) -> Result<Option<String>, ClientError> {
-        let Some(entry) = self.entry()? else {
+    type Error = ClientError;
+
+    fn load(&self, account: &str) -> Result<Option<String>, ClientError> {
+        let Some(entry) = self.entry(account)? else {
             return Ok(None);
         };
         match entry.get_password() {
@@ -99,17 +79,17 @@ impl RefreshTokenStore for KeyringStore {
         }
     }
 
-    fn store(&self, token: &str) -> Result<(), ClientError> {
+    fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
         // A backend that reports no entry before one is written still has to accept
         // the write, so this asks for the entry again rather than reusing `entry`.
-        keyring::Entry::new(&self.service, &self.user)
+        keyring::Entry::new(&self.service, account)
             .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
             .set_password(token)
             .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
     }
 
-    fn clear(&self) -> Result<(), ClientError> {
-        let Some(entry) = self.entry()? else {
+    fn clear(&self, account: &str) -> Result<(), ClientError> {
+        let Some(entry) = self.entry(account)? else {
             return Ok(());
         };
         match entry.delete_credential() {
@@ -122,59 +102,36 @@ impl RefreshTokenStore for KeyringStore {
 /// An in-memory refresh-token store, for tests and ephemeral sessions.
 #[derive(Default)]
 pub struct MemoryRefreshStore {
-    inner: Mutex<Option<String>>,
+    inner: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl RefreshTokenStore for MemoryRefreshStore {
-    fn load(&self) -> Result<Option<String>, ClientError> {
-        Ok(self.inner.lock().expect("refresh store lock").clone())
+    type Error = ClientError;
+
+    fn load(&self, account: &str) -> Result<Option<String>, ClientError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("refresh store lock")
+            .get(account)
+            .cloned())
     }
 
-    fn store(&self, token: &str) -> Result<(), ClientError> {
-        *self.inner.lock().expect("refresh store lock") = Some(token.to_owned());
+    fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
+        self.inner
+            .lock()
+            .expect("refresh store lock")
+            .insert(account.to_owned(), token.to_owned());
         Ok(())
     }
 
-    fn clear(&self) -> Result<(), ClientError> {
-        *self.inner.lock().expect("refresh store lock") = None;
+    fn clear(&self, account: &str) -> Result<(), ClientError> {
+        self.inner
+            .lock()
+            .expect("refresh store lock")
+            .remove(account);
         Ok(())
     }
-}
-
-/// Where a native client caches its per-replica encryption keys between runs.
-///
-/// Every method takes a `name`, the per-identity record this device holds for
-/// one replica. Pass the same value
-/// [`replica_db_name`](crate::replica::replica_db_name) produced for the
-/// replica file, so two identities signed in on one device keep separate keys
-/// and a wipe of one cannot reach the other.
-///
-/// A name is only knowable once login has resolved the identity, which is why
-/// the store is not consulted during acquisition. Afterwards a fresh replica
-/// gets its key from [`provision_replica_key`] and an existing one reads
-/// [`load`](Self::load).
-pub trait ReplicaKeyStore: Send + Sync {
-    /// The cached key for `name`, or `None` when none was ever stored here.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be read.
-    fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError>;
-
-    /// Persist `key` under `name`, replacing any prior value.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be written.
-    fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError>;
-
-    /// Remove the cached key for `name`, if any. This is the crypto-shred half
-    /// of a data wipe: without the key the replica ciphertext is inert.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Auth`] if the backing store cannot be cleared.
-    fn clear(&self, name: &str) -> Result<(), ClientError>;
 }
 
 /// The effective key for the replica `name`, minting one when this device has
@@ -191,6 +148,10 @@ pub trait ReplicaKeyStore: Send + Sync {
 /// per replica per device, cached locally, usable with no credential and no
 /// network.
 ///
+/// It stays once per target rather than moving to `connetto-core` beside the
+/// trait, because minting needs an entropy source and `ReplicaKey` deliberately
+/// carries none, which is what keeps the browser build free of one.
+///
 /// **Call this only for a replica that does not exist yet.** For one already on
 /// disk, read the cache with [`ReplicaKeyStore::load`] and hand the result to
 /// [`Replica::encrypted_file`](crate::Replica::encrypted_file). Minting for an
@@ -203,15 +164,15 @@ pub trait ReplicaKeyStore: Send + Sync {
 ///
 /// [`ClientError::Auth`] if the store cannot be read or written, or if the
 /// platform RNG fails.
-pub fn provision_replica_key(
-    store: &dyn ReplicaKeyStore,
+pub async fn provision_replica_key<S: ReplicaKeyStore<Error = ClientError>>(
+    store: &S,
     name: &str,
 ) -> Result<ReplicaKey, ClientError> {
-    if let Some(cached) = store.load(name)? {
+    if let Some(cached) = store.load(name).await? {
         return Ok(cached);
     }
     let minted = mint_replica_key()?;
-    store.store(name, &minted)?;
+    store.store(name, &minted).await?;
     Ok(minted)
 }
 
@@ -258,8 +219,15 @@ impl KeyringKeyStore {
     }
 }
 
+// Every method here returns before it yields, which is the cost decision 2 of
+// R41 accepted: the trait awaits because the browser must, and the keychain
+// call blocks whoever polls it. Bounded, since key custody runs at open and at
+// logout rather than per change.
+#[allow(clippy::unused_async_trait_impl)]
 impl ReplicaKeyStore for KeyringKeyStore {
-    fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
+    type Error = ClientError;
+
+    async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
         let Some(entry) = self.entry(name)? else {
             return Ok(None);
         };
@@ -275,7 +243,7 @@ impl ReplicaKeyStore for KeyringKeyStore {
         }
     }
 
-    fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
+    async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
         let mut hex = Zeroizing::new(String::with_capacity(ReplicaKey::LEN * 2));
         for byte in key.as_bytes() {
             let _ = write!(&mut *hex, "{byte:02x}");
@@ -288,7 +256,7 @@ impl ReplicaKeyStore for KeyringKeyStore {
             .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
     }
 
-    fn clear(&self, name: &str) -> Result<(), ClientError> {
+    async fn clear(&self, name: &str) -> Result<(), ClientError> {
         let Some(entry) = self.entry(name)? else {
             return Ok(());
         };
@@ -305,8 +273,11 @@ pub struct MemoryKeyStore {
     inner: Mutex<std::collections::HashMap<String, ReplicaKey>>,
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl ReplicaKeyStore for MemoryKeyStore {
-    fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
+    type Error = ClientError;
+
+    async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
         Ok(self
             .inner
             .lock()
@@ -315,7 +286,7 @@ impl ReplicaKeyStore for MemoryKeyStore {
             .cloned())
     }
 
-    fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
+    async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
         self.inner
             .lock()
             .expect("key store lock")
@@ -323,7 +294,7 @@ impl ReplicaKeyStore for MemoryKeyStore {
         Ok(())
     }
 
-    fn clear(&self, name: &str) -> Result<(), ClientError> {
+    async fn clear(&self, name: &str) -> Result<(), ClientError> {
         self.inner.lock().expect("key store lock").remove(name);
         Ok(())
     }
@@ -383,28 +354,36 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
 
 /// Acquires and refreshes connetto's own tokens for a native client, driving the
 /// loopback Authorization Code plus PKCE flow against connetto-server.
+///
+/// It holds the account whose record it reads and writes, rather than passing
+/// one at each call, so every method addresses the same record by construction
+/// and no two call sites can disagree about which credential this is.
 pub struct NativeAuthenticator {
     server_base: String,
     provider: String,
-    store: Arc<dyn RefreshTokenStore>,
+    store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
+    account: String,
     opener: BrowserOpener,
     http: reqwest::Client,
 }
 
 impl NativeAuthenticator {
     /// Build over connetto-server's auth base URL (for example
-    /// `http://127.0.0.1:8081`), the provider name to log in with, and a refresh
-    /// token store. Uses the system browser.
+    /// `http://127.0.0.1:8081`), the provider name to log in with, a refresh
+    /// token store, and the account naming this credential's record in it.
+    /// Uses the system browser.
     #[must_use]
     pub fn new(
         server_base: impl Into<String>,
         provider: impl Into<String>,
-        store: Arc<dyn RefreshTokenStore>,
+        store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
+        account: impl Into<String>,
     ) -> Self {
         Self {
             server_base: server_base.into(),
             provider: provider.into(),
             store,
+            account: account.into(),
             opener: system_browser_opener(),
             http: reqwest::Client::new(),
         }
@@ -427,7 +406,7 @@ impl NativeAuthenticator {
     ///
     /// [`ClientError::Auth`] if both refresh and login fail.
     pub async fn acquire<Id: DeserializeOwned>(&self) -> Result<AcquiredSession<Id>, ClientError> {
-        if self.store.load()?.is_some()
+        if self.store.load(&self.account)?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
             return Ok(session);
@@ -447,7 +426,7 @@ impl NativeAuthenticator {
     ) -> Result<AcquiredSession<Id>, ClientError> {
         let refresh = self
             .store
-            .load()?
+            .load(&self.account)?
             .ok_or_else(|| ClientError::Auth("no stored refresh token".to_owned()))?;
         let response: TokenResponse<Id> = self
             .post_json(
@@ -455,7 +434,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await?;
-        self.store.store(&response.refresh_token)?;
+        self.store.store(&self.account, &response.refresh_token)?;
         Ok(response.into())
     }
 
@@ -498,7 +477,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "code": code, "code_verifier": verifier }),
             )
             .await?;
-        self.store.store(&response.refresh_token)?;
+        self.store.store(&self.account, &response.refresh_token)?;
         Ok(response.into())
     }
 
@@ -555,7 +534,7 @@ impl NativeAuthenticator {
     /// after the local clear. [`ClientError::Auth`] if the store cannot be read
     /// or cleared.
     pub async fn logout(&self) -> Result<(), ClientError> {
-        let Some(refresh) = self.store.load()? else {
+        let Some(refresh) = self.store.load(&self.account)? else {
             return Ok(());
         };
         let revoked = self
@@ -564,7 +543,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await;
-        self.store.clear()?;
+        self.store.clear(&self.account)?;
         revoked.map(drop)
     }
 
@@ -706,7 +685,8 @@ fn percent_decode(value: &str) -> String {
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{MemoryKeyStore, ReplicaKeyStore as _, provision_replica_key};
+    use super::{MemoryKeyStore, provision_replica_key};
+    use connetto_core::traits::ReplicaKeyStore as _;
 
     fn key_from_byte(b: u8) -> ReplicaKey {
         ReplicaKey::from_bytes([b; ReplicaKey::LEN])
@@ -716,16 +696,21 @@ mod tests {
     /// back and nothing is minted. Without this a second login would silently
     /// re-key the replica and strand everything already written under the old
     /// key.
-    #[test]
-    fn a_cached_key_wins_over_minting_a_fresh_one() {
+    #[tokio::test]
+    async fn a_cached_key_wins_over_minting_a_fresh_one() {
         let store = MemoryKeyStore::default();
-        store.store("replica-a", &key_from_byte(0xaa)).unwrap();
+        store
+            .store("replica-a", &key_from_byte(0xaa))
+            .await
+            .unwrap();
 
-        let effective = provision_replica_key(&store, "replica-a").expect("a cached key resolves");
+        let effective = provision_replica_key(&store, "replica-a")
+            .await
+            .expect("a cached key resolves");
 
         assert_eq!(effective, key_from_byte(0xaa));
         assert_eq!(
-            store.load("replica-a").unwrap(),
+            store.load("replica-a").await.unwrap(),
             Some(key_from_byte(0xaa)),
             "provisioning must not overwrite the cache"
         );
@@ -735,31 +720,35 @@ mod tests {
     /// minted locally and written through before it is handed back. Two
     /// different replicas mint independently, which is what makes the key per
     /// replica rather than per device.
-    #[test]
-    fn a_key_is_minted_and_cached_when_nothing_is_stored() {
+    #[tokio::test]
+    async fn a_key_is_minted_and_cached_when_nothing_is_stored() {
         let store = MemoryKeyStore::default();
 
-        let minted = provision_replica_key(&store, "replica-a").expect("a key is minted");
-        assert_eq!(store.load("replica-a").unwrap(), Some(minted.clone()));
+        let minted = provision_replica_key(&store, "replica-a")
+            .await
+            .expect("a key is minted");
+        assert_eq!(store.load("replica-a").await.unwrap(), Some(minted.clone()));
         assert_eq!(
-            provision_replica_key(&store, "replica-a").unwrap(),
+            provision_replica_key(&store, "replica-a").await.unwrap(),
             minted,
             "the minted key is stable across calls"
         );
 
-        let other = provision_replica_key(&store, "replica-b").expect("a second key is minted");
+        let other = provision_replica_key(&store, "replica-b")
+            .await
+            .expect("a second key is minted");
         assert_ne!(other, minted, "each replica mints its own key");
     }
 
     /// The mint draws on the platform RNG rather than any fixed or derived
     /// value, so no two replicas and no two devices share a key.
-    #[test]
-    fn a_minted_key_is_neither_constant_nor_derived_from_the_name() {
+    #[tokio::test]
+    async fn a_minted_key_is_neither_constant_nor_derived_from_the_name() {
         let first = MemoryKeyStore::default();
         let second = MemoryKeyStore::default();
 
-        let a = provision_replica_key(&first, "replica-a").unwrap();
-        let b = provision_replica_key(&second, "replica-a").unwrap();
+        let a = provision_replica_key(&first, "replica-a").await.unwrap();
+        let b = provision_replica_key(&second, "replica-a").await.unwrap();
 
         assert_ne!(a, b, "the same name on two devices mints two keys");
         assert_ne!(
@@ -772,18 +761,33 @@ mod tests {
     /// Two identities signed in on one device keep separate keys, which is
     /// what makes the key per replica rather than per user. A single-slot
     /// store would collide here and hand one identity the other's key.
-    #[test]
-    fn keys_are_isolated_per_replica_name() {
+    #[tokio::test]
+    async fn keys_are_isolated_per_replica_name() {
         let store = MemoryKeyStore::default();
-        store.store("replica-a", &key_from_byte(0x11)).unwrap();
-        store.store("replica-b", &key_from_byte(0x22)).unwrap();
+        store
+            .store("replica-a", &key_from_byte(0x11))
+            .await
+            .unwrap();
+        store
+            .store("replica-b", &key_from_byte(0x22))
+            .await
+            .unwrap();
 
-        assert_eq!(store.load("replica-a").unwrap(), Some(key_from_byte(0x11)));
-        assert_eq!(store.load("replica-b").unwrap(), Some(key_from_byte(0x22)));
+        assert_eq!(
+            store.load("replica-a").await.unwrap(),
+            Some(key_from_byte(0x11))
+        );
+        assert_eq!(
+            store.load("replica-b").await.unwrap(),
+            Some(key_from_byte(0x22))
+        );
 
         // Crypto-shredding one replica leaves the other readable.
-        store.clear("replica-a").unwrap();
-        assert_eq!(store.load("replica-a").unwrap(), None);
-        assert_eq!(store.load("replica-b").unwrap(), Some(key_from_byte(0x22)));
+        store.clear("replica-a").await.unwrap();
+        assert_eq!(store.load("replica-a").await.unwrap(), None);
+        assert_eq!(
+            store.load("replica-b").await.unwrap(),
+            Some(key_from_byte(0x22))
+        );
     }
 }

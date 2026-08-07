@@ -16,7 +16,8 @@
 mod common;
 
 use common::{REFRESH_DB, auth_config, play_the_tab, worker_config};
-use connetto_web::auth::{RefreshStore, ReplicaKeyStore};
+use connetto_core::traits::RefreshTokenStore;
+use connetto_web::auth::{IdbKeyStore, REFRESH_RECORD, RefreshStore};
 use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key, take_pending_wipes};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -26,7 +27,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 #[wasm_bindgen_test]
 async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     take_pending_wipes().await.expect("drain any earlier wipes");
 
     // Plant a refresh store holding a credential, then rotate the device key out
@@ -39,7 +40,10 @@ async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
     let auth_db_url = storage.db_url(REFRESH_DB);
     RefreshStore::open(&auth_db_url, &stale_device)
         .expect("open the refresh store")
-        .save("a-refresh-token-the-device-key-can-no-longer-reach")
+        .store(
+            REFRESH_RECORD,
+            "a-refresh-token-the-device-key-can-no-longer-reach",
+        )
         .expect("store a credential");
     clear_device_key(&keys).await.expect("lose the device key");
     let live_device = device_key(&keys).await.expect("mint a new device key");
@@ -69,7 +73,7 @@ async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
         RefreshStore::open(&auth_db_url, &live_device).expect("the replacement store decrypts");
     assert!(
         recovered
-            .load()
+            .load(REFRESH_RECORD)
             .expect("read the replacement store")
             .is_some(),
         "the fresh login left a credential behind"

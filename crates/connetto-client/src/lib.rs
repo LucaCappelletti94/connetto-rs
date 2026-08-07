@@ -65,8 +65,7 @@ pub mod teardown;
 #[cfg(feature = "native-auth")]
 pub use auth::{
     AcquiredSession, BrowserOpener, KeyringKeyStore, KeyringStore, MemoryKeyStore,
-    MemoryRefreshStore, NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore,
-    provision_replica_key, system_browser_opener,
+    MemoryRefreshStore, NativeAuthenticator, provision_replica_key, system_browser_opener,
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;

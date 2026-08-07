@@ -21,10 +21,10 @@ use connetto_client::teardown::{
 };
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, RefreshTokenStore, Replica, ReplicaKey, ReplicaKeyStore, SqlFunctions,
-    provision_replica_key, replica_db_name,
+    NativeAuthenticator, Replica, ReplicaKey, SqlFunctions, provision_replica_key, replica_db_name,
 };
 use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use diesel::prelude::*;
 
 /// A string written into the replica, so a leftover-plaintext assertion has
@@ -70,7 +70,9 @@ async fn seed_replica(
     let record = replica_db_name("replica", user_id).expect("a replica name");
     let path = dir.join(&record);
     let db = url(&path);
-    let key = provision_replica_key(keys, &record).expect("mint a key for a fresh replica");
+    let key = provision_replica_key(keys, &record)
+        .await
+        .expect("mint a key for a fresh replica");
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
         &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
@@ -127,7 +129,9 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 
     // Forced, because the unsynced mutation is exactly what the guard blocks on,
     // and the guard's own behaviour is asserted separately below.
-    wipe_replica(&alice_path, &keys, &alice_record, &alice_unsynced, true).expect("wipe alice");
+    wipe_replica(&alice_path, &keys, &alice_record, &alice_unsynced, true)
+        .await
+        .expect("wipe alice");
 
     // The negative claim, checked against the filesystem rather than the return
     // value. The sidecars matter: a WAL left behind can hold committed pages.
@@ -138,7 +142,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
     }
     // Crypto-shredded: even a forensic copy of the ciphertext has no key left.
     assert_eq!(
-        keys.load(&alice_record).expect("load"),
+        keys.load(&alice_record).await.expect("load"),
         None,
         "the key-store record is destroyed, so leftover ciphertext is inert"
     );
@@ -147,6 +151,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
     assert!(bob_path.exists(), "the other identity's replica survives");
     let bob_key = keys
         .load(&bob_record)
+        .await
         .expect("load")
         .expect("the other identity keeps its key");
     assert_eq!(
@@ -166,7 +171,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
 
-    match wipe_replica(&path, &keys, &record, &unsynced, false) {
+    match wipe_replica(&path, &keys, &record, &unsynced, false).await {
         Err(PurgeError::Unsynced(blocked)) => assert_eq!(blocked, unsynced),
         Err(other) => panic!("expected Unsynced, got {other:?}"),
         Ok(()) => panic!("a wipe must not silently drop queued writes"),
@@ -177,6 +182,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
     assert!(path.exists(), "the blocked wipe deletes nothing");
     let key = keys
         .load(&record)
+        .await
         .expect("load")
         .expect("the blocked wipe keeps the key");
     assert_eq!(
@@ -202,6 +208,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
     // the state a keep-mode logout leaves behind.
     let key = keys
         .load(&record)
+        .await
         .expect("load")
         .expect("the key survives a credential-only logout");
 
@@ -242,8 +249,10 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
 
     // The key store is cleared without the file, which is what a partial wipe or
     // a lost keyring looks like from the next boot's point of view.
-    keys.clear(&record).expect("clear the key record");
-    let reminted = provision_replica_key(&keys, &record).expect("a later boot mints again");
+    keys.clear(&record).await.expect("clear the key record");
+    let reminted = provision_replica_key(&keys, &record)
+        .await
+        .expect("a later boot mints again");
     match read_back(&path, reminted).await {
         Err(ClientError::ReplicaUndecryptable(_)) => {}
         Err(other) => panic!("expected ReplicaUndecryptable, got {other:?}"),
@@ -256,7 +265,11 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     assert!(!path.exists(), "the unreadable replica is gone");
 
     // A fresh connect rebuilds under the key that is now cached.
-    let key = keys.load(&record).expect("load").expect("the minted key");
+    let key = keys
+        .load(&record)
+        .await
+        .expect("load")
+        .expect("the minted key");
     let db = url(&path);
     let mut conn = ConnettoConnection::connect(
         FakeTransport::accepting(),
@@ -283,15 +296,20 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
 
-    let refresh: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
+    let refresh: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync> =
+        Arc::new(MemoryRefreshStore::default());
     refresh
-        .store("session-id.secret")
+        .store("alice", "session-id.secret")
         .expect("seed a credential");
     // Port 1 is reserved and nothing listens there. The revoke can therefore
     // never land, which is deliberate: the guard must refuse before the request
     // is even attempted, so an unreachable server proves the ordering.
-    let authenticator =
-        NativeAuthenticator::new("http://127.0.0.1:1", "permissive", Arc::clone(&refresh));
+    let authenticator = NativeAuthenticator::new(
+        "http://127.0.0.1:1",
+        "permissive",
+        Arc::clone(&refresh),
+        "alice",
+    );
 
     match forget_device(&authenticator, &path, &keys, &record, &unsynced, false).await {
         Err(ForgetError::Purge(PurgeError::Unsynced(blocked))) => assert_eq!(blocked, unsynced),
@@ -299,7 +317,7 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
         Ok(()) => panic!("forget_device must not silently drop queued writes"),
     }
     assert_eq!(
-        refresh.load().expect("load").as_deref(),
+        refresh.load("alice").expect("load").as_deref(),
         Some("session-id.secret"),
         "the credential is intact, so the queued writes can still be uploaded"
     );

@@ -44,6 +44,7 @@ use connetto_client::{
     Tier,
 };
 use connetto_core::messages::SubscriptionSpec;
+use connetto_core::traits::ReplicaKeyStore as _;
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 
@@ -262,7 +263,7 @@ async fn acquire_session<Id: serde::de::DeserializeOwned>(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::ReplicaKeyStore,
+    key_store: &crate::auth::IdbKeyStore,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
     let device_key = crate::storage::device_key(key_store).await.map_err(to_js)?;
     let auth_db_url = storage.db_url(auth_db_name);
@@ -279,7 +280,8 @@ async fn acquire_session<Id: serde::de::DeserializeOwned>(
         }
         Err(err) => return Err(to_js(err)),
     };
-    let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone());
+    let authenticator =
+        crate::auth::BrowserAuthenticator::new(auth.clone(), crate::auth::REFRESH_RECORD);
     match authenticator.acquire(&store).await.map_err(to_js)? {
         crate::auth::Acquired::Access(session) => Ok(session),
         crate::auth::Acquired::NeedLogin(pending) => {
@@ -340,7 +342,7 @@ where
     // Opened whether or not authentication is configured. A durable replica is
     // encrypted, and with no auth there is simply no identity in the record name,
     // which is the same shape `device_key` already uses for the refresh store.
-    let key_store = crate::auth::ReplicaKeyStore::open().await.map_err(to_js)?;
+    let key_store = crate::auth::IdbKeyStore::open().await.map_err(to_js)?;
 
     // Every wipe the application asked for is carried out here, before the login
     // and before anything is opened.
@@ -713,10 +715,10 @@ async fn logout_locally(
     auth_db_name: &str,
 ) -> Result<(), crate::auth::AuthError> {
     let storage = crate::storage::ReplicaStorage::install().await;
-    let keys = crate::auth::ReplicaKeyStore::open().await?;
+    let keys = crate::auth::IdbKeyStore::open().await?;
     let device = crate::storage::device_key(&keys).await?;
     let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name), &device)?;
-    crate::auth::BrowserAuthenticator::new(auth.clone())
+    crate::auth::BrowserAuthenticator::new(auth.clone(), crate::auth::REFRESH_RECORD)
         .logout(&store)
         .await
 }

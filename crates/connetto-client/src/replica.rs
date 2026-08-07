@@ -189,7 +189,8 @@ impl<'a> Replica<'a, Encrypted> {
     /// key it was written under, and it is the only place that refusal lives, so
     /// the browser worker and a native application get the same behaviour.
     /// `None` is what
-    /// [`ReplicaKeyStore::load`](crate::auth::ReplicaKeyStore::load) returns for a
+    /// [`ReplicaKeyStore::load`](connetto_core::traits::ReplicaKeyStore::load)
+    /// returns for a
     /// replica whose key-store record is gone while the file survived, and its
     /// recoveries are restoring the key, or an explicit data wipe followed by a
     /// re-sync. Neither of them is "open it in the clear", so this returns an

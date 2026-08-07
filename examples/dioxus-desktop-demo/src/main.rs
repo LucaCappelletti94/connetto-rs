@@ -25,11 +25,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use connetto_client::auth::{
-    KeyringKeyStore, KeyringStore, NativeAuthenticator, ReplicaKeyStore, provision_replica_key,
+    KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key,
 };
 use connetto_client::replica::{Replica, replica_db_name};
 use connetto_client::teardown::{ForgetError, PurgeError, forget_device};
 use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Grant, SqlFunctions};
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
 use diesel::prelude::*;
@@ -53,9 +54,12 @@ const AUTH_PROVIDER: &str = "dev-idp";
 /// Prefix for per-identity replica file names (passed to `replica_db_name`).
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
 /// OS keyring service name for both the refresh token and per-replica keys.
-/// One service, one refresh-token entry (user `"refresh"`), and one key entry
+/// One service, one refresh-token entry ([`REFRESH_RECORD`]), and one key entry
 /// per replica name (derived from the identity).
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
+/// Keyring record holding the refresh token. A literal rather than an identity,
+/// because the token is what reveals the identity.
+const REFRESH_RECORD: &str = "refresh";
 
 diesel::table! {
     orders (id) {
@@ -346,15 +350,18 @@ async fn setup_authenticated(
 
     std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
 
-    // Credential store: one entry per app, user key `"refresh"`.
-    let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE, "refresh"));
+    // Credential store: one entry per app, one record per account. This demo
+    // signs one account in at a time, so the record is the literal below.
+    let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
     // Key store: one entry per replica name (one per identity on this device).
     let key_store = Arc::new(KeyringKeyStore::new(KEYRING_SERVICE));
 
     let authenticator = Arc::new(NativeAuthenticator::new(
         AUTH_SERVER,
         AUTH_PROVIDER,
-        Arc::clone(&token_store) as Arc<dyn connetto_client::auth::RefreshTokenStore>,
+        Arc::clone(&token_store)
+            as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,
+        REFRESH_RECORD,
     ));
 
     // Acquire the session. Silently refreshes from the stored refresh token
@@ -384,10 +391,12 @@ async fn setup_authenticated(
     let replica_key = if existing {
         key_store
             .load(&key_name)
+            .await
             .map_err(|err| anyhow::anyhow!("reading the replica key from the keyring: {err}"))?
     } else {
         Some(
-            provision_replica_key(key_store.as_ref() as &dyn ReplicaKeyStore, &key_name)
+            provision_replica_key(key_store.as_ref(), &key_name)
+                .await
                 .map_err(|err| anyhow::anyhow!("storing a new replica key: {err}"))?,
         )
     };
@@ -514,7 +523,7 @@ fn app() -> Element {
                             match forget_device(
                                 &auth,
                                 &path,
-                                ks.as_ref() as &dyn ReplicaKeyStore,
+                                ks.as_ref(),
                                 &kn,
                                 &unsynced,
                                 false,

@@ -1,6 +1,6 @@
 # 14: At-rest encryption
 
-**Status**: normative. The encryption subsystem (phases E0 through E5) is shipped and its tests run in CI. Every normative statement below is marked **Built**, **Built, defective**, or **Decided (EN)** where EN names an E-phase in `docs/handoff-auth-at-rest-encryption.md`.
+**Status**: normative. The encryption subsystem (phases E0 through E5) is shipped and its tests run in CI. Every normative statement below is marked **Built**, **Built, defective**, or **Decided**, naming either an E-phase from `docs/handoff-auth-at-rest-encryption.md` or an R-phase from `plans/master-implementation-plan.md`.
 
 ---
 
@@ -32,9 +32,26 @@ The key survives logout deliberately. It is scoped per device rather than per se
 
 ## Key custody
 
-### Shared trait (native)
+### One trait per secret
 
-**Built.** `connetto_client::auth::ReplicaKeyStore` in `crates/connetto-client/src/auth.rs` is the native trait:
+**Built (R41), 2026-08-07.** Each of the two secrets has one trait in `connetto-core`, implemented by every native and browser store, and every method names the account it addresses. Nothing is called `ReplicaKeyStore` in two crates any more, so a citation of that symbol is unambiguous.
+
+| Secret | Trait | Native | Browser |
+|---|---|---|---|
+| refresh token | `connetto_core::traits::RefreshTokenStore`, synchronous | `KeyringStore`, `MemoryRefreshStore` | `RefreshStore` |
+| replica keys | `connetto_core::traits::ReplicaKeyStore`, awaiting | `KeyringKeyStore`, `MemoryKeyStore` | `IdbKeyStore` |
+
+Each trait carries an associated `Error`, following `connetto_core::traits::Transport::Error`, so neither target's error type had to move and no shared error was invented.
+
+**Why the account is an argument rather than a field on the store.** The browser reads a secret before any account is known, because the refresh token is what reveals the account, and that secret sits in the same store as the derived per-account records under the literal `connetto-device-key`. A store scoped to one account would have nobody to construct it for. `KeyringStore` in `crates/connetto-client/src/auth.rs` used to carry `(service, user)` and now carries the service alone, composing its entry the way `KeyringKeyStore` beside it always did. The browser refresh store keeps one row per account, `connetto_refresh (account, token)`, rather than the single row it held before. Which name a caller passes is a separate question and belongs to R17: today the pre-login literal is `connetto_web::auth::REFRESH_RECORD`.
+
+**Why only the key store awaits.** The browser reaches `IndexedDB` and `SubtleCrypto` through promises that have no synchronous form in a worker. The native implementations therefore wear an awaiting signature over a keychain call that returns immediately, and that call blocks whoever polls it. Bounded rather than hidden: key custody runs when a database is opened or an account is logged out, never per change. The futures carry `MaybeSend` exactly as `Transport`'s do. The refresh-token trait stays synchronous, because neither target needs to await there and forcing symmetry would be a false await on both sides. Only its browser construction is asynchronous, since the device key it opens under comes from the key store.
+
+What the seam buys over the rename is one caller. `crates/connetto-client/tests/secret_stores.rs` and `crates/connetto-web/tests/secret_stores.rs` run the same two exercises from `connetto_core::test_support`, written against the traits alone, against the native and the browser stores.
+
+### The key store
+
+**Built.**
 
 | Method | Purpose |
 |---|---|
@@ -42,22 +59,22 @@ The key survives logout deliberately. It is scoped per device rather than per se
 | `store(&self, name: &str, key: &ReplicaKey)` | Persist `key` under `name` |
 | `clear(&self, name: &str)` | Remove the record, which crypto-shreds the replica |
 
-`name` is the same value `replica_db_name` produced for the replica file, so two identities on one device hold separate records and a wipe of one cannot reach the other.
+`name` is the same value `replica_db_name` produced for the replica file, so two identities on one device hold separate records and a wipe of one cannot reach the other. A literal name is equally valid and is how the browser addresses the device key it needs before any identity exists.
 
-The concrete implementation shipped for production is `connetto_client::auth::KeyringKeyStore` in `crates/connetto-client/src/auth.rs`, which uses OS secure storage: Keychain on macOS, Credential Manager on Windows, and the kernel keyutils keyring on Linux. On Linux the key lives in the session keyring. That keyring survives logout but not a reboot, so a rebooted Linux device reports `ClientError::ReplicaKeyMissing` and recovers by wiping and re-syncing.
+The concrete implementation shipped for production on native is `connetto_client::auth::KeyringKeyStore` in `crates/connetto-client/src/auth.rs`, which uses OS secure storage: Keychain on macOS, Credential Manager on Windows, and the kernel keyutils keyring on Linux. On Linux the key lives in the session keyring. That keyring survives logout but not a reboot, so a rebooted Linux device reports `ClientError::ReplicaKeyMissing` and recovers by wiping and re-syncing.
 
 The test implementation is `connetto_client::auth::MemoryKeyStore`, an in-memory `HashMap`.
 
 ### Browser key store
 
-**Built.** `connetto_web::auth::ReplicaKeyStore` in `crates/connetto-web/src/auth.rs` wraps an `IndexedDB` database named `connetto-key-store`. It has two object stores:
+**Built.** `connetto_web::auth::IdbKeyStore` in `crates/connetto-web/src/auth.rs` wraps an `IndexedDB` database named `connetto-key-store`. It has two object stores:
 
 | Store | Contents |
 |---|---|
 | `kek` | One non-extractable AES-GCM-256 key-encryption key (KEK), stored as a structured-cloneable `CryptoKey` |
 | `wrapped` | Per-identity records, each keyed by the replica name, each holding a 12-byte AES-GCM IV followed by the AES-GCM ciphertext of the raw replica key |
 
-The KEK is generated once per browser profile, marked non-extractable, and never exported. Script-level reads of the `wrapped` store yield opaque ciphertext because the KEK bytes are unreachable by script. The methods are `load`, `save`, and `clear` (named `save` rather than `store`, unlike the native trait).
+The KEK is generated once per browser profile, marked non-extractable, and never exported. Script-level reads of the `wrapped` store yield opaque ciphertext because the KEK bytes are unreachable by script.
 
 The scope of protection is documented on the type: this defends against script-level exfiltration and an off-device copy of the `IndexedDB` contents. It does not defend against a resident attacker who can call `load` directly, and does not necessarily defend against an attacker holding the full browser profile directory, which includes both the IDB files and the backing storage for non-extractable keys.
 
@@ -65,7 +82,7 @@ The scope of protection is documented on the type: this defends against script-l
 
 **Decided, and partly pending measurement.** Every locally stored secret sits behind a user-verification gate. Opening the app presents a fingerprint, a face check or a device passcode once, and both the replica and the stored refresh token become readable. This is the pattern a banking application uses, and it is worth being precise about what it is not: the server verifies nothing, sees nothing, and is not involved. The gate protects secrets at rest on the device. Session lifetime, revocation and the identity provider's authority are governed entirely by `11-authentication.md` and are untouched by it.
 
-**Both secrets are covered, not one.** Gating either alone leaves a route to the same data, because whoever can use the refresh token can open a session and pull the data down again, and whoever can open the replica already has it. In the browser this costs nothing extra: the two are already wrapped by a single key-encryption key, since the refresh store's device key is itself a record in `ReplicaKeyStore`. On native they are independent keychain items and are gated separately.
+**Both secrets are covered, not one.** Gating either alone leaves a route to the same data, because whoever can use the refresh token can open a session and pull the data down again, and whoever can open the replica already has it. In the browser this costs nothing extra: the two are already wrapped by a single key-encryption key, since the refresh store's device key is itself a record in `IdbKeyStore`. On native they are independent keychain items and are gated separately.
 
 **One unlock lasts as long as the process. Decided.** The derived key is held in memory while the application runs and a fresh start prompts again. No inactivity timeout and no per-operation prompt: the operating system's own screen lock is the right control for an unattended machine, and connetto has no notion of a sensitive operation to hang a second prompt on.
 
@@ -116,14 +133,16 @@ The reason the reporting surface carries must nonetheless distinguish the two, b
 
 **Built.** `provision_replica_key` is defined in two places, one per target, with the same provision-once semantics: a cached key always wins and is never overwritten, so a second login cannot silently re-key a replica and strand its contents. Only when nothing is cached is a fresh key minted from the device RNG and written through.
 
-- Native: `connetto_client::auth::provision_replica_key(store: &dyn ReplicaKeyStore, name: &str)` in `crates/connetto-client/src/auth.rs`
-- Browser: `connetto_web::auth::provision_replica_key(store: &ReplicaKeyStore, name: &str)` in `crates/connetto-web/src/auth.rs`
+- Native: `connetto_client::auth::provision_replica_key<S: ReplicaKeyStore>(store: &S, name: &str)` in `crates/connetto-client/src/auth.rs`
+- Browser: `connetto_web::auth::provision_replica_key<S: ReplicaKeyStore>(store: &S, name: &str)` in `crates/connetto-web/src/auth.rs`
+
+Both are generic over the shared trait and each awaits. They stay one per target rather than moving to `connetto-core` beside the trait, because minting needs an entropy source and `ReplicaKey` deliberately carries none, which is what keeps the browser build free of one.
 
 Call `provision_replica_key` only for a replica that does not yet exist. For one already on disk, call `ReplicaKeyStore::load` and pass the result to `Replica::encrypted_file`. Minting for an existing replica returns a key that decrypts nothing.
 
 ### The device key (browser only)
 
-**Built.** The browser `RefreshStore` must be readable before any identity is known, because the identity is what the refresh token resolves to. A per-replica key cannot be used here because the replica name is derived from the identity. `connetto_web::storage::device_key` in `crates/connetto-web/src/storage.rs` provisions a separate record in the `ReplicaKeyStore` under the literal constant `"connetto-device-key"`, which a derived name can never collide with. The device key wraps the `RefreshStore`'s SQLite pages with the same AES-256-CBC codec the replica uses.
+**Built.** The browser `RefreshStore` must be readable before any identity is known, because the identity is what the refresh token resolves to. A per-replica key cannot be used here because the replica name is derived from the identity. `connetto_web::storage::device_key` in `crates/connetto-web/src/storage.rs` provisions a separate record in the browser key store under the literal constant `"connetto-device-key"`, which a derived name can never collide with. The device key wraps the `RefreshStore`'s SQLite pages with the same AES-256-CBC codec the replica uses.
 
 ---
 
@@ -219,7 +238,7 @@ The replica filename is `prefix-sha256(canonical(user_id))` truncated to 128 bit
 
 ## No open decisions
 
-Everything this chapter covers is built and decided. The anonymous-access and adoption work in phase E6 introduces no new encryption decisions: decision 1 of that set (the unauthenticated replica is encrypted under a device-scoped key) was built in E5 and the `boot_db_worker` path that provisions it is already in place.
+Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07, so its record under "Key custody" now states what is built rather than what was chosen. Two items remain decided rather than built, and neither was the item this paragraph used to name: R21, which moves the native side onto the browser's page codec, and the user-verification gate, which additionally waits on the measurement `docs/webauthn-prf-probe-spec.md` specifies. The anonymous-access and adoption work in phase E6 introduces no new encryption decisions, since decision 1 of that set (the unauthenticated replica is encrypted under a device-scoped key) was built in E5 and the `boot_db_worker` path that provisions it is already in place.
 
 ---
 

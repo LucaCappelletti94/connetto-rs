@@ -29,8 +29,9 @@ use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
 use wasm_bindgen::JsValue;
 
-use crate::auth::{AuthError, ReplicaKeyStore};
+use crate::auth::AuthError;
 use connetto_client::cipher::cipher_url;
+use connetto_core::traits::ReplicaKeyStore;
 
 /// The worker's SQLite storage backend.
 ///
@@ -182,13 +183,16 @@ pub enum WipeError {
 /// [`WipeError::Unsynced`] when unsynced writes remain and `force` is false,
 /// [`WipeError::KeyStore`] when the record cannot be cleared, or
 /// [`WipeError::Storage`] when the delete fails.
-pub async fn wipe_replica(
+pub async fn wipe_replica<S>(
     storage: &ReplicaStorage,
-    key_store: &ReplicaKeyStore,
+    key_store: &S,
     name: &str,
     unsynced: &[u64],
     force: bool,
-) -> Result<(), WipeError> {
+) -> Result<(), WipeError>
+where
+    S: ReplicaKeyStore<Error = AuthError>,
+{
     if !unsynced.is_empty() && !force {
         return Err(WipeError::Unsynced(unsynced.to_vec()));
     }
@@ -219,7 +223,10 @@ const DEVICE_KEY_RECORD: &str = "connetto-device-key";
 ///
 /// [`AuthError::Store`] if the key store cannot be read or written, or
 /// [`AuthError::Context`] if the platform RNG fails.
-pub async fn device_key(key_store: &ReplicaKeyStore) -> Result<ReplicaKey, AuthError> {
+pub async fn device_key<S>(key_store: &S) -> Result<ReplicaKey, AuthError>
+where
+    S: ReplicaKeyStore<Error = AuthError>,
+{
     crate::auth::provision_replica_key(key_store, DEVICE_KEY_RECORD).await
 }
 
@@ -233,7 +240,10 @@ pub async fn device_key(key_store: &ReplicaKeyStore) -> Result<ReplicaKey, AuthE
 /// # Errors
 ///
 /// [`AuthError::Store`] if the key store cannot be cleared.
-pub async fn clear_device_key(key_store: &ReplicaKeyStore) -> Result<(), AuthError> {
+pub async fn clear_device_key<S>(key_store: &S) -> Result<(), AuthError>
+where
+    S: ReplicaKeyStore<Error = AuthError>,
+{
     key_store.clear(DEVICE_KEY_RECORD).await
 }
 

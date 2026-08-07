@@ -8,7 +8,8 @@
 //! is wrapped rather than the raw key.
 
 use connetto_core::ReplicaKey;
-use connetto_web::auth::{ReplicaKeyStore, provision_replica_key};
+use connetto_core::traits::ReplicaKeyStore as _;
+use connetto_web::auth::{IdbKeyStore, provision_replica_key};
 use indexed_db_futures::database::Database as IdbDatabase;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::query_source::QuerySource;
@@ -33,11 +34,11 @@ fn name(test: &str) -> String {
 
 #[wasm_bindgen_test]
 async fn a_saved_key_loads_back() {
-    let store = ReplicaKeyStore::open().await.expect("open the key store");
+    let store = IdbKeyStore::open().await.expect("open the key store");
     let record = name("roundtrip");
     let key = key_from_byte(0x5a);
 
-    store.save(&record, &key).await.expect("save");
+    store.store(&record, &key).await.expect("save");
     let loaded = store.load(&record).await.expect("load").expect("a key");
 
     assert_eq!(loaded, key);
@@ -45,7 +46,7 @@ async fn a_saved_key_loads_back() {
 
 #[wasm_bindgen_test]
 async fn an_absent_record_loads_as_nothing() {
-    let store = ReplicaKeyStore::open().await.expect("open the key store");
+    let store = IdbKeyStore::open().await.expect("open the key store");
     assert_eq!(
         store.load(&name("never-written")).await.expect("load"),
         None,
@@ -59,15 +60,15 @@ async fn a_cold_reopen_reads_the_key_back() {
     let key = key_from_byte(0x33);
 
     {
-        let store = ReplicaKeyStore::open().await.expect("open the key store");
-        store.save(&record, &key).await.expect("save");
+        let store = IdbKeyStore::open().await.expect("open the key store");
+        store.store(&record, &key).await.expect("save");
     }
 
     // A fresh handle, as a new worker generation gets: the wrapping key has to
     // be recovered from IndexedDB rather than regenerated, or this returns a
     // different key or fails to decrypt. This is the offline property, the
     // replica opens with no credential and no network.
-    let reopened = ReplicaKeyStore::open().await.expect("reopen the key store");
+    let reopened = IdbKeyStore::open().await.expect("reopen the key store");
     let loaded = reopened.load(&record).await.expect("load").expect("a key");
 
     assert_eq!(loaded, key, "the key survives a cold reopen");
@@ -75,15 +76,15 @@ async fn a_cold_reopen_reads_the_key_back() {
 
 #[wasm_bindgen_test]
 async fn keys_are_isolated_per_record_and_a_clear_shreds_only_one() {
-    let store = ReplicaKeyStore::open().await.expect("open the key store");
+    let store = IdbKeyStore::open().await.expect("open the key store");
     let alice = name("alice");
     let bob = name("bob");
 
     store
-        .save(&alice, &key_from_byte(0x11))
+        .store(&alice, &key_from_byte(0x11))
         .await
         .expect("save");
-    store.save(&bob, &key_from_byte(0x22)).await.expect("save");
+    store.store(&bob, &key_from_byte(0x22)).await.expect("save");
 
     assert_eq!(
         store.load(&alice).await.expect("load"),
@@ -117,8 +118,8 @@ async fn what_lands_in_indexeddb_is_wrapped_not_the_raw_key() {
     }
     let key = ReplicaKey::from_bytes(bytes);
 
-    let store = ReplicaKeyStore::open().await.expect("open the key store");
-    store.save(&record, &key).await.expect("save");
+    let store = IdbKeyStore::open().await.expect("open the key store");
+    store.store(&record, &key).await.expect("save");
 
     let stored = read_raw_record(&record).await;
 
@@ -144,7 +145,7 @@ async fn what_lands_in_indexeddb_is_wrapped_not_the_raw_key() {
 
 #[wasm_bindgen_test]
 async fn provision_once_mints_then_prefers_the_cached_key() {
-    let store = ReplicaKeyStore::open().await.expect("open the key store");
+    let store = IdbKeyStore::open().await.expect("open the key store");
     let record = name("provision-once");
 
     // First sight: nothing cached, so a key is minted in the worker and written

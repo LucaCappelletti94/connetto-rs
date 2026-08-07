@@ -13,7 +13,7 @@
 //! `MaybeSend` IS `Send`.
 
 use crate::{
-    SessionId,
+    ReplicaKey, SessionId,
     auth::Subject,
     cursor::Cursor,
     messages::{BulkMessage, ControlMessage, Grant},
@@ -143,6 +143,99 @@ pub trait Store {
 
     /// Persist a fresh session token issued by the server.
     async fn set_session_token(&mut self, token: String) -> Result<(), Self::Error>;
+}
+
+/// Where a device persists its rotating refresh token between runs.
+///
+/// Both targets implement this: an OS keyring natively, an encrypted `SQLite`
+/// database in the browser. Neither needs to await, so this stays synchronous
+/// while [`ReplicaKeyStore`] does not.
+///
+/// Every method names the account whose token it addresses. The store itself is
+/// therefore not scoped to anybody, which is what the browser bootstrap
+/// requires: the refresh token is what reveals the account, so something has to
+/// be readable before any account is known, and a store constructed for an
+/// account would have nobody to construct it for.
+pub trait RefreshTokenStore {
+    /// Store-specific error.
+    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
+
+    /// The token stored for `account`, or `None` when none was stored.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be read.
+    fn load(&self, account: &str) -> Result<Option<String>, Self::Error>;
+
+    /// Persist `token` for `account`, replacing any prior one.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be written.
+    fn store(&self, account: &str, token: &str) -> Result<(), Self::Error>;
+
+    /// Remove the token stored for `account`, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be cleared.
+    fn clear(&self, account: &str) -> Result<(), Self::Error>;
+}
+
+/// Where a device caches the per-replica encryption keys it minted.
+///
+/// Both targets implement this: an OS keyring natively, `IndexedDB` plus a
+/// non-extractable wrapping key in the browser. It awaits because the browser
+/// half has to, reaching `IndexedDB` and `SubtleCrypto` through promises that
+/// have no synchronous form in a worker. The native half therefore wears an
+/// awaiting signature over a keychain call that returns immediately, and that
+/// call blocks whoever polls it. Bounded rather than hidden: key custody runs
+/// when a database is opened or an account is logged out, never per change.
+///
+/// The futures carry [`MaybeSend`] for the same reason [`Transport`]'s do, so a
+/// native caller can hold one across a spawn while a browser one holds `JsValue`
+/// state that cannot be `Send`.
+///
+/// `name` is the record this device holds for one replica, the same value
+/// `replica_db_name` produced for the replica file, so two identities on one
+/// device keep separate keys and a wipe of one cannot reach the other. A literal
+/// name is equally valid and is how the browser addresses the device key it
+/// needs before any identity exists.
+pub trait ReplicaKeyStore {
+    /// Store-specific error.
+    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
+
+    /// The cached key for `name`, or `None` when none was ever stored here.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be read.
+    fn load(
+        &self,
+        name: &str,
+    ) -> impl core::future::Future<Output = Result<Option<ReplicaKey>, Self::Error>> + MaybeSend;
+
+    /// Persist `key` under `name`, replacing any prior value.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be written.
+    fn store(
+        &self,
+        name: &str,
+        key: &ReplicaKey,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
+
+    /// Remove the cached key for `name`, if any. This is the crypto-shred half
+    /// of a data wipe: without the key the replica ciphertext is inert.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be cleared.
+    fn clear(
+        &self,
+        name: &str,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
 /// Content-addressed file chunk store (see `docs/architecture/07-file-sync.md`).

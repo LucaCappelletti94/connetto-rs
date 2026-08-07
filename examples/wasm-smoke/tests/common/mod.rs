@@ -14,7 +14,8 @@ use connetto_wasm_smoke::workers::{
     DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, FRONTEND_DB_NAME,
 };
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, LoginMessage, RefreshStore, ReplicaKeyStore, WorkerAuthConfig,
+    Acquired, BrowserAuthenticator, IdbKeyStore, LoginMessage, REFRESH_RECORD, RefreshStore,
+    WorkerAuthConfig,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -148,7 +149,7 @@ fn install_the_tab() -> Rc<Cell<u32>> {
 /// Requires the auth server to be running at `AUTH_BASE`.
 pub async fn mint_token() -> String {
     let storage = connetto_web::storage::ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     let device = connetto_web::storage::device_key(&keys)
         .await
         .expect("device key");
@@ -160,7 +161,7 @@ pub async fn mint_token() -> String {
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");
     let store = RefreshStore::open(&storage.db_url(&db_name), &device).expect("open refresh store");
-    let authenticator = BrowserAuthenticator::new(auth_config());
+    let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
     let pending = match authenticator
         .acquire::<String>(&store)
         .await

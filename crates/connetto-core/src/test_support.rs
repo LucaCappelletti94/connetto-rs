@@ -248,3 +248,122 @@ impl Transport for FakeTransport {
         Ok(())
     }
 }
+
+/// Two accounts on one device, driven through a
+/// [`RefreshTokenStore`](crate::traits::RefreshTokenStore) by name
+/// alone.
+///
+/// One caller written against the trait rather than against any store, run
+/// against every implementation on both targets. That is the property the seam
+/// exists to buy, and the reason this lives here rather than in either suite.
+///
+/// Both records are cleared on the way in and on the way out, so a durable
+/// store survives a rerun.
+///
+/// # Panics
+///
+/// If either account reads back anything but its own token.
+pub fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
+    store: &S,
+    alice: &str,
+    bob: &str,
+) {
+    assert_ne!(alice, bob, "the two accounts must differ");
+    store.clear(alice).expect("clear alice");
+    store.clear(bob).expect("clear bob");
+
+    assert_eq!(store.load(alice).expect("load alice"), None, "starts empty");
+
+    store.store(alice, "alice-refresh").expect("store alice");
+    assert_eq!(
+        store.load(bob).expect("load bob"),
+        None,
+        "alice's write did not reach bob"
+    );
+
+    store.store(bob, "bob-refresh").expect("store bob");
+    assert_eq!(
+        store.load(alice).expect("load alice").as_deref(),
+        Some("alice-refresh"),
+        "alice reads her own token back"
+    );
+    assert_eq!(
+        store.load(bob).expect("load bob").as_deref(),
+        Some("bob-refresh"),
+        "and bob his"
+    );
+
+    store.clear(alice).expect("clear alice");
+    assert_eq!(
+        store.load(alice).expect("load alice"),
+        None,
+        "the clear removed alice"
+    );
+    assert_eq!(
+        store.load(bob).expect("load bob").as_deref(),
+        Some("bob-refresh"),
+        "and left bob alone"
+    );
+    store.clear(bob).expect("clear bob");
+}
+
+/// Two accounts on one device, driven through a
+/// [`ReplicaKeyStore`](crate::traits::ReplicaKeyStore) by name alone. The
+/// awaiting twin of [`two_accounts_keep_their_own_token`], and the same
+/// property.
+///
+/// # Panics
+///
+/// If either record reads back anything but its own key.
+pub async fn two_accounts_keep_their_own_key<S: crate::traits::ReplicaKeyStore>(
+    store: &S,
+    alice: &str,
+    bob: &str,
+) {
+    assert_ne!(alice, bob, "the two records must differ");
+    let alice_key = ReplicaKey::from_bytes([0xa1; ReplicaKey::LEN]);
+    let bob_key = ReplicaKey::from_bytes([0xb2; ReplicaKey::LEN]);
+    store.clear(alice).await.expect("clear alice");
+    store.clear(bob).await.expect("clear bob");
+
+    assert_eq!(
+        store.load(alice).await.expect("load alice"),
+        None,
+        "starts empty"
+    );
+
+    store
+        .store(alice, &alice_key)
+        .await
+        .expect("store alice's key");
+    assert_eq!(
+        store.load(bob).await.expect("load bob"),
+        None,
+        "alice's write did not reach bob"
+    );
+
+    store.store(bob, &bob_key).await.expect("store bob's key");
+    assert_eq!(
+        store.load(alice).await.expect("load alice"),
+        Some(alice_key),
+        "alice reads her own key back"
+    );
+    assert_eq!(
+        store.load(bob).await.expect("load bob"),
+        Some(bob_key.clone()),
+        "and bob his"
+    );
+
+    store.clear(alice).await.expect("clear alice");
+    assert_eq!(
+        store.load(alice).await.expect("load alice"),
+        None,
+        "the clear crypto-shredded alice"
+    );
+    assert_eq!(
+        store.load(bob).await.expect("load bob"),
+        Some(bob_key),
+        "and left bob openable"
+    );
+    store.clear(bob).await.expect("clear bob");
+}

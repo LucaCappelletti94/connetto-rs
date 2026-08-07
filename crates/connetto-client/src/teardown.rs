@@ -147,18 +147,22 @@ pub fn purge_replica(
 /// [`PurgeError::KeyStore`] when the record cannot be cleared, or
 /// [`PurgeError::Io`] when a delete fails for any reason but absence.
 #[cfg(feature = "native-auth")]
-pub fn wipe_replica(
+pub async fn wipe_replica<S>(
     db_path: &std::path::Path,
-    key_store: &dyn crate::auth::ReplicaKeyStore,
+    key_store: &S,
     key_name: &str,
     unsynced: &[u64],
     force: bool,
-) -> Result<(), PurgeError> {
+) -> Result<(), PurgeError>
+where
+    S: connetto_core::traits::ReplicaKeyStore,
+{
     if !unsynced.is_empty() && !force {
         return Err(PurgeError::Unsynced(unsynced.to_vec()));
     }
     key_store
         .clear(key_name)
+        .await
         .map_err(|err| PurgeError::KeyStore(err.to_string()))?;
     purge_replica(db_path, unsynced, force)
 }
@@ -195,19 +199,22 @@ pub enum ForgetError {
 /// [`ForgetError::Purge`] if the guard refuses or the wipe fails, or
 /// [`ForgetError::NotRevoked`] if the wipe succeeded but the revoke did not.
 #[cfg(feature = "native-auth")]
-pub async fn forget_device(
+pub async fn forget_device<S>(
     authenticator: &crate::auth::NativeAuthenticator,
     db_path: &std::path::Path,
-    key_store: &dyn crate::auth::ReplicaKeyStore,
+    key_store: &S,
     key_name: &str,
     unsynced: &[u64],
     force: bool,
-) -> Result<(), ForgetError> {
+) -> Result<(), ForgetError>
+where
+    S: connetto_core::traits::ReplicaKeyStore,
+{
     if !unsynced.is_empty() && !force {
         return Err(ForgetError::Purge(PurgeError::Unsynced(unsynced.to_vec())));
     }
     let revoked = authenticator.logout().await;
-    wipe_replica(db_path, key_store, key_name, unsynced, force)?;
+    wipe_replica(db_path, key_store, key_name, unsynced, force).await?;
     revoked.map_err(|err| ForgetError::NotRevoked(err.to_string()))
 }
 

@@ -38,8 +38,9 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::replica_db_name;
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, RefreshStore, ReplicaKeyStore, WorkerAuthConfig,
+    Acquired, BrowserAuthenticator, IdbKeyStore, REFRESH_RECORD, RefreshStore, WorkerAuthConfig,
     provision_replica_key,
 };
 use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key};
@@ -121,7 +122,7 @@ fn config() -> WorkerAuthConfig {
 #[wasm_bindgen_test]
 async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
 
     // Start from nothing, so a rerun in the same origin is not resuming an earlier
     // session's credential.
@@ -133,7 +134,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 
     let store =
         RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("open the refresh store");
-    let authenticator = BrowserAuthenticator::new(config());
+    let authenticator = BrowserAuthenticator::new(config(), REFRESH_RECORD);
 
     // Nothing is stored, so there is nothing to refresh from and the worker asks
     // for an interactive login.
@@ -172,7 +173,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         "and the identity the provider asserted"
     );
     let first_refresh = store
-        .load()
+        .load(REFRESH_RECORD)
         .expect("load")
         .expect("the refresh token is persisted");
 
@@ -190,7 +191,10 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         refreshed.user_id, session.user_id,
         "the identity is continuous across a refresh"
     );
-    let rotated = store.load().expect("load").expect("a refresh token");
+    let rotated = store
+        .load(REFRESH_RECORD)
+        .expect("load")
+        .expect("a refresh token");
     assert_ne!(rotated, first_refresh, "the refresh token rotated");
 
     // The identity names its own replica, and the key for it is minted on this
@@ -221,16 +225,19 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 
     // Keep a copy of the live credential, so the revoke can be observed rather
     // than inferred from the local clear.
-    let live_refresh = store.load().expect("load").expect("a refresh token");
+    let live_refresh = store
+        .load(REFRESH_RECORD)
+        .expect("load")
+        .expect("a refresh token");
     let revoked_store =
         RefreshStore::open(&storage.db_url(REVOKED_DB), &device).expect("open the second store");
     revoked_store
-        .save(&live_refresh)
+        .store(REFRESH_RECORD, &live_refresh)
         .expect("seed the copy before the logout");
     // Without this the revoke assertion below could pass for the wrong reason: an
     // empty store also yields `NeedLogin`, which would look like a refusal.
     assert_eq!(
-        revoked_store.load().expect("load").as_deref(),
+        revoked_store.load(REFRESH_RECORD).expect("load").as_deref(),
         Some(live_refresh.as_str()),
         "the copy really holds the credential that is about to be revoked"
     );
@@ -241,7 +248,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         .await
         .expect("logout, including the server revoke");
     assert_eq!(
-        store.load().expect("load"),
+        store.load(REFRESH_RECORD).expect("load"),
         None,
         "the local credential is cleared"
     );

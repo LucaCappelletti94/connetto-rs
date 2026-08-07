@@ -30,8 +30,9 @@
 //! then observes its own rows echoed back over CDC.
 
 use anyhow::{Context, Result, anyhow};
-use connetto_client::auth::{KeyringKeyStore, ReplicaKeyStore, provision_replica_key};
+use connetto_client::auth::{KeyringKeyStore, provision_replica_key};
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
 use tokio::net::TcpStream;
@@ -106,10 +107,12 @@ async fn main() -> Result<()> {
     let keys = KeyringKeyStore::new(KEYRING_SERVICE);
     let resolved = if std::path::Path::new(&db_path).exists() {
         keys.load(&db_path)
+            .await
             .with_context(|| format!("reading the replica key for {db_path}"))?
     } else {
         Some(
             provision_replica_key(&keys, &db_path)
+                .await
                 .with_context(|| format!("minting the replica key for {db_path}"))?,
         )
     };

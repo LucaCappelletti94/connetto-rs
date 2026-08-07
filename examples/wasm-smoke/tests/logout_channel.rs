@@ -12,9 +12,10 @@
 mod common;
 
 use common::{REFRESH_DB, auth_config, play_the_tab, worker_config};
+use connetto_core::traits::RefreshTokenStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    LogoutOutcome, RefreshStore, ReplicaKeyStore, request_logout, request_unsynced,
+    IdbKeyStore, LogoutOutcome, REFRESH_RECORD, RefreshStore, request_logout, request_unsynced,
 };
 use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key, take_pending_wipes};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -25,7 +26,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 #[wasm_bindgen_test]
 async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
     take_pending_wipes().await.expect("drain any earlier wipes");
     clear_device_key(&keys).await.expect("clear the device key");
     storage
@@ -64,7 +65,10 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
     let store =
         RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("the store still opens");
     assert!(
-        store.load().expect("read the store").is_none(),
+        store
+            .load(REFRESH_RECORD)
+            .expect("read the store")
+            .is_none(),
         "the credential is gone, so the next boot cannot refresh silently"
     );
     drop(store);

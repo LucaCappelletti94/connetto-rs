@@ -93,9 +93,11 @@ mod common;
 
 use common::{REFRESH_DB, auth_config, play_the_tab, walk_the_login, worker_config};
 use connetto_client::replica_db_name;
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, RefreshStore, ReplicaKeyStore, provision_replica_key,
+    Acquired, BrowserAuthenticator, IdbKeyStore, REFRESH_RECORD, RefreshStore,
+    provision_replica_key,
 };
 use connetto_web::storage::{
     ReplicaStorage, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
@@ -108,7 +110,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 #[wasm_bindgen_test]
 async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let storage = ReplicaStorage::install().await;
-    let keys = ReplicaKeyStore::open().await.expect("open the key store");
+    let keys = IdbKeyStore::open().await.expect("open the key store");
 
     // Start from nothing, so a rerun is not resuming an earlier session.
     take_pending_wipes().await.expect("drain any earlier wipes");
@@ -125,7 +127,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let user_id = {
         let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device)
             .expect("open the refresh store");
-        let authenticator = BrowserAuthenticator::new(auth_config());
+        let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
         let pending = match authenticator
             .acquire::<String>(&store)
             .await

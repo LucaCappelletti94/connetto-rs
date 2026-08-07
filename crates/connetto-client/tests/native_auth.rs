@@ -19,10 +19,9 @@ use std::sync::Arc;
 
 use connetto_client::{
     AcquiredSession, BrowserOpener, ClientError, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, RefreshTokenStore, ReplicaKeyStore, provision_replica_key,
-    replica_db_name,
+    NativeAuthenticator, provision_replica_key, replica_db_name,
 };
-use connetto_core::traits::{GrantRefused, HandshakeAuthority};
+use connetto_core::traits::{GrantRefused, HandshakeAuthority, RefreshTokenStore, ReplicaKeyStore};
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityResolver,
     InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard,
@@ -237,13 +236,20 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
 /// Drive the full loopback login against `base` as the provider named
 /// `subject`, yielding the session with its typed id.
 async fn login_as(base: &str, subject: &str) -> AcquiredSession<Uuid> {
-    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
-    NativeAuthenticator::new(base.to_owned(), subject, store)
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    NativeAuthenticator::new(base.to_owned(), subject, store, ACCOUNT)
         .with_browser_opener(fake_browser())
         .login::<Uuid>()
         .await
         .expect("typed login")
 }
+
+/// The refresh store a [`NativeAuthenticator`] holds, spelled once.
+type SharedRefresh = Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>;
+
+/// The record these tests keep their credential under. A literal rather than an
+/// identity, because the refresh token is what reveals the identity.
+const ACCOUNT: &str = "refresh";
 
 /// A fake browser: given connetto's login URL, walk the real OIDC redirect
 /// chain until the authenticator's loopback listener receives the code. The
@@ -279,9 +285,9 @@ fn fake_browser() -> BrowserOpener {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_login_refreshes_and_silently_reacquires() {
     let (base, _idp) = spawn_auth_server().await;
-    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(
-        NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store))
+        NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store), ACCOUNT)
             .with_browser_opener(fake_browser()),
     );
 
@@ -294,7 +300,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
         login.session_expires_at > std::time::SystemTime::now(),
         "session expiry is in the future"
     );
-    let first_refresh = store.load().expect("load").expect("refresh stored");
+    let first_refresh = store.load(ACCOUNT).expect("load").expect("refresh stored");
 
     // A silent refresh rotates the stored refresh token and keeps the identity.
     let refreshed = authenticator
@@ -303,7 +309,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
         .expect("refresh");
     assert!(!refreshed.access_token.is_empty(), "refreshed access token");
     assert_eq!(refreshed.user_id, login.user_id, "identity is continuous");
-    let second_refresh = store.load().expect("load").expect("refresh stored");
+    let second_refresh = store.load(ACCOUNT).expect("load").expect("refresh stored");
     assert_ne!(first_refresh, second_refresh, "refresh token rotated");
 
     // The token source refreshes without a browser, yielding the raw token.
@@ -317,7 +323,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
     // never opening the browser (the opener panics if called).
     let panicking: BrowserOpener =
         Arc::new(|_url: &str| panic!("browser opened during silent reacquire"));
-    let silent = NativeAuthenticator::new(base, "mock-idp", Arc::clone(&store))
+    let silent = NativeAuthenticator::new(base, "mock-idp", Arc::clone(&store), ACCOUNT)
         .with_browser_opener(panicking);
     let session = silent.acquire::<String>().await.expect("silent acquire");
     assert!(
@@ -374,10 +380,11 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     let alice_replica = replica_db_name("app.db", &alice.user_id).expect("alice replica");
 
     // First sight of this replica: a key is minted locally and written through.
-    let provisioned =
-        provision_replica_key(&keys, &alice_replica).expect("a key is minted on first login");
+    let provisioned = provision_replica_key(&keys, &alice_replica)
+        .await
+        .expect("a key is minted on first login");
     assert_eq!(
-        keys.load(&alice_replica).expect("load"),
+        keys.load(&alice_replica).await.expect("load"),
         Some(provisioned.clone()),
         "the minted key is cached for a later cold start",
     );
@@ -390,7 +397,9 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
         replica_db_name("app.db", &again.user_id).expect("replica"),
         alice_replica,
     );
-    let effective = provision_replica_key(&keys, &alice_replica).expect("resolve");
+    let effective = provision_replica_key(&keys, &alice_replica)
+        .await
+        .expect("resolve");
     assert_eq!(
         effective, provisioned,
         "the cached key survives a second login",
@@ -400,6 +409,7 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     // replica opens with no valid credential and no network.
     let offline = keys
         .load(&alice_replica)
+        .await
         .expect("load")
         .expect("the cached key reads back");
     assert_eq!(offline, provisioned, "an offline cold start reads it back");
@@ -408,10 +418,12 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     // record, so neither can read the other's replica.
     let bob = login_as(&base, "bob").await;
     let bob_replica = replica_db_name("app.db", &bob.user_id).expect("bob replica");
-    let bob_key = provision_replica_key(&keys, &bob_replica).expect("bob is provisioned too");
+    let bob_key = provision_replica_key(&keys, &bob_replica)
+        .await
+        .expect("bob is provisioned too");
     assert_ne!(bob_key, provisioned, "identities do not share a key");
     assert_eq!(
-        keys.load(&alice_replica).expect("load"),
+        keys.load(&alice_replica).await.expect("load"),
         Some(provisioned),
         "bob's login leaves alice's cached key untouched",
     );
@@ -426,13 +438,14 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     let (base, service, _idp) = spawn_auth_server_with_service().await;
-    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
-    let authenticator = NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store))
-        .with_browser_opener(fake_browser());
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let authenticator =
+        NativeAuthenticator::new(base.clone(), "mock-idp", Arc::clone(&store), ACCOUNT)
+            .with_browser_opener(fake_browser());
 
     let login = authenticator.login::<String>().await.expect("login");
     let refresh = store
-        .load()
+        .load(ACCOUNT)
         .expect("load")
         .expect("the refresh token is stored");
 
@@ -448,7 +461,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 
     // Local state is gone, so nothing on this device can silently reacquire.
     assert_eq!(
-        store.load().expect("load"),
+        store.load(ACCOUNT).expect("load"),
         None,
         "the refresh token is cleared",
     );
@@ -468,10 +481,11 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     // A copy of the refresh token kept anywhere else is dead too, so the session
     // cannot be resurrected into a fresh access token.
     let kept = MemoryRefreshStore::default();
-    kept.store(&refresh).expect("seed the copy");
-    let resurrect = NativeAuthenticator::new(base, "mock-idp", Arc::new(kept)).with_browser_opener(
-        Arc::new(|_url: &str| panic!("no browser during a refresh attempt")),
-    );
+    kept.store(ACCOUNT, &refresh).expect("seed the copy");
+    let resurrect = NativeAuthenticator::new(base, "mock-idp", Arc::new(kept), ACCOUNT)
+        .with_browser_opener(Arc::new(|_url: &str| {
+            panic!("no browser during a refresh attempt")
+        }));
     match resurrect.refresh_access::<String>().await {
         Err(ClientError::Auth(_)) => {}
         Err(other) => panic!("expected a rejected credential, got {other:?}"),
@@ -491,12 +505,18 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 /// expires on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed() {
-    let store: Arc<dyn RefreshTokenStore> = Arc::new(MemoryRefreshStore::default());
-    store.store("session-id.secret").expect("seed a credential");
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    store
+        .store(ACCOUNT, "session-id.secret")
+        .expect("seed a credential");
     // Port 1 is reserved and nothing listens there, which is this test's stand-in
     // for a device with no connectivity.
-    let authenticator =
-        NativeAuthenticator::new("http://127.0.0.1:1", "mock-idp", Arc::clone(&store));
+    let authenticator = NativeAuthenticator::new(
+        "http://127.0.0.1:1",
+        "mock-idp",
+        Arc::clone(&store),
+        ACCOUNT,
+    );
 
     match authenticator.logout().await {
         Err(ClientError::Transport(_)) => {}
@@ -504,7 +524,7 @@ async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed()
         Ok(()) => panic!("an unreachable server must not report a successful revoke"),
     }
     assert_eq!(
-        store.load().expect("load"),
+        store.load(ACCOUNT).expect("load"),
         None,
         "the credential is cleared even when the revoke never landed",
     );
@@ -513,15 +533,15 @@ async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed()
 #[test]
 fn memory_refresh_store_round_trips() {
     let store = MemoryRefreshStore::default();
-    assert!(store.load().unwrap().is_none(), "empty at first");
-    store.store("refresh-abc").unwrap();
-    assert_eq!(store.load().unwrap().as_deref(), Some("refresh-abc"));
-    store.store("refresh-def").unwrap();
+    assert!(store.load(ACCOUNT).unwrap().is_none(), "empty at first");
+    store.store(ACCOUNT, "refresh-abc").unwrap();
+    assert_eq!(store.load(ACCOUNT).unwrap().as_deref(), Some("refresh-abc"));
+    store.store(ACCOUNT, "refresh-def").unwrap();
     assert_eq!(
-        store.load().unwrap().as_deref(),
+        store.load(ACCOUNT).unwrap().as_deref(),
         Some("refresh-def"),
         "replaces"
     );
-    store.clear().unwrap();
-    assert!(store.load().unwrap().is_none(), "cleared");
+    store.clear(ACCOUNT).unwrap();
+    assert!(store.load(ACCOUNT).unwrap().is_none(), "cleared");
 }
