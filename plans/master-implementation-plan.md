@@ -1,6 +1,6 @@
 # Master implementation plan: identity, session, capability, and the change path
 
-This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. The identity half is built: R1, R0, R2, R8, R12, R3, R16 part A, R4, R5a, R35, R13, R38 and R19 are done, and the change path is what remains.
+This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. The identity half is built: R1, R0, R2, R8, R12, R3, R16 (both parts), R4, R5a, R35, R13, R38 and R19 are done, and the change path is what remains.
 
 ## How to read this
 
@@ -73,7 +73,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 10 | ~~R5a~~ **DONE** | Waited on `upstream-subql-visibility-trait.md` landing upstream, which it did at subql `8e9b2df`. Not on rls2fga |
 | 11 | ~~R0 part B, the full measurement~~ **DONE** | Needed R5a's seam to measure through, which landed first |
 | 12 | R5b | Needs `docs/upstream-subql-per-row-visibility.md`, which is underway upstream. R5a, R0 and the rls2fga request are all done |
-| 13 | R16 part B, the fan-out architecture | Blocked on nothing. R0's numbers are in and part A's findings it already had. The bulk frame decision it once had to settle before R3 shipped is settled, recorded under its inputs section |
+| 13 | ~~R16 part B, the fan-out architecture~~ **DONE** | Blocked on nothing once R0's numbers were in, and landed the same day as `docs/architecture/17-fan-out.md` |
 | 14 | R14 | Needs R5b. **Conditional, and half-answered**: R0's lock-wait fraction is zero at both subscriber counts, so that half of the trigger says no. Warranted only if per-event work still grows with subscriber count after R5b |
 | 15 | R6 | Needs R5b, and hard-blocked rather than cost-blocked |
 | 16 | R7 | Needs R6. R4 is done |
@@ -125,7 +125,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R0 part B, full measurement | **DONE** (2026-08-07) | nothing | landed with R5a |
 | R5b service as executor | NOT STARTED | `upstream-subql-per-row-visibility.md`, which is **underway** on subql branch `feat/visibility-from-the-row`. R5a, R0 and the rls2fga request are all done | **yes, subql (per-row), in progress** |
 | R16 part A, fan-out research | **DONE** | nothing | no |
-| R16 part B, the fan-out architecture | NOT STARTED | nothing, R0's numbers are in and the bulk-frame decision is settled, see the section | no |
+| R16 part B, the fan-out architecture | **DONE** (2026-08-07) | nothing | no |
 | R14 dispatch-loop cost | NOT STARTED | R5b, conditional on its rerun of the counter test. R0's lock-wait half already reads no | no |
 | R6 two-check form | NOT STARTED | R5b | inherited |
 | R7 revocation teardown | NOT STARTED | R6, R4 is done | inherited |
@@ -180,7 +180,7 @@ graph TD
   U2b --> R5b
   R5b --> R6[R6 two-check change form]
   R5b --> R14[R14 dispatch-loop cost]
-  R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture]
+  R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture, DONE]
   R0B --> R16
   R0B -.->|conditional: dropped if<br/>the loop is not the ceiling| R14
   R4 --> R7[R7 revocation teardown]
@@ -213,7 +213,7 @@ graph TD
   R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
   classDef done fill:#d7ebd7,stroke:#4a7a4a,color:#1d3b1d
-  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R19,R28,R35,R36,R38 done
+  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R19,R28,R35,R36,R38 done
 ```
 
 ## Upstream dependencies
@@ -936,9 +936,9 @@ The counter test passes. A policy with no translation and no supplied mapping re
 
 ## R16: how fan-out should scale, researched then designed
 
-**Status.** Part A **DONE**. Part B NOT STARTED.
+**Status.** Part A **DONE**. Part B **DONE** (2026-08-07).
 
-**Part B is blocked on nothing, since 2026-08-07.** It was blocked on R0 for the numbers and R0 is done, so the figures part B has to design against are in: 170.0 events per second at ten subscribers and 17.0 at a hundred, an identical 1,700 deliveries per second across both, a materializer lock that waits zero, and roughly 39 bytes copied per subscriber per event on a two-column row. The old coupling to R3 is dissolved: `PROTOCOL_VERSION` is frozen until the first release (cross-cutting checklist), so a pre-release frame change carries no bump, and the bulk frame decision itself is settled below under "Inputs already settled with the maintainer". Part A's finding that a mismatch hard-rejects with no negotiation still matters, but only from the first release onward.
+**The output is `docs/architecture/17-fan-out.md`**, which names the unit of computation as one change event, says what stays proportional to subscriber count and why each of those is acceptable, covers catchup, and lists fifteen named changes with their locations, and one further row confirming nothing goes upstream. Four open items were settled with the maintainer and eight more resolved against the tree, all recorded under "What part B settled with the maintainer". The figures it designs against are R0's: 170.0 events per second at ten subscribers and 17.0 at a hundred, an identical 1,700 deliveries per second across both, a materializer lock that waits zero, and roughly 39 bytes copied per subscriber per event on a two-column row. The old coupling to R3 is dissolved, because `PROTOCOL_VERSION` is frozen until the first release (cross-cutting checklist), so a pre-release frame change carries no bump.
 
 ### Purpose
 
@@ -973,9 +973,35 @@ All four are complete.
 
 ### Steps, part B: the architecture
 
-5. **Draft connetto's own design against those findings**, as an architecture chapter rather than as a phase. Name the unit of computation it chooses and why, and say explicitly what remains proportional to subscriber count and why that is acceptable. Part A pre-answers a good deal of this and finding 5 adds catchup to its scope.
-6. **Say what it costs to get there.** Part A establishes that no upstream change is required for anything on the delivery side, so this step reduces to naming the protocol and materializer changes. The bulk frame layout is the item on R3's clock.
+All three are complete. Part B **DONE**, 2026-08-07.
+
+5. ~~Draft connetto's own design against those findings, as an architecture chapter rather than as a phase.~~ **Done.** `docs/architecture/17-fan-out.md`. The unit of computation is **one change event**, and the socket write is the only work charged per subscriber. What stays proportional is stated with its reason in each case: the socket write (inherent), one verdict entry per watcher (cheap under R5b's tiers 1 and 2, growing under tier 3 and accepted there), one route lookup, and one payload copy until the frame becomes shareable and the transport dependency moves. Catchup is covered, per finding 5.
+6. ~~Say what it costs to get there.~~ **Done.** Fifteen named changes in one table, each marked, spanning `connetto-core`'s codec and bulk messages, the four decoders, the `Transport` trait, the materializer, the session layer, and the oplog. **Nothing upstream**, re-verified against the pinned `subql` revision rather than copied from part A.
 7. ~~Correct or delete the assertion in `08-authorization.md`, and remove the marker.~~ **Done early**, during part A, because part A produced exactly the evidence the correction needed and leaving a known-false sentence marked in a committed chapter served nobody. Both occurrences were corrected, at the decisions list and in "Cost on the change path", and the marker is gone.
+
+### What part B settled with the maintainer, and the corrections it made
+
+Four open items went to the maintainer, and four resolved against the tree instead. Recorded here because a decision that lives only in a chat is a decision lost.
+
+**Settled with the maintainer, 2026-08-07.**
+
+1. **Where the chapter goes: a new chapter plus corrections in the three it contradicts.** `17-fan-out.md` carries the design and the reasoning, and `02-protocol.md` (the bulk-plane row and the frame layout), `06-reconnect.md` (the retention bounds, the stored patch, the catchup step) and `10-subscription-materializer.md` (the fan-out unit, the ownership bullets, the responsibility row) were each corrected in place. Rejected: a chapter with pointers only, which would have left chapter 2's table giving the bulk plane as opaque bytes while the code encodes a struct. Rejected: distributing the content with no chapter, which leaves the argument tying the pieces together with no home.
+2. **A data frame carries a server handle derived from the question.** The subscribe reply maps the client's own name onto it. Rejected: no identifier at all, which needs no mapping and which the receive path would already tolerate, but which makes two subscriptions over one table indistinguishable and so degrades the label the application sees. Rejected: keeping the client-chosen name and declining the whole class of multi-client saving.
+3. **The oplog byte bound ships on by default, and pruning names the bound that fired.** Rejected: off by default, which keeps chapter 6's documented window exactly true at the cost of making the unsafe setting the default one. Rejected: dropping the entry count, which overturns a decision recorded in two places and takes away the bound an operator can reason about against a change rate.
+4. **Both R5b-gated pieces are designed in full**, on the maintainer's condition that neither turns out to depend heavily on its blocker. Neither does, and the reason is the substantive finding below.
+
+**Corrections part B made, each against the tree.**
+
+- **Frame sharing does not wait on R5b's internals.** R5a already fixed the shape: `may_see` takes one row and every watcher and returns one verdict each, so the partition over subscribers exists today, and `Materializer::dispatch` already stamps every `MatchedPatch` with the same per-event cursor. So no permission-class identifier has to be invented, which the sequencing record expected to be the blocker. R5b decides whether sharing **pays**, not whether it can be built.
+- **One copy is not the floor until the transport moves.** `tungstenite` 0.28 does change `Message::Binary` to take `Bytes` (verified, and that version is already in this lock file through `dioxus-devtools`), but it takes one contiguous region, so a per-subscriber header ahead of a shared body still forces a per-subscriber concatenation. Zero copies needs the handle, the shared frame and the bump **together**.
+- **`Arc<[u8]>` does not foreclose the zero-copy send.** `bytes::Bytes::from_owner` takes any `AsRef<[u8]> + Send + 'static` owner without copying (verified in `bytes-1.12.1`, already in the lock), and `Arc<[u8]>` satisfies it. So `connetto-core` never needs a `bytes` dependency.
+- **D2 grows oplog storage on both backends.** `plans/fanout-architecture-decisions.md` expected Postgres storage to fall by writing compressed bytes in place of `serde_json::to_vec(record.event())`. That is D3, which the same document rejects: catchup needs the event for `Materializer::match_row_consumers` and for `EventRow::current`, and only `encode_patch` goes away. The row keeps its event and gains a patch.
+- **The `02-protocol.md` ambiguity was already settled** in `plans/fanout-architecture-decisions.md` under "Decisions taken", where A2 resolves it in favour of a specification the code drifted from. Its own stale "Open items" list said otherwise.
+- **`LivePatch`'s per-subscription cursor is not load-bearing.** The client persists one cursor (`_connetto_meta` is `CHECK (id = 1)`, and every live patch overwrites it whatever its subscription), the handshake carries one, and server-side `Materializer::advance_cursor` writes per `(session, subscription)` into `subql` while connetto calls neither `cursor_for` nor `cursors_for_session`. The only observable effect is the rewind error.
+- **The oplog size question did not belong to `15-replica-retention.md`**, which opens by disclaiming the server oplog. It belongs to `06-reconnect.md`, where it now lives.
+- **No browser client makes the frame split more expensive.** All four decoders are the identical two lines and none inspects the payload. The relay is the only structural reader, and its `patch_tables` decompression is per upstream patch and independent of frame layout.
+
+**One thing part B deliberately did not do.** It wrote no implementation phase. Chapter 17's cost table is what those phases are derived from, and deriving them is the next piece of work rather than part of this one.
 
 ### Inputs already settled with the maintainer, ahead of part B
 
@@ -990,11 +1016,11 @@ The reason recorded at the time was the R3 deadline: a second `PROTOCOL_VERSION`
 
 ### Proof
 
-Part A is proved by the document: every claim about an external system carries a source, and the inherent floor is stated with the reasoning that establishes it. **Met.** Part B is proved by the architecture chapter naming a unit of computation and the changes required to adopt it, at a level of detail an implementation phase could be written from.
+Part A is proved by the document: every claim about an external system carries a source, and the inherent floor is stated with the reasoning that establishes it. **Met.** Part B is proved by the architecture chapter naming a unit of computation and the changes required to adopt it, at a level of detail an implementation phase could be written from. **Met**: `docs/architecture/17-fan-out.md`, with fifteen named changes and their locations.
 
 ### Done when
 
-Part A: the question "does per-event work have to scale with subscriber count" has a sourced answer. **Met, and the answer is no for every layer except the socket write.** Part B: connetto has a written target architecture rather than an assumption.
+Part A: the question "does per-event work have to scale with subscriber count" has a sourced answer. **Met, and the answer is no for every layer except the socket write.** Part B: connetto has a written target architecture rather than an assumption. **Met.**
 
 ### Why this precedes an implementation refactor
 
@@ -1020,8 +1046,8 @@ Today the per-subscriber authorization check dominates them by orders of magnitu
 1. Take the materializer lock **out of the per-subscriber loop.** The loop needs what the lock guards, not the lock, so hoist the read or take a snapshot of what the fan-out consumes before entering the loop.
 2. Stop cloning a `Route` per subscriber. A `Principal` behind a shared reference or a cheap handle is enough for a fan-out that only reads it.
 3. **Stop copying the compressed payload per subscriber.** `Materializer::dispatch` compresses once and then hands every consumer its own `Vec<u8>` through `MatchedPatch::payload_zstd`. A shared immutable handle carries the same bytes to every consumer. **Corrected by R16 part A: this needs no upstream change.** The step previously speculated it "may need the same upstream treatment as the visibility trait". `subql`'s `pgoutput_patchset` already returns an owned `Vec<u8>`, so wrapping it in an `Arc<[u8]>` costs nothing and changes no subql signature. It is a connetto-local API change on the materializer.
-4. **Also corrected by R16 part A: the payload is copied three times per subscriber, not once.** A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload in the encoded frame, and a second copy into the tagged frame. This step removes the first. The other two are removed by the bulk frame layout change, which is R16 part B's. If the two phases land apart, note that this step alone takes three copies to two.
-5. Do nothing else. **Scope is exactly what R0 measured**, and any further optimization needs its own measurement rather than this phase's momentum. In particular, reconnect catchup rebuilds patches per client and is *not* in this scope: R16 part A found it and R16 part B covers it.
+4. **Also corrected by R16 part A: the payload is copied three times per subscriber, not once.** A clone into `MatchedPatch`, a MessagePack re-serialization that embeds the payload in the encoded frame, and a second copy into the tagged frame. This step removes the first. The other two are removed by the bulk frame layout change, **which R16 part B specified and no phase yet builds**, so unless a phase for it is derived first, this step takes three copies to two and that is the expected reading of the counter. See `docs/architecture/17-fan-out.md`, whose copy table gives all three states.
+5. Do nothing else. **Scope is exactly what R0 measured**, and any further optimization needs its own measurement rather than this phase's momentum. In particular, reconnect catchup rebuilds patches per client and is *not* in this scope: R16 part A found it and `docs/architecture/17-fan-out.md` decided it, in the oplog rather than in this loop.
 
 ### Proof
 

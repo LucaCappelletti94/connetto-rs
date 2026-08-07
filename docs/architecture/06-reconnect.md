@@ -66,16 +66,23 @@ Rows deleted from the underlying table are retained in the oplog as tombstones (
 
 **Decided (R6).** The catchup path carries the same two-version authorization obligation as the live path: the oplog must carry whatever those checks need, or the confidentiality leak moves to reconnect. What exactly the oplog must carry is an open question recorded in `08-authorization.md`.
 
+**Decided (R16 part B): the entry also carries the prepared compressed patch, beside the event.** Catchup rebuilds it today, calling `Materializer::encode_patch` per record per subscription for bytes already built when the change was live, which no comparable system does. Storing it at append time removes the rebuild. **The event stays**, because catchup needs it twice for something else: `Materializer::match_row_consumers` decides whether the subscription matches, and `EventRow::current` supplies the post-image for the visibility question. So the entry grows by the patch on both the in-memory and the Postgres backend. `17-fan-out.md` owns the reasoning and the lifetime consequence, which is that a subscription must outlive its socket for a stored patch to exist at all.
+
 ### Retention window
 
-The oplog is a ring buffer with a configurable retention window, expressed as:
-- Maximum number of entries, **or**
-- Maximum age (time-based), **or**
-- Both (whichever limit is hit first).
+The oplog is a ring buffer with a configurable retention window, bounded three ways, whichever is hit first:
 
-Entries older than the window are purged. Tombstones follow the same retention rules as regular entries.
+| Bound | Default | Status |
+|---|---|---|
+| Maximum number of entries | 1M | **Built**, `OplogConfig::max_entries` |
+| Maximum age | 72 hours | **Built**, `OplogConfig::max_age` |
+| Maximum bytes | on by default | **Decided (R16 part B)** |
 
-**Default: 72 hours or 1M entries, whichever is hit first.** Both are configurable per deployment. Pruning is unconditional on the retention window: no per-client cursor tracking. Clients outside the window get a full re-sync.
+Entries outside the window are purged, and tombstones follow the same rules as any other entry. All three bounds are configurable per deployment. Pruning is unconditional on the window: no per-client cursor tracking, and a client outside it gets a full re-sync.
+
+**Why bytes became a bound. Decided (R16 part B).** An entry count and an age are both counts of entries, and neither notices how wide the changed rows are. That was accurate while an entry held only the event, and storing the prepared patch beside it makes the footprint depend on row width: at the thirty-nine bytes R0 measured for a two-column row a full window is tens of megabytes, and at a few kilobytes per row it is gigabytes, held on the heap by `InMemoryOplog`. **Pruning names which bound fired**, in the structured log, because the failure mode of a byte bound set too small is extra full snapshots rather than lost data, and extra snapshots look like a client defect while being a retention setting. The default value has no measurement behind it.
+
+**It is a memory bound and not an abuse defence.** One entry per change event, appended once regardless of who is watching or how many, so a caller cannot enlarge the log by connecting. Only a writer to Postgres adds entries.
 
 ---
 
@@ -119,7 +126,9 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 1. Server checks `last_lsn` against the oldest entry in the oplog.
 2. If `last_lsn >= oplog_min_lsn`: the server can replay.
 3. For each re-declared subscription:
-   - Server queries the oplog for entries since `last_lsn` that match the subscription and the caller's `Principal`, converts them into a SQLite PatchSet, and sends it. The format matches the live path (no special catchup message type).
+   - Server queries the oplog for entries since `last_lsn` that match the subscription and the caller's `Principal`, and sends each one. The format matches the live path (no special catchup message type).
+
+**Decided (R16 part B): the patch is read, not rebuilt.** The entry already carries the prepared compressed bytes (see Structure), so catchup streams them and `Materializer::encode_patch` leaves this path. Two costs per record per client remain and are not addressed there: one predicate match, and one visibility question, the second of which R5b answers with no round trip in its cheapest tier. Catchup frames are not shared between clients, because two clients resuming from different positions receive different sequences, so catchup gets the copy elimination and not the frame sharing.
 
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 

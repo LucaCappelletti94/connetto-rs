@@ -25,6 +25,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `14-at-rest-encryption.md` | The replica page codec, key custody, ordering constraints, and what the encryption does and does not defend |
 | `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming. **Decided, not built**, and blocked on upstream diesel work |
 | `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers. **Decided, not built** |
+| `17-fan-out.md` | How one change event reaches many subscribers: the unit of computation, what stays proportional to subscriber count, catchup, and what adopting the shape costs. **Decided, not built** |
 
 ## Not chapters
 

@@ -54,10 +54,18 @@ Open question, see below. Candidates:
 
 The protocol has two planes. The **control plane** carries typed, MessagePack-encoded frames for signaling, handshake, and subscription management. The **bulk plane** carries large, opaque, Zstd-precompressed byte payloads (snapshot data, live patches, and client-uploaded mutation patchsets). The tag byte at the start of each frame distinguishes the planes: `TAG_CONTROL = 0`, `TAG_BULK = 1`. Bulk payloads arrive already compressed. The transport does not re-compress them, and decompression is the consumer's responsibility.
 
-| Plane | Tag | Encoding | Frame types |
-|---|---|---|---|
-| Control | `TAG_CONTROL = 0` | MessagePack | `Handshake`, `Subscribe`, `SnapshotBegin`, `SnapshotEnd`, `MutationHeader`, and so on |
-| Bulk | `TAG_BULK = 1` | Zstd-precompressed opaque bytes | `SnapshotPatch`, `LivePatch`, `MutationPatch` |
+| Plane | Tag | Encoding | Frame types | Status |
+|---|---|---|---|---|
+| Control | `TAG_CONTROL = 0` | MessagePack | `Handshake`, `Subscribe`, `SnapshotBegin`, `SnapshotEnd`, `MutationHeader`, and so on | **Built** |
+| Bulk | `TAG_BULK = 1` | Short MessagePack header, then the Zstd-precompressed payload appended untouched | `SnapshotPatch`, `LivePatch`, `MutationPatch` | **Decided (R16 part B)** |
+
+**The bulk row is the target, and the code does not implement it. Settled 2026-08-07.** This table gave the bulk plane as opaque precompressed bytes from the first draft, and `crates/connetto-core/src/messages/bulk.rs` says the same in its module comment, while `encode_bulk` in `crates/connetto-core/src/codec.rs` runs `rmp_serde::to_vec_named` over a `BulkMessage` whose variants embed the payload as a field. So the payload is copied into a MessagePack buffer per socket and then again into the tagged frame. R16 part B records that as a drift from this specification rather than a change of direction, and settles the layout:
+
+```
+[ 1 byte: tag ][ 4 bytes: header length (big-endian u32) ][ header ][ compressed payload ]
+```
+
+The header is a MessagePack-encoded enum mirroring the bulk variants with the payload field removed. On a byte-stream transport the existing outer length wraps all three parts. `17-fan-out.md` owns the reasoning, the copy counts, and what else has to move before the payload reaches a socket without being copied.
 
 ---
 
