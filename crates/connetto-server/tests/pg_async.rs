@@ -33,29 +33,44 @@ use subql::reexec::PgAsyncDieselConnector;
 use subql::{CdcSource, PgSqliteEmuSource};
 
 diesel::table! {
+    /// Row from the notes test fixture.
     notes (id) {
+        /// Note identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Note text.
         body -> diesel::sql_types::Text,
+        /// Timestamp of the last edit.
         edited_at -> diesel::sql_types::Text,
     }
 }
 diesel::table! {
+    /// Row from the orders test fixture.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Unit price.
         price -> diesel::sql_types::Double,
+        /// Number of units.
         quantity -> diesel::sql_types::BigInt,
+        /// Order status.
         status -> diesel::sql_types::Text,
     }
 }
 diesel::table! {
+    /// Aggregate value row.
     aggs (id) {
+        /// Aggregate identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Aggregate amount.
         amount -> diesel::sql_types::BigInt,
     }
 }
 diesel::table! {
+    /// Row with a UUID key and bigint value.
     things (id) {
+        /// Thing identifier, the primary key.
         id -> diesel::sql_types::Uuid,
+        /// Integer value.
         n -> diesel::sql_types::BigInt,
     }
 }
@@ -727,8 +742,11 @@ const TRANSLATED_SQLITE_DDL: &str =
     "CREATE TABLE translated (id INTEGER PRIMARY KEY, quantity INTEGER);";
 
 diesel::table! {
+    /// Row from the translated query fixture.
     translated (id) {
+        /// Row identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Quantity value.
         quantity -> diesel::sql_types::BigInt,
     }
 }

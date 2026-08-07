@@ -897,6 +897,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88490bf1b990d87eaaa7ac8aa887f629a08e7359765b4911faf63c3763347d23"
+dependencies = [
+ "darling_core 0.24.0",
+ "darling_macro 0.24.0",
+]
+
+[[package]]
 name = "darling_core"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -923,6 +933,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling_core"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "084e274f91c482280130e1e34e0b8d6e66776a060d7b6de7b84289ca778868c4"
+dependencies = [
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "darling_macro"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -942,6 +965,17 @@ dependencies = [
  "darling_core 0.23.0",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f5792fa0d41cd2325ce0ffa64f0a340eaebd4971a3a0c5e1ffd2cc488a355e"
+dependencies = [
+ "darling_core 0.24.0",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -972,8 +1006,8 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.11"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
+version = "2.3.12"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -1022,32 +1056,32 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
  "dsl_auto_type",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
 dependencies = [
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1424,14 +1458,14 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#679b4d2df83c78220bd2ef823a5c94ba292a59a6"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.24.0",
  "either",
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -5192,7 +5226,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

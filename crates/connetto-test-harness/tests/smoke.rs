@@ -30,10 +30,15 @@ const PG_DDL: &str =
     "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT);";
 
 diesel::table! {
+    /// Test table for subscription and write integration
     notes (id) {
+        /// Note identifier, the primary key
         id -> diesel::sql_types::Integer,
+        /// Identity that owns the note
         owner -> diesel::sql_types::Text,
+        /// Note content
         body -> diesel::sql_types::Text,
+        /// Timestamp of the last edit
         edited_at -> diesel::sql_types::Text,
     }
 }

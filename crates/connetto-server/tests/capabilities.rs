@@ -52,9 +52,13 @@ CREATE TABLE paper_shares (paper_id INT, viewer TEXT, PRIMARY KEY (paper_id, vie
 const REPLICA_DDL: &str = "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
 
 diesel::table! {
+    /// Row from the papers test fixture.
     papers (id) {
+        /// Paper identifier, the primary key.
         id -> Integer,
+        /// Person who owns the paper.
         owner -> Text,
+        /// Paper content.
         body -> Text,
     }
 }

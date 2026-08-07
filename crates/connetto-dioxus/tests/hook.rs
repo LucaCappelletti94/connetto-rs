@@ -34,8 +34,11 @@ const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
 
 diesel::table! {
+    /// Test table for orders in the fixture.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> BigInt,
+        /// Quantity ordered.
         quantity -> BigInt,
     }
 }

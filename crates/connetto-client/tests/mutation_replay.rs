@@ -68,10 +68,15 @@ impl SnapshotSource for SeedSnapshot {
 
 // The client replica schema (SQLite): local writes and the pending-record read.
 diesel::table! {
+    /// Orders table, primary key id.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> BigInt,
+        /// Unit price per item, nullable while written.
         price -> Nullable<Double>,
+        /// Number of items in the order, nullable while written.
         quantity -> Nullable<BigInt>,
+        /// Order state as a string, nullable while written.
         status -> Nullable<Text>,
     }
 }
@@ -80,10 +85,15 @@ diesel::table! {
 // `INT` maps to `Integer` (`i32`), narrower than the replica's `BigInt`.
 mod pg_readback {
     diesel::table! {
+        /// Orders table, primary key id.
         orders (id) {
+            /// Order identifier, the primary key.
             id -> diesel::sql_types::Integer,
+            /// Unit price per item, nullable.
             price -> diesel::sql_types::Nullable<diesel::sql_types::Double>,
+            /// Number of items in the order, nullable.
             quantity -> diesel::sql_types::Nullable<diesel::sql_types::Integer>,
+            /// Order state as a string, nullable.
             status -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
         }
     }

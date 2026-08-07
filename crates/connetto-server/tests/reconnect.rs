@@ -82,10 +82,15 @@ impl SnapshotSource for SeedSnapshot {
 }
 
 diesel::table! {
+    /// Row from the orders test fixture.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Unit price.
         price -> diesel::sql_types::Double,
+        /// Number of units.
         quantity -> diesel::sql_types::BigInt,
+        /// Order status.
         status -> diesel::sql_types::Text,
     }
 }

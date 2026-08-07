@@ -36,8 +36,11 @@ const REPLICA: &str = "e43-refusal.sqlite";
 const AUTH_DB: &str = "e43-refusal-auth.sqlite";
 
 diesel::table! {
+    /// Test table for replica contents
     items (id) {
+        /// Item identifier, the primary key
         id -> Integer,
+        /// Optional item label
         label -> Nullable<Text>,
     }
 }

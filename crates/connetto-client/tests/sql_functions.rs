@@ -23,8 +23,11 @@ extern "SQL" {
 }
 
 diesel::table! {
+    /// Test table for minted items.
     minted (id) {
+        /// Item identifier minted by function, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Item label text.
         label -> diesel::sql_types::Text,
     }
 }

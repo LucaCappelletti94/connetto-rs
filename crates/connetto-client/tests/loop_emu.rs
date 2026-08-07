@@ -113,17 +113,24 @@ impl SnapshotSource for RecordingSeed {
 }
 
 diesel::table! {
+    /// Orders table, primary key id.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Unit price per item.
         price -> diesel::sql_types::Double,
+        /// Number of items in the order.
         quantity -> diesel::sql_types::BigInt,
+        /// Order state as a string.
         status -> diesel::sql_types::Text,
     }
 }
-
 diesel::table! {
+    /// Metrics table, primary key id.
     metrics (id) {
+        /// Observation identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Timestamp when the observation was recorded.
         seen -> diesel::sql_types::Timestamp,
     }
 }
@@ -167,9 +174,13 @@ const GADGETS_SQLITE_DDL: &str = "CREATE TABLE gadgets (id BLOB PRIMARY KEY NOT 
                                   INTEGER NOT NULL, label TEXT NOT NULL);";
 
 diesel::table! {
+    /// Gadgets table, primary key id.
     gadgets (id) {
+        /// Gadget identifier, the primary key.
         id -> rosetta_uuid::sql_types::Uuid,
+        /// Whether the gadget is currently active.
         active -> diesel::sql_types::Bool,
+        /// Descriptive label for the gadget.
         label -> diesel::sql_types::Text,
     }
 }
@@ -307,10 +318,15 @@ async fn seeded_orders_target(
 // narrower than the client replica's BigInt.
 mod pg_orders {
     diesel::table! {
+        /// Orders table, primary key id.
         orders (id) {
+            /// Order identifier, the primary key.
             id -> diesel::sql_types::Integer,
+            /// Unit price per item.
             price -> diesel::sql_types::Double,
+            /// Number of items in the order.
             quantity -> diesel::sql_types::Integer,
+            /// Order state as a string.
             status -> diesel::sql_types::Text,
         }
     }

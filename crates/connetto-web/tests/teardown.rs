@@ -33,8 +33,11 @@ const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 const REFRESH_TOKEN: &str = "session-id.connetto-refresh-canary-3f80ba61";
 
 diesel::table! {
+    /// Table with a marker string to verify encryption at rest
     canary (id) {
+        /// Row identifier, the primary key
         id -> Integer,
+        /// Marker string for encryption verification
         note -> Text,
     }
 }

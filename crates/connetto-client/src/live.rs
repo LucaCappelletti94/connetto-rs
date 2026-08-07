@@ -1429,8 +1429,11 @@ mod tests {
     use diesel::prelude::*;
 
     diesel::table! {
+        /// Orders, the fixture these render tests build queries against.
         orders (id) {
+            /// Order identifier, the primary key.
             id -> BigInt,
+            /// How many units the order is for.
             quantity -> BigInt,
         }
     }

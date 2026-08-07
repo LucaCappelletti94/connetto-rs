@@ -37,15 +37,21 @@ const SQLITE_DDL: &str =
 const NOTES_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 
 diesel::table! {
+    /// Test table for orders in the fixture.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Quantity ordered.
         quantity -> diesel::sql_types::BigInt,
     }
 }
 
 diesel::table! {
+    /// Test table for notes in the local tier.
     notes (id) {
+        /// Note identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Note content text.
         body -> diesel::sql_types::Text,
     }
 }

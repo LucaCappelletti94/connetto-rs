@@ -110,7 +110,10 @@ macro_rules! connetto_watermark_table {
             /// session id and the highest client sequence durably applied for
             /// that session.
             _connetto_mutations (session_id) {
+                /// The durable session handle this watermark belongs to.
                 session_id -> diesel::sql_types::Uuid,
+                /// The highest client sequence durably applied for it. Advances
+                /// monotonically, so a replayed lower sequence never lowers it.
                 last_seq -> diesel::sql_types::BigInt,
             }
         }

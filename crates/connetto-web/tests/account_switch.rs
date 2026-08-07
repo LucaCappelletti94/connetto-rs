@@ -36,8 +36,11 @@ const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT
 const PREFIX: &str = "e4-switch";
 
 diesel::table! {
+    /// Test table for replica contents
     items (id) {
+        /// Item identifier, the primary key
         id -> Integer,
+        /// Optional item label
         label -> Nullable<Text>,
     }
 }

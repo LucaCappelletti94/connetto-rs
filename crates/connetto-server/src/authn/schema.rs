@@ -239,11 +239,19 @@ macro_rules! connetto_auth_tables {
             /// typed user id, the rotating refresh-secret hash, and the refresh
             /// deadlines.
             connetto_sessions (session_id) {
+                /// The connetto-minted session id, the durable handle every
+                /// other contract keys on.
                 session_id -> diesel::sql_types::Uuid,
+                /// Whose session it is, in the deployment's own id type.
                 user_id -> $id_sql,
+                /// Hash of the refresh secret currently valid for this session.
+                /// Presenting a rotated-out one is treated as theft.
                 current_refresh_hash -> diesel::sql_types::Binary,
+                /// When the session lapses if it is never refreshed again.
                 idle_deadline -> diesel::sql_types::Timestamptz,
+                /// When the session lapses however often it is refreshed.
                 absolute_deadline -> diesel::sql_types::Timestamptz,
+                /// Whether the session was ended before either deadline.
                 revoked -> diesel::sql_types::Bool,
             }
         }
@@ -251,10 +259,17 @@ macro_rules! connetto_auth_tables {
         diesel::table! {
             /// connetto retained provider tokens, keyed by session id.
             connetto_provider_tokens (session_id) {
+                /// The session these provider tokens belong to.
                 session_id -> diesel::sql_types::Uuid,
+                /// The identity provider that issued them, as its issuer URL.
                 issuer -> diesel::sql_types::Text,
+                /// The provider access token, never emitted to a client.
                 access_token -> diesel::sql_types::Text,
+                /// The provider refresh token, absent when the provider issued
+                /// none.
                 refresh_token -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                /// When the access token expires, absent when the provider said
+                /// nothing about it.
                 expires_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
             }
         }

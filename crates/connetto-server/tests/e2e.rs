@@ -58,10 +58,15 @@ const OWNED_QUERY: &str = "SELECT * FROM owned";
 
 // The client replica's `orders` table, typed for the poller's count query.
 diesel::table! {
+    /// Row from the orders test fixture.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> Integer,
+        /// Unit price.
         price -> Nullable<Double>,
+        /// Number of units.
         quantity -> Nullable<Integer>,
+        /// Order status.
         status -> Nullable<Text>,
     }
 }

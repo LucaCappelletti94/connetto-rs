@@ -132,8 +132,11 @@ pub struct RefreshStore {
 }
 
 diesel::table! {
+    /// Encrypted refresh token storage
     connetto_refresh (id) {
+        /// Row identifier, the primary key
         id -> diesel::sql_types::Integer,
+        /// Encrypted refresh token value
         token -> diesel::sql_types::Text,
     }
 }

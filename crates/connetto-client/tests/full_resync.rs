@@ -26,10 +26,15 @@ const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const SUB: &str = "orders";
 
 diesel::table! {
+    /// Orders table, primary key id.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> diesel::sql_types::BigInt,
+        /// Unit price per item.
         price -> diesel::sql_types::Double,
+        /// Number of items in the order.
         quantity -> diesel::sql_types::BigInt,
+        /// Order state as a string.
         status -> diesel::sql_types::Text,
     }
 }

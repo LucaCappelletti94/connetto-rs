@@ -27,8 +27,11 @@ const MARKER: &str = "connetto-plaintext-canary-a7f31c0e";
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 
 diesel::table! {
+    /// Table with a marker string to verify encryption at rest
     canary (id) {
+        /// Row identifier, the primary key
         id -> Integer,
+        /// Marker string that must never appear unencrypted
         note -> Text,
     }
 }

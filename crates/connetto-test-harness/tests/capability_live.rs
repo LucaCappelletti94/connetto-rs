@@ -38,9 +38,13 @@ const REPLICA_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEX
 const KEY: &str = "key:live-share";
 
 diesel::table! {
+    /// Test table for share key filtering
     notes (id) {
+        /// Note identifier, the primary key
         id -> Integer,
+        /// Identity that owns the note
         owner -> Text,
+        /// Note content
         body -> Text,
     }
 }

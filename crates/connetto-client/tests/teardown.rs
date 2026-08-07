@@ -34,8 +34,11 @@ const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
 diesel::table! {
+    /// Test table for items in the replica.
     items (id) {
+        /// Item identifier, the primary key.
         id -> Integer,
+        /// Item label text.
         label -> Nullable<Text>,
     }
 }

@@ -323,10 +323,17 @@ macro_rules! connetto_ban_table {
             /// The identities currently refused, one row each, a null
             /// `expires_at` meaning permanent.
             connetto_bans (user_id) {
+                /// Who is banned, in the deployment's own id type.
                 user_id -> $id_sql,
+                /// The run the crossing happened on, so a lift months later has
+                /// a real session to record against.
                 session -> diesel::sql_types::Uuid,
+                /// Which threshold they crossed, as connetto recorded it.
                 reason -> diesel::sql_types::Text,
+                /// When the ban started, bound by connetto so it shares a clock
+                /// with the expiry.
                 banned_at -> diesel::sql_types::Timestamptz,
+                /// When it lapses. Null is permanent.
                 expires_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
             }
         }

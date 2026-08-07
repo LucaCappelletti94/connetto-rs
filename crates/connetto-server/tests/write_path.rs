@@ -93,9 +93,13 @@ impl VisibilityPolicy for DenyAuth {
 }
 
 diesel::table! {
+    /// Row from the notes test fixture.
     notes (id) {
+        /// Note identifier, the primary key.
         id -> diesel::sql_types::Integer,
+        /// Note text.
         body -> diesel::sql_types::Text,
+        /// Timestamp of the last edit.
         edited_at -> diesel::sql_types::Text,
     }
 }

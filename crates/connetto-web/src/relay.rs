@@ -236,8 +236,12 @@ const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_tab_mutations
 /// typed declaration and the typed DSL; the hub meta queries use `sql_query`.
 mod local_schema {
     diesel::table! {
+        /// Per-tab durable write counter, the browser mirror of the server's
+        /// mutation watermark.
         _connetto_tab_mutations (client_id) {
+            /// Which tab the counter belongs to.
             client_id -> rosetta_uuid::sql_types::Uuid,
+            /// The highest sequence that tab has durably uploaded.
             last_seq -> diesel::sql_types::BigInt,
         }
     }

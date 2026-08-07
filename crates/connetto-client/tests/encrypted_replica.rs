@@ -35,8 +35,11 @@ const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT
 const TIER_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
 
 diesel::table! {
+    /// Test table for items in the replica.
     items (id) {
+        /// Item identifier, the primary key.
         id -> Integer,
+        /// Item label text.
         label -> Nullable<Text>,
     }
 }
@@ -44,8 +47,11 @@ diesel::table! {
 // Unqualified, like the tier suite: SQLite resolves the name across the attached
 // schemas, so one declaration serves the tier wherever it is attached.
 diesel::table! {
+    /// Test table for notes in the local tier.
     notes (id) {
+        /// Note identifier, the primary key.
         id -> Integer,
+        /// Note content text.
         body -> Nullable<Text>,
     }
 }

@@ -275,11 +275,19 @@ macro_rules! connetto_audit_table {
             /// The durable record of changes to who can reach what. Holds state
             /// changes only: denials go to structured logging.
             auth_events (at, session) {
+                /// When it happened, defaulted by the column so one clock
+                /// decides rather than whichever process emitted.
                 at -> diesel::sql_types::Timestamptz,
+                /// The session the change concerns, always present because every
+                /// run has a handle whether or not anyone is logged in.
                 session -> diesel::sql_types::Uuid,
+                /// Who it concerns, absent when the caller has no identity.
                 user_id -> diesel::sql_types::Nullable<$id_sql>,
+                /// What changed, as a closed set both ends agree on.
                 op -> $crate::audit::AuthOpSql,
+                /// The table a share key names, absent for everything else.
                 table_name -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                /// The row a share key names, absent for everything else.
                 pk -> diesel::sql_types::Nullable<$pk_sql>,
             }
         }

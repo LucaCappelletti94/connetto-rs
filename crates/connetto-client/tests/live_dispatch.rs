@@ -18,10 +18,15 @@ use diesel::prelude::*;
 use diesel::query_builder::AsQuery;
 
 diesel::table! {
+    /// Orders table, primary key id.
     orders (id) {
+        /// Order identifier, the primary key.
         id -> BigInt,
+        /// Number of items in the order.
         quantity -> BigInt,
+        /// Unit price per item.
         price -> Double,
+        /// Order state as a string.
         status -> Text,
     }
 }
