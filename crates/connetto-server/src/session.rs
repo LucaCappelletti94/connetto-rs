@@ -781,13 +781,19 @@ where
     /// [`SessionError`] when dispatch, a cursor advance, an install, or the
     /// oplog append fails.
     pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
-        counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
-        let dispatched = { self.materializer.lock().await.dispatch(event)? };
+        let dispatched = {
+            counters::timed_lock(&self.materializer)
+                .await
+                .dispatch(event)?
+        };
 
         // Record the event in the oplog before fan-out. The append is per event,
         // not per consumer, since reconnect catchup re-filters per client.
-        counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
-        let record = { self.materializer.lock().await.oplog_record(event) };
+        let record = {
+            counters::timed_lock(&self.materializer)
+                .await
+                .oplog_record(event)
+        };
         if let Some(record) = record {
             self.oplog.append(record).await.map_err(oplog_err)?;
         }
@@ -828,12 +834,9 @@ where
                 continue;
             }
             {
-                counters::add(&counters::MATERIALIZER_LOCK_TAKES, 1);
-                self.materializer.lock().await.advance_cursor(
-                    route.session_key,
-                    route.sub_id,
-                    &patch.cursor,
-                )?;
+                counters::timed_lock(&self.materializer)
+                    .await
+                    .advance_cursor(route.session_key, route.sub_id, &patch.cursor)?;
             }
             let live = LivePatch::new(route.label, Cursor::new(patch.cursor), patch.payload_zstd);
             // A dropped session receiver just means the client is gone.

@@ -2,7 +2,7 @@
 //!
 //! The snapshot and the change path are different executors and they can
 //! disagree silently. A snapshot runs one policy-filtered `SELECT`, while live
-//! delivery asks `RlsAuth::can_read` per row per subscriber in its own
+//! delivery asks `RlsAuth::visible` per row per subscriber in its own
 //! transaction. Binding the caller's keys in one and forgetting the other would
 //! show a shared row once and then never update it, which is the divergence
 //! `docs/architecture/08-authorization.md` warns about. This drives the whole
