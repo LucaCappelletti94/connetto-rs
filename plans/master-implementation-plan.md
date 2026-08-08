@@ -87,6 +87,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R44~~ **DONE** | Landed 2026-08-08, the day it was split out of R29. A departed row is now removed unless a sibling subscription still covers it |
 | any | R45 | The fix bundle from the 2026-08-08 reconciliation: five small defects, each mechanical and blocked on nothing, bundled so none sits unowned |
 | any | R46 | The wasm-smoke intermittent hang. An investigation, demonstrate-first like R33, because a flaky browser gate halves confidence in every browser-touching phase |
+| any | R47 | One helper per job: seven verified duplications from the 2026-08-08 sweep, consolidations with no behaviour change |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
@@ -149,6 +150,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R44 a row that leaves one subscription's window | **DONE** (2026-08-08) | nothing | no, checked |
 | R45 reconciliation fix bundle | NOT STARTED | nothing | no |
 | R46 the wasm-smoke intermittent hang | NOT STARTED | nothing | no |
+| R47 one helper per job | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
@@ -227,6 +229,7 @@ graph TD
   R29 --> R44[R44 a row that leaves one subscription's window]
   R29 --> R45[R45 reconciliation fix bundle]
   R46[R46 the wasm-smoke intermittent hang]
+  R47[R47 one helper per job]
   R40[R40 replica policy wired into sync]
   U2b -.->|pin moves when it lands| R40
   R24[R24 file-sync integration, exploratory]
@@ -2315,7 +2318,7 @@ An identified caller's handshake cannot be starved by unidentified traffic, what
 1. **Anchor the grace countdown at launch for a died-while-watching record.** The startup seed leaves `stopped_at` empty for a record the previous run died still holding, so it reads as live for ever and `expired` can never return it (R29 step 2 carries the full account). At seed time, set the stop moment to now for every record with no stop moment **and no pin name**: a pin has grace zero by design, so anchoring one would expire it at the first pump, which is why the exclusion is load-bearing. The countdown runs the record's own persisted grace, so a zero-grace watch that died held is dropped at once, which is its contract. A watch re-claiming the query inside the grace clears the anchor through the existing `remember` upsert.
 2. **Keep connetto's own bookkeeping out of the application-facing changed-tables signal.** Every cursor persist puts `_connetto_meta` into the set that wakes the live-query refresh, so the refresh walks the registry and matches nothing, on every applied frame. Filter `sqlite_%` and `_connetto%` names at the boundary where the tracker's set feeds `Reactive::changed_tables` and the refresh, reusing the exclusion convention `local_tier_tables` already set (R43). Found by R20 and left with no owner until now.
 3. **Stop presenting a share key whose `exp` has passed.** The client reads `exp` out of the JWT payload it already holds (base64url, no key, no round trip) and skips the dead key at handshake. Advisory only: the server verifies `exp` authoritatively regardless, so a forged claim either presents a dead key and is refused as now, or skips a live one and harms only itself. Specified in full in the Parked section entry this step retires, and `02-protocol.md` already carries the opacity-rule amendment (2026-08-06). This is also what removes the one honest refusal burst R36's daily tally must currently clear.
-4. **One `quote_ident`.** The identical three-line helper is defined three times in `connetto-server` (`key_filter.rs` as `pub(crate)`, private copies in `materializer.rs` and `oplog.rs`). Keep the `pub(crate)` one, delete the two copies, repoint their callers.
+4. **One `quote_ident`. Corrected 2026-08-08 by the duplication sweep: four copies across two crates, not three in one.** The identical three-line helper is defined in `connetto-server` (`key_filter.rs` as `pub(crate)`, private copies in `materializer.rs` and `oplog.rs`) **and in `connetto-web` (`relay.rs`)**, and `connetto-client` splices table names with a bare `format!("\"{table}\"")` at four sites (`lib.rs`, the complement-of-union delete and the coverage probe, and `live.rs`, the resync spec) **without** the embedded-quote doubling, in statements that inline identifiers into SQL text. One definition goes to `connetto-core`, which all four crates already depend on, every copy dies, and the four bare sites call it.
 5. **Read the snapshot row off the builder instead of parsing bytes back.** `PgSnapshotSource::read_row` (`snapshot.rs`) encodes the row with `pgbinary_patchset` and immediately parses the bytes with `ParsedDiffSet::parse` to extract the insert's values. `pgbinary_patchset_builder` returns the builder whose ops are readable directly, exactly the shape R44's fix used for `pgoutput_patchset_builder`, so the one-encoder property the code comment defends (a value read here and delivered to a client are one value) is kept while the encode-and-parse pair goes.
 
 ### Proof
@@ -2348,6 +2351,37 @@ The hang is demonstrated and named before anything is changed. After the fix, te
 ### Done when
 
 Ten consecutive clean runs, or a written upstream finding with a reproduction and this phase concluding with the workaround decision recorded.
+
+---
+
+## R47: one helper per job
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** The findings of the 2026-08-08 duplication sweep: a mechanical function-similarity pass over the four crates' `src` trees (1099 functions, exact and near-duplicate token comparison) plus targeted convention greps, every candidate then verified by reading both sides. Consolidations only, no behaviour change anywhere, which is what separates this from R45: R45's items need failing-first proofs, these need the gate.
+
+### Purpose
+
+A helper pasted twice drifts, and this codebase has already paid for the pattern twice: `quote_ident` reached four copies before anyone counted, and the loopback comment below says "mirroring" and mirrors by copy. Each step names the one definition and where it lives. `provision_replica_key` and `mint_replica_key` are **deliberately excluded**: their per-target duplication is a documented decision (`connetto-web/src/auth.rs`, the entropy-source note) and stands.
+
+### Steps
+
+1. **One percent-encoder.** `urlencode` (`connetto-server/src/authn/http.rs`) and `percent_encode` (`connetto-client/src/auth.rs`, `connetto-web/src/auth.rs`) are byte-identical. One definition in `connetto-core`, the three call sites repoint to it, and `percent_decode` (client-only today) moves beside it.
+2. **One wasm frame pump.** `BroadcastTransport` and `PortTransport` (`connetto-web/src/{broadcast,port}.rs`) duplicate `send_frame` and the entire `Transport` impl, `TAG_CLOSE` handling included, differing only in the post-message sink and the error type. Unify over the sink so the close semantics exist once.
+3. **Generalize `ask` and collapse `await_login_code` onto it.** `ask` (`connetto-web/src/auth.rs`) is the broadcast request-reply dance hardcoded to `LogoutMessage`, so the login path hand-rolls the same closure, oneshot and cleanup sequence for its own channel. Parameterize the channel name and message type.
+4. **One PKCE token convention.** `random_token` exists twice with different conventions: the client concatenates two UUIDv4s as hex, 244 random bits while its doc comment claims 256, and the web mints a true 256-bit URL-safe base64 token. Settle on the web's convention, correct or retire the client's, and while here resolve the `getrandom` major split the pair exposed (`fill` is the 0.3 API in `connetto-client`, `getrandom()` the 0.2 API in `connetto-web`), verifying the 0.3 wasm backend configuration before moving the web crate. If the entropy-source-per-target rule is judged to cover this helper too, the convention still unifies and the doc claim is still corrected.
+5. **One login tail.** `AuthService::login` and `login_with_provider` (`authn/service.rs`) share thirty lines including the `guard.learn_owner` call R19's owner map depends on, the provider variant adding one store call mid-sequence. A private shared tail keeps a future change to the token assembly or the owner registration from landing in one path only.
+6. **One keyring dance.** `KeyringStore` and `KeyringKeyStore` (`connetto-client/src/auth.rs`) each carry the entry, load, store and clear sequence, including the non-obvious ask-for-the-entry-again-on-store workaround and its comment. A private helper shared by both stores carries it once.
+7. **One loopback host predicate.** `is_loopback_redirect` (`authn/http.rs`) and `is_loopback_origin` (`bin/connetto-server.rs`) share the parsed host-match block verbatim, and the difference between them (the redirect check also pins the `http` scheme) is policy that stays at each site. Extract the host predicate so a hardening lands in both checks at once: it is a security predicate, which is why the copy is the riskiest one in this list.
+8. **Three minors, each allowed to conclude leave-alone**, and the disposition recorded either way: `LiveQuery` and `LiveValue` have byte-identical `Drop` and `changed` bodies (a shared reaper-guard inner collapses them), the two dev binaries duplicate `env_or` and `read_ddl` verbatim with `bans_enabled`/`audit_enabled` as one body under two names, and `write_target.rs` calls `zstd::decode_all` past its own crate's `materializer::decompress`.
+
+### Proof
+
+The full gate, unchanged: these are consolidations, so the existing suites are the behaviour proof. A grep per step shows one definition. The client PKCE doc claim reads 256 bits only if the token carries 256.
+
+### Done when
+
+One definition exists per job for steps 1 through 7, step 8's three items are dispositioned explicitly, and no test changed for behavioural reasons.
 
 ---
 
