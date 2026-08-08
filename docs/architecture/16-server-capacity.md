@@ -1,6 +1,6 @@
 # 16: Server capacity and admission
 
-**Status**: normative, and short by intent. Paragraphs marked **Built.** describe what exists today. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The reservation this chapter decides is unbuilt. Its three inputs were settled with the maintainer on 2026-08-08 and are recorded at the end. The survey behind the decisions is `docs/research-overload-and-fairness.md`, a process artifact carrying a citation per claim.
+**Status**: normative, and short by intent. Paragraphs marked **Built.** describe what exists today. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The reservation this chapter decides was built on 2026-08-08 (R39). Its three inputs were settled with the maintainer the same day and are recorded at the end. The survey behind the decisions is `docs/research-overload-and-fairness.md`, a process artifact carrying a citation per claim.
 
 ---
 
@@ -14,7 +14,7 @@ They also fail differently, which is why they are separate mechanisms rather tha
 
 ## The two pools
 
-**Built.** The server builds two Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/bin/connetto-server.rs`, and gives neither a size, so both take bb8's default of ten connections.
+**Built, sizes explicit since R39 (2026-08-08).** The server builds two Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/bin/connetto-server.rs`. Both default to bb8's ten connections, now stated rather than implied: `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set them, and `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
 
 The **owner pool** connects as the deployment's owning role and carries re-execution (`PgAsyncDieselConnector`), the authentication store (`DbAuthStore`) and audit writes (`pg_audit_hook`). Row-level security does not apply to it, which is the entire reason a second pool exists.
 
@@ -28,19 +28,19 @@ The **reader pool** connects as a role that row-level security does apply to, an
 
 **Built, defective.** `08-authorization.md` records the cost per unit and names it the current scalability wall: one visibility question takes a pooled connection, opens a transaction, binds the caller, runs a `SELECT EXISTS` and commits, and these are awaited one after another across watchers. That is not restated here.
 
-What this chapter adds is the consequence at the pool. Nothing distinguishes callers at checkout, so unidentified and signed-in traffic contend first-come-first-served for the same ten connections, and a caller opening connections in a loop competes on equal terms with one that signed in.
+What this chapter adds is the consequence at the pool. Until R39 nothing distinguished callers at checkout, so unidentified and signed-in traffic contended first-come-first-served for the same ten connections, and a caller opening connections in a loop competed on equal terms with one that signed in. The reservation below is what changed that (2026-08-08): the per-question cost and its sequential await remain `08-authorization.md`'s wall until R5b.
 
 ---
 
 ## Reserving for identified callers
 
-**Decided (R39).** A share of the reader pool is held for callers whose handshake resolved an identity. Unidentified callers may occupy the total less that share and no more, so a connection remains reachable by an identified caller whatever volume of unidentified traffic has arrived.
+**Decided (R39). Built 2026-08-08.** A share of the reader pool is held for callers whose handshake resolved an identity. Unidentified callers may occupy the total less that share and no more, so a connection remains reachable by an identified caller whatever volume of unidentified traffic has arrived. The mechanism is `ReaderGate` in `crates/connetto-server/src/reserve.rs`, a permit split held by `RequestGuard` and taken around each caller-attributed reader-pool span (the handshake's watermark read, a row subscription's delivery, a mutation's apply, and the library mint call through `CapabilityIssuer::with_reader_gate`). An over-share unidentified checkout queues up to one second, holding no connection, then draws R19's refusal shape. The change path stays ungated: it holds at most one reader connection by construction (R0), and a permit wait inside the single sequential ingest task would stall identified live delivery behind anonymous saturation, the exact inversion of the guarantee.
 
 The guarantee is arithmetic rather than behavioural. It detects nothing, has no threshold and no window, and keeps no state that decays. It needs no key for the caller, only the tier the handshake already established, which `Tier` in `crates/connetto-server/src/throttle.rs` carries to every limit call today.
 
 **This is what reaches a caller a ban cannot.** A ban needs a durable name, and a caller presenting no resume credential is minted a fresh one every connection (R36, and `12-identity-session-capability.md` for what a handle is). A reservation never asks who is calling, so the number of identities a caller cycles through does not enter into it. No source surveyed closes that gap by detection, and the literature treats it as a load problem rather than an abuse problem.
 
-**Built (R36, 2026-08-06): what a caller with no identity gets instead is a per-connection tally.** Three refusal counts within one socket, no window because the connection is the window, and the outcome is that socket closing with no durable record and nothing reported to the application. It ends a runaway loop inside the connection it is happening in and nothing more, since a reconnect starts over. The gap this chapter names is therefore narrower than it was and still open: a prober that reconnects between crossings stays invisible, and only the reservation below bounds it.
+**Built (R36, 2026-08-06): what a caller with no identity gets instead is a per-connection tally.** Three refusal counts within one socket, no window because the connection is the window, and the outcome is that socket closing with no durable record and nothing reported to the application. It ends a runaway loop inside the connection it is happening in and nothing more, since a reconnect starts over. The remaining gap, a prober that reconnects between crossings and stays invisible to detection, is what the reservation above now bounds (R39, 2026-08-08).
 
 ---
 
@@ -72,7 +72,7 @@ Connetto's obligation is the narrow one, and the same book states it: a task pro
 
 ## The three inputs, settled 2026-08-08
 
-These were open until the reconciliation session of 2026-08-08, which settled all three with the maintainer. R39's step 1 is discharged by this section.
+These were open until the reconciliation session of 2026-08-08, which settled all three with the maintainer, and R39 built to them the same day. R39's step 1 was discharged by this section. The default reserve, chosen generous at implementation per the R19 precedent and recorded in the plan, is 3 of the reader pool's 10.
 
 1. **The pool sizes become explicit, configurable settings now, and the real number is derived after R5b.** Both pools keep their default of ten, no longer implicit, and the reserve is expressed relative to the reader pool's configured total. Sizing from today's measurement was rejected because the measured profile is about to change: R0 found the throughput ceiling to be the per-subscriber visibility round trips, which R5b deletes. What R0 already settled, and the eventual measurement therefore skips: **the change path is not what occupies the reader pool.** Visibility questions are issued one at a time by the single change-ingest task, so that path holds exactly one connection at any moment whatever the subscriber count, while turning it over roughly 1,700 times a second. What occupies the pool is per-caller work, snapshots, mutation applies and the handshake watermark read, and R5b's rerun of the load harness is where those get their number.
 2. **Strict, not work-conserving.** The reserved share is held back even when no identified caller wants it, so the guarantee is arithmetic and immediate, and the mechanism is a permit split with no admission logic. Work-conserving was rejected: it weakens the promise to however long in-flight unidentified work takes to drain, which a snapshot transfer makes unbounded in practice, and the async runtime's first-come-first-served permit queue means it needs its own admission decision rather than a permit count. Stripe, the closest surveyed peer, chose strict.

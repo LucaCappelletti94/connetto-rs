@@ -44,9 +44,10 @@ pub struct NonFatalError {
 /// [`SUBSCRIPTION_REFUSED`], which stays byte-identical across causes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimited {
-    /// Identifier of the request this refusal refers to, the `sub_id` of a
-    /// refused `Subscribe`. Absent when the refusal belongs to no single
-    /// request.
+    /// Identifier of the request this refusal refers to: the `sub_id` of a
+    /// refused `Subscribe`, or a deferred mutation's `client_seq` rendered as
+    /// a string, the same correlation [`NonFatalError`] carries. Absent when
+    /// the refusal belongs to no single request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_to: Option<String>,
     /// How long until the limit's window rolls over, so a client waits once

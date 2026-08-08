@@ -102,6 +102,9 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
 connetto-core = { workspace = true, features = ["test-support"] }
+# Paused-clock reserve-gate tests: the over-share refusal waits out a real
+# queue window, which `start_paused` advances instantly.
+tokio = { workspace = true, features = ["test-util"] }
 # The refused-grant assertion reads the log back through its own writer, which
 # means naming the destination's own trait.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }

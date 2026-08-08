@@ -24,6 +24,16 @@
 //!   `docs/architecture/11-authentication.md`) alongside the auth tables. A
 //!   restricted role cannot `CREATE` in schema `public` on Postgres 15 and
 //!   later, so the admin runs the migration.
+//! - `CONNETTO_OWNER_POOL_SIZE`: connections in the owner pool (default 10,
+//!   bb8's own default made explicit).
+//! - `CONNETTO_READER_POOL_SIZE`: connections in the reader pool (default 10).
+//! - `CONNETTO_READER_RESERVE`: reader connections held back for callers whose
+//!   handshake resolved an identity (default 3). Unidentified callers may hold
+//!   at most the pool size less this, so signed-in traffic cannot be starved
+//!   by anonymous volume, and setting it equal to the pool size turns
+//!   anonymous database access off. Must not exceed
+//!   `CONNETTO_READER_POOL_SIZE`. See
+//!   `docs/architecture/16-server-capacity.md`.
 //! - `CONNETTO_OIDC_PROVIDER`: which identity provider `CONNETTO_AUTH` logs
 //!   users in with, one of `google`, `microsoft`, or `generic` (lowercase).
 //!   Anything else, including an unset or miscapitalised value, refuses
@@ -49,11 +59,12 @@ use connetto_server::audit::pg_audit_hook;
 use connetto_server::{
     AbuseConfig, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, PgSnapshotSource, ProviderRegistry, ReconnectEvent, ReconnectPolicy,
-    RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RlsAuth,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TokenAuthority,
-    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
-    connetto_ban_table, connetto_watermark_table, pg_ban_store, pg_write_target,
+    OidcProviderConfig, PgSnapshotSource, ProviderRegistry, ReaderGate, ReaderReserve,
+    ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
+    ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
+    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
+    pg_ban_store, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -197,8 +208,12 @@ impl AuthStore for ServerStore {
 /// The ban list reads and writes on the **owner** pool. On the reader pool an
 /// invisible row is zero rows rather than an error, so the fail-closed check
 /// would never fire and a ban would silently not apply.
-fn build_guard(pool: &Pool<AsyncPgConnection>) -> Result<Arc<RequestGuard<String>>> {
-    let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default());
+fn build_guard(
+    pool: &Pool<AsyncPgConnection>,
+    reader_gate: ReaderGate,
+) -> Result<Arc<RequestGuard<String>>> {
+    let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+        .with_reader_gate(reader_gate);
     let guard = if bans_enabled()? {
         tracing::info!("banning identities that cross an abuse threshold");
         guard.with_bans(pg_ban_store::<ConnettoBans>(pool.clone()))
@@ -388,6 +403,17 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
+/// Read a `u32` from `<key>`, or `default` when unset.
+fn env_u32(key: &str, default: u32) -> Result<u32> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .with_context(|| format!("parsing {key}: {text:?}")),
+    }
+}
+
 /// Read a DDL from `<key>` directly, or from the path in `<key>_FILE`.
 fn read_ddl(key: &str) -> Result<String> {
     if let Ok(inline) = std::env::var(key) {
@@ -414,9 +440,10 @@ fn writable_catalog() -> RuntimeWritableCatalog {
     builder.build()
 }
 
-async fn build_pool(url: &str) -> Result<Pool<AsyncPgConnection>> {
+async fn build_pool(url: &str, size: u32) -> Result<Pool<AsyncPgConnection>> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
     Pool::builder()
+        .max_size(size)
         .build(manager)
         .await
         .context("building the Postgres connection pool")
@@ -433,7 +460,7 @@ async fn main() -> Result<()> {
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
     let slot = env_or("CONNETTO_SLOT", "connetto_slot");
     let publication = env_or("CONNETTO_PUBLICATION", "connetto_pub");
-    let pool = build_pool(&database_url).await?;
+    let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     // connetto emits no DDL. The deployment owns the `_connetto_mutations`
     // watermark table (see `docs/architecture/11-authentication.md`) and the
     // `ConnettoWatermark` reference schema keys on it.
@@ -441,11 +468,27 @@ async fn main() -> Result<()> {
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
 
+    // The reader pool's size and its reserved share (R39). Both explicit so
+    // the reserve is expressed against a number the operator can see, with
+    // the split refused up front when no such split exists.
+    let reader_pool_size = env_u32("CONNETTO_READER_POOL_SIZE", ReaderReserve::DEFAULT_TOTAL)?;
+    let reader_reserve = env_u32("CONNETTO_READER_RESERVE", ReaderReserve::DEFAULT_RESERVED)?;
+    if reader_reserve > reader_pool_size {
+        return Err(anyhow!(
+            "CONNETTO_READER_RESERVE ({reader_reserve}) exceeds \
+             CONNETTO_READER_POOL_SIZE ({reader_pool_size}), so no split exists"
+        ));
+    }
+    let reader_gate = ReaderReserve::new()
+        .total(reader_pool_size)
+        .reserved(reader_reserve)
+        .gate();
+
     // The handshake authority is a required constructor argument with no
     // default (R2), so the auth service is built first and the server refuses
     // to run without one: an unset CONNETTO_AUTH would otherwise mean a
     // handshake with nothing to check a grant against.
-    let guard = build_guard(&pool)?;
+    let guard = build_guard(&pool, reader_gate)?;
     let Some((service, registry)) = build_auth(&pool, Arc::clone(&guard)).await? else {
         return Err(anyhow!(
             "set CONNETTO_AUTH to in-memory or database: the server refuses to run \
@@ -466,7 +509,7 @@ async fn main() -> Result<()> {
              Security (the server does not serve reads or writes from the owner pool)"
         )
     })?;
-    let reader_pool = build_pool(&reader_url).await?;
+    let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?;
     let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)

@@ -49,6 +49,7 @@ use crate::materializer::{
     agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
 use crate::throttle::Tier;
 use crate::watermark_schema::ConnettoWatermarkSchema;
@@ -234,6 +235,11 @@ fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
 
 fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
+}
+
+/// A refusal's wait as the wire's milliseconds, saturating.
+fn retry_ms(wait: Duration) -> u64 {
+    u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Decode a resume cursor into an LSN. The cursor is an 8-byte big-endian LSN;
@@ -603,15 +609,6 @@ where
 
     fn next_consumer_id(&self) -> u64 {
         self.next_consumer.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Map a principal to its throttle tier.
-    fn principal_tier(principal: &Principal<Id, Key>) -> Tier {
-        if principal.identity().is_some() {
-            Tier::Identified
-        } else {
-            Tier::Anonymous
-        }
     }
 
     /// Who a signal is attributed to: the handle for the rate limit, the person
@@ -1083,7 +1080,7 @@ where
             span.record("user", tracing::field::display(&identity.user_id));
         }
         let session_id = principal.session_id();
-        let tier = Self::principal_tier(&principal);
+        let tier = Tier::of(&principal);
         if self
             .refuse_over_limit(transport, session_id, tier, grant_wait, &span)
             .await
@@ -1120,12 +1117,21 @@ where
             None => Cursor::new(Vec::new()),
         };
         // The durable mutation watermark: the client retires pending records
-        // at or below it and replays the rest.
-        let applied_watermark = self
-            .target
-            .last_applied(session_id)
-            .await
-            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        // at or below it and replays the rest. Its read is the handshake's one
+        // reader-pool checkout, so an unidentified caller takes a share permit
+        // for it (R39) and draws R19's fatal refusal when the share stays full.
+        let applied_watermark = {
+            let Some(_reader_permit) = self
+                .handshake_reader_permit(transport, tier, &principal, refused_grants, &span)
+                .await
+            else {
+                return Ok(None);
+            };
+            self.target
+                .last_applied(session_id)
+                .await
+                .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        };
         let resume_token = self
             .authority
             .mint_handle(session_id)
@@ -1175,7 +1181,7 @@ where
         let Some((limit, wait)) = refused else {
             return false;
         };
-        let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let retry_after_ms = retry_ms(wait);
         // Inside the connection context, so the line names the handle it
         // refused. Unlike a version mismatch, a run exists here.
         span.in_scope(|| {
@@ -1191,6 +1197,111 @@ where
             )))
             .await;
         true
+    }
+
+    /// Take the handshake's reader-share permit (R39), or refuse the caller
+    /// in R19's fatal shape and report [`None`].
+    ///
+    /// The refusals still count on this exit, exactly as on the rate-limit
+    /// one: the tally here and the announcement in `run_session` are two ends
+    /// of one count.
+    async fn handshake_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        tier: Tier,
+        principal: &Principal<Id, Key>,
+        refused_grants: u32,
+        span: &tracing::Span,
+    ) -> Option<ReaderPermit> {
+        match self.guard.reader_permit(tier).await {
+            Ok(permit) => Some(permit),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                span.in_scope(|| {
+                    tracing::warn!(
+                        retry_after_ms,
+                        "connection refused, the unreserved reader share is full"
+                    );
+                });
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::RateLimited { retry_after_ms },
+                    )))
+                    .await;
+                let _ = span.in_scope(|| {
+                    self.guard
+                        .refused_grants(Self::caller(principal), refused_grants)
+                });
+                None
+            }
+        }
+    }
+
+    /// Take the mutation's reader-share permit (R39), or defer the mutation
+    /// in R19's shape and report [`None`].
+    ///
+    /// The refusal is correlated by the `client_seq` rendered as a string,
+    /// exactly as `NonFatalError` correlates. The mutation is neither applied
+    /// nor acknowledged, so it stays pending on the client and replays on
+    /// reconnect.
+    async fn mutation_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<ReaderPermit>, SessionError> {
+        match self.guard.reader_permit(Tier::of(&state.principal)).await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    client_seq,
+                    retry_after_ms,
+                    "mutation deferred, the unreserved reader share is full"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(client_seq.to_string()),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Take a row subscription's reader-share permit (R39), or refuse it in
+    /// R19's nonfatal shape and report [`None`], unwinding the registration.
+    /// The route is not attached and the label not recorded at this point, so
+    /// the registration is the one thing to unwind.
+    async fn subscribe_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        tier: Tier,
+        sub_id: &str,
+        registered: SubscriptionId,
+    ) -> Result<Option<ReaderPermit>, SessionError> {
+        match self.guard.reader_permit(tier).await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    sub_id = %sub_id,
+                    retry_after_ms,
+                    "subscription refused, the unreserved reader share is full"
+                );
+                self.materializer.lock().await.unregister(registered);
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(sub_id.to_owned()),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(None)
+            }
+        }
     }
 
     /// Whether the caller is banned, checked one frame after the grant that
@@ -1591,18 +1702,26 @@ where
 
         // Probe conflicts and apply through the write target, which owns the
         // backend specifics: the Postgres target applies under the user's RLS
-        // context so the database gates the write.
-        match self
-            .target
-            .commit(
-                &state.principal,
-                &plan,
-                &patch.patchset_zstd,
-                state.session_id,
-                client_seq,
-            )
-            .await
-        {
+        // context so the database gates the write. The apply is the mutation's
+        // one reader-pool checkout, so a share permit spans it (R39).
+        let outcome = {
+            let Some(_reader_permit) = self
+                .mutation_reader_permit(transport, client_seq, state)
+                .await?
+            else {
+                return Ok(());
+            };
+            self.target
+                .commit(
+                    &state.principal,
+                    &plan,
+                    &patch.patchset_zstd,
+                    state.session_id,
+                    client_seq,
+                )
+                .await
+        };
+        match outcome {
             Ok(WriteOutcome::Applied) => {
                 state.applied_watermark = Some(client_seq);
                 self.ack(transport, client_seq).await
@@ -1691,9 +1810,9 @@ where
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        let tier = Self::principal_tier(&state.principal);
+        let tier = Tier::of(&state.principal);
         if let Some(wait) = self.guard.subscription(state.session_id, tier) {
-            let retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+            let retry_after_ms = retry_ms(wait);
             tracing::warn!(
                 sub_id = %sub.sub_id,
                 retry_after_ms,
@@ -1743,6 +1862,18 @@ where
 
         match registration {
             Registration::Row(sub_id) => {
+                // One share permit spans the whole row delivery (R39): the
+                // snapshot read or the catchup replay's visibility questions,
+                // which check out reader connections one at a time, so an
+                // unidentified caller counts once for the operation however
+                // many checkouts it makes. Aggregates bootstrap through the
+                // re-execution connector on the owner pool and take none.
+                let Some(_reader_permit) = self
+                    .subscribe_reader_permit(transport, tier, &sub.sub_id, sub_id)
+                    .await?
+                else {
+                    return Ok(());
+                };
                 let sub_label = sub.sub_id.clone();
                 let reg = RowRegistration {
                     consumer_id,

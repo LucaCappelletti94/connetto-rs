@@ -28,8 +28,10 @@ use subql::backend::{Postgres, Value};
 use subql::visibility::{Verdict, VisibilityPolicy};
 
 use crate::authn::token::{AuthConfig, TokenAuthority, TokenError};
+use crate::reserve::{ReaderGate, ReaderPermit};
 use crate::row_view::ValuesRow;
 use crate::snapshot::RowSource;
+use crate::throttle::Tier;
 
 /// The deployment's share-key type: how one is minted, and how the keys a
 /// caller holds reach Postgres.
@@ -218,6 +220,14 @@ pub enum ShareError {
     /// Signing failed.
     #[error(transparent)]
     Mint(#[from] TokenError),
+    /// The unreserved reader share stayed full for the whole queue window, so
+    /// the reads behind the mint were refused rather than served on capacity
+    /// R39 reserves for identified callers.
+    #[error("no reader capacity for an unidentified caller, retry after {retry_after:?}")]
+    RateLimited {
+        /// How long to wait before asking again.
+        retry_after: Duration,
+    },
 }
 
 /// Mints share keys, having checked the caller may read what it is sharing.
@@ -234,6 +244,9 @@ pub struct CapabilityIssuer<P, R, Id> {
     /// Sink for the durable record of a successful mint. `None` records
     /// nothing. It also fixes `Id`, so no separate marker is needed.
     audit: Option<crate::audit::AuditHook<Id>>,
+    /// The reader-pool gate the mint's reads take a share permit from. `None`
+    /// leaves them ungated, the pre-R39 behaviour.
+    reader: Option<ReaderGate>,
 }
 
 impl<P, R, Id> CapabilityIssuer<P, R, Id> {
@@ -254,6 +267,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             ttl: config.capability_ttl,
             max_ttl: config.capability_max_ttl,
             audit: None,
+            reader: None,
         }
     }
 
@@ -264,6 +278,18 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     #[must_use]
     pub fn with_audit(mut self, hook: crate::audit::AuditHook<Id>) -> Self {
         self.audit = Some(hook);
+        self
+    }
+
+    /// Bound this issuer's reads by the reader pool's reserved split (R39).
+    ///
+    /// The mint reads the shared row and asks the visibility question on the
+    /// reader pool, so without this an unidentified caller could occupy
+    /// connections past the reserve. Clone the same [`ReaderGate`] the
+    /// [`RequestGuard`](crate::RequestGuard) holds: one split per pool.
+    #[must_use]
+    pub fn with_reader_gate(mut self, gate: ReaderGate) -> Self {
+        self.reader = Some(gate);
         self
     }
 
@@ -284,7 +310,8 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     /// # Errors
     ///
     /// [`ShareError`] when the caller may not read the row, the row cannot be
-    /// reached, the lifetime exceeds the ceiling, or signing fails.
+    /// reached, the lifetime exceeds the ceiling, signing fails, or an
+    /// unidentified caller finds the unreserved reader share full.
     pub async fn issue<Key>(
         &self,
         caller: &Principal<Id, Key>,
@@ -308,6 +335,16 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             }
             Some(requested) => requested,
             None => self.ttl,
+        };
+        // The row read and the visibility question below both check out
+        // reader connections, one at a time, so one share permit spans the
+        // mint (R39).
+        let _reader_permit = match &self.reader {
+            Some(gate) => gate
+                .acquire(Tier::of(caller))
+                .await
+                .map_err(|retry_after| ShareError::RateLimited { retry_after })?,
+            None => ReaderPermit::none(),
         };
         let row = self
             .rows

@@ -70,6 +70,19 @@ pub enum Tier {
     Anonymous,
 }
 
+impl Tier {
+    /// The tier `principal` gets: identified when its handshake resolved an
+    /// identity, anonymous otherwise.
+    #[must_use]
+    pub fn of<Id, Key>(principal: &connetto_core::auth::Principal<Id, Key>) -> Self {
+        if principal.identity().is_some() {
+            Self::Identified
+        } else {
+            Self::Anonymous
+        }
+    }
+}
+
 /// The limits one tier gets, built by naming only what differs from the
 /// tier's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

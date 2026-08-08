@@ -25,6 +25,7 @@ use crate::abuse::{
 };
 use crate::audit::{AuditHook, AuthEvent, AuthOp};
 use crate::ban::{Ban, BanError, BanStore, NewBan};
+use crate::reserve::{ReaderGate, ReaderPermit};
 use crate::throttle::{AuthThrottle, Counters, HandleThrottle, ThrottleConfig, Tier};
 
 /// Closes every live connection one banned person holds, telling them nothing.
@@ -125,6 +126,7 @@ pub struct RequestGuard<Id> {
     enforcement: Option<Arc<dyn EnforcementPolicy<Id>>>,
     audit: OnceLock<AuditHook<Id>>,
     close: OnceLock<PersonCloseHook>,
+    reader: Option<ReaderGate>,
 }
 
 // Hand-written because four fields are trait objects. What a reader wants is
@@ -138,6 +140,7 @@ impl<Id> core::fmt::Debug for RequestGuard<Id> {
             .field("enforcement", &self.enforcement.is_some())
             .field("audit", &self.audit.get().is_some())
             .field("close", &self.close.get().is_some())
+            .field("reader", &self.reader.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +174,7 @@ where
             enforcement: None,
             audit: OnceLock::new(),
             close: OnceLock::new(),
+            reader: None,
         }
     }
 
@@ -188,6 +192,25 @@ where
     pub fn with_enforcement(mut self, policy: Arc<dyn EnforcementPolicy<Id>>) -> Self {
         self.enforcement = Some(policy);
         self
+    }
+
+    /// Attach the reader-pool gate, so unidentified callers cannot occupy the
+    /// share R39 reserves for identified ones. Without one every checkout is
+    /// permitted, which is the pre-R39 behaviour and right for a host with no
+    /// reader pool to protect.
+    #[must_use]
+    pub fn with_reader_gate(mut self, gate: ReaderGate) -> Self {
+        self.reader = Some(gate);
+        self
+    }
+
+    /// A permit for one reader-pool span as `tier`, refused with retry advice
+    /// when the unreserved share stays full for the whole queue window.
+    pub(crate) async fn reader_permit(&self, tier: Tier) -> Result<ReaderPermit, Duration> {
+        match &self.reader {
+            Some(gate) => gate.acquire(tier).await,
+            None => Ok(ReaderPermit::none()),
+        }
     }
 
     /// Attach the audit sink, once, so an impose and a lift reach `auth_events`.

@@ -31,6 +31,7 @@ mod key_filter;
 pub mod materializer;
 pub mod oplog;
 pub mod pk;
+pub mod reserve;
 pub mod row_view;
 pub mod session;
 pub mod snapshot;
@@ -76,6 +77,7 @@ pub use oplog::{
     OplogConfig, catchup_decision,
 };
 pub use oplog::{PgOplog, PgOplogError};
+pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
     NoConnector, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError, SessionManager,

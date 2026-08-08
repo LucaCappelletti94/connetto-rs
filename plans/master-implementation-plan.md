@@ -70,7 +70,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R19~~ **DONE** | Throttling. Landed 2026-08-06: subscriptions, connections and credential refusals metered per durable handle and per tier, refresh failures per session and per account, all limits chain-built |
 | done | ~~R36~~ **DONE** | Landed 2026-08-06: four refusal signals tallied per person over a day and per connection within one socket, bans in a deployment-owned table with a nullable expiry, and the application asked what a crossing costs |
 | any | R37 | Needs R36, so one sweep converts every remaining plain struct at once. The style itself enters with R19 (decided 2026-08-06). Consistency work, so it slots wherever it is wanted |
-| any | R39 | Blocked on nothing. R36's detector cannot bound a caller that discards its identity, and the reserved pool share is that bound, so R36 leans on this landing |
+| done | ~~R39~~ **DONE** | Landed 2026-08-08: pool sizes explicit, a strict permit split over the reader pool held by `RequestGuard`, over-share refusals in R19's shape at the handshake, subscribe and mutation boundaries, proven against a real pool under contention |
 | 10 | ~~R5a~~ **DONE** | Waited on `upstream-subql-visibility-trait.md` landing upstream, which it did at subql `8e9b2df`. Not on rls2fga |
 | 11 | ~~R0 part B, the full measurement~~ **DONE** | Needed R5a's seam to measure through, which landed first |
 | 12 | R5b | Needs `docs/upstream-subql-per-row-visibility.md`, which is underway upstream. R5a, R0 and the rls2fga request are all done |
@@ -128,7 +128,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R19 request throttling | **DONE** (2026-08-06) | nothing | no |
 | R36 abuse detection and identity bans | **DONE** (2026-08-06) | nothing | no |
 | R37 one configuration style | NOT STARTED | nothing, R36 is done | no |
-| R39 reserved pool share for identified callers | NOT STARTED | nothing, its three inputs were settled 2026-08-08 | no |
+| R39 reserved pool share for identified callers | **DONE** (2026-08-08) | nothing | no |
 | R5a visibility seam | **DONE** (2026-08-04) | nothing, the trait landed upstream at subql `8e9b2df` and the pin is past it | landed |
 | R0 part B, full measurement | **DONE** (2026-08-07) | nothing | landed with R5a |
 | R5b service as executor | NOT STARTED | `upstream-subql-per-row-visibility.md`, which is **underway** on subql branch `feat/visibility-from-the-row`. R5a, R0 and the rls2fga request are all done | **yes, subql (per-row), in progress** |
@@ -2270,7 +2270,7 @@ One configuration style exists in the codebase.
 
 ## R39: a reserved share of the connection pool for identified callers
 
-**Status.** NOT STARTED. Its three inputs were settled with the maintainer on 2026-08-08 and are recorded below and in `16-server-capacity.md`, so nothing blocks code.
+**Status.** **DONE (2026-08-08).** Its three inputs were settled with the maintainer the same day and are recorded below and in `16-server-capacity.md`.
 
 **Blocked on nothing.** R36 step 1 points here for a bound it cannot provide itself, so this should not sit behind R36 indefinitely.
 
@@ -2293,9 +2293,22 @@ The shape is sourced in `docs/research-overload-and-fairness.md`: reserve for th
 ### Steps
 
 1. ~~Settle and record inputs 1 and 2 before writing code.~~ **Settled 2026-08-08, all three, see Inputs above.**
-2. Make both pool sizes explicit and configurable, defaults unchanged, with the reserve expressed relative to the reader pool's configured total. The number is revisited against R5b's rerun, not chosen here.
-3. Gate pool checkout by tier, so unidentified callers in flight cannot exceed the total less the reserve.
-4. Refuse an over-reserve checkout in the shape R19 already established rather than inventing a second one.
+2. ~~Make both pool sizes explicit and configurable, defaults unchanged, with the reserve expressed relative to the reader pool's configured total.~~ **Done.** `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` (both default 10), `CONNETTO_READER_RESERVE` (default 3), all in the binary's module header. A reserve over the pool size refuses startup naming both numbers. The number is revisited against R5b's rerun, not chosen here.
+3. ~~Gate pool checkout by tier, so unidentified callers in flight cannot exceed the total less the reserve.~~ **Done**, as a permit split in `reserve.rs` held by `RequestGuard`, see What execution changed.
+4. ~~Refuse an over-reserve checkout in the shape R19 already established rather than inventing a second one.~~ **Done**: `FatalErrorReason::RateLimited` at the handshake, `ControlMessage::RateLimited` at subscribe and mutation, `ShareError::RateLimited` on the library mint call.
+
+### What execution changed
+
+Mechanism decisions taken in-phase, none reopening the three inputs.
+
+1. **The split is a permit around each caller-attributed span, not a wrapper inside the pool types.** `reserve.rs` holds `ReaderReserve` (chain-of-calls config: `total`, `reserved`) and `ReaderGate`, a FIFO `tokio::sync::Semaphore` with `total - reserved` permits that only the anonymous tier draws from. Identified callers are never gated, because the pool itself is their bound. `RequestGuard` carries the gate (`with_reader_gate`) and `SessionManager` takes one permit per span: the handshake's watermark read, a row subscription's whole delivery (the snapshot read or the catchup replay's per-row visibility questions, sequential checkouts that count once), and a mutation's apply. Gating inside `RlsAuth::visible` was rejected because that function also serves the change path, where the single ingest task issues questions for watchers of both tiers sequentially: an anonymous permit wait there would head-of-line-block identified live delivery, and refusing would silently drop a row an anonymous watcher was entitled to see. The change path holds at most one reader connection by construction (R0), so it stays ungated and the guarantee under full anonymous saturation is `reserved` less that one connection.
+2. **Wait briefly, then refuse.** An over-share anonymous checkout queues up to one second (constant, `reserve.rs`) on the fair semaphore before drawing the typed refusal carrying that wait as `retry_after_ms`. Refusing at once was rejected because the share's cheap occupants (visibility questions, watermark reads) turn over in milliseconds, so transient fullness would make refusals routine at modest anonymous concurrency. Waiting longer was rejected because the long occupant is a snapshot read, which no short wait rides out, and a queued flood must not build an unbounded backlog. A queued caller holds no connection.
+3. **Permit return is RAII.** The permit is an owned semaphore permit dropped at span end, so every path including panics and early returns releases it. Proven in `reserve.rs` unit tests with a paused clock.
+4. **The default reserve is 3 of 10**, recorded per the R19 precedent (chosen generous at implementation). Setting the reserve equal to the pool size is legal and turns anonymous database access off, since every anonymous operation, the handshake watermark read included, then refuses.
+5. **A deferred mutation is correlated by its `client_seq` rendered as a string**, the correlation `NonFatalError` already documents, and `RateLimited.related_to`'s doc gained that clause (the phase's one `connetto-core` touch, a rustdoc string only). The mutation is neither applied nor acknowledged, so it stays pending on the client and replays on reconnect.
+6. **The mint path is gated through `CapabilityIssuer::with_reader_gate`**, since the mint's row read and visibility question run on the reader pool but the issuer is a library call from the application's own handler. The application clones the same gate the guard holds (one split per pool) and maps the new `ShareError::RateLimited { retry_after }` to its own 429. The reference binary builds no issuer, so nothing changes there. Aggregate bootstraps stay ungated: they run on the owner pool through the re-execution connector.
+7. **`Tier::of(principal)` moved the tier mapping into `throttle.rs`**, replacing the session-private `principal_tier`, so the capability path names the same rule. A `retry_ms` helper now owns the wait-to-milliseconds conversion at every refusal site.
+8. **Proof rig.** `tests/reserve.rs`, Docker-gated: a 3-connection reader pool with reserve 1, anonymous snapshots held open by a row-level-security policy that sleeps (`pg_sleep` in a plpgsql function), occupancy observed through `pg_stat_activity` rather than timing. With both anonymous share connections held: an over-share anonymous subscribe draws the nonfatal `RateLimited` naming its `sub_id` and the session survives, an over-share anonymous mutation draws the same shape naming its sequence and answers a ping after, a fresh anonymous handshake draws the fatal shape, and the identified caller completes handshake plus snapshot while `pg_stat_activity` still shows both share connections inside the slow read. The counterpart test holds both anonymous reads concurrently in flight and both complete. Gate run 2026-08-08: fmt, nightly clippy `-D warnings`, native suite 223 passed, docs clean, Docker sweep 99 (server and harness, `reserve.rs`'s 2 included) plus 40 (client, `verified_topology` excluded as ever, dev stack) all green.
 
 ### Proof
 
