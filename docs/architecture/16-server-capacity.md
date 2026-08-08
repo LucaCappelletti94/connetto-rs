@@ -1,6 +1,6 @@
 # 16: Server capacity and admission
 
-**Status**: normative, and short by intent. Paragraphs marked **Built.** describe what exists today. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The reservation this chapter decides is unbuilt, and three of its inputs are undecided and named as such at the end. The survey behind the decisions is `docs/research-overload-and-fairness.md`, a process artifact carrying a citation per claim.
+**Status**: normative, and short by intent. Paragraphs marked **Built.** describe what exists today. Every normative statement is marked **Decided**, naming its phase in `plans/master-implementation-plan.md`. The reservation this chapter decides is unbuilt. Its three inputs were settled with the maintainer on 2026-08-08 and are recorded at the end. The survey behind the decisions is `docs/research-overload-and-fairness.md`, a process artifact carrying a citation per claim.
 
 ---
 
@@ -70,10 +70,10 @@ Connetto's obligation is the narrow one, and the same book states it: a task pro
 
 ---
 
-## Not decided
+## The three inputs, settled 2026-08-08
 
-R39 settles these before any code, per the standing rule on under-defined sections.
+These were open until the reconciliation session of 2026-08-08, which settled all three with the maintainer. R39's step 1 is discharged by this section.
 
-1. **The size of each pool.** Both are a library default nobody chose, and a reserve cannot be carved out of a number that was never decided. The number should come from measurement, and R0 part B supplies the first piece of it, on 2026-08-07: **the change path is not what sizes the reader pool.** Visibility questions are issued one at a time by the single change-ingest task, so that path holds exactly one connection at any moment whatever the subscriber count, while turning it over roughly 1,700 times a second. What competes for the rest is per-caller work, snapshots and the handshake watermark read, which is what item 3 below is already about. R0 did not measure those, so the size itself is still open.
-2. **Strict or work-conserving.** A strict reserve holds its share back even when no identified caller wants it, and guarantees availability immediately. A work-conserving one lets unidentified traffic use everything and engages the reserve only while an identified caller is waiting, wasting nothing but weakening the guarantee to however long in-flight work takes to drain.
-3. **One reserve or several.** A snapshot read holds a connection far longer than a visibility question does, so a single count may be the wrong unit.
+1. **The pool sizes become explicit, configurable settings now, and the real number is derived after R5b.** Both pools keep their default of ten, no longer implicit, and the reserve is expressed relative to the reader pool's configured total. Sizing from today's measurement was rejected because the measured profile is about to change: R0 found the throughput ceiling to be the per-subscriber visibility round trips, which R5b deletes. What R0 already settled, and the eventual measurement therefore skips: **the change path is not what occupies the reader pool.** Visibility questions are issued one at a time by the single change-ingest task, so that path holds exactly one connection at any moment whatever the subscriber count, while turning it over roughly 1,700 times a second. What occupies the pool is per-caller work, snapshots, mutation applies and the handshake watermark read, and R5b's rerun of the load harness is where those get their number.
+2. **Strict, not work-conserving.** The reserved share is held back even when no identified caller wants it, so the guarantee is arithmetic and immediate, and the mechanism is a permit split with no admission logic. Work-conserving was rejected: it weakens the promise to however long in-flight unidentified work takes to drain, which a snapshot transfer makes unbounded in practice, and the async runtime's first-come-first-served permit queue means it needs its own admission decision rather than a permit count. Stripe, the closest surveyed peer, chose strict.
+3. **One reserve, not per-operation.** A single reserved count over the whole reader pool, whatever the operation, keeping the configuration one knob in the style the throttling and abuse settings already set. Per-operation reserves were rejected as several numbers nobody has measured, each future operation class needing its own decision, and the failure they would prevent (unidentified snapshots crowding unidentified checks) sits inside the tier the reserve deliberately does not protect.

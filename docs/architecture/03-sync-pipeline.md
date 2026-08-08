@@ -16,7 +16,7 @@ Describe how mutations flow from client to server (write path) and how server-si
 
 The client writes the mutation to its local SQLite immediately, before the server has confirmed it. This keeps the UI responsive.
 
-The local write is tagged with a `pending` flag and the `client_seq`.
+Nothing tags the row itself. The write is recorded by the change-capture session, and pending state lives in the queue below, keyed by `client_seq`. What makes the write "optimistic" is only that the local apply precedes the server's answer: a rejection or a conflict later inverts the captured changeset (see 6 below).
 
 ### 2. Local mutation queue
 
@@ -43,37 +43,23 @@ If the connection drops before an ack, the mutation is re-sent after reconnect (
 
 On receiving a `MutationHeader` and its `MutationPatch`:
 
-1. Check authorization: does the client have write permission for this table and row?
-2. Check schema: does the payload match the current column set?
-3. Check for conflict: compare `base_version` to the current row version in PostgreSQL.
-4. If all checks pass: `BEGIN`, apply the mutation, `COMMIT`.
-5. Reply with `MutationApplied { client_seq }`.
-
-On authorization failure: `MutationReject(client_seq, reason=Unauthorized)`.
-On schema mismatch: `MutationReject(client_seq, reason=SchemaMismatch)`.
-On constraint violation: `MutationReject(client_seq, reason=Constraint(detail))`.
+1. Decompress and parse the patchset. A payload that does not parse is refused with `reason=Malformed`, and one naming tables or columns outside the current schema with `reason=SchemaMismatch`.
+2. Open one transaction and bind the caller (`SET LOCAL app.user_id`, plus the held share keys per R4), so Postgres row-level security gates the writes.
+3. For each version-bearing op, probe the row: `WHERE id = ? AND updated_at = ?` against the op's recorded old `updated_at` (the conflict token, Q3.2). A stale or missing row rolls the transaction back and replies `MutationConflict` carrying the server's current copy when the row still exists.
+4. Apply the changeset. A row-level-security refusal (a `WITH CHECK` violation, or an `UPDATE`/`DELETE` finding no visible row) rolls back and replies `MutationReject(reason=Unauthorized)`. A constraint violation replies `reason=Constraint(detail)`.
+5. On commit: `MutationApplied { client_seq }`, which is what retires the client's pending record.
 
 ### 5. Conflict handling
 
-A conflict occurs when `base_version` does not match the server's current row version, meaning the row was modified by someone else since the client last saw it.
+A conflict occurs when a version-bearing op's recorded `updated_at` does not match the server's current row version, meaning the row was modified by someone else since the client last saw it.
 
-The server sends `MutationConflict(client_seq, server_current_value)`.
+The server sends `MutationConflict(client_seq, table, server_row)`, with the server's copy absent when the row is gone.
 
-The client's conflict resolution policy (configured per table) then runs:
-
-| Strategy | Behavior |
-|---|---|
-| `ServerWins` | Client rolls back the optimistic write; applies server value. |
-| `ClientWins` | Client re-sends the mutation without a `base_version` check (force-apply). |
-| `LastWriterWins` | Compare timestamps; highest timestamp wins. |
-| `Custom` | Application-provided merge function; result re-queued as a new mutation. |
+**The client's response is one policy, revert, and the application layers its own merge on top.** An earlier sketch here tabled four per-table strategies (`ServerWins`, `ClientWins`, `LastWriterWins`, `Custom`). None of that configuration exists and none is planned: the connection inverts the retained changeset and applies the inverse with capture suspended, undoing the optimistic write without re-uploading it, and a row a concurrent server patch already changed is left as the server left it. Both `MutationReject` and `MutationConflict` reach the application carrying the affected rows (`AffectedRow { table, key }`) and, for a conflict, the server's current copy, so an application wanting anything other than server-wins re-writes on top of the reverted state with data it was handed.
 
 ### 6. Rollback on rejection
 
-On `MutationReject`, the client:
-1. Removes the mutation from the queue.
-2. Reverts the optimistic local write.
-3. Notifies the application layer of the rejection.
+On `MutationReject`, the client retires the pending record, inverts the retained changeset with capture suspended (reverting the optimistic local write), and surfaces the rejection with its affected rows to the application.
 
 ---
 
@@ -106,22 +92,18 @@ This is an index lookup: subscriptions are indexed by the tables they reference.
 
 ### 3. Authorization filter
 
-For each matched subscription, the auth engine checks:
+**Built (R5a): one question per changed row, asked once for every watcher.** `may_see` takes the row and all matched watchers and returns one verdict each, so authorization is evaluated in batch rather than per-subscription serially. Behind the seam the RLS implementation still runs one `SELECT EXISTS` round trip per watcher, which R0 measured as the whole throughput ceiling and R5b replaces.
 
-- **Before the change**: if the client could see the old row, it may need a delete event.
-- **After the change**: if the client can see the new row, it gets an insert/update event.
-- **Visibility change**: a row becoming visible to a client is delivered as an insert. A row becoming invisible is delivered as a delete (even if the underlying op was an update).
+**What the filter consults today is the current row version only, and the two-check form is Decided (R6), not built.** The built behaviour and its two consequences:
 
-Auth is evaluated in batch for all affected subscriptions at once, not per-subscription serially.
+- An event whose post-image exists (insert, update) is delivered only to watchers who may see the current row. A row whose update made it **invisible** to a watcher is silently dropped: no delete is synthesized, and that client keeps its stale copy for ever. R6 closes this by consulting the previous version when the current one is absent or invisible and delivering the tombstone the client already applies.
+- A delete or truncate has no post-image, so it replays to **every** subscriber of the table unconditionally, disclosing the primary key of a deleted row to callers who could never see it. R6 filters tombstones on the previous version.
+
+**Distinct from both, and built (R44): a predicate departure.** A row that stops matching a subscription's own `WHERE` clause (visibility unchanged) is announced to exactly the subscribers it left, as a delete marked with the patchset op's indirect flag, and the client applies it only when no surviving subscription still covers the row. See `04-subscriptions.md`. Losing authorization is R6's unbuilt case, leaving the predicate window is R44's built one.
 
 ### 4. Delta packager
 
-Matching, authorized changes are grouped into a `LivePatch` frame per session. The frame includes:
-
-- The server LSN (so the client can advance its cursor)
-- A list of `(sub_id, op, pk, new_values)` entries
-
-Multiple subscriptions affected by the same underlying change may be bundled in the same `LivePatch` frame.
+One patchset is encoded per CDC event, compressed once, and the identical bytes go to every matched consumer as a `LivePatch` bulk frame carrying that subscription's `sub_id`, the event's `cursor`, and `patchset_zstd`. There is no per-session bundling and no `(op, pk, values)` entry list: the payload is a Zstd-compressed SQLite patchset, exactly what the client applies. An event that also has departures encodes one further payload, the marked departure delete, shared by every subscriber the row left (R44).
 
 ### 5. Delivery
 
@@ -133,22 +115,18 @@ The message is sent over the WebSocket connection.
 
 On receiving `LivePatch`:
 
-1. Buffer if LSN is not contiguous with the last applied LSN (gap detected: see `06-reconnect.md`).
-2. For each entry, apply to local SQLite: INSERT / UPDATE / DELETE on the relevant local table.
-3. Clear the `pending` flag on local rows that match a confirmed mutation (matched by pk + LSN).
-4. Persist the new LSN as the client's resume cursor.
-5. Send `Ack(1)` to the server to replenish one flow-control credit.
+1. Apply the patchset to local SQLite inside one transaction, with capture suspended so server rows are never re-uploaded. Frames arrive in commit order on an ordered transport, so there is no gap detection and no reorder buffer on the live path: a gap can only open across a disconnect, and the resume cursor plus catchup or full resync covers it (`06-reconnect.md`).
+2. Honour the departure marker: an indirect delete applies only when no surviving subscription's predicate still matches the row (R44).
+3. Persist the frame's cursor as the resume position, atomically with the apply.
+4. Return flow-control credit to the server (`AckCredits`).
 
 ---
 
 ## Interaction Between Write and Read Paths
 
-When a client's own mutation is successfully applied server-side, it triggers a CDC event. That event flows through the fanout engine and may arrive back at the originating client as a `LivePatch` frame.
+When a client's own mutation is successfully applied server-side, it triggers a CDC event. That event flows through the fanout engine and arrives back at the originating client as an ordinary `LivePatch`.
 
-The client must recognize this and not double-apply:
-
-- Server-confirmed rows are matched by pk + LSN (the LSN of the mutation's commit is included in `MutationApplied`).
-- When a `LivePatch` frame arrives for a row the client already applied optimistically, the client reconciles: if the server value matches the local value, it just clears the `pending` flag. If it differs, it applies the server value (server wins by default for own-mutation reconciliation).
+**The echo is not suppressed and needs no recognition.** Applying it is idempotent: the patch carries the values the client already holds, and re-application converges under the same rule as the snapshot overlap (R28 part A). Pending bookkeeping never rides the echo: the dedicated `MutationApplied { client_seq }` reply is what retires the pending record, and the handshake's durable watermark (`last_applied_seq`) retires anything acknowledged while the client was away.
 
 ---
 
@@ -158,7 +136,7 @@ The client must recognize this and not double-apply:
 2. ~~**Base version representation**: what exactly is `base_version`? Row-level timestamp? Vector clock? PostgreSQL `xmin`? Choice affects conflict granularity and server-side comparison cost.~~ **Decided (Q3.2):** `updated_at TIMESTAMPTZ` is the conflict token, using `WHERE id = ? AND updated_at = ?` to detect conflicts. `xmin` wraps internally and is unsuitable. Vector clocks and HLC are overkill for a single-authority PostgreSQL backend.
 3. ~~**CDC source**: logical replication vs. trigger-based `NOTIFY`: tradeoffs in latency, setup complexity, and permission requirements.~~ **Decided (Q3.3):** Logical replication. The entire stack is built on logical replication, so no trigger-based `NOTIFY` path is needed or planned.
 4. ~~**Predicate evaluation**: for complex subscription filters, should matching be done fully in-process, or should the server issue a small SQL query per CDC event? The latter is accurate but slower.~~ **Decided (Q3.4, Q8.1):** Subscription predicate matching is in-process via `subql` (bitmap-indexed candidate pruning plus predicate bytecode VM), with SQL re-execution fallback for predicates outside its scope (JOINs, subqueries, MIN or MAX extreme removal). Authorization is evaluated via OpenFGA using its Rust SDK (Q8.1), not per-row SQL queries.
-5. ~~**Own-mutation echo suppression**: should the server suppress the CDC echo for the originating client (send only `MutationAck` and no `RowUpdate`), or always send both? Suppression is an optimization but complicates LSN tracking.~~ **Decided (Q3.5):** No suppression. The `LivePatch` frame arriving from the CDC fanout is the de-facto acknowledgement: the client matches it against pending ops by PK and clears the pending status. Dedicated reject or conflict messages handle error cases only.
+5. ~~**Own-mutation echo suppression**: should the server suppress the CDC echo for the originating client (send only `MutationAck` and no `RowUpdate`), or always send both? Suppression is an optimization but complicates LSN tracking.~~ **Decided (Q3.5):** No suppression. The echo `LivePatch` is delivered like any other and re-applies idempotently. **Mechanism note corrected 2026-08-08**: this entry used to say the echo was the de-facto acknowledgement, matched against pending ops by primary key. It is not and never was built that way: the dedicated `MutationApplied` reply retires the pending record by `client_seq`, and the echo carries no pending bookkeeping at all.
 
 ---
 

@@ -32,7 +32,7 @@ The client persists the following in local SQLite across process restarts:
 | `last_applied_lsn` | Highest server LSN the client has applied to local SQLite. |
 | `pending_mutations` | The local mutation queue (see `03-sync-pipeline.md`). |
 | `subscriptions` | The set of subscriptions to re-declare on reconnect (spec + sub_id). |
-| `session_token` | Durable session handle. **Built, defective**: not persisted and not read back by the server. **Decided (R2)**: persisted outside the local replica and presented on reconnect (chapter 12). |
+| `session_token` | Durable session handle. **Built (R2, R3)**: for an identified run the auth store's session id is the handle, an unidentified run gets one minted at handshake, and the `resume_token` credential returned beside it is what proves the handle on the next connect. The client persists the pair outside the local replica (natively where the refresh token lives, worker-only in the browser). Cursors, the watermark and the connection registry key on it (chapter 12). |
 
 The `last_applied_lsn` is the client's resume cursor. It is updated atomically with each applied `LivePatch` frame.
 
@@ -103,17 +103,19 @@ The server responds with:
 
 ```
 HandshakeAck {
-  session_token:  String,    // Built, defective: see note below
-  current_lsn:    u64,
-  schema_version: String,
+  connection_id:    String,           // per-connection routing label, not identity
+  session_token:    String,           // the run's durable handle, in the clear
+  resume_token:     String,           // the credential proving that handle next time
+  current_cursor:   Cursor,           // server's current position
+  schema_version:   Option<SchemaVersion>,
+  initial_credits:  u32,              // flow-control grant
+  last_applied_seq: Option<u64>,      // durable mutation watermark
 }
 ```
 
-**Built, defective.** `session_token` exists on the wire in both directions but is non-functional: the server mints `format!("token-{connection_num}")` per connection, never reads the client's presented value back, and no client persists it. See chapter 12 for the full account.
+**Built (R2, R3).** The handle is real and everything operational keys on it: subql's per-subscription cursors resume through it, the exactly-once watermark is keyed on it alone, and the registry serves revocation and supersession by it. `resume_token` proves it, so a handle presented without the credential that proves it starts a fresh run instead of adopting the old one.
 
-**Decided (R2).** `session_token` becomes a real server-minted durable opaque handle. The client persists it outside its local replica and presents it on reconnect. See chapter 12.
-
-**Decided (R3).** A grant that fails to resolve does not end the connection. The handshake succeeds on whatever resolved. See chapter 12.
+**Built (R3).** A grant that fails to resolve does not end the connection. The handshake succeeds on whatever resolved. See chapter 12.
 
 After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 

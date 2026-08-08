@@ -70,6 +70,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R19~~ **DONE** | Throttling. Landed 2026-08-06: subscriptions, connections and credential refusals metered per durable handle and per tier, refresh failures per session and per account, all limits chain-built |
 | done | ~~R36~~ **DONE** | Landed 2026-08-06: four refusal signals tallied per person over a day and per connection within one socket, bans in a deployment-owned table with a nullable expiry, and the application asked what a crossing costs |
 | any | R37 | Needs R36, so one sweep converts every remaining plain struct at once. The style itself enters with R19 (decided 2026-08-06). Consistency work, so it slots wherever it is wanted |
+| any | R39 | Blocked on nothing. R36's detector cannot bound a caller that discards its identity, and the reserved pool share is that bound, so R36 leans on this landing |
 | 10 | ~~R5a~~ **DONE** | Waited on `upstream-subql-visibility-trait.md` landing upstream, which it did at subql `8e9b2df`. Not on rls2fga |
 | 11 | ~~R0 part B, the full measurement~~ **DONE** | Needed R5a's seam to measure through, which landed first |
 | 12 | R5b | Needs `docs/upstream-subql-per-row-visibility.md`, which is underway upstream. R5a, R0 and the rls2fga request are all done |
@@ -84,6 +85,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R33 | Found while reading the same function for R28 part A, and separated because the cause and the consequence both differ. Reasoned, not demonstrated, so its first step is to demonstrate it |
 | done | ~~R29~~ **DONE** | The coverage question R15 asks. Landed 2026-08-08: the resync delete spares what siblings still want, watches gain a grace and pins are the durable form. Its window-exit half became R44 and its write surface moved to R15 |
 | done | ~~R44~~ **DONE** | Landed 2026-08-08, the day it was split out of R29. A departed row is now removed unless a sibling subscription still covers it |
+| any | R45 | The fix bundle from the 2026-08-08 reconciliation: five small defects, each mechanical and blocked on nothing, bundled so none sits unowned |
+| any | R46 | The wasm-smoke intermittent hang. An investigation, demonstrate-first like R33, because a flaky browser gate halves confidence in every browser-touching phase |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
@@ -92,7 +95,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
 | done | ~~R41~~ **DONE** | One seam for the two secret stores. Landed 2026-08-07: one trait per secret in `connetto-core`, both name-addressed, the browser key store renamed off the collision |
 | done | ~~R17~~ **DONE** | The local tier's name and key scope. Landed 2026-08-07: the tier is named from the replica's own file name, and the delete-my-data path destroys it too |
-| any | R42 | Several accounts signed in at once, split out of R17 on 2026-08-07. Blocked on one decision, not on a phase, so it waits for that discussion rather than for code |
+| any | R42 | Several accounts signed in at once, split out of R17 on 2026-08-07. The cold-boot decision was taken 2026-08-08 and is recorded in the phase, so it lands whenever it is wanted |
 | done | ~~R43~~ **DONE** | The browser held two handles on one tier file. Found while grounding R17 on 2026-08-07 and landed the same day: the client's attachment is the only handle, the relay serves through it, and a tab write is replayed under the old conflict rule |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
@@ -124,7 +127,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R19 request throttling | **DONE** (2026-08-06) | nothing | no |
 | R36 abuse detection and identity bans | **DONE** (2026-08-06) | nothing | no |
 | R37 one configuration style | NOT STARTED | nothing, R36 is done | no |
-| R39 reserved pool share for identified callers | NOT STARTED, three inputs undecided | nothing | no |
+| R39 reserved pool share for identified callers | NOT STARTED | nothing, its three inputs were settled 2026-08-08 | no |
 | R5a visibility seam | **DONE** (2026-08-04) | nothing, the trait landed upstream at subql `8e9b2df` and the pin is past it | landed |
 | R0 part B, full measurement | **DONE** (2026-08-07) | nothing | landed with R5a |
 | R5b service as executor | NOT STARTED | `upstream-subql-per-row-visibility.md`, which is **underway** on subql branch `feat/visibility-from-the-row`. R5a, R0 and the rls2fga request are all done | **yes, subql (per-row), in progress** |
@@ -144,11 +147,13 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R33 completion frame overtakes its data | NOT STARTED | nothing | no |
 | R29 client-side coverage | **DONE** (2026-08-08) | nothing | no |
 | R44 a row that leaves one subscription's window | **DONE** (2026-08-08) | nothing | no, checked |
+| R45 reconciliation fix bundle | NOT STARTED | nothing | no |
+| R46 the wasm-smoke intermittent hang | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
-| R42 several accounts signed in at once | NOT STARTED, one input undecided | nothing in code. Blocked on the cold-boot account-selection decision, which is named in the phase | no |
+| R42 several accounts signed in at once | NOT STARTED | nothing. The cold-boot rule was decided 2026-08-08 and is recorded in the phase | no |
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | NOT STARTED | nothing, `diesel-rs/diesel#5128` is merged and the pin reaches it | no |
 | R11 shared public store | NOT STARTED | nothing | no |
@@ -162,24 +167,27 @@ Execution order. The early steps depend on nothing outside this repository and c
 
 ## Dependency graph
 
-A rendering of the table above, for reading rather than for deciding. **If the two disagree, the table is right and this diagram is stale.**
+A rendering of the dependencies in the table above, for reading rather than for deciding. **The graph carries dependencies only and says nothing about status. Decided with the maintainer 2026-08-08**, after the graph's done-highlighting was found missing R20, R29 and R44 and its node set missing R34 and R39: status lived in three hand-maintained places and drifted within days, so finishing a phase now updates the two tables and never this diagram. If an edge disagrees with the table, the table is right.
 
 ```mermaid
 graph TD
-  R1[R1 security defaults, DONE]
-  R12A[R12 part A logging facility, DONE] --> R3
-  R2[R2 durable session identity, DONE] --> R3[R3 grants and Principal, DONE]
-  R3 --> R4[R4 capabilities in the model, DONE]
-  R3 --> R13[R13 auth_events audit table, DONE]
-  R3 --> R19[R19 request throttling, DONE]
-  R3 --> R12B[R12 part B refused-grant line, DONE]
+  R1[R1 security defaults]
+  R12A[R12 part A logging facility] --> R3
+  R2[R2 durable session identity] --> R3[R3 grants and Principal]
+  R3 --> R4[R4 capabilities in the model]
+  R3 --> R13[R13 auth_events audit table]
+  R3 --> R19[R19 request throttling]
+  R3 --> R12B[R12 part B refused-grant line]
   R2 --> R19
-  R19 --> R36[R36 abuse detection and identity bans, DONE]
+  R19 --> R36[R36 abuse detection and identity bans]
   R13 --> R36
   R36 --> R37[R37 one configuration style]
-  R0A[R0 part A, connetto-only counters, DONE]
-  R5a[R5a visibility seam, DONE] --> R0B[R0 part B, full measurement, DONE]
+  R19 --> R39[R39 reserved pool share for identified callers]
+  R36 -.->|the bound R36 cannot provide| R39
+  R0A[R0 part A, connetto-only counters]
+  R5a[R5a visibility seam] --> R0B[R0 part B, full measurement]
   R5a --> R5b[R5b service as executor]
+  R5a --> R34[R34 a write-level share]
   R0B --> R5b
   U2a[upstream subql:<br/>visibility trait] --> R5a
   U2a --> U2b
@@ -188,19 +196,19 @@ graph TD
   U2b --> R5b
   R5b --> R6[R6 two-check change form]
   R5b --> R14[R14 dispatch-loop cost]
-  R16A[R16 part A fan-out research, DONE] --> R16[R16 part B fan-out architecture, DONE]
+  R16A[R16 part A fan-out research] --> R16[R16 part B fan-out architecture]
   R0B --> R16
   R0B -.->|conditional: dropped if<br/>the loop is not the ceiling| R14
   R4 --> R7[R7 revocation teardown]
   R6 --> R7
   R5b --> R9[R9 permissive policy out of tests]
-  R8[R8 inert surface, DONE]
-  R35[R35 narrow the over-broad column types, DONE]
-  R38[R38 a refusal stops disclosing what exists, DONE]
+  R8[R8 inert surface]
+  R35[R35 narrow the over-broad column types]
+  R38[R38 a refusal stops disclosing what exists]
   R21[R21 one page codec on both backends]
   R43 -->|step 5 only| R20[R20 start with no reachable server]
-  R41[R41 one seam for the two secret stores, DONE] --> R17[R17 local tier name and key scope, DONE]
-  R17 --> R43[R43 the browser opens the local tier twice, DONE]
+  R41[R41 one seam for the two secret stores] --> R17[R17 local tier name and key scope]
+  R17 --> R43[R43 the browser opens the local tier twice]
   R41 --> R42[R42 several accounts signed in at once]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
@@ -213,18 +221,18 @@ graph TD
   R26[R26 local data export]
   R6 --> R27[R27 membership term in the subscription language]
   U4[upstream: subql subquery membership term] --> R27
-  R28[R28 part A subscribe-time delivery gap, DONE] --> R28B[R28 part B aggregate subscribe paths]
+  R28[R28 part A subscribe-time delivery gap] --> R28B[R28 part B aggregate subscribe paths]
   R33[R33 completion frame overtakes its data]
   R20 --> R29[R29 client-side coverage] --> R15
   R29 --> R44[R44 a row that leaves one subscription's window]
+  R29 --> R45[R45 reconciliation fix bundle]
+  R46[R46 the wasm-smoke intermittent hang]
   R40[R40 replica policy wired into sync]
   U2b -.->|pin moves when it lands| R40
   R24[R24 file-sync integration, exploratory]
   R25[R25 device-to-device sync, exploratory]
   R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
-  classDef done fill:#d7ebd7,stroke:#4a7a4a,color:#1d3b1d
-  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R17,R19,R28,R35,R36,R38,R41,R43 done
 ```
 
 ## Upstream dependencies
@@ -1436,9 +1444,9 @@ One handle exists per tier file at any moment in the browser, native still attac
 
 ## R42: several accounts stay signed in at once
 
-**Status.** NOT STARTED, one input undecided
+**Status.** NOT STARTED. The one undecided input was settled with the maintainer on 2026-08-08, so nothing blocks it.
 
-**Blocked on nothing in code.** Split out of R17 on 2026-08-07, where it had been step 2. It is blocked on a decision rather than on a phase, and that decision is named below.
+**Blocked on nothing.** Split out of R17 on 2026-08-07, where it had been step 2. It was blocked on a decision rather than on a phase, and that decision is now taken and recorded below.
 
 ### Purpose
 
@@ -1450,15 +1458,19 @@ A person with a work account and a personal one should flip between them instant
 
 **The security cost, accepted deliberately.** A found device can resume any account whose credential is still stored, rather than only the last one. That follows from the threat model rather than contradicting it, since those accounts belong to one person and the operating system boundary is what separates people.
 
-### What is undecided, and it is one thing
+### The cold-boot rule, decided with the maintainer 2026-08-08
 
-**How a cold boot chooses which account to resume when nobody has said who they are.** This is why R41 stopped at the shape. A store keyed on the identity has nothing to look up before a login, because the credential is what reveals the identity, so something else has to name the account to resume and no such thing exists. Candidates worth pricing when this is taken up, none of them chosen: a separate last-used marker beside the credentials, resuming every stored account at once, or asking the application to name one. Each changes what a boot costs and what a shared device discloses, so this needs a discussion rather than a default, per the standing rule on an under-defined section.
+**Last used wins, and the application can override.** A cold boot with no one saying who they are resumes the most recently used account, and connetto exposes the list of stored account names so an application wanting a picker names one instead of accepting the default.
 
-A smaller question rides with it: what replaces the pre-login literal once an account can be named, and whether native follows or keeps its own literal.
+**The marker already exists, which is what tipped the decision.** R20 decision 1 made the device remember the identity of the last login so an offline start can name the replica file: `remember_identity` in `crates/connetto-web/src/auth.rs` writes the encoded identity under the fixed `IDENTITY_RECORD` name on every token acquisition, in the same account-addressed store as the credentials. So the last-used rule extends a record R20 already writes rather than adding a second mechanism, and this phase's work on that record is to keep it current on an account **switch** as well as on a login, and to read it back as the boot default.
+
+**Rejected: last-used with no override**, which saves almost nothing and forces an application wanting a picker to keep its own list of accounts beside connetto's store, a second bookkeeping of the same fact. **Rejected: resuming every stored account at once**, which multiplies boot work and open files per account (the browser storage pool holds roughly four files per account and R17 already had to grow it for two), decrypts every account's data with no gesture, and still needs a selection rule for what the interface shows, so it buys nothing the default does not while fitting a side-by-side product this stack does not model (chapter 12's model is flip-between). **Rejected: no default, the application must name one**, which makes every embedding application build account selection before multi-account works at all and re-implement resume-last for the common case, and an application that does nothing loses resume entirely.
+
+**The smaller question riding with it falls out mechanically.** The pre-login literal (`connetto_web::auth::REFRESH_RECORD`, and the desktop demo's own `"refresh"`) dies with this phase: every store call names the account it is about, taken from the login response, the switch target, or the boot default read from the marker. Native follows the same rule, since R41 made both stores account-addressed and `IDENTITY_RECORD` lives in `connetto-client`, shared by both targets.
 
 ### Done when
 
-Two accounts are signed in on one browser at once, a switch between them needs no login, and a cold boot resumes the right one by whatever rule the decision above settles.
+Two accounts are signed in on one browser at once, a switch between them needs no login, a cold boot resumes the last-used account by default, and an application can list the stored accounts and name one at boot instead.
 
 ### Why it is not part of R17
 
@@ -1597,7 +1609,7 @@ Subscription creation, connection rate and the auth endpoints are all metered, t
 
 **Status.** NOT STARTED
 
-**Blocked on a measurement, not on code.** `docs/webauthn-prf-probe-spec.md` specifies a probe to be built and run separately. Two decisions inside this phase wait on its report, and a negative result on its central question would reshape the phase rather than merely delay it.
+**Blocked on a measurement, not on code.** `docs/webauthn-prf-probe-spec.md` specifies a probe to be built and run separately. Two decisions inside this phase wait on its report, and a negative result on its central question would reshape the phase rather than merely delay it. **Confirmed by the 2026-08-08 reconciliation: nothing in this phase is decidable ahead of the probe report**, so its next action is executing step 1 as written, not a discussion, and no future session should reopen the phase looking for one.
 
 **Renamed and rescoped.** It was "derive the browser replica key from a passkey". That undersized it in three ways: it covered one of the two secrets, it was browser-only, and its step 1 conflated "is the extension supported" with "is the mechanism it replaces actually weak", so it could never deliver what its own step 5 promised.
 
@@ -1832,7 +1844,7 @@ Dropping a subscription never names it, it stops contributing a clause. With no 
    **Half of this landed with R20 on 2026-08-08, and the half that did not is the half this phase needs.** Built: the three tables, in `crates/connetto-client/src/subscriptions.rs`, written on declare, removed on cancel, and replayed on every attach. **Built in the replica, not the never-synced tier**, because the tier is optional and defaults to absent while the shipped `connetto-client` binary and three test files watch queries without one. The requirement is unchanged and `docs/architecture/15-replica-retention.md` is corrected to match.
    **Not built, and still this phase's:** the subscription row records no kind, so there is nothing distinguishing a watch-backed entry from a pin, no recorded stop moment, and no grace duration. **`sub_tables` is gone as of 2026-08-08**, deleted by step 3 rather than merely superseded: once the resync path read the persisted set, that map was written and never read, so it was dead state.
 2. **Re-declare subscriptions from that table on startup**, rather than depending on the application to remember what it had: pins always, watch-backed entries still within their grace. An entry the app died still watching anchors its countdown at launch. One past its grace is unsubscribed rather than re-declared, and its rows become evictable.
-   **R20 built the unconditional half on 2026-08-08: every persisted subscription is re-declared on attach, with no notion of grace or kind, because neither is recorded yet.** What this phase adds is the filtering, which is also the only thing that retires a record. **The gap that leaves, named here so it is not rediscovered as a defect:** cancelling a subscription deletes its record, so ordinary operation leaves nothing behind, but a process that dies while still watching leaves a record no later run can distinguish from a live one, and it is re-declared for ever. Until the grace countdown exists there is nothing that can retire it. The cost today is one redundant subscription per crashed run, which the server tolerates and which the in-memory seed re-claims the moment the application watches the same query again, so it self-heals for the common case and accumulates only across crashes with a changing query set.
+   **R20 built the unconditional half on 2026-08-08: every persisted subscription was re-declared on attach, with no notion of grace or kind.** This phase then added the filtering: `replay_subscriptions` re-declares only records still live (pins always, watches held or inside their grace), and the pump unsubscribes and forgets an expired one, which is what retires a record. **One piece of the step above is not built, found 2026-08-08 while reconciling the plan with the tree: the launch anchor for a died-while-watching record.** The step gives such a record, which has no recorded stop moment, a fresh countdown from launch. The startup seed leaves the stop moment empty instead (`live.rs`, the `WireSub` seeding), so the record reads as live, is re-declared on every attach until the same query is watched and dropped again, and `expired` can never return it, since the expiry comparison needs a stop moment. The cost is one leaked server subscription per crashed run whose query set changed: re-claim self-heals a stable query set, and the leak accumulates only across crashes with a changing one. **Owned by R45 step 1.** `15-replica-retention.md` carries the same correction under What covers a row.
 3. **Replace `clear_subscription_rows` with the complement-of-union delete** above, built from the surviving subscriptions rather than from the resyncing one's table list.
    **DONE 2026-08-08.** The delete is now `DELETE FROM "t" WHERE NOT ((p1) OR (p2))` over the surviving subscriptions' predicates, taken from the set R20 persists rather than from `sub_tables`. Three things execution settled that the step did not say. **A survivor with no `WHERE` at all wants the whole table**, so that table is skipped entirely rather than given an empty clause list, which would have degenerated to the very `DELETE FROM "t"` this fixes. **Binds are inlined, not bound**, reusing the existing `inline_binds` and `bind_literal` that local aggregate re-execution already uses, because diesel's `sql_query` cannot chain a bind list whose length is unknown at compile time and a second convention here would be worse than the one already in the tree. Inlining happens on the whole statement before parsing, since a placeholder ahead of the `WHERE` would otherwise shift every value inside it. **A `NULL` predicate keeps the row**, because `NOT (NULL)` is `NULL` and SQLite does not delete on it, which is the conservative direction.
    **Step 5 needed no work and is discharged here.** Taking `select.selection` alone already discards `LIMIT`, `OFFSET` and `FETCH`, so a paginated subscription contributes the predicate its page was drawn from and protects a superset of what it received, which is exactly what step 5 asked for. No AST surgery, no visitor. The step's citation was checked and is correct: `Query.limit_clause` does exist at the pinned `sqlparser` (git `bef86dd`), contrary to what a docs.rs reading of the released 0.62.0 suggests.
@@ -2009,7 +2021,10 @@ The replica holds the union of subscribed query results, so it grows with what i
 3. Rotating time-windowed subscriptions: a standing predicate fixes its bound at registration, so rotation means re-subscribing with a fresh bound.
 4. Local eviction of rows no active subscription covers, where active means a watch-backed subscription within its grace or a pin. The pass runs by itself when a subscription ends (grace expiry or unpin), scoped to that subscription's tables, and a callable tidy pass exists besides. **Two guards, decided with the maintainer.** Rows referenced by a pending, un-acknowledged mutation are never evicted: write-time interest marks over the durable pending queue (set at capture, cleared on ack, rebuilt at boot, keys extractable by the `affected_rows` decode) exclude their keys from the complement delete, bounded by the queue's cap. And the pass does not run while the transport is down, because a row discarded offline cannot be re-fetched until connectivity returns. Grace clocks keep running offline, only the pass waits. **Local-tier rows are never evictable**, and that holds structurally rather than by rule, because no `SubscriptionSpec` can carry a frontend-tier table.
 5. The trimming pass: bounded `incremental_vacuum` plus `wal_checkpoint(TRUNCATE)`, triggered on `freelist_count` relative to `page_count` rather than on a schedule.
-6. **A typed write-and-keep surface at the write site. Moved here from R29 step 7 on 2026-08-08**, because it guards against exactly the eviction step 4 introduces and its shape cannot be judged anywhere else: designed here, a row can be watched surviving or vanishing rather than argued about. The plain diesel write path stays fire-and-forget, carrying only step 4's transient un-acked protection and then living or dying by coverage. The typed variant, shaped like `watch`, composes the write with an explicit mark of interest through the existing mechanisms, a watch over the written row or a pin, never hidden per-row state. **Names, return types, and generated-key mechanics are undecided and need a discussion before code**, per the standing rule. The hard part is the generated key: an autoincrement primary key is not known until the insert has run, so the predicate that would watch the row cannot be built beforehand.
+6. **A typed write-and-keep surface at the write site. Moved here from R29 step 7 on 2026-08-08**, because it guards against exactly the eviction step 4 introduces and its shape cannot be judged anywhere else: designed here, a row can be watched surviving or vanishing rather than argued about. The plain diesel write path stays fire-and-forget, carrying only step 4's transient un-acked protection and then living or dying by coverage. The typed variant, shaped like `watch`, composes the write with an explicit mark of interest through the existing mechanisms, a watch over the written row or a pin, never hidden per-row state.
+   **Shape decided with the maintainer 2026-08-08: a values-only one-liner, the table inferred from the value's own type.** `insert_watched(values)` returns the inserted row and its `LiveQuery`, `insert_watched_with_grace(values, grace)` chooses the grace, and `insert_pinned(name, values)` is the durable form returning the row alone. The signature carries no table parameter, on the maintainer's observation that a value already fixes its table at the type level so a parameter could only disagree with it: a `#[derive(Insertable)]` struct implements `Insertable` for exactly its table, an ad-hoc `col.eq(v)` implements `Insertable<T::Table>` through its column (verified at the pinned diesel fork, `expression/operators.rs`, `impl<T, U> Insertable<T::Table> for Eq<T, U> where T: Column`), and the generated `table` struct derives `Default` so connetto synthesizes the instance itself. An `update_watched` twin takes an `Identifiable` target plus a changeset on the same inference principle.
+   **Generated-key mechanics, the part named as the hard one, dissolve on the local-first write order.** The write lands locally before any server involvement, so the key exists the moment the insert statement runs: connetto appends a RETURNING clause (enable diesel's `returning_clauses_for_sqlite_3_35`, one Cargo line, the SQLite floor of 3.35 met with 3.51.1 verified in chapter 15), loads the row, reads the key through the row's own `Identifiable` impl, and registers `find(key)` on the inferred table through the same machinery `watch` and `pin` use. The write and the registration happen under the client's one lock, though the protection does not depend on that: step 4's write-time un-acked mark covers the gap regardless.
+   **What the one-liner does not cover stays on the documented two-call pattern** (`with_conn` write, then `watch(table.find(key))`): batch inserts, multi-statement writes, and any shape the bounds do not admit. That is safe for the same mark-covers-the-gap reason. **Rejected: a closure-composition surface** (`write_and_watch(|conn| ...)`) as the primary form, which covers every shape at the price of every call site writing the read-key-back and build-predicate lines itself, exactly what the one-liner exists to hide, and its generality survives as the documented pattern. **Rejected: a table-and-values signature**, per the inference observation above. **Accepted cost:** the generic bound stack over diesel's insert types is paid once inside connetto, the row type must derive `Identifiable`, and the RETURNING feature turns on workspace-wide.
 
 ### Proof
 
@@ -2252,7 +2267,7 @@ One configuration style exists in the codebase.
 
 ## R39: a reserved share of the connection pool for identified callers
 
-**Status.** NOT STARTED
+**Status.** NOT STARTED. Its three inputs were settled with the maintainer on 2026-08-08 and are recorded below and in `16-server-capacity.md`, so nothing blocks code.
 
 **Blocked on nothing.** R36 step 1 points here for a bound it cannot provide itself, so this should not sit behind R36 indefinitely.
 
@@ -2266,16 +2281,16 @@ That is the gap R36 cannot close. A ban needs a name and the caller in question 
 
 The shape is sourced in `docs/research-overload-and-fairness.md`: reserve for the traffic that can be named rather than capping the traffic that cannot. Stripe reserves a fixed fraction of its fleet for critical requests, Netflix's concurrency limiter guarantees request classes a percentage of one adaptive limit, and Google sheds by request criticality under measured utilization. The guarantee is arithmetic rather than behavioural, which is what lets it reach a caller holding unlimited identities.
 
-### Inputs, and what is not settled
+### Inputs, settled with the maintainer 2026-08-08
 
-1. **The pool size is a library default nobody chose**, and a reserve cannot be carved out of a number that was never decided. Size it against measurement rather than a guess: R0 part A already counts authorization round trips per event per subscriber.
-2. **Strict or work-conserving. Not decided.** A strict reserve holds its share back even when no identified caller wants it, and guarantees availability immediately. A work-conserving one lets unidentified traffic use everything and engages the reserve only while an identified caller waits, wasting nothing but weakening the guarantee to however long in-flight work takes to drain. Tokio's `Semaphore` is FIFO-fair, so the second needs its own admission decision rather than a permit count. Stripe chose strict.
-3. Whether the reserve is one number or per-operation, since a snapshot read holds a connection far longer than a visibility check does.
+1. **The pool size becomes an explicit, configurable setting now, and its real value is derived after R5b.** The default stays at ten, no longer implicit, and the reserve is expressed relative to the configured total. Deciding the number from today's measurement was rejected because the measured workload is about to change shape: R0 found the throughput ceiling to be the per-subscriber visibility round trips, which R5b exists to delete, so a size calibrated now would answer a profile that will not exist. One R0 fact narrows what the eventual measurement must cover, recorded in `16-server-capacity.md`: the change path holds exactly one reader connection at any moment (the single ingest task issues visibility questions sequentially), so what occupies the pool is per-caller work, snapshots, writes and the handshake watermark read. The number is justified against R5b's rerun of the load harness, and until then a saturated deployment tunes the setting by hand.
+2. **Strict.** The reserved share is held back even when no identified caller wants it, so the guarantee is arithmetic and immediate and the mechanism is a permit split with no admission logic. Work-conserving was rejected: it weakens the promise to however long in-flight anonymous work takes to drain (a snapshot holds a connection for a whole transfer), and Tokio's `Semaphore` being FIFO-fair means it needs its own admission decision rather than a permit count. Stripe, the closest surveyed peer, chose strict.
+3. **One number.** A single reserved count over the whole reader pool, whatever the operation, keeping the configuration one knob in the style R19 and R36 set. Per-operation reserves were rejected as several numbers nobody has measured, each future operation class needing its own decision, and the failure they would prevent (anonymous snapshots crowding anonymous checks) sits inside the tier the reserve deliberately does not protect.
 
 ### Steps
 
-1. Settle and record inputs 1 and 2 before writing code, per the standing rule on under-defined sections.
-2. Size the pool explicitly, with the number justified against measurement.
+1. ~~Settle and record inputs 1 and 2 before writing code.~~ **Settled 2026-08-08, all three, see Inputs above.**
+2. Make both pool sizes explicit and configurable, defaults unchanged, with the reserve expressed relative to the reader pool's configured total. The number is revisited against R5b's rerun, not chosen here.
 3. Gate pool checkout by tier, so unidentified callers in flight cannot exceed the total less the reserve.
 4. Refuse an over-reserve checkout in the shape R19 already established rather than inventing a second one.
 
@@ -2286,6 +2301,53 @@ With the reserve set and every other connection held by unidentified callers, an
 ### Done when
 
 An identified caller's handshake cannot be starved by unidentified traffic, whatever its volume and however many identities it presents.
+
+---
+
+## R45: the fix bundle from the 2026-08-08 reconciliation
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** Five defects found by the reconciliation session of 2026-08-08, bundled with the maintainer's agreement because each is small, mechanical, and would otherwise sit unowned, which is how the third item had already sat for two days. Off-convention as a grab-bag and accepted as such: the alternative was distributing them to phases whose blockers they do not share.
+
+### Steps
+
+1. **Anchor the grace countdown at launch for a died-while-watching record.** The startup seed leaves `stopped_at` empty for a record the previous run died still holding, so it reads as live for ever and `expired` can never return it (R29 step 2 carries the full account). At seed time, set the stop moment to now for every record with no stop moment **and no pin name**: a pin has grace zero by design, so anchoring one would expire it at the first pump, which is why the exclusion is load-bearing. The countdown runs the record's own persisted grace, so a zero-grace watch that died held is dropped at once, which is its contract. A watch re-claiming the query inside the grace clears the anchor through the existing `remember` upsert.
+2. **Keep connetto's own bookkeeping out of the application-facing changed-tables signal.** Every cursor persist puts `_connetto_meta` into the set that wakes the live-query refresh, so the refresh walks the registry and matches nothing, on every applied frame. Filter `sqlite_%` and `_connetto%` names at the boundary where the tracker's set feeds `Reactive::changed_tables` and the refresh, reusing the exclusion convention `local_tier_tables` already set (R43). Found by R20 and left with no owner until now.
+3. **Stop presenting a share key whose `exp` has passed.** The client reads `exp` out of the JWT payload it already holds (base64url, no key, no round trip) and skips the dead key at handshake. Advisory only: the server verifies `exp` authoritatively regardless, so a forged claim either presents a dead key and is refused as now, or skips a live one and harms only itself. Specified in full in the Parked section entry this step retires, and `02-protocol.md` already carries the opacity-rule amendment (2026-08-06). This is also what removes the one honest refusal burst R36's daily tally must currently clear.
+4. **One `quote_ident`.** The identical three-line helper is defined three times in `connetto-server` (`key_filter.rs` as `pub(crate)`, private copies in `materializer.rs` and `oplog.rs`). Keep the `pub(crate)` one, delete the two copies, repoint their callers.
+5. **Read the snapshot row off the builder instead of parsing bytes back.** `PgSnapshotSource::read_row` (`snapshot.rs`) encodes the row with `pgbinary_patchset` and immediately parses the bytes with `ParsedDiffSet::parse` to extract the insert's values. `pgbinary_patchset_builder` returns the builder whose ops are readable directly, exactly the shape R44's fix used for `pgoutput_patchset_builder`, so the one-encoder property the code comment defends (a value read here and delivered to a client are one value) is kept while the encode-and-parse pair goes.
+
+### Proof
+
+Each fix lands with a proof that fails first where one is expressible. Step 1: a record seeded with no stop moment and never re-claimed is unsubscribed and forgotten once its grace passes, a re-claim inside the grace mints no second subscription, and a pin is untouched at launch. Step 2: a cursor persist wakes no refresh and an application-table write still does. Step 3: a handshake holding one expired and one live key sends only the live one. Step 4 is compile-plus-grep. Step 5: the gated aggregate-seed tests stay green with the parse call gone.
+
+### Done when
+
+All five proofs pass, the Parked entry for the expired key is retired, and R29 step 2's open-defect paragraph and the matching correction in `15-replica-retention.md` are updated to Built.
+
+---
+
+## R46: the wasm-smoke intermittent hang
+
+**Status.** NOT STARTED
+
+**Blocked on nothing.** Confirmed pre-existing on 2026-08-08 by stashing that session's changes and reproducing at the previous commit: roughly half of full `examples/wasm-smoke` runs hang, with the hanging binary varying between runs. An investigation phase in R33's demonstrate-first shape, because a gate that fails a coin flip halves confidence in every browser-touching phase and trains people to rerun until green, which is how a real regression will one day pass.
+
+### Steps
+
+1. **Reproduce under instrumentation.** Loop the full suite, recording per run which binary and which test hung, with the browser console and `RUST_LOG` output captured. The position varying between runs is already a finding: it points at shared state or timing (worker election, port contention, a stale container, chromedriver) rather than one bad test.
+2. **Check the known non-hang first.** R35 recorded that a slow sweep entry on this machine can be contention rather than a hang (`loop_emu` once hit a per-binary timeout in a sweep and passed alone in eight seconds), so distinguish a genuine wedge from a timeout under load before chasing anything.
+3. **Localize against the history of hangs in this suite**, each of which had a specific cause: the worker's login broadcast answered by no tab (R2, fixed by installing the listener before the worker spawns), a second listener answering one request twice (R2, `play_the_tab` installing once per binary), and a leftover process holding a port. The candidates are boot, relay traffic, and harness, in that order of suspicion.
+4. **Fix at the source, or write it up.** A cause inside this repository is fixed here with the reproduction as its test. A cause in an upstream crate stops this phase and becomes an `upstream/<name>.md` finding with a runnable reproduction, per the standing rule.
+
+### Proof
+
+The hang is demonstrated and named before anything is changed. After the fix, ten consecutive full wasm-smoke runs pass on this machine.
+
+### Done when
+
+Ten consecutive clean runs, or a written upstream finding with a reproduction and this phase concluding with the workaround decision recorded.
 
 ---
 
@@ -2422,7 +2484,7 @@ Grouped aggregates are either phased as committed work or reaffirmed as parked, 
 
 Tick these off across the whole programme, because each is easy to lose inside a phase.
 
-**Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R19 added `ControlMessage::RateLimited` and `FatalErrorReason::RateLimited` (**landed**). R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
+**Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R19 added `ControlMessage::RateLimited` and `FatalErrorReason::RateLimited` (**landed**). R20 added `ControlMessage::SyncStatus`, relay-to-tab only (**landed**, and its omission here until 2026-08-08 is why this list is checked against `connetto-core/src/messages` when it is consulted). R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
 
 **Startup checks, all six refusing to start**: R1 on an unrecognised provider and on a missing reader role. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it. **Corrected 2026-08-07**: this list also named an R2 refusal on a stale watermark table shape, which does not exist. R13 deleted that check along with the audit shape check it was written beside, because hardcoding connetto's own column names while being generic over a schema trait would refuse exactly the application-owned table the trait exists to permit, and the shapes it caught fail loudly on the first write anyway. Six is now the count for the right reason, and it matches R36's own arithmetic, which called a threshold-confirmation refusal the seventh.
 
@@ -2439,7 +2501,7 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **Chapter 11 claims backend-for-frontend while the tokens live in JavaScript-reachable storage. Recorded 2026-08-06, not decided, and it has no phase.** Found while researching where a websocket should be authenticated (`docs/research-websocket-auth-placement.md`), and independent of that question. `draft-ietf-oauth-browser-based-apps-26`, a Best Current Practice in the RFC Editor queue, requires a BFF to keep its session in a cookie that **MUST** be `HttpOnly` and `Secure`, and states plainly that JavaScript-reachable storage does not protect against an attacker executing in the origin. Connetto keeps its tokens in worker-side IndexedDB and uses no cookies anywhere, verified by grep across the server and the browser client. It is partly mitigated: the refresh store is encrypted under a device key, R23 exists to put that key behind user verification, and OWASP permits IndexedDB when the key is not itself recoverable from the browser. What the cookie would buy is precisely defeating exfiltration and offline replay, and it would not defeat online proxying through the victim's browser, which the same draft says cannot be prevented at the application layer. What it would cost is cross-site websocket hijacking, whose standard defence (a custom header forcing a preflight) is structurally unavailable on a websocket, leaving an origin allowlist and `SameSite`. **The gap is between what the chapter claims and what the code does**, so either the code moves or the chapter stops claiming BFF, and neither is decided here.
 
-**The client should not present a share key whose `exp` has passed, and this is decided but has no phase. Recorded 2026-08-06, and it needs an owner rather than parking.** A grant is an EdDSA JWT (`authn/token.rs`, `CapabilityClaims { iss, aud, sub, iat, exp }`), and a JWT payload is base64url, signed rather than encrypted, so a client reads `exp` out of a token it already holds with no key and no round trip. Today it does not, so an expired key is re-presented on every reconnect and draws a refusal every time, which is the only honest source of the refusal signal R36 counts. The check is safe precisely because it is advisory: the server still verifies `exp` authoritatively, so a client fed a forged claim either presents a dead key and is refused exactly as now, or skips a live one and harms only itself. **It contradicts a rule as written**: `02-protocol.md` says a grant "is opaque to the client, which never parses it", so that rule needs the amendment recorded in that chapter alongside this. **This replaced R36 step 7**, a `HandshakeAck` boolean reporting that some grant failed, which was removed on 2026-08-06 once the justification collapsed: revoking a share produces no refusal at all, so the boolean was silent for the case it was written for and fired only for expiry, which the client can answer offline.
+**The client should not present a share key whose `exp` has passed. ~~Recorded 2026-08-06, and it needs an owner rather than parking.~~ Owned by R45 step 3 as of 2026-08-08.** A grant is an EdDSA JWT (`authn/token.rs`, `CapabilityClaims { iss, aud, sub, iat, exp }`), and a JWT payload is base64url, signed rather than encrypted, so a client reads `exp` out of a token it already holds with no key and no round trip. Today it does not, so an expired key is re-presented on every reconnect and draws a refusal every time, which is the only honest source of the refusal signal R36 counts. The check is safe precisely because it is advisory: the server still verifies `exp` authoritatively, so a client fed a forged claim either presents a dead key and is refused exactly as now, or skips a live one and harms only itself. **The rule it contradicted is already amended**: `02-protocol.md` carried "opaque to the client, which never parses it", and the `exp` exception was recorded there on 2026-08-06. **This replaced R36 step 7**, a `HandshakeAck` boolean reporting that some grant failed, which was removed on 2026-08-06 once the justification collapsed: revoking a share produces no refusal at all, so the boolean was silent for the case it was written for and fired only for expiry, which the client can answer offline.
 
 **Owner-less synced data is duplicated once per identity.** A public catalogue lives in the replica, which is named from the identity, so several signed-in users on one device hold several copies. Sharing a store across identities is exactly the boundary the per-identity name establishes, so it is not a small change. Not decided.
 
