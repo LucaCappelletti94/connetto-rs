@@ -11,7 +11,7 @@
 
 pub use connetto_web::{
     BroadcastTransport, BroadcastTransportError, BrowserSocket, BrowserSocketError, HubNotice,
-    LocalTier, PortTransport, PortTransportError, RelayError, RelayHub, TabId, locks,
+    PortTransport, PortTransportError, RelayError, RelayHub, TabId, locks,
 };
 
 /// The Postgres schema source the demo server is launched with
@@ -103,9 +103,6 @@ pub mod workers {
     pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
     /// The OPFS file holding the DB worker's durable replica.
     pub const DB_NAME: &str = "connetto-relay.sqlite";
-    /// The OPFS file holding the DB worker's durable local tier (device-private
-    /// tables, never synced).
-    pub const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 
     /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
     ///
@@ -135,7 +132,6 @@ pub mod workers {
             ws_url: DEMO_WS_URL,
             replica_db_prefix: DB_NAME,
             replica_ddl: DEMO_SQLITE_DDL,
-            frontend_db_name: FRONTEND_DB_NAME,
             frontend_ddl: DEMO_FRONTEND_DDL,
             upstream_sub_id: "db-upstream",
             upstream_query: DEMO_QUERY,

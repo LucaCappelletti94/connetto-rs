@@ -251,7 +251,7 @@ async fn full_resync_is_relay_transparent() {
         upstream: vec![(UPSTREAM_SUB.to_owned(), SubscriptionSpec::new(QUERY))],
     };
     let (hub, pump, _notices) =
-        RelayHub::with_reconnect(worker, ":memory:", None, reconnect).expect("relay hub");
+        RelayHub::with_reconnect(worker, ":memory:", reconnect).expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });

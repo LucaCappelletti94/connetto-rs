@@ -15,21 +15,30 @@
 //! identity to its own key is what the `key_store` and `teardown` suites prove.
 //! What this suite owes is that two identities' replicas are mutually opaque and
 //! that a switch destroys nothing.
+//!
+//! R17 added the same claim for the device-private database beside each replica,
+//! which used to carry one name for the whole device while its key was per
+//! identity, so the second identity to sign in opened the first one's file and
+//! could not unlock it.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
+use connetto_client::cipher::{UnlockError, unlock};
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, SqlFunctions,
     replica_db_name,
 };
 use connetto_core::test_support::FakeTransport;
-use connetto_web::storage::ReplicaStorage;
+use connetto_web::storage::{ReplicaStorage, tier_db_name};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use diesel::{Connection, SqliteConnection};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
 /// The replica-name prefix, distinct from the other suites' so one OPFS pool
 /// holds them all without collision.
@@ -45,6 +54,16 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Test table for device-private contents
+    drafts (id) {
+        /// Draft identifier, the primary key
+        id -> Integer,
+        /// Optional draft body
+        body -> Nullable<Text>,
+    }
+}
+
 fn config() -> ClientConfig {
     ClientConfig {
         client_id: "e4".to_owned(),
@@ -57,6 +76,18 @@ fn config() -> ClientConfig {
 
 fn key_from_byte(byte: u8) -> ReplicaKey {
     ReplicaKey::from_bytes([byte; ReplicaKey::LEN])
+}
+
+/// Open a device-private database the way the DB worker does: its own connection
+/// over its own file, with the replica's key applied explicitly.
+fn open_tier(
+    storage: &ReplicaStorage,
+    name: &str,
+    key: &ReplicaKey,
+) -> Result<SqliteConnection, UnlockError> {
+    let mut conn = SqliteConnection::establish(&storage.db_url(name)).expect("open the tier file");
+    unlock(&mut conn, key)?;
+    Ok(conn)
 }
 
 /// First-boot the encrypted replica at `url` under `key`, write a row, and leave
@@ -187,4 +218,64 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
         alice_unsynced,
         "her unuploaded mutation survived the switch and replays"
     );
+}
+
+/// R17: the device-private database beside each replica belongs to that identity
+/// too, so two accounts on one device each keep usable device-private data.
+///
+/// Opened the way `open_replica_and_tier` opens it in the worker, as its own
+/// connection over its own file with the replica's key applied explicitly,
+/// because the browser tier is not attached and carries its own salt.
+#[wasm_bindgen_test]
+async fn a_second_identity_gets_its_own_openable_local_tier() {
+    let storage = ReplicaStorage::install().await;
+
+    // Named from the replica, which is itself named from the identity, so the
+    // convention under test is the worker's own rather than a copy of it.
+    let alice_tier = tier_db_name(&replica_db_name(PREFIX, "alice").expect("derive alice"));
+    let bob_tier = tier_db_name(&replica_db_name(PREFIX, "bob").expect("derive bob"));
+    storage.delete_db(&alice_tier).expect("clear alice");
+    storage.delete_db(&bob_tier).expect("clear bob");
+    assert_ne!(
+        alice_tier, bob_tier,
+        "distinct identities select distinct device-private files"
+    );
+
+    let alice_key = key_from_byte(0x11);
+    let bob_key = key_from_byte(0x22);
+
+    // Each account first-boots its own tier and writes a draft into it.
+    for (name, key, draft) in [
+        (&alice_tier, &alice_key, "alice-draft"),
+        (&bob_tier, &bob_key, "bob-draft"),
+    ] {
+        let mut tier = open_tier(&storage, name, key).expect("first-boot the tier");
+        tier.batch_execute(TIER_DDL).expect("apply the tier schema");
+        diesel::insert_into(drafts::table)
+            .values((drafts::id.eq(1), drafts::body.eq(draft)))
+            .execute(&mut tier)
+            .expect("write the draft");
+    }
+
+    // Neither key opens the other's file. This is the failure the phase closed:
+    // before it, both accounts named one file and the second one to arrive met
+    // exactly this error with nowhere else to go.
+    match open_tier(&storage, &bob_tier, &alice_key) {
+        Err(UnlockError::WrongKey(_)) => {}
+        Err(other) => panic!("expected WrongKey, got {other:?}"),
+        Ok(_) => panic!("one identity's key must not open another's device-private database"),
+    }
+
+    // And each account still reads its own draft back.
+    for (name, key, draft) in [
+        (&alice_tier, &alice_key, "alice-draft"),
+        (&bob_tier, &bob_key, "bob-draft"),
+    ] {
+        let mut tier = open_tier(&storage, name, key).expect("reopen the tier");
+        let seen: Vec<Option<String>> = drafts::table
+            .select(drafts::body)
+            .load(&mut tier)
+            .expect("read the tier");
+        assert_eq!(seen, vec![Some(draft.to_owned())]);
+    }
 }

@@ -140,6 +140,42 @@ impl ReplicaStorage {
         }
         Ok(())
     }
+
+    /// Grow the pool so it can hold `headroom` files beyond the ones it holds now.
+    ///
+    /// The sahpool hands out a fixed number of preallocated slots, six by
+    /// default, and its open path is synchronous, so it cannot grow itself when
+    /// the last one goes: the open past it fails with `unable to open database
+    /// file` rather than waiting for room. Nothing frees a slot on its own,
+    /// because every account that signs in leaves a replica and the
+    /// device-private database beside it, both kept deliberately so switching
+    /// back resumes rather than re-snapshots. So the count grows with the number
+    /// of accounts and the default runs out on the third.
+    ///
+    /// Reserve before opening anything, and count a rollback journal as a file:
+    /// the pool gives it a slot of its own and a write cannot proceed without
+    /// one, so a database that is written to costs two. Over-reserve rather than
+    /// under, because a spare slot is an empty file and running out inside a
+    /// worker is a boot that dies with a string nobody reads. The in-memory
+    /// backend has no such limit and this does nothing there.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the backend refuses to grow.
+    pub async fn reserve(&self, headroom: u32) -> Result<(), AuthError> {
+        let Self::Opfs(util) = self else {
+            return Ok(());
+        };
+        let held = u32::try_from(self.list().len()).unwrap_or(u32::MAX);
+        let want = held.saturating_add(headroom);
+        let have = util.get_capacity();
+        if want > have {
+            util.add_capacity(want - have)
+                .await
+                .map_err(|err| AuthError::Store(format!("grow the pool to {want}: {err:?}")))?;
+        }
+        Ok(())
+    }
 }
 
 /// Failure to wipe a browser replica.
@@ -158,7 +194,27 @@ pub enum WipeError {
     Storage(String),
 }
 
-/// Data teardown: destroy the replica's key, then delete the replica.
+/// The device-private database that sits beside the replica `name`.
+///
+/// Derived rather than configured, so its name and the key it is opened under
+/// have one scope. The key is the replica's own, minted per identity, and the
+/// replica name already carries that identity, so computing one from the other
+/// is what makes a second identity on the same device open a file it can
+/// actually unlock. A name the application chose could not track the identity
+/// without being told about it.
+///
+/// Two consequences the derivation buys rather than enforces. There is no second
+/// prefix, so no configuration can collide the two files. And a caller holding
+/// only the replica name can reach the tier, which is what lets
+/// [`wipe_replica`] destroy both from the one name its pending-delete record
+/// keeps.
+#[must_use]
+pub fn tier_db_name(replica: &str) -> String {
+    format!("{replica}-tier")
+}
+
+/// Data teardown: destroy the replica's key, then delete the replica and the
+/// device-private database beside it.
 ///
 /// The browser mirror of `connetto_client::teardown::wipe_replica`, and the
 /// crypto-shredding half of the logout grid. Deleting the pool entry alone
@@ -169,6 +225,11 @@ pub enum WipeError {
 /// `connetto_client::replica_db_name` produced for this identity. Only that entry
 /// and that record are touched, so a second identity signed in on the same device
 /// keeps its replica and its key.
+///
+/// The tier goes too, at [`tier_db_name`], because it shares the key being
+/// destroyed and has no record of its own. Left behind it would outlive the key
+/// that opens it, and the next boot for this identity would mint a fresh key,
+/// meet the surviving file and fail to unlock it.
 ///
 /// The key goes first, so a failed delete leaves inert ciphertext rather than a
 /// readable database.
@@ -182,7 +243,7 @@ pub enum WipeError {
 ///
 /// [`WipeError::Unsynced`] when unsynced writes remain and `force` is false,
 /// [`WipeError::KeyStore`] when the record cannot be cleared, or
-/// [`WipeError::Storage`] when the delete fails.
+/// [`WipeError::Storage`] when either delete fails.
 pub async fn wipe_replica<S>(
     storage: &ReplicaStorage,
     key_store: &S,
@@ -200,6 +261,9 @@ where
         .clear(name)
         .await
         .map_err(|err| WipeError::KeyStore(err.to_string()))?;
+    storage
+        .delete_db(&tier_db_name(name))
+        .map_err(|err| WipeError::Storage(err.to_string()))?;
     storage
         .delete_db(name)
         .map_err(|err| WipeError::Storage(err.to_string()))

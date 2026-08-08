@@ -19,7 +19,7 @@ use connetto_web::auth::{
 };
 use connetto_web::storage::{
     ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
-    wipe_replica,
+    tier_db_name, wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -155,6 +155,57 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
         read_marker(&storage, bob, &bob_key),
         MARKER,
         "the other identity's replica still decrypts under its own key"
+    );
+}
+
+/// R17: the device-private database goes with the replica, because it shares the
+/// key being shredded and has no key record of its own.
+///
+/// Left behind it would outlive the key that opens it, and the next boot for this
+/// identity would mint a fresh key, meet the surviving file and die at the unlock.
+/// That is the same failure R17 closed for a second identity, arriving through the
+/// wipe path instead, and naming the tier per identity does not fix it because the
+/// name stays stable for that identity.
+#[wasm_bindgen_test]
+async fn a_wipe_destroys_the_tier_beside_the_replica() {
+    let storage = ReplicaStorage::install().await;
+    let keys = IdbKeyStore::open().await.expect("open the key store");
+    let alice = "e3-tier-wipe-alice.sqlite";
+    let bob = "e3-tier-wipe-bob.sqlite";
+    reset(&storage, &keys, alice).await;
+    reset(&storage, &keys, bob).await;
+    storage.delete_db(&tier_db_name(alice)).expect("clear");
+    storage.delete_db(&tier_db_name(bob)).expect("clear");
+    // Four databases at once and a rollback journal for each, against a pool
+    // that ships six slots and holds whatever the earlier tests left.
+    // `boot_db_worker` reserves for the same reason.
+    storage.reserve(8).await.expect("room in the pool");
+
+    // Two identities, each with a replica and the device-private database beside
+    // it, both under that identity's one key.
+    for name in [alice, bob] {
+        let key = provision_replica_key(&keys, name).await.expect("mint");
+        write_marker(&mut open(&storage, name, &key));
+        write_marker(&mut open(&storage, &tier_db_name(name), &key));
+    }
+    assert!(
+        storage.exists(&tier_db_name(alice)) && storage.exists(&tier_db_name(bob)),
+        "both device-private databases are here"
+    );
+
+    wipe_replica(&storage, &keys, alice, &[], false)
+        .await
+        .expect("wipe alice");
+
+    // Read off the pool's own listing, not off what the delete returned.
+    let listed = storage.list();
+    assert!(
+        !listed.iter().any(|entry| entry == &tier_db_name(alice)),
+        "the wiped identity's device-private database is gone too"
+    );
+    assert!(
+        listed.iter().any(|entry| entry == &tier_db_name(bob)),
+        "and the other identity's is untouched"
     );
 }
 

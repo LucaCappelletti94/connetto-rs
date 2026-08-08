@@ -603,10 +603,17 @@ struct SchemaTableRow {
     name: String,
 }
 
-/// The lowercased names of every table in the attached local tier.
+/// The lowercased names of every application table in the attached local tier.
+///
+/// connetto's own bookkeeping tables are excluded. The relay keeps a per-tab
+/// write counter in this database, and a caller subscribing to it or routing a
+/// live query at it would be reading connetto's internals as though they were
+/// application data. `sqlite_schema` of an attached database has no `table!` to
+/// query through, which is why this one stays a catalogue read.
 fn local_tier_tables(db: &mut SqliteConnection) -> Result<HashSet<String>, ClientError> {
     let rows: Vec<SchemaTableRow> = diesel::sql_query(format!(
-        "SELECT name FROM {LOCAL_SCHEMA}.sqlite_schema WHERE type = 'table'"
+        "SELECT name FROM {LOCAL_SCHEMA}.sqlite_schema WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_connetto*'"
     ))
     .load(db)?;
     Ok(rows

@@ -63,8 +63,6 @@ const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The OPFS file holding the worker's durable synced replica (base name; the
 /// worker appends the identity hash so each account gets its own encrypted file).
 const DB_NAME: &str = "connetto-relay.sqlite";
-/// The OPFS file holding the worker's durable device-private tier.
-const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The OPFS file holding the worker-only refresh token, encrypted at rest.
 const AUTH_DB_NAME: &str = "connetto-auth.sqlite";
 /// The shared leader lock every window of this app races.
@@ -289,7 +287,6 @@ async fn run_db_worker() -> Result<(), JsValue> {
         ws_url: DEMO_WS_URL,
         replica_db_prefix: DB_NAME,
         replica_ddl: DEMO_SQLITE_DDL,
-        frontend_db_name: FRONTEND_DB_NAME,
         frontend_ddl: FRONTEND_DDL,
         upstream_sub_id: "db-upstream",
         upstream_query: DEMO_QUERY,

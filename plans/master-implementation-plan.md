@@ -86,11 +86,13 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
-| any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it |
+| any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it. Its four decisions are taken and R43, which step 5 waited on, landed 2026-08-07 |
 | any | R34 | Blocked on nothing. R5a put the write question on the same seam as the read one, so this is the mint call learning to ask it |
 | done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
 | done | ~~R41~~ **DONE** | One seam for the two secret stores. Landed 2026-08-07: one trait per secret in `connetto-core`, both name-addressed, the browser key store renamed off the collision |
-| any | R17 | A defect, blocked on nothing now that R41 is done. Land it before anything else relies on the local tier |
+| done | ~~R17~~ **DONE** | The local tier's name and key scope. Landed 2026-08-07: the tier is named from the replica's own file name, and the delete-my-data path destroys it too |
+| any | R42 | Several accounts signed in at once, split out of R17 on 2026-08-07. Blocked on one decision, not on a phase, so it waits for that discussion rather than for code |
+| done | ~~R43~~ **DONE** | The browser held two handles on one tier file. Found while grounding R17 on 2026-08-07 and landed the same day: the client's attachment is the only handle, the relay serves through it, and a tab write is replayed under the old conflict rule |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
 | any | R15 | Off the critical path. Gated on R29 and on the one remaining diesel proposal, `wal_checkpoint`. The other four landed and the pin reaches them |
@@ -141,9 +143,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R33 completion frame overtakes its data | NOT STARTED | nothing | no |
 | R29 client-side coverage | NOT STARTED | nothing | no |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
-| R20 start with no reachable server | NOT STARTED | nothing | no |
+| R20 start with no reachable server | NOT STARTED | nothing. R43 landed 2026-08-07, so step 5 is unblocked too | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
-| R17 local tier name and key scope | NOT STARTED | nothing, R41 reshaped the store this phase re-keys and is done | no |
+| R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
+| R42 several accounts signed in at once | NOT STARTED, one input undecided | nothing in code. Blocked on the cold-boot account-selection decision, which is named in the phase | no |
+| R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | NOT STARTED | nothing, `diesel-rs/diesel#5128` is merged and the pin reaches it | no |
 | R11 shared public store | NOT STARTED | nothing | no |
 | R15 replica retention and trimming | NOT STARTED | R29 and one diesel proposal (`wal_checkpoint`), the pin now reaching the four merges | **yes, diesel** |
@@ -192,8 +196,10 @@ graph TD
   R35[R35 narrow the over-broad column types, DONE]
   R38[R38 a refusal stops disclosing what exists, DONE]
   R21[R21 one page codec on both backends]
-  R20[R20 start with no reachable server]
-  R41[R41 one seam for the two secret stores, DONE] --> R17[R17 local tier name and key scope]
+  R43 -->|step 5 only| R20[R20 start with no reachable server]
+  R41[R41 one seam for the two secret stores, DONE] --> R17[R17 local tier name and key scope, DONE]
+  R17 --> R43[R43 the browser opens the local tier twice, DONE]
+  R41 --> R42[R42 several accounts signed in at once]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
   R31[R31 application schema majors]
@@ -207,7 +213,7 @@ graph TD
   U4[upstream: subql subquery membership term] --> R27
   R28[R28 part A subscribe-time delivery gap, DONE] --> R28B[R28 part B aggregate subscribe paths]
   R33[R33 completion frame overtakes its data]
-  R29[R29 client-side coverage] --> R15
+  R20 --> R29[R29 client-side coverage] --> R15
   R40[R40 replica policy wired into sync]
   U2b -.->|pin moves when it lands| R40
   R24[R24 file-sync integration, exploratory]
@@ -215,7 +221,7 @@ graph TD
   R30[R30 grouped aggregates revisited, exploratory]
   R2 -.->|registry only| R8
   classDef done fill:#d7ebd7,stroke:#4a7a4a,color:#1d3b1d
-  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R19,R28,R35,R36,R38,R41 done
+  class R1,R0A,R0B,R2,R3,R4,R5a,R8,R12A,R12B,R13,R16A,R16,R17,R19,R28,R35,R36,R38,R41,R43 done
 ```
 
 ## Upstream dependencies
@@ -573,7 +579,7 @@ R5a's only proof is that nothing observable changed, which a new refusal would e
 
 **Was blocked on nothing.** Found by a sweep the maintainer asked for on 2026-08-04, after the same sweep for text columns turned up four sketches and one built table.
 
-**Landed.** The three deadline columns are `TIMESTAMPTZ` carrying `chrono::DateTime<Utc>` and have lost the `_ms` suffix along with the unit, through `ConnettoStoreSchema`, the `connetto_auth_tables!` macro, `authn/store.rs`, the reference SQL, and the two stack recipes that create those tables. A tab mints `rosetta_uuid::Uuid::new_v4()`, both browser watermark tables key on it as a 16-byte blob, and the relay refuses a handshake that does not parse. `client_id_prefix` is deleted from `ReplicaConfig` with its four setters. The demo `quantity` is required and non-negative. The refresh store is untouched on purpose, recorded in R17 step 2.
+**Landed.** The three deadline columns are `TIMESTAMPTZ` carrying `chrono::DateTime<Utc>` and have lost the `_ms` suffix along with the unit, through `ConnettoStoreSchema`, the `connetto_auth_tables!` macro, `authn/store.rs`, the reference SQL, and the two stack recipes that create those tables. A tab mints `rosetta_uuid::Uuid::new_v4()`, both browser watermark tables key on it as a 16-byte blob, and the relay refuses a handshake that does not parse. `client_id_prefix` is deleted from `ReplicaConfig` with its four setters. The demo `quantity` is required and non-negative. The refresh store is untouched on purpose, recorded in decision 3 below.
 
 **Decided 2026-08-05, closing the one thing this phase left open: both ends mint version 4.** The demo's Postgres default and its client-side generator disagreed, v4 against v7, and matching on v7 would have needed Postgres 18, which first shipped a built-in `uuidv7()`, against a test stack on 16. So the client moves to v4 rather than the server to v7: the registered SQLite function, the baked column default and the four demos are renamed with it. What that gives up is the time ordering a v7 key carries.
 
@@ -610,7 +616,7 @@ A column whose type is wider than the values it holds is a contract nothing enfo
 1. **Three columns hold a moment in time as a plain 64-bit count of milliseconds** and become zone-aware timestamps with a real date type in Rust: `connetto_sessions.idle_deadline_ms`, `connetto_sessions.absolute_deadline_ms` and `connetto_provider_tokens.expires_at_ms` (`crates/connetto-server/src/authn/schema.rs`, and the reference SQL in `11-authentication.md`). The unit lives in the column name because the type refuses to carry it, and seconds and milliseconds are indistinguishable to the compiler because both are `i64`. The columns lose the `_ms` suffix with the unit. **Verified before deciding**: the pinned diesel maps `std::time::SystemTime` to a zone-less timestamp only, so a zone-aware column needs `chrono`, which was a test-only dependency of `connetto-server` and is already in the build through subql. Diesel's own integer wrapper was considered and rejected: the column would be right and the Rust side would still carry a bare integer. **One claim I made while asking was too strong**: I said this deletes a conversion boundary. It does not. The `AuthStore` API speaks `SystemTime` and keeps doing so, so `unix_ms` and `time_from_ms` become `to_instant` and `from_instant`. What goes is the lossiness and the unit hazard, since both new conversions are total and between two instant types.
 2. **A browser tab identifies itself with a wall-clock reading**, `format!("{prefix}-{}", js_sys::Date::now())` at `crates/connetto-web/src/workers.rs:422`, and that string is the primary key of its durable write counter and the name of its lock. Two tabs opened in the same millisecond share both. It becomes a bare `rosetta_uuid::Uuid::new_v4()`, and the relay refuses a handshake whose client id does not parse as one. **That crate rather than `uuid`**, because the browser's counter is a SQLite table mirroring a Postgres one and `rosetta-uuid` is one type with diesel bindings for both, where plain `uuid` has no SQLite mapping and would have meant a hand-rolled encoding on one side. Already a dependency of `connetto-server`, already the demo's key type, and its own suite asserts v4 generation on `wasm32-unknown-unknown`.
    **The cost I quoted was wrong and the maintainer re-decided on the corrected figure.** I said roughly three places. It is thirteen call sites across the browser tests and `crates/connetto-web`'s own tests, plus `client_id_prefix` deleted from `ReplicaConfig` and its four setters, because one value serving both jobs means the value cannot carry a prefix and still parse. It also makes the wire label an identity, so `11-authentication.md` principle 1 needed rewriting to name the relay as the one place that keys on it. A third shape was offered on the corrected costs, deriving the key from the label with a version 5 uuid so no call site changes, and was rejected in favour of the strict requirement.
-3. **The browser's refresh store keeps one row by call-site convention**, three sites hardcoding `1`, where its sibling `_connetto_meta` states it as a check constraint. **Deliberately left alone**: there is no live defect, nothing else writes that table, and R17 step 2 re-keys it on the identity, which deletes the one-row idea entirely. Recorded in R17 so whoever does that phase knows the invariant currently rests on call sites.
+3. **The browser's refresh store keeps one row by call-site convention**, three sites hardcoding `1`, where its sibling `_connetto_meta` states it as a check constraint. **Deliberately left alone**: there is no live defect and nothing else writes that table. **Overtaken since.** R41 replaced the schema on 2026-08-07, so `connetto_refresh` is keyed `(account TEXT PRIMARY KEY NOT NULL, token)` and the one-row idea is gone. Which name a caller passes is R42's, not R17's, which took the naming defect alone.
 4. **The demo schema's `quantity` becomes required and non-negative**, because the demo's own subscription is `SELECT * FROM orders WHERE quantity > 0`, so a null row silently never syncs.
    **The other half of this decision was taken on a premise of mine that was false, and is reverted.** I reported that `DEFAULT gen_random_uuid()` never fires, having checked that all 53 inserts in the tree name the key, and proposed dropping it. That check only covered the server. On the client the default is the key generator: `build.rs` translates it through pg2sqlite with `with_uuid_function_name("uuidv7")` into the replica's own `DEFAULT (uuidv7())`, which is what mints the key when a local write omits it, exactly as `dioxus-desktop-demo/src/main.rs:75` says. Dropping it broke every local write, caught by `opfs.rs` failing with `NOT NULL constraint failed: orders.id`. The default is restored and the comment above it now says what it is really for. **The version disagreement it caused is real and unresolved**: Postgres mints v4 here and the client v7, and closing that needs either Postgres 18, which first shipped a built-in `uuidv7()`, or an extension, against a test stack on 16.
 
@@ -1173,9 +1179,9 @@ No test constructs a policy that authorizes unconditionally. The full gate is gr
 
 ## R20: connetto must not require a reachable server to start
 
-**Status.** NOT STARTED
+**Status.** NOT STARTED, **blocked on nothing**. Step 5 waited on R43, which landed 2026-08-07.
 
-**Blocked on nothing.** This is a defect, not an enhancement. Working offline is a stated objective of the project, and an application whose own local features do not depend on connetto still fails to start today because connetto's boot cannot complete.
+**A defect, not an enhancement.** Working offline is a stated objective of the project, and an application whose own local features do not depend on connetto still fails to start today because connetto's boot cannot complete.
 
 ### Purpose
 
@@ -1183,13 +1189,31 @@ No test constructs a policy that authorizes unconditionally. The full gate is gr
 
 **This is a fatal ordering, not a missing feature.** The pieces that would serve an offline start already exist. Live queries already answer from the replica before any server round trip, and `crates/connetto-client/src/reconnect.rs` already carries the machinery for connecting later. What is missing is the ability to exist first and connect second.
 
+### Three corrections from grounding, 2026-08-07
+
+**Correction 1, and it is the real blocker the Purpose above misses. An offline boot cannot learn who it is, so it cannot name the replica file at all.** `boot_db_worker` calls `acquire_session` before it opens anything, because the identity names the file. That calls `BrowserAuthenticator::acquire`, which loads the stored refresh token and then calls `refresh_tokens`, an HTTP fetch to `{auth_base_url}/auth/refresh`. A network failure yields `AuthError::Transient`, which `acquire` returns rather than swallowing and which `acquire_session` propagates. The identity itself only ever arrives inside the token response as `TokenResponse::user_id`, and nothing persists it. No network means no `user_id`, no `user_id` means no `replica_db_name`, and no name means no durable replica to read from. Making the connection transport-less does not touch this. The native path has the same ordering for a different reason: `examples/dioxus-desktop-demo/src/main.rs` opens a `TcpStream` before it authenticates.
+
+**Correction 2. "Live queries already answer from the replica before any server round trip" is half true, and the false half is the one that matters.** `watch` and `watch_fn` in `crates/connetto-client/src/live.rs` do read the replica first, and their own error documentation ends with "or the subscribe frame cannot be sent". `attach_wire` sends the `Subscribe` frame inline, so the call as a whole fails while the transport is down. `docs/architecture/15-replica-retention.md` already records this under "Durability is not optional for the offline case". Step 5 is therefore a behaviour change, not a clarification.
+
+**Correction 3. The reconnect path cannot be reused verbatim, because it needs a connection to already exist.** `reconnect.rs` carries `ReconnectPolicy`, `Sleeper` and `TransportFactory`, which are the policy and the source of a transport. The driver is `recover` in `live.rs` and it calls `state.conn.resume(transport)`, a method on an existing connection. Step 2 is right in instinct and strictly follows step 1.
+
+### Decisions taken with the maintainer on 2026-08-07, before any code
+
+**1. The device remembers the account identifier, not the derived file name.** An offline start reads it from beside the stored credential, which is already encrypted under a machine key that needs no account, and derives the file name from it exactly as an online start does. Rejected: storing only the hashed file name, which is already on the device in the clear as both the storage pool entry and the key-store record name and which would open the file but leave the startup unable to report who is signed in and unable to identify itself when a connection later arrives, while adding a second path to a file name beside the derive-from-identifier one. Rejected: deferring to R42, which would hold a defect against a stated project objective behind an undecided feature. Rejected: narrowing this phase to losing the network mid-run, which is the smaller half of the work wearing the whole phase's name. **The cost, stated plainly:** the device now holds a recoverable account identifier at rest rather than only a hash of one. It sits under the same machine key as the credential beside it, and anyone who can read that credential can already impersonate the account, so it grants an attacker nothing new, but it is a real change to what is stored.
+
+**2. Not-connected is one optional bundle, not five optional fields.** The socket and the four values that only exist because the server answered a greeting (`connection_id`, `session_handle`, `resume_token`, `schema_version`) move into one group, and the connection holds one optional group. They arrive together in one exchange and are meaningless apart, so a half-built connection holding a session handle and no socket stops being expressible. `resume` already does the attach work and becomes the attach path. Rejected: making all five optional separately, which is smaller and lets the code express states that cannot occur, so every future reader handles an absence that only ever happens together. Rejected: a stand-in socket that always fails, which cannot work because the socket type is fixed when the connection is built, so such a connection could never later hold a real one without boxing every message, and which would make not-connected-yet indistinguishable from the network breaking.
+
+**3. A subscription declared offline is persisted, not held in memory, and that is what R43 blocks.** `docs/architecture/15-replica-retention.md` already decided the end state: the client persists its subscriptions in the never-synced database, in three normalised tables, and persisting the set replaces the in-memory best-effort `sub_tables`. Holding them in memory here is therefore not a staging post, it is writing the thing that end state deletes. **Rejected as a shortcut, on the maintainer's standing rule that an interim step needs a named blocker rather than a price tag.** The named blocker is R43: in the browser that file has two live handles, and persisting subscriptions would be the first thing to write through the one the relay does not read, turning R43 from latent to live. R43's own undecided input, who owns the single handle, is the same question this needs answered.
+
 ### Steps
 
+0. **Persist the account identifier at login**, per decision 1, so a start with no network can name the replica file. Added 2026-08-07: without it steps 1 to 3 change nothing observable in the browser, because the boot dies before it reaches them.
 1. **Make a connection constructible with no transport**, opening the replica, applying or verifying the schema, and serving local reads. The handshake and the cursor resume become things that happen when a transport arrives rather than preconditions for existing.
 2. **Attach a transport afterwards**, reusing the reconnect path rather than adding a second one, since reconnecting to a server after losing it and connecting for the first time after starting without one are the same operation.
 3. **Stop propagating a connect failure as fatal at boot** in the browser worker. An unreachable server becomes a state the caller is told about, not an error that ends the process.
 4. **A first run with no data and no server reports empty, and reports why. Decided.** It cannot serve rows nobody has ever fetched, so it returns an empty state **flagged as never-synced**, distinct from a genuinely empty dataset. The application must be able to tell "you have no orders" from "we could not load your orders", because collapsing the two guarantees the wrong message reaches somebody and it is a bug nobody finds until a user reports it. Connetto reports the state, the application decides what to show.
-5. **Say what a subscription means before a server has ever been reached.** It is registered locally and takes effect on the first connection, which is the behaviour a caller can reason about without knowing whether a connection has happened yet.
+   **The mechanism already exists and is already public**, found 2026-08-07: `_connetto_meta.cursor` holds the Postgres LSN, `load_cursor` returns `None` when nothing was ever persisted, and `ConnettoConnection::cursor` exposes it. What is left is a caller-facing shape, not a mechanism.
+5. **Say what a subscription means before a server has ever been reached.** It is registered locally and takes effect on the first connection. **Persisted, per decision 3, which is what makes this step wait on R43.** This is the part that splits the phase: steps 0 to 4 depend on nothing R43 owns.
 
 ### Proof
 
@@ -1244,7 +1268,7 @@ Two accounts on one device, where each store returns each account's own secret a
 
 `connetto_core::traits::RefreshTokenStore` and `connetto_core::traits::ReplicaKeyStore` are the two traits, each with an associated `Error`, each addressing the account per call, and the key store's three methods returning `impl Future + MaybeSend`. The native side is `KeyringStore` (now `new(service)` alone) and `MemoryRefreshStore` for the token, `KeyringKeyStore` and `MemoryKeyStore` for the keys. The browser side is `RefreshStore` and `IdbKeyStore`, which is decision 7's rename. `connetto-client` re-exports neither trait any more.
 
-**One thing decision 4 implied and no step named: the browser refresh table had to move.** A `load(name)` the implementation ignores is a lie in the interface and would fail the proof's first clause, so `connetto_refresh` went from `(id INTEGER PRIMARY KEY, token)` holding one row to `(account TEXT PRIMARY KEY NOT NULL, token)` holding one row per name. That is the shape only. **R17 still owns the keying**, which is the separate question of which name a caller passes: today every caller passes the literal `connetto_web::auth::REFRESH_RECORD`, because the token is what reveals the identity and nothing knows an identity at boot. R17 decides what replaces that literal and how a cold boot picks among several, and it now touches call sites rather than the schema.
+**One thing decision 4 implied and no step named: the browser refresh table had to move.** A `load(name)` the implementation ignores is a lie in the interface and would fail the proof's first clause, so `connetto_refresh` went from `(id INTEGER PRIMARY KEY, token)` holding one row to `(account TEXT PRIMARY KEY NOT NULL, token)` holding one row per name. That is the shape only. **R42 owns the keying**, which is the separate question of which name a caller passes: today every caller passes the literal `connetto_web::auth::REFRESH_RECORD`, because the token is what reveals the identity and nothing knows an identity at boot. R42 decides what replaces that literal and how a cold boot picks among several, and it now touches call sites rather than the schema. This said R17 until the split on 2026-08-07 moved it.
 
 **Two smaller consequences, both forced rather than chosen.** The key-store trait is not dyn-compatible once its methods return `impl Future`, so `provision_replica_key`, `teardown::wipe_replica` and `teardown::forget_device` took a type parameter in place of `&dyn ReplicaKeyStore`, and the two teardown functions became awaiting. And both authenticators now hold the record name rather than taking one per call, because `NativeAuthenticator::token_source` captures a closure that has to know it anyway, and because one field cannot disagree with itself the way five call sites can.
 
@@ -1262,37 +1286,162 @@ R17 is one scope mismatch, a file named device-wide and keyed per account. This 
 
 ## R17: the local tier is device-named and identity-keyed
 
-**Status.** NOT STARTED
+**Status.** **DONE** (2026-08-07)
 
-**Blocked on nothing.** It was blocked on R41, which landed on 2026-08-07 and reshaped the refresh store this phase re-keys. It is a defect rather than an improvement, so it does not wait on a measurement either.
+**Blocked on nothing.** It was blocked on R41, which landed on 2026-08-07. It is a defect rather than an improvement, so it does not wait on a measurement either.
+
+**Narrowed on 2026-08-07, and step 2 became R42.** The phase held two unrelated pieces of work: the naming defect in its title, and letting several accounts stay signed in at once. The second appeared in no line of the Proof and no line of the Done when, and it carries a design question nobody has answered, so keeping it here would have blocked a decided defect behind an undecided feature. That is the objection R41's own "Why it is not folded into R17" raised against the same mixing. Rejected: settling the several-accounts design first and building both, whose only argument was one fewer phase to track. Rejected: leaving step 2 written here and unbuilt, which is how a decision goes stale in this repository and is what the status markers exist to catch.
 
 ### Purpose
 
-`docs/architecture/12-identity-session-capability.md` records that **the never-syncing attached database stays keyed to the identity**, with the reasoning that a device-scoped file is readable by everyone who uses the machine, which is right for a catalogue and wrong for a draft. The code does not do this, and the decision carries no status marker, which is how it went unnoticed.
+`docs/architecture/12-identity-session-capability.md` records that **the never-syncing attached database stays keyed to the identity**, with the reasoning that a device-scoped file is readable by everyone who uses the machine, which is right for a catalogue and wrong for a draft. It marks that decision `Decided (R17)`. The code does not do it.
 
-`ReplicaConfig::frontend_db_name` is a `&'static str`, so the tier has **one name per deployment**, shared by every identity on the device. The replica beside it is named per identity through `replica_db_name`. Then `boot_db_worker` in `crates/connetto-web/src/workers.rs` opens the tier at that fixed name and unlocks it with `Replica::key`, which is the **per-identity** replica key.
+`ReplicaConfig::frontend_db_name` is a `&'static str`, so the tier has **one name per deployment**, shared by every identity on the device. The replica beside it is named per identity through `replica_db_name`. Then `boot_db_worker` in `crates/connetto-web/src/workers.rs` opens the tier at that fixed name, and the browser tier is a separate connection carrying the replica's key explicitly, which is the **per-identity** key.
 
-**So the tier is device-scoped by name and identity-scoped by key, which cannot both be right.** The observable consequence is that a second identity on one device opens the first identity's tier file and fails to unlock it, so device-private data becomes unusable rather than merely private. `boot_db_worker` also deletes only the replica on an account switch, leaving that file behind, so the failure persists across switches.
+**So the tier is device-scoped by name and identity-scoped by key, which cannot both be right.** The observable consequence is that a second identity on one device opens the first identity's tier file and fails to unlock it, so device-private data becomes unusable rather than merely private.
+
+**One correction to this section, made 2026-08-07 by reading the code.** It used to say `boot_db_worker` deletes the replica on an account switch and leaves the tier behind, so the failure persists across switches. Nothing is deleted on a switch: the comment in `boot_db_worker` says the identity that just left keeps its replica, and `crates/connetto-web/tests/account_switch.rs` carries a passing test named for it. Step 3 rested on that sentence and dissolved with it.
+
+**Only `boot_db_worker` is affected.** `Replica::with_tier` takes whatever path its caller supplies, so it is not itself wrong, and no native caller in this repository names a tier. The one place connetto chooses a tier name is the browser boot.
+
+### Decisions taken with the maintainer on 2026-08-07, before any code
+
+Three things the section did not settle, each reproduced or grounded first and then put to the maintainer as a choice.
+
+**1. The tier is named from the replica's own file name plus the fixed ending `-tier`, and the application no longer names it at all.** `frontend_db_name` leaves `DbWorkerConfig` rather than becoming a prefix, and `crate::storage::tier_db_name` in `crates/connetto-web/src/storage.rs` is the derivation. This reaches the same scope the chapter wants, one file per account, and it makes two other problems disappear rather than solving them. There is no second prefix, so a consumer can no longer set two prefixes to one string and collide the two files, and the guard that would have needed is unnecessary. And because one name computes the other, the delete-my-data path can destroy both from the single name its record already holds. Rejected: the prefix this section originally called for, whose cost was leaving a reproduced dead-startup defect in the tree and needing the collision guard. Rejected: the prefix plus widening the pending-delete record to carry two names, which changes the record shape, its write, its drain, the delete primitive and the logout service, and puts two unrelated defects in one phase. Rejected: a device-scoped file under R11's device-scoped key, which chapter 12 already argues against.
+
+**2. The delete-my-data defect is closed here, and it was reproduced before it was fixed.** `storage::wipe_replica` destroyed the replica and its key and left the tier file behind with the shredded key's salt, so the next boot for that same identity minted a fresh key, met the surviving file, and died at the unlock. Renaming per identity does not fix it, because the name stays stable for that identity. Reproduced in headless Chrome as `Err(WrongKey(DatabaseError(Unknown, "file is not a database")))`. Under decision 1 the fix is one extra delete inside `wipe_replica`, so it lands here rather than becoming its own item.
+
+**3. The proof is split, because the only code that picks the name is a startup routine no fast test can drive.** `boot_db_worker` opens a real socket to a real server, so `crates/connetto-web/tests/` cannot call it, and the suite that can needs five processes. The test identity provider hands out one fixed user for the life of the process (`IssuerConfig::default_user_id`, the literal `test-user-123`, with no per-login override and none wired through `auth_stack.rs`), so two accounts through it need that example patched and a second copy of it running. So the two-account property runs in the fast suite against real browser storage, calling `tier_db_name` rather than a copy of the convention, and the startup's use of it is pinned by one assertion in the suite that already boots it for one account. Rejected: end to end only, which is the only shape that fails at the unlock step today rather than failing to compile, but which changes a shared test server and runs rarely. Rejected: the fast suite alone, which leaves nothing tying the startup to the naming function.
 
 ### Steps
 
-1. **Decide which scope the tier actually has, and make name and key agree.** The recorded decision says identity, which means deriving the tier name from the identity exactly as `replica_db_name` does, so each identity gets its own tier under its own key. The alternative is a genuinely device-scoped tier, which then cannot use a per-identity key and needs the device-scoped key that R11 introduces. **These are different products, not different implementations**: the first is a private draft, the second is a shared catalogue, and chapter 12 already argues for the first.
-2. **Several accounts stay signed in at once, and only the browser needs changing. Decided.** Blocking at one is not wanted: a person with a work account and a personal one should switch instantly rather than logging in each time, which is what the accounts-belong-to-one-person model already assumes.
-   **R41 moved the shape, and this step now moves only the keying.** Both stores address the account per call, natively through `KeyringStore::load(account)` and in the browser through a `connetto_refresh (account TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL)` holding one row per name. So neither the trait nor the schema is what is left. What is left is which name a caller passes: every caller passes the literal `connetto_web::auth::REFRESH_RECORD` today, because the refresh token is what reveals the identity and nothing knows one at boot. Native passes its own literal, `"refresh"` in the desktop demo.
-   **The two questions this step has to answer, and neither is settled.** Which name replaces the literal, and how a cold boot chooses among several stored accounts when no identity is known yet. The second is the harder one and it is why R41 stopped short: a store keyed on the identity has nothing to look up before a login, so something else has to name the account to resume, and that something does not exist. Settle both before writing code, per the standing rule on an under-defined section.
-   **The encryption already supports several accounts**: the store is opened under a device-scoped key from `device_key`, not a per-identity one, so several accounts' tokens coexist in it without a key change.
-   Note the security cost and accept it deliberately: a found device can resume any account whose token is still stored, rather than only the last one. That follows from the threat model rather than contradicting it, since those accounts belong to one person and the operating system boundary is what separates people.
-   **The `id = 1` call sites are gone (R41, 2026-08-07).** The three places that hardcoded them, the load, the save, and a clear that deleted every row, now address `account`, and the clear deletes one row. The note that the sibling `_connetto_meta` states its one-row invariant as a `CHECK (id = 1)` while this table never did is now moot: the one-row idea is gone rather than unenforced.
-3. Make the account-switch path consistent with whatever step 1 decides, since it currently removes the replica and leaves the tier.
-4. **Give the decision in chapter 12 a status marker** naming this phase, so the same silence cannot recur.
+1. **Name the tier from the identity**, so name and key have one scope. `docs/architecture/12-identity-session-capability.md` records it as `Decided (R17)` and argues it, since a device-scoped file is readable by everyone who uses the machine, which is right for a catalogue and wrong for a draft. **Amended 2026-08-07 by decision 1 above**: this section used to say `frontend_db_name` becomes a prefix. It is derived from the replica's file name instead, and the field is gone.
+2. **Leave the no-account case exactly as it is.** An unidentified boot already gets an in-memory tier beside an in-memory replica, which is what chapter 12 records, so there is nothing to change and nothing to decide.
+3. ~~Make the account-switch path consistent.~~ **Dissolved 2026-08-07.** It rested on the deletion that does not happen, and once each identity opens its own tier a switch needs no path of its own: the same file selection that already keeps each identity's replica keeps each identity's tier.
+4. **Give the decision in chapter 12 a status marker** naming this phase. The marker exists and says `Decided (R17)`, so this step is now the smaller one of turning it into a statement of what is built.
+5. **Added by decision 2.** Make the delete-my-data path destroy the tier beside the replica.
+
+### Found while grounding this phase, and split out as R43
+
+The browser startup holds two live handles on the tier file for the worker's whole life. `ConnettoConnection::connect` attaches it to the replica connection, and `open_replica_and_tier` then opens the same file again as the standalone connection the relay serves from. Confirmed in a real browser. It is latent rather than live, because nothing reads the attached copy after connect. R17 changes the one value that feeds both opens and deliberately does not fix it. See R43.
+
+### One consequence no step named: the storage pool had to learn to grow
+
+A file per account per tier is a file the browser's storage pool has to hold, and it ships **six slots and never grows**. The sahpool hands out preallocated slots and its open path is synchronous, so it cannot make room itself: the open past the last one fails with `unable to open database file`, which inside the worker is a boot that dies with a string nobody reads. Measured rather than assumed, by printing the pool's capacity and listing through a run: one slot per database, and **a rollback journal takes a slot of its own**, so a database being written to costs two.
+
+**Left alone this phase would have halved the account ceiling.** A boot opens four databases (the replica, the tier, the refresh store and the hub's own state) and each account leaves a replica behind, deliberately, so switching back resumes rather than re-snapshots. With one shared tier that reached six files at the third account. With one tier each it reaches six at the second.
+
+So `ReplicaStorage::reserve` grows the pool to hold a given number of files beyond the ones it already holds, and `boot_db_worker` calls it for eight slots after the pending deletes (which are what free slots) and before the login (which opens the refresh store). Over-reserving costs an empty file per spare slot. This was found by the new wipe test failing, and it took two other tests in that binary down with it, which is what a shared exhausted pool looks like.
 
 ### Proof
 
-Two identities on one device each write to the local tier, switch between each other, and both find their own data intact and neither can read the other's. That test fails today at the unlock step, which is what makes it the right test.
+Two identities on one device each write to the local tier, boot as each other in turn, and both find their own data intact and neither can read the other's. It needs one account signed in at a time, which is why it does not wait on R42. Split per decision 3: `a_second_identity_gets_its_own_openable_local_tier` in `crates/connetto-web/tests/account_switch.rs` carries the two-account property, `a_wipe_destroys_the_tier_beside_the_replica` in `crates/connetto-web/tests/teardown.rs` carries decision 2, and `the_logged_in_startup_runs_and_carries_out_a_pending_delete` in `examples/wasm-smoke/tests/authenticated_boot.rs` pins the startup to the derivation.
 
 ### Done when
 
-A tier's name and its key have the same scope, that scope matches what chapter 12 records, and an account switch leaves each identity's device-private data usable. The decision in chapter 12 carries a marker.
+A tier's name and its key have the same scope, that scope matches what chapter 12 records, and two identities on one device each keep usable device-private data. The decision in chapter 12 reads as built.
+
+---
+
+## R43: the browser opens the local tier twice at once
+
+**Status.** **DONE** (2026-08-07)
+
+**Was blocked on nothing here** and on one change to `diesel-sqlite-session`, which landed the same day. Found on 2026-08-07 while grounding R17 and split out that day. **R20 step 5 no longer waits on anything.**
+
+### Purpose
+
+`boot_db_worker` holds **two live SQLite handles on one OPFS file** for the worker's whole life. `ConnettoConnection::connect` calls `attach_tier`, which runs `ATTACH DATABASE <tier path> AS connetto_local` on the replica connection, and `open_replica_and_tier` then opens the same file again as the standalone connection the relay hub serves the tier from.
+
+**Confirmed in headless Chrome**, not reasoned: `PRAGMA database_list` on the replica connection reports `main` and `connetto_local`, and while that connection is open the same file opens again, unlocks under the same key, lists its tables and takes a write through the second handle.
+
+**The storage layer does not refuse the second open and cannot.** `sqlite-wasm-vfs`'s sahpool keeps its open files in a `HashSet<String>` keyed by name, so the second `xOpen` inserts a name that is already there and the first `xClose` removes it for both. The second close then trips its own `debug_assert!(exist, "DB closed without open")`. No test has seen it, because the worker never closes either handle. That assertion is upstream behaving correctly against an invariant connetto violates, so it is not an upstream finding.
+
+**The cost is a second page cache over one file**, and it stays latent only while nothing reads the attached copy inside the worker. R20 step 5 would be the first thing to read and write it, which is why that step waits here.
+
+### The constraint that decides the shape, verified 2026-08-07
+
+**A tab's write to a device-private table is applied with `sqlite3changeset_apply`, whose C signature takes a database handle and no schema name**, so it can only ever write into whichever file is that connection's `main`. Read from the `libsqlite3-sys` bindings, not inferred. `relay.rs` does exactly this on `local.conn`.
+
+**The client reaches those same tables by plain unqualified diesel names on the replica connection**, resolved through the attachment. `examples/wasm-smoke/tests/local_tier.rs` inserts into `notes::table`, runs a live query over it and runs a local count, all against `conn.conn()`. Remove the attachment and the client's entire typed device-private surface goes with it, not merely queries that span both tiers.
+
+So one side needs the file to be `main` and the other needs it attached. That is why there are two handles, and only one side can win.
+
+### Decided with the maintainer on 2026-08-07
+
+**The client keeps the attachment and the relay gives up its own connection.** One mechanism on both targets, the client reads and writes those tables by plain typed queries everywhere, and R20's subscription records become ordinary SQL rather than an interface implemented once per target. Rejected: the relay keeping it and the client giving up the attachment, which is what the first draft of this phase said. It would have left the client unable to touch that file in the browser at all, forced R20's subscription records through a hand-over interface, and left the typed local surface working natively and not in the browser. Rejected: leaving the two handles and fixing only the bookkeeping, which is defensible today and stops being so the moment R20 writes through the client.
+
+### Steps
+
+1. **Keep the tier attached to the replica connection, and delete the relay's standalone tier connection.** `LocalTier` stops wrapping a connection. The hub can read the tier's table set from the worker's own `local_tables()`, so `RelayHub`'s `Option<LocalTier>` parameter and `open_replica_and_tier`'s second return value both go.
+2. **Replace the tab-write apply.** `local.conn.apply_changeset(..)` cannot target an attached schema, so the change list is read and replayed as statements against `connetto_local`. **This is smaller than it first looked**: `diesel-sqlite-session` already exports a typed reader, `ChangesetReader::open` plus `ChangesetRow` with `op`, `table`, `column_count`, `is_primary_key`, `old_value` and `new_value`, so this is not raw FFI. The conflict rule keeps today's meaning exactly, abort on any mismatch, which is what `ConflictAction::Abort` gives now.
+3. **Make the tab-snapshot path schema-aware.** `snapshot_patchset` reads `sqlite_schema` unqualified and calls `create_session`, which binds to `main`, so serving a snapshot of a device-private table needs both qualified against `connetto_local`. The constructor it needs now exists: see Prerequisite.
+4. **Native converges rather than diverging.** It already attaches and already has one handle, so both targets end on one mechanism. The earlier draft's step keeping native different is withdrawn.
+
+### Prerequisite, discharged 2026-08-07
+
+`sqlite3session_create` takes a schema name and `diesel-sqlite-session` hardcoded `MAIN_DB_NAME`, so a change-capture session could not be opened on an attached schema, and the failure was silent: an empty patchset when the table lived only in the attached schema, and `main`'s rows when a same-named table existed there too. Written up in `docs/upstream-diesel-session-attached-schema.md` with a runnable reproduction.
+
+**Landed upstream the same day** as `61f2c5e`, and the pin moved from `6504251` to `61f2c5e` across all six lockfiles. The constructor is `SqliteSessionExt::create_session_on(database)`, with `create_session` unchanged. Verified against the new pin rather than taken on trust: the attached schema's rows are captured and `main`'s same-named table is not substituted, an unattached name is refused at construction with `SessionError::UnknownDatabase`, and a throwaway session on an attached schema coexists with the long-lived capture session, which is what step 3 needs. The root suite and the twenty-eight browser tests are green on the new pin.
+
+**One clause to know about.** The fix also arbitrates the pre-update hook slot and adds `SessionError::PreUpdateHookInstalled`. connetto installs an update hook (`install_change_tracker`) and a commit hook, and no pre-update hook, so it does not fire here. A later phase that adds one would break step 3.
+
+**Note the naming correction.** This section previously called the crate a diesel fork. `diesel-sqlite-session` is a standalone crate, not a fork of anything.
+
+### Proof
+
+`the_tier_is_attached_to_the_replica_and_frees_with_it` in `crates/connetto-web/tests/local_tier_one_handle.rs` is the phase's own claim: the tier appears in `PRAGMA database_list` on the replica connection, a device-private row is written through it by a bare name and uploads nothing, and the pool takes both files back the instant that one connection drops, with no await in between. **Mutation-proven**: adding back the standalone open R43 removed makes it fail with the pool's own `DB closed without open`, which is the assertion this phase exists to eliminate. Its sibling proves a device-private row survives a reopen through the attachment, which is the half a second page cache would break.
+
+The replay's conflict rule has five cases in `crates/connetto-web/src/relay.rs`, the crate's first in-crate tests, because the function is private and correctness-critical: an update lands when the row still holds what the writer saw, an update onto a row somebody else changed is refused and leaves it alone, a delete of a vanished row is refused, an insert onto an occupied key is refused, and a null old value matches only a null.
+
+End to end, `local_tier_notes_fan_out_across_tabs` in `examples/wasm-smoke/tests/notes_fanout.rs` drives a real tab write into a device-private table through the replay and out to the other tab, against the dev stack.
+
+### Done when
+
+One handle exists per tier file at any moment in the browser, native still attaches, and local query routing still sends tier tables to the tier.
+
+**All of it holds as of 2026-08-07.** `LocalTier` is gone, and so is the standalone connection and `RelayHub`'s `Option<LocalTier>` parameter. `open_replica_and_tier` is now `open_replica` and only connects. The hub reads the tier's table set from the worker's own `local_tables()`, snapshots it with `create_session_on(LOCAL_SCHEMA)`, and reads and writes its watermark through the same typed DSL as before, unqualified, because a bare name resolves into the attachment. Both targets now use one mechanism, so step 4 needed no code.
+
+### What execution changed
+
+**The table list needed a filter it never had.** `local_tables` came from the attached catalogue unfiltered, so the hub's own `_connetto_tab_mutations` would have appeared as an application table a tab could subscribe to, once the watermark moved into a database the client also reads. `local_tier_tables` in `crates/connetto-client/src/lib.rs` now excludes `sqlite_%` and `_connetto*`, matching what the deleted `LocalTier::new` did for itself.
+
+**The replay is hand-written, and the reason is worth keeping.** `sqlite-diff-rs` renders a parsed changeset operation as an executable diesel query under its `diesel` feature, which was the obvious route and was tried. Its predicate is primary-key only, which is patchset semantics, so it would have turned a stale write into a silent last-write-wins where `ConflictAction::Abort` refuses it. The predicate here carries every column the changeset recorded an old value for, so one affected row means the row was there and unchanged, and anything else aborts. Nulls are written into the SQL rather than bound, because a bind carries no type to compare against.
+
+**Two lints the new code tripped, both real.** The renderer split into `render_insert`, `render_update` and `render_delete` behind a `RenderedOp` alias, and `handle_local_mutation` stopped taking a cursor it can read from the worker itself.
+
+---
+
+## R42: several accounts stay signed in at once
+
+**Status.** NOT STARTED, one input undecided
+
+**Blocked on nothing in code.** Split out of R17 on 2026-08-07, where it had been step 2. It is blocked on a decision rather than on a phase, and that decision is named below.
+
+### Purpose
+
+A person with a work account and a personal one should flip between them instantly rather than logging in again each time, which is what the accounts-belong-to-one-person model in `docs/architecture/12-identity-session-capability.md` already assumes. **Decided, and the requirement is not in question.** Blocking at one account is not wanted.
+
+**Only the browser needs changing, and R41 already moved the shape.** Both stores address the account per call, natively through `KeyringStore::load(account)` and in the browser through `connetto_refresh (account TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL)`, which holds one row per name. So neither the trait nor the schema is what is left. What is left is which name a caller passes: every caller passes the literal `connetto_web::auth::REFRESH_RECORD` today, and the desktop demo passes its own literal `"refresh"`.
+
+**The encryption already supports it.** The refresh store is opened under a device-scoped key from `device_key`, not a per-identity one, so several accounts' credentials coexist in it with no key change.
+
+**The security cost, accepted deliberately.** A found device can resume any account whose credential is still stored, rather than only the last one. That follows from the threat model rather than contradicting it, since those accounts belong to one person and the operating system boundary is what separates people.
+
+### What is undecided, and it is one thing
+
+**How a cold boot chooses which account to resume when nobody has said who they are.** This is why R41 stopped at the shape. A store keyed on the identity has nothing to look up before a login, because the credential is what reveals the identity, so something else has to name the account to resume and no such thing exists. Candidates worth pricing when this is taken up, none of them chosen: a separate last-used marker beside the credentials, resuming every stored account at once, or asking the application to name one. Each changes what a boot costs and what a shared device discloses, so this needs a discussion rather than a default, per the standing rule on an under-defined section.
+
+A smaller question rides with it: what replaces the pre-login literal once an account can be named, and whether native follows or keeps its own literal.
+
+### Done when
+
+Two accounts are signed in on one browser at once, a switch between them needs no login, and a cold boot resumes the right one by whatever rule the decision above settles.
+
+### Why it is not part of R17
+
+R17 is one naming defect with a decision already recorded and a proof that needs a single account signed in at a time. This is a product feature with an open design question. Landing them together would hold a decided defect behind an undecided feature, which is the same objection R41 raised against being folded into R17.
 
 ---
 
@@ -2213,7 +2362,7 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **Owner-less synced data is duplicated once per identity.** A public catalogue lives in the replica, which is named from the identity, so several signed-in users on one device hold several copies. Sharing a store across identities is exactly the boundary the per-identity name establishes, so it is not a small change. Not decided.
 
-**The never-syncing attached database stays keyed to the identity.** Decided, and needs no work.
+**The never-syncing attached database stays keyed to the identity.** ~~Decided, and needs no work.~~ **Built (R17, 2026-08-07)**, so this is no longer parked: its file is named from the replica's own name through `tier_db_name`, and a delete-my-data destroys it beside the replica.
 
 **Android as a web target.** Technically supported, verified by measurement: WebView 124 on Android 15 has every API connetto uses. What remains is a product decision, and the recorded exclusion stands until stated otherwise.
 

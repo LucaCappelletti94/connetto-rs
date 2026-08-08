@@ -64,8 +64,6 @@ const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uu
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The OPFS file holding the worker's durable synced replica.
 const DB_NAME: &str = "connetto-relay.sqlite";
-/// The OPFS file holding the worker's durable device-private tier.
-const FRONTEND_DB_NAME: &str = "connetto-frontend.sqlite";
 /// The shared leader lock every window of this app races.
 const LEADER_LOCK: &str = "connetto-demo-leader";
 /// The local tier schema, translated from `frontend.sql` by build.rs. DDL rather
@@ -226,7 +224,6 @@ async fn run_db_worker() -> Result<(), JsValue> {
             ws_url: DEMO_WS_URL,
             replica_db_prefix: DB_NAME,
             replica_ddl: DEMO_SQLITE_DDL,
-            frontend_db_name: FRONTEND_DB_NAME,
             frontend_ddl: FRONTEND_DDL,
             upstream_sub_id: "db-upstream",
             upstream_query: DEMO_QUERY,

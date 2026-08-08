@@ -221,7 +221,7 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     })
     .await;
 
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });

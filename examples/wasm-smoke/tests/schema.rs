@@ -75,7 +75,7 @@ async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> Re
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
             .expect("worker connect");
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });

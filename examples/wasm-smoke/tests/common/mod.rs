@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use connetto_wasm_smoke::workers::{
-    DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, FRONTEND_DB_NAME,
+    DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL,
 };
 use connetto_web::auth::{
     Acquired, BrowserAuthenticator, IdbKeyStore, LoginMessage, REFRESH_RECORD, RefreshStore,
@@ -45,7 +45,6 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         ws_url: DEMO_WS_URL,
         replica_db_prefix: DB_NAME,
         replica_ddl: DEMO_SQLITE_DDL,
-        frontend_db_name: FRONTEND_DB_NAME,
         frontend_ddl: DEMO_FRONTEND_DDL,
         upstream_sub_id: "e42-upstream",
         upstream_query: DEMO_QUERY,

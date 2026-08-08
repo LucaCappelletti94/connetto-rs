@@ -151,7 +151,7 @@ async fn bad_tab_subscription_yields_scoped_nonfatal() {
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
             .expect("worker connect");
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });
@@ -214,7 +214,7 @@ async fn aggregate_upstream_nonfatal_reaches_the_tab() {
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_cfg, None)
             .await
             .expect("worker connect");
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("relay hub");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });
@@ -266,7 +266,7 @@ async fn row_upstream_nonfatal_fans_out_to_reading_tabs() {
         upstream: vec![(UPSTREAM_SUB.to_owned(), SubscriptionSpec::new(QUERY))],
     };
     let (hub, pump, _notices) =
-        RelayHub::with_reconnect(worker, ":memory:", None, reconnect).expect("relay hub");
+        RelayHub::with_reconnect(worker, ":memory:", reconnect).expect("relay hub");
     spawn_local(async move {
         let _ = pump.await;
     });

@@ -101,6 +101,7 @@ use connetto_web::auth::{
 };
 use connetto_web::storage::{
     ReplicaStorage, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
+    tier_db_name,
 };
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -208,13 +209,24 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     );
 
     // And the account owns its replica, named from its identity rather than from
-    // the bare prefix an unauthenticated startup would have used.
+    // the bare prefix an unauthenticated startup would have used. The
+    // device-private database beside it is named from the replica in turn, which
+    // is what R17 closed: it used to carry one name for the whole device while
+    // its key was per identity, so the second account to sign in opened the first
+    // one's file and could not unlock it.
+    let listed = storage.list();
     assert!(
-        storage.list().iter().any(|entry| entry == &replica_name),
+        listed.iter().any(|entry| entry == &replica_name),
         "the account's replica is in the pool"
     );
     assert_ne!(
         replica_name, DB_NAME,
         "a logged-in startup names the replica after the account"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|entry| entry == &tier_db_name(&replica_name)),
+        "and the startup opened the device-private database the derivation names"
     );
 }

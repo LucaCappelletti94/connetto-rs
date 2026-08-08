@@ -74,9 +74,11 @@ use connetto_core::{Cursor, IncomingFrame, Transport};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;
+use diesel::sqlite::Sqlite;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
-use sqlite_diff_rs::ParsedDiffSet;
+use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Zstd level for relayed snapshot payloads, matching the client library default.
@@ -205,6 +207,7 @@ struct TabState {
 }
 
 /// A failure inside the tab-mutation apply transaction.
+#[derive(Debug)]
 enum TabApplyError {
     /// The changeset failed to apply: rejected back to the tab.
     Apply(String),
@@ -227,13 +230,21 @@ const HUB_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_hub._tab_mutatio
 /// DDL for the local tier's durable per-tab mutation watermark. It lives
 /// in the tier database itself so it advances in the same transaction as
 /// the apply, mirroring the server's `_connetto_mutations` design.
-const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_tab_mutations \
+///
+/// Qualified, because `CREATE TABLE` with a bare name would land in `main`.
+/// Every later read and write of it is unqualified and typed, since a bare
+/// name resolves across attached databases and `local_tier_tables` keeps
+/// connetto's own tables out of the set a caller can name.
+const LOCAL_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_local._connetto_tab_mutations \
     (client_id BLOB NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
-/// Typed schema for the local tier watermark table. The hub meta watermark
-/// lives in `connetto_hub._tab_mutations` (an ATTACHED schema), which
-/// `diesel::table!` does not model for SQLite, so only this table gets the
-/// typed declaration and the typed DSL; the hub meta queries use `sql_query`.
+/// Typed schema for the local tier watermark table, which lives in the
+/// ATTACHED `connetto_local` database. The declaration names no schema and
+/// does not need to: a bare table name resolves across attached databases,
+/// and the replica never holds a table of this name. The hub meta watermark
+/// cannot do the same, because `connetto_hub._tab_mutations` collides with
+/// nothing but is created under a schema `diesel::table!` will not model, so
+/// those queries stay `sql_query`.
 mod local_schema {
     diesel::table! {
         /// Per-tab durable write counter, the browser mirror of the server's
@@ -278,49 +289,17 @@ struct BlankState {
     tables: HashSet<String>,
 }
 
-/// The device-local tier a hub can serve alongside the worker replica: a
-/// connection whose MAIN schema is the durable tier database, because
-/// `sqlite3changeset_apply` only ever targets main. Tab writes to these
-/// tables commit here, fan out to the other tabs, and can never reach the
-/// server: the worker replica does not even contain them.
-pub struct LocalTier {
-    conn: SqliteConnection,
-    /// Lowercased table names of the tier, from its own schema catalog.
-    tables: HashSet<String>,
-    /// The tier connection's own blank twin database for snapshots.
-    blank: BlankState,
-}
+/// The attach name of the device-private tier on the worker connection. It is
+/// the client's own `ATTACH` alias, and the hub reads and writes those tables
+/// through the worker connection rather than opening the file a second time:
+/// the browser's storage pool gives two connections to one file a single
+/// underlying handle and two page caches, which is not a thing SQLite can be
+/// asked to survive.
+const LOCAL_SCHEMA: &str = "connetto_local";
 
-impl LocalTier {
-    /// Wrap an open connection to the local tier database: ensure the
-    /// watermark table and load the table catalog.
-    ///
-    /// # Errors
-    ///
-    /// [`RelayError::Replica`] when the watermark DDL or the catalog read
-    /// fails.
-    pub fn new(mut conn: SqliteConnection) -> Result<Self, RelayError> {
-        #[derive(QueryableByName)]
-        struct NameRow {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            name: String,
-        }
-        conn.batch_execute(LOCAL_META_DDL)?;
-        let rows: Vec<NameRow> = sql_query(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' \
-             AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_connetto*'",
-        )
-        .load(&mut conn)?;
-        Ok(Self {
-            conn,
-            tables: rows
-                .into_iter()
-                .map(|row| row.name.to_lowercase())
-                .collect(),
-            blank: BlankState::default(),
-        })
-    }
-}
+/// The name of a connection's own database, which is where the synced replica
+/// lives. Named so a snapshot reads the same way for either tier.
+const MAIN_SCHEMA: &str = "main";
 
 /// Core state threaded through the hub loop.
 #[derive(Default)]
@@ -332,8 +311,11 @@ struct HubState {
     /// [`SEQ_MAP_CAP`].
     seq_map: BTreeMap<u64, (TabId, u64)>,
     blank: BlankState,
-    /// The device-local tier, when the hub serves one.
-    local: Option<LocalTier>,
+    /// Lowercased names of the device-private tables the worker connection has
+    /// attached, empty when this run serves no tier. Writes to them commit on
+    /// the worker connection and can never reach the server, because the
+    /// capture session is bound to `main` and these tables are not in it.
+    local_tables: HashSet<String>,
     /// Aggregate subscriptions multiplexed onto the worker connection,
     /// keyed by the private upstream sub id the hub registered
     /// (`agg-{tab}-{sub}`). Each entry demuxes the worker's
@@ -420,7 +402,6 @@ impl RelayHub {
     pub fn new<U>(
         worker: ConnettoConnection<U>,
         hub_meta: &str,
-        local: Option<LocalTier>,
     ) -> Result<
         (
             Self,
@@ -436,7 +417,6 @@ impl RelayHub {
         Self::build(
             worker,
             hub_meta,
-            local,
             None::<HubReconnect<NoFactory<U>, NoSleep>>,
         )
     }
@@ -457,7 +437,6 @@ impl RelayHub {
     pub fn with_reconnect<U, F, S>(
         worker: ConnettoConnection<U>,
         hub_meta: &str,
-        local: Option<LocalTier>,
         reconnect: HubReconnect<F, S>,
     ) -> Result<
         (
@@ -473,11 +452,12 @@ impl RelayHub {
         F: TransportFactory<Transport = U>,
         S: Sleeper,
     {
-        Self::build(worker, hub_meta, local, Some(reconnect))
+        Self::build(worker, hub_meta, Some(reconnect))
     }
 
     /// Shared constructor body behind the two hub flavors: attach the hub
-    /// meta database and ensure its schema, then assemble the channels.
+    /// meta database and ensure its schema, ensure the device-private tier's
+    /// watermark table when this run has one, then assemble the channels.
     #[allow(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
@@ -485,7 +465,6 @@ impl RelayHub {
     fn build<U, F, S>(
         mut worker: ConnettoConnection<U>,
         hub_meta: &str,
-        local: Option<LocalTier>,
         reconnect: Option<HubReconnect<F, S>>,
     ) -> Result<
         (
@@ -510,6 +489,14 @@ impl RelayHub {
             .conn()
             .batch_execute(&format!("ATTACH DATABASE '{hub_meta}' AS connetto_hub"))?;
         worker.conn().batch_execute(HUB_META_DDL)?;
+        // The tier is already attached to this same connection by the client,
+        // which is what keeps one handle on that file. Its watermark table is
+        // created here rather than by the client, because the per-tab counter
+        // is the hub's own bookkeeping and a run with no tabs never needs it.
+        let local_tables = worker.local_tables().clone();
+        if !local_tables.is_empty() {
+            worker.conn().batch_execute(LOCAL_META_DDL)?;
+        }
         let (events_tx, events_rx) = unbounded_channel();
         let (notices_tx, notices_rx) = unbounded_channel();
         let hub = Self {
@@ -518,7 +505,7 @@ impl RelayHub {
         };
         Ok((
             hub,
-            run_hub(worker, local, events_rx, notices_tx, reconnect),
+            run_hub(worker, local_tables, events_rx, notices_tx, reconnect),
             notices_rx,
         ))
     }
@@ -618,7 +605,7 @@ async fn shovel<D>(
 /// queued frames are served after the resume.
 async fn run_hub<U, F, S>(
     mut worker: ConnettoConnection<U>,
-    local: Option<LocalTier>,
+    local_tables: HashSet<String>,
     mut events: UnboundedReceiver<HubEvent>,
     notices: UnboundedSender<HubNotice>,
     mut reconnect: Option<HubReconnect<F, S>>,
@@ -630,7 +617,7 @@ where
     S: Sleeper,
 {
     let mut state = HubState {
-        local,
+        local_tables,
         ..HubState::default()
     };
     // Row upstream subs the hub can re-snapshot after a full resync. Aggregate
@@ -868,7 +855,7 @@ async fn handle_tab_subscribe<U>(
     worker: &mut ConnettoConnection<U>,
     agg_routes: &mut HashMap<String, AggRoute>,
     blank: &mut BlankState,
-    local: &mut Option<LocalTier>,
+    local_tables: &HashSet<String>,
     tab: &mut TabState,
     id: TabId,
     subscribe: Subscribe,
@@ -896,7 +883,7 @@ where
             if let Err(err) = serve_snapshot(
                 worker,
                 blank,
-                local,
+                local_tables,
                 tab,
                 &subscribe.sub_id,
                 subscribe.spec.priority,
@@ -944,9 +931,10 @@ where
             tab.handshaken = true;
             tab.client_id = Some(client_uuid);
             tab.applied_watermark = tab_watermark(worker, client_uuid)?;
-            tab.local_watermark = match state.local.as_mut() {
-                Some(local) => local_tab_watermark(local, client_uuid)?,
-                None => None,
+            tab.local_watermark = if state.local_tables.is_empty() {
+                None
+            } else {
+                local_tab_watermark(worker, client_uuid)?
             };
             // The hub handles a tab's mutations in order and each lands in
             // exactly one tier, so every sequence at or below the higher of
@@ -982,7 +970,7 @@ where
                 worker,
                 &mut state.agg_routes,
                 &mut state.blank,
-                &mut state.local,
+                &state.local_tables,
                 tab,
                 id,
                 subscribe,
@@ -1065,10 +1053,7 @@ where
     let Ok(tables) = changeset_tables(&changeset) else {
         return Err(TabFault::Close("unparsable mutation changeset".to_owned()));
     };
-    let local_hit = state
-        .local
-        .as_ref()
-        .map_or(0, |local| tables.intersection(&local.tables).count());
+    let local_hit = tables.intersection(&state.local_tables).count();
     if local_hit > 0 && local_hit < tables.len() {
         let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
             MutationReject {
@@ -1083,38 +1068,296 @@ where
         return Ok(());
     }
     if local_hit > 0 {
-        let cursor = relay_cursor(worker);
         return handle_local_mutation(
+            worker,
             state,
             id,
             tab_seq,
             &changeset,
             &tables,
-            &cursor,
             &patch.patchset_zstd,
         );
     }
     handle_synced_mutation(worker, state, id, tab_seq, &changeset).await
 }
 
+/// One identifier, quoted for SQLite.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Bind one changeset value at its own SQLite storage class.
+///
+/// `Value::Null` never reaches here: a null is written into the predicate as
+/// `IS NULL` and into an assignment as the literal, because a bind has no
+/// type to carry.
+fn bind_value<'a>(
+    query: BoxedSqlQuery<'a, Sqlite, SqlQuery>,
+    value: &Value<String, Vec<u8>>,
+) -> BoxedSqlQuery<'a, Sqlite, SqlQuery> {
+    match value {
+        Value::Null => query,
+        Value::Integer(v) => query.bind::<diesel::sql_types::BigInt, _>(*v),
+        Value::Real(v) => query.bind::<diesel::sql_types::Double, _>(*v),
+        Value::Text(v) => query.bind::<diesel::sql_types::Text, _>(v.clone()),
+        Value::Blob(v) => query.bind::<diesel::sql_types::Binary, _>(v.clone()),
+    }
+}
+
+/// Column names of one device-private table, in the order a changeset records
+/// them, which is the table's own column order.
+///
+/// `PRAGMA table_info` is a vendor pragma with no typed form, and it takes no
+/// bind parameter for the table, so the name is quoted into it. Every name
+/// reaching here came from `local_tables`, which connetto read out of the
+/// attached catalogue itself.
+fn tier_columns(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>, TabApplyError> {
+    #[derive(QueryableByName)]
+    struct ColumnRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let rows: Vec<ColumnRow> =
+        sql_query(format!("PRAGMA table_info({})", quote_ident(table))).load(conn)?;
+    if rows.is_empty() {
+        return Err(TabApplyError::Apply(format!("no such table: {table}")));
+    }
+    Ok(rows.into_iter().map(|row| row.name).collect())
+}
+
+/// Replay one changeset into the attached device-private tables.
+///
+/// SQLite's own `sqlite3changeset_apply` takes a connection and no schema, so
+/// it can only ever write into `main`, which here is the synced replica. These
+/// tables live in an attached database on that same connection, so the change
+/// list is replayed as ordinary statements instead. Table names are written
+/// bare on purpose: a bare name resolves across attached databases, and a name
+/// shared between the two tiers is a generation-time error.
+///
+/// **The conflict rule is `ConflictAction::Abort`'s, kept exactly.** Every
+/// column the changeset carries an old value for goes into the predicate, so
+/// one affected row means the row was there and still held what the writer
+/// saw. Anything else is a conflict, which covers both a row that has gone and
+/// a row somebody else has changed underneath, and both abort the whole
+/// transaction exactly as they do today. An insert onto an occupied key raises
+/// a constraint error, which is the same refusal by another route.
+fn apply_local_changeset(
+    conn: &mut SqliteConnection,
+    changeset: &[u8],
+) -> Result<(), TabApplyError> {
+    let parsed = ParsedDiffSet::parse(changeset)
+        .map_err(|err| TabApplyError::Apply(format!("unparsable changeset: {err:?}")))?;
+    let ParsedDiffSet::Changeset(diff) = parsed else {
+        // A patchset carries no old values, so it cannot be replayed under the
+        // conflict rule above. Tabs capture with `changeset()`, so this is a
+        // client that is not connetto's.
+        return Err(TabApplyError::Apply(
+            "a local tier mutation must be a changeset, not a patchset".to_owned(),
+        ));
+    };
+    let mut columns: HashMap<String, Vec<String>> = HashMap::new();
+    for op in diff.iter() {
+        let table = op.table().name().to_owned();
+        if !columns.contains_key(&table) {
+            let names = tier_columns(conn, &table)?;
+            columns.insert(table.clone(), names);
+        }
+        let names = &columns[&table];
+        let (sql, binds) = render_local_op(&op, &table, names)?;
+        let mut query = sql_query(sql).into_boxed::<Sqlite>();
+        for value in &binds {
+            query = bind_value(query, value);
+        }
+        let affected = query
+            .execute(conn)
+            .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+        if affected != 1 {
+            return Err(TabApplyError::Apply(format!(
+                "conflict on {table}: the row was not there or no longer held what the writer saw"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One rendered statement and the values to bind, in order.
+type RenderedOp = (String, Vec<Value<String, Vec<u8>>>);
+
+/// One `column IS ?` term, or `column IS NULL` when the value is null. A null
+/// is written rather than bound, because a bind carries no type to compare.
+fn predicate_term(
+    terms: &mut Vec<String>,
+    binds: &mut Vec<Value<String, Vec<u8>>>,
+    column: &str,
+    value: &Value<String, Vec<u8>>,
+) {
+    if matches!(value, Value::Null) {
+        terms.push(format!("{} IS NULL", quote_ident(column)));
+    } else {
+        terms.push(format!("{} IS ?", quote_ident(column)));
+        binds.push(value.clone());
+    }
+}
+
+/// The column a changeset names at `index`, or a refusal when the changeset
+/// and the table disagree about the table's width.
+fn column_at<'a>(
+    columns: &'a [String],
+    index: usize,
+    table: &str,
+) -> Result<&'a str, TabApplyError> {
+    columns.get(index).map(String::as_str).ok_or_else(|| {
+        TabApplyError::Apply(format!(
+            "{table}: the changeset names column {index} and the table has {}",
+            columns.len()
+        ))
+    })
+}
+
+/// Render one changeset operation as SQL plus the values to bind, in order.
+fn render_local_op(
+    op: &ChangesetOp<'_, TableSchema<String>, String, Vec<u8>>,
+    table: &str,
+    columns: &[String],
+) -> Result<RenderedOp, TabApplyError> {
+    match op {
+        ChangesetOp::Insert { values, .. } => render_insert(values, table, columns),
+        ChangesetOp::Update { values, .. } => render_update(values, table, columns),
+        ChangesetOp::Delete { old_values, .. } => render_delete(old_values, table, columns),
+    }
+}
+
+fn render_insert(
+    values: &[Value<String, Vec<u8>>],
+    table: &str,
+    columns: &[String],
+) -> Result<RenderedOp, TabApplyError> {
+    if values.len() != columns.len() {
+        return Err(TabApplyError::Apply(format!(
+            "{table}: the changeset has {} columns and the table has {}",
+            values.len(),
+            columns.len()
+        )));
+    }
+    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
+    let names = columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>();
+    let slots = values
+        .iter()
+        .map(|value| {
+            if matches!(value, Value::Null) {
+                "NULL".to_owned()
+            } else {
+                binds.push(value.clone());
+                "?".to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_ident(table),
+            names.join(", "),
+            slots.join(", ")
+        ),
+        binds,
+    ))
+}
+
+fn render_update(
+    values: &[sqlite_diff_rs::ChangesetUpdatePair<String, Vec<u8>>],
+    table: &str,
+    columns: &[String],
+) -> Result<RenderedOp, TabApplyError> {
+    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
+    let mut assignments: Vec<String> = Vec::new();
+    let mut terms: Vec<String> = Vec::new();
+    let mut predicate_binds: Vec<Value<String, Vec<u8>>> = Vec::new();
+    for (index, pair) in values.iter().enumerate() {
+        let column = column_at(columns, index, table)?;
+        if let Some(new) = pair.1.as_ref() {
+            if matches!(new, Value::Null) {
+                assignments.push(format!("{} = NULL", quote_ident(column)));
+            } else {
+                assignments.push(format!("{} = ?", quote_ident(column)));
+                binds.push(new.clone());
+            }
+        }
+        if let Some(old) = pair.0.as_ref() {
+            predicate_term(&mut terms, &mut predicate_binds, column, old);
+        }
+    }
+    if assignments.is_empty() || terms.is_empty() {
+        return Err(TabApplyError::Apply(format!(
+            "{table}: an update with nothing to set or nothing to match"
+        )));
+    }
+    binds.extend(predicate_binds);
+    Ok((
+        format!(
+            "UPDATE {} SET {} WHERE {}",
+            quote_ident(table),
+            assignments.join(", "),
+            terms.join(" AND ")
+        ),
+        binds,
+    ))
+}
+
+fn render_delete(
+    old_values: &[Value<String, Vec<u8>>],
+    table: &str,
+    columns: &[String],
+) -> Result<RenderedOp, TabApplyError> {
+    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
+    let mut terms: Vec<String> = Vec::new();
+    for (index, value) in old_values.iter().enumerate() {
+        let column = column_at(columns, index, table)?;
+        predicate_term(&mut terms, &mut binds, column, value);
+    }
+    if terms.is_empty() {
+        return Err(TabApplyError::Apply(format!(
+            "{table}: a delete with nothing to match"
+        )));
+    }
+    Ok((
+        format!(
+            "DELETE FROM {} WHERE {}",
+            quote_ident(table),
+            terms.join(" AND ")
+        ),
+        binds,
+    ))
+}
+
 /// Apply one pure local tier mutation and fan it out.
 ///
-/// The changeset commits into the tier database together with the tab's
-/// durable watermark, in one transaction. The hub is the terminal
-/// authority for this tier (there is no upstream leg), so its own durable
-/// apply is the acknowledgement. The payload then fans out to every tab
-/// with a subscription reading a touched table, the originator included:
-/// its re-apply is idempotent under the client's conflict policy and
-/// converges every mirror on the hub's serialization order.
-fn handle_local_mutation(
+/// The changeset commits into the attached device-private tables together
+/// with the tab's durable watermark, in one transaction on the worker
+/// connection. The hub is the terminal authority for this tier (there is no
+/// upstream leg), so its own durable apply is the acknowledgement. Nothing
+/// here can ride an upload: the capture session is bound to `main` and these
+/// tables are not in it.
+///
+/// The payload then fans out to every tab with a subscription reading a
+/// touched table, the originator included: its re-apply is idempotent under
+/// the client's conflict policy and converges every mirror on the hub's
+/// serialization order.
+fn handle_local_mutation<U>(
+    worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     id: TabId,
     tab_seq: u64,
     changeset: &[u8],
     tables: &HashSet<String>,
-    cursor: &Cursor,
     payload: &[u8],
-) -> Result<(), TabFault> {
+) -> Result<(), TabFault>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
     let (client_id, out, watermark) = {
         let Some(tab) = state.tabs.get(&id) else {
             return Ok(());
@@ -1139,12 +1382,11 @@ fn handle_local_mutation(
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
-    let Some(local) = state.local.as_mut() else {
+    if state.local_tables.is_empty() {
         return Ok(());
-    };
-    let applied = local.conn.transaction::<_, TabApplyError, _>(|conn| {
-        conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
-            .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+    }
+    let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
+        apply_local_changeset(conn, changeset)?;
         {
             use local_schema::_connetto_tab_mutations::dsl as wm;
             // MAX(a, b) as a 2-arg scalar is not in diesel's aggregate DSL;
@@ -1185,6 +1427,9 @@ fn handle_local_mutation(
             client_seq: tab_seq,
         },
     )));
+    // The worker's own cursor stamps the fan-out. Read here rather than passed
+    // in, because this tier has no upstream leg that could advance it.
+    let cursor = relay_cursor(worker);
     for tab in state.tabs.values_mut() {
         let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(tables)) else {
             continue;
@@ -1444,7 +1689,7 @@ where
         serve_snapshot(
             worker,
             &mut state.blank,
-            &mut state.local,
+            &state.local_tables,
             tab,
             &tab_sub,
             priority,
@@ -1595,9 +1840,9 @@ fn forward_worker_rate_limited(state: &HubState, related_to: Option<&str>, retry
     }
 }
 
-/// Answer one tab subscription: a snapshot from the worker replica for
-/// synced tables, from the tier database for local tables, both between
-/// one begin and end pair.
+/// Answer one tab subscription: a snapshot from the worker replica for synced
+/// tables and from the attached device-private tables for the rest, both over
+/// the one connection and between one begin and end pair.
 ///
 /// Both payloads are built and compressed before any frame goes out. A begin
 /// ahead of a failing read would mark the refusal as one that got as far as
@@ -1605,7 +1850,7 @@ fn forward_worker_rate_limited(state: &HubState, related_to: Option<&str>, retry
 fn serve_snapshot<U>(
     worker: &mut ConnettoConnection<U>,
     blank: &mut BlankState,
-    local: &mut Option<LocalTier>,
+    tier_tables: &HashSet<String>,
     tab: &mut TabState,
     sub_id: &str,
     priority: SubscriptionPriority,
@@ -1615,21 +1860,17 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    let local_tables: HashSet<String> = local.as_ref().map_or_else(HashSet::new, |tier| {
-        tables.intersection(&tier.tables).cloned().collect()
-    });
+    let local_tables: HashSet<String> = tables.intersection(tier_tables).cloned().collect();
     let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     if !synced.is_empty() {
-        let patchset = snapshot_patchset(worker.conn(), &synced, blank)?;
+        let patchset = snapshot_patchset(worker.conn(), MAIN_SCHEMA, &synced, blank)?;
         if !patchset.is_empty() {
             payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
         }
     }
-    if !local_tables.is_empty()
-        && let Some(tier) = local.as_mut()
-    {
-        let patchset = snapshot_patchset(&mut tier.conn, &local_tables, &mut tier.blank)?;
+    if !local_tables.is_empty() {
+        let patchset = snapshot_patchset(worker.conn(), LOCAL_SCHEMA, &local_tables, blank)?;
         if !patchset.is_empty() {
             payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
         }
@@ -1675,17 +1916,23 @@ fn flush_tab_bulk(tab: &mut TabState) {
 }
 
 /// Build one insert patchset holding every current row of the requested
-/// tables, by diffing the connection's main schema against empty twins in
-/// an attached blank database.
+/// tables in `schema`, by diffing them against empty twins in an attached
+/// blank database.
 ///
 /// `sqlite3session_diff` requires the twin to live on the same connection
-/// under the same table name and schema, so the blank database is attached
-/// once and each requested table's stored DDL is replayed into it with a
-/// schema qualifier spliced in. The throwaway session never sees a write, it
-/// only loads the diff, so any capture session on the connection is
-/// unaffected.
+/// under the same table name, so the blank database is attached once and each
+/// requested table's stored DDL is replayed into it with a schema qualifier
+/// spliced in. The throwaway session never sees a write, it only loads the
+/// diff, so any capture session on the connection is unaffected.
+///
+/// `schema` is what lets one connection serve both tiers. A session binds to
+/// one database for its whole life, so the device-private tables need a
+/// session opened on their attached name rather than on `main`. One blank
+/// database serves both, because its twins are keyed by table name and a name
+/// shared between the two tiers is a generation-time error.
 fn snapshot_patchset(
     conn: &mut SqliteConnection,
+    schema: &str,
     tables: &HashSet<String>,
     blank: &mut BlankState,
 ) -> Result<Vec<u8>, RelayError> {
@@ -1696,9 +1943,10 @@ fn snapshot_patchset(
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         sql: Option<String>,
     }
-    let rows: Vec<SchemaRow> = sql_query(
-        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-    )
+    let rows: Vec<SchemaRow> = sql_query(format!(
+        "SELECT name, sql FROM {schema}.sqlite_schema \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ))
     .load(&mut *conn)?;
     let matching: Vec<SchemaRow> = rows
         .into_iter()
@@ -1725,7 +1973,7 @@ fn snapshot_patchset(
         conn.batch_execute(&twin)?;
         blank.tables.insert(row.name.clone());
     }
-    let mut session = conn.create_session().map_err(session_err)?;
+    let mut session = conn.create_session_on(schema).map_err(session_err)?;
     for row in &matching {
         session.attach_by_name(&row.name).map_err(session_err)?;
         session.diff("blank", &row.name).map_err(session_err)?;
@@ -1822,15 +2070,19 @@ where
 }
 
 /// The local tier's durable watermark for one tab client id, if any.
-fn local_tab_watermark(
-    local: &mut LocalTier,
+fn local_tab_watermark<U>(
+    worker: &mut ConnettoConnection<U>,
     client_id: rosetta_uuid::Uuid,
-) -> Result<Option<u64>, RelayError> {
+) -> Result<Option<u64>, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
     use local_schema::_connetto_tab_mutations::dsl as wm;
     let result = wm::_connetto_tab_mutations
         .filter(wm::client_id.eq(client_id))
         .select(wm::last_seq)
-        .first::<i64>(&mut local.conn)
+        .first::<i64>(worker.conn())
         .optional()?;
     Ok(result.and_then(|v| u64::try_from(v).ok()))
 }
@@ -1851,4 +2103,143 @@ where
 /// Fold a session extension error into [`RelayError::Session`].
 fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
     RelayError::Session(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabApplyError, apply_local_changeset};
+    use diesel::connection::SimpleConnection;
+    use diesel::{Connection, RunQueryDsl, SqliteConnection};
+    use diesel_sqlite_session::SqliteSessionExt;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+
+    /// A database holding `drafts` with one row, in memory.
+    fn seeded(body: &str) -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open");
+        conn.batch_execute(DDL).expect("schema");
+        conn.batch_execute(&format!("INSERT INTO drafts VALUES (1, '{body}')"))
+            .expect("seed");
+        conn
+    }
+
+    /// Capture the changeset a tab would ship for `statement`, against a row
+    /// that starts at `from`.
+    fn captured(from: &str, statement: &str) -> Vec<u8> {
+        let mut conn = seeded(from);
+        let mut session = conn.create_session().expect("session");
+        session.attach_all().expect("attach");
+        conn.batch_execute(statement).expect("write");
+        session.changeset().expect("changeset")
+    }
+
+    fn body(conn: &mut SqliteConnection) -> Option<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            body: Option<String>,
+        }
+        diesel::sql_query("SELECT body FROM drafts WHERE id = 1")
+            .load::<Row>(conn)
+            .expect("read")
+            .into_iter()
+            .next()
+            .and_then(|row| row.body)
+    }
+
+    /// The rule `ConflictAction::Abort` gave and the replay has to keep: a
+    /// write lands only onto the row the writer actually saw.
+    #[wasm_bindgen_test]
+    fn an_update_lands_when_the_row_still_holds_what_the_writer_saw() {
+        let changeset = captured("first", "UPDATE drafts SET body = 'second' WHERE id = 1");
+        let mut target = seeded("first");
+        apply_local_changeset(&mut target, &changeset).expect("the update applies");
+        assert_eq!(body(&mut target).as_deref(), Some("second"));
+    }
+
+    /// The case that separates a changeset replay from a blind key match: the
+    /// row is there, its key matches, and somebody else has changed it.
+    #[wasm_bindgen_test]
+    fn an_update_onto_a_row_somebody_else_changed_is_refused() {
+        let changeset = captured("first", "UPDATE drafts SET body = 'second' WHERE id = 1");
+        let mut target = seeded("somebody-elses-edit");
+        let outcome = apply_local_changeset(&mut target, &changeset);
+        assert!(
+            matches!(outcome, Err(TabApplyError::Apply(_))),
+            "a stale update must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            body(&mut target).as_deref(),
+            Some("somebody-elses-edit"),
+            "and must leave the row alone"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_delete_of_a_row_that_has_gone_is_refused() {
+        let changeset = captured("first", "DELETE FROM drafts WHERE id = 1");
+        let mut target = SqliteConnection::establish(":memory:").expect("open");
+        target.batch_execute(DDL).expect("schema");
+        let outcome = apply_local_changeset(&mut target, &changeset);
+        assert!(
+            matches!(outcome, Err(TabApplyError::Apply(_))),
+            "a delete of a vanished row must be refused, got {outcome:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn an_insert_onto_an_occupied_key_is_refused() {
+        let mut source = SqliteConnection::establish(":memory:").expect("open");
+        source.batch_execute(DDL).expect("schema");
+        let mut session = source.create_session().expect("session");
+        session.attach_all().expect("attach");
+        source
+            .batch_execute("INSERT INTO drafts VALUES (1, 'mine')")
+            .expect("write");
+        let changeset = session.changeset().expect("changeset");
+
+        let mut target = seeded("already-here");
+        let outcome = apply_local_changeset(&mut target, &changeset);
+        assert!(
+            matches!(outcome, Err(TabApplyError::Apply(_))),
+            "an insert onto an occupied key must be refused, got {outcome:?}"
+        );
+    }
+
+    /// A null is written into the predicate rather than bound, so a row whose
+    /// old value was null still has to match exactly.
+    #[wasm_bindgen_test]
+    fn a_null_old_value_matches_only_a_null() {
+        let changeset = captured_null();
+        let mut holds_null = SqliteConnection::establish(":memory:").expect("open");
+        holds_null.batch_execute(DDL).expect("schema");
+        holds_null
+            .batch_execute("INSERT INTO drafts VALUES (1, NULL)")
+            .expect("seed");
+        apply_local_changeset(&mut holds_null, &changeset).expect("the update applies");
+        assert_eq!(body(&mut holds_null).as_deref(), Some("filled"));
+
+        let mut holds_text = seeded("not-null");
+        let outcome = apply_local_changeset(&mut holds_text, &changeset);
+        assert!(
+            matches!(outcome, Err(TabApplyError::Apply(_))),
+            "a null old value must not match a row holding text, got {outcome:?}"
+        );
+    }
+
+    /// The changeset for filling a null column.
+    fn captured_null() -> Vec<u8> {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open");
+        conn.batch_execute(DDL).expect("schema");
+        conn.batch_execute("INSERT INTO drafts VALUES (1, NULL)")
+            .expect("seed");
+        let mut session = conn.create_session().expect("session");
+        session.attach_all().expect("attach");
+        conn.batch_execute("UPDATE drafts SET body = 'filled' WHERE id = 1")
+            .expect("write");
+        session.changeset().expect("changeset")
+    }
 }

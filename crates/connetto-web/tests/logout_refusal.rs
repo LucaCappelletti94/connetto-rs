@@ -105,7 +105,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
 
     // The hub takes the connection, so from here the count is only reachable by
     // asking the pump, which is exactly what the logout service does.
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:", None).expect("hub meta");
+    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("hub pump");
     });

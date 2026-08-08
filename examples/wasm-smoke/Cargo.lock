@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#6504251de04c0f647670d7ba2d7a8139d406d481"
+source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#61f2c5e5ac4d909a019b7d9fd0371dbcf7d0f446"
 dependencies = [
  "diesel",
  "libsqlite3-sys",

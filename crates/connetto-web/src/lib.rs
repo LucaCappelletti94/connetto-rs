@@ -46,7 +46,7 @@ use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
 pub use leader::{Membership, join};
 pub use port::{PortTransport, PortTransportError};
-pub use relay::{HubNotice, LocalTier, RelayError, RelayHub, TabId};
+pub use relay::{HubNotice, RelayError, RelayHub, TabId};
 pub use storage::{
     ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
     wipe_replica,
