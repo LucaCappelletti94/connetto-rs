@@ -97,7 +97,7 @@ use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
     Acquired, BrowserAuthenticator, IdbKeyStore, REFRESH_RECORD, RefreshStore,
-    provision_replica_key,
+    provision_replica_key, remembered_identity,
 };
 use connetto_web::storage::{
     ReplicaStorage, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
@@ -228,5 +228,25 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
             .iter()
             .any(|entry| entry == &tier_db_name(&replica_name)),
         "and the startup opened the device-private database the derivation names"
+    );
+
+    // R20 step 0: the startup wrote down which account it signed in as, beside
+    // the credential it stored. This is what a later start with no network has
+    // to read, because the account otherwise only ever arrives inside a token
+    // response and fetching one needs the network. The test deleted this
+    // database before the startup ran, so the record here was written by the
+    // login the startup itself performed.
+    let device = device_key(&keys).await.expect("the device key");
+    let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("reopen the store");
+    let remembered: Option<String> = remembered_identity(&store).expect("read the record");
+    assert_eq!(
+        remembered.as_deref(),
+        Some(user_id.as_str()),
+        "the startup remembered the account it signed in as"
+    );
+    assert_eq!(
+        replica_db_name(DB_NAME, &remembered.expect("remembered")).expect("derive"),
+        replica_name,
+        "and the remembered account names the very replica the startup opened"
     );
 }

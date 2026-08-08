@@ -78,6 +78,13 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
     .await
     .expect("connect");
 
+    // Connecting states the connection's own state first, ahead of anything the
+    // server sends, so an application always knows whether what follows is
+    // current.
+    assert_eq!(
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)
+    );
     let event = conn.pump_one().await.expect("pump");
     assert_eq!(
         event,

@@ -223,7 +223,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
 /// R17: the device-private database beside each replica belongs to that identity
 /// too, so two accounts on one device each keep usable device-private data.
 ///
-/// Opened the way `open_replica_and_tier` opens it in the worker, as its own
+/// Opened the way `open_replica` opens it in the worker, as its own
 /// connection over its own file with the replica's key applied explicitly,
 /// because the browser tier is not attached and carries its own salt.
 #[wasm_bindgen_test]

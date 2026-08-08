@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{AccessTokenSource, ClientError};
+use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 
 /// OS secure storage for the refresh token: Keychain on macOS, Credential
 /// Manager on Windows, and the kernel keyutils keyring on Linux (daemon-free,
@@ -405,7 +405,9 @@ impl NativeAuthenticator {
     /// # Errors
     ///
     /// [`ClientError::Auth`] if both refresh and login fail.
-    pub async fn acquire<Id: DeserializeOwned>(&self) -> Result<AcquiredSession<Id>, ClientError> {
+    pub async fn acquire<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+    ) -> Result<AcquiredSession<Id>, ClientError> {
         if self.store.load(&self.account)?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
@@ -421,9 +423,22 @@ impl NativeAuthenticator {
     /// # Errors
     ///
     /// [`ClientError::Auth`] if no refresh token is stored or the refresh fails.
-    pub async fn refresh_access<Id: DeserializeOwned>(
+    pub async fn refresh_access<Id: DeserializeOwned + serde::Serialize>(
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
+        let response = self.refresh_tokens::<Id>().await?;
+        self.remember(&response.user_id)?;
+        Ok(response.into())
+    }
+
+    /// The refresh exchange itself: present the stored token, take the rotated
+    /// one, and persist it.
+    ///
+    /// Separate from [`refresh_access`](Self::refresh_access) because
+    /// [`token_source`](Self::token_source) wants only a fresh access token and
+    /// has no id type to decode into, so it must not be forced to name one it
+    /// could then write to the identity record.
+    async fn refresh_tokens<Id: DeserializeOwned>(&self) -> Result<TokenResponse<Id>, ClientError> {
         let refresh = self
             .store
             .load(&self.account)?
@@ -435,7 +450,7 @@ impl NativeAuthenticator {
             )
             .await?;
         self.store.store(&self.account, &response.refresh_token)?;
-        Ok(response.into())
+        Ok(response)
     }
 
     /// Run the interactive loopback login: bind a `127.0.0.1` listener, open the
@@ -445,7 +460,9 @@ impl NativeAuthenticator {
     /// # Errors
     ///
     /// [`ClientError::Auth`] on any loopback, browser, or exchange failure.
-    pub async fn login<Id: DeserializeOwned>(&self) -> Result<AcquiredSession<Id>, ClientError> {
+    pub async fn login<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+    ) -> Result<AcquiredSession<Id>, ClientError> {
         let verifier = random_token();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_token();
@@ -478,7 +495,18 @@ impl NativeAuthenticator {
             )
             .await?;
         self.store.store(&self.account, &response.refresh_token)?;
+        self.remember(&response.user_id)?;
         Ok(response.into())
+    }
+
+    /// Write which account this device signed in as, beside its credential.
+    ///
+    /// Both token paths call it, because either can be the one that establishes
+    /// who this device is: a silent refresh on a start, or an interactive login
+    /// on a first run or after the credential lapsed.
+    fn remember<Id: serde::Serialize>(&self, user_id: &Id) -> Result<(), ClientError> {
+        self.store
+            .store(IDENTITY_RECORD, &encode_identity(user_id)?)
     }
 
     /// A silent-refresh [`AccessTokenSource`] for
@@ -497,7 +525,7 @@ impl NativeAuthenticator {
             let authenticator = Arc::clone(&authenticator);
             async move {
                 authenticator
-                    .refresh_access::<serde::de::IgnoredAny>()
+                    .refresh_tokens::<serde::de::IgnoredAny>()
                     .await
                     .map(|session| session.access_token)
             }

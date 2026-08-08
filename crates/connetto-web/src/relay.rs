@@ -67,7 +67,7 @@ use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
     FullResyncRequired, HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
     MutationRejectReason, NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec,
+    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, SyncStatus,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport};
@@ -316,6 +316,10 @@ struct HubState {
     /// the worker connection and can never reach the server, because the
     /// capture session is bound to `main` and these tables are not in it.
     local_tables: HashSet<String>,
+    /// Whether the hub can currently reach the server, so a tab arriving later
+    /// is told the current answer rather than having to wait for the next
+    /// change, which may never come.
+    sync_status: SyncStatus,
     /// Aggregate subscriptions multiplexed onto the worker connection,
     /// keyed by the private upstream sub id the hub registered
     /// (`agg-{tab}-{sub}`). Each entry demuxes the worker's
@@ -618,6 +622,14 @@ where
 {
     let mut state = HubState {
         local_tables,
+        // Taken from the worker rather than defaulted, because the hub may not
+        // have pumped its opening notice yet and a tab that handshakes first
+        // would otherwise be told the connection is down when it is not.
+        sync_status: if worker.is_connected() {
+            SyncStatus::Connected
+        } else {
+            SyncStatus::Offline
+        },
         ..HubState::default()
     };
     // Row upstream subs the hub can re-snapshot after a full resync. Aggregate
@@ -681,8 +693,11 @@ where
                 }
             },
             event = worker.pump_one() => match event {
+                // A worker that started with no server is in the same position
+                // as one whose transport died: it wants a transport, and the
+                // driver is what gets one.
                 Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
-                | Err(ClientError::Transport(_)) => {
+                | Err(ClientError::Transport(_) | ClientError::NotConnected) => {
                     let Some(driver) = reconnect.as_mut() else {
                         break;
                     };
@@ -726,7 +741,7 @@ where
         let Ok(transport) = driver.factory.connect().await else {
             continue;
         };
-        if worker.resume(transport).await.is_err() {
+        if worker.attach(transport).await.is_err() {
             continue;
         }
         let mut redeclared = true;
@@ -954,10 +969,17 @@ where
                     session_token: "relay".to_owned(),
                     resume_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
-                    schema_version: worker.schema_version().clone(),
+                    schema_version: worker.schema_version().cloned(),
                     initial_credits: INITIAL_CREDITS,
                     last_applied_seq: last_applied,
                 },
+            )));
+            // Right after its own ack, so a tab knows from its first moment
+            // whether what it is about to read is current. Waiting for the next
+            // change would leave a tab that attached during an outage showing
+            // stale rows with nothing saying so.
+            let _ = tab.out.send(TabOut::Control(ControlMessage::SyncStatus(
+                state.sync_status,
             )));
             let _ = notices.send(HubNotice::Handshake {
                 tab: id,
@@ -1640,6 +1662,23 @@ where
             retry_after_ms,
         } => {
             forward_worker_rate_limited(state, related_to.as_deref(), retry_after_ms);
+            Ok(())
+        }
+        // Whether the hub can reach the server is the answer every tab needs,
+        // because a tab whose own link to the hub is perfect still cannot sync
+        // while the hub cannot. It goes to every tab rather than to the readers
+        // of some subscription, since it is about the connection and not about
+        // any one query.
+        ClientEvent::SyncStatus(status) => {
+            state.sync_status = status;
+            // Only tabs that have finished their own handshake: a control frame
+            // ahead of a tab's ack is a protocol violation to that tab, and it
+            // learns the current state as part of handshaking anyway.
+            for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::SyncStatus(status)));
+            }
             Ok(())
         }
         _ => Ok(()),

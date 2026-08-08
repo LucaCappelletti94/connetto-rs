@@ -27,7 +27,7 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
-pub use connetto_core::messages::Grant;
+pub use connetto_core::messages::{Grant, SyncStatus};
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
@@ -50,7 +50,7 @@ use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
 use sqlite_diff_rs::{ParsedDiffSet, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "native-auth")]
@@ -60,6 +60,7 @@ pub mod dsl;
 pub mod live;
 pub mod reconnect;
 pub mod replica;
+mod subscriptions;
 pub mod teardown;
 
 #[cfg(feature = "native-auth")]
@@ -76,7 +77,10 @@ pub use live::{
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
-pub use replica::{Encrypted, InMemory, Replica, ReplicaStorage, Tier, replica_db_name};
+pub use replica::{
+    Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
+    encode_identity, replica_db_name,
+};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -119,6 +123,14 @@ pub enum ClientError {
         /// The version the server advertised in the handshake ack.
         server: SchemaVersion,
     },
+    /// The operation needs a server and this connection has none.
+    ///
+    /// Raised by everything that speaks to the server on a connection that was
+    /// opened offline and never attached, or whose transport dropped. Local
+    /// reads, local writes and the pending queue are unaffected: a caller that
+    /// meets this keeps working and retries when a transport arrives.
+    #[error("not connected: this operation needs a server")]
+    NotConnected,
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
@@ -169,6 +181,11 @@ pub enum SignInRefused {
     /// unknown and the switch is refused rather than guessed at.
     #[error("sign-in blocked, the queued writes could not be sent: {0}")]
     Push(String),
+    /// No server has been reached, so there is no handle to hand over. A run
+    /// that has never connected has written nothing the server attributed to
+    /// it, so there is nothing for the incoming account to adopt.
+    #[error("sign-in blocked: this run has no server handle to hand over")]
+    NotConnected,
 }
 
 /// Split a cipher failure by what the caller can do about it: a key that does
@@ -331,6 +348,14 @@ pub struct ClientConfig {
 /// One observable outcome of [`ConnettoConnection::pump_one`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
+    /// Whether this connection can reach a server changed, or is being stated
+    /// for the first time.
+    ///
+    /// The only thing that carries connection state. It arrives when a
+    /// connection is opened with no server, when one is attached, and whenever
+    /// a transport fails, so an application reading this stream always knows
+    /// whether what it is showing is current.
+    SyncStatus(SyncStatus),
     /// The server began an initial snapshot for a subscription.
     SnapshotBegin {
         /// Subscription id.
@@ -815,28 +840,62 @@ fn install_change_tracker(conn: &mut SqliteConnection, changed: &Arc<Mutex<HashS
     );
 }
 
-/// A native sync client bound to one transport and one local SQLite database.
-pub struct ConnettoConnection<T: Transport> {
+/// What a dropped transport does not touch: the run the server attributed this
+/// caller's work to.
+///
+/// Separate from [`Wire`] because these three deliberately outlive a socket.
+/// The handle survives a reconnect by design, and the resume credential exists
+/// precisely to be presented again so the run continues rather than starting
+/// over, so emptying them when a transport dies would silently turn every
+/// reconnect into a new session.
+struct Run {
+    /// The durable handle of this run, in the clear, for the application to
+    /// read: a synced row written before anybody signed in is attributed to it.
+    session_handle: String,
+    /// The credential proving that handle is this caller's, presented again on
+    /// every later attach so the run's operational state (its per-subscription
+    /// cursors and pending buffer) continues rather than starting over. A
+    /// bearer secret, so it never goes into the replica.
+    resume_token: String,
+    /// The server's schema version from the handshake ack, kept so a relay can
+    /// forward it verbatim to its tabs and a stale build can be detected
+    /// against the baked schema.
+    schema_version: Option<SchemaVersion>,
+}
+
+/// One live socket and the label the server gave it.
+///
+/// Present exactly while this connection can reach a server. Absent before the
+/// first [`ConnettoConnection::attach`] and again the moment a transport
+/// fails, which is what makes the offline half of
+/// [`SyncStatus`] something the connection itself can state rather than
+/// something each layer above has to infer.
+struct Wire<T> {
     transport: T,
+    connection_id: String,
+}
+
+/// A sync client bound to one local SQLite database, with or without a server.
+///
+/// It exists before any transport does. Opening the replica, serving reads from
+/// it and capturing writes into the pending queue all work with nothing to talk
+/// to, and [`attach`](Self::attach) is what later gives it a server. That is
+/// what lets an application start with no network and sync when one appears.
+pub struct ConnettoConnection<T: Transport> {
+    /// The live socket, absent when no server is reachable.
+    wire: Option<Wire<T>>,
+    /// The run this caller's work belongs to, absent until a first handshake
+    /// and kept across every later drop.
+    run: Option<Run>,
+    /// State changes waiting to be handed to the application, drained ahead of
+    /// the transport so an offline connection can still report itself.
+    notices: VecDeque<ClientEvent>,
     // `session` is declared before `db` so it drops first: it holds a raw
     // pointer into the connection's SQLite handle and must not outlive it.
     session: Session,
     db: SqliteConnection,
     last_cursor: Option<Cursor>,
     next_seq: u64,
-    connection_id: String,
-    /// The durable handle of this run, in the clear, for the application to
-    /// read: a synced row written before anybody signed in is attributed to it.
-    session_handle: String,
-    /// The credential proving that handle is this caller's, presented again on
-    /// every resume so the run's operational state (its per-subscription
-    /// cursors and pending buffer) continues rather than starting over. A
-    /// bearer secret, so it never goes into the replica.
-    resume_token: String,
-    /// The server's schema version from the handshake ack, kept so a relay can
-    /// forward it verbatim to its tabs and (Phase 7) a stale build can be
-    /// detected against the baked schema.
-    schema_version: Option<SchemaVersion>,
     /// Set by the commit hook whenever a write commits, so the driver knows
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
@@ -860,11 +919,6 @@ pub struct ConnettoConnection<T: Transport> {
     /// replica named, empty when it named none. Live
     /// queries dispatch on it: a local table never reaches the wire.
     local_tables: HashSet<String>,
-    /// Lowercased tables backing each row subscription, keyed by sub id, so a
-    /// `FullResyncRequired` can drop the subscription's stale replica rows
-    /// before the fresh snapshot repopulates. Aggregate subscriptions hold no
-    /// replica rows, so they are never recorded here.
-    sub_tables: HashMap<String, HashSet<String>>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -894,7 +948,9 @@ where
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(transport, replica, Some(sqlite_ddl), config, resume).await
+        let mut conn = Self::open_inner(replica, Some(sqlite_ddl), config, resume)?;
+        conn.attach(transport).await?;
+        Ok(conn)
     }
 
     /// Connect to a replica that already carries its schema, executing no
@@ -914,14 +970,63 @@ where
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        Self::connect_inner(transport, replica, None, config, resume).await
+        let mut conn = Self::open_inner(replica, None, config, resume)?;
+        conn.attach(transport).await?;
+        Ok(conn)
     }
 
-    /// Shared connect body: open the connection, unlock the page codec, apply
-    /// the schema when it arrives as DDL, hook the capture session, and run the
-    /// handshake.
-    async fn connect_inner<S: ReplicaStorage>(
-        mut transport: T,
+    /// Open the replica with no server, serving local reads at once.
+    ///
+    /// The connection exists and works before anything is reachable: reads
+    /// answer from the replica, writes capture into the pending queue, and
+    /// [`attach`](Self::attach) later hands it a transport, which replays
+    /// whatever queued up. This is what lets an application start offline.
+    ///
+    /// `sqlite_ddl` creates the local schema on a first boot. See
+    /// [`connect`](Self::connect) for why `replica` states all three of where
+    /// it lives, whether it is encrypted, and what sits beside it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a database, cipher or session failure.
+    /// [`ClientError::ReplicaUndecryptable`] when an existing replica does not
+    /// open under the key given.
+    pub fn open<S: ReplicaStorage>(
+        replica: &Replica<'_, S>,
+        sqlite_ddl: &str,
+        config: &ClientConfig,
+        resume: Option<Cursor>,
+    ) -> Result<Self, ClientError> {
+        let mut conn = Self::open_inner(replica, Some(sqlite_ddl), config, resume)?;
+        conn.notices
+            .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
+        Ok(conn)
+    }
+
+    /// Open a replica that already carries its schema, with no server.
+    ///
+    /// [`open`](Self::open) for a replica a previous run created.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a database, cipher or session failure.
+    /// [`ClientError::ReplicaUndecryptable`] when the replica does not open
+    /// under the key given.
+    pub fn open_existing<S: ReplicaStorage>(
+        replica: &Replica<'_, S>,
+        config: &ClientConfig,
+        resume: Option<Cursor>,
+    ) -> Result<Self, ClientError> {
+        let mut conn = Self::open_inner(replica, None, config, resume)?;
+        conn.notices
+            .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
+        Ok(conn)
+    }
+
+    /// Shared open body: open the database, unlock the page codec, apply the
+    /// schema when it arrives as DDL, and hook the capture session. No
+    /// handshake happens here, which is the whole point.
+    fn open_inner<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
         sqlite_ddl: Option<&str>,
         config: &ClientConfig,
@@ -948,6 +1053,7 @@ where
             db.batch_execute(ddl)?;
         }
         db.batch_execute(META_DDL)?;
+        db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. Pending
@@ -971,20 +1077,15 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
-        let ack = exchange_handshake(&mut transport, config, None, resume.as_ref(), None).await?;
-        let watermark = ack.watermark;
-
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
         let mut conn = Self {
-            transport,
+            wire: None,
+            run: None,
+            notices: VecDeque::new(),
             session,
             db,
             last_cursor: resume,
             next_seq,
-            connection_id: ack.connection_id,
-            session_handle: ack.session_handle,
-            resume_token: ack.resume_token,
-            schema_version: ack.schema_version,
             dirty,
             changed,
             transaction_state: AnsiTransactionManager::default(),
@@ -992,10 +1093,8 @@ where
             config: config.clone(),
             token_source: None,
             local_tables: HashSet::new(),
-            sub_tables: HashMap::new(),
         };
         conn.attach_tier(replica.tier())?;
-        conn.reconcile_pending(watermark).await?;
         Ok(conn)
     }
 
@@ -1044,7 +1143,7 @@ where
     }
 
     /// Attach a source of fresh access tokens, consulted on every
-    /// [`resume`](Self::resume) so a reconnect silently refreshes the access
+    /// [`attach`](Self::attach) so a reconnect silently refreshes the access
     /// token from the stored refresh token with no user interaction. The first
     /// connect used `config.login`, so a native client sets that to a token it
     /// acquired interactively and this to its silent-refresh source.
@@ -1054,38 +1153,52 @@ where
         self
     }
 
-    /// Swap in a fresh transport after a drop: re-handshake with the highest
+    /// Give this connection a transport: greet the server with the highest
     /// applied cursor and keep every piece of local state (replica, capture
     /// session, pending mutations, sequence counter).
     ///
+    /// One method for both arrivals, because they are one operation. A
+    /// connection opened offline reaching a server for the first time and a
+    /// live connection replacing a dropped transport differ only in whether a
+    /// resume credential exists to present, and the server settles the rest.
+    ///
     /// The ack's durable watermark retires every pending mutation the server
     /// already applied and the rest are replayed, so the upload path stays
-    /// exactly-once across the drop. The dirty flag is forced so writes that
-    /// were captured but never pushed re-flush. A re-declared subscription
-    /// replays what the server retained past the cursor, or full-resyncs.
+    /// exactly-once across the gap, however long it was. The dirty flag is
+    /// forced so writes captured but never pushed re-flush. A re-declared
+    /// subscription replays what the server retained past the cursor, or
+    /// full-resyncs.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a transport or handshake failure. The connection
-    /// keeps its previous (dead) transport in that case, so a caller can try
-    /// again with another one.
-    pub async fn resume(&mut self, mut transport: T) -> Result<(), ClientError> {
+    /// keeps whatever it had, so a caller can try again with another
+    /// transport, and one that had nothing stays usable for local reads.
+    pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
         let ack = exchange_handshake(
             &mut transport,
             &self.config,
             self.token_source.as_ref(),
             self.last_cursor.as_ref(),
-            Some(self.resume_token.as_str()),
+            self.run.as_ref().map(|run| run.resume_token.as_str()),
         )
         .await?;
-        self.transport = transport;
-        self.connection_id = ack.connection_id;
-        self.session_handle = ack.session_handle;
-        self.resume_token = ack.resume_token;
-        self.schema_version = ack.schema_version;
+        let watermark = ack.watermark;
+        self.run = Some(Run {
+            session_handle: ack.session_handle,
+            resume_token: ack.resume_token,
+            schema_version: ack.schema_version,
+        });
+        self.wire = Some(Wire {
+            transport,
+            connection_id: ack.connection_id,
+        });
+        self.notices
+            .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
-        self.reconcile_pending(ack.watermark).await?;
+        self.reconcile_pending(watermark).await?;
+        self.replay_subscriptions().await?;
         Ok(())
     }
 
@@ -1121,21 +1234,60 @@ where
         Ok(())
     }
 
-    /// The per-connection routing label from the handshake ack. This is not
-    /// identity and must not be treated as such.
-    #[must_use]
-    pub fn connection_id(&self) -> &str {
-        &self.connection_id
+    /// The live socket, or the not-connected refusal.
+    ///
+    /// Every method that speaks to the server goes through this, so the offline
+    /// case is stated once rather than at each of them.
+    fn wire(&mut self) -> Result<&mut Wire<T>, ClientError> {
+        self.wire.as_mut().ok_or(ClientError::NotConnected)
     }
 
-    /// The durable session handle from the handshake ack.
+    /// Judge one transport result: a failure means this socket is gone, so the
+    /// wire is dropped and the change is announced before the error surfaces.
+    ///
+    /// The run is deliberately kept, because the next attach presents its
+    /// resume credential to continue rather than start over.
+    fn judge<V, E: core::fmt::Display>(&mut self, result: Result<V, E>) -> Result<V, ClientError> {
+        result.map_err(|err| {
+            self.disconnected();
+            ClientError::Transport(err.to_string())
+        })
+    }
+
+    /// Drop the live socket and announce it, once.
+    fn disconnected(&mut self) {
+        if self.wire.take().is_some() {
+            self.notices
+                .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
+        }
+    }
+
+    /// Whether a handshake currently stands.
+    ///
+    /// False before the first [`attach`](Self::attach) and after a transport
+    /// drops. Local reads and writes work either way.
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
+        self.wire.is_some()
+    }
+
+    /// The per-connection routing label from the handshake ack, or `None` while
+    /// no server has been reached. This is not identity and must not be treated
+    /// as such.
+    #[must_use]
+    pub fn connection_id(&self) -> Option<&str> {
+        self.wire.as_ref().map(|wire| wire.connection_id.as_str())
+    }
+
+    /// The durable session handle from the handshake ack, or `None` while no
+    /// server has been reached.
     ///
     /// One unbroken run of one caller, and the key the server's resume, its
     /// per-subscription cursors, and the exactly-once watermark all address.
     /// Unlike [`connection_id`](Self::connection_id), it survives a reconnect.
     #[must_use]
-    pub fn session_handle(&self) -> &str {
-        &self.session_handle
+    pub fn session_handle(&self) -> Option<&str> {
+        self.run.as_ref().map(|run| run.session_handle.as_str())
     }
 
     /// End this run because somebody is signing in, handing back the handle it
@@ -1174,14 +1326,18 @@ where
         if !unsent.is_empty() {
             return Err(SignInRefused::Unsent(unsent));
         }
-        Ok(self.session_handle.clone())
+        self.session_handle()
+            .map(ToOwned::to_owned)
+            .ok_or(SignInRefused::NotConnected)
     }
 
-    /// The server's schema version from the handshake ack, or `None` when the
-    /// server declared none.
+    /// The server's schema version from the handshake ack, or `None` when no
+    /// server has been reached or the server declared none.
     #[must_use]
-    pub fn schema_version(&self) -> &Option<SchemaVersion> {
-        &self.schema_version
+    pub fn schema_version(&self) -> Option<&SchemaVersion> {
+        self.run
+            .as_ref()
+            .and_then(|run| run.schema_version.as_ref())
     }
 
     /// The application's local connection, for ordinary diesel reads and writes.
@@ -1194,6 +1350,18 @@ where
     #[must_use]
     pub const fn cursor(&self) -> Option<&Cursor> {
         self.last_cursor.as_ref()
+    }
+
+    /// Whether this replica has ever received data from a server.
+    ///
+    /// False on a first run that has never reached one. An empty read then
+    /// means the rows were never fetched, not that there are none, and only
+    /// the application knows which of those two sentences to show. Device
+    /// private tables are unaffected: their rows are authoritative with or
+    /// without a server.
+    #[must_use]
+    pub const fn has_ever_synced(&self) -> bool {
+        self.last_cursor.is_some()
     }
 
     /// The sequence numbers of mutations captured locally but not yet
@@ -1224,15 +1392,8 @@ where
     ///
     /// [`ClientError::Transport`] when the subscribe frame cannot be sent.
     pub async fn subscribe(&mut self, sub_id: &str, query: &str) -> Result<(), ClientError> {
-        self.transport
-            .send_control(ControlMessage::Subscribe(Subscribe {
-                sub_id: sub_id.to_owned(),
-                spec: SubscriptionSpec::new(query),
-            }))
+        self.subscribe_spec(sub_id, SubscriptionSpec::new(query))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.record_row_subscription(sub_id, query);
-        Ok(())
     }
 
     /// Declare a subscription from a full [`SubscriptionSpec`], carrying the
@@ -1247,15 +1408,59 @@ where
         sub_id: &str,
         spec: SubscriptionSpec,
     ) -> Result<(), ClientError> {
-        let query = spec.query.clone();
-        self.transport
+        // Recorded before it is sent, and recorded whether or not it can be
+        // sent. A subscription declared with no server reachable is a
+        // declaration, not a failure, and it takes effect on the first
+        // connection.
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session);
+            subscriptions::remember(&mut self.db, sub_id, &spec)?;
+        }
+        if self.is_connected() {
+            self.send_subscribe(sub_id, spec).await?;
+        }
+        Ok(())
+    }
+
+    /// Put one `Subscribe` frame on the wire.
+    async fn send_subscribe(
+        &mut self,
+        sub_id: &str,
+        spec: SubscriptionSpec,
+    ) -> Result<(), ClientError> {
+        self.wire()?
+            .transport
             .send_control(ControlMessage::Subscribe(Subscribe {
                 sub_id: sub_id.to_owned(),
                 spec,
             }))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.record_row_subscription(sub_id, &query);
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// Every subscription this replica has declared and not dropped, whether
+    /// or not a server has ever seen them.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub fn declared_subscriptions(
+        &mut self,
+    ) -> Result<Vec<(String, SubscriptionSpec)>, ClientError> {
+        subscriptions::declared(&mut self.db)
+    }
+
+    /// Declare every persisted subscription on a freshly attached transport.
+    ///
+    /// One rule covers both cases the set can hold: subscriptions this run
+    /// declared while alone, and subscriptions a previous run declared and
+    /// never dropped. `docs/architecture/15-replica-retention.md` decides that
+    /// the second kind is live at launch and re-claimed as screens mount, so
+    /// there is no second case to write here.
+    async fn replay_subscriptions(&mut self) -> Result<(), ClientError> {
+        for (sub_id, spec) in subscriptions::declared(&mut self.db)? {
+            self.send_subscribe(&sub_id, spec).await?;
+        }
         Ok(())
     }
 
@@ -1266,29 +1471,22 @@ where
     ///
     /// [`ClientError::Transport`] when the unsubscribe frame cannot be sent.
     pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        self.transport
-            .send_control(ControlMessage::Unsubscribe(Unsubscribe {
-                sub_id: sub_id.to_owned(),
-            }))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.sub_tables.remove(sub_id);
-        Ok(())
-    }
-
-    /// Record the lowercased replica tables a row subscription reads, so a
-    /// later `FullResyncRequired` drops its stale rows before the fresh
-    /// snapshot repopulates. Best-effort: an aggregate or an unparsable query
-    /// records nothing (and clears any prior mapping under this id), because it
-    /// holds no replica rows to reset.
-    fn record_row_subscription(&mut self, sub_id: &str, query: &str) {
-        if let Ok(false) = subscription_is_aggregate(query)
-            && let Ok(tables) = subscription_tables(query)
+        // Dropped from the record first, so a cancellation made offline is not
+        // replayed as a subscription by the next attach.
         {
-            self.sub_tables.insert(sub_id.to_owned(), tables);
-        } else {
-            self.sub_tables.remove(sub_id);
+            let _suspended = SuspendedCapture::new(&mut self.session);
+            subscriptions::forget(&mut self.db, sub_id)?;
         }
+        if self.is_connected() {
+            self.wire()?
+                .transport
+                .send_control(ControlMessage::Unsubscribe(Unsubscribe {
+                    sub_id: sub_id.to_owned(),
+                }))
+                .await
+                .map_err(|e| ClientError::Transport(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Read one inbound frame, apply it if it is a patch, and report what
@@ -1298,11 +1496,11 @@ where
     ///
     /// [`ClientError`] on a transport, apply, or protocol failure.
     pub async fn pump_one(&mut self) -> Result<ClientEvent, ClientError> {
-        let frame = self
-            .transport
-            .recv()
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        if let Some(notice) = self.notices.pop_front() {
+            return Ok(notice);
+        }
+        let frame = self.wire()?.transport.recv().await;
+        let frame = self.judge(frame)?;
         self.handle_frame(frame).await
     }
 
@@ -1319,13 +1517,25 @@ where
         &mut self,
         cancel: impl core::future::Future<Output = ()>,
     ) -> Result<Option<ClientEvent>, ClientError> {
+        // Ahead of the transport, and ahead of the cancel, because a state
+        // change already happened and holding it back would leave a caller
+        // showing stale data with nothing to tell it otherwise.
+        if let Some(notice) = self.notices.pop_front() {
+            return Ok(Some(notice));
+        }
+        let Some(wire) = self.wire.as_mut() else {
+            // No socket is not a failure here. It is a connection with nothing
+            // to say, exactly like an idle one, and treating it as an error
+            // would end a pump that still has local work to do.
+            cancel.await;
+            return Ok(None);
+        };
         let frame = tokio::select! {
             biased;
             () = cancel => return Ok(None),
-            frame = self.transport.recv() => {
-                frame.map_err(|e| ClientError::Transport(e.to_string()))?
-            }
+            frame = wire.transport.recv() => frame,
         };
+        let frame = self.judge(frame)?;
         self.handle_frame(frame).await.map(Some)
     }
 
@@ -1336,7 +1546,12 @@ where
         frame: Option<IncomingFrame>,
     ) -> Result<ClientEvent, ClientError> {
         match frame {
-            None => Ok(ClientEvent::Closed),
+            // A peer that closed cleanly is as gone as one that failed, so the
+            // wire goes and the change is announced behind this event.
+            None => {
+                self.disconnected();
+                Ok(ClientEvent::Closed)
+            }
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
                 self.apply_patch(&patch.patchset_zstd, None)?;
                 self.ack_one().await?;
@@ -1369,7 +1584,8 @@ where
     ///
     /// [`ClientError::Transport`] when the ping cannot be sent.
     pub async fn ping(&mut self, nonce: u64) -> Result<(), ClientError> {
-        self.transport
+        self.wire()?
+            .transport
             .send_control(ControlMessage::Ping(Ping { nonce }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -1419,7 +1635,15 @@ where
             .map_err(|e| ClientError::Session(e.to_string()))?;
         self.session = fresh;
         self.pending.insert(seq, changeset.clone());
-        self.send_mutation(seq, &changeset).await?;
+        // With no server the write stays queued, which is the designed offline
+        // state rather than a failure: it is already durable in
+        // `_connetto_pending` above, and `attach` replays it. Returning an
+        // error here would make every caller treat working offline as a fault.
+        // A caller that needs to know asks `unsynced`, or reads the
+        // connection-state event.
+        if self.is_connected() {
+            self.send_mutation(seq, &changeset).await?;
+        }
         Ok(Some(seq))
     }
 
@@ -1429,13 +1653,15 @@ where
     async fn send_mutation(&mut self, seq: u64, changeset: &[u8]) -> Result<(), ClientError> {
         let op_count = count_ops(changeset);
         let payload = zstd::encode_all(changeset, ZSTD_LEVEL)?;
-        self.transport
+        self.wire()?
+            .transport
             .send_control(ControlMessage::MutationHeader(MutationHeader::new(
                 seq, op_count,
             )))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.transport
+        self.wire()?
+            .transport
             .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
@@ -1517,7 +1743,8 @@ where
     ///
     /// [`ClientError::Transport`] when the close fails.
     pub async fn close(&mut self) -> Result<(), ClientError> {
-        self.transport
+        self.wire()?
+            .transport
             .close()
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -1583,6 +1810,11 @@ where
                 related_to: limited.related_to,
                 retry_after_ms: limited.retry_after_ms,
             }),
+            // A relay saying whether IT can reach the server. For a tab that is
+            // the answer that matters, because a tab whose own link is fine
+            // still cannot sync while the relay cannot, so it rides the same
+            // event as this connection's own state.
+            ControlMessage::SyncStatus(status) => Ok(ClientEvent::SyncStatus(status)),
             // The server says why it is closing. Surfaced rather than treated
             // as a violation: the server behaved exactly as the protocol says.
             ControlMessage::FatalError(fatal) => Ok(ClientEvent::ServerClosed {
@@ -1594,23 +1826,79 @@ where
         }
     }
 
-    /// Drop every replica row of a row subscription's tables ahead of a
-    /// full-resync snapshot. The fresh snapshot carries only the currently
+    /// Drop the replica rows of a row subscription's tables ahead of a
+    /// full-resync snapshot, sparing every row a sibling subscription still
+    /// covers.
+    ///
+    /// The fresh snapshot carries only the resyncing subscription's currently
     /// authorized rows, so the insert-only apply would leave rows deleted
-    /// during the outage behind. Capture is suspended so the deletes are never
-    /// re-uploaded as a local mutation. An unknown or aggregate sub id (no
-    /// recorded tables) is a no-op.
+    /// during the outage behind. Deleting the whole table instead destroys a
+    /// sibling's rows over that table, which nothing then restores, so the
+    /// statement deletes the complement of what the survivors want. Dropping a
+    /// subscription never names it: it simply stops contributing a clause.
+    ///
+    /// Capture is suspended so the deletes are never re-uploaded as a local
+    /// mutation. An unknown or aggregate sub id is a no-op.
     fn clear_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        let Some(tables) = self.sub_tables.get(sub_id).cloned() else {
+        let declared = subscriptions::declared(&mut self.db)?;
+        let Some(resyncing) = declared
+            .iter()
+            .find(|(id, _)| id == sub_id)
+            .and_then(|(_, spec)| crate::live::coverage_of(spec).transpose())
+            .transpose()?
+        else {
             return Ok(());
         };
+
+        // Every other subscription's claim on those tables, as SQL. A survivor
+        // with no predicate wants the whole table, so nothing there may go.
+        let mut clauses: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut untouchable: HashSet<&str> = HashSet::new();
+        for (id, spec) in &declared {
+            if id == sub_id {
+                continue;
+            }
+            let Some(coverage) = crate::live::coverage_of(spec)? else {
+                continue;
+            };
+            for table in resyncing
+                .tables
+                .iter()
+                .filter(|t| coverage.tables.contains(*t))
+            {
+                match &coverage.predicate {
+                    Some(predicate) => clauses
+                        .entry(table.as_str())
+                        .or_default()
+                        .push(predicate.clone()),
+                    None => {
+                        untouchable.insert(table.as_str());
+                    }
+                }
+            }
+        }
+
         let _suspended = SuspendedCapture::new(&mut self.session);
         self.db.transaction::<_, ClientError, _>(|conn| {
-            for table in &tables {
-                // The table is chosen at runtime from the subscription's parsed
-                // query, so diesel's compile-time table DSL cannot name it: a
-                // quoted-identifier DELETE is the one raw statement here.
-                diesel::sql_query(format!("DELETE FROM \"{table}\"")).execute(conn)?;
+            for table in &resyncing.tables {
+                if untouchable.contains(table.as_str()) {
+                    continue;
+                }
+                // The table and the predicates are chosen at runtime from the
+                // subscriptions' own parsed queries, so diesel's compile-time
+                // DSL cannot name them: this is the one raw statement here.
+                let statement = match clauses.get(table.as_str()) {
+                    Some(surviving) if !surviving.is_empty() => {
+                        let kept = surviving
+                            .iter()
+                            .map(|clause| format!("({clause})"))
+                            .collect::<Vec<_>>()
+                            .join(" OR ");
+                        format!("DELETE FROM \"{table}\" WHERE NOT ({kept})")
+                    }
+                    _ => format!("DELETE FROM \"{table}\""),
+                };
+                diesel::sql_query(statement).execute(conn)?;
             }
             Ok(())
         })
@@ -1639,7 +1927,8 @@ where
     }
 
     async fn ack_one(&mut self) -> Result<(), ClientError> {
-        self.transport
+        self.wire()?
+            .transport
             .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))

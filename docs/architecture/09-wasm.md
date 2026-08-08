@@ -54,10 +54,12 @@ The worker exposes a message-passing API to the main thread:
 { type: "row_update",   sub_id, changes }
 { type: "mutation_ack", client_seq }
 { type: "mutation_reject", client_seq, reason }
-{ type: "sync_status",  status }  // connected | reconnecting | offline
+{ type: "sync_status",  status }  // connected | offline
 ```
 
 The main thread does not access the local SQLite directly: it reads through the worker or from a local read replica exposed by the worker.
+
+**Built with two states, not three (R20, 2026-08-08).** `SyncStatus` carries `Connected` or `Offline`, and reconnecting is not one of them: a reconnect attempt in progress is indistinguishable to an application from being offline, and both mean the same thing, that what you are reading may be stale. It rides `ControlMessage::SyncStatus` rather than a bespoke worker message, so the hub forwards it to tabs on the same channel as every other control frame, and a tab is told the current value right after its own handshake ack rather than having to wait for the next change.
 
 ---
 

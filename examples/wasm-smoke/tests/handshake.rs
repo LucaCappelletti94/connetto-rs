@@ -84,7 +84,7 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
             .expect("worker connect");
     assert_eq!(
         worker.schema_version(),
-        &Some(upstream_version.clone()),
+        Some(&upstream_version),
         "the worker records the upstream server's schema version at handshake",
     );
 

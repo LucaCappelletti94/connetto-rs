@@ -624,6 +624,46 @@ pub async fn provision_replica_key<S: ReplicaKeyStore<Error = AuthError>>(
     Ok(minted)
 }
 
+/// Write which account this device signed in as, beside its credential.
+///
+/// The browser mirror of the same write on `NativeAuthenticator`. Both token
+/// paths do it, because either can be the one that establishes who this device
+/// is: a silent refresh on a start, or an interactive login on a first run.
+///
+/// # Errors
+///
+/// [`AuthError::Store`] if the record cannot be encoded or written.
+pub fn remember_identity<Id: serde::Serialize>(
+    store: &RefreshStore,
+    user_id: &Id,
+) -> Result<(), AuthError> {
+    let encoded = connetto_client::encode_identity(user_id)
+        .map_err(|err| AuthError::Store(err.to_string()))?;
+    store.store(connetto_client::IDENTITY_RECORD, &encoded)
+}
+
+/// The account this device last signed in as, if it ever did.
+///
+/// This is what makes a start with no network possible at all: the replica file
+/// is named from the account, and the account otherwise only ever arrives
+/// inside a token response, which needs the network to fetch.
+///
+/// # Errors
+///
+/// [`AuthError::Store`] if the record cannot be read, or if it does not decode
+/// as this build's id type, which means a build whose id type differed wrote
+/// it. The recovery is a fresh login, which rewrites it.
+pub fn remembered_identity<Id: serde::de::DeserializeOwned>(
+    store: &RefreshStore,
+) -> Result<Option<Id>, AuthError> {
+    let Some(record) = store.load(connetto_client::IDENTITY_RECORD)? else {
+        return Ok(None);
+    };
+    connetto_client::decode_identity(&record)
+        .map(Some)
+        .map_err(|err| AuthError::Store(err.to_string()))
+}
+
 /// A fresh key from the platform RNG.
 ///
 /// The staging array is key material until it is wiped, and a plain fill would
@@ -686,7 +726,7 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError::Store`] if the refresh store cannot be read.
-    pub async fn acquire<Id: serde::de::DeserializeOwned>(
+    pub async fn acquire<Id: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         store: &RefreshStore,
     ) -> Result<Acquired<Id>, AuthError> {
@@ -694,6 +734,7 @@ impl BrowserAuthenticator {
             match self.refresh_tokens(&refresh).await {
                 Ok(tokens) => {
                     store.store(&self.account, &tokens.refresh_token)?;
+                    remember_identity(store, &tokens.user_id)?;
                     return Ok(Acquired::Access(tokens.into()));
                 }
                 // A transient refresh fault must not force an interactive login:
@@ -734,7 +775,7 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError`] on a state mismatch, a failed exchange, or a store write.
-    pub async fn complete<Id: serde::de::DeserializeOwned>(
+    pub async fn complete<Id: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         pending: &PendingLogin,
         code: &str,
@@ -746,6 +787,7 @@ impl BrowserAuthenticator {
         }
         let tokens = self.exchange_code(code, &pending.verifier).await?;
         store.store(&self.account, &tokens.refresh_token)?;
+        remember_identity(store, &tokens.user_id)?;
         Ok(tokens.into())
     }
 

@@ -262,7 +262,7 @@ pub async fn announce_tab(wire: &str) {
 /// existed, or one whose key was destroyed: either way the credential inside is
 /// unreachable and the only recovery is a fresh login, so it is discarded rather
 /// than reported as a boot failure.
-async fn acquire_session<Id: serde::de::DeserializeOwned>(
+async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     storage: &crate::storage::ReplicaStorage,
@@ -436,7 +436,22 @@ where
         schema_version: Some(config.schema_version.clone()),
         sql_functions: config.sql_functions.clone(),
     };
-    let transport = BrowserSocket::connect(config.ws_url).await.map_err(to_js)?;
+    // An unreachable server is a state, not a boot failure. The worker comes up
+    // on its replica, serves tabs from it, and the hub's reconnect driver
+    // attaches a transport when one can be had, declaring the upstream
+    // subscription then. Offline operation is a stated objective of this
+    // project, and dying here is what used to violate it.
+    let transport = match BrowserSocket::connect(config.ws_url).await {
+        Ok(transport) => Some(transport),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                url = config.ws_url,
+                "db worker: no server reachable, starting offline"
+            );
+            None
+        }
+    };
     let replica_url = storage.db_url(&replica_db_name);
     // The device-private database is named from the replica rather than
     // configured, so it belongs to the same identity the replica's key does.
@@ -456,28 +471,35 @@ where
         let replica = Replica::in_memory().with_tier(config.frontend_ddl);
         open_replica(transport, &replica, false, config, &client_config).await?
     };
+    let connected = worker.is_connected();
     tracing::info!(
         replica = %replica_db_name,
         resumed = existing,
         durable = identified,
+        connected,
         "db worker: replica open"
     );
-    worker
-        .subscribe(config.upstream_sub_id, config.upstream_query)
-        .await
-        .map_err(to_js)?;
-    // Ping fence instead of waiting for a snapshot end: a resumed
-    // subscription catches up with plain live patches and never sends one.
-    // Control frames are processed in order, so the pong proves the
-    // subscription is fully served either way.
-    worker.ping(1).await.map_err(to_js)?;
-    loop {
-        match worker.pump_one().await.map_err(to_js)? {
-            ClientEvent::Pong { nonce: 1 } => break,
-            ClientEvent::Closed => {
-                return Err(JsValue::from_str("server closed during the upstream boot"));
+    // Only worth doing with a server. Offline, the hub declares this same
+    // subscription the moment its driver attaches a transport, from the
+    // `upstream` list below, so nothing is lost by skipping it.
+    if connected {
+        worker
+            .subscribe(config.upstream_sub_id, config.upstream_query)
+            .await
+            .map_err(to_js)?;
+        // Ping fence instead of waiting for a snapshot end: a resumed
+        // subscription catches up with plain live patches and never sends one.
+        // Control frames are processed in order, so the pong proves the
+        // subscription is fully served either way.
+        worker.ping(1).await.map_err(to_js)?;
+        loop {
+            match worker.pump_one().await.map_err(to_js)? {
+                ClientEvent::Pong { nonce: 1 } => break,
+                ClientEvent::Closed => {
+                    return Err(JsValue::from_str("server closed during the upstream boot"));
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -783,7 +805,7 @@ async fn sleep_ms(ms: i32) {
 /// single underlying handle and two page caches. Both tiers therefore share
 /// one key and one salt, which is what an attached database inherits anyway.
 async fn open_replica<S: StorageKind>(
-    transport: BrowserSocket,
+    transport: Option<BrowserSocket>,
     replica: &Replica<'_, S>,
     existing: bool,
     config: &DbWorkerConfig,
@@ -796,15 +818,17 @@ async fn open_replica<S: StorageKind>(
             "the db worker named no device-private database",
         ));
     }
-    if existing {
-        ConnettoConnection::connect_existing(transport, replica, client_config, None)
-            .await
-            .map_err(to_js)
+    // Opened first and greeted second, always, so the replica is serving reads
+    // whether or not the greeting can happen at all.
+    let mut worker = if existing {
+        ConnettoConnection::open_existing(replica, client_config, None).map_err(to_js)?
     } else {
-        ConnettoConnection::connect(transport, replica, config.replica_ddl, client_config, None)
-            .await
-            .map_err(to_js)
+        ConnettoConnection::open(replica, config.replica_ddl, client_config, None).map_err(to_js)?
+    };
+    if let Some(transport) = transport {
+        worker.attach(transport).await.map_err(to_js)?;
     }
+    Ok(worker)
 }
 
 fn to_js(err: impl core::fmt::Display) -> JsValue {

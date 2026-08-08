@@ -272,6 +272,9 @@ async fn hub_enforces_the_per_tab_credit_window() {
             IncomingFrame::Control(ControlMessage::SnapshotBegin(_)) => {}
             IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_)) => snapshot_patches += 1,
             IncomingFrame::Control(ControlMessage::SnapshotEnd(_)) => break,
+            // The hub states its reach to every tab, and it is not a bulk frame
+            // so it spends no credit.
+            IncomingFrame::Control(ControlMessage::SyncStatus(_)) => {}
             other => panic!("unexpected frame during the snapshot: {other:?}"),
         }
     }

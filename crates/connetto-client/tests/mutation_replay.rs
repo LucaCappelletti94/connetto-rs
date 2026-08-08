@@ -287,7 +287,7 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
 
     // Resume against the real server: the handshake carries no watermark for
     // this client, so the pending mutation replays and applies.
-    conn.resume(open_session(&manager)).await.expect("resume");
+    conn.attach(open_session(&manager)).await.expect("resume");
     loop {
         match conn.pump_one().await.expect("pump") {
             ClientEvent::MutationApplied { client_seq } => {
@@ -350,7 +350,7 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
 
     // Resume with the SAME client id: the handshake watermark retires the
     // pending record without a replay, so the row applies exactly once.
-    conn.resume(open_session(&manager)).await.expect("resume");
+    conn.attach(open_session(&manager)).await.expect("resume");
     assert_eq!(
         pending_count(&mut conn),
         0,

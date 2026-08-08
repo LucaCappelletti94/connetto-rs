@@ -83,10 +83,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R28 part B | The two aggregate subscribe paths, read and excluded by part A. An ordering question rather than a demonstrated defect, so it follows part A and may conclude nothing needs changing |
 | any | R33 | Found while reading the same function for R28 part A, and separated because the cause and the consequence both differ. Reasoned, not demonstrated, so its first step is to demonstrate it |
 | any | R29 | A defect plus its missing mechanism, blocked on nothing. Two subscriptions over one table lose each other's rows today, and R15 cannot be built without what this delivers |
+| any | R44 | Split out of R29 2026-08-08. A departed row is never removed and the subscriber never told. Carries one undecided input, the per-subscriber encoding cost |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
-| any | R20 | A defect, blocked on nothing. Offline operation is a project objective and boot currently violates it. Its four decisions are taken and R43, which step 5 waited on, landed 2026-08-07 |
+| any | R20 | **DONE 2026-08-08.** A defect, blocked on nothing. Offline operation is a project objective and boot violated it |
 | any | R34 | Blocked on nothing. R5a put the write question on the same seam as the read one, so this is the mint call learning to ask it |
 | done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
 | done | ~~R41~~ **DONE** | One seam for the two secret stores. Landed 2026-08-07: one trait per secret in `connetto-core`, both name-addressed, the browser key store renamed off the collision |
@@ -141,9 +142,10 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
 | R28 part B, the aggregate subscribe paths | NOT STARTED | nothing, follows part A | no |
 | R33 completion frame overtakes its data | NOT STARTED | nothing | no |
-| R29 client-side coverage | NOT STARTED | nothing | no |
+| R29 client-side coverage | IN PROGRESS (2026-08-08), resync half done | nothing | no |
+| R44 a row that leaves one subscription's window | NOT STARTED, one input undecided | nothing. Split out of R29 2026-08-08 | no, checked |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
-| R20 start with no reachable server | NOT STARTED | nothing. R43 landed 2026-08-07, so step 5 is unblocked too | no |
+| R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
 | R42 several accounts signed in at once | NOT STARTED, one input undecided | nothing in code. Blocked on the cold-boot account-selection decision, which is named in the phase | no |
@@ -214,6 +216,7 @@ graph TD
   R28[R28 part A subscribe-time delivery gap, DONE] --> R28B[R28 part B aggregate subscribe paths]
   R33[R33 completion frame overtakes its data]
   R20 --> R29[R29 client-side coverage] --> R15
+  R29 --> R44[R44 a row that leaves one subscription's window]
   R40[R40 replica policy wired into sync]
   U2b -.->|pin moves when it lands| R40
   R24[R24 file-sync integration, exploratory]
@@ -1179,7 +1182,17 @@ No test constructs a policy that authorizes unconditionally. The full gate is gr
 
 ## R20: connetto must not require a reachable server to start
 
-**Status.** NOT STARTED, **blocked on nothing**. Step 5 waited on R43, which landed 2026-08-07.
+**Status.** **DONE** (2026-08-08). All six steps built and proven. Step 5 waited on R43, which landed 2026-08-07.
+
+**What execution found, beyond the three corrections recorded below.** Four things the plan did not anticipate, each fixed with a test that failed first.
+
+**The one bundle decision 2 asked for had to become two.** Three of the five values a handshake produces (the session handle, the resume token, the schema version) deliberately outlive a dropped socket, and only the transport and connection id die with it. Splitting into `Run` and `Wire` is what lets a reconnect resume rather than restart. Decision 2 as written would have thrown the resume state away with the socket.
+
+**Frame ordering leaked a tab's own handshake.** The hub broadcast the connection state to every tab including ones mid-handshake, which two smoke tests caught as `expected handshake ack`. It now reaches only handshaken tabs, and each tab is told the state right after its own ack, so one attaching during an outage is not left showing stale rows in silence. The hub's tracked state is initialised from the worker rather than defaulted, because a tab that handshook before the hub pumped its opening notice was being told the connection was down when it was not.
+
+**Step 4's flag cannot be driven by the live query refresh.** A first sync that delivers no rows refreshes nothing, so a caller would be told "never fetched" forever about a set that was fetched and found empty. It is updated where the cursor is observed instead. Measured while proving it: an empty first sync does today put `_connetto_meta` into the application-facing change set, so a refresh-driven flag would appear to work by riding connetto's own bookkeeping leaking into a signal meant for application tables. **Noted and not chased, it belongs to whoever owns the change tracker.**
+
+**A pump with no socket must park, not fail.** Treating a missing transport as an error ended the pump on its first step, which would silently stop device-private queries refreshing for an application that has no server at all and never will. `pump_one_or` now parks until cancelled, which is what an idle socket does anyway, and the pump routes to recovery only when a driver exists to find one.
 
 **A defect, not an enhancement.** Working offline is a stated objective of the project, and an application whose own local features do not depend on connetto still fails to start today because connetto's boot cannot complete.
 
@@ -1203,17 +1216,23 @@ No test constructs a policy that authorizes unconditionally. The full gate is gr
 
 **2. Not-connected is one optional bundle, not five optional fields.** The socket and the four values that only exist because the server answered a greeting (`connection_id`, `session_handle`, `resume_token`, `schema_version`) move into one group, and the connection holds one optional group. They arrive together in one exchange and are meaningless apart, so a half-built connection holding a session handle and no socket stops being expressible. `resume` already does the attach work and becomes the attach path. Rejected: making all five optional separately, which is smaller and lets the code express states that cannot occur, so every future reader handles an absence that only ever happens together. Rejected: a stand-in socket that always fails, which cannot work because the socket type is fixed when the connection is built, so such a connection could never later hold a real one without boxing every message, and which would make not-connected-yet indistinguishable from the network breaking.
 
-**3. A subscription declared offline is persisted, not held in memory, and that is what R43 blocks.** `docs/architecture/15-replica-retention.md` already decided the end state: the client persists its subscriptions in the never-synced database, in three normalised tables, and persisting the set replaces the in-memory best-effort `sub_tables`. Holding them in memory here is therefore not a staging post, it is writing the thing that end state deletes. **Rejected as a shortcut, on the maintainer's standing rule that an interim step needs a named blocker rather than a price tag.** The named blocker is R43: in the browser that file has two live handles, and persisting subscriptions would be the first thing to write through the one the relay does not read, turning R43 from latent to live. R43's own undecided input, who owns the single handle, is the same question this needs answered.
+**3. A subscription declared offline is persisted, not held in memory, and that is what R43 blocks.** `docs/architecture/15-replica-retention.md` already decided the end state: the client persists its subscriptions in three normalised tables, and persisting the set replaces the in-memory best-effort `sub_tables`. **Two corrections from execution, 2026-08-08.** The chapter said the never-synced tier and now says the replica, per the decision recorded under step 5. And replacing `sub_tables` did not happen here: R20 added the tables beside it, and R29 step 3 deleted it on 2026-08-08 once the resync path read the persisted set instead. Holding them in memory here is therefore not a staging post, it is writing the thing that end state deletes. **Rejected as a shortcut, on the maintainer's standing rule that an interim step needs a named blocker rather than a price tag.** The named blocker is R43: in the browser that file has two live handles, and persisting subscriptions would be the first thing to write through the one the relay does not read, turning R43 from latent to live. R43's own undecided input, who owns the single handle, is the same question this needs answered.
+
+**4. Connection state is one event on the stream the application already reads, and nothing else carries it.** The startup emits the state it came up in as an event, and every later change arrives the same way, including the moment a first server is reached. Decided 2026-08-07, closing step 3, which said only that an unreachable server "becomes a state the caller is told about" and never said how. `docs/architecture/09-wasm.md` already sketches this and never built it, as a worker-to-tab status carrying connected, reconnecting or offline, so this discharges a written decision as well as closing the step. The relay forwards it to tabs the way it forwards every other event. **Accepted cost:** an application wanting to render offline at first paint must read the stream rather than a value the startup handed back. Rejected: the startup returning the state and events carrying changes afterwards, which puts one truth in two places, and a connection landing between the return and the first read makes the returned value wrong the instant anybody looks at it. Rejected: the return value alone, which is the literal reading of step 3 and cannot report the connection arriving later, which is step 2 of this same phase. Rejected: letting the caller infer it from an unset sync position, which is the exact collapse step 4 refuses, since never synced and currently offline need different words on screen.
+
+**Nothing here is open any more.** Step 5's dependency on R43 is discharged too: R43 landed on 2026-08-07.
 
 ### Steps
 
 0. **Persist the account identifier at login**, per decision 1, so a start with no network can name the replica file. Added 2026-08-07: without it steps 1 to 3 change nothing observable in the browser, because the boot dies before it reaches them.
 1. **Make a connection constructible with no transport**, opening the replica, applying or verifying the schema, and serving local reads. The handshake and the cursor resume become things that happen when a transport arrives rather than preconditions for existing.
 2. **Attach a transport afterwards**, reusing the reconnect path rather than adding a second one, since reconnecting to a server after losing it and connecting for the first time after starting without one are the same operation.
-3. **Stop propagating a connect failure as fatal at boot** in the browser worker. An unreachable server becomes a state the caller is told about, not an error that ends the process.
+3. **Stop propagating a connect failure as fatal at boot** in the browser worker. An unreachable server becomes a state the caller is told about, not an error that ends the process. **How it is told is decision 4 above**, taken 2026-08-07: one event on the stream the application already reads, and nothing else.
 4. **A first run with no data and no server reports empty, and reports why. Decided.** It cannot serve rows nobody has ever fetched, so it returns an empty state **flagged as never-synced**, distinct from a genuinely empty dataset. The application must be able to tell "you have no orders" from "we could not load your orders", because collapsing the two guarantees the wrong message reaches somebody and it is a bug nobody finds until a user reports it. Connetto reports the state, the application decides what to show.
    **The mechanism already exists and is already public**, found 2026-08-07: `_connetto_meta.cursor` holds the Postgres LSN, `load_cursor` returns `None` when nothing was ever persisted, and `ConnettoConnection::cursor` exposes it. What is left is a caller-facing shape, not a mechanism.
 5. **Say what a subscription means before a server has ever been reached.** It is registered locally and takes effect on the first connection. **Persisted, per decision 3, which is what makes this step wait on R43.** This is the part that splits the phase: steps 0 to 4 depend on nothing R43 owns.
+   **Where the list lives was open and is now decided, 2026-08-08: in the replica, beside the synced data, not in the device-private tier.** `docs/architecture/15-replica-retention.md` said the tier, and grounding found the tier is optional (`Tier::None` is the default) while the shipped `connetto-client` binary and three test files watch queries without one, so the chapter's rule had no answer for the configuration most native callers actually run. The requirement the chapter was serving is that the list be durable, never synced, per account, destroyed with the account, and untouched by anything that clears synced rows. The replica satisfies all five, and `_connetto_meta` is the standing precedent: connetto's own bookkeeping already lives there for exactly this reason, that it must not depend on a feature the application may not have asked for. Chapter 15 is corrected to match. Rejected: keeping the list in memory when no tier exists, which makes a watch survive a restart on one configuration and vanish on another with no error either way, and leaves R15 needing a second answer for the same question. Rejected: connetto creating a tier the application never asked for. Rejected: requiring a tier in order to watch, which breaks the shipped binary.
+   **One replay rule, taken from chapter 15's own restart paragraph, decided 2026-08-08.** On attach, every persisted subscription is sent, whether this run declared it or a previous run did. The chapter already decided that a subscription the application died still watching is live at launch and is re-claimed as screens mount, so there is no second case to write. Re-claim falls out of seeding the in-memory wire set from the persisted one at startup, which is also what stops a restart minting a fresh id for a query already recorded.
 
 ### Proof
 
@@ -1222,6 +1241,8 @@ Start with a populated replica and no server listening, and prove reads answer f
 ### Done when
 
 An application embedding connetto starts, runs, and serves local reads with no server reachable, and later syncs without restarting. No boot path treats an unreachable server as fatal.
+
+**All of it holds as of 2026-08-08.** The proof is native where the behaviour is (`crates/connetto-client/tests/offline_start.rs`, five tests, and `never_synced.rs`, five more) and in the browser where the boot is (`crates/connetto-web/tests/offline_boot.rs`). Every claim was mutation-checked: removing the persistence, the replay on attach, the removal on cancel, the pump's park, and the fatal boot each fail a test that passes with them. Two mutations that survived exposed weak tests rather than sound code, one racing the pump and one asserting a redundant path, and both tests were rewritten until they discriminated. Gate green across all six workspaces plus both browser suites, the twenty-one wasm-smoke binaries run against a live five-process stack.
 
 ---
 
@@ -1770,13 +1791,21 @@ R28 part A is about a route that does not exist yet, so patches are produced and
 
 ## R29: the client knows what covers a row
 
-**Status.** NOT STARTED. **Both consequences demonstrated 2026-08-01 against `2e671a8`**: subscription B's row wiped by A's resync clear (left `[1]`, expected `[1, 2]`), and the shared row removed by a window-exit delete addressed to A while B still covers it (left `[]`, expected `[7]`), controls passing in both. Test preserved at `~/github/connetto-r29-coverage-loss.rs`, rerunnable by dropping it into `crates/connetto-client/tests/`, no Postgres needed.
+**Status.** IN PROGRESS (2026-08-08), **narrowed the same day to the resync half. Steps 4 and 5 became R44.**
 
-**Blocked on nothing.** A defect plus the mechanism it needs, decided with the maintainer and recorded in `docs/architecture/15-replica-retention.md` and `docs/architecture/04-subscriptions.md`. **R15 cannot be built without this**, since its eviction design assumes a coverage test that does not exist.
+**Grounding found step 4 rests on a premise the code contradicts, 2026-08-08.** This section said a row leaving a subscription's window arrives at that subscriber as a delete, and `04-subscriptions.md` said "today both arrive as a delete and the client cannot tell them apart". Neither is true. The server encodes **one** patchset per CDC event (`materializer.rs`, `pgoutput_patchset` inside `dispatch`) and clones the identical bytes to every matched consumer, having merged `engine.inserted()`, `engine.updated()` and `engine.deleted()` into a single list. `SessionManager::dispatch_event` then forwards that payload verbatim or drops it whole on a read-filter denial. **No departure delete is synthesized anywhere**, so the second consequence below cannot occur today, and the live defect is its opposite: a departed row is never removed and the subscriber is never told.
+
+**The preserved reproduction proves the client, not the server.** Its second test hand-builds a delete patchset with `PatchSet::new().delete(PatchDelete::new(..))` under a comment calling it "exactly the frame shape a window exit" produces. That frame shape is an assumption, and it is the one that turned out to be wrong. Its first test drives real snapshots and is sound.
+
+**Both consequences demonstrated 2026-08-01 against `2e671a8`**: subscription B's row wiped by A's resync clear (left `[1]`, expected `[1, 2]`), and the shared row removed by a window-exit delete addressed to A while B still covers it (left `[]`, expected `[7]`), controls passing in both. Test preserved at `~/github/connetto-r29-coverage-loss.rs`, rerunnable by dropping it into `crates/connetto-client/tests/`, no Postgres needed. **Read the second one with the paragraph above in mind.**
+
+**Blocked on nothing.** A defect plus the mechanism it needs, decided with the maintainer and recorded in `docs/architecture/15-replica-retention.md` and `docs/architecture/04-subscriptions.md`. **R15 cannot be built without this**, since its eviction design assumes a coverage test that does not exist. The coverage test is this phase's, so R15 is unblocked by this phase alone and does not wait for R44.
+
+**The split, decided with the maintainer 2026-08-08.** This phase keeps the resync defect, which is live, reproducible, and fixable with the subscription set R20 already persists. Teaching the server to announce a departure, and teaching the client to honour that announcement without wiping a sibling's rows, move together into **R44** because they are inseparable: landing either alone introduces the exact row loss this phase exists to remove. **No upstream change is needed for R44**, checked on 2026-08-08 because it was expected to need one: the `indirect` flag is settable through the `Indirect` trait in `sqlite-diff-rs` 0.9.0, which `connetto-server` already depends on directly, a departure delete is synthesized from table and primary key rather than translated from the event so subql's encoder is not on that path, and the genuine-versus-departure distinction is derivable today from the event kind plus which of subql's three consumer lists the subscriber landed in. What R44 does carry is a cost decision this phase should not prejudge, that per-subscriber departure notices replace one encode and N cheap clones with per-subscriber encoding. Rejected: doing all of it here, which puts a live data-loss defect behind an unscoped server change. Rejected: building the client half against the marker now, which is code nothing exercises, built on the premise that just proved false.
 
 ### Purpose
 
-**The client cannot tell which subscription wants a row, so it deletes by table.** The only association it holds is `sub_tables`, a subscription id to a set of table names, parsed from the query, held in memory, and best-effort: a query it cannot parse records nothing at all and silently disables the resync clear for that subscription.
+**The client could not tell which subscription wanted a row, so it deleted by table. Fixed by step 3 on 2026-08-08.** The only association it held was `sub_tables`, a subscription id to a set of table names, parsed from the query, held in memory, and best-effort: a query it could not parse recorded nothing at all and silently disabled the resync clear for that subscription. That map is deleted and the resync path reads the persisted subscription set.
 
 Two live consequences, both requiring only that a client hold two subscriptions over one table, which nothing discourages.
 
@@ -1799,29 +1828,69 @@ Dropping a subscription never names it, it stops contributing a clause. With no 
 
 ### Steps
 
-1. **Persist the subscriptions in the never-synced tier, normalised so a shared query is stored once.** Three tables: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the binds keyed by subscription and position. Two subscriptions differing only in a bind value share one row of query text. This replaces `sub_tables` and survives a restart. The subscription row also records its kind: watch-backed, carrying the recorded stop moment (when the last handle dropped) and its grace duration, or a pin, carrying an app-chosen unique name.
+1. **Persist the subscriptions, normalised so a shared query is stored once.** Three tables: the query text keyed by its own id and unique on the text, the subscription carrying its id and a reference to that query, and the binds keyed by subscription and position. Two subscriptions differing only in a bind value share one row of query text.
+   **Half of this landed with R20 on 2026-08-08, and the half that did not is the half this phase needs.** Built: the three tables, in `crates/connetto-client/src/subscriptions.rs`, written on declare, removed on cancel, and replayed on every attach. **Built in the replica, not the never-synced tier**, because the tier is optional and defaults to absent while the shipped `connetto-client` binary and three test files watch queries without one. The requirement is unchanged and `docs/architecture/15-replica-retention.md` is corrected to match.
+   **Not built, and still this phase's:** the subscription row records no kind, so there is nothing distinguishing a watch-backed entry from a pin, no recorded stop moment, and no grace duration. **`sub_tables` is gone as of 2026-08-08**, deleted by step 3 rather than merely superseded: once the resync path read the persisted set, that map was written and never read, so it was dead state.
 2. **Re-declare subscriptions from that table on startup**, rather than depending on the application to remember what it had: pins always, watch-backed entries still within their grace. An entry the app died still watching anchors its countdown at launch. One past its grace is unsubscribed rather than re-declared, and its rows become evictable.
+   **R20 built the unconditional half on 2026-08-08: every persisted subscription is re-declared on attach, with no notion of grace or kind, because neither is recorded yet.** What this phase adds is the filtering, which is also the only thing that retires a record. **The gap that leaves, named here so it is not rediscovered as a defect:** cancelling a subscription deletes its record, so ordinary operation leaves nothing behind, but a process that dies while still watching leaves a record no later run can distinguish from a live one, and it is re-declared for ever. Until the grace countdown exists there is nothing that can retire it. The cost today is one redundant subscription per crashed run, which the server tolerates and which the in-memory seed re-claims the moment the application watches the same query again, so it self-heals for the common case and accumulates only across crashes with a changing query set.
 3. **Replace `clear_subscription_rows` with the complement-of-union delete** above, built from the surviving subscriptions rather than from the resyncing one's table list.
-4. **Distinguish the two deletes on the wire.** A removed row and a row that left this subscription's window are indistinguishable today. A removed row applies unconditionally, a departed row applies only when no surviving predicate matches. **A predicate check alone cannot substitute**: on a genuine deletion the server sends a delete to every covering subscription and each is held back by the others still matching the stale local row, so the row is never removed at all. **Decided: the marker is the patchset op's own session-format indirect flag.** One CDC event loses its kind at fan-out (a Postgres `DELETE` fans out as per-subscription deletes, a Postgres `UPDATE` fans out as a delete for a subscription the row left and an update for one it still matches), so the server restores the lost bit at synthesis: departure deletes are built `indirect(true)`, genuine deletes stay direct. The flag is native to the format and already round-trips (`op.indirect()` in `sqlite-diff-rs`), so live delivery, catchup, and resync inherit it with no frame change, no format change, and no protocol bump. The convention is scoped to server-synthesized patchsets, and client-captured changesets keep the flag's native trigger-caused meaning. `apply_patch` walks ops through the view API, applies direct ops as today, and applies an indirect delete only when no surviving predicate (pagination stripped) matches.
-5. **A subscription carrying pagination (`LIMIT`, its `OFFSET`, `FETCH`) contributes its predicate with the pagination stripped, and dies like any other.** Its delivered set is not locally recomputable: the snapshot honors the pagination (`translate_subscription_sql` is a whole-statement round trip), live matching ignores it (`subql` extracts table and `WHERE` only), and local ordering can disagree with the server's since Postgres and SQLite collate differently. While alive it therefore protects a superset of what it delivered, which can only keep too much, and once it ends its rows are evictable like any other's, so accumulation is bounded by its lifetime. Stripping is AST surgery at the pinned `sqlparser` (`Query.limit_clause`, which carries any `OFFSET`, and `Query.fetch` are public, `VisitorMut` covers nested shapes), no upstream change wanted, and `OFFSET` cannot even appear without `LIMIT` in the client's SQLite dialect. **Pagination is the whole class needing this rule**: joins, subqueries and set operations are rejected at registration, aggregate shapes ride the pushed-value path and hold no replica rows to evict, and `ORDER BY` alone or a projection changes no row membership, ordering mattering only as what gives `LIMIT` its meaning. Decided with the maintainer, superseding the earlier blanket exclusion.
+   **DONE 2026-08-08.** The delete is now `DELETE FROM "t" WHERE NOT ((p1) OR (p2))` over the surviving subscriptions' predicates, taken from the set R20 persists rather than from `sub_tables`. Three things execution settled that the step did not say. **A survivor with no `WHERE` at all wants the whole table**, so that table is skipped entirely rather than given an empty clause list, which would have degenerated to the very `DELETE FROM "t"` this fixes. **Binds are inlined, not bound**, reusing the existing `inline_binds` and `bind_literal` that local aggregate re-execution already uses, because diesel's `sql_query` cannot chain a bind list whose length is unknown at compile time and a second convention here would be worse than the one already in the tree. Inlining happens on the whole statement before parsing, since a placeholder ahead of the `WHERE` would otherwise shift every value inside it. **A `NULL` predicate keeps the row**, because `NOT (NULL)` is `NULL` and SQLite does not delete on it, which is the conservative direction.
+   **Step 5 needed no work and is discharged here.** Taking `select.selection` alone already discards `LIMIT`, `OFFSET` and `FETCH`, so a paginated subscription contributes the predicate its page was drawn from and protects a superset of what it received, which is exactly what step 5 asked for. No AST surgery, no visitor. The step's citation was checked and is correct: `Query.limit_clause` does exist at the pinned `sqlparser` (git `bef86dd`), contrary to what a docs.rs reading of the released 0.62.0 suggests.
+   **One defect in R20 surfaced here and is fixed.** `ConnettoConnection::subscribe` was a second public entry point that built its own frame and never went through `subscribe_spec`, so a subscription declared through it was never persisted, never replayed on attach, and invisible to this delete. It now delegates, which also makes it work offline like every other declaration. It was caught by mutation: with `subscribe` bypassing the store, both "delete nothing" and "delete the whole table" passed the proof, because the new code was never reached at all.
+4. **Moved to R44 on 2026-08-08**, with the reasoning under Status. It was written against a departure delete the server does not send.
+5. **Discharged by step 3**, see above. Nothing moved to R44 with step 4.
 6. **Carry the coverage model decided with the maintainer** (`15-replica-retention.md`, What covers a row). Watches gain a grace period after the last handle drops: default five minutes, capped at ten, per-watch configurable within the cap, the cap being what keeps grace from becoming a second retention mechanism beside pins. Pins are the durable form: `pin(name, query)` creates or replaces, `unpin(name)` ends, listable, idempotent at startup, no clock, offline-safe. Ending either is what makes rows evictable. The eviction pass itself is R15's.
 7. **A typed `insert` (and likely `update`) surface makes post-ack interest explicit at the write site**, decided with the maintainer. The plain diesel write path stays fire-and-forget: its rows carry only the transient un-acked protection (R15 step 4) and then live or die by coverage. The typed variant, shaped like `watch`, composes the write with an explicit mark of interest through the existing mechanisms, a watch over the written row or a pin, never hidden per-row state. Names, return types, and generated-key mechanics are decided when built.
 
 ### Proof
 
-Two subscriptions over one table, and a stale cursor forcing both to resync: both sets of rows survive. That fails today, and it is the test that pins step 3.
+Two subscriptions over one table, and a resync of the first: the second's rows survive **and** a row the first no longer has is still removed. Both halves in one test, because either alone is passed by a wrong implementation. That is `crates/connetto-client/tests/coverage_resync.rs`, ported from the preserved reproduction, and it pins step 3.
 
-Then a row leaving the first subscription's window while the second still covers it: the row stays. Then the same row deleted upstream: it goes, from both. Those two together are what step 4 buys, and neither passes without it.
+**It is mutation-proven in both directions, 2026-08-08**: deleting nothing leaves `[1, 2, 3]` when `[1, 2]` is required, and deleting the whole table leaves `[1]`. The first mutation is the one that matters, because the original single-assertion reproduction passed it.
+
+The window-exit pair moved to R44 with step 4.
 
 ### Done when
 
-Subscriptions survive a restart and are re-declared from the replica. No delete is issued by table. A row survives exactly as long as some subscription still wants it, proved in both the resync and the window-exit directions. Pins survive restart and offline and end only by name, and a watch-backed entry past its grace is not re-declared. `15-replica-retention.md` no longer describes a coverage test that does not exist.
+Subscriptions survive a restart and are re-declared from the replica. No delete is issued by table. A row survives a resync exactly as long as some subscription still wants it. Pins survive restart and offline and end only by name, and a watch-backed entry past its grace is not re-declared. `15-replica-retention.md` no longer describes a coverage test that does not exist. The window-exit direction is R44's.
 
 ### Why this is not part of R15
 
 R15 is retention: deciding what to discard and returning the space. This is the question R15's eviction asks and cannot currently answer, and two of its consequences are live defects that have nothing to do with retention. R15 is additionally blocked on the diesel `wal_checkpoint` proposal, and none of this is.
 
 ---
+
+## R44: a row that leaves one subscription's window
+
+**Status.** NOT STARTED. **Split out of R29 on 2026-08-08**, where the reasoning and the grounding are recorded in full under that phase's Status.
+
+**Blocked on nothing, and specifically not on subql**, checked on 2026-08-08 because it was expected to need an upstream change and does not. The `indirect` flag is settable through the `Indirect` trait in `sqlite-diff-rs` 0.9.0, already a direct dependency of `connetto-server`. A departure delete is synthesized from a table and a primary key rather than translated from a CDC event, so subql's `pgoutput_patchset` is not on that path. And the distinction the flag records is derivable today from information the server already holds.
+
+### Purpose
+
+**A row that stops matching a subscription is never removed from that subscriber's replica, and the subscriber is never told.** `04-subscriptions.md` specifies `old matches, new does not` as a delete, and the code does not do it: one patchset is encoded per CDC event and the identical bytes go to every matched consumer, with `engine.inserted()`, `engine.updated()` and `engine.deleted()` merged into one list. A subscriber whose row departed receives the update as though it still matched.
+
+**Fixing that alone would introduce the row loss R29 exists to remove**, which is why the two halves are one phase. Once departures arrive as deletes, a genuine deletion and a departure look identical, and applying either unconditionally destroys a row a sibling subscription still covers.
+
+### Steps
+
+1. **Synthesize a departure delete per subscriber, and mark it.** A subscriber in `deleted()` on a Postgres `UPDATE` departed, one in `deleted()` on a Postgres `DELETE` did not. Build the departure as its own patchset carrying `indirect(true)`, leaving genuine deletes direct. The convention is scoped to server-synthesized patchsets, and client-captured changesets keep the flag's native trigger-caused meaning.
+2. **Decide the encoding cost first, and record it before writing code**, per the standing rule. Today the server encodes once and clones N times. Per-subscriber departures mean encoding per departed subscriber, and whether that is one extra encode for the departed set or one per subscriber is the choice. **Not decided.**
+3. **Honour the flag on the client.** `apply_patch` hands the whole blob to `apply_patchset` today with no per-op inspection, so this is the first place that needs to walk ops: a direct delete applies as now, an indirect delete applies only when no surviving subscription's predicate matches. The predicates come from the same coverage extractor R29 built (`live::coverage_of`).
+4. **Confirm the oplog carries it.** Catchup re-encodes from the stored `ChangeEvent` rather than replaying bytes, so a flag computed at fan-out is not automatically reproduced on replay and either has to be recomputed there or stored.
+
+### Proof
+
+A row leaving the first subscription's window while the second still covers it: the row stays, and the first subscriber stops seeing it. Then the same row deleted upstream: it goes, from both. Neither passes without the other, which is why they are one phase.
+
+**The preserved reproduction at `~/github/connetto-r29-coverage-loss.rs` holds a client-side characterization of the second half**, hand-building the delete frame. It is a starting point and not a proof: this phase must drive the real server, because the frame that reproduction assumes is exactly the one that turned out not to exist.
+
+### Done when
+
+A row that stops matching a subscription is removed from that subscriber's replica unless another subscription still covers it, and a genuinely deleted row is removed regardless, both proven against the real server rather than an injected frame.
+
+---
+
 
 ## R21: one page codec on both backends
 

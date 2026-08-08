@@ -231,7 +231,11 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
         None,
     )
     .await
-    .map(|conn| conn.session_handle().to_owned())
+    .map(|conn| {
+        conn.session_handle()
+            .expect("a connected run has a handle")
+            .to_owned()
+    })
 }
 
 #[tokio::test]

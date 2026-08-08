@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
     let mut client = ConnettoConnection::connect(transport, &replica, &sqlite_ddl, &config, None)
         .await
         .map_err(|err| anyhow!("connecting sync client: {err}"))?;
-    tracing::info!(connection = %client.connection_id(), "connected");
+    tracing::info!(connection = ?client.connection_id(), "connected");
     client
         .subscribe(&sub_id, &query)
         .await

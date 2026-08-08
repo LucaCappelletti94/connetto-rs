@@ -22,7 +22,7 @@
 
 use core::future::Future;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use connetto_core::messages::{BindValue, SubscriptionSpec};
@@ -246,6 +246,48 @@ fn wire_subscriptions(
         .collect()
 }
 
+/// What one subscription still wants from the replica.
+pub(crate) struct Coverage {
+    /// Lowercased replica tables the subscription reads.
+    pub tables: HashSet<String>,
+    /// Its `WHERE` clause with every bind already a literal, or `None` when it
+    /// has none and therefore covers the whole table.
+    pub predicate: Option<String>,
+}
+
+/// The coverage a row subscription contributes, or `None` for an aggregate,
+/// which holds no replica rows.
+///
+/// Binds are inlined into the whole statement before parsing, not into the
+/// extracted clause afterwards, because a placeholder anywhere ahead of the
+/// `WHERE` would otherwise shift every value in it by one.
+///
+/// Pagination needs no special handling here and gets none: taking the `WHERE`
+/// clause alone already discards `LIMIT`, `OFFSET` and `FETCH`, so a paginated
+/// subscription contributes the predicate its page was drawn from. That
+/// protects a superset of what it was actually delivered, which can only keep
+/// too much, never too little.
+pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, ClientError> {
+    let sql = inline_binds(&spec.query, &spec.binds)?;
+    let parsed = parse_subscription(&sql)?;
+    if matches!(parsed.shape, QueryShape::Aggregate) {
+        return Ok(None);
+    }
+    let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
+        .map_err(|err| ClientError::Session(err.to_string()))?;
+    let predicate = match statements.as_slice() {
+        [Statement::Query(query)] => match query.body.as_ref() {
+            SetExpr::Select(select) => select.selection.as_ref().map(ToString::to_string),
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(Some(Coverage {
+        tables: parsed.tables,
+        predicate,
+    }))
+}
+
 /// One SQL literal for a bound value, for local re-execution of a rendered
 /// aggregate. Text doubles its quotes, blobs render as `X'..'` hex.
 fn bind_literal(bind: &BindValue) -> Result<String, ClientError> {
@@ -407,6 +449,11 @@ struct Shared<T: Transport> {
     next_live: AtomicU64,
     // Distinct id spaces: handle ids (`live-N`) and shared wire ids (`wire-N`).
     next_wire: AtomicU64,
+    /// Whether the replica has ever received data from a server, shared with
+    /// every live handle. Updated where the cursor is observed rather than
+    /// where queries refresh, so it holds for a first sync that delivers no
+    /// rows and therefore refreshes nothing.
+    ever_synced: Arc<AtomicBool>,
 }
 
 /// The shared surface of every live handle: a current snapshot, an awaitable
@@ -443,6 +490,10 @@ pub struct LiveQuery<R> {
     rows: Arc<RwLock<Vec<R>>>,
     changed: watch::Receiver<u64>,
     reaper: Arc<Reaper>,
+    /// Whether this query reads any synced table. False for a query over
+    /// device-private tables alone, whose rows never depended on a server.
+    reads_synced: bool,
+    ever_synced: Arc<AtomicBool>,
 }
 
 impl<R: Clone + Send + Sync> LiveHandle for LiveQuery<R> {
@@ -477,6 +528,20 @@ impl<R> LiveQuery<R> {
     #[must_use]
     pub fn sub_id(&self) -> &str {
         &self.sub_id
+    }
+
+    /// Whether these rows come from a replica that has never synced.
+    ///
+    /// True only while this query reads synced tables and no server has ever
+    /// answered. An empty result then means the rows were never fetched, not
+    /// that there are none, and the application picks the sentence to show.
+    /// Always false for a query over device-private tables alone.
+    ///
+    /// Turns false for good on the first sync, including one that delivers no
+    /// rows, which is what separates a loaded empty set from an unloaded one.
+    #[must_use]
+    pub fn never_synced(&self) -> bool {
+        self.reads_synced && !self.ever_synced.load(Ordering::Relaxed)
     }
 
     /// Wait until the rows change. Resolves once per refresh that actually
@@ -682,7 +747,7 @@ where
 
     /// Shared constructor body behind the two pump flavors.
     fn build<F, S>(
-        conn: ConnettoConnection<T>,
+        mut conn: ConnettoConnection<T>,
         reconnect: Option<ReconnectDriver<F, S>>,
     ) -> (Self, impl Future<Output = ()>)
     where
@@ -691,12 +756,36 @@ where
     {
         let wake = Arc::new(Notify::new());
         let (events, _) = broadcast::channel(256);
+        let ever_synced = Arc::new(AtomicBool::new(conn.has_ever_synced()));
+        // Seeded from what a previous run left declared, so watching the same
+        // query again re-claims its record instead of minting a second one for
+        // the same text, and so a fresh id can never collide with a stored one.
+        let declared = conn.declared_subscriptions().unwrap_or_default();
+        let next_wire = declared
+            .iter()
+            .filter_map(|(id, _)| id.strip_prefix(WIRE_PREFIX))
+            .filter_map(|n| n.parse::<u64>().ok())
+            .max()
+            .map_or(1, |max| max.saturating_add(1));
+        let wire: Vec<WireSub> = declared
+            .into_iter()
+            .map(|(wire_id, spec)| WireSub {
+                wire_id,
+                spec,
+                // Nothing in this run holds them yet. A watch that re-claims
+                // one takes the count to one, and one never claimed stays here
+                // for R15's grace to retire.
+                refs: 0,
+                last_agg: None,
+            })
+            .collect();
         let shared = Arc::new(Shared {
+            ever_synced,
             state: Mutex::new(State {
                 conn,
                 registry: Vec::new(),
                 values: Vec::new(),
-                wire: Vec::new(),
+                wire,
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -705,7 +794,7 @@ where
             }),
             events,
             next_live: AtomicU64::new(1),
-            next_wire: AtomicU64::new(1),
+            next_wire: AtomicU64::new(next_wire),
         });
         let token = Arc::new(ClientToken { wake });
         let driver = pump(Arc::clone(&shared), Arc::downgrade(&token), reconnect);
@@ -822,6 +911,7 @@ where
             let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec).await?;
             wire_ids.push(wire_id);
         }
+        let reads_synced = !wire_ids.is_empty();
         state.registry.push(LiveEntry {
             sub_id: sub_id.clone(),
             tables,
@@ -834,6 +924,8 @@ where
             rows,
             changed: rx,
             reaper: Arc::clone(&self.shared.reaper),
+            reads_synced,
+            ever_synced: Arc::clone(&self.shared.ever_synced),
         })
     }
 
@@ -1105,7 +1197,10 @@ struct ReconnectDriver<F, S> {
 /// Whether a pump-step failure means the transport is gone (and a reconnect
 /// driver should take over) rather than a local fault.
 fn is_disconnect(err: &ClientError) -> bool {
-    matches!(err, ClientError::Transport(_))
+    // A send attempted with no socket is the same situation as one whose socket
+    // died: there is a transport to go and find, and the run continues either
+    // way. Anything else is a genuine fault and ends the pump.
+    matches!(err, ClientError::Transport(_) | ClientError::NotConnected)
 }
 
 /// Decrement one reference on the wire subscription `wire_id`. When the last
@@ -1123,6 +1218,9 @@ fn release_wire(wire: &mut Vec<WireSub>, wire_id: &str, released: &mut Vec<Strin
 /// one (increment its ref count) or declaring a new one (subscribe once, ref
 /// count 1). Returns the wire id and, for an aggregate handle joining an
 /// existing sub, the cached last aggregate result to resolve from at once.
+/// The id space for shared wire subscriptions, distinct from handle ids.
+const WIRE_PREFIX: &str = "wire-";
+
 async fn attach_wire<T>(
     state: &mut State<T>,
     next_wire: &AtomicU64,
@@ -1137,7 +1235,7 @@ where
         return Ok((existing.wire_id.clone(), existing.last_agg.clone()));
     }
     let seq = next_wire.fetch_add(1, Ordering::Relaxed);
-    let wire_id = format!("wire-{seq}");
+    let wire_id = format!("{WIRE_PREFIX}{seq}");
     state.conn.subscribe_spec(&wire_id, spec.clone()).await?;
     state.wire.push(WireSub {
         wire_id: wire_id.clone(),
@@ -1248,7 +1346,16 @@ async fn pump<T, F, S>(
             continue;
         }
 
-        // 2. Auto-submit local writes committed since the last step.
+        // 2. No socket and a driver to find one: go and find it. With no
+        //    driver there is nothing to recover to, so the pump falls through
+        //    and step 4 parks it until local work wakes it, which is what
+        //    keeps device-private queries refreshing with no server at all.
+        if reconnect.is_some() && !state.conn.is_connected() {
+            needs_recovery = true;
+            continue;
+        }
+
+        // 3. Auto-submit local writes committed since the last step.
         if let Err(err) = state.conn.flush().await {
             if is_disconnect(&err) {
                 needs_recovery = true;
@@ -1257,7 +1364,7 @@ async fn pump<T, F, S>(
             return;
         }
 
-        // 3. One cancellable pump step. A wake interrupts the idle wait so
+        // 4. One cancellable pump step. A wake interrupts the idle wait so
         //    lock waiters (watch, with_conn, drops) get in promptly.
         let wake = Arc::clone(&shared.wake);
         match state.conn.pump_one_or(wake.notified()).await {
@@ -1294,28 +1401,41 @@ async fn pump<T, F, S>(
             }
         }
 
-        // 4. Refresh live queries whose tables changed, from server patches
+        // The first cursor is the moment "empty" stops meaning "never
+        // fetched", so it is recorded here rather than beside the refresh
+        // below, which an empty first sync gives nothing to do.
+        if !shared.ever_synced.load(Ordering::Relaxed) && state.conn.has_ever_synced() {
+            shared.ever_synced.store(true, Ordering::Relaxed);
+        }
+
+        // 5. Refresh live queries whose tables changed, from server patches
         //    and local writes alike.
-        let changed = state.conn.take_changed();
-        if !changed.is_empty() {
-            let changed: HashSet<String> = changed.into_iter().map(|t| t.to_lowercase()).collect();
-            let State {
-                conn,
-                registry,
-                values: _,
-                wire: _,
-            } = &mut *state;
-            for entry in registry.iter_mut() {
-                if entry.tables.is_disjoint(&changed) {
-                    continue;
-                }
-                if let Err(err) = (entry.refresh)(conn) {
-                    let _ = shared.events.send(ClientEvent::NonFatal {
-                        related_to: Some(entry.sub_id.clone()),
-                        detail: format!("live query refresh failed: {err}"),
-                    });
-                }
-            }
+        refresh_changed(&mut state, &shared.events);
+    }
+}
+
+/// Re-run every live query whose tables were touched since the last step.
+fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
+    let changed = state.conn.take_changed();
+    if changed.is_empty() {
+        return;
+    }
+    let changed: HashSet<String> = changed.into_iter().map(|t| t.to_lowercase()).collect();
+    let State {
+        conn,
+        registry,
+        values: _,
+        wire: _,
+    } = state;
+    for entry in registry.iter_mut() {
+        if entry.tables.is_disjoint(&changed) {
+            continue;
+        }
+        if let Err(err) = (entry.refresh)(conn) {
+            let _ = events.send(ClientEvent::NonFatal {
+                related_to: Some(entry.sub_id.clone()),
+                detail: format!("live query refresh failed: {err}"),
+            });
         }
     }
 }
@@ -1392,32 +1512,16 @@ where
             continue;
         };
         let mut state = shared.state.lock().await;
-        match state.conn.resume(transport).await {
+        match state.conn.attach(transport).await {
             Ok(()) => {}
             // A rejected credential is not a transport blip: stop the backoff
             // loop and let the pump surface a re-login requirement.
             Err(ClientError::Auth(_)) => return Recovery::ReauthRequired,
             Err(_) => continue,
         }
-        // Re-declare every live subscription under its original id, so the
-        // server streams retained changes (or a full resync) into the same
-        // handles. A send failure here means the fresh transport died
-        // already: try again from the top.
-        let specs: Vec<(String, SubscriptionSpec)> = state
-            .wire
-            .iter()
-            .map(|wire| (wire.wire_id.clone(), wire.spec.clone()))
-            .collect();
-        let mut redeclared = true;
-        for (sub_id, spec) in specs {
-            if state.conn.subscribe_spec(&sub_id, spec).await.is_err() {
-                redeclared = false;
-                break;
-            }
-        }
-        if !redeclared {
-            continue;
-        }
+        // Re-declaring every live subscription under its original id is
+        // `attach`'s own job now, from the persisted set, which is the same
+        // work a first connection does.
         let _ = shared.events.send(ClientEvent::Reconnected);
         return Recovery::Live;
     }

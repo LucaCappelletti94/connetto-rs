@@ -313,6 +313,59 @@ where
     Ok(name)
 }
 
+/// The credential-store record naming the account this device last signed in
+/// as.
+///
+/// It sits beside the refresh token rather than in a store of its own, because
+/// the two are written together at every login and read together at every
+/// start, and because that store is already reachable before any account is
+/// known: it opens under a device key, which is the whole reason a silent
+/// refresh works at all.
+///
+/// A derived replica name is always a prefix followed by a hash, so it can
+/// never collide with this literal.
+pub const IDENTITY_RECORD: &str = "connetto-device-identity";
+
+/// Encode `user_id` for [`IDENTITY_RECORD`].
+///
+/// The encoding is the id's own serde form, the same byte source
+/// [`replica_db_name`] hashes, so an account
+/// read back from the record names the replica it named when it was written.
+/// That is the property a start with no network depends on: nothing else on
+/// the device says who the stored credential belongs to.
+///
+/// # Errors
+///
+/// [`ClientError::Session`](crate::ClientError::Session) when the id's
+/// `Serialize` impl fails, which for an id type is a programming error rather
+/// than a runtime condition.
+pub fn encode_identity<Id>(user_id: &Id) -> Result<String, crate::ClientError>
+where
+    Id: serde::Serialize + ?Sized,
+{
+    serde_json::to_string(user_id).map_err(|err| {
+        crate::ClientError::Session(format!(
+            "serializing the user id for the identity record: {err}"
+        ))
+    })
+}
+
+/// Decode what [`encode_identity`] wrote.
+///
+/// # Errors
+///
+/// [`ClientError::Session`](crate::ClientError::Session) when the record does not decode as this
+/// deployment's id type, which means the record was written by a build whose
+/// id type differed. The recovery is a fresh login, which rewrites it.
+pub fn decode_identity<Id>(record: &str) -> Result<Id, crate::ClientError>
+where
+    Id: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(record).map_err(|err| {
+        crate::ClientError::Session(format!("reading the remembered user id: {err}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Replica, Tier, replica_db_name};
@@ -356,6 +409,51 @@ mod tests {
             .expect("a resolved key builds an encrypted replica")
             .with_existing_tier("frontend.sqlite");
         assert_eq!(replica.tier().path(), Some("frontend.sqlite"));
+    }
+
+    /// The property a start with no network rests on: an account read back out
+    /// of the record names the replica it named when it was written.
+    #[test]
+    fn a_remembered_account_names_the_same_replica() {
+        let written = super::encode_identity("alice").expect("encode");
+        let read: String = super::decode_identity(&written).expect("decode");
+        assert_eq!(
+            replica_db_name("app.db", &read).expect("derive"),
+            replica_db_name("app.db", "alice").expect("derive"),
+        );
+    }
+
+    /// A typed id survives the record too, since the encoding is the id's own
+    /// serde form rather than a rendering of it.
+    #[test]
+    fn a_typed_account_survives_the_record() {
+        let written = super::encode_identity(&7_u64).expect("encode");
+        let read: u64 = super::decode_identity(&written).expect("decode");
+        assert_eq!(read, 7);
+        assert_ne!(
+            replica_db_name("app.db", &read).expect("derive"),
+            replica_db_name("app.db", "7").expect("derive"),
+            "the record keeps a number a number, so it cannot collide with its text",
+        );
+    }
+
+    /// A record written by a build whose id type differed is refused rather
+    /// than silently naming the wrong file.
+    #[test]
+    fn a_record_of_the_wrong_shape_is_refused() {
+        let written = super::encode_identity("alice").expect("encode");
+        let read = super::decode_identity::<u64>(&written);
+        assert!(matches!(read, Err(ClientError::Session(_))));
+    }
+
+    /// The record name can never be mistaken for a replica, which matters
+    /// because both live in stores addressed by name.
+    #[test]
+    fn the_record_name_cannot_collide_with_a_derived_one() {
+        assert_ne!(
+            replica_db_name(super::IDENTITY_RECORD, "alice").expect("derive"),
+            super::IDENTITY_RECORD,
+        );
     }
 
     #[test]
