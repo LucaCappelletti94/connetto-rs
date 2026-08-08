@@ -82,8 +82,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | R28 part A | **DONE 2026-08-03.** The route now precedes the snapshot read. Its step 2, the client-side discard rule, was dropped after measuring that it loses data, and the overlap is re-applied instead |
 | any | R28 part B | The two aggregate subscribe paths, read and excluded by part A. An ordering question rather than a demonstrated defect, so it follows part A and may conclude nothing needs changing |
 | any | R33 | Found while reading the same function for R28 part A, and separated because the cause and the consequence both differ. Reasoned, not demonstrated, so its first step is to demonstrate it |
-| any | R29 | A defect plus its missing mechanism, blocked on nothing. Two subscriptions over one table lose each other's rows today, and R15 cannot be built without what this delivers |
-| any | R44 | Split out of R29 2026-08-08. A departed row is never removed and the subscriber never told. Carries one undecided input, the per-subscriber encoding cost |
+| done | ~~R29~~ **DONE** | The coverage question R15 asks. Landed 2026-08-08: the resync delete spares what siblings still want, watches gain a grace and pins are the durable form. Its window-exit half became R44 and its write surface moved to R15 |
+| any | R44 | Split out of R29 2026-08-08. A departed row is never removed and the subscriber never told. Fully decided |
 | any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
 | any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
@@ -96,7 +96,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R43~~ **DONE** | The browser held two handles on one tier file. Found while grounding R17 on 2026-08-07 and landed the same day: the client's attachment is the only handle, the relay serves through it, and a tab write is replayed under the old conflict rule |
 | any | R18 | Blocked on nothing here. A configuration and documentation pass over the SQLite hardening surface |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
-| any | R15 | Off the critical path. Gated on R29 and on the one remaining diesel proposal, `wal_checkpoint`. The other four landed and the pin reaches them |
+| any | R15 | Off the critical path. R29 landed 2026-08-08, so it is gated on the one remaining diesel proposal, `wal_checkpoint`. The other four landed and the pin reaches them |
 | any | R31 | Application schema majors: the drain gate, the resync boundary, and the local-tier migration trait. Deadline is the first deployment intending to survive a schema change |
 | any | R32 | The replication slot lifecycle: startup refusal, lag logging, and the invalidation resync epoch. Deadline is any production deployment |
 | any | R40 | Replica policy enforcement wired into sync. Blocked on the subql branch landing, which is what lets the pg2sqlite pin move. Land it before any synced table carries a policy, since the failure it prevents is silent |
@@ -142,8 +142,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
 | R28 part B, the aggregate subscribe paths | NOT STARTED | nothing, follows part A | no |
 | R33 completion frame overtakes its data | NOT STARTED | nothing | no |
-| R29 client-side coverage | IN PROGRESS (2026-08-08), resync half done | nothing | no |
-| R44 a row that leaves one subscription's window | NOT STARTED, one input undecided | nothing. Split out of R29 2026-08-08 | no, checked |
+| R29 client-side coverage | **DONE** (2026-08-08) | nothing | no |
+| R44 a row that leaves one subscription's window | NOT STARTED | nothing. Split out of R29 2026-08-08, and its one open input settled by grounding the same day | no, checked |
 | R21 one page codec on both backends | NOT STARTED | nothing | no |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
@@ -152,7 +152,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | NOT STARTED | nothing, `diesel-rs/diesel#5128` is merged and the pin reaches it | no |
 | R11 shared public store | NOT STARTED | nothing | no |
-| R15 replica retention and trimming | NOT STARTED | R29 and one diesel proposal (`wal_checkpoint`), the pin now reaching the four merges | **yes, diesel** |
+| R15 replica retention and trimming | NOT STARTED | one diesel proposal (`wal_checkpoint`), the pin now reaching the four merges. R29 landed 2026-08-08 | **yes, diesel** |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
 | R32 replication slot lifecycle | NOT STARTED | nothing, R12 part A is done | no |
 | R40 replica policy enforcement wired into sync | NOT STARTED | the subql branch landing, which unblocks the pg2sqlite pin | **yes, subql then pg2sqlite, both exist and neither needs writing** |
@@ -1791,7 +1791,7 @@ R28 part A is about a route that does not exist yet, so patches are produced and
 
 ## R29: the client knows what covers a row
 
-**Status.** IN PROGRESS (2026-08-08), **narrowed the same day to the resync half. Steps 4 and 5 became R44.**
+**Status.** **DONE** (2026-08-08). **Narrowed the same day: steps 4 and 5 became R44, and step 7 moved to R15.**
 
 **Grounding found step 4 rests on a premise the code contradicts, 2026-08-08.** This section said a row leaving a subscription's window arrives at that subscriber as a delete, and `04-subscriptions.md` said "today both arrive as a delete and the client cannot tell them apart". Neither is true. The server encodes **one** patchset per CDC event (`materializer.rs`, `pgoutput_patchset` inside `dispatch`) and clones the identical bytes to every matched consumer, having merged `engine.inserted()`, `engine.updated()` and `engine.deleted()` into a single list. `SessionManager::dispatch_event` then forwards that payload verbatim or drops it whole on a read-filter denial. **No departure delete is synthesized anywhere**, so the second consequence below cannot occur today, and the live defect is its opposite: a departed row is never removed and the subscriber is never told.
 
@@ -1840,7 +1840,14 @@ Dropping a subscription never names it, it stops contributing a clause. With no 
 4. **Moved to R44 on 2026-08-08**, with the reasoning under Status. It was written against a departure delete the server does not send.
 5. **Discharged by step 3**, see above. Nothing moved to R44 with step 4.
 6. **Carry the coverage model decided with the maintainer** (`15-replica-retention.md`, What covers a row). Watches gain a grace period after the last handle drops: default five minutes, capped at ten, per-watch configurable within the cap, the cap being what keeps grace from becoming a second retention mechanism beside pins. Pins are the durable form: `pin(name, query)` creates or replaces, `unpin(name)` ends, listable, idempotent at startup, no clock, offline-safe. Ending either is what makes rows evictable. The eviction pass itself is R15's.
-7. **A typed `insert` (and likely `update`) surface makes post-ack interest explicit at the write site**, decided with the maintainer. The plain diesel write path stays fire-and-forget: its rows carry only the transient un-acked protection (R15 step 4) and then live or die by coverage. The typed variant, shaped like `watch`, composes the write with an explicit mark of interest through the existing mechanisms, a watch over the written row or a pin, never hidden per-row state. Names, return types, and generated-key mechanics are decided when built.
+   **DONE 2026-08-08.** The subscription row carries `pin_name`, `stopped_at` and `grace_secs`, and `pin_name IS NULL` is the only kind discriminant, because a second one could disagree with it. Five findings execution settled that the step did not say.
+   **The clock is SQLite's, not the host's.** The client library deliberately never calls a clock (`chrono` is a dev dependency and the one `SystemTime::now` is inside a test), which is what keeps it compiling for wasm, where `SystemTime::now` panics. The replica is open on both targets and has a clock, so the grace is measured by the same connection that stores it. Proven in the browser rather than assumed: `the_replica_clock_works_in_the_browser` asserts a plausible epoch, because a VFS returning zero would make every grace read as unexpired and fail silently.
+   **`release_wire` had to stop removing the entry at zero references.** It removed it, so a re-watch inside the grace minted a second subscription and paid a fresh snapshot, which is the exact cost the grace exists to avoid. The entry now stays at zero references and is re-claimed, leaving the set only when the grace runs out. Caught by mutation, not by reading.
+   **A pin's grace is zero, not the default.** A pin has no clock, so giving it a countdown it never consults would mean a released pin surviving for a reason unrelated to being pinned, and the property became untestable: the pin exemption could be deleted and every test still passed.
+   **`unpin` ends the subscription rather than starting a countdown**, because the documented use is a dataset downloaded deliberately and cleared explicitly, and a grace tail would keep the server streaming what the application just released. A handle still holding it is protected by the reference count instead, which is where handles live.
+   **`remember` is an upsert, not a replace**, so a watch declaring a query that is also pinned cannot silently unpin it.
+   **One performance correction.** The expiry check first ran a full load with a query per subscription on every pump step. It is now one query returning ids, and it is skipped entirely unless some entry is unheld, since nothing can expire while every watch is held. The pump steps per frame and the replica is a real file on a browser's storage.
+7. **Moved to R15 on 2026-08-08.** The typed write-and-keep surface guards against an eviction pass that does not exist yet, so its shape cannot be judged here: there is nothing to watch a row survive or vanish against. R15 already owns the short-lived protection for rows not yet acknowledged, which is the same question one step earlier, so the two are designed together. Rejected: its own phase, whose entire value appears only once R15 lands, which is how a surface gets built in the wrong shape with nothing to check it against. Rejected: designing it here on argument alone.
 
 ### Proof
 
@@ -1862,7 +1869,7 @@ R15 is retention: deciding what to discard and returning the space. This is the 
 
 ## R44: a row that leaves one subscription's window
 
-**Status.** NOT STARTED. **Split out of R29 on 2026-08-08**, where the reasoning and the grounding are recorded in full under that phase's Status.
+**Status.** NOT STARTED, and fully decided. **Split out of R29 on 2026-08-08**, where the reasoning and the grounding are recorded in full under that phase's Status.
 
 **Blocked on nothing, and specifically not on subql**, checked on 2026-08-08 because it was expected to need an upstream change and does not. The `indirect` flag is settable through the `Indirect` trait in `sqlite-diff-rs` 0.9.0, already a direct dependency of `connetto-server`. A departure delete is synthesized from a table and a primary key rather than translated from a CDC event, so subql's `pgoutput_patchset` is not on that path. And the distinction the flag records is derivable today from information the server already holds.
 
@@ -1875,7 +1882,7 @@ R15 is retention: deciding what to discard and returning the space. This is the 
 ### Steps
 
 1. **Synthesize a departure delete per subscriber, and mark it.** A subscriber in `deleted()` on a Postgres `UPDATE` departed, one in `deleted()` on a Postgres `DELETE` did not. Build the departure as its own patchset carrying `indirect(true)`, leaving genuine deletes direct. The convention is scoped to server-synthesized patchsets, and client-captured changesets keep the flag's native trigger-caused meaning.
-2. **Decide the encoding cost first, and record it before writing code**, per the standing rule. Today the server encodes once and clones N times. Per-subscriber departures mean encoding per departed subscriber, and whether that is one extra encode for the departed set or one per subscriber is the choice. **Not decided.**
+2. **The encoding cost was expected to need a decision and does not. Settled by grounding 2026-08-08.** A departure notice carries a table, a primary key and the marker, with no per-subscriber content, so every subscriber that lost the same row receives identical bytes. The server therefore encodes a second payload only on an event that has departures, and the existing consumer list splits in two rather than fanning out per subscriber. One extra encode and compress on those events, against today's one, with the clone count unchanged.
 3. **Honour the flag on the client.** `apply_patch` hands the whole blob to `apply_patchset` today with no per-op inspection, so this is the first place that needs to walk ops: a direct delete applies as now, an indirect delete applies only when no surviving subscription's predicate matches. The predicates come from the same coverage extractor R29 built (`live::coverage_of`).
 4. **Confirm the oplog carries it.** Catchup re-encodes from the stored `ChangeEvent` rather than replaying bytes, so a flag computed at fan-out is not automatically reproduced on replay and either has to be recomputed there or stored.
 
@@ -1983,7 +1990,7 @@ Public rows are stored once per device rather than once per identity, the switch
 
 **Status.** NOT STARTED
 
-**Blocked on R29 and on one remaining upstream diesel proposal. Corrected 2026-08-07.** This line used to say five proposals. Four are merged upstream and **reachable**: `auto_vacuum` mode control (diesel #5130), the `page_count` and `freelist_count` readers (#5129), `incremental_vacuum` (#5145), and `vacuum` with `vacuum_into` (#5146). Their proposal documents are deleted, because a merged pull request is a better record than a copy of its own argument. R29 still comes first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. Off the critical path.
+**Blocked on one remaining upstream diesel proposal. R29 landed 2026-08-08, discharging the other half, and handed this phase its step 6.** Corrected 2026-08-07 and again 2026-08-08. This line used to say five proposals. Four are merged upstream and **reachable**: `auto_vacuum` mode control (diesel #5130), the `page_count` and `freelist_count` readers (#5129), `incremental_vacuum` (#5145), and `vacuum` with `vacuum_into` (#5146). Their proposal documents are deleted, because a merged pull request is a better record than a copy of its own argument. R29 still comes first, because this phase's eviction step asks which subscriptions still cover a row and that test does not exist yet. Off the critical path.
 
 **The pin blocker is gone, and clearing it cost something worth knowing.** The fork's `future` branch was rebased on upstream `main` on 2026-08-07 and every workspace lock moved to it, so the four APIs are callable here. The rebase dropped a commit this workspace turned out to depend on: `diesel::table!` generates public items carrying only the caller's doc comments, and the dropped commit hid the undocumented ones from `missing_docs`, which the root `Cargo.toml` sets to `forbid`. The maintainer chose to document instead, so **all 141 columns across 45 `diesel::table!` blocks now carry doc comments and any new table must too**. `docs/upstream-diesel-future-branch-sync.md` is the record. What is left for this phase is the fifth proposal alone, `docs/upstream-diesel-wal-checkpoint.md`, unfiled, wanting `SqliteConnection::wal_checkpoint`, `WalCheckpointMode` and `WalCheckpointOutcome` for step 5's `TRUNCATE` checkpoint. The OPFS atomic-swap probe (`15-replica-retention.md`, open questions) waited on `vacuum_into` and is unblocked.
 
@@ -1998,6 +2005,7 @@ The replica holds the union of subscribed query results, so it grows with what i
 3. Rotating time-windowed subscriptions: a standing predicate fixes its bound at registration, so rotation means re-subscribing with a fresh bound.
 4. Local eviction of rows no active subscription covers, where active means a watch-backed subscription within its grace or a pin. The pass runs by itself when a subscription ends (grace expiry or unpin), scoped to that subscription's tables, and a callable tidy pass exists besides. **Two guards, decided with the maintainer.** Rows referenced by a pending, un-acknowledged mutation are never evicted: write-time interest marks over the durable pending queue (set at capture, cleared on ack, rebuilt at boot, keys extractable by the `affected_rows` decode) exclude their keys from the complement delete, bounded by the queue's cap. And the pass does not run while the transport is down, because a row discarded offline cannot be re-fetched until connectivity returns. Grace clocks keep running offline, only the pass waits. **Local-tier rows are never evictable**, and that holds structurally rather than by rule, because no `SubscriptionSpec` can carry a frontend-tier table.
 5. The trimming pass: bounded `incremental_vacuum` plus `wal_checkpoint(TRUNCATE)`, triggered on `freelist_count` relative to `page_count` rather than on a schedule.
+6. **A typed write-and-keep surface at the write site. Moved here from R29 step 7 on 2026-08-08**, because it guards against exactly the eviction step 4 introduces and its shape cannot be judged anywhere else: designed here, a row can be watched surviving or vanishing rather than argued about. The plain diesel write path stays fire-and-forget, carrying only step 4's transient un-acked protection and then living or dying by coverage. The typed variant, shaped like `watch`, composes the write with an explicit mark of interest through the existing mechanisms, a watch over the written row or a pin, never hidden per-row state. **Names, return types, and generated-key mechanics are undecided and need a discussion before code**, per the standing rule. The hard part is the generated key: an autoincrement primary key is not known until the insert has run, so the predicate that would watch the row cannot be built beforehand.
 
 ### Proof
 

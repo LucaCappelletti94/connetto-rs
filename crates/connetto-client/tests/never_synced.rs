@@ -19,7 +19,7 @@ use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica, SqlFunctions,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd,
+    BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
@@ -452,5 +452,190 @@ async fn a_run_that_starts_before_its_server_ends_up_subscribed() {
         *script.subscribes.lock().expect("subscribes lock"),
         vec!["SELECT `items`.`id`, `items`.`label` FROM `items` ORDER BY `items`.`id`".to_owned()],
         "the query declared before the server existed reached it unprompted"
+    );
+}
+
+/// Dropping the last handle starts a countdown instead of unsubscribing, so
+/// navigating away and back inside the grace pays no fresh snapshot.
+///
+/// The subscription staying declared is the observable: before this, the last
+/// drop unsubscribed at once and the record went with it.
+#[tokio::test]
+async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("grace.sqlite");
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+
+    let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+
+    let query = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("watch");
+    // A second, differently shaped query over the same table. It holds its own
+    // subscription, so dropping the first genuinely releases one, and its
+    // refresh is the barrier proving the pump finished the drop pass.
+    let mut probe = client
+        .watch::<_, Item>(items::table.filter(items::id.gt(0)))
+        .await
+        .expect("probe");
+    assert_eq!(
+        client
+            .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
+            .await
+            .len(),
+        2
+    );
+    drop(query);
+
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(items::table)
+                .values((items::id.eq(1), items::label.eq("wake the pump")))
+                .execute(conn.conn())
+                .expect("write");
+        })
+        .await;
+    tokio::time::timeout(core::time::Duration::from_secs(5), probe.changed())
+        .await
+        .expect("the pump completed an iteration")
+        .expect("changed");
+
+    assert_eq!(
+        client
+            .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
+            .await
+            .len(),
+        2,
+        "the dropped handle's subscription outlives it for the grace"
+    );
+
+    // And re-watching it finds the same subscription rather than minting a
+    // second one for the same query.
+    let again = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        client
+            .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
+            .await
+            .len(),
+        2,
+        "re-watching re-claims rather than declaring a second time"
+    );
+    drop(again);
+    drop(probe);
+}
+
+/// A pin survives closing and reopening the application, with no server ever
+/// involved, which is the case it exists for.
+#[tokio::test]
+async fn a_pin_survives_a_restart_with_no_server() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("pinned.sqlite");
+    let key = connetto_core::test_support::replica_key();
+    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
+        .expect("a resolved key");
+
+    {
+        let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
+            .expect("open with no server");
+        let (client, pump) = ConnettoClient::with_pump(conn);
+        tokio::spawn(pump);
+        client
+            .pin("offline-pack", "SELECT * FROM items")
+            .await
+            .expect("pinning must not need a server");
+        assert_eq!(
+            client.pins().await.expect("pins"),
+            vec![("offline-pack".to_owned(), "SELECT * FROM items".to_owned())]
+        );
+    }
+
+    // The process ends. A pin has no handle and no clock, so it is still there.
+    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
+        .expect("a resolved key");
+    let mut conn =
+        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    assert_eq!(
+        conn.pins().expect("pins"),
+        vec![("offline-pack".to_owned(), "SELECT * FROM items".to_owned())],
+        "the pin outlived the process that made it"
+    );
+
+    // And it is what the first connection re-declares.
+    let script = Script::with(vec![ack()]);
+    conn.attach(script.clone()).await.expect("attach");
+    assert_eq!(
+        *script.subscribes.lock().expect("subscribes lock"),
+        vec!["SELECT * FROM items".to_owned()],
+        "the pin reached the first server that turned up"
+    );
+
+    conn.unpin_subscription("offline-pack").expect("unpin");
+    assert!(conn.pins().expect("pins").is_empty());
+}
+
+/// A subscription past its grace is not re-declared on the next connection,
+/// and one still live beside it is.
+///
+/// Both halves matter. Sending nothing at all would pass a test that only
+/// checked the expired one, so a live sibling has to travel in the same
+/// attach. The expired record is reached through the public surface: unpinning
+/// ends a pin at once rather than starting a countdown, which leaves exactly
+/// the past-grace state a watch reaches five minutes after its last handle.
+#[tokio::test]
+async fn a_subscription_past_its_grace_is_not_re_declared() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("grace-attach.sqlite");
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+
+    let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+
+    let ended = SubscriptionSpec::new("SELECT * FROM items WHERE id = 1");
+    let live = SubscriptionSpec::new("SELECT * FROM items WHERE id = 2");
+    conn.subscribe_spec("wire-1", ended.clone())
+        .await
+        .expect("declare the one that will end");
+    conn.subscribe_spec("wire-2", live.clone())
+        .await
+        .expect("declare the one that stays");
+
+    // Pinning then unpinning ends `wire-1` immediately, which is the same
+    // record state as a watch whose grace has run out.
+    conn.pin_subscription("temporary", "wire-1", &ended)
+        .expect("pin");
+    conn.unpin_subscription("temporary").expect("unpin");
+    assert_eq!(
+        conn.declared_subscriptions().expect("declared").len(),
+        2,
+        "both are still recorded until the next attach reads them"
+    );
+
+    let script = Script::with(vec![ack()]);
+    conn.attach(script.clone()).await.expect("attach");
+
+    assert_eq!(
+        *script.subscribes.lock().expect("subscribes lock"),
+        vec![live.query.clone()],
+        "only the live subscription reached the server"
+    );
+    assert_eq!(
+        conn.declared_subscriptions().expect("declared"),
+        vec![("wire-2".to_owned(), live)],
+        "and the ended one is gone rather than lingering"
     );
 }

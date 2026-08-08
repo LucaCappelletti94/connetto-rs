@@ -1414,7 +1414,7 @@ where
         // connection.
         {
             let _suspended = SuspendedCapture::new(&mut self.session);
-            subscriptions::remember(&mut self.db, sub_id, &spec)?;
+            subscriptions::remember(&mut self.db, sub_id, &spec, subscriptions::DEFAULT_GRACE)?;
         }
         if self.is_connected() {
             self.send_subscribe(sub_id, spec).await?;
@@ -1438,6 +1438,74 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
+    /// Record `sub_id` as a pin under the application's `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    pub fn pin_subscription(
+        &mut self,
+        name: &str,
+        sub_id: &str,
+        spec: &SubscriptionSpec,
+    ) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        subscriptions::pin(&mut self.db, name, sub_id, spec)
+    }
+
+    /// End the pin under `name`, leaving its subscription on the ordinary
+    /// grace path. Unknown names are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    pub fn unpin_subscription(&mut self, name: &str) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        subscriptions::unpin(&mut self.db, name)
+    }
+
+    /// Every pin, as name and query, in name order.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub fn pins(&mut self) -> Result<Vec<(String, String)>, ClientError> {
+        subscriptions::pins(&mut self.db)
+    }
+
+    /// Start the grace countdown on `sub_id`, because its last handle dropped.
+    /// The subscription stays declared and stays on the wire until the grace
+    /// runs out, so re-watching the same query inside the window costs no
+    /// fresh snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    pub fn release_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        subscriptions::release(&mut self.db, sub_id)
+    }
+
+    /// Stop the grace countdown on `sub_id`, because a handle holds it again.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    pub fn hold_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        subscriptions::hold(&mut self.db, sub_id)
+    }
+
+    /// Every subscription whose grace has run out. Reading this ends nothing:
+    /// the caller unsubscribes each and drops its record.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub fn expired_subscriptions(&mut self) -> Result<Vec<String>, ClientError> {
+        subscriptions::expired(&mut self.db)
+    }
+
     /// Every subscription this replica has declared and not dropped, whether
     /// or not a server has ever seen them.
     ///
@@ -1447,7 +1515,10 @@ where
     pub fn declared_subscriptions(
         &mut self,
     ) -> Result<Vec<(String, SubscriptionSpec)>, ClientError> {
-        subscriptions::declared(&mut self.db)
+        Ok(subscriptions::declared(&mut self.db)?
+            .into_iter()
+            .map(|record| (record.sub_id, record.spec))
+            .collect())
     }
 
     /// Declare every persisted subscription on a freshly attached transport.
@@ -1458,8 +1529,16 @@ where
     /// the second kind is live at launch and re-claimed as screens mount, so
     /// there is no second case to write here.
     async fn replay_subscriptions(&mut self) -> Result<(), ClientError> {
-        for (sub_id, spec) in subscriptions::declared(&mut self.db)? {
-            self.send_subscribe(&sub_id, spec).await?;
+        for record in subscriptions::declared(&mut self.db)? {
+            if record.live {
+                self.send_subscribe(&record.sub_id, record.spec).await?;
+            } else {
+                // Past its grace, so it is ended rather than re-declared and
+                // its rows become evictable. The server never saw it on this
+                // connection, so there is nothing to unsubscribe.
+                let _suspended = SuspendedCapture::new(&mut self.session);
+                subscriptions::forget(&mut self.db, &record.sub_id)?;
+            }
         }
         Ok(())
     }
@@ -1843,8 +1922,8 @@ where
         let declared = subscriptions::declared(&mut self.db)?;
         let Some(resyncing) = declared
             .iter()
-            .find(|(id, _)| id == sub_id)
-            .and_then(|(_, spec)| crate::live::coverage_of(spec).transpose())
+            .find(|record| record.sub_id == sub_id)
+            .and_then(|record| crate::live::coverage_of(&record.spec).transpose())
             .transpose()?
         else {
             return Ok(());
@@ -1854,11 +1933,13 @@ where
         // with no predicate wants the whole table, so nothing there may go.
         let mut clauses: HashMap<&str, Vec<String>> = HashMap::new();
         let mut untouchable: HashSet<&str> = HashSet::new();
-        for (id, spec) in &declared {
-            if id == sub_id {
+        for record in &declared {
+            // A subscription past its grace no longer wants anything, so it
+            // contributes no clause and its rows are the pass's to remove.
+            if record.sub_id == sub_id || !record.live {
                 continue;
             }
-            let Some(coverage) = crate::live::coverage_of(spec)? else {
+            let Some(coverage) = crate::live::coverage_of(&record.spec)? else {
                 continue;
             };
             for table in resyncing

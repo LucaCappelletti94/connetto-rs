@@ -161,3 +161,44 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
         .expect("read the tier back");
     assert_eq!(seen, vec![Some("kept".to_owned())]);
 }
+
+/// The replica's own clock is real under the browser's OPFS VFS.
+///
+/// R29 measures a watch's grace with `strftime('%s','now')` evaluated by
+/// SQLite, because the client library deliberately never calls a host clock:
+/// `SystemTime::now` panics on `wasm32-unknown-unknown`. If the VFS did not
+/// supply a time, the value would be zero or nonsense and every grace would
+/// silently read as unexpired, so this asserts a plausible epoch rather than
+/// merely that the query runs.
+#[wasm_bindgen_test]
+async fn the_replica_clock_works_in_the_browser() {
+    let storage = ReplicaStorage::install().await;
+    storage.delete_db("r29-clock.sqlite").expect("clear");
+    storage.reserve(4).await.expect("room in the pool");
+    let key = ReplicaKey::from_bytes([0x29; ReplicaKey::LEN]);
+    let replica_url = storage.db_url("r29-clock.sqlite");
+    let replica = Replica::encrypted_file(&replica_url, Some(key)).expect("a resolved key");
+    let mut conn = ConnettoConnection::<FakeTransport>::open(
+        &replica,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        &config(),
+        None,
+    )
+    .expect("open");
+
+    #[derive(diesel::QueryableByName)]
+    struct Now {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        secs: i64,
+    }
+    let now: Now = diesel::sql_query("SELECT CAST(strftime('%s','now') AS INTEGER) AS secs")
+        .get_result(conn.conn())
+        .expect("read the replica clock");
+    // 2023-01-01, comfortably in the past and far above the zero a missing
+    // implementation would hand back.
+    assert!(
+        now.secs > 1_672_531_200,
+        "the replica clock reads {} seconds, which is not a real time",
+        now.secs
+    );
+}

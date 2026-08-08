@@ -1149,6 +1149,50 @@ where
         out
     }
 
+    /// Keep a query's rows synced and covered until [`unpin`](Self::unpin),
+    /// under an application-chosen name.
+    ///
+    /// A pin is the durable form of interest: it has no handle and no clock,
+    /// so it survives closing and reopening the application and it survives
+    /// being offline. Pinning the same name and query twice is a no-op, and
+    /// pinning a changed query under an existing name replaces it, which is
+    /// the upgrade path. Collisions between application features are the
+    /// application's to avoid, since the application chooses the names.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the record.
+    pub async fn pin(&self, name: &str, query: &str) -> Result<(), ClientError> {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        let spec = SubscriptionSpec::new(query);
+        let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec.clone()).await?;
+        state.conn.pin_subscription(name, &wire_id, &spec)
+    }
+
+    /// End the pin under `name`. Unknown names are a no-op, so this is safe to
+    /// call unconditionally. Its rows stop being covered by the pin and become
+    /// evictable unless something else still wants them.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    pub async fn unpin(&self, name: &str) -> Result<(), ClientError> {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        state.conn.unpin_subscription(name)
+    }
+
+    /// Every pin, as name and query, in name order.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub async fn pins(&self) -> Result<Vec<(String, String)>, ClientError> {
+        let mut state = self.shared.state.lock().await;
+        state.conn.pins()
+    }
+
     /// Send a keepalive probe. The matching [`ClientEvent::Pong`] on the
     /// [`events`](Self::events) stream doubles as a barrier: the server
     /// processes frames in order, so the pong proves every frame sent before
@@ -1204,12 +1248,17 @@ fn is_disconnect(err: &ClientError) -> bool {
 }
 
 /// Decrement one reference on the wire subscription `wire_id`. When the last
-/// sharer drops, remove the entry and record its id for a single Unsubscribe.
-fn release_wire(wire: &mut Vec<WireSub>, wire_id: &str, released: &mut Vec<String>) {
-    if let Some(pos) = wire.iter().position(|w| w.wire_id == wire_id) {
-        wire[pos].refs -= 1;
-        if wire[pos].refs == 0 {
-            released.push(wire.remove(pos).wire_id);
+/// sharer drops, report its id so the grace countdown can start.
+///
+/// The entry stays in the set at zero references rather than being removed,
+/// which is what lets a re-watch inside the grace re-claim it instead of
+/// minting a second subscription for the same query and paying a fresh
+/// snapshot. It leaves the set only when its grace runs out.
+fn release_wire(wire: &mut [WireSub], wire_id: &str, released: &mut Vec<String>) {
+    if let Some(entry) = wire.iter_mut().find(|w| w.wire_id == wire_id) {
+        entry.refs -= 1;
+        if entry.refs == 0 {
+            released.push(entry.wire_id.clone());
         }
     }
 }
@@ -1231,8 +1280,17 @@ where
     T::Error: core::fmt::Display,
 {
     if let Some(existing) = state.wire.iter_mut().find(|w| w.spec == spec) {
+        let reclaimed = existing.refs == 0;
         existing.refs += 1;
-        return Ok((existing.wire_id.clone(), existing.last_agg.clone()));
+        let wire_id = existing.wire_id.clone();
+        let last_agg = existing.last_agg.clone();
+        if reclaimed {
+            // Held again, so the countdown stops. The server still has this
+            // subscription, so nothing goes on the wire and no snapshot is
+            // paid, which is the whole point of the grace.
+            state.conn.hold_subscription(&wire_id)?;
+        }
+        return Ok((wire_id, last_agg));
     }
     let seq = next_wire.fetch_add(1, Ordering::Relaxed);
     let wire_id = format!("{WIRE_PREFIX}{seq}");
@@ -1275,8 +1333,35 @@ where
             release_wire(&mut state.wire, &entry.wire_id, &mut released);
         }
     }
+    // The last handle dropping starts a countdown, it does not end the
+    // subscription. Navigating away and back inside the grace re-claims the
+    // record and pays no fresh snapshot, which is the whole point of the
+    // grace. A pin ignores this: it has no handle to drop.
     for wire_id in released {
-        state.conn.unsubscribe(&wire_id).await?;
+        state.conn.release_subscription(&wire_id)?;
+    }
+    // Anything whose grace has since run out ends here, which is the only
+    // place a watch is ever unsubscribed. Nothing runs on a timer: the pass
+    // happens whenever the pump next steps, and an expiry is a comparison.
+    //
+    // Only when something could actually have expired, which is exactly when
+    // some entry is unheld: a countdown starts at the last drop, and a record
+    // inherited from a previous run is seeded unheld. With every watch held
+    // this costs nothing, which matters because the pump steps per frame and
+    // the replica is a real file on a browser's storage.
+    if !state.wire.iter().any(|w| w.refs == 0) {
+        return Ok(());
+    }
+    // A subscription this run still holds a handle on is never retired, however
+    // the record reads. The record carries the durable claim and the reference
+    // count carries the handles, and an unpin arriving while a handle is open
+    // would otherwise unsubscribe a live query out from under it.
+    for sub_id in state.conn.expired_subscriptions()? {
+        if state.wire.iter().any(|w| w.wire_id == sub_id && w.refs > 0) {
+            continue;
+        }
+        state.wire.retain(|w| w.wire_id != sub_id);
+        state.conn.unsubscribe(&sub_id).await?;
     }
     Ok(())
 }
