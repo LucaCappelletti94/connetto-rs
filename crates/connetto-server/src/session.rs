@@ -830,7 +830,13 @@ where
         }
 
         for ((patch, route), verdict) in deliveries.into_iter().zip(verdicts) {
-            if !verdict.allowed() {
+            // A departure notice is exempt, decided with the maintainer for
+            // R44 and for the same reason the filter never sees a delete: it
+            // carries only a primary key this caller was already given, so
+            // withholding it discloses nothing and leaves the row on their
+            // device for ever, which is both the stale answer and the weaker
+            // privacy outcome. This is deliberate, not an oversight.
+            if !patch.departure && !verdict.allowed() {
                 continue;
             }
             {
@@ -1941,32 +1947,28 @@ where
             if record.lsn() > ceiling {
                 continue;
             }
-            let matched = {
+            let replayed = {
                 self.materializer
                     .lock()
                     .await
-                    .match_row_consumers(record.event())?
-                    .contains(&reg.consumer_id)
+                    .replay_patch(record.event(), reg.consumer_id)?
             };
-            if !matched {
+            let Some((payload, departure)) = replayed else {
                 continue;
-            }
+            };
             // A delete or a truncate has no post-image and so no question, and
             // replays regardless, which is what lets a client drop a row it may
-            // still hold.
-            if let Some(row) = EventRow::current(record.event(), self.catalog.as_ref()) {
+            // still hold. A departure notice is exempt for the same reason,
+            // decided for R44: it carries only a key this caller already has.
+            if !departure
+                && let Some(row) = EventRow::current(record.event(), self.catalog.as_ref())
+            {
                 Verdict::reset(&mut verdicts, watchers.len());
                 let _ = self.auth.may_see(&row, &watchers, &mut verdicts).await;
                 if !verdicts.first().copied().unwrap_or_default().allowed() {
                     continue;
                 }
             }
-            let payload = {
-                self.materializer
-                    .lock()
-                    .await
-                    .encode_patch(record.event())?
-            };
             let cursor = record.lsn().to_be_bytes().to_vec();
             {
                 self.materializer.lock().await.advance_cursor(

@@ -36,6 +36,7 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 use diesel::connection::SimpleConnection;
 use diesel::connection::{
     AnsiTransactionManager, CacheSize, ConnectionSealed, DefaultLoadingMode, Instrumentation,
@@ -49,7 +50,10 @@ use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
-use sqlite_diff_rs::{ParsedDiffSet, Value};
+use sqlite_diff_rs::{
+    DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
+    Value,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +65,8 @@ pub mod live;
 pub mod reconnect;
 pub mod replica;
 mod subscriptions;
+
+pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
 #[cfg(feature = "native-auth")]
@@ -670,6 +676,38 @@ fn qualify_create_table(statement: &str) -> Result<String, ClientError> {
     Ok(format!(
         "CREATE TABLE {if_not_exists}{LOCAL_SCHEMA}.{name_part}"
     ))
+}
+
+/// A one-column existence probe, for asking whether a row is still covered.
+#[derive(diesel::QueryableByName)]
+struct Present {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    #[allow(dead_code)]
+    present: i32,
+}
+
+/// The primary-key column positions of `table`, in key order.
+fn pk_ordinals(table: &TableSchema<String>) -> Vec<usize> {
+    let mut ordinals: Vec<(usize, usize)> = (0..table.number_of_columns())
+        .filter_map(|col| table.primary_key_index(col).map(|pos| (pos, col)))
+        .collect();
+    ordinals.sort_unstable();
+    ordinals.into_iter().map(|(_, col)| col).collect()
+}
+
+/// The replica's own column names for `table`, in ordinal order.
+fn replica_columns(db: &mut SqliteConnection, table: &str) -> Result<Vec<String>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct Column {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let quoted = table.replace('\'', "''");
+    let rows: Vec<Column> = diesel::sql_query(format!(
+        "SELECT name FROM pragma_table_info('{quoted}') ORDER BY cid"
+    ))
+    .load(db)?;
+    Ok(rows.into_iter().map(|row| row.name).collect())
 }
 
 /// Record `cursor` in the replica's metadata table. Callers wrap this in the
@@ -1408,13 +1446,33 @@ where
         sub_id: &str,
         spec: SubscriptionSpec,
     ) -> Result<(), ClientError> {
+        self.subscribe_spec_with_grace(sub_id, spec, subscriptions::DEFAULT_GRACE)
+            .await
+    }
+
+    /// Declare a subscription that outlives its last handle by `grace` rather
+    /// than by the default.
+    ///
+    /// Clamped to [`MAX_GRACE`]: wanting to outlive
+    /// the cap is by definition a pin, and the cap is what enforces that
+    /// boundary mechanically rather than by documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the subscribe frame cannot be sent.
+    pub async fn subscribe_spec_with_grace(
+        &mut self,
+        sub_id: &str,
+        spec: SubscriptionSpec,
+        grace: Duration,
+    ) -> Result<(), ClientError> {
         // Recorded before it is sent, and recorded whether or not it can be
         // sent. A subscription declared with no server reachable is a
         // declaration, not a failure, and it takes effect on the first
         // connection.
         {
             let _suspended = SuspendedCapture::new(&mut self.session);
-            subscriptions::remember(&mut self.db, sub_id, &spec, subscriptions::DEFAULT_GRACE)?;
+            subscriptions::remember(&mut self.db, sub_id, &spec, grace)?;
         }
         if self.is_connected() {
             self.send_subscribe(sub_id, spec).await?;
@@ -1632,14 +1690,18 @@ where
                 Ok(ClientEvent::Closed)
             }
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd, None)?;
+                self.apply_patch(&patch.patchset_zstd, None, Some(&patch.sub_id))?;
                 self.ack_one().await?;
                 Ok(ClientEvent::SnapshotApplied {
                     sub_id: patch.sub_id,
                 })
             }
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd, Some(&patch.cursor))?;
+                self.apply_patch(
+                    &patch.patchset_zstd,
+                    Some(&patch.cursor),
+                    Some(&patch.sub_id),
+                )?;
                 self.last_cursor = Some(patch.cursor.clone());
                 self.ack_one().await?;
                 Ok(ClientEvent::LivePatch {
@@ -1994,17 +2056,129 @@ where
         &mut self,
         payload_zstd: &[u8],
         cursor: Option<&Cursor>,
+        addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
+        let apply = self.honour_departures(&bytes, addressed_to)?;
         let _suspended = SuspendedCapture::new(&mut self.session);
         self.db.transaction::<_, ClientError, _>(|conn| {
-            conn.apply_patchset(&bytes, server_wins)
-                .map_err(|e| ClientError::Apply(e.to_string()))?;
+            // The cursor advances even when every op was withheld. A departure
+            // this replica declined to act on is still an event it has seen,
+            // and not recording it would replay the same decision for ever.
+            if let Some(bytes) = apply.as_deref() {
+                conn.apply_patchset(bytes, server_wins)
+                    .map_err(|e| ClientError::Apply(e.to_string()))?;
+            }
             if let Some(cursor) = cursor {
                 persist_cursor(conn, cursor)?;
             }
             Ok(())
         })
+    }
+
+    /// What of `bytes` should actually be applied, once departure notices are
+    /// weighed against what other subscriptions still want.
+    ///
+    /// A server-synthesized indirect delete means the row left the addressed
+    /// subscription's window rather than being removed, so it applies only
+    /// when no surviving subscription still covers the row. Everything else,
+    /// including a genuine delete, applies unconditionally: on a real removal
+    /// the server sends one to every covering subscription, and holding each
+    /// back on the others would leave the row for ever.
+    ///
+    /// Returns `None` when the payload should be applied unchanged, which is
+    /// every ordinary patch and costs one parse.
+    fn honour_departures(
+        &mut self,
+        bytes: &[u8],
+        addressed_to: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(bytes) else {
+            return Ok(Some(bytes.to_vec()));
+        };
+        // The server sends a departure as a patchset of indirect deletes and
+        // nothing else, so a payload carrying anything further is an ordinary
+        // one and is not inspected further.
+        let mut departures = Vec::new();
+        for op in set.iter() {
+            match op {
+                PatchsetOp::Delete { .. } if op.indirect() => {
+                    departures.push((op.table().clone(), op.primary_key()));
+                }
+                _ => return Ok(Some(bytes.to_vec())),
+            }
+        }
+        if departures.is_empty() {
+            return Ok(Some(bytes.to_vec()));
+        }
+
+        let mut kept = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
+        let mut any = false;
+        for (table, pk) in departures {
+            if self.still_covered(&table, &pk, addressed_to)? {
+                continue;
+            }
+            any = true;
+            kept = kept.delete(PatchDelete::new(table, pk));
+        }
+        Ok(any.then(|| kept.build()))
+    }
+
+    /// Whether some subscription other than `addressed_to` still wants the row
+    /// `pk` identifies in `table`.
+    fn still_covered(
+        &mut self,
+        table: &TableSchema<String>,
+        pk: &[sqlite_diff_rs::Value<String, Vec<u8>>],
+        addressed_to: Option<&str>,
+    ) -> Result<bool, ClientError> {
+        let name = table.name().to_lowercase();
+        let mut clauses = Vec::new();
+        for record in subscriptions::declared(&mut self.db)? {
+            if !record.live || addressed_to.is_some_and(|id| id == record.sub_id) {
+                continue;
+            }
+            let Some(coverage) = crate::live::coverage_of(&record.spec)? else {
+                continue;
+            };
+            if !coverage.tables.contains(&name) {
+                continue;
+            }
+            match coverage.predicate {
+                // A survivor with no predicate wants the whole table, so the
+                // row is covered and no further clause can change that.
+                None => return Ok(true),
+                Some(predicate) => clauses.push(format!("({predicate})")),
+            }
+        }
+        if clauses.is_empty() {
+            return Ok(false);
+        }
+
+        // The key is matched by ordinal, because the wire format carries a
+        // primary key's positions and never its column names. The replica's own
+        // catalog supplies the names for those positions.
+        let columns = replica_columns(&mut self.db, table.name())?;
+        let mut wheres = Vec::with_capacity(pk.len());
+        for (position, value) in pk_ordinals(table).into_iter().zip(pk) {
+            let column = columns.get(position).ok_or_else(|| {
+                ClientError::Session(format!(
+                    "a patch names column {position} of {name}, which the replica does not have"
+                ))
+            })?;
+            wheres.push(format!(
+                "\"{column}\" IS {}",
+                crate::live::bind_literal_of(value)?
+            ));
+        }
+        let sql = format!(
+            "SELECT 1 AS present FROM \"{}\" WHERE {} AND ({}) LIMIT 1",
+            table.name(),
+            wheres.join(" AND "),
+            clauses.join(" OR ")
+        );
+        let rows: Vec<Present> = diesel::sql_query(sql).load(&mut self.db)?;
+        Ok(!rows.is_empty())
     }
 
     async fn ack_one(&mut self) -> Result<(), ClientError> {

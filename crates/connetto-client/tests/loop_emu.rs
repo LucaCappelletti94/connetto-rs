@@ -1984,10 +1984,16 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
 
     // An ordinary typed diesel query, no SQL strings in sight: the postfix
     // live() dispatches to a row LiveQuery at compile time.
-    let mut live: LiveQuery<Order> = orders::table
-        .filter(orders::quantity.gt(0))
-        .order(orders::id)
-        .live(&client)
+    // No grace, so the last drop ends the subscription at once. That is what
+    // this test is about, and the default grace would otherwise keep it alive
+    // for five minutes and deliver the patch below on purpose.
+    let mut live: LiveQuery<Order> = client
+        .watch_with_grace(
+            orders::table
+                .filter(orders::quantity.gt(0))
+                .order(orders::id),
+            Duration::ZERO,
+        )
         .await
         .expect("watch");
     assert!(
@@ -2323,7 +2329,12 @@ async fn identical_row_watches_share_one_subscription() {
             .filter(orders::quantity.gt(0))
             .order(orders::id)
     };
-    let mut live_a: LiveQuery<Order> = build().live(&client).await.expect("watch a");
+    // No grace: this test ends by proving the last drop unsubscribes, which the
+    // default five minutes would otherwise defer.
+    let mut live_a: LiveQuery<Order> = client
+        .watch_with_grace(build(), Duration::ZERO)
+        .await
+        .expect("watch a");
     tokio::select! {
         changed = tokio::time::timeout(Duration::from_secs(5), live_a.changed()) => {
             changed.expect("snapshot refresh timed out").expect("driver alive");
@@ -2336,7 +2347,10 @@ async fn identical_row_watches_share_one_subscription() {
 
     // The second identical watch shares the wire sub: no new subscribe, and it
     // reads its initial rows from the replica the first subscription filled.
-    let mut live_b: LiveQuery<Order> = build().live(&client).await.expect("watch b");
+    let mut live_b: LiveQuery<Order> = client
+        .watch_with_grace(build(), Duration::ZERO)
+        .await
+        .expect("watch b");
     assert_eq!(
         live_b.rows(),
         vec![order(1, 1.0, 3, "seed")],
@@ -2952,9 +2966,9 @@ async fn gated_server(
 
 /// Drive `sql` through the emulator and fan every resulting event out, exactly
 /// as the standing CDC ingestor does.
-async fn drive_cdc(
+async fn drive_cdc<S: SnapshotSource>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<GatedSnapshot, PermissiveAuth, ConnettoWatermark>,
+    manager: &SessionManager<S, PermissiveAuth, ConnettoWatermark>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -3071,6 +3085,188 @@ async fn the_snapshot_overlap_converges_on_the_later_value() {
         orders(client.conn()),
         vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 6, "v2")],
         "the row the snapshot and the overlap both carry appears once, at the later value",
+    );
+
+    drop(client);
+    server.abort();
+}
+
+/// R44. A row that stops matching one subscription is removed from that
+/// subscriber's replica, unless another of its subscriptions still covers it,
+/// and a genuine deletion removes it regardless.
+///
+/// Both halves are one test because each alone is passed by a wrong build.
+/// Withholding every departure passes the middle assertion and fails the last.
+/// Applying every departure passes the last and fails the middle. Before this
+/// phase the server sent no departure at all, so the row simply stayed for
+/// ever and the middle assertion passed for the wrong reason, which is why the
+/// last assertion is what proves a departure is delivered at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        test_verifier(),
+        server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "r44", &db_path).await;
+
+    // Two subscriptions over one table. Row 7 will leave the first and stay in
+    // the second, which is the whole point.
+    client
+        .subscribe("busy", "SELECT * FROM orders WHERE quantity > 4")
+        .await
+        .expect("subscribe busy");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    client
+        .subscribe("seven", "SELECT * FROM orders WHERE id = 7")
+        .await
+        .expect("subscribe seven");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 9, 'busy')",
+    )
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 9, "busy")],
+        "control: the row arrives, matching both subscriptions (row 1 is the \
+         snapshot seed and matches neither)",
+    );
+
+    // It drops out of `busy` and stays in `seven`. The server now says so, and
+    // the client must weigh that against what `seven` still wants.
+    drive_cdc(
+        &mut source,
+        &manager,
+        "UPDATE orders SET quantity = 1, status = 'quiet' WHERE id = 7",
+    )
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 1, "quiet")],
+        "the row left one subscription's window and the other still covers it, \
+         so it stays and carries the update",
+    );
+
+    // Genuinely removed upstream, so it goes whoever was covering it.
+    drive_cdc(&mut source, &manager, "DELETE FROM orders WHERE id = 7").await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "a real deletion is not held back by a surviving subscription",
+    );
+
+    drop(client);
+    server.abort();
+}
+
+/// R44, the half the sibling test cannot see. With nothing else covering it, a
+/// row that stops matching its only subscription is removed from the replica.
+///
+/// Before this phase the server told the subscriber nothing: every matched
+/// consumer received the same update, so the row simply stayed for ever. That
+/// is invisible to a test with a second subscription, because there the row is
+/// meant to stay, which is why this one exists separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_row_that_leaves_its_only_subscription_is_removed() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let manager = SessionManager::new(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        test_verifier(),
+        server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "r44-solo", &db_path).await;
+
+    client
+        .subscribe("busy", "SELECT * FROM orders WHERE quantity > 4")
+        .await
+        .expect("subscribe");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 9, 'busy')",
+    )
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 9, "busy")],
+        "control: the row arrives while it matches",
+    );
+
+    drive_cdc(
+        &mut source,
+        &manager,
+        "UPDATE orders SET quantity = 1, status = 'quiet' WHERE id = 7",
+    )
+    .await;
+    pump_for(&mut client, Duration::from_secs(2)).await;
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "seed")],
+        "nothing else covers it, so leaving the window removes it",
     );
 
     drop(client);

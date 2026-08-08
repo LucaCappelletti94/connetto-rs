@@ -36,11 +36,15 @@ use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use diesel::{QueryableByName, SqliteConnection, sql_query};
 use pg2sqlite::options::Pg2SqliteOptions;
 use pg2sqlite::prelude::ReverseTranslator;
-use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, SchemaWithPK, TableSchema, Value};
+use sqlite_diff_rs::{
+    ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
+    TableSchema, Value,
+};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
+use subql::EventKind;
 use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
-use subql::emit::pgoutput_patchset;
+use subql::emit::{WireTable, pgoutput_patchset, pgoutput_patchset_builder};
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
 use subql::visibility::WriteOp;
@@ -125,6 +129,10 @@ pub struct MatchedPatch {
     pub payload_zstd: Vec<u8>,
     /// Resume cursor for this event (the source `PgLsn`, big-endian).
     pub cursor: Vec<u8>,
+    /// Whether this payload is a synthesized departure notice: the row still
+    /// exists and merely left this consumer's window. The session layer does
+    /// not put one through the read filter, per R44.
+    pub departure: bool,
 }
 
 /// A runtime version column: a column resolved by name at run time.
@@ -684,6 +692,15 @@ where
         }
 
         let engine = &notifications.engine;
+        // A consumer the engine reports as deleted on an UPDATE did not lose
+        // the row, the row left its window. On a DELETE the same list means the
+        // row is genuinely gone, which is what makes the event kind the
+        // discriminant rather than the list alone.
+        let departing: HashSet<u64> = if matches!(event.kind(), EventKind::Update) {
+            engine.deleted().iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
         let mut consumers: Vec<u64> = Vec::new();
         consumers.extend_from_slice(engine.inserted());
         consumers.extend_from_slice(engine.updated());
@@ -693,10 +710,23 @@ where
         let patches = if consumers.is_empty() {
             Vec::new()
         } else {
-            let raw =
-                pgoutput_patchset(self.engine.inner().database(), std::slice::from_ref(event))
-                    .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
-            let payload = compress(&raw)?;
+            let built = pgoutput_patchset_builder(
+                self.engine.inner().database(),
+                std::slice::from_ref(event),
+            )
+            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+            // One extra encode on an event that has departures, not one per
+            // departing consumer: the notice carries a table and a primary key
+            // and nothing consumer-specific, so every consumer that lost this
+            // row receives the same bytes.
+            let departure = if departing.is_empty() {
+                None
+            } else {
+                Self::departure_patchset(&built)
+                    .map(|bytes| compress(&bytes))
+                    .transpose()?
+            };
+            let payload = compress(&built.build())?;
             // Fallible only in theory: usize to u64 cannot lose on any
             // supported pointer width, and a counter saturates rather than
             // panics regardless.
@@ -704,11 +734,17 @@ where
             consumers
                 .into_iter()
                 .map(|consumer_id| {
+                    let leaving = departing.contains(&consumer_id);
+                    let bytes = match (leaving, departure.as_ref()) {
+                        (true, Some(notice)) => notice.clone(),
+                        _ => payload.clone(),
+                    };
                     crate::counters::add(&crate::counters::FANOUT_PAYLOAD_BYTES, payload_len);
                     MatchedPatch {
                         consumer_id,
-                        payload_zstd: payload.clone(),
+                        payload_zstd: bytes,
                         cursor: cursor.clone(),
+                        departure: leaving && departure.is_some(),
                     }
                 })
                 .collect()
@@ -758,28 +794,49 @@ where
         Some(ChangeRecord::new(lsn, table, pk, event.clone()))
     }
 
-    /// Row consumers a replayed event notifies, for reconnect catchup.
+    /// The catchup payload for one consumer, and whether it is a departure.
     ///
-    /// Runs the same predicate matching the live path uses, but only through the
-    /// core engine, so it folds no aggregates and fires no re-execution triggers.
-    /// Matching is a pure function of the event's row images, so replaying a
-    /// historical event yields the same consumers it did live.
+    /// `None` when the event never matched this consumer. Replaces asking for
+    /// the matched set and the payload separately, which took two engine calls
+    /// and could not tell a departure from a removal because the merged list
+    /// does not carry the distinction.
+    ///
+    /// Runs the same predicate matching the live path uses, but only through
+    /// the core engine, so it folds no aggregates and fires no re-execution
+    /// triggers. A departure is recomputed here rather than stored: matching is
+    /// a pure function of the event's row images, so replay reaches the same
+    /// three lists the live path did and classifies the same way. Live and replay
+    /// therefore cannot disagree, whatever either can determine.
     ///
     /// # Errors
     ///
-    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
-    pub fn match_row_consumers(
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched,
+    /// [`MaterializerError::Emit`] when it cannot be folded, and
+    /// [`MaterializerError::Compression`] on a compression failure.
+    pub fn replay_patch(
         &mut self,
         event: &ChangeEvent,
-    ) -> Result<Vec<u64>, MaterializerError> {
-        let notifs = self.engine.inner_mut().consumers(event)?;
-        let mut consumers: Vec<u64> = Vec::new();
-        consumers.extend_from_slice(notifs.inserted());
-        consumers.extend_from_slice(notifs.updated());
-        consumers.extend_from_slice(notifs.deleted());
-        consumers.sort_unstable();
-        consumers.dedup();
-        Ok(consumers)
+        consumer_id: u64,
+    ) -> Result<Option<(Vec<u8>, bool)>, MaterializerError> {
+        let (matched, departing) = {
+            let notifs = self.engine.inner_mut().consumers(event)?;
+            let departing = matches!(event.kind(), EventKind::Update)
+                && notifs.deleted().contains(&consumer_id);
+            let matched = notifs.inserted().contains(&consumer_id)
+                || notifs.updated().contains(&consumer_id)
+                || notifs.deleted().contains(&consumer_id);
+            (matched, departing)
+        };
+        if !matched {
+            return Ok(None);
+        }
+        let built =
+            pgoutput_patchset_builder(self.engine.inner().database(), std::slice::from_ref(event))
+                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        if departing && let Some(notice) = Self::departure_patchset(&built) {
+            return Ok(Some((compress(&notice)?, true)));
+        }
+        Ok(Some((compress(&built.build())?, false)))
     }
 
     /// Fold one event into a compressed patchset, the catchup delivery payload.
@@ -795,6 +852,33 @@ where
         let raw = pgoutput_patchset(self.engine.inner().database(), std::slice::from_ref(event))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         Ok(compress(&raw)?)
+    }
+
+    /// A patchset carrying one delete for the row `built` describes, marked
+    /// indirect.
+    ///
+    /// Indirect is the session format's own flag and this is the convention
+    /// R44 puts on it: a server-synthesized indirect delete means the row left
+    /// this subscription's window rather than being removed. The client applies
+    /// it only when no surviving subscription still covers the row. A
+    /// client-captured changeset keeps the flag's native trigger-caused
+    /// meaning, which nothing here reads.
+    ///
+    /// Reads the table and key off the builder subql already filled, so the key
+    /// is the very one the ordinary payload will carry. Deriving it from the
+    /// event's typed values instead would mean a second mapping from Postgres
+    /// values to storage classes, and a departure whose key disagreed with the
+    /// row it must match would delete nothing.
+    ///
+    /// The bytes are the same for every consumer that lost the same row, so
+    /// this is built once per event and cloned, exactly as the ordinary payload
+    /// is.
+    fn departure_patchset(built: &PatchSet<WireTable, String, Vec<u8>>) -> Option<Vec<u8>> {
+        let op = built.iter().next()?;
+        let bytes = PatchSet::<WireTable, String, Vec<u8>>::new()
+            .delete(PatchDelete::new(op.table().clone(), op.primary_key()).indirect(true))
+            .build();
+        Some(bytes)
     }
 
     /// The `(table, primary-key bytes)` identity of a CDC event, for the auth

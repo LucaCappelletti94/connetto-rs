@@ -21,6 +21,7 @@
 //! contract of the handles themselves.
 
 use core::future::Future;
+use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -40,6 +41,7 @@ use subql::backend::Value as SqliteValue;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
+use crate::subscriptions::DEFAULT_GRACE;
 use crate::{ClientError, ClientEvent, ConnettoConnection};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
@@ -286,6 +288,20 @@ pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, C
         tables: parsed.tables,
         predicate,
     }))
+}
+
+/// One SQL literal for a wire value, so a primary key can be matched inside a
+/// statement that has no bind list.
+pub(crate) fn bind_literal_of(
+    value: &sqlite_diff_rs::Value<String, Vec<u8>>,
+) -> Result<String, ClientError> {
+    bind_literal(&match value {
+        sqlite_diff_rs::Value::Null => BindValue::Null,
+        sqlite_diff_rs::Value::Integer(int) => BindValue::Integer(*int),
+        sqlite_diff_rs::Value::Real(real) => BindValue::Real(*real),
+        sqlite_diff_rs::Value::Text(text) => BindValue::Text(text.clone()),
+        sqlite_diff_rs::Value::Blob(blob) => BindValue::Blob(blob.clone()),
+    })
 }
 
 /// One SQL literal for a bound value, for local re-execution of a rendered
@@ -822,6 +838,26 @@ where
         self.watch_fn(move || query.clone()).await
     }
 
+    /// Run a diesel query and keep its result fresh, choosing how long the
+    /// subscription outlives its last handle. See
+    /// [`watch_fn_with_grace`](Self::watch_fn_with_grace).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`watch`](Self::watch).
+    pub async fn watch_with_grace<Q, R>(
+        &self,
+        query: Q,
+        grace: Duration,
+    ) -> Result<LiveQuery<R>, ClientError>
+    where
+        Q: QueryFragment<Sqlite> + Clone + Send + 'static,
+        Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
+        R: Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_fn_with_grace(move || query.clone(), grace).await
+    }
+
     /// Run a diesel query produced by a factory closure and keep its result
     /// fresh.
     ///
@@ -853,6 +889,33 @@ where
     /// [`ClientError`] when the query cannot be rendered, is aggregate-shaped,
     /// the initial local read fails, or the subscribe frame cannot be sent.
     pub async fn watch_fn<F, Q, R>(&self, build: F) -> Result<LiveQuery<R>, ClientError>
+    where
+        F: Fn() -> Q + Send + 'static,
+        Q: QueryFragment<Sqlite>,
+        Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
+        R: Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_fn_with_grace(build, DEFAULT_GRACE).await
+    }
+
+    /// Run a diesel query and keep its result fresh, choosing how long the
+    /// subscription outlives its last handle.
+    ///
+    /// The default is [`crate::DEFAULT_GRACE`] and the ceiling is
+    /// [`crate::MAX_GRACE`], above
+    /// which the request is clamped: wanting to outlive the cap is by
+    /// definition a pin, so use [`pin`](Self::pin) for that. A zero grace ends
+    /// the subscription the moment the last handle drops, which is what the
+    /// behaviour was before graces existed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`watch_fn`](Self::watch_fn).
+    pub async fn watch_fn_with_grace<F, Q, R>(
+        &self,
+        build: F,
+        grace: Duration,
+    ) -> Result<LiveQuery<R>, ClientError>
     where
         F: Fn() -> Q + Send + 'static,
         Q: QueryFragment<Sqlite>,
@@ -908,7 +971,7 @@ where
         });
         let mut wire_ids = Vec::with_capacity(specs.len());
         for spec in specs {
-            let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec).await?;
+            let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec, grace).await?;
             wire_ids.push(wire_id);
         }
         let reads_synced = !wire_ids.is_empty();
@@ -1106,7 +1169,12 @@ where
         }
 
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
-        let (wire_id, cached) = attach_wire(&mut state, &self.shared.next_wire, spec).await?;
+        // No grace for an aggregate. The grace exists so a re-watch does not
+        // re-pay a snapshot, and an aggregate handle holds no replica rows: its
+        // bootstrap is one scalar the server pushes again on the next
+        // subscribe, which is cheaper than keeping the subscription alive.
+        let (wire_id, cached) =
+            attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
         if let Some(json) = cached {
             // Late joiner: the server sends the bootstrap only at the first
             // subscribe, so resolve from the cached last result now. Set the
@@ -1166,7 +1234,13 @@ where
         self.shared.wake.notify_one();
         let mut state = self.shared.state.lock().await;
         let spec = SubscriptionSpec::new(query);
-        let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec.clone()).await?;
+        let (wire_id, _) = attach_wire(
+            &mut state,
+            &self.shared.next_wire,
+            spec.clone(),
+            DEFAULT_GRACE,
+        )
+        .await?;
         state.conn.pin_subscription(name, &wire_id, &spec)
     }
 
@@ -1274,6 +1348,7 @@ async fn attach_wire<T>(
     state: &mut State<T>,
     next_wire: &AtomicU64,
     spec: SubscriptionSpec,
+    grace: Duration,
 ) -> Result<(String, Option<String>), ClientError>
 where
     T: Transport,
@@ -1294,7 +1369,10 @@ where
     }
     let seq = next_wire.fetch_add(1, Ordering::Relaxed);
     let wire_id = format!("{WIRE_PREFIX}{seq}");
-    state.conn.subscribe_spec(&wire_id, spec.clone()).await?;
+    state
+        .conn
+        .subscribe_spec_with_grace(&wire_id, spec.clone(), grace)
+        .await?;
     state.wire.push(WireSub {
         wire_id: wire_id.clone(),
         spec,

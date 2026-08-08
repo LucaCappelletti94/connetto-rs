@@ -162,6 +162,13 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
     assert_eq!(seen, vec![Some("kept".to_owned())]);
 }
 
+/// One epoch-seconds reading from the replica's clock.
+#[derive(diesel::QueryableByName)]
+struct Now {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    secs: i64,
+}
+
 /// The replica's own clock is real under the browser's OPFS VFS.
 ///
 /// R29 measures a watch's grace with `strftime('%s','now')` evaluated by
@@ -186,11 +193,6 @@ async fn the_replica_clock_works_in_the_browser() {
     )
     .expect("open");
 
-    #[derive(diesel::QueryableByName)]
-    struct Now {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        secs: i64,
-    }
     let now: Now = diesel::sql_query("SELECT CAST(strftime('%s','now') AS INTEGER) AS secs")
         .get_result(conn.conn())
         .expect("read the replica clock");
