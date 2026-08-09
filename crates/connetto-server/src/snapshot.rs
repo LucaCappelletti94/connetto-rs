@@ -114,7 +114,7 @@ mod pg {
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-    use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp};
+    use sqlite_diff_rs::PatchsetOp;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
     use subql::{ColumnId, DatabaseLike, ParserDB, PgLsn, catalog_helpers};
@@ -124,8 +124,9 @@ mod pg {
 
     use super::{RowSource, SnapshotError, SourceRow, table_from_select};
     use crate::capability::{CallerBinding, CapabilityKey};
-    use crate::key_filter::{KeyFilter, quote_ident};
+    use crate::key_filter::KeyFilter;
     use crate::session::{Snapshot, SnapshotSource};
+    use connetto_core::quote_ident;
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a
     /// bb8-pooled `AsyncPgConnection`.
@@ -284,19 +285,15 @@ mod pg {
                 return Ok(None);
             };
             // Lower through the same encoder the snapshot uses, so a value read
-            // here and the same value delivered to a client are one value.
+            // here and the same value delivered to a client are one value. The
+            // builder's ops are the encoder's own, so nothing is serialized and
+            // parsed back to reach them.
             let names: Vec<&str> = row.names.iter().map(String::as_str).collect();
             let cells: Vec<Option<&[u8]>> = row.cells.iter().map(|c| c.as_deref()).collect();
-            let patchset = subql::emit::pgbinary_patchset(&self.catalog, table, &names, &[cells])
-                .map_err(|err| SnapshotError::Encode(err.to_string()))?;
-            let parsed = ParsedDiffSet::parse(&patchset)
-                .map_err(|err| SnapshotError::Encode(format!("{err}")))?;
-            let ParsedDiffSet::Patchset(diff) = parsed else {
-                return Err(SnapshotError::Encode(
-                    "the row encoder produced a changeset".into(),
-                ));
-            };
-            let Some(PatchsetOp::Insert { values, .. }) = diff.iter().next() else {
+            let built =
+                subql::emit::pgbinary_patchset_builder(&self.catalog, table, &names, &[cells])
+                    .map_err(|err| SnapshotError::Encode(err.to_string()))?;
+            let Some(PatchsetOp::Insert { values, .. }) = built.iter().next() else {
                 return Err(SnapshotError::Encode(
                     "the row encoder produced no insert".into(),
                 ));

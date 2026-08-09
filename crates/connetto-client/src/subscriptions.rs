@@ -17,6 +17,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
 use crate::ClientError;
+use crate::clock::now_secs;
 
 /// DDL for the persisted subscription set. Written only under capture
 /// suspension, like the rest of `_connetto_*`, so it never rides a mutation
@@ -154,24 +155,6 @@ pub(crate) struct Declared {
     /// Whether the subscription still wants its rows: a pin always, a watch
     /// while held and until its grace runs out.
     pub live: bool,
-}
-
-/// Seconds since the epoch, read from SQLite rather than from the host.
-///
-/// The client library deliberately never calls a clock of its own: `chrono` is
-/// a dev dependency and the one `SystemTime::now` is in a test, which is what
-/// keeps it compiling for wasm, where `SystemTime::now` panics. The replica is
-/// open on both targets and carries a clock, so the grace is measured by the
-/// same connection that stores it.
-fn now_secs(db: &mut SqliteConnection) -> Result<i64, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct Now {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        secs: i64,
-    }
-    let row: Now =
-        diesel::sql_query("SELECT CAST(strftime('%s','now') AS INTEGER) AS secs").get_result(db)?;
-    Ok(row.secs)
 }
 
 /// Record `spec` under `sub_id`, replacing any record already there.
@@ -343,6 +326,32 @@ pub(crate) fn hold(db: &mut SqliteConnection, sub_id: &str) -> Result<(), Client
     diesel::update(subscription::table.filter(subscription::id.eq(sub_id)))
         .set(subscription::stopped_at.eq(None::<i64>))
         .execute(db)?;
+    Ok(())
+}
+
+/// Start the grace countdown on every watch a previous run died still holding,
+/// so an abandoned one retires while a re-claimed one is free.
+///
+/// Such a record has no stop moment, because nothing released it. Left as it
+/// is it reads live for ever and [`expired`] can never return it, so the
+/// server keeps a subscription nobody asked for. Anchoring here rather than in
+/// the in-memory seed is what makes the countdown outlive this run too.
+///
+/// A pin is excluded, and that exclusion is load-bearing: a pin's grace is
+/// zero by design, so anchoring one would end it at the first pump.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica rejects the write.
+pub(crate) fn anchor_launch(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    let now = now_secs(db)?;
+    diesel::update(
+        subscription::table
+            .filter(subscription::pin_name.is_null())
+            .filter(subscription::stopped_at.is_null()),
+    )
+    .set(subscription::stopped_at.eq(Some(now)))
+    .execute(db)?;
     Ok(())
 }
 
@@ -703,5 +712,54 @@ mod tests {
             2,
             "the displaced one is still a watch"
         );
+    }
+
+    /// The launch anchor: a watch with no stop moment gets one, a pin does
+    /// not, and a countdown already running is not restarted.
+    ///
+    /// The pin case is the load-bearing one. A pin's grace is zero, so
+    /// anchoring it would leave a record that ends the moment its name is
+    /// released for any reason.
+    #[test]
+    fn the_launch_anchor_starts_watches_and_spares_pins() {
+        let mut db = replica();
+        let spec = SubscriptionSpec::new("SELECT * FROM orders");
+        remember(&mut db, "wire-0", &spec, Duration::ZERO).expect("remember");
+        pin(&mut db, "pack", "wire-1", &spec).expect("pin");
+        remember(&mut db, "wire-2", &spec, Duration::from_secs(300)).expect("remember");
+        release(&mut db, "wire-2").expect("release");
+        let released_at = stopped_at(&mut db, "wire-2");
+
+        assert!(
+            expired(&mut db).expect("expired").is_empty(),
+            "control: nothing has a stop moment except the one just released, \
+             whose grace has not run out"
+        );
+        anchor_launch(&mut db).expect("anchor");
+
+        assert_eq!(
+            expired(&mut db).expect("expired"),
+            vec!["wire-0".to_owned()],
+            "the zero-grace watch the run died holding is now past its grace"
+        );
+        assert_eq!(
+            stopped_at(&mut db, "wire-1"),
+            None,
+            "the pin keeps no stop moment"
+        );
+        assert_eq!(
+            stopped_at(&mut db, "wire-2"),
+            released_at,
+            "a countdown already running is left where it was"
+        );
+    }
+
+    /// The stop moment recorded for `sub_id`.
+    fn stopped_at(db: &mut SqliteConnection, sub_id: &str) -> Option<i64> {
+        subscription::table
+            .filter(subscription::id.eq(sub_id))
+            .select(subscription::stopped_at)
+            .first(db)
+            .expect("read stop moment")
     }
 }

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use connetto_core::messages::{BindValue, SubscriptionSpec};
+use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::SqliteConnection;
 use diesel::query_builder::QueryFragment;
@@ -244,7 +245,7 @@ fn wire_subscriptions(
     synced.sort_unstable();
     synced
         .into_iter()
-        .map(|table| SubscriptionSpec::new(format!("SELECT * FROM \"{table}\"")))
+        .map(|table| SubscriptionSpec::new(format!("SELECT * FROM {}", quote_ident(table))))
         .collect()
 }
 

@@ -38,6 +38,7 @@ pub mod messages;
 pub mod replica_key;
 pub mod schema;
 pub mod session_id;
+pub mod sql;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod traits;
@@ -55,6 +56,7 @@ pub use messages::{BulkMessage, ControlMessage};
 pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};
+pub use sql::quote_ident;
 pub use traits::{
     FileStore, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority, IncomingFrame,
     PendingMutation, RefreshTokenStore, ReplicaKeyStore, Store, Transport,

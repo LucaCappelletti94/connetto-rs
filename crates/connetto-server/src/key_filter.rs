@@ -10,6 +10,7 @@
 
 use core::fmt::Write as _;
 
+use connetto_core::quote_ident;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Bool, Double, Text};
@@ -43,11 +44,6 @@ enum KeyBind {
     Text(String),
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
-}
-
-/// Quote a SQL identifier, doubling embedded quotes.
-pub(crate) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// `"col" = $1 AND "col2" = $2` over a table's primary key, plus its values.

@@ -30,6 +30,7 @@
 use std::collections::{HashMap, HashSet};
 
 use connetto_core::messages::{BindValue, MutationPatch};
+use connetto_core::quote_ident;
 use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
@@ -1298,11 +1299,6 @@ fn column_name_at<DB: DatabaseLike>(
         u16::try_from(index).map_err(|_| MaterializerError::SchemaMismatch(index.to_string()))?;
     catalog_helpers::column_name(db, table_id, column_id)
         .ok_or_else(|| MaterializerError::SchemaMismatch(format!("column {index}")))
-}
-
-/// Quote a SQL identifier, doubling embedded quotes.
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Zstd-compress a raw bulk payload at the materializer's standard level.

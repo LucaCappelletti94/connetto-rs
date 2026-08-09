@@ -74,7 +74,8 @@ mod rls {
     use subql::{DatabaseLike, ParserDB, TableLike};
 
     use crate::capability::{CallerBinding, CapabilityKey};
-    use crate::key_filter::{KeyError, KeyFilter, quote_ident};
+    use crate::key_filter::{KeyError, KeyFilter};
+    use connetto_core::quote_ident;
 
     /// Failure surfaced by [`RlsAuth`].
     #[derive(Debug, thiserror::Error)]

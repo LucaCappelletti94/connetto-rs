@@ -34,7 +34,7 @@ use connetto_core::messages::{
     MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion};
+use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, quote_ident};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use diesel::connection::SimpleConnection;
@@ -60,7 +60,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "native-auth")]
 pub mod auth;
 pub mod cipher;
+mod clock;
 pub mod dsl;
+mod grant_expiry;
 pub mod live;
 pub mod reconnect;
 pub mod replica;
@@ -653,6 +655,21 @@ fn local_tier_tables(db: &mut SqliteConnection) -> Result<HashSet<String>, Clien
         .collect())
 }
 
+/// Whether `name` is SQLite's or connetto's own, rather than the application's.
+///
+/// The Rust counterpart of the exclusion [`local_tier_tables`] writes in SQL,
+/// down to the case rules the two operators have: `LIKE 'sqlite_%'` is
+/// ASCII-case-insensitive with `_` standing for one character, so a table named
+/// exactly `sqlite` is the application's, and `GLOB '_connetto*'` is
+/// case-sensitive with `_` a literal.
+fn is_internal_table(name: &str) -> bool {
+    let sqlite_own = name.len() > 6
+        && name
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("sqlite"));
+    sqlite_own || name.starts_with("_connetto")
+}
+
 /// `s` without `prefix`, matched case-insensitively, or `None`. Byte-indexed
 /// through `get` so a multibyte character at the boundary cannot panic.
 fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -796,6 +813,9 @@ struct HandshakeOk {
 /// grants, the resume cursor and, on a resume, the credential proving the
 /// previous run's handle) and read the ack.
 ///
+/// `now` is the epoch second the replica's clock reports, used to drop a share
+/// key whose expiry has already passed.
+///
 /// Shared by the first connect and every resume.
 async fn exchange_handshake<T>(
     transport: &mut T,
@@ -803,6 +823,7 @@ async fn exchange_handshake<T>(
     token_source: Option<&AccessTokenSource>,
     resume: Option<&Cursor>,
     resume_token: Option<&str>,
+    now: i64,
 ) -> Result<HandshakeOk, ClientError>
 where
     T: Transport,
@@ -813,7 +834,17 @@ where
         Some(source) => grants.push(Grant::new(source.token().await?)),
         None => grants.extend(config.login.clone()),
     }
-    grants.extend(config.capabilities.iter().cloned());
+    // A dead share key can only draw a refusal, and the refusal is the one
+    // honest source of the signal R36 counts, so it is worth not sending. The
+    // login grant is not filtered: its refresh is `token_source`'s job, and a
+    // client with no fresh token still has to present what it has and be told.
+    grants.extend(
+        config
+            .capabilities
+            .iter()
+            .filter(|grant| !grant_expiry::has_expired(grant, now))
+            .cloned(),
+    );
     let mut handshake =
         Handshake::new(PROTOCOL_VERSION, config.client_id.clone()).with_grants(grants);
     if let Some(cursor) = resume {
@@ -1092,6 +1123,11 @@ where
         }
         db.batch_execute(META_DDL)?;
         db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+        // Once per open, before anything can re-claim: a watch the previous run
+        // died still holding gets its countdown from now, so the UI has this
+        // run to re-claim it and an abandoned one retires. Ahead of the capture
+        // session, which does not exist yet, so nothing has to be suspended.
+        subscriptions::anchor_launch(&mut db)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. Pending
@@ -1213,12 +1249,14 @@ where
     /// keeps whatever it had, so a caller can try again with another
     /// transport, and one that had nothing stays usable for local reads.
     pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
+        let now = clock::now_secs(&mut self.db)?;
         let ack = exchange_handshake(
             &mut transport,
             &self.config,
             self.token_source.as_ref(),
             self.last_cursor.as_ref(),
             self.run.as_ref().map(|run| run.resume_token.as_str()),
+            now,
         )
         .await?;
         let watermark = ack.watermark;
@@ -1868,11 +1906,20 @@ where
     }
 
     /// Drain the set of tables whose rows changed since the last call, sorted.
+    ///
+    /// connetto's own bookkeeping is dropped here rather than at the update
+    /// hook, so the tracker stays a plain record of what the connection wrote
+    /// and this one boundary decides what counts as an application table for
+    /// both consumers, [`Reactive::changed_tables`] and the live-query refresh.
     pub fn take_changed(&mut self) -> Vec<String> {
         let mut tables: Vec<String> = self
             .changed
             .lock()
-            .map(|mut set| set.drain().collect())
+            .map(|mut set| {
+                set.drain()
+                    .filter(|name| !is_internal_table(name))
+                    .collect()
+            })
             .unwrap_or_default();
         tables.sort();
         tables
@@ -2030,6 +2077,7 @@ where
                 // The table and the predicates are chosen at runtime from the
                 // subscriptions' own parsed queries, so diesel's compile-time
                 // DSL cannot name them: this is the one raw statement here.
+                let quoted = quote_ident(table);
                 let statement = match clauses.get(table.as_str()) {
                     Some(surviving) if !surviving.is_empty() => {
                         let kept = surviving
@@ -2037,9 +2085,9 @@ where
                             .map(|clause| format!("({clause})"))
                             .collect::<Vec<_>>()
                             .join(" OR ");
-                        format!("DELETE FROM \"{table}\" WHERE NOT ({kept})")
+                        format!("DELETE FROM {quoted} WHERE NOT ({kept})")
                     }
-                    _ => format!("DELETE FROM \"{table}\""),
+                    _ => format!("DELETE FROM {quoted}"),
                 };
                 diesel::sql_query(statement).execute(conn)?;
             }
@@ -2167,13 +2215,14 @@ where
                 ))
             })?;
             wheres.push(format!(
-                "\"{column}\" IS {}",
+                "{} IS {}",
+                quote_ident(column),
                 crate::live::bind_literal_of(value)?
             ));
         }
         let sql = format!(
-            "SELECT 1 AS present FROM \"{}\" WHERE {} AND ({}) LIMIT 1",
-            table.name(),
+            "SELECT 1 AS present FROM {} WHERE {} AND ({}) LIMIT 1",
+            quote_ident(table.name()),
             wheres.join(" AND "),
             clauses.join(" OR ")
         );

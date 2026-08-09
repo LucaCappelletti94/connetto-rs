@@ -424,6 +424,7 @@ impl Oplog for InMemoryOplog {
 pub use pg::{PgOplog, PgOplogError};
 
 mod pg {
+    use connetto_core::quote_ident;
     use diesel::sql_types::{BigInt, Binary, Bool, Text};
     use diesel::{QueryableByName, sql_query};
     use diesel_async::RunQueryDsl;
@@ -590,11 +591,6 @@ mod pg {
 
     fn pool_err<E: core::fmt::Display>(err: E) -> PgOplogError {
         PgOplogError::Pool(err.to_string())
-    }
-
-    /// Quote a SQL identifier, doubling embedded quotes.
-    fn quote_ident(name: &str) -> String {
-        format!("\"{}\"", name.replace('"', "\"\""))
     }
 
     impl Oplog for PgOplog {

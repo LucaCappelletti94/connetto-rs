@@ -15,9 +15,11 @@ use crate::{cursor::Cursor, schema::SchemaVersion};
 /// One grant on a handshake: a connetto-signed token asserting that the bearer
 /// is a named subject, either a person or a key.
 ///
-/// Opaque to the client, which never parses it and only stores and presents
-/// it. It says nothing about what the subject may do, because the authorization
-/// model answers that from a row the application owns.
+/// Opaque to the client with one exception: it reads `exp` out of the payload
+/// so it does not present a key it can already tell is dead, which is advisory
+/// because the server checks the expiry regardless (`02-protocol.md`). It says
+/// nothing about what the subject may do, because the authorization model
+/// answers that from a row the application owns.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Grant(String);

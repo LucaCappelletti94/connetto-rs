@@ -5,15 +5,22 @@
 //! `user_id` is an account switch onto its own replica rather than a resume
 //! onto another identity's data.
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::future::{Future, ready};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
     Encrypted, Grant, ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper,
     replica_db_name,
 };
-use connetto_core::messages::FatalErrorReason;
+use connetto_core::Cursor;
+use connetto_core::auth::CapabilitySubject;
+use connetto_core::messages::{BulkMessage, ControlMessage, FatalErrorReason, HandshakeAck};
 use connetto_core::test_support::{FakeClosed, FakeTransport};
+use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_server::{AuthConfig, TokenAuthority};
 use diesel::prelude::*;
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
@@ -333,4 +340,106 @@ async fn reconnect_retries_a_transient_refresh_fault() {
     }
     assert!(saw_reconnecting, "the driver retried before giving up");
     drop(client);
+}
+
+/// A transport that accepts the handshake and keeps the grants it carried.
+#[derive(Clone, Default)]
+struct GrantRecorder {
+    grants: Arc<Mutex<Vec<String>>>,
+    inbox: Arc<Mutex<VecDeque<IncomingFrame>>>,
+}
+
+impl Transport for GrantRecorder {
+    type Error = FakeClosed;
+
+    fn send_control(
+        &mut self,
+        message: ControlMessage,
+    ) -> impl Future<Output = Result<(), FakeClosed>> {
+        if let ControlMessage::Handshake(handshake) = message {
+            self.grants.lock().expect("grants lock").extend(
+                handshake
+                    .grants
+                    .iter()
+                    .map(|grant| grant.as_str().to_owned()),
+            );
+            self.inbox
+                .lock()
+                .expect("inbox lock")
+                .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
+                    HandshakeAck {
+                        connection_id: "recorder".to_owned(),
+                        session_token: "recorder".to_owned(),
+                        resume_token: "recorder".to_owned(),
+                        current_cursor: Cursor::new(Vec::new()),
+                        schema_version: None,
+                        initial_credits: 64,
+                        last_applied_seq: None,
+                    },
+                )));
+        }
+        ready(Ok(()))
+    }
+
+    fn send_bulk(&mut self, _message: BulkMessage) -> impl Future<Output = Result<(), FakeClosed>> {
+        ready(Ok(()))
+    }
+
+    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, FakeClosed>> {
+        ready(Ok(self.inbox.lock().expect("inbox lock").pop_front()))
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), FakeClosed>> {
+        ready(Ok(()))
+    }
+}
+
+/// R45 step 3: a share key whose expiry has passed is not presented again.
+///
+/// A grant is a signed, unencrypted JWT, so the client reads `exp` out of one
+/// it already holds with no key and no round trip. Both keys are really minted
+/// and really signed, differing only in when they were issued, so the check is
+/// exercised against the claim shape connetto actually produces.
+///
+/// The live key travelling is half the assertion: withholding everything would
+/// silence the refusals just as well and break every share in the process.
+#[tokio::test]
+async fn an_expired_share_key_is_not_presented_and_a_live_one_is() {
+    let authority = TokenAuthority::generate(&AuthConfig::default()).expect("keypair");
+    let hour = Duration::from_secs(3600);
+    let dead = authority
+        .mint_capability(
+            &CapabilitySubject::<String>::new("share:expired"),
+            SystemTime::now() - 2 * hour,
+            hour,
+        )
+        .expect("mint the expired key");
+    let alive = authority
+        .mint_capability(
+            &CapabilitySubject::<String>::new("share:live"),
+            SystemTime::now(),
+            hour,
+        )
+        .expect("mint the live key");
+
+    let transport = GrantRecorder::default();
+    let config = ClientConfig {
+        capabilities: vec![Grant::new(dead), Grant::new(alive.clone())],
+        ..config()
+    };
+    let _conn = ConnettoConnection::connect(
+        transport.clone(),
+        &Replica::in_memory(),
+        SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("connect");
+
+    assert_eq!(
+        *transport.grants.lock().expect("grants lock"),
+        vec!["user:token".to_owned(), alive],
+        "the dead share key stayed home and the live one travelled"
+    );
 }

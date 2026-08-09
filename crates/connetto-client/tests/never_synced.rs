@@ -639,3 +639,131 @@ async fn a_subscription_past_its_grace_is_not_re_declared() {
         "and the ended one is gone rather than lingering"
     );
 }
+
+/// R45 step 1: a watch the previous run died still holding starts its
+/// countdown at launch, so an abandoned one retires instead of being
+/// re-declared for ever.
+///
+/// Such a record has no stop moment, because nothing released it: the process
+/// simply ended. Left unanchored it reads live on every attach and `expired`
+/// can never return it, so the server keeps a subscription nobody asked for
+/// and the rows it covers can never be evicted.
+///
+/// The zero-grace watch is the half observable without waiting five minutes,
+/// and it is also the contract: one that asked for no grace and died held is
+/// dropped at once. The pin is the exclusion that makes the anchor safe.
+#[tokio::test]
+async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("died-holding.sqlite");
+    let key = connetto_core::test_support::replica_key();
+    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
+        .expect("a resolved key");
+
+    let abandoned = SubscriptionSpec::new("SELECT * FROM items WHERE id = 1");
+    let kept = SubscriptionSpec::new("SELECT * FROM items WHERE id = 2");
+    let packed = SubscriptionSpec::new("SELECT * FROM items WHERE id = 3");
+    {
+        let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
+            .expect("open with no server");
+        conn.subscribe_spec_with_grace("wire-1", abandoned, core::time::Duration::ZERO)
+            .await
+            .expect("declare the zero-grace watch");
+        conn.subscribe_spec("wire-2", kept.clone())
+            .await
+            .expect("declare the one whose grace is still running");
+        conn.pin_subscription("pack", "wire-3", &packed)
+            .expect("pin");
+        // The process ends with all three still held: nothing released them,
+        // so none of the three carries a stop moment.
+    }
+
+    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
+        .expect("a resolved key");
+    let mut conn =
+        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    let script = Script::with(vec![ack()]);
+    conn.attach(script.clone()).await.expect("attach");
+
+    assert_eq!(
+        *script.subscribes.lock().expect("subscribes lock"),
+        vec![kept.query.clone(), packed.query.clone()],
+        "the abandoned zero-grace watch is not re-declared, and the two that \
+         still want their rows are"
+    );
+    assert_eq!(
+        conn.declared_subscriptions()
+            .expect("declared")
+            .into_iter()
+            .map(|(sub_id, _)| sub_id)
+            .collect::<Vec<_>>(),
+        vec!["wire-2".to_owned(), "wire-3".to_owned()],
+        "and the abandoned record is forgotten rather than lingering"
+    );
+    assert_eq!(
+        conn.pins().expect("pins"),
+        vec![("pack".to_owned(), packed.query)],
+        "a pin is untouched at launch: its grace is zero by design, so \
+         anchoring one would end it at the first pump"
+    );
+}
+
+/// The other half of the same launch anchor: the countdown exists so the UI
+/// has time to re-claim, and re-claiming costs nothing.
+///
+/// Guards the anchor rather than demonstrating the defect, which is why it
+/// passes before the fix too. Retiring the record at launch, or anchoring it
+/// with no grace, would both satisfy the test above and fail this one.
+#[tokio::test]
+async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("re-claim.sqlite");
+    let key = connetto_core::test_support::replica_key();
+    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
+        .expect("a resolved key");
+
+    {
+        let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
+            .expect("open with no server");
+        let (client, pump) = ConnettoClient::with_pump(conn);
+        tokio::spawn(pump);
+        let watching = client
+            .watch::<_, Item>(items::table.order(items::id))
+            .await
+            .expect("watch");
+        // Died holding it: the handle never runs its drop, so nothing releases
+        // the subscription and its record keeps no stop moment.
+        core::mem::forget(watching);
+    }
+
+    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
+        .expect("a resolved key");
+    let conn =
+        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    let again = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("re-watch the query the previous run died holding");
+
+    assert_eq!(
+        client
+            .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
+            .await
+            .into_iter()
+            .map(|(sub_id, _)| sub_id)
+            .collect::<Vec<_>>(),
+        vec!["wire-1".to_owned()],
+        "the screen mounting again re-claimed the record rather than minting a \
+         second subscription for the same query"
+    );
+    assert!(
+        client
+            .with_conn(|conn| conn.expired_subscriptions().expect("expired"))
+            .await
+            .is_empty(),
+        "and a re-claimed record is no longer counting down"
+    );
+    drop(again);
+}

@@ -279,6 +279,7 @@ name = "connetto-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "connetto-core",
  "diesel",
  "diesel-sqlite-session",

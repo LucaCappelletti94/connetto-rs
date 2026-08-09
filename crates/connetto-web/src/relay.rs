@@ -70,7 +70,7 @@ use connetto_core::messages::{
     SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, SyncStatus,
 };
 use connetto_core::traits::MaybeSend;
-use connetto_core::{Cursor, IncomingFrame, Transport};
+use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -1101,11 +1101,6 @@ where
         );
     }
     handle_synced_mutation(worker, state, id, tab_seq, &changeset).await
-}
-
-/// One identifier, quoted for SQLite.
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Bind one changeset value at its own SQLite storage class.
