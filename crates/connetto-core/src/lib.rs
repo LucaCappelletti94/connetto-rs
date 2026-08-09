@@ -9,6 +9,8 @@
 //!   [`RefreshTokenStore`], and [`ReplicaKeyStore`] seams the server, native
 //!   client, and `WASM` client each fill with a platform-specific
 //!   implementation.
+//! * [`sql`] and [`percent`] hold the text helpers every side would otherwise
+//!   paste: SQL identifier quoting and query-value percent-encoding.
 //!
 //! Consumer crates in this workspace depend on `connetto-core` only. They never
 //! depend on each other.
@@ -31,10 +33,13 @@
 pub mod auth;
 pub mod codec;
 pub mod cursor;
+#[cfg(feature = "env")]
+pub mod env;
 pub mod error;
 #[cfg(feature = "logging")]
 pub mod logging;
 pub mod messages;
+pub mod percent;
 pub mod replica_key;
 pub mod schema;
 pub mod session_id;
@@ -53,6 +58,7 @@ pub use auth::{
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
+pub use percent::{percent_decode, percent_encode};
 pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};

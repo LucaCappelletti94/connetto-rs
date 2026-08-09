@@ -10,8 +10,8 @@
 //! topology in headless Chrome against a real `connetto-server` and Postgres.
 
 pub use connetto_web::{
-    BroadcastTransport, BroadcastTransportError, BrowserSocket, BrowserSocketError, HubNotice,
-    PortTransport, PortTransportError, RelayError, RelayHub, TabId, locks,
+    BrowserSocket, BrowserSocketError, HubNotice, MessageTransport, MessageTransportError,
+    RelayError, RelayHub, TabId, locks,
 };
 
 /// The Postgres schema source the demo server is launched with

@@ -20,10 +20,11 @@ mod common;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
-use connetto_wasm_smoke::{BroadcastTransport, leader, locks, uuidv4_functions};
+use connetto_wasm_smoke::{MessageTransport, leader, locks, uuidv4_functions};
 use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::BroadcastChannel;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -100,10 +101,10 @@ fn glue_url() -> String {
 
 /// Connect a tab client to the DB worker over its own wire channel. The
 /// tab mirror holds both tiers in its main schema.
-async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> {
+async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
-    let transport = BroadcastTransport::new(&wire).expect("wire channel");
+    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         login: Some(Grant::new(common::mint_token().await)),

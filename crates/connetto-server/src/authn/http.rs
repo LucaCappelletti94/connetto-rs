@@ -29,6 +29,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::percent::percent_encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -70,15 +71,28 @@ impl RedirectPolicy {
 }
 
 /// Whether `redirect_uri` is an RFC 8252 loopback redirect: the `http` scheme
-/// and a literal loopback host. Parsed rather than string-matched so a host
-/// like `127.0.0.1.evil.example` or a `user@` authority trick cannot pass.
+/// and a literal loopback host.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
     let Ok(parsed) = url::Url::parse(redirect_uri) else {
         return false;
     };
-    if parsed.scheme() != "http" {
-        return false;
-    }
+    parsed.scheme() == "http" && is_loopback_host(&parsed)
+}
+
+/// Whether `parsed` names a literal loopback host: a `127.0.0.0/8` address,
+/// `[::1]`, or `localhost` case-insensitively. Parsed rather than
+/// string-matched, so `127.0.0.1.evil.example`, a trailing dot, or a `user@`
+/// authority trick cannot pass.
+///
+/// The IPv4-mapped form `[::ffff:127.0.0.1]` is not loopback here, because
+/// `Ipv6Addr::is_loopback` is false for it.
+///
+/// Two policies rest on this and each keeps its own extra condition at its own
+/// site: [`RedirectPolicy`]'s loopback rule also pins the `http` scheme before
+/// a minted authorization code may be delivered, and the CORS predicate in the
+/// reference binary does not.
+#[must_use]
+pub fn is_loopback_host(parsed: &url::Url) -> bool {
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
@@ -374,10 +388,12 @@ async fn callback<S: AuthStore + 'static>(
             });
             let state_param = pending.client_state.unwrap_or_default();
             let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+            // Codes and states are URL-safe base64 or hex, none of which needs
+            // escaping, but a client-chosen state might.
             let location = format!(
                 "{redirect_uri}{separator}code={}&state={}",
-                urlencode(&code),
-                urlencode(&state_param),
+                percent_encode(&code),
+                percent_encode(&state_param),
             );
             Ok(Redirect::temporary(&location).into_response())
         }
@@ -446,21 +462,44 @@ fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
     computed.as_bytes().ct_eq(challenge.as_bytes()).into()
 }
 
-/// Percent-encode a value for a query string. Codes and states are URL-safe
-/// base64 or hex plus `-`, `_`, and `~`, none of which need escaping, but a
-/// client-chosen state might, so escape the reserved set defensively.
-fn urlencode(value: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => {
-                let _ = write!(out, "%{other:02X}");
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_host;
+
+    fn loopback(url: &str) -> bool {
+        url::Url::parse(url).is_ok_and(|parsed| is_loopback_host(&parsed))
     }
-    out
+
+    #[test]
+    fn accepts_the_three_literal_loopback_forms() {
+        assert!(loopback("http://127.0.0.1:8080/callback"));
+        assert!(loopback("http://127.7.7.7/"));
+        assert!(loopback("http://[::1]:0/"));
+        assert!(loopback("http://localhost/"));
+        assert!(loopback("http://LocalHost/"));
+        assert!(loopback("https://127.0.0.1/"));
+    }
+
+    #[test]
+    fn rejects_hosts_that_only_look_loopback() {
+        assert!(!loopback("http://127.0.0.1.evil.example/"));
+        assert!(!loopback("http://localhost.evil.example/"));
+        assert!(!loopback("http://localhost./"));
+        assert!(!loopback("http://example.com/"));
+        assert!(!loopback("not a url"));
+    }
+
+    #[test]
+    fn an_authority_trick_does_not_move_the_host() {
+        // The host is what is matched, never the userinfo before the `@`.
+        assert!(loopback("http://evil.example@127.0.0.1/"));
+        assert!(!loopback("http://127.0.0.1@evil.example/"));
+    }
+
+    #[test]
+    fn the_ipv4_mapped_form_is_not_loopback() {
+        // `Ipv6Addr::is_loopback` is false for it. A gap both callers have
+        // always shared, pinned here so a change to it is deliberate.
+        assert!(!loopback("http://[::ffff:127.0.0.1]/"));
+    }
 }

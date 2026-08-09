@@ -33,7 +33,7 @@ use std::{cell::RefCell, time::Duration};
 use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica};
 use connetto_dioxus::use_live;
 use connetto_web::{
-    BroadcastTransport,
+    MessageTransport,
     auth::{LogoutOutcome, WorkerAuthConfig, deliver_login_code, request_logout, request_unsynced},
     leader, locks, workers,
 };
@@ -44,7 +44,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, MessageEvent};
 
 /// The tab-to-worker transport this window's client rides.
-type Tab = BroadcastTransport;
+type Tab = MessageTransport<BroadcastChannel>;
 
 /// The demo server the DB worker connects upstream to.
 const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
@@ -348,8 +348,9 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
     workers::announce_tab(&wire).await;
-    let transport = BroadcastTransport::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
-        .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let transport =
+        MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let config = ClientConfig {
         client_id: client_id.clone(),
         login: None,

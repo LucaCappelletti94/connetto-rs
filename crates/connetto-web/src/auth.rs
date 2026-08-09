@@ -19,6 +19,7 @@ use std::rc::Rc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
+use connetto_core::percent::percent_encode;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -670,7 +671,7 @@ pub fn remembered_identity<Id: serde::de::DeserializeOwned>(
 /// be elidable where `zeroize` is not.
 fn mint_replica_key() -> Result<ReplicaKey, AuthError> {
     let mut bytes = [0u8; ReplicaKey::LEN];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|err| AuthError::Context(format!("replica key mint: {err}")))?;
     let key = ReplicaKey::from_bytes(bytes);
     bytes.zeroize();
@@ -859,38 +860,17 @@ impl BrowserAuthenticator {
 ///
 /// [`AuthError`] if the channel cannot be opened or the login is cancelled.
 pub async fn await_login_code(login_url: &str) -> Result<(String, String), AuthError> {
-    let channel = BroadcastChannel::new(LOGIN_CHANNEL)
-        .map_err(|err| AuthError::Context(format!("login channel: {err:?}")))?;
-    let (sender, receiver) = futures_channel::oneshot::channel::<(String, String)>();
-    let sender = Rc::new(RefCell::new(Some(sender)));
-    let on_message = Closure::<dyn FnMut(MessageEvent)>::new({
-        let sender = Rc::clone(&sender);
-        move |event: MessageEvent| {
-            let Some(text) = event.data().as_string() else {
-                return;
-            };
-            if let Ok(LoginMessage::Code { code, state }) = serde_json::from_str(&text)
-                && let Some(sender) = sender.borrow_mut().take()
-            {
-                let _ = sender.send((code, state));
-            }
-        }
-    });
-    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-
-    let request = serde_json::to_string(&LoginMessage::Request {
-        url: login_url.to_owned(),
-    })
-    .map_err(|_| AuthError::Decode)?;
-    channel
-        .post_message(&JsValue::from_str(&request))
-        .map_err(|err| js_error("broadcast login request", &err))?;
-
-    let outcome = receiver.await.map_err(|_| AuthError::Cancelled);
-    channel.set_onmessage(None);
-    channel.close();
-    drop(on_message);
-    outcome
+    ask(
+        LOGIN_CHANNEL,
+        &LoginMessage::Request {
+            url: login_url.to_owned(),
+        },
+        |message| match message {
+            LoginMessage::Code { code, state } => Some((code, state)),
+            LoginMessage::Request { .. } => None,
+        },
+    )
+    .await
 }
 
 /// Page-side: post the authorization code and state from the login callback
@@ -927,15 +907,21 @@ pub enum LogoutOutcome {
     },
 }
 
-/// Ask the worker something on [`LOGOUT_CHANNEL`] and wait for the reply that
-/// `reply` recognises. Other traffic on the channel is ignored, including this
-/// tab's own request, which a `BroadcastChannel` never echoes to its sender.
-async fn ask<T: 'static>(
-    request: &LogoutMessage,
-    reply: impl Fn(LogoutMessage) -> Option<T> + 'static,
-) -> Result<T, AuthError> {
-    let channel = BroadcastChannel::new(LOGOUT_CHANNEL)
-        .map_err(|err| AuthError::Context(format!("logout channel: {err:?}")))?;
+/// Broadcast `request` on `channel` and wait for the reply that `reply`
+/// recognises. Other traffic on the channel is ignored, including this
+/// context's own request, which a `BroadcastChannel` never echoes to its
+/// sender.
+async fn ask<M, T>(
+    channel: &str,
+    request: &M,
+    reply: impl Fn(M) -> Option<T> + 'static,
+) -> Result<T, AuthError>
+where
+    M: Serialize + serde::de::DeserializeOwned + 'static,
+    T: 'static,
+{
+    let broadcast = BroadcastChannel::new(channel)
+        .map_err(|err| AuthError::Context(format!("{channel} channel: {err:?}")))?;
     let (sender, receiver) = futures_channel::oneshot::channel::<T>();
     let sender = Rc::new(RefCell::new(Some(sender)));
     let on_message = Closure::<dyn FnMut(MessageEvent)>::new({
@@ -944,7 +930,7 @@ async fn ask<T: 'static>(
             let Some(text) = event.data().as_string() else {
                 return;
             };
-            if let Ok(message) = serde_json::from_str::<LogoutMessage>(&text)
+            if let Ok(message) = serde_json::from_str::<M>(&text)
                 && let Some(value) = reply(message)
                 && let Some(sender) = sender.borrow_mut().take()
             {
@@ -952,16 +938,16 @@ async fn ask<T: 'static>(
             }
         }
     });
-    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    broadcast.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
     let encoded = serde_json::to_string(request).map_err(|_| AuthError::Decode)?;
-    channel
+    broadcast
         .post_message(&JsValue::from_str(&encoded))
-        .map_err(|err| js_error("broadcast logout request", &err))?;
+        .map_err(|err| js_error(&format!("broadcast on {channel}"), &err))?;
 
     let outcome = receiver.await.map_err(|_| AuthError::Cancelled);
-    channel.set_onmessage(None);
-    channel.close();
+    broadcast.set_onmessage(None);
+    broadcast.close();
     drop(on_message);
     outcome
 }
@@ -978,10 +964,14 @@ async fn ask<T: 'static>(
 /// [`AuthError::Cancelled`] when no worker answers, which is what a dead or
 /// still-booting DB worker looks like from a tab.
 pub async fn request_unsynced() -> Result<Vec<u64>, AuthError> {
-    ask(&LogoutMessage::Unsynced, |message| match message {
-        LogoutMessage::Pending { seqs } => Some(seqs),
-        _ => None,
-    })
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::Unsynced,
+        |message| match message {
+            LogoutMessage::Pending { seqs } => Some(seqs),
+            _ => None,
+        },
+    )
     .await
 }
 
@@ -997,6 +987,7 @@ pub async fn request_unsynced() -> Result<Vec<u64>, AuthError> {
 /// [`AuthError::Cancelled`] when no worker answers.
 pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, AuthError> {
     ask(
+        LOGOUT_CHANNEL,
         &LogoutMessage::Logout { delete, force },
         |message| match message {
             LogoutMessage::Done { deleted } => Some(if deleted {
@@ -1014,7 +1005,7 @@ pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, 
 /// A 256-bit random token as URL-safe base64, for the PKCE verifier and state.
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("platform RNG");
+    getrandom::fill(&mut bytes).expect("platform RNG");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1057,23 +1048,6 @@ async fn post_json(url: &str, body: &str) -> Result<String, AuthError> {
     text_value.as_string().ok_or(AuthError::Decode)
 }
 
-/// Percent-encode the reserved set for a query-string value.
-fn percent_encode(value: &str) -> String {
-    use core::fmt::Write as _;
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => {
-                let _ = write!(out, "%{other:02X}");
-            }
-        }
-    }
-    out
-}
-
 /// Return the `SubtleCrypto` interface from the current worker global scope.
 fn subtle() -> Result<web_sys::SubtleCrypto, AuthError> {
     let scope: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
@@ -1102,6 +1076,6 @@ fn aes_key_gen_params() -> js_sys::Object {
 /// Generate a fresh 12-byte random IV for AES-GCM.
 fn random_iv() -> [u8; AES_GCM_IV_LEN] {
     let mut iv = [0u8; AES_GCM_IV_LEN];
-    getrandom::getrandom(&mut iv).unwrap_throw();
+    getrandom::fill(&mut iv).unwrap_throw();
     iv
 }

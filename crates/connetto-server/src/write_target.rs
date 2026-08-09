@@ -177,7 +177,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         client_seq: u64,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(client_seq)?;
-        let bytes = zstd::decode_all(payload_zstd)
+        let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self
             .pool

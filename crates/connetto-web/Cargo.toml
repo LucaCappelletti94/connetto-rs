@@ -70,12 +70,15 @@ zstd = "0.13"
 # tokio mpsc channels carry frames between the hub core and its tab shovels.
 tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
 # Browser OAuth acquisition (docs/architecture/11-authentication.md phase 5):
-# the worker mints PKCE with getrandom (js backend) plus sha2 and base64,
-# posts to connetto-server's token and refresh endpoints through web-sys fetch,
-# and serializes the login-channel messages and token responses with serde.
+# the worker mints PKCE with getrandom plus sha2 and base64, posts to
+# connetto-server's token and refresh endpoints through web-sys fetch, and
+# serializes the login-channel messages and token responses with serde.
 # getrandom also mints the per-replica encryption key, which is minted on the
-# device and never crosses the wire.
-getrandom = { version = "0.2", features = ["js"] }
+# device and never crosses the wire. The `wasm_js` feature selects the
+# `Crypto.getRandomValues` backend, which since 0.3 is a crate feature rather
+# than a `--cfg` flag, and which this crate may enable because it already
+# depends unconditionally on wasm-bindgen.
+getrandom = { version = "0.3", features = ["wasm_js"] }
 sha2 = { version = "0.10", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }

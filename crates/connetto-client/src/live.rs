@@ -405,6 +405,52 @@ struct Reaper {
     wake: Arc<Notify>,
 }
 
+/// What [`LiveQuery`] and [`LiveValue`] both are underneath: a subscription
+/// id, the wake signal its refreshes arrive on, and the queue that unsubscribes
+/// it when the handle goes.
+///
+/// Dropping this is what queues the unsubscribe, so it is the last field of
+/// each handle rather than a duplicated `Drop` on each.
+struct LiveHandleCore {
+    sub_id: String,
+    changed: watch::Receiver<u64>,
+    reaper: Arc<Reaper>,
+}
+
+impl LiveHandleCore {
+    fn new(sub_id: String, changed: watch::Receiver<u64>, reaper: &Arc<Reaper>) -> Self {
+        Self {
+            sub_id,
+            changed,
+            reaper: Arc::clone(reaper),
+        }
+    }
+
+    fn sub_id(&self) -> &str {
+        &self.sub_id
+    }
+
+    async fn changed(&mut self) -> Result<(), ClientError> {
+        self.changed
+            .changed()
+            .await
+            .map_err(|_| ClientError::Transport("live query driver stopped".to_owned()))
+    }
+}
+
+impl Drop for LiveHandleCore {
+    fn drop(&mut self) {
+        let sub_id = core::mem::take(&mut self.sub_id);
+        let mut pending = match self.reaper.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.push(sub_id);
+        drop(pending);
+        self.reaper.wake.notify_one();
+    }
+}
+
 /// Driver-side refresh callback of one live query: re-run the captured query
 /// against the shared connection and publish fresh rows.
 type Refresh<T> = Box<dyn FnMut(&mut ConnettoConnection<T>) -> Result<(), ClientError> + Send>;
@@ -503,10 +549,8 @@ pub trait LiveHandle {
 /// they moved. Dropping the handle queues the server unsubscribe; the pump
 /// sends it on its next step.
 pub struct LiveQuery<R> {
-    sub_id: String,
+    handle: LiveHandleCore,
     rows: Arc<RwLock<Vec<R>>>,
-    changed: watch::Receiver<u64>,
-    reaper: Arc<Reaper>,
     /// Whether this query reads any synced table. False for a query over
     /// device-private tables alone, whose rows never depended on a server.
     reads_synced: bool,
@@ -544,7 +588,7 @@ impl<R> LiveQuery<R> {
     /// The subscription id backing this handle.
     #[must_use]
     pub fn sub_id(&self) -> &str {
-        &self.sub_id
+        self.handle.sub_id()
     }
 
     /// Whether these rows come from a replica that has never synced.
@@ -568,23 +612,7 @@ impl<R> LiveQuery<R> {
     ///
     /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
     pub async fn changed(&mut self) -> Result<(), ClientError> {
-        self.changed
-            .changed()
-            .await
-            .map_err(|_| ClientError::Transport("live query driver stopped".to_owned()))
-    }
-}
-
-impl<R> Drop for LiveQuery<R> {
-    fn drop(&mut self) {
-        let sub_id = core::mem::take(&mut self.sub_id);
-        let mut pending = match self.reaper.pending.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        pending.push(sub_id);
-        drop(pending);
-        self.reaper.wake.notify_one();
+        self.handle.changed().await
     }
 }
 
@@ -597,10 +625,8 @@ impl<R> Drop for LiveQuery<R> {
 /// Dropping the handle queues the server unsubscribe, exactly like
 /// [`LiveQuery`].
 pub struct LiveValue<V> {
-    sub_id: String,
+    handle: LiveHandleCore,
     value: Arc<RwLock<Option<V>>>,
-    changed: watch::Receiver<u64>,
-    reaper: Arc<Reaper>,
 }
 
 impl<V: Clone + Send + Sync> LiveHandle for LiveValue<V> {
@@ -634,7 +660,7 @@ impl<V> LiveValue<V> {
     /// The subscription id backing this handle.
     #[must_use]
     pub fn sub_id(&self) -> &str {
-        &self.sub_id
+        self.handle.sub_id()
     }
 
     /// Wait until the value changes, the initial bootstrap included.
@@ -643,23 +669,7 @@ impl<V> LiveValue<V> {
     ///
     /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
     pub async fn changed(&mut self) -> Result<(), ClientError> {
-        self.changed
-            .changed()
-            .await
-            .map_err(|_| ClientError::Transport("live query driver stopped".to_owned()))
-    }
-}
-
-impl<V> Drop for LiveValue<V> {
-    fn drop(&mut self) {
-        let sub_id = core::mem::take(&mut self.sub_id);
-        let mut pending = match self.reaper.pending.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        pending.push(sub_id);
-        drop(pending);
-        self.reaper.wake.notify_one();
+        self.handle.changed().await
     }
 }
 
@@ -984,10 +994,8 @@ where
         });
 
         Ok(LiveQuery {
-            sub_id,
+            handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
             rows,
-            changed: rx,
-            reaper: Arc::clone(&self.shared.reaper),
             reads_synced,
             ever_synced: Arc::clone(&self.shared.ever_synced),
         })
@@ -1162,10 +1170,8 @@ where
                 wire_ids: Vec::new(),
             });
             return Ok(LiveValue {
-                sub_id,
+                handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
                 value,
-                changed: rx,
-                reaper: Arc::clone(&self.shared.reaper),
             });
         }
 
@@ -1194,10 +1200,8 @@ where
         });
 
         Ok(LiveValue {
-            sub_id,
+            handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
             value,
-            changed: rx,
-            reaper: Arc::clone(&self.shared.reaper),
         })
     }
 

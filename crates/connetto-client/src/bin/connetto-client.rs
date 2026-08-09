@@ -32,6 +32,7 @@
 use anyhow::{Context, Result, anyhow};
 use connetto_client::auth::{KeyringKeyStore, provision_replica_key};
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_core::env::{read_ddl, var_or};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
@@ -41,27 +42,13 @@ use tokio::net::TcpStream;
 /// `CONNETTO_DB` path.
 const KEYRING_SERVICE: &str = "connetto-client";
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
-/// Read a DDL from `<key>` directly, or from the path in `<key>_FILE`.
-fn read_ddl(key: &str) -> Result<String> {
-    if let Ok(inline) = std::env::var(key) {
-        return Ok(inline);
-    }
-    let file_key = format!("{key}_FILE");
-    let path = std::env::var(&file_key).map_err(|_| anyhow!("set {key} or {file_key}"))?;
-    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
-    let server = env_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
+    let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
     let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
     let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
-    let sub_id = env_or("CONNETTO_SUB_ID", "default");
+    let sub_id = var_or("CONNETTO_SUB_ID", "default");
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
     // Declared only when a shared canonical source is provided, matching the
     // server's version. Absent, the client declares nothing and a versioned
@@ -69,7 +56,7 @@ async fn main() -> Result<()> {
     let schema_version = read_ddl("CONNETTO_SCHEMA_SQL")
         .ok()
         .map(|source| connetto_core::SchemaVersion::from_source(&source));
-    let client_id = env_or("CONNETTO_CLIENT_ID", "anonymous");
+    let client_id = var_or("CONNETTO_CLIENT_ID", "anonymous");
     let config = ClientConfig {
         // CONNETTO_TOKEN carries the caller's identity grant. Unset means no
         // identity: the server accepts an anonymous caller.

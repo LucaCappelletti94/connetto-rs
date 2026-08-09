@@ -22,7 +22,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
-use crate::authn::store::{AuthStore, AuthStoreError, ResolvedIdentity, split_refresh};
+use crate::authn::store::{
+    AuthStore, AuthStoreError, IssuedSession, ResolvedIdentity, split_refresh,
+};
 use crate::authn::token::{TokenAuthority, TokenError};
 use crate::guard::RequestGuard;
 
@@ -171,22 +173,12 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login(&self, identity: &ResolvedIdentity) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let issued = self.store.create_session(identity, now).await?;
-        let access_token = self
-            .authority
-            .mint_access(&issued.context, issued.session_id, now)?;
-        tracing::info!(
-            session = %issued.session_id,
-            user = %issued.context.user_id,
-            "login succeeded, session created"
-        );
-        self.guard
-            .learn_owner(issued.session_id, &issued.context.user_id);
-        Ok(TokenPair {
-            access_token,
-            refresh_token: issued.refresh_token,
-            expires_in_secs: self.authority.access_ttl().as_secs(),
-            user_id: issued.context.user_id,
-            session_expires_at_secs: unix_secs(issued.session_expires_at),
+        self.finish_login(issued, now, |issued| {
+            tracing::info!(
+                session = %issued.session_id,
+                user = %issued.context.user_id,
+                "login succeeded, session created"
+            );
         })
     }
 
@@ -207,15 +199,32 @@ impl<S: AuthStore> AuthService<S> {
         self.store
             .set_retained_provider_token(issued.session_id, &login.retained, now)
             .await?;
+        self.finish_login(issued, now, |issued| {
+            tracing::info!(
+                session = %issued.session_id,
+                user = %issued.context.user_id,
+                issuer = %login.retained.issuer,
+                "login succeeded, session created with retained provider tokens"
+            );
+        })
+    }
+
+    /// Mint the first token pair for a freshly created session, register its
+    /// owner with the guard, and assemble the response.
+    ///
+    /// `announce` runs once the mint has succeeded, so a failed mint still
+    /// logs nothing. The owner registration is what R19 attributes later abuse
+    /// through, so it must not fall off either login path.
+    fn finish_login(
+        &self,
+        issued: IssuedSession<S::Id>,
+        now: SystemTime,
+        announce: impl FnOnce(&IssuedSession<S::Id>),
+    ) -> Result<TokenPair<S::Id>, AuthError> {
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
-        tracing::info!(
-            session = %issued.session_id,
-            user = %issued.context.user_id,
-            issuer = %login.retained.issuer,
-            "login succeeded, session created with retained provider tokens"
-        );
+        announce(&issued);
         self.guard
             .learn_owner(issued.session_id, &issued.context.user_id);
         Ok(TokenPair {

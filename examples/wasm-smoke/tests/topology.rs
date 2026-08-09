@@ -22,10 +22,11 @@ use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{
     DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready,
 };
-use connetto_wasm_smoke::{BroadcastTransport, BrowserSocket, leader, locks};
+use connetto_wasm_smoke::{BrowserSocket, MessageTransport, leader, locks};
 use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::BroadcastChannel;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -94,10 +95,10 @@ fn glue_url() -> String {
 ///
 /// Announces the channel and waits for the worker's attachment ack first,
 /// so the handshake cannot outrun the worker's end of the channel.
-async fn connect_tab(client_id: &str) -> ConnettoConnection<BroadcastTransport> {
+async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
-    let transport = BroadcastTransport::new(&wire).expect("wire channel");
+    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         login: Some(Grant::new(common::mint_token().await)),

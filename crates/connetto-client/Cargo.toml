@@ -20,6 +20,7 @@ default = ["native-transport"]
 # ConnettoClient::start and the client binary. Wasm builds leave this off,
 # inject their own transport, and drive the pump with spawn_local.
 native-transport = [
+    "connetto-core/env",
     "connetto-core/logging",
     "connetto-core/native-transport",
     "tokio/rt",
@@ -42,7 +43,6 @@ native-auth = [
     "dep:reqwest",
     "dep:keyring",
     "dep:open",
-    "dep:uuid",
     "dep:getrandom",
 ]
 
@@ -94,10 +94,9 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # blocking client). keyring stores the refresh token in OS secure storage
 # (daemon-free keyutils on Linux, Keychain, Credential Manager). open launches
 # the system browser. The unconditional base64 below plus the unconditional
-# sha2 above compute the PKCE S256 challenge and uuid mints the verifier and
-# CSRF state. getrandom mints the per-replica encryption key, which is minted
-# on the device and never crosses the wire, from the same platform RNG the rest
-# of that list draws on.
+# sha2 above compute the PKCE S256 challenge. getrandom mints the PKCE
+# verifier, the CSRF state, and the per-replica encryption key, the last of
+# which is minted on the device and never crosses the wire.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"], optional = true }
 open = { version = "5.4", optional = true }
@@ -105,7 +104,6 @@ open = { version = "5.4", optional = true }
 # key whose expiry has passed is not presented again. Unconditional and tiny:
 # the check has to hold on wasm too, where `native-auth` is never on.
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-uuid = { version = "1", features = ["v4"], optional = true }
 getrandom = { version = "0.3", optional = true }
 # Wiping the transient hex strings that carry key material: the `PRAGMA key`
 # statement built from a ReplicaKey, and the hex a KeyringKeyStore persists.
@@ -172,3 +170,7 @@ reqwest = { version = "0.12", default-features = false }
 oauth2-test-server = { version = "0.2", default-features = false, features = ["testing", "config"] }
 # GenericOidcProvider::discover takes an openidconnect::reqwest::Client.
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+# The two native-auth tests mint a deterministic v5 id for their resolver and a
+# PKCE token of their own. Test-only since R47: the client's own PKCE token now
+# comes from the platform RNG through `getrandom`.
+uuid = { version = "1", features = ["v4", "v5"] }

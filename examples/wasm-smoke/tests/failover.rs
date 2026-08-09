@@ -28,10 +28,11 @@ use connetto_wasm_smoke::workers::{
     DB_ALIVE_LOCK, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready, sleep,
     spawn_db_worker, tab_wire_factory,
 };
-use connetto_wasm_smoke::{BroadcastTransport, BrowserSocket, locks};
+use connetto_wasm_smoke::{BrowserSocket, MessageTransport, locks};
 use diesel::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::BroadcastChannel;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -195,8 +196,8 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
     announce_tab(&wire).await;
-    let transport =
-        BroadcastTransport::with_peer_liveness(&wire, DB_ALIVE_LOCK).expect("boot wire");
+    let transport = MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
+        .expect("boot wire");
     let config = ClientConfig {
         client_id: client_id.clone(),
         login: Some(Grant::new(common::mint_token().await)),

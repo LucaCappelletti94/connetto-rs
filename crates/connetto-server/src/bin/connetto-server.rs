@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
@@ -64,7 +65,7 @@ use connetto_server::{
     ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
     connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    pg_ban_store, pg_write_target,
+    is_loopback_host, pg_ban_store, pg_write_target,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -79,18 +80,11 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 /// Whether `origin` is a loopback origin, so script served from it may read a
 /// login response without being listed.
 ///
-/// Parsed rather than string-matched, mirroring the redirect policy's own
-/// loopback rule, so a host like `127.0.0.1.evil.example` cannot pass.
+/// No scheme condition, unlike the redirect policy's own loopback rule: an
+/// origin is not a delivery target, and a page served over `https` from a
+/// loopback development server is still the developer's own.
 fn is_loopback_origin(origin: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(origin) else {
-        return false;
-    };
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    }
+    url::Url::parse(origin).is_ok_and(|parsed| is_loopback_host(&parsed))
 }
 
 // The reference binary uses the default connetto auth and watermark tables over
@@ -214,7 +208,8 @@ fn build_guard(
 ) -> Result<Arc<RequestGuard<String>>> {
     let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
         .with_reader_gate(reader_gate);
-    let guard = if bans_enabled()? {
+    // Without the ban list a crossed threshold is logged and nothing is banned.
+    let guard = if database_toggle("CONNETTO_BANS")? {
         tracing::info!("banning identities that cross an abuse threshold");
         guard.with_bans(pg_ban_store::<ConnettoBans>(pool.clone()))
     } else {
@@ -223,19 +218,16 @@ fn build_guard(
     Ok(Arc::new(guard))
 }
 
-/// Whether `CONNETTO_BANS` asks for the ban list.
+/// Whether `key` asks for the database-backed table it names.
 ///
-/// Off unless switched on, for the same reason the audit table is: the table
-/// belongs to the application and connetto emits no DDL, so a server pointed at
-/// a database without it must not attempt reads or writes. Without it a crossed
-/// threshold is logged and nothing is banned.
-fn bans_enabled() -> Result<bool> {
-    match env_or("CONNETTO_BANS", "").as_str() {
+/// Off unless switched on: the table belongs to the application and connetto
+/// emits no DDL, so a server pointed at a database without it must not attempt
+/// reads or writes.
+fn database_toggle(key: &str) -> Result<bool> {
+    match var_or(key, "").as_str() {
         "" => Ok(false),
         "database" => Ok(true),
-        other => Err(anyhow!(
-            "unknown CONNETTO_BANS mode {other:?}, expected database"
-        )),
+        other => Err(anyhow!("unknown {key} mode {other:?}, expected database")),
     }
 }
 
@@ -250,8 +242,9 @@ async fn build_auth(
     // Parsed before anything else, so a bad value fails on the spot rather
     // than behind identity-provider discovery, and so that asking for records
     // without asking for logins is refused instead of silently doing nothing.
-    let audit = audit_enabled()?;
-    let mode = env_or("CONNETTO_AUTH", "");
+    // Without it, no access change is recorded.
+    let audit = database_toggle("CONNETTO_AUDIT")?;
+    let mode = var_or("CONNETTO_AUTH", "");
     if mode.is_empty() {
         if audit {
             return Err(anyhow!(
@@ -298,21 +291,6 @@ async fn build_auth(
     Ok(Some((service, registry)))
 }
 
-/// Whether `CONNETTO_AUDIT` asks for the durable record of access changes.
-///
-/// Off unless switched on, because the table belongs to the application and
-/// connetto emits no DDL, so a server pointed at a database without it must
-/// not attempt writes.
-fn audit_enabled() -> Result<bool> {
-    match env_or("CONNETTO_AUDIT", "").as_str() {
-        "" => Ok(false),
-        "database" => Ok(true),
-        other => Err(anyhow!(
-            "unknown CONNETTO_AUDIT mode {other:?}, expected database"
-        )),
-    }
-}
-
 /// Build the provider registry from `CONNETTO_OIDC_PROVIDER`.
 ///
 /// `google` and `microsoft` discover the respective provider and `generic`
@@ -323,7 +301,7 @@ fn audit_enabled() -> Result<bool> {
 /// `CONNETTO_OIDC_REDIRECT_URL`, and `CONNETTO_OIDC_SCOPES` (comma-separated).
 async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
-    let kind = env_or("CONNETTO_OIDC_PROVIDER", "");
+    let kind = var_or("CONNETTO_OIDC_PROVIDER", "");
     match kind.as_str() {
         "google" | "microsoft" | "generic" => {
             let http = openidconnect::reqwest::ClientBuilder::new()
@@ -356,18 +334,18 @@ async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
 
 /// The generic provider configuration from the `CONNETTO_OIDC_*` environment.
 fn oidc_config_from_env(config: &AuthConfig) -> Result<OidcProviderConfig> {
-    let scopes = env_or("CONNETTO_OIDC_SCOPES", "")
+    let scopes = var_or("CONNETTO_OIDC_SCOPES", "")
         .split(',')
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(str::to_owned)
         .collect();
     Ok(OidcProviderConfig {
-        name: env_or("CONNETTO_OIDC_NAME", "oidc"),
+        name: var_or("CONNETTO_OIDC_NAME", "oidc"),
         client_id: std::env::var("CONNETTO_OIDC_CLIENT_ID")
             .context("set CONNETTO_OIDC_CLIENT_ID")?,
         client_secret: std::env::var("CONNETTO_OIDC_CLIENT_SECRET").ok(),
-        issuer: env_or("CONNETTO_OIDC_ISSUER", &config.issuer),
+        issuer: var_or("CONNETTO_OIDC_ISSUER", &config.issuer),
         redirect_url: std::env::var("CONNETTO_OIDC_REDIRECT_URL")
             .context("set CONNETTO_OIDC_REDIRECT_URL")?,
         scopes,
@@ -399,10 +377,6 @@ fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
     }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
 /// Read a `u32` from `<key>`, or `default` when unset.
 fn env_u32(key: &str, default: u32) -> Result<u32> {
     match std::env::var(key) {
@@ -414,22 +388,12 @@ fn env_u32(key: &str, default: u32) -> Result<u32> {
     }
 }
 
-/// Read a DDL from `<key>` directly, or from the path in `<key>_FILE`.
-fn read_ddl(key: &str) -> Result<String> {
-    if let Ok(inline) = std::env::var(key) {
-        return Ok(inline);
-    }
-    let file_key = format!("{key}_FILE");
-    let path = std::env::var(&file_key).map_err(|_| anyhow!("set {key} or {file_key}"))?;
-    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))
-}
-
 /// Parse `CONNETTO_WRITABLE` into a runtime write policy. Each comma-separated
 /// entry is a table, or `table:version_column` to conflict-check version-bearing
 /// updates and deletes on that table. Unset or empty yields no writable tables,
 /// so every client mutation is rejected.
 fn writable_catalog() -> RuntimeWritableCatalog {
-    let spec = env_or("CONNETTO_WRITABLE", "");
+    let spec = var_or("CONNETTO_WRITABLE", "");
     let mut builder = RuntimeWritableCatalog::builder();
     for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         builder = match entry.split_once(':') {
@@ -455,11 +419,11 @@ async fn main() -> Result<()> {
     // line per ten seconds per server whether or not anything happened, and it
     // buries this server's own events. `RUST_LOG` brings it back.
     connetto_core::logging::init_stdout_with_default("info,pg_walstream=warn");
-    let bind = env_or("CONNETTO_BIND", "127.0.0.1:8080");
+    let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
     let database_url = std::env::var("DATABASE_URL").context("set DATABASE_URL")?;
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
-    let slot = env_or("CONNETTO_SLOT", "connetto_slot");
-    let publication = env_or("CONNETTO_PUBLICATION", "connetto_pub");
+    let slot = var_or("CONNETTO_SLOT", "connetto_slot");
+    let publication = var_or("CONNETTO_PUBLICATION", "connetto_pub");
     let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     // connetto emits no DDL. The deployment owns the `_connetto_mutations`
     // watermark table (see `docs/architecture/11-authentication.md`) and the
@@ -560,12 +524,12 @@ async fn main() -> Result<()> {
 
 /// Serve the login and refresh endpoints beside the sync listener.
 fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<ProviderRegistry>) {
-    let auth_bind = env_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
+    let auth_bind = var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
     // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
     // non-loopback client redirect URIs that are permitted (a browser client
     // lists its own callback). Loopback redirects are always allowed, so a
     // native client needs no entry.
-    let allowlist = env_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
+    let allowlist = var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
@@ -577,7 +541,7 @@ fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<P
     // refuses to hand the response to the page. Loopback origins are always
     // allowed, mirroring the redirect policy's loopback rule and for the same
     // reason: script on a loopback origin is already on the machine.
-    let cors_origins: Vec<String> = env_or("CONNETTO_AUTH_CORS_ORIGINS", "")
+    let cors_origins: Vec<String> = var_or("CONNETTO_AUTH_CORS_ORIGINS", "")
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())

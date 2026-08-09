@@ -36,8 +36,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, MessageEvent, Worker, WorkerOptions, WorkerType};
 
+use crate::frames::{MessageTransport, MessageTransportError};
 use crate::relay::HubReconnect;
-use crate::{BroadcastTransport, BrowserSocket, HubNotice, RelayHub, locks};
+use crate::{BrowserSocket, HubNotice, RelayHub, locks};
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
     ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ReplicaStorage as StorageKind,
@@ -577,7 +578,7 @@ where
             if message == "ask" {
                 let _ = hello.post_message(&JsValue::from_str("ready"));
             } else if let Some(wire) = message.strip_prefix("tab:") {
-                match BroadcastTransport::new(wire) {
+                match MessageTransport::<BroadcastChannel>::new(wire) {
                     Ok(transport) => {
                         hub.attach(transport);
                         let _ = hello.post_message(&JsValue::from_str(&format!("attached:{wire}")));
@@ -748,6 +749,10 @@ async fn logout_locally(
         .await
 }
 
+/// The transport a tab rides to the DB worker: one end of a uniquely named
+/// broadcast channel.
+pub type TabWire = MessageTransport<BroadcastChannel>;
+
 /// A transport factory for a reconnecting tab client: every attempt waits
 /// for a ready DB worker, announces a fresh wire channel, and returns a
 /// transport watching the worker's alive lock, so a dead worker surfaces
@@ -755,9 +760,8 @@ async fn logout_locally(
 /// `ConnettoClient::with_reconnect` together with [`sleep`] as the sleeper.
 pub fn tab_wire_factory(
     client_id: String,
-) -> impl FnMut() -> std::pin::Pin<
-    Box<dyn Future<Output = Result<crate::BroadcastTransport, crate::BroadcastTransportError>>>,
-> {
+) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<TabWire, MessageTransportError>>>>
+{
     let mut attempt: u64 = 0;
     move || {
         attempt += 1;
@@ -768,7 +772,7 @@ pub fn tab_wire_factory(
         Box::pin(async move {
             await_db_worker_ready().await;
             announce_tab(&wire).await;
-            BroadcastTransport::with_peer_liveness(&wire, DB_ALIVE_LOCK)
+            MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         })
     }
 }

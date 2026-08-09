@@ -39,6 +39,10 @@ test-support = ["dep:thiserror"]
 # library emits through `tracing` and installs nothing, so only a program pays
 # for a subscriber. Browser programs install `connetto_web::logging` instead.
 logging = ["dep:tracing-subscriber"]
+# Program configuration read from the environment, for the reference binaries.
+# Off by default for the same reason `logging` is: a library reads no
+# environment and opens no file, so only a program pays for it.
+env = ["dep:thiserror"]
 
 [dependencies]
 serde.workspace = true

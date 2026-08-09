@@ -6,7 +6,7 @@
 //! patches, events, and values as a client on a direct socket to
 //! `connetto-server`. This harness is the reusable way to assert that. It
 //! connects one direct client (a `BrowserSocket` straight to the server) and
-//! one relay tab client (a `BroadcastTransport` to the DB worker's hub)
+//! one relay tab client (a broadcast `MessageTransport` to the DB worker's hub)
 //! against the same running stack, subscribes both to the same live query,
 //! and exposes helpers to drive them through identical steps and compare what
 //! each observes.
@@ -35,8 +35,9 @@ use connetto_wasm_smoke::locks::HeldLock;
 use connetto_wasm_smoke::workers::{
     DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready,
 };
-use connetto_wasm_smoke::{BroadcastTransport, BrowserSocket, leader, locks};
+use connetto_wasm_smoke::{BrowserSocket, MessageTransport, leader, locks};
 use diesel::prelude::*;
+use web_sys::BroadcastChannel;
 
 diesel::table! {
     orders (id) {
@@ -109,10 +110,13 @@ pub fn glue_url() -> String {
 ///
 /// Announces the channel and waits for the worker's attachment ack first, so
 /// the handshake cannot outrun the worker's end of the channel.
-pub async fn connect_tab(client_id: &str, token: String) -> ConnettoConnection<BroadcastTransport> {
+pub async fn connect_tab(
+    client_id: &str,
+    token: String,
+) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
-    let transport = BroadcastTransport::new(&wire).expect("wire channel");
+    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig {
         client_id: client_id.to_owned(),
         login: Some(Grant::new(token)),
@@ -248,8 +252,9 @@ pub async fn write_row(
 pub struct ParityFixture {
     /// A client on a direct `BrowserSocket` to `connetto-server`.
     pub direct: ConnettoConnection<BrowserSocket>,
-    /// A tab client on a `BroadcastTransport` to the DB worker's relay hub.
-    pub relay: ConnettoConnection<BroadcastTransport>,
+    /// A tab client on a broadcast `MessageTransport` to the DB worker's
+    /// relay hub.
+    pub relay: ConnettoConnection<MessageTransport<BroadcastChannel>>,
     /// Keeps the leader's DB worker alive for the fixture's lifetime.
     membership: Membership,
     /// The relay tab's liveness lock, released on teardown.

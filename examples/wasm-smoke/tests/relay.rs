@@ -24,9 +24,10 @@ use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
 };
 use connetto_core::{Transport, loopback};
-use connetto_wasm_smoke::{BrowserSocket, PortTransport, RelayHub};
+use connetto_wasm_smoke::{BrowserSocket, MessageTransport, RelayHub};
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::MessagePort;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -267,7 +268,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     // A real browser MessageChannel carries the wire protocol between the
     // tab client and the relay.
     let channel = web_sys::MessageChannel::new().expect("message channel");
-    let relay_end = PortTransport::new(channel.port1());
+    let relay_end = MessageTransport::<MessagePort>::new(channel.port1());
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("relay hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("relay hub");
@@ -283,7 +284,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
         sql_functions: connetto_wasm_smoke::uuidv4_functions(),
     };
     let mut tab = ConnettoConnection::connect(
-        PortTransport::new(channel.port2()),
+        MessageTransport::<MessagePort>::new(channel.port2()),
         &Replica::in_memory(),
         SQLITE_DDL,
         &config,

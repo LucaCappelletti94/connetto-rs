@@ -19,16 +19,81 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
+use connetto_core::percent::{percent_decode, percent_encode};
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
+
+/// The keyring sequence both secret stores here perform.
+///
+/// One service holds one entry per name, and both stores need the first-run
+/// quirk [`entry`](Self::entry) documents, so the sequence lives here once and
+/// each store adds only what its own secret needs on top.
+struct Keyring {
+    service: String,
+}
+
+impl Keyring {
+    fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    /// The keyring entry for `name`, or `None` when this platform's backend
+    /// reports that no such entry exists.
+    ///
+    /// Some backends resolve the credential when the entry is constructed rather
+    /// than when it is read, so "not stored yet" can surface here instead of from
+    /// [`get_password`](keyring::Entry::get_password). Reporting that as an error
+    /// would make a first run fatal, when it only means there is nothing to load.
+    fn entry(&self, name: &str) -> Result<Option<keyring::Entry>, ClientError> {
+        match keyring::Entry::new(&self.service, name) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
+        }
+    }
+
+    /// The secret stored under `name`, or `None` when none was stored.
+    fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
+        let Some(entry) = self.entry(name)? else {
+            return Ok(None);
+        };
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
+        }
+    }
+
+    /// Persist `secret` under `name`, replacing any prior one.
+    fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
+        // A backend that reports no entry before one is written still has to accept
+        // the write, so this asks for the entry again rather than reusing `entry`.
+        keyring::Entry::new(&self.service, name)
+            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
+            .set_password(secret)
+            .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
+    }
+
+    /// Remove the entry stored under `name`, if any.
+    fn clear(&self, name: &str) -> Result<(), ClientError> {
+        let Some(entry) = self.entry(name)? else {
+            return Ok(());
+        };
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
+        }
+    }
+}
 
 /// OS secure storage for the refresh token: Keychain on macOS, Credential
 /// Manager on Windows, and the kernel keyutils keyring on Linux (daemon-free,
@@ -37,7 +102,7 @@ use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 /// One service holds one entry per account, exactly as [`KeyringKeyStore`]
 /// holds one per replica record.
 pub struct KeyringStore {
-    service: String,
+    keyring: Keyring,
 }
 
 impl KeyringStore {
@@ -45,22 +110,7 @@ impl KeyringStore {
     #[must_use]
     pub fn new(service: impl Into<String>) -> Self {
         Self {
-            service: service.into(),
-        }
-    }
-
-    /// The keyring entry for `account`, or `None` when this platform's backend
-    /// reports that no such entry exists.
-    ///
-    /// Some backends resolve the credential when the entry is constructed rather
-    /// than when it is read, so "not stored yet" can surface here instead of from
-    /// [`get_password`](keyring::Entry::get_password). Reporting that as an error
-    /// would make a first run fatal, when it only means there is nothing to load.
-    fn entry(&self, account: &str) -> Result<Option<keyring::Entry>, ClientError> {
-        match keyring::Entry::new(&self.service, account) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
+            keyring: Keyring::new(service),
         }
     }
 }
@@ -69,33 +119,15 @@ impl RefreshTokenStore for KeyringStore {
     type Error = ClientError;
 
     fn load(&self, account: &str) -> Result<Option<String>, ClientError> {
-        let Some(entry) = self.entry(account)? else {
-            return Ok(None);
-        };
-        match entry.get_password() {
-            Ok(token) => Ok(Some(token)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
-        }
+        self.keyring.read(account)
     }
 
     fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
-        // A backend that reports no entry before one is written still has to accept
-        // the write, so this asks for the entry again rather than reusing `entry`.
-        keyring::Entry::new(&self.service, account)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
-            .set_password(token)
-            .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
+        self.keyring.write(account, token)
     }
 
     fn clear(&self, account: &str) -> Result<(), ClientError> {
-        let Some(entry) = self.entry(account)? else {
-            return Ok(());
-        };
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
-        }
+        self.keyring.clear(account)
     }
 }
 
@@ -195,7 +227,7 @@ fn mint_replica_key() -> Result<ReplicaKey, ClientError> {
 /// The keyring account is the record name, so one service holds one entry per
 /// identity.
 pub struct KeyringKeyStore {
-    service: String,
+    keyring: Keyring,
 }
 
 impl KeyringKeyStore {
@@ -203,18 +235,7 @@ impl KeyringKeyStore {
     #[must_use]
     pub fn new(service: impl Into<String>) -> Self {
         Self {
-            service: service.into(),
-        }
-    }
-
-    /// The keyring entry for `name`, or `None` when this platform's backend
-    /// reports that no such entry exists. See [`KeyringStore::entry`] for why a
-    /// missing entry can surface here rather than from the read.
-    fn entry(&self, name: &str) -> Result<Option<keyring::Entry>, ClientError> {
-        match keyring::Entry::new(&self.service, name) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
+            keyring: Keyring::new(service),
         }
     }
 }
@@ -228,19 +249,16 @@ impl ReplicaKeyStore for KeyringKeyStore {
     type Error = ClientError;
 
     async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
-        let Some(entry) = self.entry(name)? else {
-            return Ok(None);
-        };
-        match entry.get_password() {
+        self.keyring
+            .read(name)?
             // The keyring hands back an owned hex string, which is key
             // material until it is wiped, hence the `Zeroizing` wrapper.
-            Ok(hex) => Zeroizing::new(hex)
-                .parse::<ReplicaKey>()
-                .map(Some)
-                .map_err(|err| ClientError::Auth(format!("keyring key parse: {err}"))),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
-        }
+            .map(|hex| {
+                Zeroizing::new(hex)
+                    .parse::<ReplicaKey>()
+                    .map_err(|err| ClientError::Auth(format!("keyring key parse: {err}")))
+            })
+            .transpose()
     }
 
     async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
@@ -248,22 +266,11 @@ impl ReplicaKeyStore for KeyringKeyStore {
         for byte in key.as_bytes() {
             let _ = write!(&mut *hex, "{byte:02x}");
         }
-        // A backend that reports no entry before one is written still has to accept
-        // the write, so this asks for the entry again rather than reusing `entry`.
-        keyring::Entry::new(&self.service, name)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
-            .set_password(&hex)
-            .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
+        self.keyring.write(name, &hex)
     }
 
     async fn clear(&self, name: &str) -> Result<(), ClientError> {
-        let Some(entry) = self.entry(name)? else {
-            return Ok(());
-        };
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
-        }
+        self.keyring.clear(name)
     }
 }
 
@@ -618,9 +625,12 @@ impl NativeAuthenticator {
     }
 }
 
-/// A 256-bit random token as hex, for the PKCE verifier and the CSRF state.
+/// A 256-bit random token as URL-safe base64, for the PKCE verifier and the
+/// CSRF state.
 fn random_token() -> String {
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("platform RNG");
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Accept one loopback connection, read the GET request, reply with a small
@@ -666,47 +676,6 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
     let state =
         state.ok_or_else(|| ClientError::Auth("loopback callback had no state".to_owned()))?;
     Ok((code, state))
-}
-
-/// Percent-encode the reserved set for a query-string value.
-fn percent_encode(value: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => {
-                let _ = write!(out, "%{other:02X}");
-            }
-        }
-    }
-    out
-}
-
-/// Decode a percent-encoded query value. Bytes we cannot decode pass through.
-fn percent_decode(value: &str) -> String {
-    let mut out = Vec::with_capacity(value.len());
-    let mut bytes = value.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            let hi = bytes.next();
-            let lo = bytes.next();
-            if let (Some(hi), Some(lo)) = (hi, lo)
-                && let (Some(hi), Some(lo)) =
-                    (char::from(hi).to_digit(16), char::from(lo).to_digit(16))
-            {
-                // Both nibbles are in 0..16, so the byte fits.
-                out.push(u8::try_from(hi * 16 + lo).expect("nibble byte fits u8"));
-                continue;
-            }
-            out.push(b'%');
-        } else {
-            out.push(byte);
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
