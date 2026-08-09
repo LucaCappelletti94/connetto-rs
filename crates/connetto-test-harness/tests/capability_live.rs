@@ -16,12 +16,9 @@
 //!
 //! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_server::{
-    Materializer, PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
-};
+use connetto_server::{Materializer, PgSnapshotSource, RlsAuth};
 use connetto_test_harness::{
     Fixture, HarnessAuth, ServerConfig, pool_for, spawn_server, with_user,
 };
@@ -105,13 +102,7 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
 
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let server = spawn_server(
-        ServerConfig {
-            pg_ddl: PG_DDL.to_owned(),
-            writable: RuntimeWritableCatalog::builder().build(),
-            admin_url: fixture.admin_url().to_owned(),
-            session: SessionConfig::default(),
-            guard: Arc::new(RequestGuard::default()),
-        },
+        ServerConfig::new(PG_DDL, fixture.admin_url()),
         PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source"),
         HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth")),
         writer_pool,

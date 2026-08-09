@@ -221,13 +221,9 @@ async fn full_resync_is_relay_transparent() {
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(fake_upstream(fake_up, trigger_rx, doomed_id, survivor_id));
 
-    let worker_config = ClientConfig {
-        client_id: format!("resync-worker-{base}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: uuidv4_functions(),
-    };
+    let worker_config = ClientConfig::new(format!("resync-worker-{base}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_sql_functions(uuidv4_functions());
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
@@ -259,13 +255,9 @@ async fn full_resync_is_relay_transparent() {
     // The tab attaches to the hub and subscribes: its mirror seeds both rows.
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_config = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: uuidv4_functions(),
-    };
+    let tab_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_sql_functions(uuidv4_functions());
     let mut tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
             .await

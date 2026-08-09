@@ -160,8 +160,8 @@ async fn subscribe<T: Transport>(client: &mut T, sub_id: &str, query: &str) -> C
 /// A throttle whose only tight limit is how many subscriptions each tier gets.
 fn subscription_limits(identified: u32, anonymous: u32) -> ThrottleConfig {
     ThrottleConfig::new()
-        .identified(TierLimits::identified().subscriptions(identified, WINDOW))
-        .anonymous(TierLimits::anonymous().subscriptions(anonymous, WINDOW))
+        .with_identified(TierLimits::identified().with_subscriptions(identified, WINDOW))
+        .with_anonymous(TierLimits::anonymous().with_subscriptions(anonymous, WINDOW))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,8 +316,8 @@ async fn a_rate_refusal_and_a_schema_refusal_stay_distinguishable() {
 async fn too_many_connections_on_one_handle_are_closed() {
     let fixture = Fixture::acquire().await;
     let throttle = ThrottleConfig::new()
-        .identified(TierLimits::identified().connections(2, WINDOW))
-        .anonymous(TierLimits::anonymous().connections(2, WINDOW));
+        .with_identified(TierLimits::identified().with_connections(2, WINDOW))
+        .with_anonymous(TierLimits::anonymous().with_connections(2, WINDOW));
     let manager = manager(&fixture, throttle);
 
     let (client, server, resume) = connect(&manager, "flapper", &["user:flapper"], None).await;
@@ -373,7 +373,7 @@ async fn an_anonymous_caller_cannot_reconnect_past_its_connection_limit() {
     let fixture = Fixture::acquire().await;
     let manager = manager(
         &fixture,
-        ThrottleConfig::new().anonymous(TierLimits::anonymous().connections(2, WINDOW)),
+        ThrottleConfig::new().with_anonymous(TierLimits::anonymous().with_connections(2, WINDOW)),
     );
 
     let (client, server, resume) = connect(&manager, "visitor", &[], None).await;
@@ -447,7 +447,7 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
             .expect("build write target"),
         Arc::new(RequestGuard::new(
             ThrottleConfig::new()
-                .anonymous(TierLimits::anonymous().credential_refusals(LIMIT, WINDOW)),
+                .with_anonymous(TierLimits::anonymous().with_credential_refusals(LIMIT, WINDOW)),
             AbuseConfig::default(),
         )),
         SessionConfig::default(),

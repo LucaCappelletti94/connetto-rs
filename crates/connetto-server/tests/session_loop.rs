@@ -162,10 +162,7 @@ async fn drive_cdc<
 async fn loopback_session_full_lifecycle() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let config = SessionConfig {
-        initial_credits: 1,
-        ..SessionConfig::default()
-    };
+    let config = SessionConfig::new().with_initial_credits(1);
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,

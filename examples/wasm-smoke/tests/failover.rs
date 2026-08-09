@@ -97,13 +97,10 @@ async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocke
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig {
-        client_id: format!("{name}-{tag}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(format!("{name}-{tag}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -198,13 +195,10 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     announce_tab(&wire).await;
     let transport = MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         .expect("boot wire");
-    let config = ClientConfig {
-        client_id: client_id.clone(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(client_id.clone())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -214,11 +208,9 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     )
     .await
     .expect("tab connect");
-    let policy = ReconnectPolicy {
-        initial_backoff: Duration::from_millis(50),
-        max_backoff: Duration::from_millis(500),
-        max_attempts: None,
-    };
+    let policy = ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(50))
+        .with_max_backoff(Duration::from_millis(500));
     let (tab, pump) =
         ConnettoClient::with_reconnect(conn, tab_wire_factory(client_id.clone()), sleep, policy);
     wasm_bindgen_futures::spawn_local(pump);

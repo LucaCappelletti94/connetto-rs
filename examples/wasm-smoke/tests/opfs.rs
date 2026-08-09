@@ -94,13 +94,10 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
     .await
     .expect("install sahpool vfs");
 
-    let config = ClientConfig {
-        client_id: format!("wasm-opfs-{}", unique_id()),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(format!("wasm-opfs-{}", unique_id()))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let conn = connect(&config, Some(REPLICA_DDL)).await;
 
     // The pump under spawn_local: the wasm driving mode for the same client

@@ -490,11 +490,9 @@ impl RowSource for AlwaysFound {
 
 #[tokio::test]
 async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
-    let config = AuthConfig {
-        capability_ttl: Duration::from_secs(60),
-        capability_max_ttl: Duration::from_secs(600),
-        ..AuthConfig::default()
-    };
+    let config = AuthConfig::new()
+        .with_capability_ttl(Duration::from_secs(60))
+        .with_capability_max_ttl(Duration::from_secs(600));
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let issuer = CapabilityIssuer::new(
         authority,

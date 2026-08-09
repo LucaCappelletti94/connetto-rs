@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica, SqlFunctions,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
@@ -142,13 +142,7 @@ fn ack() -> IncomingFrame {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "r20-never-synced".to_owned(),
-        login: Some(Grant::new("user:tester")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("r20-never-synced").with_login(Some(Grant::new("user:tester")))
 }
 
 /// Wait for the pump to report the named event, so the assertions that follow
@@ -424,11 +418,10 @@ async fn a_run_that_starts_before_its_server_ends_up_subscribed() {
         conn,
         factory,
         |d| tokio::time::sleep(d),
-        ReconnectPolicy {
-            initial_backoff: core::time::Duration::from_millis(5),
-            max_backoff: core::time::Duration::from_millis(20),
-            max_attempts: Some(20),
-        },
+        ReconnectPolicy::new()
+            .with_initial_backoff(core::time::Duration::from_millis(5))
+            .with_max_backoff(core::time::Duration::from_millis(20))
+            .with_max_attempts(Some(20)),
     );
     tokio::spawn(pump);
     let mut events = client.events();

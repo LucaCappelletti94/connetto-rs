@@ -45,13 +45,9 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
 }
 
 fn config(schema_version: Option<SchemaVersion>) -> ClientConfig {
-    ClientConfig {
-        client_id: "schema-detection".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    }
+    ClientConfig::new("schema-detection")
+        .with_login(Some(Grant::new("user:token")))
+        .with_schema_version(schema_version)
 }
 
 #[tokio::test]

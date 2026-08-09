@@ -326,7 +326,7 @@ impl std::fmt::Debug for SqlFunctions {
 pub struct ClientConfig {
     /// Stable client id, echoed for logging and correlation. Never a trust
     /// input on the server.
-    pub client_id: String,
+    client_id: String,
     /// The login grant, when somebody is signed in. `None` is a caller with no
     /// identity, which the server accepts: it reads whatever the deployment's
     /// policy shows such a caller and writes only where a capability says it
@@ -335,22 +335,65 @@ pub struct ClientConfig {
     /// It is separate from [`capabilities`](Self::capabilities) because only
     /// this one refreshes: a token source, when set, replaces it on every
     /// reconnect. On the wire the two are one undifferentiated list.
-    pub login: Option<Grant>,
+    login: Option<Grant>,
     /// Capability grants, for example share keys, presented alongside the
     /// login. Each is checked on its own, and one that fails changes nothing
     /// except what the caller can see.
-    pub capabilities: Vec<Grant>,
+    capabilities: Vec<Grant>,
     /// The schema version this client build was compiled against, for staleness
     /// detection, or `None` to opt out. When both this and the server's ack
     /// carry a version and they differ, [`ConnettoConnection::connect`] fails
     /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
     /// being `None` skips the check.
-    pub schema_version: Option<SchemaVersion>,
+    schema_version: Option<SchemaVersion>,
     /// Custom SQLite functions connetto registers on the replica connection it
     /// opens for this client, before any DDL or insert. Empty by default. A
     /// schema whose column `DEFAULT` calls a function (a `uuidv7` key
     /// generator, say) supplies the matching installer here.
-    pub sql_functions: SqlFunctions,
+    sql_functions: SqlFunctions,
+}
+
+impl ClientConfig {
+    /// Build a config for a client with the given id, no login, no capabilities,
+    /// no schema version, and no custom SQL functions.
+    #[must_use]
+    pub fn new(client_id: impl Into<String>) -> Self {
+        Self {
+            client_id: client_id.into(),
+            login: None,
+            capabilities: Vec::new(),
+            schema_version: None,
+            sql_functions: SqlFunctions::default(),
+        }
+    }
+
+    /// The login grant, when somebody is signed in.
+    #[must_use]
+    pub fn with_login(mut self, login: Option<Grant>) -> Self {
+        self.login = login;
+        self
+    }
+
+    /// Capability grants presented alongside the login.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: impl IntoIterator<Item = Grant>) -> Self {
+        self.capabilities = capabilities.into_iter().collect();
+        self
+    }
+
+    /// Schema version for staleness detection, or `None` to opt out.
+    #[must_use]
+    pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+
+    /// Custom SQLite functions registered before any DDL or insert.
+    #[must_use]
+    pub fn with_sql_functions(mut self, sql_functions: SqlFunctions) -> Self {
+        self.sql_functions = sql_functions;
+        self
+    }
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].

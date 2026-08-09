@@ -329,10 +329,11 @@ async fn cursor_outside_window_forces_full_resync() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // A tiny window: after four inserts the oldest two are pruned.
-    let oplog = InMemoryOplog::new(OplogConfig {
-        max_entries: 2,
-        max_age: Duration::from_secs(72 * 60 * 60),
-    });
+    let oplog = InMemoryOplog::new(
+        OplogConfig::new()
+            .with_max_entries(2)
+            .with_max_age(Duration::from_secs(72 * 60 * 60)),
+    );
     let manager = SessionManager::with_oplog(
         materializer,
         SeedSnapshot,

@@ -57,21 +57,20 @@ async fn main() -> Result<()> {
         .ok()
         .map(|source| connetto_core::SchemaVersion::from_source(&source));
     let client_id = var_or("CONNETTO_CLIENT_ID", "anonymous");
-    let config = ClientConfig {
+    let config = ClientConfig::new(client_id)
         // CONNETTO_TOKEN carries the caller's identity grant. Unset means no
         // identity: the server accepts an anonymous caller.
-        login: std::env::var("CONNETTO_TOKEN").ok().map(Grant::new),
-        capabilities: std::env::var("CONNETTO_KEYS")
-            .ok()
-            .iter()
-            .flat_map(|keys| keys.split(','))
-            .filter(|key| !key.is_empty())
-            .map(Grant::new)
-            .collect(),
-        client_id,
-        schema_version,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+        .with_login(std::env::var("CONNETTO_TOKEN").ok().map(Grant::new))
+        .with_capabilities(
+            std::env::var("CONNETTO_KEYS")
+                .ok()
+                .iter()
+                .flat_map(|keys| keys.split(','))
+                .filter(|key| !key.is_empty())
+                .map(Grant::new)
+                .collect::<Vec<_>>(),
+        )
+        .with_schema_version(schema_version);
 
     // The ws URL's authority is also the TCP target.
     let authority = server

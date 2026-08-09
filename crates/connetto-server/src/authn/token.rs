@@ -43,27 +43,27 @@ const DEFAULT_CAPABILITY_MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// The `iss` connetto stamps on and pins in its own tokens.
-    pub issuer: String,
+    issuer: String,
     /// The `aud` connetto stamps on and pins in its own tokens.
-    pub audience: String,
+    audience: String,
     /// Access-token lifetime.
-    pub access_ttl: Duration,
+    access_ttl: Duration,
     /// How long a caller with no identity may keep resuming the same run.
     ///
     /// It bounds a bearer blob that no login backs, so it cannot be endless,
     /// and it is the lifetime of the canonical case for an unidentified run,
     /// a shopping cart the visitor comes back to.
-    pub resume_ttl: Duration,
+    resume_ttl: Duration,
     /// Default share-key lifetime, used when a mint names none.
-    pub capability_ttl: Duration,
+    capability_ttl: Duration,
     /// Hard ceiling on a share-key lifetime. A mint asking for longer is
     /// refused rather than quietly shortened, so an application's own statement
     /// of when a link dies cannot be a lie.
-    pub capability_max_ttl: Duration,
+    capability_max_ttl: Duration,
     /// Sliding refresh window, extended on each online refresh.
-    pub refresh_idle_window: Duration,
+    refresh_idle_window: Duration,
     /// Absolute refresh ceiling, never extended.
-    pub refresh_absolute_ceiling: Duration,
+    refresh_absolute_ceiling: Duration,
 }
 
 impl Default for AuthConfig {
@@ -82,13 +82,96 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
+    /// The defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `iss` connetto stamps on and pins in its own tokens.
+    #[must_use]
+    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.issuer = issuer.into();
+        self
+    }
+
+    /// The `aud` connetto stamps on and pins in its own tokens.
+    #[must_use]
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = audience.into();
+        self
+    }
+
+    /// Access-token lifetime.
+    #[must_use]
+    pub fn with_access_ttl(mut self, access_ttl: Duration) -> Self {
+        self.access_ttl = access_ttl;
+        self
+    }
+
+    /// How long a caller with no identity may keep resuming the same run.
+    #[must_use]
+    pub fn with_resume_ttl(mut self, resume_ttl: Duration) -> Self {
+        self.resume_ttl = resume_ttl;
+        self
+    }
+
+    /// Default share-key lifetime, used when a mint names none.
+    #[must_use]
+    pub fn with_capability_ttl(mut self, capability_ttl: Duration) -> Self {
+        self.capability_ttl = capability_ttl;
+        self
+    }
+
+    /// Hard ceiling on a share-key lifetime.
+    #[must_use]
+    pub fn with_capability_max_ttl(mut self, capability_max_ttl: Duration) -> Self {
+        self.capability_max_ttl = capability_max_ttl;
+        self
+    }
+
+    /// Sliding refresh window, extended on each online refresh.
+    #[must_use]
+    pub fn with_refresh_idle_window(mut self, refresh_idle_window: Duration) -> Self {
+        self.refresh_idle_window = refresh_idle_window;
+        self
+    }
+
+    /// Absolute refresh ceiling, never extended.
+    #[must_use]
+    pub fn with_refresh_absolute_ceiling(mut self, refresh_absolute_ceiling: Duration) -> Self {
+        self.refresh_absolute_ceiling = refresh_absolute_ceiling;
+        self
+    }
+
+    /// The `iss` connetto stamps on and pins in its own tokens.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Access-token lifetime.
+    #[must_use]
+    pub fn access_ttl(&self) -> Duration {
+        self.access_ttl
+    }
+
+    /// Default share-key lifetime, used when a mint names none.
+    #[must_use]
+    pub fn capability_ttl(&self) -> Duration {
+        self.capability_ttl
+    }
+
+    /// Hard ceiling on a share-key lifetime.
+    #[must_use]
+    pub fn capability_max_ttl(&self) -> Duration {
+        self.capability_max_ttl
+    }
+
     /// The refresh-token lifetimes an auth store enforces.
     #[must_use]
     pub fn refresh_lifetimes(&self) -> RefreshLifetimes {
-        RefreshLifetimes {
-            idle_window: self.refresh_idle_window,
-            absolute_ceiling: self.refresh_absolute_ceiling,
-        }
+        RefreshLifetimes::new(self.refresh_idle_window, self.refresh_absolute_ceiling)
     }
 }
 
@@ -96,9 +179,32 @@ impl AuthConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshLifetimes {
     /// The session is refreshable only within this window since the last use.
-    pub idle_window: Duration,
+    idle_window: Duration,
     /// The session is refreshable only within this window since creation.
-    pub absolute_ceiling: Duration,
+    absolute_ceiling: Duration,
+}
+
+impl RefreshLifetimes {
+    /// The window and ceiling an auth store enforces.
+    #[must_use]
+    pub const fn new(idle_window: Duration, absolute_ceiling: Duration) -> Self {
+        Self {
+            idle_window,
+            absolute_ceiling,
+        }
+    }
+
+    /// The session is refreshable only within this window since the last use.
+    #[must_use]
+    pub const fn idle_window(self) -> Duration {
+        self.idle_window
+    }
+
+    /// The session is refreshable only within this window since creation.
+    #[must_use]
+    pub const fn absolute_ceiling(self) -> Duration {
+        self.absolute_ceiling
+    }
 }
 
 /// Failure minting or verifying a connetto access token.

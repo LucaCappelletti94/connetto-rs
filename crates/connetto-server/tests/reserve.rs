@@ -145,7 +145,12 @@ type Manager = Arc<SessionManager<PgSnapshotSource, PermissiveAuth, ConnettoWate
 fn manager(reader: &Pool<AsyncPgConnection>) -> Manager {
     let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
     let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-        .with_reader_gate(ReaderReserve::new().total(TOTAL).reserved(RESERVED).gate());
+        .with_reader_gate(
+            ReaderReserve::new()
+                .with_total(TOTAL)
+                .with_reserved(RESERVED)
+                .gate(),
+        );
     SessionManager::new(
         Materializer::with_write_catalog(
             PG_DDL,

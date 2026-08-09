@@ -94,7 +94,7 @@ pub struct WorkerAuthConfig {
     /// `{base}/auth/refresh`, and `{base}/auth/logout`. These carry no CORS
     /// headers from connetto, so this is the application's own origin whenever the
     /// deployment puts the auth endpoints behind its own reverse proxy.
-    pub auth_base_url: String,
+    auth_base_url: String,
     /// The origin the login navigation goes to, when it is not
     /// [`auth_base_url`](Self::auth_base_url).
     ///
@@ -104,12 +104,43 @@ pub struct WorkerAuthConfig {
     /// served by a dev server whose proxy does not forward navigations, in which
     /// case the navigation goes straight to the auth origin while the `fetch` calls
     /// keep going through the proxy.
-    pub login_base_url: Option<String>,
+    login_base_url: Option<String>,
     /// The provider name to log in with.
-    pub provider: String,
+    provider: String,
     /// The app page the login redirect returns to, which posts the code back to
     /// the worker with [`deliver_login_code`].
-    pub redirect_uri: String,
+    redirect_uri: String,
+}
+
+impl WorkerAuthConfig {
+    /// Builds with the given auth origin, provider name, and callback URI.
+    #[must_use]
+    pub fn new(
+        auth_base_url: impl Into<String>,
+        provider: impl Into<String>,
+        redirect_uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            auth_base_url: auth_base_url.into(),
+            login_base_url: None,
+            provider: provider.into(),
+            redirect_uri: redirect_uri.into(),
+        }
+    }
+
+    /// The origin the login navigation goes to, when it is not the auth origin.
+    ///
+    /// A login is a navigation the browser follows, so it needs no CORS and only
+    /// needs an origin that actually serves the auth router. That is usually the
+    /// same one, and `None` means exactly that. It differs when the application is
+    /// served by a dev server whose proxy does not forward navigations, in which
+    /// case the navigation goes straight to the auth origin while the `fetch` calls
+    /// keep going through the proxy.
+    #[must_use]
+    pub fn with_login_base_url(mut self, login_base_url: Option<String>) -> Self {
+        self.login_base_url = login_base_url;
+        self
+    }
 }
 
 /// The refresh-store record holding the credential this device signed in with,

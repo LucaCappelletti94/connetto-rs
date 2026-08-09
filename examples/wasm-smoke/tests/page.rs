@@ -56,13 +56,10 @@ async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig {
-        client_id: format!("{name}-{}", unique_id()),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(format!("{name}-{}", unique_id()))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await
         .expect("client connect")

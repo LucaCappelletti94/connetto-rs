@@ -128,24 +128,23 @@ pub mod workers {
         // `Id` names the user id the server mints. The server requires a session
         // from the dev identity provider, so the worker authenticates before
         // connecting and names the replica after the acquired identity.
-        connetto_web::workers::boot_db_worker::<String>(&connetto_web::workers::DbWorkerConfig {
-            ws_url: DEMO_WS_URL,
-            replica_db_prefix: DB_NAME,
-            replica_ddl: DEMO_SQLITE_DDL,
-            frontend_ddl: DEMO_FRONTEND_DDL,
-            upstream_sub_id: "db-upstream",
-            upstream_query: DEMO_QUERY,
-            hub_meta_name: "connetto-hub-meta.sqlite",
-            schema_version: crate::demo_schema_version(),
-            sql_functions: crate::uuidv4_functions(),
-            auth: Some(connetto_web::auth::WorkerAuthConfig {
-                auth_base_url: "http://127.0.0.1:18099".to_owned(),
-                login_base_url: None,
-                provider: "dev-idp".to_owned(),
-                redirect_uri: "http://127.0.0.1:18099/dev/landing".to_owned(),
-            }),
-            auth_db_name: "connetto-auth.sqlite",
-        })
+        connetto_web::workers::boot_db_worker::<String>(
+            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
+                .with_ws_url(DEMO_WS_URL)
+                .with_replica_db_prefix(DB_NAME)
+                .with_replica_ddl(DEMO_SQLITE_DDL)
+                .with_frontend_ddl(DEMO_FRONTEND_DDL)
+                .with_upstream_sub_id("db-upstream")
+                .with_upstream_query(DEMO_QUERY)
+                .with_hub_meta_name("connetto-hub-meta.sqlite")
+                .with_sql_functions(crate::uuidv4_functions())
+                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
+                    "http://127.0.0.1:18099",
+                    "dev-idp",
+                    "http://127.0.0.1:18099/dev/landing",
+                )))
+                .with_auth_db_name("connetto-auth.sqlite"),
+        )
         .await
         .map(drop)
     }

@@ -26,19 +26,15 @@ const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"
 const NOWHERE: &str = "ws://127.0.0.1:9/connetto";
 
 fn config() -> DbWorkerConfig {
-    DbWorkerConfig {
-        ws_url: NOWHERE,
-        replica_db_prefix: "r20-offline-boot.sqlite",
-        replica_ddl: REPLICA_DDL,
-        frontend_ddl: TIER_DDL,
-        upstream_sub_id: "r20-upstream",
-        upstream_query: "SELECT * FROM items",
-        hub_meta_name: "r20-offline-boot-hub.sqlite",
-        schema_version: connetto_core::SchemaVersion::from_source(REPLICA_DDL),
-        sql_functions: connetto_client::SqlFunctions::new(),
-        auth: None,
-        auth_db_name: "r20-offline-boot-auth.sqlite",
-    }
+    DbWorkerConfig::new(connetto_core::SchemaVersion::from_source(REPLICA_DDL))
+        .with_ws_url(NOWHERE)
+        .with_replica_db_prefix("r20-offline-boot.sqlite")
+        .with_replica_ddl(REPLICA_DDL)
+        .with_frontend_ddl(TIER_DDL)
+        .with_upstream_sub_id("r20-upstream")
+        .with_upstream_query("SELECT * FROM items")
+        .with_hub_meta_name("r20-offline-boot-hub.sqlite")
+        .with_auth_db_name("r20-offline-boot-auth.sqlite")
 }
 
 /// The worker comes up with nothing listening, and says so by completing.

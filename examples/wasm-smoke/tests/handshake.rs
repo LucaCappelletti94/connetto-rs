@@ -71,13 +71,10 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     let (worker_up, fake_up) = loopback();
     spawn_local(schema_upstream(fake_up));
 
-    let worker_config = ClientConfig {
-        client_id: format!("handshake-worker-{base}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let worker_config = ClientConfig::new(format!("handshake-worker-{base}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await

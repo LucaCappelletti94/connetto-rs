@@ -301,16 +301,51 @@ type HarnessManager =
 pub struct ServerConfig {
     /// The Postgres catalog DDL the materializer, write target, and CDC catalog
     /// are all built from.
-    pub pg_ddl: String,
+    pg_ddl: String,
     /// Which tables accept client mutations, and their version columns.
-    pub writable: RuntimeWritableCatalog,
+    writable: RuntimeWritableCatalog,
     /// The admin conninfo the CDC stream connects with. It needs `REPLICATION`.
-    pub admin_url: String,
+    admin_url: String,
     /// Per-session server configuration.
-    pub session: SessionConfig,
+    session: SessionConfig,
     /// The counters the server meters and tallies against. Supply one built
     /// from tight thresholds to trip a limit or a ban inside a test.
-    pub guard: Arc<RequestGuard<String>>,
+    guard: Arc<RequestGuard<String>>,
+}
+
+impl ServerConfig {
+    /// Build a config from the two values every site must supply.
+    #[must_use]
+    pub fn new(pg_ddl: impl Into<String>, admin_url: impl Into<String>) -> Self {
+        Self {
+            pg_ddl: pg_ddl.into(),
+            admin_url: admin_url.into(),
+            writable: RuntimeWritableCatalog::default(),
+            session: SessionConfig::default(),
+            guard: Arc::new(RequestGuard::default()),
+        }
+    }
+
+    /// Which tables accept client mutations, and their version columns.
+    #[must_use]
+    pub fn with_writable(mut self, writable: RuntimeWritableCatalog) -> Self {
+        self.writable = writable;
+        self
+    }
+
+    /// Per-session server configuration.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionConfig) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// The counters the server meters and tallies against.
+    #[must_use]
+    pub fn with_guard(mut self, guard: Arc<RequestGuard<String>>) -> Self {
+        self.guard = guard;
+        self
+    }
 }
 
 /// A running harness server: a [`SessionManager`] wired to the full production

@@ -166,13 +166,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_resync_drops_rows_deleted_during_the_outage() {
-    let config = ClientConfig {
-        client_id: "resync".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("resync").with_login(Some(Grant::new("user:token")));
     let mut conn = ConnettoConnection::connect(
         resync_server(),
         &Replica::in_memory(),

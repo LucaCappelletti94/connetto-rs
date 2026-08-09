@@ -69,15 +69,15 @@ thread_local! {
 /// from its own constants and awaits [`boot_db_worker`].
 pub struct DbWorkerConfig {
     /// The server WebSocket URL the worker connects upstream to.
-    pub ws_url: &'static str,
+    ws_url: &'static str,
     /// The base name of the OPFS file holding the durable synced replica.
     /// With `auth` set the worker appends the authenticated identity, so each
     /// identity owns its own replica file and an account switch opens a
     /// different one. With `auth` unset this is the file name verbatim.
-    pub replica_db_prefix: &'static str,
+    replica_db_prefix: &'static str,
     /// The synced replica DDL, applied only on a first boot (a resumed
     /// replica keeps its schema and its persisted cursor).
-    pub replica_ddl: &'static str,
+    replica_ddl: &'static str,
     /// The local tier DDL, applied only on a first boot, exactly like
     /// `replica_ddl`. Its file is not named here: the worker derives it from
     /// the replica's own name through
@@ -90,32 +90,128 @@ pub struct DbWorkerConfig {
     /// plaintext-to-encrypted transform that works on both backends. DDL is the
     /// route that works whether the tier is encrypted or not, and the replica
     /// already took it.
-    pub frontend_ddl: &'static str,
+    frontend_ddl: &'static str,
     /// The subscription id the worker registers upstream.
-    pub upstream_sub_id: &'static str,
+    upstream_sub_id: &'static str,
     /// The subscription query the worker registers upstream.
-    pub upstream_query: &'static str,
+    upstream_query: &'static str,
     /// The attached database file holding the hub's own durable state.
-    pub hub_meta_name: &'static str,
+    hub_meta_name: &'static str,
     // The tab's own id is not configurable: it is a fresh UUID per worker,
     // because the hub keys a durable write counter and a lock on it.
     /// The schema version this app build was compiled against. The worker
     /// presents it to the server at handshake (a mismatch is a stale build)
     /// and the hub forwards the server's version to tabs for the same check.
-    pub schema_version: connetto_core::SchemaVersion,
+    schema_version: connetto_core::SchemaVersion,
     /// Custom SQLite functions connetto registers on every connection the
     /// worker opens (the synced replica and the local tier alike), before any
     /// DDL or insert. Empty by default. A synced schema whose key column has a
     /// function-backed `DEFAULT` supplies the matching installer here.
-    pub sql_functions: connetto_client::SqlFunctions,
+    sql_functions: connetto_client::SqlFunctions,
     /// Browser OAuth acquisition. `None` uses a placeholder token (dev and the
     /// pre-auth loops). `Some` makes the worker acquire connetto's own token
     /// before connecting: silently from the OPFS-stored refresh token on a cold
     /// start or leader failover, or through an interactive tab login otherwise.
-    pub auth: Option<crate::auth::WorkerAuthConfig>,
+    auth: Option<crate::auth::WorkerAuthConfig>,
     /// The OPFS database holding the worker-only refresh token, used only when
     /// `auth` is set.
-    pub auth_db_name: &'static str,
+    auth_db_name: &'static str,
+}
+
+impl DbWorkerConfig {
+    /// Builds with `schema_version` set and all other fields at empty or absent defaults.
+    ///
+    /// Supply the remaining fields with the `with_*` setters in declaration order.
+    #[must_use]
+    pub fn new(schema_version: connetto_core::SchemaVersion) -> Self {
+        Self {
+            ws_url: "",
+            replica_db_prefix: "",
+            replica_ddl: "",
+            frontend_ddl: "",
+            upstream_sub_id: "",
+            upstream_query: "",
+            hub_meta_name: "",
+            schema_version,
+            sql_functions: connetto_client::SqlFunctions::default(),
+            auth: None,
+            auth_db_name: "",
+        }
+    }
+
+    /// The server WebSocket URL the worker connects upstream to.
+    #[must_use]
+    pub fn with_ws_url(mut self, ws_url: &'static str) -> Self {
+        self.ws_url = ws_url;
+        self
+    }
+
+    /// The base name of the OPFS file holding the durable synced replica.
+    /// With `auth` set the worker appends the authenticated identity. With
+    /// `auth` unset this is the file name verbatim.
+    #[must_use]
+    pub fn with_replica_db_prefix(mut self, replica_db_prefix: &'static str) -> Self {
+        self.replica_db_prefix = replica_db_prefix;
+        self
+    }
+
+    /// The synced replica DDL, applied only on a first boot.
+    #[must_use]
+    pub fn with_replica_ddl(mut self, replica_ddl: &'static str) -> Self {
+        self.replica_ddl = replica_ddl;
+        self
+    }
+
+    /// The local tier DDL, applied only on a first boot.
+    #[must_use]
+    pub fn with_frontend_ddl(mut self, frontend_ddl: &'static str) -> Self {
+        self.frontend_ddl = frontend_ddl;
+        self
+    }
+
+    /// The subscription id the worker registers upstream.
+    #[must_use]
+    pub fn with_upstream_sub_id(mut self, upstream_sub_id: &'static str) -> Self {
+        self.upstream_sub_id = upstream_sub_id;
+        self
+    }
+
+    /// The subscription query the worker registers upstream.
+    #[must_use]
+    pub fn with_upstream_query(mut self, upstream_query: &'static str) -> Self {
+        self.upstream_query = upstream_query;
+        self
+    }
+
+    /// The attached database file holding the hub's own durable state.
+    #[must_use]
+    pub fn with_hub_meta_name(mut self, hub_meta_name: &'static str) -> Self {
+        self.hub_meta_name = hub_meta_name;
+        self
+    }
+
+    /// Custom SQLite functions connetto registers on every connection the
+    /// worker opens, before any DDL or insert.
+    #[must_use]
+    pub fn with_sql_functions(mut self, sql_functions: connetto_client::SqlFunctions) -> Self {
+        self.sql_functions = sql_functions;
+        self
+    }
+
+    /// Browser OAuth acquisition.
+    #[must_use]
+    pub fn with_auth(mut self, auth: Option<crate::auth::WorkerAuthConfig>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// The OPFS database holding the worker-only refresh token, used only when
+    /// `auth` is set.
+    #[must_use]
+    pub fn with_auth_db_name(mut self, auth_db_name: &'static str) -> Self {
+        self.auth_db_name = auth_db_name;
+        self
+    }
 }
 
 /// How the leader launches the dedicated DB worker, which differs only by how
@@ -430,13 +526,10 @@ where
         .map(|session| Grant::new(session.access_token.clone()));
     let identified = session.is_some();
     let identity = session.map(|session| session.user_id);
-    let client_config = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login,
-        capabilities: Vec::new(),
-        schema_version: Some(config.schema_version.clone()),
-        sql_functions: config.sql_functions.clone(),
-    };
+    let client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(login)
+        .with_schema_version(Some(config.schema_version.clone()))
+        .with_sql_functions(config.sql_functions.clone());
     // An unreachable server is a state, not a boot failure. The worker comes up
     // on its replica, serves tabs from it, and the hub's reconnect driver
     // attaches a transport when one can be had, declaring the upstream

@@ -62,15 +62,12 @@ async fn schema_upstream(mut server: LoopbackTransport, server_version: SchemaVe
 async fn hub_with_server_version(base: i64, server_version: SchemaVersion) -> RelayHub {
     let (worker_up, fake_up) = loopback();
     spawn_local(schema_upstream(fake_up, server_version.clone()));
-    let worker_config = ClientConfig {
-        client_id: format!("schema-worker-{base}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
+    let worker_config = ClientConfig::new(format!("schema-worker-{base}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
         // The worker presents the same version the upstream advertises, so it
         // connects and then forwards that version to tabs.
-        schema_version: Some(server_version),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+        .with_schema_version(Some(server_version))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
@@ -91,13 +88,12 @@ async fn stale_tab_is_rejected_through_the_relay() {
     // A tab built for an older schema must be told to reload, not subscribe.
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let stale = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(SchemaVersion::from_source("CREATE TABLE orders (id INT);")),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let stale = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(SchemaVersion::from_source(
+            "CREATE TABLE orders (id INT);",
+        )))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let result =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &stale, None).await;
     match result {
@@ -121,13 +117,10 @@ async fn matching_tab_connects_through_the_relay() {
 
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let fresh = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(version),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let fresh = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(version))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let conn = ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &fresh, None).await;
     assert!(
         conn.is_ok(),

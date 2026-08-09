@@ -38,10 +38,10 @@ use anyhow::{Context as _, Result};
 use axum::routing::get;
 use connetto_core::SessionId;
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, OidcProviderConfig,
-    ProviderRegistry, RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity,
-    RetainedProviderToken, TokenAuthority, auth_router, connetto_auth_tables,
+    AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
+    GenericOidcProvider, InMemoryAuthStore, IssuedSession, OidcProviderConfig, ProviderRegistry,
+    RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken,
+    TokenAuthority, auth_router, connetto_auth_tables,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -248,18 +248,16 @@ async fn main() -> Result<()> {
     let jwks = serde_json::from_value((*idp.jwks_json).clone())
         .context("reading the provider's JWKS into a key set")?;
     let provider = GenericOidcProvider::from_parts(
-        OidcProviderConfig {
-            name: PROVIDER.to_owned(),
-            client_id: client.client_id.clone(),
-            client_secret: client.client_secret.clone(),
-            issuer: base.clone(),
-            redirect_url: callback.clone(),
-            scopes: Vec::new(),
-            // The provider issues no `amr` or `acr`, so a bar it cannot express
-            // would refuse every login. The bar itself is covered by
-            // `tests/provider.rs`.
-            assurance: AssuranceRequirement::none(),
-        },
+        // No assurance bar: the provider issues no `amr` or `acr`, so one it
+        // cannot express would refuse every login. The bar itself is covered
+        // by `tests/provider.rs`.
+        OidcProviderConfig::new(
+            PROVIDER,
+            client.client_id.clone(),
+            base.clone(),
+            callback.clone(),
+        )
+        .with_client_secret(client.client_secret.clone()),
         &format!("{base}/authorize"),
         &format!("{base}/token"),
         jwks,

@@ -48,13 +48,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
 }
 
 fn config(client_id: &str) -> ClientConfig {
-    ClientConfig {
-        client_id: client_id.to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    }
+    ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")))
 }
 
 // The decoded event mirrors the wire AggregateUpdate field for field, so a

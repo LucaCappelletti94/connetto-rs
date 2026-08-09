@@ -202,11 +202,9 @@ fn session_factory(
 
 /// A policy with test-sized backoff so the harness never waits long.
 fn fast_policy() -> ReconnectPolicy {
-    ReconnectPolicy {
-        initial_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(20),
-        max_attempts: None,
-    }
+    ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(1))
+        .with_max_backoff(Duration::from_millis(20))
 }
 
 /// Barrier: control frames are processed in order, so the pong proves the
@@ -227,13 +225,7 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
 /// The client identity every test in this file presents, differing only by the
 /// client id it labels its connection with.
 fn config(client_id: &str) -> ClientConfig {
-    ClientConfig {
-        client_id: client_id.to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    }
+    ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

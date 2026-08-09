@@ -552,8 +552,8 @@ mod tests {
 
     fn guard(person: u32, connection: u32) -> RequestGuard<String> {
         let abuse = AbuseLimits::new()
-            .person(PersonLimits::new().unresolvable_subscriptions(person, MINUTE))
-            .connection(ConnectionLimits::new().unresolvable_subscriptions(connection))
+            .with_person(PersonLimits::new().with_unresolvable_subscriptions(person, MINUTE))
+            .with_connection(ConnectionLimits::new().with_unresolvable_subscriptions(connection))
             .build()
             .expect("valid thresholds");
         RequestGuard::new(ThrottleConfig::default(), abuse)

@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::counters::{self, CountersSnapshot};
-use connetto_server::{
-    PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
-};
+use connetto_server::{PgSnapshotSource, RlsAuth, SessionConfig};
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -243,7 +241,7 @@ pub async fn fanout_load(fixture: &Fixture, subscribers: u64, duration: Duration
     let written = Arc::new(AtomicU64::new(0));
     // Half the credit window: often enough that the server never runs dry,
     // rarely enough to avoid a control frame per patch.
-    let ack_batch = (SessionConfig::default().initial_credits / 2).max(1);
+    let ack_batch = (SessionConfig::new().initial_credits() / 2).max(1);
 
     let consumers: Vec<_> = clients
         .into_iter()
@@ -317,13 +315,7 @@ async fn provision(fixture: &Fixture) -> Server {
         PgSnapshotSource::from_ddl(reader_pool.clone(), FANOUT_PG_DDL).expect("snapshot source");
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(reader_pool, FANOUT_PG_DDL).expect("rls auth"));
     spawn_server(
-        ServerConfig {
-            pg_ddl: FANOUT_PG_DDL.to_owned(),
-            writable: RuntimeWritableCatalog::default(),
-            admin_url: fixture.admin_url().to_owned(),
-            session: SessionConfig::default(),
-            guard: Arc::new(RequestGuard::default()),
-        },
+        ServerConfig::new(FANOUT_PG_DDL, fixture.admin_url()),
         snapshot,
         auth,
         fixture.admin().clone(),

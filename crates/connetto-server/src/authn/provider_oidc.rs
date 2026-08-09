@@ -80,22 +80,66 @@ impl IssuerMatch {
 }
 
 /// Confidential-client configuration for one provider.
+///
+/// Built as a chain of calls like [`ThrottleConfig`](crate::ThrottleConfig).
+/// The four values a provider cannot be discovered without are arguments to
+/// [`new`](Self::new) rather than chained, because there is no honest default
+/// for any of them and an empty string would fail late, at discovery.
 #[derive(Debug, Clone)]
 pub struct OidcProviderConfig {
-    /// The provider name, for the by-name registry lookup.
-    pub name: String,
-    /// The OAuth client id.
-    pub client_id: String,
-    /// The OAuth client secret, when the provider is confidential.
-    pub client_secret: Option<String>,
-    /// The OIDC issuer to discover (for the generic and Google providers).
-    pub issuer: String,
-    /// The redirect URL registered with the provider.
-    pub redirect_url: String,
+    name: String,
+    client_id: String,
+    client_secret: Option<String>,
+    issuer: String,
+    redirect_url: String,
+    scopes: Vec<String>,
+    assurance: AssuranceRequirement,
+}
+
+impl OidcProviderConfig {
+    /// A public client called `name`, discovered at `issuer`, returning to
+    /// `redirect_url`. No secret, no scopes beyond `openid`, and no assurance
+    /// bar until each is named.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        client_id: impl Into<String>,
+        issuer: impl Into<String>,
+        redirect_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            client_id: client_id.into(),
+            client_secret: None,
+            issuer: issuer.into(),
+            redirect_url: redirect_url.into(),
+            scopes: Vec::new(),
+            assurance: AssuranceRequirement::none(),
+        }
+    }
+
+    /// The OAuth client secret, making this a confidential client. Takes an
+    /// [`Option`] because every caller reads it from a place that may not
+    /// have one.
+    #[must_use]
+    pub fn with_client_secret(mut self, secret: Option<String>) -> Self {
+        self.client_secret = secret;
+        self
+    }
+
     /// The scopes to request beyond `openid`.
-    pub scopes: Vec<String>,
+    #[must_use]
+    pub fn with_scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// The MFA assurance bar to request and enforce.
-    pub assurance: AssuranceRequirement,
+    #[must_use]
+    pub fn with_assurance(mut self, assurance: AssuranceRequirement) -> Self {
+        self.assurance = assurance;
+        self
+    }
 }
 
 /// An OIDC identity provider driven by `openidconnect`.
@@ -333,10 +377,10 @@ impl IdentityProvider for GenericOidcProvider {
         for scope in &self.scopes {
             request = request.add_scope(scope.clone());
         }
-        for acr in &self.assurance.acr_values {
+        for acr in self.assurance.acr_values() {
             request = request.add_auth_context_value(AuthenticationContextClass::new(acr.clone()));
         }
-        if let Some(max_age) = self.assurance.max_age {
+        if let Some(max_age) = self.assurance.max_age() {
             request = request.set_max_age(max_age);
         }
         let (url, csrf, nonce) = request.set_pkce_challenge(challenge).url();

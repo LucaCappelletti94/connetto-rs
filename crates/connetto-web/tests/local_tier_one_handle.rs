@@ -13,7 +13,7 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica, ReplicaKey, SqlFunctions};
+use connetto_client::{ClientConfig, ConnettoConnection, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use diesel::prelude::*;
@@ -41,13 +41,7 @@ struct SchemaName {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "r43".to_owned(),
-        login: Some(connetto_client::Grant::new("user:tester")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("r43").with_login(Some(connetto_client::Grant::new("user:tester")))
 }
 
 /// The tier is reached through the replica connection, and the pool gets its

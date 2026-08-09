@@ -116,21 +116,21 @@ impl TierLimits {
     /// How many subscriptions this tier may create per window. The expensive
     /// one: each takes a full snapshot of the subscribed shape.
     #[must_use]
-    pub const fn subscriptions(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_subscriptions(mut self, max: u32, window: Duration) -> Self {
         self.subscriptions = Limit::new(max, window);
         self
     }
 
     /// How many connections this tier may open per window on one handle.
     #[must_use]
-    pub const fn connections(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_connections(mut self, max: u32, window: Duration) -> Self {
         self.connections = Limit::new(max, window);
         self
     }
 
     /// How many grants this tier may present and have refused per window.
     #[must_use]
-    pub const fn credential_refusals(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_credential_refusals(mut self, max: u32, window: Duration) -> Self {
         self.credential_refusals = Limit::new(max, window);
         self
     }
@@ -176,14 +176,14 @@ impl ThrottleConfig {
 
     /// Replace the limits a signed-in caller gets.
     #[must_use]
-    pub const fn identified(mut self, limits: TierLimits) -> Self {
+    pub const fn with_identified(mut self, limits: TierLimits) -> Self {
         self.identified = limits;
         self
     }
 
     /// Replace the limits a caller with no identity gets.
     #[must_use]
-    pub const fn anonymous(mut self, limits: TierLimits) -> Self {
+    pub const fn with_anonymous(mut self, limits: TierLimits) -> Self {
         self.anonymous = limits;
         self
     }
@@ -193,7 +193,7 @@ impl ThrottleConfig {
     /// The session is named inside the presented token, so a caller guessing a
     /// secret still says which session it is guessing at, and that is the key.
     #[must_use]
-    pub const fn refresh_failures_per_session(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_refresh_failures_per_session(mut self, max: u32, window: Duration) -> Self {
         self.refresh_failures_per_session = Limit::new(max, window);
         self
     }
@@ -201,7 +201,7 @@ impl ThrottleConfig {
     /// How many refresh attempts naming one account may fail per window,
     /// across every session of that account this process has seen succeed.
     #[must_use]
-    pub const fn refresh_failures_per_account(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_refresh_failures_per_account(mut self, max: u32, window: Duration) -> Self {
         self.refresh_failures_per_account = Limit::new(max, window);
         self
     }
@@ -213,7 +213,7 @@ impl ThrottleConfig {
     /// callers than the default, since a real caller evicted early gets its
     /// allowance back.
     #[must_use]
-    pub const fn max_tracked(mut self, keys: usize) -> Self {
+    pub const fn with_max_tracked(mut self, keys: usize) -> Self {
         self.max_tracked = keys;
         self
     }
@@ -664,8 +664,8 @@ mod tests {
         const CAP: usize = 4;
         let throttle = HandleThrottle::new(
             ThrottleConfig::new()
-                .anonymous(TierLimits::anonymous().subscriptions(2, MINUTE))
-                .max_tracked(CAP),
+                .with_anonymous(TierLimits::anonymous().with_subscriptions(2, MINUTE))
+                .with_max_tracked(CAP),
         );
 
         let hot = handle();
@@ -708,18 +708,18 @@ mod tests {
         let brief = Duration::from_millis(60);
         let short_tier = |limits: TierLimits| {
             limits
-                .subscriptions(5, brief)
-                .connections(5, brief)
-                .credential_refusals(5, brief)
+                .with_subscriptions(5, brief)
+                .with_connections(5, brief)
+                .with_credential_refusals(5, brief)
         };
         // The credential windows stay long, which is the point: the connection
         // counters must not inherit their retention.
         let throttle = HandleThrottle::new(
             ThrottleConfig::new()
-                .anonymous(short_tier(TierLimits::anonymous()))
-                .identified(short_tier(TierLimits::identified()))
-                .refresh_failures_per_session(5, FIVE_MINUTES)
-                .refresh_failures_per_account(5, FIVE_MINUTES),
+                .with_anonymous(short_tier(TierLimits::anonymous()))
+                .with_identified(short_tier(TierLimits::identified()))
+                .with_refresh_failures_per_session(5, FIVE_MINUTES)
+                .with_refresh_failures_per_account(5, FIVE_MINUTES),
         );
         for _ in 0..8 {
             let _ = throttle.subscription(handle(), Tier::Anonymous);
@@ -743,8 +743,8 @@ mod tests {
 
     #[test]
     fn a_window_admits_its_limit_then_refuses() {
-        let config =
-            ThrottleConfig::new().anonymous(TierLimits::anonymous().subscriptions(2, MINUTE));
+        let config = ThrottleConfig::new()
+            .with_anonymous(TierLimits::anonymous().with_subscriptions(2, MINUTE));
         let throttle = HandleThrottle::new(config);
         let key = handle();
 
@@ -762,8 +762,8 @@ mod tests {
     #[test]
     fn the_tiers_are_separate_allowances() {
         let config = ThrottleConfig::new()
-            .anonymous(TierLimits::anonymous().subscriptions(1, MINUTE))
-            .identified(TierLimits::identified().subscriptions(3, MINUTE));
+            .with_anonymous(TierLimits::anonymous().with_subscriptions(1, MINUTE))
+            .with_identified(TierLimits::identified().with_subscriptions(3, MINUTE));
         let throttle = HandleThrottle::new(config);
         let signed_in = handle();
         let visitor = handle();
@@ -779,8 +779,8 @@ mod tests {
 
     #[test]
     fn one_handles_limit_does_not_spend_anothers() {
-        let config =
-            ThrottleConfig::new().anonymous(TierLimits::anonymous().subscriptions(1, MINUTE));
+        let config = ThrottleConfig::new()
+            .with_anonymous(TierLimits::anonymous().with_subscriptions(1, MINUTE));
         let throttle = HandleThrottle::new(config);
         let first = handle();
         let second = handle();
@@ -810,8 +810,8 @@ mod tests {
     #[test]
     fn a_failure_counts_against_the_account_once_its_session_is_known() {
         let config = ThrottleConfig::new()
-            .refresh_failures_per_session(10, MINUTE)
-            .refresh_failures_per_account(2, MINUTE);
+            .with_refresh_failures_per_session(10, MINUTE)
+            .with_refresh_failures_per_account(2, MINUTE);
         let throttle = AuthThrottle::new(config);
         let (first, second) = (handle(), handle());
 
@@ -826,8 +826,8 @@ mod tests {
     #[test]
     fn an_unknown_session_is_capped_alone() {
         let config = ThrottleConfig::new()
-            .refresh_failures_per_session(1, MINUTE)
-            .refresh_failures_per_account(1, MINUTE);
+            .with_refresh_failures_per_session(1, MINUTE)
+            .with_refresh_failures_per_account(1, MINUTE);
         let throttle = AuthThrottle::new(config);
         let guessed = handle();
 

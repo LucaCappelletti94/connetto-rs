@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::{
-    ClientConfig, ClientError, ClientEvent, ConnettoConnection, Grant, Replica, SqlFunctions,
-    SyncStatus,
+    ClientConfig, ClientError, ClientEvent, ConnettoConnection, Grant, Replica, SyncStatus,
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck, SubscriptionSpec};
@@ -109,13 +108,7 @@ impl Transport for Recorder {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "r20-offline".to_owned(),
-        login: Some(Grant::new("user:tester")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("r20-offline").with_login(Some(Grant::new("user:tester")))
 }
 
 fn labels(conn: &mut ConnettoConnection<Recorder>) -> Vec<Option<String>> {

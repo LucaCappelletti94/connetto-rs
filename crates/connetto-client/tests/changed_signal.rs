@@ -33,13 +33,8 @@ diesel::table! {
 }
 
 fn client_config() -> ClientConfig {
-    ClientConfig {
-        client_id: "r45-changed-signal".to_owned(),
-        login: Some(connetto_client::Grant::new("user:changed")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    }
+    ClientConfig::new("r45-changed-signal")
+        .with_login(Some(connetto_client::Grant::new("user:changed")))
 }
 
 /// A server that answers the handshake and then advances the resume cursor

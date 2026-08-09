@@ -440,13 +440,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-a".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
     let mut client = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
@@ -587,13 +581,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-a".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
     let mut client = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
@@ -720,13 +708,7 @@ async fn connection_is_a_diesel_connection() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-a".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
     let mut client = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
@@ -824,13 +806,7 @@ async fn rejected_write_rolls_back_locally() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-a".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
     let mut client = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
@@ -941,13 +917,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-a".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
     let mut client = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
@@ -1034,17 +1004,12 @@ async fn connect_client(
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: client_id.to_owned(),
+    let config = ClientConfig::new(client_id.to_owned())
         // One user, one session per client. TestGrantChecker reads the part
         // between "user:" and "#" as the identity, so these stay the same caller
         // while holding distinct durable handles, which is what two devices of
         // one person look like. Sharing a handle would supersede the older.
-        login: Some(Grant::new(format!("user:token#{client_id}"))),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+        .with_login(Some(Grant::new(format!("user:token#{client_id}"))));
     ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(db_path, Some(connetto_core::test_support::replica_key()))
@@ -2710,13 +2675,7 @@ async fn watch_fn_drives_a_boxed_row_query() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "client-gadgets".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("client-gadgets").with_login(Some(Grant::new("user:token")));
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))

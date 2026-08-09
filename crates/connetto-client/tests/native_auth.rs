@@ -23,9 +23,9 @@ use connetto_client::{
 };
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, RefreshTokenStore, ReplicaKeyStore};
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityResolver,
-    InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard,
-    ResolveFuture, TokenAuthority, VerifiedClaims, auth_router,
+    AuthConfig, AuthService, GenericOidcProvider, IdentityResolver, InMemoryAuthStore,
+    OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard, ResolveFuture,
+    TokenAuthority, VerifiedClaims, auth_router,
 };
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
 use openidconnect::reqwest;
@@ -95,15 +95,8 @@ async fn spawn_auth_server_with_service()
         }))
         .await;
     let provider = GenericOidcProvider::discover(
-        OidcProviderConfig {
-            name: "mock-idp".to_owned(),
-            client_id: client.client_id.clone(),
-            client_secret: client.client_secret.clone(),
-            issuer: idp_issuer,
-            redirect_url: callback,
-            scopes: Vec::new(),
-            assurance: AssuranceRequirement::none(),
-        },
+        OidcProviderConfig::new("mock-idp", client.client_id.clone(), idp_issuer, callback)
+            .with_client_secret(client.client_secret.clone()),
         reqwest::Client::new(),
     )
     .await
@@ -171,19 +164,13 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
         }))
         .await;
     let alice_provider = GenericOidcProvider::discover(
-        OidcProviderConfig {
-            name: "alice".to_owned(),
-            client_id: alice_client.client_id.clone(),
-            client_secret: alice_client.client_secret.clone(),
-            issuer: idp_alice
-                .base_url
-                .to_string()
-                .trim_end_matches('/')
-                .to_owned(),
-            redirect_url: callback.clone(),
-            scopes: Vec::new(),
-            assurance: AssuranceRequirement::none(),
-        },
+        OidcProviderConfig::new(
+            "alice",
+            alice_client.client_id.clone(),
+            idp_alice.base_url.to_string().trim_end_matches('/'),
+            callback.clone(),
+        )
+        .with_client_secret(alice_client.client_secret.clone()),
         reqwest::Client::new(),
     )
     .await
@@ -207,19 +194,13 @@ async fn spawn_typed_auth_server() -> (String, OAuthTestServer, OAuthTestServer)
         }))
         .await;
     let bob_provider = GenericOidcProvider::discover(
-        OidcProviderConfig {
-            name: "bob".to_owned(),
-            client_id: bob_client.client_id.clone(),
-            client_secret: bob_client.client_secret.clone(),
-            issuer: idp_bob
-                .base_url
-                .to_string()
-                .trim_end_matches('/')
-                .to_owned(),
-            redirect_url: callback,
-            scopes: Vec::new(),
-            assurance: AssuranceRequirement::none(),
-        },
+        OidcProviderConfig::new(
+            "bob",
+            bob_client.client_id.clone(),
+            idp_bob.base_url.to_string().trim_end_matches('/'),
+            callback,
+        )
+        .with_client_secret(bob_client.client_secret.clone()),
         reqwest::Client::new(),
     )
     .await

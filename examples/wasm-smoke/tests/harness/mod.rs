@@ -117,13 +117,10 @@ pub async fn connect_tab(
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    let config = ClientConfig {
-        client_id: client_id.to_owned(),
-        login: Some(Grant::new(token)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(client_id.to_owned())
+        .with_login(Some(Grant::new(token)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -144,13 +141,10 @@ pub async fn connect_server(
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig {
-        client_id: format!("{name}-{tag}"),
-        login: Some(Grant::new(token)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(format!("{name}-{tag}"))
+        .with_login(Some(Grant::new(token)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

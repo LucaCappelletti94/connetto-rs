@@ -12,8 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use connetto_client::{
     AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    Encrypted, Grant, ReconnectPolicy, Replica, ReplicaKey, SqlFunctions, TokioSleeper,
-    replica_db_name,
+    Encrypted, Grant, ReconnectPolicy, Replica, ReplicaKey, TokioSleeper, replica_db_name,
 };
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
@@ -36,13 +35,7 @@ diesel::table! {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "phase6".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("phase6").with_login(Some(Grant::new("user:token")))
 }
 
 #[tokio::test]
@@ -219,11 +212,10 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
                 Err(ClientError::Auth("credential no longer valid".to_owned()))
             }));
     let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
-    let policy = ReconnectPolicy {
-        initial_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(5),
-        max_attempts: Some(5),
-    };
+    let policy = ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(1))
+        .with_max_backoff(Duration::from_millis(5))
+        .with_max_attempts(Some(5));
     let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
     let mut events = client.events();
     tokio::spawn(pump);
@@ -263,11 +255,10 @@ async fn a_mid_session_close_surfaces_its_reason_then_routes_to_relogin() {
     // A revoked session causes the token source to fail on the next reconnect,
     // routing to re-login rather than an endless retry.
     let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
-    let policy = ReconnectPolicy {
-        initial_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(5),
-        max_attempts: Some(5),
-    };
+    let policy = ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(1))
+        .with_max_backoff(Duration::from_millis(5))
+        .with_max_attempts(Some(5));
     let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
     let mut events = client.events();
     tokio::spawn(pump);
@@ -312,11 +303,10 @@ async fn reconnect_retries_a_transient_refresh_fault() {
                 ))
             }));
     let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
-    let policy = ReconnectPolicy {
-        initial_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(5),
-        max_attempts: Some(3),
-    };
+    let policy = ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(1))
+        .with_max_backoff(Duration::from_millis(5))
+        .with_max_attempts(Some(3));
     let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
     let mut events = client.events();
     tokio::spawn(pump);
@@ -423,10 +413,7 @@ async fn an_expired_share_key_is_not_presented_and_a_live_one_is() {
         .expect("mint the live key");
 
     let transport = GrantRecorder::default();
-    let config = ClientConfig {
-        capabilities: vec![Grant::new(dead), Grant::new(alive.clone())],
-        ..config()
-    };
+    let config = config().with_capabilities(vec![Grant::new(dead), Grant::new(alive.clone())]);
     let _conn = ConnettoConnection::connect(
         transport.clone(),
         &Replica::in_memory(),

@@ -10,13 +10,10 @@
 //! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
 //! Run under Docker with `DATABASE_URL` pointed at it and `-- --ignored`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::ControlMessage;
-use connetto_server::{
-    PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
-};
+use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, ServerConfig, insert_changeset, pool_for, spawn_server, with_user,
 };
@@ -98,15 +95,11 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
         PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
     let server = spawn_server(
-        ServerConfig {
-            pg_ddl: PG_DDL.to_owned(),
-            writable: RuntimeWritableCatalog::builder()
+        ServerConfig::new(PG_DDL, fixture.admin_url()).with_writable(
+            RuntimeWritableCatalog::builder()
                 .versioned("notes", "edited_at")
                 .build(),
-            admin_url: fixture.admin_url().to_owned(),
-            session: SessionConfig::default(),
-            guard: Arc::new(RequestGuard::default()),
-        },
+        ),
         snapshot,
         auth,
         writer_pool,

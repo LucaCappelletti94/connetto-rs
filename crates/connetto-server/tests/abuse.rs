@@ -177,18 +177,18 @@ impl EnforcementPolicy<String> for Recording {
 /// each test names only the numbers it cares about.
 fn limits(person: u32, connection: u32) -> AbuseConfig {
     AbuseLimits::new()
-        .person(
+        .with_person(
             PersonLimits::new()
-                .refused_grants(person, WINDOW)
-                .unresolvable_subscriptions(person, WINDOW)
-                .rejected_writes(person, WINDOW)
-                .failed_renewals(person, WINDOW),
+                .with_refused_grants(person, WINDOW)
+                .with_unresolvable_subscriptions(person, WINDOW)
+                .with_rejected_writes(person, WINDOW)
+                .with_failed_renewals(person, WINDOW),
         )
-        .connection(
+        .with_connection(
             ConnectionLimits::new()
-                .refused_grants(connection)
-                .unresolvable_subscriptions(connection)
-                .rejected_writes(connection),
+                .with_refused_grants(connection)
+                .with_unresolvable_subscriptions(connection)
+                .with_rejected_writes(connection),
         )
         .build()
         .expect("the thresholds a test names are valid")
@@ -960,13 +960,14 @@ async fn a_tripped_credential_limit_still_counts_its_refusals() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let abuse = AbuseLimits::new()
-        .person(PersonLimits::new().refused_grants(4, WINDOW))
-        .connection(ConnectionLimits::new().refused_grants(3))
+        .with_person(PersonLimits::new().with_refused_grants(4, WINDOW))
+        .with_connection(ConnectionLimits::new().with_refused_grants(3))
         .build()
         .expect("valid thresholds");
     let guard = throttled_guard(
         &fixture,
-        ThrottleConfig::new().anonymous(TierLimits::anonymous().credential_refusals(2, WINDOW)),
+        ThrottleConfig::new()
+            .with_anonymous(TierLimits::anonymous().with_credential_refusals(2, WINDOW)),
         abuse,
         None,
     );

@@ -114,10 +114,10 @@ struct RowRegistration {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Delivery credits granted to the server at handshake.
-    pub initial_credits: u32,
+    initial_credits: u32,
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
-    pub schema_version: Option<SchemaVersion>,
+    schema_version: Option<SchemaVersion>,
 }
 
 impl Default for SessionConfig {
@@ -129,6 +129,34 @@ impl Default for SessionConfig {
     }
 }
 
+impl SessionConfig {
+    /// Returns the defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the delivery credits granted at handshake.
+    #[must_use]
+    pub const fn with_initial_credits(mut self, initial_credits: u32) -> Self {
+        self.initial_credits = initial_credits;
+        self
+    }
+
+    /// Sets the schema version advertised in the handshake ack.
+    #[must_use]
+    pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+
+    /// Delivery credits granted at handshake.
+    #[must_use]
+    pub fn initial_credits(&self) -> u32 {
+        self.initial_credits
+    }
+}
+
 /// Backoff policy for reconnecting a dropped CDC stream.
 ///
 /// [`SessionManager::ingest_with_reconnect`] reconnects the source after the
@@ -136,15 +164,15 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
     /// Backoff before the first retry.
-    pub initial_backoff: Duration,
+    initial_backoff: Duration,
     /// Ceiling for the exponential backoff.
-    pub max_backoff: Duration,
+    max_backoff: Duration,
     /// Give up after this many consecutive failed attempts. `None` retries
     /// forever, which is what a long-running server wants.
-    pub max_attempts: Option<u32>,
+    max_attempts: Option<u32>,
     /// A connection that stayed up at least this long is treated as healthy, so
     /// the backoff resets after it drops.
-    pub healthy_after: Duration,
+    healthy_after: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -159,6 +187,40 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
+    /// Returns the defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the backoff before the first retry.
+    #[must_use]
+    pub const fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// Sets the ceiling for the exponential backoff.
+    #[must_use]
+    pub const fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Sets the attempt limit. `None` retries forever.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Sets the minimum uptime for a connection to be treated as healthy.
+    #[must_use]
+    pub const fn with_healthy_after(mut self, healthy_after: Duration) -> Self {
+        self.healthy_after = healthy_after;
+        self
+    }
+
     /// Backoff before the `attempt`-th retry (1-based): exponential from
     /// `initial_backoff`, capped at `max_backoff`.
     fn backoff(&self, attempt: u32) -> Duration {

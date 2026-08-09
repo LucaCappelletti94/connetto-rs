@@ -17,7 +17,7 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica, SqlFunctions};
+use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::test_support::{FakeTransport, replica_key};
 use connetto_web::RelayHub;
 use connetto_web::auth::{LogoutOutcome, WorkerAuthConfig, request_logout, request_unsynced};
@@ -46,25 +46,15 @@ diesel::table! {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(connetto_client::Grant::new("user:tester")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(connetto_client::Grant::new("user:tester")))
 }
 
 /// An auth base that would fail loudly if anything tried to use it. The refusal
 /// path must not reach the network, and a forced logout with no stored credential
 /// returns before it would.
 fn unused_auth() -> WorkerAuthConfig {
-    WorkerAuthConfig {
-        auth_base_url: "http://127.0.0.1:1".to_owned(),
-        login_base_url: None,
-        provider: "unused".to_owned(),
-        redirect_uri: "http://127.0.0.1:1/unused".to_owned(),
-    }
+    WorkerAuthConfig::new("http://127.0.0.1:1", "unused", "http://127.0.0.1:1/unused")
 }
 
 /// A delete is refused while a write is stranded offline, and forcing it through

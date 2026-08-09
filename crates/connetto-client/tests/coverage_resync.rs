@@ -128,13 +128,7 @@ async fn wait_subscribe(server: &mut LoopbackTransport) {
 }
 
 fn client_config() -> ClientConfig {
-    ClientConfig {
-        client_id: "coverage".to_owned(),
-        login: Some(connetto_client::Grant::new("user:coverage")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    }
+    ClientConfig::new("coverage").with_login(Some(connetto_client::Grant::new("user:coverage")))
 }
 
 /// Pump until the next snapshot completes.

@@ -24,14 +24,14 @@ use connetto_core::traits::{MaybeSend, Transport};
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
     /// Wait before the first attempt. Doubles per failed attempt.
-    pub initial_backoff: Duration,
+    initial_backoff: Duration,
     /// Ceiling for the doubling backoff.
-    pub max_backoff: Duration,
+    max_backoff: Duration,
     /// Give up after this many attempts, `None` keeps trying forever. On
     /// giving up the pump broadcasts
     /// [`ClientEvent::Closed`](crate::ClientEvent) and exits, exactly like a
     /// pump built without reconnect.
-    pub max_attempts: Option<u32>,
+    max_attempts: Option<u32>,
 }
 
 impl Default for ReconnectPolicy {
@@ -41,6 +41,53 @@ impl Default for ReconnectPolicy {
             max_backoff: Duration::from_secs(5),
             max_attempts: None,
         }
+    }
+}
+
+impl ReconnectPolicy {
+    /// The defaults: 200 ms initial backoff, 5 s ceiling, retry forever.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wait before the first attempt. Doubles per failed attempt.
+    #[must_use]
+    pub const fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// Ceiling for the doubling backoff.
+    #[must_use]
+    pub const fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Give up after this many attempts, `None` keeps trying forever.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Wait before the first attempt.
+    #[must_use]
+    pub const fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Ceiling for the doubling backoff.
+    #[must_use]
+    pub const fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    /// How many attempts before giving up, `None` keeps trying forever.
+    #[must_use]
+    pub const fn max_attempts(&self) -> Option<u32> {
+        self.max_attempts
     }
 }
 

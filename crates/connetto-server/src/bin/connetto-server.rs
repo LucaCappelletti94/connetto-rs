@@ -339,18 +339,15 @@ fn oidc_config_from_env(config: &AuthConfig) -> Result<OidcProviderConfig> {
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(str::to_owned)
-        .collect();
-    Ok(OidcProviderConfig {
-        name: var_or("CONNETTO_OIDC_NAME", "oidc"),
-        client_id: std::env::var("CONNETTO_OIDC_CLIENT_ID")
-            .context("set CONNETTO_OIDC_CLIENT_ID")?,
-        client_secret: std::env::var("CONNETTO_OIDC_CLIENT_SECRET").ok(),
-        issuer: var_or("CONNETTO_OIDC_ISSUER", &config.issuer),
-        redirect_url: std::env::var("CONNETTO_OIDC_REDIRECT_URL")
-            .context("set CONNETTO_OIDC_REDIRECT_URL")?,
-        scopes,
-        assurance: connetto_server::AssuranceRequirement::none(),
-    })
+        .collect::<Vec<_>>();
+    Ok(OidcProviderConfig::new(
+        var_or("CONNETTO_OIDC_NAME", "oidc"),
+        std::env::var("CONNETTO_OIDC_CLIENT_ID").context("set CONNETTO_OIDC_CLIENT_ID")?,
+        var_or("CONNETTO_OIDC_ISSUER", config.issuer()),
+        std::env::var("CONNETTO_OIDC_REDIRECT_URL").context("set CONNETTO_OIDC_REDIRECT_URL")?,
+    )
+    .with_client_secret(std::env::var("CONNETTO_OIDC_CLIENT_SECRET").ok())
+    .with_scopes(scopes))
 }
 
 /// Load the Ed25519 signing keypair from `CONNETTO_JWT_PRIVATE_KEY_FILE` and
@@ -444,8 +441,8 @@ async fn main() -> Result<()> {
         ));
     }
     let reader_gate = ReaderReserve::new()
-        .total(reader_pool_size)
-        .reserved(reader_reserve)
+        .with_total(reader_pool_size)
+        .with_reserved(reader_reserve)
         .gate();
 
     // The handshake authority is a required constructor argument with no
@@ -489,10 +486,7 @@ async fn main() -> Result<()> {
         connector,
         write,
         Arc::clone(&guard),
-        SessionConfig {
-            schema_version: Some(SchemaVersion::from_source(&pg_ddl)),
-            ..SessionConfig::default()
-        },
+        SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
     );
     // Revoking a session closes its live connection rather than only refusing
     // its next handshake. The hook fires synchronously inside the revoke, so

@@ -104,13 +104,8 @@ async fn walk_the_login(login_url: &str) -> (String, String) {
 }
 
 fn config() -> WorkerAuthConfig {
-    WorkerAuthConfig {
-        auth_base_url: AUTH_BASE.to_owned(),
-        // The stack serves the navigation and the fetch calls on one origin.
-        login_base_url: None,
-        provider: PROVIDER.to_owned(),
-        redirect_uri: format!("{AUTH_BASE}/dev/landing"),
-    }
+    // The stack serves the navigation and the fetch calls on one origin.
+    WorkerAuthConfig::new(AUTH_BASE, PROVIDER, format!("{AUTH_BASE}/dev/landing"))
 }
 
 /// The whole browser branch in one pass: acquire needs a login, the login

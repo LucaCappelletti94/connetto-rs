@@ -87,12 +87,9 @@ pub struct RetainedProviderToken {
 /// entry in `required_amr` must appear in the token's `amr`.
 #[derive(Debug, Clone, Default)]
 pub struct AssuranceRequirement {
-    /// Acceptable `acr` values, requested and enforced. Empty means unenforced.
-    pub acr_values: Vec<String>,
-    /// Authentication methods that must all be present in the token's `amr`.
-    pub required_amr: Vec<String>,
-    /// The `max_age` request parameter, when set.
-    pub max_age: Option<Duration>,
+    acr_values: Vec<String>,
+    required_amr: Vec<String>,
+    max_age: Option<Duration>,
 }
 
 impl AssuranceRequirement {
@@ -100,6 +97,43 @@ impl AssuranceRequirement {
     #[must_use]
     pub fn none() -> Self {
         Self::default()
+    }
+
+    /// Acceptable `acr` values, requested and enforced. Empty, the default,
+    /// leaves `acr` unenforced.
+    #[must_use]
+    pub fn with_acr_values(mut self, values: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.acr_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Authentication methods that must all be present in the token's `amr`.
+    #[must_use]
+    pub fn with_required_amr(
+        mut self,
+        methods: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_amr = methods.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The `max_age` request parameter.
+    #[must_use]
+    pub fn with_max_age(mut self, age: Duration) -> Self {
+        self.max_age = Some(age);
+        self
+    }
+
+    /// The `acr_values` to send on the authorize request.
+    #[must_use]
+    pub fn acr_values(&self) -> &[String] {
+        &self.acr_values
+    }
+
+    /// The `max_age` to send on the authorize request, when set.
+    #[must_use]
+    pub fn max_age(&self) -> Option<Duration> {
+        self.max_age
     }
 
     /// Whether an achieved `(acr, amr)` meets this bar.
@@ -530,11 +564,9 @@ mod tests {
 
     #[test]
     fn assurance_enforces_acr_allowlist_and_required_amr() {
-        let bar = AssuranceRequirement {
-            acr_values: vec!["high".to_owned()],
-            required_amr: vec!["mfa".to_owned()],
-            max_age: None,
-        };
+        let bar = AssuranceRequirement::none()
+            .with_acr_values(["high"])
+            .with_required_amr(["mfa"]);
         assert!(bar.is_satisfied(Some("high"), &["mfa", "pwd"]));
         // acr not in the allowlist.
         assert!(!bar.is_satisfied(Some("low"), &["mfa"]));

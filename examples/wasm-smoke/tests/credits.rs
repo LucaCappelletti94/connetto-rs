@@ -202,13 +202,9 @@ async fn hub_enforces_the_per_tab_credit_window() {
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(fake_upstream(fake_up, trigger_rx));
 
-    let worker_config = ClientConfig {
-        client_id: format!("credits-worker-{base}"),
-        login: Some(Grant::new(worker_token)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: uuidv4_functions(),
-    };
+    let worker_config = ClientConfig::new(format!("credits-worker-{base}"))
+        .with_login(Some(Grant::new(worker_token)))
+        .with_sql_functions(uuidv4_functions());
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await

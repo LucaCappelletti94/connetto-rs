@@ -10,12 +10,11 @@
 //! `-- --ignored`.
 
 use std::str::FromStr as _;
-use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::SessionId;
 use connetto_core::messages::{ControlMessage, FatalErrorReason};
-use connetto_server::{PgSnapshotSource, RequestGuard, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, Server, ServerConfig, insert_changeset, provision_watermark, spawn_server,
 };
@@ -40,15 +39,11 @@ async fn serve(fixture: &Fixture) -> Server {
     let snapshot =
         PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source");
     spawn_server(
-        ServerConfig {
-            pg_ddl: PG_DDL.to_owned(),
-            writable: RuntimeWritableCatalog::builder()
+        ServerConfig::new(PG_DDL, fixture.admin_url()).with_writable(
+            RuntimeWritableCatalog::builder()
                 .versioned("notes", "edited_at")
                 .build(),
-            admin_url: fixture.admin_url().to_owned(),
-            session: SessionConfig::default(),
-            guard: Arc::new(RequestGuard::default()),
-        },
+        ),
         snapshot,
         HarnessAuth::permissive(),
         fixture.admin().clone(),

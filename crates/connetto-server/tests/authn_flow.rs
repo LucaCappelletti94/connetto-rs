@@ -16,10 +16,10 @@ use connetto_core::messages::{ControlMessage, FatalErrorReason, Grant, Handshake
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore,
-    Materializer, OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy,
-    RequestGuard, ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    TokenAuthority, auth_router, loopback, pg_write_target,
+    AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, Materializer,
+    OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy, RequestGuard,
+    ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority,
+    auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
@@ -394,7 +394,7 @@ async fn expired_access_token_is_refused() {
     };
 
     // Mint a token issued far enough in the past that it is already expired.
-    let stale_issued = SystemTime::now() - (config.access_ttl + Duration::from_secs(120));
+    let stale_issued = SystemTime::now() - (config.access_ttl() + Duration::from_secs(120));
     let stale = authority
         .mint_access(&verified.context, verified.session_id, stale_issued)
         .expect("mint stale");
@@ -493,15 +493,8 @@ async fn oidc_registry(subject: &str) -> (OAuthTestServer, Arc<ProviderRegistry>
         }))
         .await;
     let provider = GenericOidcProvider::discover(
-        OidcProviderConfig {
-            name: "mock-idp".to_owned(),
-            client_id: client.client_id.clone(),
-            client_secret: client.client_secret.clone(),
-            issuer,
-            redirect_url: CALLBACK.to_owned(),
-            scopes: Vec::new(),
-            assurance: AssuranceRequirement::none(),
-        },
+        OidcProviderConfig::new("mock-idp", client.client_id.clone(), issuer, CALLBACK)
+            .with_client_secret(client.client_secret.clone()),
         reqwest::Client::new(),
     )
     .await

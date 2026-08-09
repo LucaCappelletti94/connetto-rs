@@ -201,13 +201,9 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     // rosetta_uuid::Uuid is Copy; no clone needed.
     spawn_local(fake_upstream(fake_up, seeded_id));
 
-    let worker_config = ClientConfig {
-        client_id: format!("conflict-worker-{base}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: uuidv4_functions(),
-    };
+    let worker_config = ClientConfig::new(format!("conflict-worker-{base}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_sql_functions(uuidv4_functions());
     let mut worker =
         ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
             .await
@@ -229,13 +225,9 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     // The tab attaches and converges on the seeded row.
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_config = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: uuidv4_functions(),
-    };
+    let tab_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_sql_functions(uuidv4_functions());
     let mut tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
             .await

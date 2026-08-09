@@ -264,8 +264,8 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             authority,
             policy,
             rows,
-            ttl: config.capability_ttl,
-            max_ttl: config.capability_max_ttl,
+            ttl: config.capability_ttl(),
+            max_ttl: config.capability_max_ttl(),
             audit: None,
             reader: None,
         }

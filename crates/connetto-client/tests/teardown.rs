@@ -21,7 +21,7 @@ use connetto_client::teardown::{
 };
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, Replica, ReplicaKey, SqlFunctions, provision_replica_key, replica_db_name,
+    NativeAuthenticator, Replica, ReplicaKey, provision_replica_key, replica_db_name,
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
@@ -44,13 +44,7 @@ diesel::table! {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "e3".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("e3").with_login(Some(Grant::new("user:token")))
 }
 
 /// The utf-8 form of a temporary path, with the same expectation spelled once.

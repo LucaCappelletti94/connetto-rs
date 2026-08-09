@@ -323,8 +323,8 @@ impl<
         let record = SessionRecord {
             context: context.clone(),
             current_refresh_hash: hash_secret(&secret),
-            idle_deadline: now + self.lifetimes.idle_window,
-            absolute_deadline: now + self.lifetimes.absolute_ceiling,
+            idle_deadline: now + self.lifetimes.idle_window(),
+            absolute_deadline: now + self.lifetimes.absolute_ceiling(),
             revoked: false,
             retained: None,
         };
@@ -337,8 +337,8 @@ impl<
             session_id,
             context,
             refresh_token,
-            session_expires_at: (now + self.lifetimes.idle_window)
-                .min(now + self.lifetimes.absolute_ceiling),
+            session_expires_at: (now + self.lifetimes.idle_window())
+                .min(now + self.lifetimes.absolute_ceiling()),
         })
     }
 
@@ -378,7 +378,7 @@ impl<
         }
         let new_secret = new_refresh_secret();
         record.current_refresh_hash = hash_secret(&new_secret);
-        record.idle_deadline = (now + self.lifetimes.idle_window).min(record.absolute_deadline);
+        record.idle_deadline = (now + self.lifetimes.idle_window()).min(record.absolute_deadline);
         Ok(RefreshOutcome {
             session_id,
             context: record.context.clone(),
@@ -534,8 +534,8 @@ mod db {
             now: SystemTime,
         ) -> Result<IssuedSession<S::Id>, AuthStoreError> {
             let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
-            let idle = to_instant(now + self.lifetimes.idle_window);
-            let absolute = to_instant(now + self.lifetimes.absolute_ceiling);
+            let idle = to_instant(now + self.lifetimes.idle_window());
+            let absolute = to_instant(now + self.lifetimes.absolute_ceiling());
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
@@ -587,7 +587,7 @@ mod db {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
             let presented_hash = hash_secret(secret).to_vec();
-            let idle = to_instant(now + self.lifetimes.idle_window);
+            let idle = to_instant(now + self.lifetimes.idle_window());
             let now = to_instant(now);
             let new_secret = new_refresh_secret();
             let new_hash = hash_secret(&new_secret).to_vec();

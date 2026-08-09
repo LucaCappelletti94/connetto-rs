@@ -108,7 +108,7 @@ impl PersonLimits {
 
     /// How many refused share keys one person may produce per window.
     #[must_use]
-    pub const fn refused_grants(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_refused_grants(mut self, max: u32, window: Duration) -> Self {
         self.refused_grants = Limit::new(max, window);
         self
     }
@@ -116,21 +116,21 @@ impl PersonLimits {
     /// How many subscriptions naming something that does not resolve one person
     /// may produce per window.
     #[must_use]
-    pub const fn unresolvable_subscriptions(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_unresolvable_subscriptions(mut self, max: u32, window: Duration) -> Self {
         self.unresolvable_subscriptions = Limit::new(max, window);
         self
     }
 
     /// How many writes the policy rejects one person may produce per window.
     #[must_use]
-    pub const fn rejected_writes(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_rejected_writes(mut self, max: u32, window: Duration) -> Self {
         self.rejected_writes = Limit::new(max, window);
         self
     }
 
     /// How many failed session renewals one person may produce per window.
     #[must_use]
-    pub const fn failed_renewals(mut self, max: u32, window: Duration) -> Self {
+    pub const fn with_failed_renewals(mut self, max: u32, window: Duration) -> Self {
         self.failed_renewals = Limit::new(max, window);
         self
     }
@@ -184,7 +184,7 @@ impl ConnectionLimits {
 
     /// How many refused share keys one connection may produce.
     #[must_use]
-    pub const fn refused_grants(mut self, max: u32) -> Self {
+    pub const fn with_refused_grants(mut self, max: u32) -> Self {
         self.refused_grants = max;
         self
     }
@@ -192,14 +192,14 @@ impl ConnectionLimits {
     /// How many subscriptions naming something that does not resolve one
     /// connection may produce.
     #[must_use]
-    pub const fn unresolvable_subscriptions(mut self, max: u32) -> Self {
+    pub const fn with_unresolvable_subscriptions(mut self, max: u32) -> Self {
         self.unresolvable_subscriptions = max;
         self
     }
 
     /// How many writes the policy rejects one connection may produce.
     #[must_use]
-    pub const fn rejected_writes(mut self, max: u32) -> Self {
+    pub const fn with_rejected_writes(mut self, max: u32) -> Self {
         self.rejected_writes = max;
         self
     }
@@ -241,14 +241,14 @@ impl AbuseLimits {
 
     /// Replace what one person may produce.
     #[must_use]
-    pub const fn person(mut self, limits: PersonLimits) -> Self {
+    pub const fn with_person(mut self, limits: PersonLimits) -> Self {
         self.person = limits;
         self
     }
 
     /// Replace what one connection may produce.
     #[must_use]
-    pub const fn connection(mut self, limits: ConnectionLimits) -> Self {
+    pub const fn with_connection(mut self, limits: ConnectionLimits) -> Self {
         self.connection = limits;
         self
     }
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn a_zero_window_is_refused() {
         let err = AbuseLimits::new()
-            .person(PersonLimits::new().rejected_writes(10, Duration::ZERO))
+            .with_person(PersonLimits::new().with_rejected_writes(10, Duration::ZERO))
             .build()
             .expect_err("a window of zero never fires");
         assert_eq!(
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn a_zero_count_is_refused_in_either_tier() {
         let person = AbuseLimits::new()
-            .person(PersonLimits::new().refused_grants(0, MINUTE))
+            .with_person(PersonLimits::new().with_refused_grants(0, MINUTE))
             .build()
             .expect_err("acting on the first refusal is a slip");
         assert_eq!(
@@ -506,7 +506,7 @@ mod tests {
         );
 
         let connection = AbuseLimits::new()
-            .connection(ConnectionLimits::new().rejected_writes(0))
+            .with_connection(ConnectionLimits::new().with_rejected_writes(0))
             .build()
             .expect_err("acting on the first refusal is a slip");
         assert_eq!(
@@ -521,8 +521,8 @@ mod tests {
     #[test]
     fn a_connection_count_at_or_above_its_person_count_is_refused() {
         let equal = AbuseLimits::new()
-            .person(PersonLimits::new().unresolvable_subscriptions(10, MINUTE))
-            .connection(ConnectionLimits::new().unresolvable_subscriptions(10))
+            .with_person(PersonLimits::new().with_unresolvable_subscriptions(10, MINUTE))
+            .with_connection(ConnectionLimits::new().with_unresolvable_subscriptions(10))
             .build()
             .expect_err("the cheap defence must be able to fire first");
         assert_eq!(
@@ -536,8 +536,8 @@ mod tests {
 
         assert!(
             AbuseLimits::new()
-                .person(PersonLimits::new().unresolvable_subscriptions(10, MINUTE))
-                .connection(ConnectionLimits::new().unresolvable_subscriptions(9))
+                .with_person(PersonLimits::new().with_unresolvable_subscriptions(10, MINUTE))
+                .with_connection(ConnectionLimits::new().with_unresolvable_subscriptions(9))
                 .build()
                 .is_ok()
         );

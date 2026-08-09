@@ -37,9 +37,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, SqlFunctions,
-};
+use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
 use connetto_core::transport::WebSocketTransport;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -215,13 +213,9 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
     let path = replica.path().to_string_lossy().into_owned();
     // No subscription, so nothing past the handshake is under test. A local DDL that
     // does not mirror the upstream is fine when no snapshot is ever requested.
-    let config = ClientConfig {
-        client_id: format!("verified-topology-{}", random_token()),
-        login: Some(Grant::new(token.to_owned())),
-        capabilities: Vec::new(),
-        schema_version: Some(schema_version()),
-        sql_functions: SqlFunctions::new(),
-    };
+    let config = ClientConfig::new(format!("verified-topology-{}", random_token()))
+        .with_login(Some(Grant::new(token.to_owned())))
+        .with_schema_version(Some(schema_version()));
     ConnettoConnection::connect(
         transport,
         &Replica::encrypted_file(&path, Some(connetto_core::test_support::replica_key()))

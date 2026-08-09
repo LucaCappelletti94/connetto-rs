@@ -184,13 +184,7 @@ async fn connect_with_tier(
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: client_id.to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")));
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory().with_tier(NOTES_DDL),

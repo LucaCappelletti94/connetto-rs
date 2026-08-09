@@ -1665,16 +1665,20 @@ where
     F: TransportFactory<Transport = T>,
     S: Sleeper,
 {
-    let mut backoff = driver.policy.initial_backoff;
+    let mut backoff = driver.policy.initial_backoff();
     let mut attempt: u32 = 0;
     loop {
         attempt = attempt.saturating_add(1);
-        if driver.policy.max_attempts.is_some_and(|max| attempt > max) {
+        if driver
+            .policy
+            .max_attempts()
+            .is_some_and(|max| attempt > max)
+        {
             return Recovery::Exhausted;
         }
         let _ = shared.events.send(ClientEvent::Reconnecting { attempt });
         driver.sleeper.sleep(backoff).await;
-        backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff);
+        backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff());
 
         let Ok(transport) = driver.factory.connect().await else {
             continue;

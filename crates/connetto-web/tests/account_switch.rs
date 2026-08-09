@@ -25,8 +25,7 @@
 
 use connetto_client::cipher::{UnlockError, unlock};
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, SqlFunctions,
-    replica_db_name,
+    ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, replica_db_name,
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
@@ -65,13 +64,7 @@ diesel::table! {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "e4".to_owned(),
-        login: Some(connetto_client::Grant::new("user:tester")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("e4").with_login(Some(connetto_client::Grant::new("user:tester")))
 }
 
 fn key_from_byte(byte: u8) -> ReplicaKey {

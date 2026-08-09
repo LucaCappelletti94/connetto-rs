@@ -404,15 +404,12 @@ async fn setup_authenticated(
     let replica = Replica::encrypted_file(&db_path_str, replica_key)
         .map_err(|err| anyhow::anyhow!("opening the encrypted replica: {err}"))?;
 
-    let config = ClientConfig {
+    let config = ClientConfig::new(key_name.clone())
         // Use the replica name as the client id so the server can correlate
         // this connection to the specific per-identity replica.
-        client_id: key_name.clone(),
-        login: Some(Grant::new(session.access_token)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
-        sql_functions: uuidv4_functions(),
-    };
+        .with_login(Some(Grant::new(session.access_token)))
+        .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
+        .with_sql_functions(uuidv4_functions());
 
     let conn = if existing {
         // Resume: the replica already carries its schema and cursor.

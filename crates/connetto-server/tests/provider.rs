@@ -73,15 +73,13 @@ fn http() -> openidconnect::reqwest::Client {
 
 fn provider(assurance: AssuranceRequirement) -> GenericOidcProvider {
     let jwks = CoreJsonWebKeySet::new(vec![signing_key().as_verification_key()]);
-    let config = OidcProviderConfig {
-        name: "test".to_owned(),
-        client_id: TEST_CLIENT.to_owned(),
-        client_secret: None,
-        issuer: TEST_ISSUER.to_owned(),
-        redirect_url: "https://app.example/callback".to_owned(),
-        scopes: Vec::new(),
-        assurance,
-    };
+    let config = OidcProviderConfig::new(
+        "test",
+        TEST_CLIENT,
+        TEST_ISSUER,
+        "https://app.example/callback",
+    )
+    .with_assurance(assurance);
     GenericOidcProvider::from_parts(
         config,
         "https://issuer.example/auth",
@@ -155,11 +153,7 @@ fn a_wrong_nonce_or_audience_is_refused() {
 
 #[test]
 fn mfa_assurance_requires_the_configured_amr() {
-    let provider = provider(AssuranceRequirement {
-        acr_values: Vec::new(),
-        required_amr: vec!["mfa".to_owned()],
-        max_age: None,
-    });
+    let provider = provider(AssuranceRequirement::none().with_required_amr(["mfa"]));
 
     let without_mfa = mint("nonce-1", TEST_CLIENT, &["pwd"], None);
     let refused = provider.verify_claims(&without_mfa, "nonce-1");
@@ -199,15 +193,8 @@ async fn service_with_real_provider() -> (
         .await;
     let provider: Arc<dyn IdentityProvider> = Arc::new(
         GenericOidcProvider::discover(
-            OidcProviderConfig {
-                name: "mock-idp".to_owned(),
-                client_id: client.client_id.clone(),
-                client_secret: client.client_secret.clone(),
-                issuer,
-                redirect_url: CALLBACK.to_owned(),
-                scopes: Vec::new(),
-                assurance: AssuranceRequirement::none(),
-            },
+            OidcProviderConfig::new("mock-idp", client.client_id.clone(), issuer, CALLBACK)
+                .with_client_secret(client.client_secret.clone()),
             reqwest::Client::new(),
         )
         .await

@@ -14,7 +14,7 @@
 //! is an unrecognised pragma that succeeds and encrypts nothing.
 
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, ReplicaKey, SqlFunctions, cipher,
+    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, ReplicaKey, cipher,
 };
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -59,13 +59,7 @@ diesel::table! {
 diesel::allow_tables_to_appear_in_same_query!(items, notes);
 
 fn config() -> ClientConfig {
-    ClientConfig {
-        client_id: "e2".to_owned(),
-        login: Some(Grant::new("user:token")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: SqlFunctions::new(),
-    }
+    ClientConfig::new("e2").with_login(Some(Grant::new("user:token")))
 }
 
 fn key() -> ReplicaKey {

@@ -71,7 +71,7 @@ impl ReaderReserve {
 
     /// The reader pool's configured total.
     #[must_use]
-    pub const fn total(mut self, connections: u32) -> Self {
+    pub const fn with_total(mut self, connections: u32) -> Self {
         self.total = connections;
         self
     }
@@ -80,7 +80,7 @@ impl ReaderReserve {
     ///
     /// Equal to the total, unidentified callers never reach the database.
     #[must_use]
-    pub const fn reserved(mut self, connections: u32) -> Self {
+    pub const fn with_reserved(mut self, connections: u32) -> Self {
         self.reserved = connections;
         self
     }
@@ -163,14 +163,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn identified_callers_never_take_from_the_share() {
         // The share is zero wide, yet every identified acquire succeeds.
-        let gate = ReaderReserve::new().total(1).reserved(1).gate();
+        let gate = ReaderReserve::new().with_total(1).with_reserved(1).gate();
         let _a = gate.acquire(Tier::Identified).await.expect("first");
         let _b = gate.acquire(Tier::Identified).await.expect("second");
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_share_is_the_total_less_the_reserve() {
-        let gate = ReaderReserve::new().total(3).reserved(1).gate();
+        let gate = ReaderReserve::new().with_total(3).with_reserved(1).gate();
         let held = gate.acquire(Tier::Anonymous).await.expect("first of two");
         let _second = gate.acquire(Tier::Anonymous).await.expect("second of two");
         // The third is over the share, queued to the deadline, then refused
@@ -187,7 +187,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_reserve_equal_to_the_total_turns_anonymous_access_off() {
-        let gate = ReaderReserve::new().total(2).reserved(2).gate();
+        let gate = ReaderReserve::new().with_total(2).with_reserved(2).gate();
         gate.acquire(Tier::Anonymous)
             .await
             .expect_err("the share is zero wide");
@@ -196,7 +196,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn clones_share_one_split() {
-        let gate = ReaderReserve::new().total(2).reserved(1).gate();
+        let gate = ReaderReserve::new().with_total(2).with_reserved(1).gate();
         let sibling = gate.clone();
         let _held = gate.acquire(Tier::Anonymous).await.expect("first");
         sibling
@@ -208,6 +208,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds the pool total")]
     fn a_reserve_over_the_total_refuses_configuration() {
-        let _ = ReaderReserve::new().total(2).reserved(3).gate();
+        let _ = ReaderReserve::new().with_total(2).with_reserved(3).gate();
     }
 }

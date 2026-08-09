@@ -31,29 +31,22 @@ pub const PROVIDER: &str = "dev-idp";
 pub const REFRESH_DB: &str = "e42-refresh.sqlite";
 
 pub fn auth_config() -> WorkerAuthConfig {
-    WorkerAuthConfig {
-        auth_base_url: AUTH_BASE.to_owned(),
-        // The stack serves the navigation and the fetch calls on one origin.
-        login_base_url: None,
-        provider: PROVIDER.to_owned(),
-        redirect_uri: format!("{AUTH_BASE}/dev/landing"),
-    }
+    // The stack serves the navigation and the fetch calls on one origin.
+    WorkerAuthConfig::new(AUTH_BASE, PROVIDER, format!("{AUTH_BASE}/dev/landing"))
 }
 
 pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::DbWorkerConfig {
-    connetto_web::workers::DbWorkerConfig {
-        ws_url: DEMO_WS_URL,
-        replica_db_prefix: DB_NAME,
-        replica_ddl: DEMO_SQLITE_DDL,
-        frontend_ddl: DEMO_FRONTEND_DDL,
-        upstream_sub_id: "e42-upstream",
-        upstream_query: DEMO_QUERY,
-        hub_meta_name: "e42-hub-meta.sqlite",
-        schema_version: connetto_wasm_smoke::demo_schema_version(),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-        auth,
-        auth_db_name: REFRESH_DB,
-    }
+    connetto_web::workers::DbWorkerConfig::new(connetto_wasm_smoke::demo_schema_version())
+        .with_ws_url(DEMO_WS_URL)
+        .with_replica_db_prefix(DB_NAME)
+        .with_replica_ddl(DEMO_SQLITE_DDL)
+        .with_frontend_ddl(DEMO_FRONTEND_DDL)
+        .with_upstream_sub_id("e42-upstream")
+        .with_upstream_query(DEMO_QUERY)
+        .with_hub_meta_name("e42-hub-meta.sqlite")
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_auth(auth)
+        .with_auth_db_name(REFRESH_DB)
 }
 
 /// Walk a login URL the way a navigating tab would, and return the code and state

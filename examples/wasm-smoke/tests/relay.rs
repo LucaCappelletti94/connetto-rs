@@ -83,13 +83,10 @@ async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig {
-        client_id: format!("{name}-{tag}"),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(format!("{name}-{tag}"))
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
         .await
         .expect("client connect")
@@ -185,13 +182,10 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     });
     hub.attach(relay_end);
 
-    let config = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let tab =
         ConnettoConnection::connect(tab_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
             .await
@@ -276,13 +270,10 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     hub.attach(relay_end);
     stage("hub attached");
 
-    let config = ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_wasm_smoke::demo_schema_version()),
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    };
+    let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
     let mut tab = ConnettoConnection::connect(
         MessageTransport::<MessagePort>::new(channel.port2()),
         &Replica::in_memory(),

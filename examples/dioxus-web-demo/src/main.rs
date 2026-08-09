@@ -272,30 +272,30 @@ fn main() {
 /// failure.
 async fn run_db_worker() -> Result<(), JsValue> {
     let origin = worker_origin();
-    let auth = Some(WorkerAuthConfig {
-        // Fetch calls go through this origin, where the dev server proxies
-        // them, so they are same-origin and need no CORS.
-        auth_base_url: origin.clone(),
+    let auth = Some(
+        WorkerAuthConfig::new(
+            origin.clone(),
+            AUTH_PROVIDER,
+            format!("{origin}{AUTH_CALLBACK_PATH}"),
+        )
         // The login is a navigation, which the dev server's proxy does not
         // forward, so it goes straight to the auth origin. A navigation needs
         // no CORS either way.
-        login_base_url: Some(AUTH_ORIGIN.to_owned()),
-        provider: AUTH_PROVIDER.to_owned(),
-        redirect_uri: format!("{origin}{AUTH_CALLBACK_PATH}"),
-    });
-    let user_id = workers::boot_db_worker::<String>(&workers::DbWorkerConfig {
-        ws_url: DEMO_WS_URL,
-        replica_db_prefix: DB_NAME,
-        replica_ddl: DEMO_SQLITE_DDL,
-        frontend_ddl: FRONTEND_DDL,
-        upstream_sub_id: "db-upstream",
-        upstream_query: DEMO_QUERY,
-        hub_meta_name: "connetto-hub-meta.sqlite",
-        schema_version: connetto_core::SchemaVersion::from_source(SCHEMA_SQL),
-        sql_functions: uuidv4_functions(),
-        auth,
-        auth_db_name: AUTH_DB_NAME,
-    })
+        .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
+    );
+    let user_id = workers::boot_db_worker::<String>(
+        &workers::DbWorkerConfig::new(connetto_core::SchemaVersion::from_source(SCHEMA_SQL))
+            .with_ws_url(DEMO_WS_URL)
+            .with_replica_db_prefix(DB_NAME)
+            .with_replica_ddl(DEMO_SQLITE_DDL)
+            .with_frontend_ddl(FRONTEND_DDL)
+            .with_upstream_sub_id("db-upstream")
+            .with_upstream_query(DEMO_QUERY)
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_sql_functions(uuidv4_functions())
+            .with_auth(auth)
+            .with_auth_db_name(AUTH_DB_NAME),
+    )
     .await?;
     // Post the identity so the page can show which account owns the replica.
     if let (Some(uid), Ok(ch)) = (user_id, BroadcastChannel::new(DEMO_UID_CHANNEL)) {
@@ -351,13 +351,9 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let transport =
         MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let config = ClientConfig {
-        client_id: client_id.clone(),
-        login: None,
-        capabilities: Vec::new(),
-        schema_version: Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)),
-        sql_functions: uuidv4_functions(),
-    };
+    let config = ClientConfig::new(client_id.clone())
+        .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
+        .with_sql_functions(uuidv4_functions());
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -367,11 +363,9 @@ async fn boot_window() -> Result<Boot, JsValue> {
     )
     .await
     .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let policy = connetto_client::reconnect::ReconnectPolicy {
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(2),
-        max_attempts: None,
-    };
+    let policy = connetto_client::reconnect::ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(100))
+        .with_max_backoff(Duration::from_secs(2));
     let (client, pump) = ConnettoClient::with_reconnect(
         conn,
         workers::tab_wire_factory(client_id),

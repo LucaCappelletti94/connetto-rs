@@ -53,9 +53,9 @@ const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 #[derive(Debug, Clone)]
 pub struct OplogConfig {
     /// Maximum number of retained entries. The oldest are dropped first.
-    pub max_entries: usize,
+    max_entries: usize,
     /// Maximum age of a retained entry, measured against the oplog's clock.
-    pub max_age: Duration,
+    max_age: Duration,
 }
 
 impl Default for OplogConfig {
@@ -64,6 +64,28 @@ impl Default for OplogConfig {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_age: DEFAULT_MAX_AGE,
         }
+    }
+}
+
+impl OplogConfig {
+    /// Returns the defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of retained entries.
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
+    /// Sets the maximum age of a retained entry.
+    #[must_use]
+    pub const fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
     }
 }
 

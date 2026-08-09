@@ -260,13 +260,7 @@ async fn use_live_renders_and_follows_cdc() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "dioxus-test".to_owned(),
-        login: Some(Grant::new("user:dioxus-test")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config = ClientConfig::new("dioxus-test").with_login(Some(Grant::new("user:dioxus-test")));
     let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
     let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
         .await
@@ -338,13 +332,8 @@ async fn use_live_fn_follows_a_boxed_row_query() {
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig {
-        client_id: "dioxus-fn-test".to_owned(),
-        login: Some(Grant::new("user:dioxus-fn-test")),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_client::SqlFunctions::new(),
-    };
+    let config =
+        ClientConfig::new("dioxus-fn-test").with_login(Some(Grant::new("user:dioxus-fn-test")));
     let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
     let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
         .await

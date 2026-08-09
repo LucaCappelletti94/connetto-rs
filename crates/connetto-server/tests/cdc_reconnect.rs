@@ -194,12 +194,11 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .expect("send subscribe");
 
     // Resilient ingest: reconnect the streaming source with a brisk backoff.
-    let policy = ReconnectPolicy {
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(2),
-        max_attempts: Some(50),
-        healthy_after: Duration::from_secs(1),
-    };
+    let policy = ReconnectPolicy::new()
+        .with_initial_backoff(Duration::from_millis(100))
+        .with_max_backoff(Duration::from_secs(2))
+        .with_max_attempts(Some(50))
+        .with_healthy_after(Duration::from_secs(1));
     let url = admin_url();
     let ingest_manager = manager.clone();
     let _ingest = tokio::spawn(async move {

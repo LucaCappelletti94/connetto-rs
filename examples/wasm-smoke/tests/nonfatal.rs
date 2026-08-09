@@ -132,13 +132,9 @@ where
 }
 
 async fn tab_config() -> ClientConfig {
-    ClientConfig {
-        client_id: rosetta_uuid::Uuid::new_v4().to_string(),
-        login: Some(Grant::new(common::mint_token().await)),
-        capabilities: Vec::new(),
-        schema_version: None,
-        sql_functions: connetto_wasm_smoke::uuidv4_functions(),
-    }
+    ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
 }
 
 #[wasm_bindgen_test]
