@@ -2252,6 +2252,13 @@ where
         state: &mut SessionState<Id, Key>,
         capture: DeltaAggregateCapture,
     ) -> Result<(), SessionError> {
+        // Announce the seed before reading it, so a change dispatched while the
+        // connector is in flight is held and applied on top rather than folded
+        // into an accumulator that does not exist yet (R28 part B).
+        self.materializer
+            .lock()
+            .await
+            .expect_aggregate(capture.consumer_id);
         let row = match self
             .connector
             .execute_scalar_row(&capture.bootstrap.sql, &capture.bootstrap.kinds, &())

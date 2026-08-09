@@ -402,6 +402,9 @@ where
     /// Per-consumer delta aggregate state, keyed by consumer id. Seeded by the
     /// session after bootstrap, then folded on each dispatched event.
     deltas: HashMap<u64, (AggSpec, AggAccumulator)>,
+    /// Deltas that arrived while a consumer's seed was still being read, keyed
+    /// the same way. Drained into the accumulator by `install_aggregate`.
+    pending_deltas: HashMap<u64, Vec<subql::AggDelta>>,
 }
 
 impl Materializer<ParserDB, RuntimeWritableCatalog> {
@@ -442,6 +445,7 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
             write,
             reexec: HashMap::new(),
             deltas: HashMap::new(),
+            pending_deltas: HashMap::new(),
         })
     }
 
@@ -627,12 +631,27 @@ where
         self.engine.install(query_id, value)
     }
 
-    /// Seed a delta aggregate's accumulator for `consumer_id`.
+    /// Announce that a seed is being read for `consumer_id`, so deltas
+    /// dispatched while the read is in flight are held rather than dropped.
     ///
-    /// Called once after the session bootstraps the initial value through the
-    /// connector. Later [`dispatch`](Self::dispatch) calls fold each event's
+    /// The seed is a value as of some moment before it arrives, and the
+    /// accumulator does not exist until it does, so without this every change
+    /// committed inside that window is folded into nothing. It cannot be
+    /// recovered later either: each update carries the whole accumulated
+    /// value, so the error is permanent rather than transient (R28 part B).
+    pub fn expect_aggregate(&mut self, consumer_id: u64) {
+        self.pending_deltas.insert(consumer_id, Vec::new());
+    }
+
+    /// Seed the folded accumulator for `consumer_id` with the value read by the
+    /// connector, then apply everything buffered since
+    /// [`expect_aggregate`](Self::expect_aggregate). Later
+    /// [`dispatch`](Self::dispatch) calls fold each event's
     /// [`AggDelta`](subql::AggDelta) into this accumulator.
-    pub fn install_aggregate(&mut self, consumer_id: u64, spec: AggSpec, acc: AggAccumulator) {
+    pub fn install_aggregate(&mut self, consumer_id: u64, spec: AggSpec, mut acc: AggAccumulator) {
+        for delta in self.pending_deltas.remove(&consumer_id).unwrap_or_default() {
+            acc.apply(&delta);
+        }
         self.deltas.insert(consumer_id, (spec, acc));
     }
 
@@ -640,6 +659,8 @@ where
     /// subscription. Returns whether the subscription existed.
     pub fn unregister_delta_aggregate(&mut self, consumer_id: u64, sub_id: SubscriptionId) -> bool {
         self.deltas.remove(&consumer_id);
+        // A bootstrap that failed leaves a buffer nobody will ever drain.
+        self.pending_deltas.remove(&consumer_id);
         self.engine.inner_mut().unregister_subscription(sub_id)
     }
 
@@ -751,26 +772,7 @@ where
                 .collect()
         };
 
-        // Fold this event's per-consumer deltas into the seeded accumulators.
-        // Skip the engine call entirely when no delta aggregate is installed,
-        // which is the common case and avoids a spurious error path for events
-        // the aggregate machinery treats specially (e.g. Truncate).
-        let delta_aggregates = if self.deltas.is_empty() {
-            Vec::new()
-        } else {
-            let deltas = self.engine.inner_mut().aggregate_deltas(event)?;
-            let mut changes = Vec::with_capacity(deltas.len());
-            for (consumer_id, delta) in deltas {
-                if let Some((_, acc)) = self.deltas.get_mut(&consumer_id) {
-                    acc.apply(&delta);
-                    changes.push(DeltaAggregateChange {
-                        consumer_id,
-                        result_json: agg_value_to_json(acc.value()),
-                    });
-                }
-            }
-            changes
-        };
+        let delta_aggregates = self.fold_delta_aggregates(event)?;
 
         Ok(Dispatched {
             patches,
@@ -778,6 +780,39 @@ where
             triggers,
             delta_aggregates,
         })
+    }
+
+    /// Fold this event's per-consumer deltas into the seeded accumulators, and
+    /// buffer them for a consumer whose seed is still in flight.
+    ///
+    /// Skips the engine call entirely when neither map holds anything, which is
+    /// the common case and avoids a spurious error path for events the
+    /// aggregate machinery treats specially (e.g. Truncate).
+    fn fold_delta_aggregates(
+        &mut self,
+        event: &ChangeEvent,
+    ) -> Result<Vec<DeltaAggregateChange>, MaterializerError> {
+        if self.deltas.is_empty() && self.pending_deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deltas = self.engine.inner_mut().aggregate_deltas(event)?;
+        let mut changes = Vec::with_capacity(deltas.len());
+        for (consumer_id, delta) in deltas {
+            if let Some((_, acc)) = self.deltas.get_mut(&consumer_id) {
+                acc.apply(&delta);
+                changes.push(DeltaAggregateChange {
+                    consumer_id,
+                    result_json: agg_value_to_json(acc.value()),
+                });
+            } else if let Some(buffered) = self.pending_deltas.get_mut(&consumer_id) {
+                // The seed this consumer will be built from was read before
+                // this event, so the delta is not in it. Hold it until
+                // `install_aggregate` can apply it on top, or it is lost for
+                // the life of the accumulator (R28 part B).
+                buffered.push(delta);
+            }
+        }
+        Ok(changes)
     }
 
     /// Build the oplog record for a dispatched CDC event.

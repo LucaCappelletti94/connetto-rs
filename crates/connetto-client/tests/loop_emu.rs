@@ -1473,6 +1473,27 @@ async fn collect_aggregates(
     seen
 }
 
+/// Pump the client to the first aggregate frame carrying `sub_id`, and report
+/// whether it was a full result. Frames for other labels are skipped, so a
+/// second aggregate in the same session cannot decide the answer.
+async fn first_aggregate_frame(
+    client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
+    sub_id: &str,
+) -> bool {
+    loop {
+        let event = pump_until(client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
+        if let ClientEvent::Aggregate {
+            sub_id: label,
+            is_full_result,
+            ..
+        } = event
+            && label == sub_id
+        {
+            return is_full_result;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
@@ -1571,6 +1592,224 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     assert_eq!(after_delete["count"], "1");
     assert_eq!(after_delete["sum"], "20.0");
     assert_eq!(after_delete["avg"], "20.0");
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// An [`AsyncConnector`] whose delta aggregate seed reports when it starts and
+/// is held open until the test releases it, so a change can be dispatched
+/// inside the bootstrap window rather than raced into it. The
+/// [`GatedSnapshot`] of part A, for the aggregate path of part B.
+struct GatedSeed {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    rows: Mutex<VecDeque<Vec<PgValue<Postgres>>>>,
+}
+
+#[allow(clippy::manual_async_fn)]
+impl AsyncConnector for GatedSeed {
+    type AuthContext = ();
+    type Error = std::io::Error;
+    type Checkpoint = PgLsn;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        _sql: &str,
+        _kind: ScalarKind,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+    > + Send {
+        async { Err(std::io::Error::other("the gated seed serves no scalars")) }
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+    > + Send {
+        async { Err(std::io::Error::other("the gated seed serves no rows")) }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        _sql: &str,
+        _kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
+    > + Send {
+        let next = self.rows.lock().expect("queue poisoned").pop_front();
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        async move {
+            entered.notify_one();
+            release.notified().await;
+            next.map(|row| (row, Some(PgLsn(1)))).ok_or_else(|| {
+                ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
+            })
+        }
+    }
+}
+
+/// R28 part B. A change dispatched while a delta aggregate is reading its own
+/// bootstrap must still be counted.
+///
+/// The accumulator is seeded from a read taken before the change, and the
+/// route does not exist yet, so the fold is computed and dropped by
+/// `Materializer::dispatch`, which skips a consumer with no installed
+/// accumulator. Nothing heals it: every later update sends the whole
+/// accumulated value, permanently short by one. The second insert is what
+/// makes that visible, since it forces a delivery whose value can be checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_change_during_an_aggregate_bootstrap_is_counted() {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    // The seed the connector will return once released: COUNT(*) over the
+    // table as it stood before the contested insert.
+    let connector = GatedSeed {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        rows: Mutex::new(VecDeque::from([vec![PgValue::Int(0)]])),
+    };
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        test_verifier(),
+        connector,
+        target,
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe count");
+
+    // The seed is now held open inside the connector, which is the window.
+    entered.notified().await;
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 10, 'x')")
+        .expect("emu insert inside the window");
+    drain_events(&manager, &mut source).await;
+    release.notify_one();
+
+    let seeded = collect_aggregates(&mut client, &["count"]).await;
+    assert_eq!(seeded["count"], "0", "the seed is the pre-change read");
+
+    // A second insert forces a delivery. The true count is two.
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 1.0, 20, 'y')")
+        .expect("emu insert after the window");
+    drain_events(&manager, &mut source).await;
+    let after = collect_aggregates(&mut client, &["count"]).await;
+    assert_eq!(
+        after["count"], "2",
+        "the change dispatched during the bootstrap must be counted, not dropped",
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// R28 part B. The first aggregate frame a subscriber sees is its full result,
+/// never a fold that arrived first.
+///
+/// This one passes before the fix as well, and deliberately: its job is to
+/// defend the ordering rather than to demonstrate a defect. The property comes
+/// from `run_session` being one task with two `select!` arms, so a fold queued
+/// on `outbound` cannot reach the wire while the transport arm is still inside
+/// the subscribe. Moving the initial send onto its own task would break that
+/// with nothing else failing, which is what this asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn an_aggregates_first_frame_is_its_full_result() {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let connector = GatedSeed {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        rows: Mutex::new(VecDeque::from([vec![PgValue::Int(0)]])),
+    };
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        PermissiveAuth,
+        test_verifier(),
+        connector,
+        target,
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client
+        .subscribe("count", "SELECT COUNT(*) FROM orders")
+        .await
+        .expect("subscribe count");
+
+    // Queue a fold while the subscribe is still inside its bootstrap, so the
+    // route exists before the initial value has been sent.
+    entered.notified().await;
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 10, 'x')")
+        .expect("emu insert inside the window");
+    drain_events(&manager, &mut source).await;
+    release.notify_one();
+
+    let first = first_aggregate_frame(&mut client, "count").await;
+    assert!(
+        first,
+        "the first frame for an aggregate must be its full result",
+    );
 
     client.close().await.expect("close");
     server.await.expect("join server");
