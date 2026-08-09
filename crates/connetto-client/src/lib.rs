@@ -770,9 +770,20 @@ fn replica_columns(db: &mut SqliteConnection, table: &str) -> Result<Vec<String>
     Ok(rows.into_iter().map(|row| row.name).collect())
 }
 
-/// Record `cursor` in the replica's metadata table. Callers wrap this in the
-/// same transaction as the patch apply it belongs to, so a crash never
-/// separates a row change from its resume point.
+/// Record `cursor` in the replica's metadata table.
+///
+/// **Invariant: a resume position is never recorded for data this replica has
+/// not applied.** A resume position is a promise that everything up to it is
+/// already here, and the next attach asks the server only for what follows, so
+/// recording one early loses the rows in between with nothing on either side
+/// able to notice.
+///
+/// Two callers hold it two ways. `apply_patch` writes the rows and the cursor
+/// in one transaction, so a crash cannot separate them. The `SnapshotEnd` arm
+/// of `handle_control` has no rows of its own to bind to and relies on the
+/// server having sent the snapshot first, which it does because the completion
+/// frame shares the delivery queue with the rows it completes (R33). Asserted
+/// by `no_resume_position_is_persisted_for_rows_that_never_arrived`.
 fn persist_cursor(db: &mut SqliteConnection, cursor: &Cursor) -> Result<(), ClientError> {
     diesel::sql_query(
         "INSERT INTO _connetto_meta (id, cursor) VALUES (1, ?) \
@@ -1987,6 +1998,10 @@ where
                 sub_id: begin.sub_id,
             }),
             ControlMessage::SnapshotEnd(end) => {
+                // This records a resume position for rows delivered on the
+                // other plane, so it depends on the server having sent them
+                // first: see the invariant on `persist_cursor`.
+                //
                 // An empty cursor carries no resume information: never let
                 // it regress a real one, in memory or in the replica.
                 if !end.cursor.is_empty() {

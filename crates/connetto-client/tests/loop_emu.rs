@@ -87,6 +87,34 @@ impl SnapshotSource for SeedSnapshot {
     }
 }
 
+/// The resume position `CursoredSeed` names, so the assertions can say which
+/// cursor they mean rather than testing merely for absence.
+const SEED_CURSOR: u64 = 42;
+
+/// The one-row seed under a non-empty cursor.
+///
+/// Every other source here leaves the cursor empty, and the client skips
+/// persisting an empty one, so a source that carries a real resume position is
+/// what makes the durability question observable at all.
+struct CursoredSeed;
+
+impl SnapshotSource for CursoredSeed {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<Snapshot, Self::Error> {
+        Ok(Snapshot {
+            cursor: Cursor::new(SEED_CURSOR.to_be_bytes().to_vec()),
+            ..seed_snapshot()
+        })
+    }
+}
+
 /// A snapshot source that serves the one-row seed and records every
 /// subscription's `select_sql`, so a test can count how many distinct wire
 /// subscriptions actually reached the server.
@@ -384,21 +412,21 @@ async fn pump_until(
     }
 }
 
-/// Apply every frame that arrives within `window`, then stop. For assertions
-/// about what did or did not reach the replica, where waiting for a named
-/// event would hang precisely in the failing case.
+/// Apply every frame that arrives within `window`, then stop, returning the
+/// events seen. For assertions about what did or did not reach the replica,
+/// where waiting for a named event would hang precisely in the failing case.
 async fn pump_for(
     client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
     window: Duration,
-) {
+) -> Vec<ClientEvent> {
     let deadline = tokio::time::Instant::now() + window;
+    let mut seen = Vec::new();
     while let Ok(event) = tokio::time::timeout_at(deadline, client.pump_one()).await {
-        assert_ne!(
-            event.expect("client pump failed"),
-            ClientEvent::Closed,
-            "connection closed early"
-        );
+        let event = event.expect("client pump failed");
+        assert_ne!(event, ClientEvent::Closed, "connection closed early");
+        seen.push(event);
     }
+    seen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3465,6 +3493,99 @@ async fn a_row_that_leaves_its_only_subscription_is_removed() {
         orders(client.conn()),
         vec![order(1, 1.0, 3, "seed")],
         "nothing else covers it, so leaving the window removes it",
+    );
+
+    drop(client);
+    server.abort();
+}
+
+/// The resume position this replica would restart from, read from the replica
+/// rather than from memory, because surviving a process death is the whole
+/// property.
+fn persisted_cursor(conn: &mut SqliteConnection) -> Option<Vec<u8>> {
+    #[derive(diesel::QueryableByName)]
+    struct MetaRow {
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        cursor: Vec<u8>,
+    }
+    let rows: Vec<MetaRow> = sql_query("SELECT cursor FROM _connetto_meta WHERE id = 1")
+        .load(conn)
+        .expect("read the resume position");
+    rows.into_iter().next().map(|row| row.cursor)
+}
+
+/// R33. A client must never hold a resume position for rows it has not applied.
+///
+/// `SnapshotEnd` is a control frame and is not flow controlled, while the rows
+/// it completes ride the credit-gated bulk plane. With the window shut the
+/// completion frame arrives alone, and acting on it writes the snapshot's
+/// cursor into `_connetto_meta` over an empty replica. A process dying there
+/// restarts from a position naming rows it never saw, and nothing detects it.
+///
+/// Demonstrating: this fails before the fix, with the cursor present and the
+/// rows absent.
+///
+/// The window is shut by configuration, so there is no race and no gate. It
+/// cannot reopen: a client acknowledges a credit only after applying a bulk
+/// frame, so a zero window admits nothing it could acknowledge. The test
+/// therefore pumps for a bounded period and asserts what did and did not land,
+/// rather than waiting for a frame that must stop arriving once the fix is in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let manager = SessionManager::new(
+        Materializer::new(PG_DDL).expect("build materializer"),
+        CursoredSeed,
+        PermissiveAuth,
+        test_verifier(),
+        server_write_target(&fixture),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::new().with_initial_credits(0),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    let seen = pump_for(&mut client, Duration::from_secs(2)).await;
+
+    // Guards the assertions below against passing vacuously: the subscription
+    // did reach the server and the server did start serving it.
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, ClientEvent::SnapshotBegin { .. })),
+        "the subscription was served, so the assertions below are about \
+         delivery rather than about a subscription that never happened: {seen:?}",
+    );
+    assert_eq!(
+        orders(client.conn()),
+        vec![],
+        "the window is shut, so no snapshot row can have arrived",
+    );
+    assert_eq!(
+        persisted_cursor(client.conn()),
+        None,
+        "no resume position may be persisted for rows that never arrived",
+    );
+    assert_eq!(
+        client.cursor(),
+        None,
+        "and none may be held in memory either, since that is what the next \
+         handshake resumes from",
     );
 
     drop(client);

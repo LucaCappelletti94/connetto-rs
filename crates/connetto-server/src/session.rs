@@ -407,10 +407,35 @@ struct HandshakeOutcome<Id, Key> {
     span: tracing::Span,
 }
 
+/// One item waiting on the outbound queue.
+///
+/// Whether a frame is rationed and whether it is ordered against the data are
+/// two separate questions, and the queue answers both. [`Rows`](Self::Rows)
+/// costs a credit, because flow control exists to bound bulk. `SnapshotEnd`
+/// costs nothing but must still travel behind the rows it completes, so it
+/// waits in line and leaves free.
+///
+/// The set is closed on purpose. A control frame that must **not** be held
+/// behind data, a `Pong` above all, has no variant here and cannot be queued
+/// by accident: it goes straight out through `send_control`.
+enum Deliverable {
+    /// A bulk frame. Costs one credit.
+    Rows(BulkMessage),
+    /// The frame closing a snapshot. Ordered, never charged.
+    SnapshotComplete(SnapshotEnd),
+}
+
+impl Deliverable {
+    /// Whether sending this spends one of the client's delivery credits.
+    const fn costs_credit(&self) -> bool {
+        matches!(self, Self::Rows(_))
+    }
+}
+
 /// Mutable per-session state carried through the run loop.
 struct SessionState<Id, Key> {
     credits: u32,
-    pending: VecDeque<BulkMessage>,
+    pending: VecDeque<Deliverable>,
     subs: HashMap<String, (u64, SubscriptionId)>,
     agg_subs: HashMap<String, u64>,
     /// Delta aggregate subscriptions by client label: consumer id and engine
@@ -1582,7 +1607,7 @@ where
                                 &mut transport,
                                 &mut state.credits,
                                 &mut state.pending,
-                                BulkMessage::LivePatch(patch),
+                                Deliverable::Rows(BulkMessage::LivePatch(patch)),
                             )
                             .await
                             .map_err(transport_err)?;
@@ -2037,6 +2062,10 @@ where
     /// Snapshot a row subscription: route first, then read, then resync
     /// notice, begin, patch, end.
     ///
+    /// The patch and the end share one queue, so the end cannot overtake the
+    /// rows it completes however far behind the client has fallen. Only the
+    /// patch spends a credit.
+    ///
     /// Live delivery runs throughout the snapshot, so a change committed while
     /// it is in flight reaches the client as a patch queued behind
     /// `SnapshotEnd`. Such a patch may repeat a row the snapshot already
@@ -2084,17 +2113,29 @@ where
             transport,
             &mut state.credits,
             &mut state.pending,
-            BulkMessage::SnapshotPatch(SnapshotPatch::new(sub.sub_id.clone(), payload)),
+            Deliverable::Rows(BulkMessage::SnapshotPatch(SnapshotPatch::new(
+                sub.sub_id.clone(),
+                payload,
+            ))),
         )
         .await
         .map_err(transport_err)?;
-        transport
-            .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
+        // Queued rather than sent, so it cannot overtake the rows it completes
+        // when the credit window is shut. It costs no credit: it waits its
+        // turn, it is not rationed. Sending it here instead would tell the
+        // client to record a resume position for rows still in `pending`
+        // (R33).
+        enqueue_and_flush(
+            transport,
+            &mut state.credits,
+            &mut state.pending,
+            Deliverable::SnapshotComplete(SnapshotEnd {
                 sub_id: sub.sub_id,
                 cursor: snapshot.cursor,
-            }))
-            .await
-            .map_err(transport_err)?;
+            }),
+        )
+        .await
+        .map_err(transport_err)?;
         Ok(())
     }
 
@@ -2175,7 +2216,7 @@ where
                 transport,
                 &mut state.credits,
                 &mut state.pending,
-                BulkMessage::LivePatch(live),
+                Deliverable::Rows(BulkMessage::LivePatch(live)),
             )
             .await
             .map_err(transport_err)?;
@@ -2316,30 +2357,45 @@ where
     }
 }
 
-/// Send `msg` under flow control: enqueue then drain what the credit window
-/// allows, preserving FIFO order.
+/// Queue `msg` then drain what the credit window allows, preserving FIFO order.
 async fn enqueue_and_flush<T: Transport>(
     transport: &mut T,
     credits: &mut u32,
-    pending: &mut VecDeque<BulkMessage>,
-    msg: BulkMessage,
+    pending: &mut VecDeque<Deliverable>,
+    msg: Deliverable,
 ) -> Result<(), T::Error> {
     pending.push_back(msg);
     flush(transport, credits, pending).await
 }
 
-/// Drain queued bulk frames while credits remain.
+/// Drain the outbound queue in order, stopping at the first bulk frame the
+/// credit window cannot pay for.
+///
+/// A free item behind a bulk frame the window cannot afford stays queued, and
+/// that is the point: it is queued precisely because it describes data the
+/// client has not received.
 async fn flush<T: Transport>(
     transport: &mut T,
     credits: &mut u32,
-    pending: &mut VecDeque<BulkMessage>,
+    pending: &mut VecDeque<Deliverable>,
 ) -> Result<(), T::Error> {
-    while *credits > 0 {
-        let Some(msg) = pending.pop_front() else {
-            break;
+    loop {
+        if *credits == 0 && pending.front().is_some_and(Deliverable::costs_credit) {
+            return Ok(());
+        }
+        let Some(next) = pending.pop_front() else {
+            return Ok(());
         };
-        transport.send_bulk(msg).await?;
-        *credits -= 1;
+        match next {
+            Deliverable::Rows(msg) => {
+                transport.send_bulk(msg).await?;
+                *credits -= 1;
+            }
+            Deliverable::SnapshotComplete(end) => {
+                transport
+                    .send_control(ControlMessage::SnapshotEnd(end))
+                    .await?;
+            }
+        }
     }
-    Ok(())
 }

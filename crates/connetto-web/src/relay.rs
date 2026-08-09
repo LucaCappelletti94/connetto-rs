@@ -51,8 +51,10 @@
 //!
 //! Flow control matches the server: each tab has a delivery-credit window, so
 //! bulk frames (`LivePatch`, `SnapshotPatch`) queue once credits reach zero and
-//! drain on `AckCredits`. Control frames are never gated, so keepalive and
-//! acknowledgements cannot deadlock behind a full window.
+//! drain on `AckCredits`. No control frame consumes a credit, so keepalive and
+//! acknowledgements cannot deadlock behind a full window. `SnapshotEnd` is the
+//! one control frame that still waits its turn in the queue, because it
+//! describes rows the tab has not received yet.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -91,8 +93,8 @@ const SEQ_MAP_CAP: usize = 256;
 
 /// The delivery-credit window the hub advertises and enforces per tab,
 /// matching the server's `initial_credits`. Only bulk frames (`LivePatch`,
-/// `SnapshotPatch`) consume credits; control frames are never gated, so
-/// keepalive and acknowledgements cannot deadlock behind a full window.
+/// `SnapshotPatch`) consume credits, so keepalive and acknowledgements cannot
+/// deadlock behind a full window.
 const INITIAL_CREDITS: u32 = 64;
 
 /// Identifies one attached tab for the hub's lifetime.
@@ -201,9 +203,32 @@ struct TabState {
     /// decrements it, an `AckCredits` frame replenishes it. Starts at
     /// `INITIAL_CREDITS`, mirroring the server's per-session window.
     credits: u32,
-    /// Bulk frames queued while `credits` was zero, drained in FIFO order as
-    /// credits return.
-    pending: VecDeque<BulkMessage>,
+    /// Frames queued toward this tab, drained in FIFO order as credits return.
+    pending: VecDeque<TabDeliverable>,
+}
+
+/// One item waiting on a tab's outbound queue.
+///
+/// Mirrors the server's `Deliverable`: whether a frame is rationed and whether
+/// it is ordered against the data are two separate questions.
+/// [`Rows`](Self::Rows) costs a credit, `SnapshotEnd` costs nothing but must
+/// still travel behind the rows it completes.
+///
+/// The set is closed on purpose. A control frame that must **not** be held
+/// behind data, a `Pong` above all, has no variant here and cannot be queued
+/// by accident.
+enum TabDeliverable {
+    /// A bulk frame. Costs one credit.
+    Rows(BulkMessage),
+    /// The frame closing a snapshot. Ordered, never charged.
+    SnapshotComplete(SnapshotEnd),
+}
+
+impl TabDeliverable {
+    /// Whether sending this spends one of the tab's delivery credits.
+    const fn costs_credit(&self) -> bool {
+        matches!(self, Self::Rows(_))
+    }
 }
 
 /// A failure inside the tab-mutation apply transaction.
@@ -1460,7 +1485,7 @@ where
             cursor.clone(),
             payload.to_vec(),
         ));
-        enqueue_tab_bulk(tab, msg);
+        enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
     }
     Ok(())
 }
@@ -1582,7 +1607,7 @@ where
                     cursor.clone(),
                     patchset_zstd.to_vec(),
                 ));
-                enqueue_tab_bulk(tab, msg);
+                enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
             }
             Ok(())
         }
@@ -1920,36 +1945,65 @@ where
         },
     )));
     for payload in payloads {
-        enqueue_tab_bulk(
+        enqueue_tab_frame(
             tab,
-            BulkMessage::SnapshotPatch(SnapshotPatch::new(sub_id.to_owned(), payload)),
+            TabDeliverable::Rows(BulkMessage::SnapshotPatch(SnapshotPatch::new(
+                sub_id.to_owned(),
+                payload,
+            ))),
         );
     }
-    let _ = tab
-        .out
-        .send(TabOut::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
+    // Queued rather than sent, so it cannot overtake the rows it completes
+    // when the tab's credit window is shut. It costs no credit: it waits its
+    // turn, it is not rationed (R33).
+    enqueue_tab_frame(
+        tab,
+        TabDeliverable::SnapshotComplete(SnapshotEnd {
             sub_id: sub_id.to_owned(),
             cursor: relay_cursor(worker),
-        })));
+        }),
+    );
     Ok(())
 }
 
-/// Queue one bulk frame toward a tab under its credit window, then drain what
-/// the credits allow in FIFO order. Mirrors the server's `enqueue_and_flush`.
-fn enqueue_tab_bulk(tab: &mut TabState, msg: BulkMessage) {
+/// Queue one frame toward a tab under its credit window, then drain what the
+/// credits allow in FIFO order. Mirrors the server's `enqueue_and_flush`.
+fn enqueue_tab_frame(tab: &mut TabState, msg: TabDeliverable) {
     tab.pending.push_back(msg);
     flush_tab_bulk(tab);
 }
 
-/// Drain a tab's queued bulk frames while credits remain, one credit per
-/// frame. A dropped `out` means the tab is gone, so sends stay best effort.
+/// Drain a tab's queue in order, stopping at the first bulk frame the credit
+/// window cannot pay for. A dropped `out` means the tab is gone, so sends stay
+/// best effort.
+///
+/// A free item behind a bulk frame the window cannot afford stays queued, and
+/// that is the point: it is queued precisely because it describes data the tab
+/// has not received.
 fn flush_tab_bulk(tab: &mut TabState) {
-    while tab.credits > 0 {
-        let Some(msg) = tab.pending.pop_front() else {
-            break;
+    loop {
+        if tab.credits == 0
+            && tab
+                .pending
+                .front()
+                .is_some_and(TabDeliverable::costs_credit)
+        {
+            return;
+        }
+        let Some(next) = tab.pending.pop_front() else {
+            return;
         };
-        let _ = tab.out.send(TabOut::Bulk(msg));
-        tab.credits -= 1;
+        match next {
+            TabDeliverable::Rows(msg) => {
+                let _ = tab.out.send(TabOut::Bulk(msg));
+                tab.credits -= 1;
+            }
+            TabDeliverable::SnapshotComplete(end) => {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::SnapshotEnd(end)));
+            }
+        }
     }
 }
 
