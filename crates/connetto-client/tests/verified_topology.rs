@@ -19,7 +19,9 @@
 //!   -p 55470:5432 postgres:16 -c wal_level=logical
 //! # apply examples/wasm-smoke/schema.sql, a publication, a slot,
 //! # _connetto_mutations, connetto_sessions, connetto_provider_tokens,
-//! # and examples/wasm-smoke/roles.sql for the reader role
+//! # the connetto_change_op enum and the connetto_oplog table (see
+//! # docs/architecture/11-authentication.md for both), and
+//! # examples/wasm-smoke/roles.sql for the reader role
 //! cargo run --release -p connetto-server --example dev_idp
 //! set -a && . target/dev-idp.env && set +a
 //! CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \

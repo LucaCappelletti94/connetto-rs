@@ -90,6 +90,14 @@ pub enum FatalErrorReason {
         /// How long until the limit's window rolls over.
         retry_after_ms: u64,
     },
+    /// The server's change feed skipped a stretch of changes, so it can no
+    /// longer prove what this connection has already seen.
+    ///
+    /// The connection is closed rather than corrected in place: reconnecting
+    /// re-declares every subscription through the ordinary path, which rebuilds
+    /// a running total from its source instead of trying to repair one that
+    /// accumulated across the gap.
+    ChangeStreamGap,
 }
 
 /// Session-terminating error frame.

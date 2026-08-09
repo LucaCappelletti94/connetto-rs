@@ -31,9 +31,11 @@ mod key_filter;
 pub mod materializer;
 pub mod oplog;
 pub mod pk;
+pub mod preflight;
 pub mod reserve;
 pub mod row_view;
 pub mod session;
+pub mod slot;
 pub mod snapshot;
 pub mod throttle;
 pub mod watermark_schema;
@@ -77,12 +79,14 @@ pub use oplog::{
     OplogConfig, catchup_decision,
 };
 pub use oplog::{PgOplog, PgOplogError};
+pub use preflight::{Artifact, PreflightError};
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
     NoConnector, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError, SessionManager,
     Snapshot, SnapshotSource,
 };
+pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
 pub use throttle::{Limit, ThrottleConfig, Tier, TierLimits};
 pub use watermark_schema::ConnettoWatermarkSchema;

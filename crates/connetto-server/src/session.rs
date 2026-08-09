@@ -765,14 +765,83 @@ where
     /// so a handshake racing the shutdown registers into an empty map and is
     /// closed by the listener stopping rather than by a second frame.
     pub async fn shutdown(&self) -> usize {
+        self.close_all(FatalErrorReason::ServerShuttingDown).await
+    }
+
+    /// Reconcile the change feed's resume position against what the log holds,
+    /// declaring a resync epoch when the feed skipped a stretch.
+    ///
+    /// Called before each connect with the position the stream is about to
+    /// resume from. Everything the feed delivered was appended to the log
+    /// before being acknowledged, so in ordinary operation the resume position
+    /// is at or behind the log's own high-water mark and this does nothing. A
+    /// resume position **ahead** of it means changes happened that the feed
+    /// never delivered: an invalidated slot the deployment recreated, a
+    /// database restored from a backup, or a slot dropped under a running
+    /// server. Detecting the hole rather than the cause is deliberate, since
+    /// no layer here distinguishes an invalidation from an ordinary
+    /// disconnection and matching on an error string would pin this to one
+    /// Postgres version and to the causes somebody enumerated (R32).
+    ///
+    /// **The boundary reported is the resume position, not the last record
+    /// ingested, and today nothing turns on that.** Trimming through either
+    /// deletes the same rows, because the last record ingested is by definition
+    /// the highest the log holds. The resume position is the honest number to
+    /// name because it is where the epoch actually starts, and the difference
+    /// would matter the moment a boundary were stored and compared rather than
+    /// applied: a client's cursor can sit above the last record without being
+    /// current, since a snapshot's cursor is the write-ahead position when it
+    /// was read and that advances for reasons other than changes.
+    ///
+    /// Two things follow, and both are needed. The log forgets everything
+    /// through the boundary, so every later handshake is judged against what
+    /// can still be proven. And every live connection is closed, because a
+    /// connection never asks that question again: reconnecting re-declares its
+    /// subscriptions through the ordinary path, which rebuilds a running total
+    /// from its source rather than repairing one that accumulated across the
+    /// hole.
+    ///
+    /// Returns the boundary when an epoch was declared.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] when the log could not be read or trimmed. The caller
+    /// must not begin streaming on an error: an undeclared gap is the silence
+    /// this exists to remove.
+    pub async fn reconcile_stream(&self, resume_lsn: u64) -> Result<Option<u64>, SessionError> {
+        let Some(ingested) = self.oplog.current_lsn().await.map_err(oplog_err)? else {
+            // Nothing recorded, so there is nothing to be past. A log in that
+            // state already resyncs every client that presents a cursor.
+            return Ok(None);
+        };
+        if resume_lsn <= ingested {
+            return Ok(None);
+        }
+        self.oplog
+            .forget_through(resume_lsn)
+            .await
+            .map_err(oplog_err)?;
+        let closed = self.close_all(FatalErrorReason::ChangeStreamGap).await;
+        tracing::error!(
+            ingested,
+            resume_lsn,
+            missing_bytes = resume_lsn.saturating_sub(ingested),
+            closed,
+            "change feed resumed past what it delivered, so a stretch of changes \
+             was never seen: the reconnect log is trimmed to the resume point and \
+             every client will resynchronise"
+        );
+        Ok(Some(resume_lsn))
+    }
+
+    /// Close every live connection with `reason`, returning how many were told.
+    async fn close_all(&self, reason: FatalErrorReason) -> usize {
         let live: Vec<_> = {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().map(|(_, live)| live.tx).collect()
         };
         for tx in &live {
-            let _ = tx.send(Outbound::Fatal(FatalError::new(
-                FatalErrorReason::ServerShuttingDown,
-            )));
+            let _ = tx.send(Outbound::Fatal(FatalError::new(reason.clone())));
         }
         live.len()
     }

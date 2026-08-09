@@ -148,6 +148,27 @@ pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WATERMARK_DDL).await;
 }
 
+/// The oplog table name the server binary defaults to.
+pub const OPLOG_TABLE: &str = "connetto_oplog";
+
+/// Create the reference oplog table and its enum if missing, as admin.
+///
+/// The server refuses to start without the table, because a reconnect log that
+/// does not survive the process tells every resuming client it is already
+/// current and sends it nothing (R32). Bringing up a scratch database is the
+/// one job `PgOplog::ensure_schema` exists for, so this calls it rather than
+/// keeping a second copy of the shape that could drift from it.
+pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
+    connetto_server::PgOplog::new(
+        pool.clone(),
+        OPLOG_TABLE,
+        connetto_server::OplogConfig::default(),
+    )
+    .ensure_schema()
+    .await
+    .expect("provisioning the oplog table");
+}
+
 /// The shared Postgres, held under the process-wide serialization lock for the
 /// lifetime of one test. Dropping it releases the lock for the next test.
 pub struct Fixture {

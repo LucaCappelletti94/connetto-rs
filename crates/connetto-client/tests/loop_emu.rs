@@ -24,8 +24,9 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, Oplog, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PermissiveAuth, PgOplog,
+    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
@@ -39,8 +40,11 @@ use tokio::sync::Notify;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-const SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
+// `IF NOT EXISTS` because `connect` replays the caller's DDL on every open, so
+// a test that reopens one replica across two server runs would otherwise fail
+// there rather than at what it is testing.
+const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, price REAL, \
+                          quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
@@ -3590,4 +3594,274 @@ async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
 
     drop(client);
     server.abort();
+}
+
+/// A snapshot source serving one `orders` row at `status`, standing in for a
+/// server whose data has moved on since the client last synced.
+struct StatusSnapshot {
+    status: &'static str,
+}
+
+impl SnapshotSource for StatusSnapshot {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<Snapshot, Self::Error> {
+        let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(1))
+            .expect("set id")
+            .set(1, Value::Real(1.0))
+            .expect("set price")
+            .set(2, Value::Integer(3))
+            .expect("set quantity")
+            .set(3, Value::Text(self.status.to_owned()))
+            .expect("set status");
+        Ok(Snapshot {
+            patchset: PatchSet::<SimpleTable, String, Vec<u8>>::new()
+                .insert(insert)
+                .build(),
+            cursor: Cursor::new(Vec::new()),
+        })
+    }
+}
+
+/// A manager over `oplog` whose snapshot serves `status`.
+///
+/// A second one with a fresh [`InMemoryOplog`] is what a restart looks like,
+/// and a second one over the same `PgOplog` table is what a restart looks like
+/// once the log is durable.
+///
+/// The socket is left to the caller: `Oplog`'s methods are plain `async fn`, so
+/// a generic `O` carries no `Send` guarantee and the spawn has to happen where
+/// the type is concrete.
+fn status_manager<O: Oplog>(
+    fixture: &Fixture,
+    status: &'static str,
+    oplog: O,
+) -> Arc<SessionManager<StatusSnapshot, PermissiveAuth, ConnettoWatermark, NoConnector, O>> {
+    SessionManager::with_oplog(
+        Materializer::new(PG_DDL).expect("build materializer"),
+        StatusSnapshot { status },
+        PermissiveAuth,
+        test_verifier(),
+        NoConnector,
+        oplog,
+        server_write_target(fixture),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    )
+}
+
+/// Drive one insert through `manager`, whatever oplog it holds.
+async fn drive_insert<O: Oplog>(
+    source: &mut PgSqliteEmuSource,
+    manager: &SessionManager<StatusSnapshot, PermissiveAuth, ConnettoWatermark, NoConnector, O>,
+    sql: &str,
+) {
+    source.execute_sql(sql).expect("execute dml");
+    while let Some(event) = source.next_event().await.expect("poll source") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+}
+
+/// R32. A server that cannot prove a resuming client is current must resync it.
+///
+/// The reconnect log answers "what has this client missed", and an empty log
+/// used to answer "nothing". That is sound for a server which has been up all
+/// along and false for one that has just started, and with the log in memory
+/// every start looks the same. So a client came back after a restart, was told
+/// it was current, and kept whatever it had while the server served something
+/// newer, with nothing on either side able to tell.
+///
+/// Demonstrating: this failed before the fix, the second run producing
+/// `[SyncStatus(Connected)]` and no frame of any kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+
+    // The first run. The client snapshots at "before" and takes a live patch,
+    // so it leaves holding a real resume position rather than an empty one.
+    let first = status_manager(&fixture, "before", InMemoryOplog::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve = first.clone();
+    // Each run ends by dropping the client rather than closing it, so an
+    // abrupt reset in the served session is the test's own doing.
+    let server_one = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        let _ = serve.serve(transport).await;
+    });
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_insert(
+        &mut source,
+        &first,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')",
+    )
+    .await;
+    pump_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+    assert!(
+        persisted_cursor(client.conn()).is_some(),
+        "the client leaves the first run holding a real resume position",
+    );
+    drop(client);
+    server_one.abort();
+
+    // The second run, with a fresh log exactly as a restarted process has. Row
+    // 1 moved to "after" while both sides were away, so a client that really
+    // was current would already hold it and one that is not can only learn it
+    // from a fresh snapshot.
+    let second = status_manager(&fixture, "after", InMemoryOplog::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve = second.clone();
+    let server_two = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        let _ = serve.serve(transport).await;
+    });
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    let seen = pump_for(&mut client, Duration::from_secs(2)).await;
+
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, ClientEvent::SnapshotEnd { .. })),
+        "a server that cannot prove the client is current must resync it, and \
+         this one recorded nothing to prove it with: {seen:?}",
+    );
+    assert_eq!(
+        orders(client.conn()),
+        vec![order(1, 1.0, 3, "after")],
+        "the client must not be left holding a value the server has moved past",
+    );
+
+    drop(client);
+    server_two.abort();
+}
+
+/// R32. A durable reconnect log spares the resync the rule above would force.
+///
+/// Resyncing whenever the server cannot prove otherwise is correct but costs a
+/// full snapshot per client per restart, which is what the durable log is for:
+/// the evidence outlives the process, so the same restart resumes incrementally
+/// instead. The two runs here share one `PgOplog` table, which is what the
+/// shipped binary now does.
+///
+/// Defending rather than demonstrating: this fails if the log stops surviving a
+/// restart, and it says so because a passing catchup is otherwise hard to tell
+/// apart from a resync that happened to deliver the same rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_durable_log_lets_a_restart_resume_incrementally() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let table = "connetto_oplog_restart";
+    fixture
+        .setup(&[&format!("DROP TABLE IF EXISTS {table}")])
+        .await;
+    PgOplog::new(fixture.admin().clone(), table, OplogConfig::default())
+        .ensure_schema()
+        .await
+        .expect("provision the oplog table");
+    let oplog = || PgOplog::new(fixture.admin().clone(), table, OplogConfig::default());
+
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+
+    let first = status_manager(&fixture, "before", oplog());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve = first.clone();
+    let server_one = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        let _ = serve.serve(transport).await;
+    });
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_insert(
+        &mut source,
+        &first,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')",
+    )
+    .await;
+    pump_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+    drop(client);
+    server_one.abort();
+
+    // The second run reads the same table, so it can prove what the client has
+    // and hands it the one entry it missed rather than the whole set. The new
+    // snapshot value is the tell: a resync would deliver "after", a catchup
+    // cannot, because the oplog holds changes and not the current truth.
+    let second = status_manager(&fixture, "after", oplog());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve = second.clone();
+    let server_two = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        let _ = serve.serve(transport).await;
+    });
+    drive_insert(
+        &mut source,
+        &second,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'late')",
+    )
+    .await;
+    let mut client = connect_client(addr, "client-a", &db_path).await;
+    client.subscribe("orders", QUERY).await.expect("subscribe");
+    let seen = pump_for(&mut client, Duration::from_secs(2)).await;
+
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, ClientEvent::SnapshotEnd { .. })),
+        "the log survived, so the server could prove what the client had and \
+         owed it no snapshot: {seen:?}",
+    );
+    assert_eq!(
+        orders(client.conn()),
+        vec![
+            order(1, 1.0, 3, "before"),
+            order(7, 9.5, 5, "paid"),
+            order(8, 4.0, 2, "late"),
+        ],
+        "the missed change arrived on its own, and the snapshot's newer value \
+         did not, which is what makes this a catchup rather than a resync",
+    );
+
+    drop(client);
+    server_two.abort();
 }

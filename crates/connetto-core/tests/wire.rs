@@ -188,6 +188,9 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         FatalErrorReason::RateLimited {
             retry_after_ms: 30_000,
         },
+        // SessionManager::reconcile_stream, when the change feed resumed past
+        // what it had delivered (R32).
+        FatalErrorReason::ChangeStreamGap,
     ];
     for reason in &reasons {
         match reason {
@@ -196,7 +199,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::ConnectionSuperseded
             | FatalErrorReason::ProtocolViolation { .. }
             | FatalErrorReason::ServerShuttingDown
-            | FatalErrorReason::RateLimited { .. } => {}
+            | FatalErrorReason::RateLimited { .. }
+            | FatalErrorReason::ChangeStreamGap => {}
         }
     }
     reasons

@@ -45,8 +45,18 @@
 //!   would be worse than not checking at all, since row-level security makes an
 //!   invisible row zero rows rather than an error.
 //!
-//! The publication and replication slot (with the `pgoutput` plugin) must
-//! already exist. The server does not create them.
+//! - `CONNETTO_SLOT`, `CONNETTO_PUBLICATION`, `CONNETTO_OPLOG_TABLE`: the
+//!   logical replication slot (with the `pgoutput` plugin), the publication,
+//!   and the table the reconnect log lives in. Default `connetto_slot`,
+//!   `connetto_pub` and `connetto_oplog`. All three are the deployment's to
+//!   provision, connetto creates no server objects, and startup refuses when
+//!   one is absent rather than discovering it on the first change.
+//! - `CONNETTO_SLOT_LAG_SECS`: how often the slot's retained write-ahead log,
+//!   its remaining headroom and its reservation status are written to the log,
+//!   in seconds. Default 60, `0` turns the watch off. Deciding when a number
+//!   is alarming belongs to the deployment's log aggregator, so the line goes
+//!   out at one level on a fixed interval rather than escalating on a
+//!   threshold connetto picked.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -58,14 +68,14 @@ use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::audit::pg_audit_hook;
 use connetto_server::{
-    AbuseConfig, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
+    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, PgSnapshotSource, ProviderRegistry, ReaderGate, ReaderReserve,
-    ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
+    OidcProviderConfig, OplogConfig, PgOplog, PgSnapshotSource, ProviderRegistry, ReaderGate,
+    ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
     ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
     SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
     connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    is_loopback_host, pg_ban_store, pg_write_target,
+    is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -410,6 +420,64 @@ async fn build_pool(url: &str, size: u32) -> Result<Pool<AsyncPgConnection>> {
         .context("building the Postgres connection pool")
 }
 
+/// Check what the change stream needs, then set up the reconnect log and the
+/// slot watch. Everything here reads or writes connetto's own bookkeeping, so
+/// it runs on the owner pool: the reader pool is what callers contend for, and
+/// R39 holds a share of it back for identified traffic that background work
+/// must not spend.
+async fn prepare_change_log(
+    pool: &Pool<AsyncPgConnection>,
+    slot: &str,
+    publication: &str,
+    oplog_table: &str,
+) -> Result<PgOplog> {
+    // connetto emits no DDL. The deployment owns the `_connetto_mutations`
+    // watermark table (see `docs/architecture/11-authentication.md`) and the
+    // `ConnettoWatermark` reference schema keys on it.
+    //
+    // The same rule makes these three a startup refusal rather than a
+    // discovery. Absent, the slot and the publication turn the change stream
+    // into a retry loop that never succeeds, and the oplog table turns the
+    // first change into a failure on a boot that looked healthy (R32).
+    preflight::require(
+        pool,
+        &[
+            Artifact::ReplicationSlot(slot),
+            Artifact::Publication(publication),
+            Artifact::Table(oplog_table),
+        ],
+    )
+    .await?;
+
+    // A slot retains write-ahead log until its consumer confirms it, so a stuck
+    // or departed server fills the primary's disk and stops writes for every
+    // application on it. connetto cannot prevent that and can say it is
+    // happening.
+    let lag_secs = u64::from(env_u32("CONNETTO_SLOT_LAG_SECS", 60)?);
+    if lag_secs == 0 {
+        tracing::warn!(
+            "CONNETTO_SLOT_LAG_SECS is 0, so the replication slot is not watched: nothing \
+             will report a slot filling the primary's disk before it does"
+        );
+    } else {
+        tokio::spawn(connetto_server::slot::log_lag_forever(
+            pool.clone(),
+            slot.to_owned(),
+            Duration::from_secs(lag_secs),
+        ));
+    }
+
+    // The reconnect log is durable, so what a resuming client is owed survives
+    // a restart. In memory it did not, and an empty log reads as "this client
+    // has missed nothing", which silently lost every change made while the
+    // server was down (R32).
+    Ok(PgOplog::new(
+        pool.clone(),
+        oplog_table,
+        OplogConfig::default(),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // `pg_walstream` reports every standby status update at `info`, which is one
@@ -421,10 +489,9 @@ async fn main() -> Result<()> {
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
     let slot = var_or("CONNETTO_SLOT", "connetto_slot");
     let publication = var_or("CONNETTO_PUBLICATION", "connetto_pub");
+    let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
     let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
-    // connetto emits no DDL. The deployment owns the `_connetto_mutations`
-    // watermark table (see `docs/architecture/11-authentication.md`) and the
-    // `ConnettoWatermark` reference schema keys on it.
+    let oplog = prepare_change_log(&pool, &slot, &publication, &oplog_table).await?;
     let connector = PgAsyncDieselConnector::new(pool.clone());
     let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
         .map_err(|err| anyhow!("building materializer: {err}"))?;
@@ -478,12 +545,13 @@ async fn main() -> Result<()> {
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
 
-    let manager = SessionManager::with_connector(
+    let manager = SessionManager::with_oplog(
         materializer,
         snapshot,
         auth,
         authority,
         connector,
+        oplog,
         write,
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
@@ -513,7 +581,16 @@ async fn main() -> Result<()> {
         }));
     }
     spawn_auth_endpoints(&service, registry);
-    run(&manager, &database_url, &slot, &publication, &pg_ddl, &bind).await
+    run(
+        &manager,
+        &pool,
+        &database_url,
+        &slot,
+        &publication,
+        &pg_ddl,
+        &bind,
+    )
+    .await
 }
 
 /// Serve the login and refresh endpoints beside the sync listener.
@@ -604,8 +681,15 @@ async fn shutdown_signal() {
 /// shutdown signal arrives.
 async fn run(
     manager: &Arc<
-        SessionManager<PgSnapshotSource, RlsAuth, ConnettoWatermark, PgAsyncDieselConnector>,
+        SessionManager<
+            PgSnapshotSource,
+            RlsAuth,
+            ConnettoWatermark,
+            PgAsyncDieselConnector,
+            PgOplog,
+        >,
     >,
+    pool: &Pool<AsyncPgConnection>,
     database_url: &str,
     slot: &str,
     publication: &str,
@@ -618,19 +702,36 @@ async fn run(
         .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
 
     let ingest_manager = manager.clone();
+    let gap_manager = manager.clone();
+    let gap_pool = pool.clone();
     let url = database_url.to_owned();
     let slot = slot.to_owned();
     let publication = publication.to_owned();
     let ddl = pg_ddl.to_owned();
     tokio::spawn(async move {
-        // Reconnect the replication stream forever; the slot resumes from its
-        // confirmed position, so a dropped connection loses no events.
+        // Reconnect the replication stream forever. An ordinary drop loses no
+        // events, because the slot resumes from its confirmed position, which
+        // is behind what was already delivered and logged.
         let connect = || {
             let (url, slot, publication, ddl) =
                 (url.clone(), slot.clone(), publication.clone(), ddl.clone());
+            let (pool, manager) = (gap_pool.clone(), gap_manager.clone());
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
+                // Where the stream is about to resume, read before opening it
+                // so streaming cannot have moved it. Past what was delivered
+                // means a stretch of changes was never seen, and nothing may
+                // be served against the old log after that (R32).
+                if let Some(resume) = connetto_server::slot::resume_position(&pool, &slot)
+                    .await
+                    .map_err(|err| anyhow!("reading the replication slot: {err}"))?
+                {
+                    manager
+                        .reconcile_stream(resume)
+                        .await
+                        .map_err(|err| anyhow!("reconciling the change feed: {err}"))?;
+                }
                 let config = PgStreamingConfig::new(url, slot, publication);
                 PgStreamingCdcSource::connect(config, catalog)
                     .await

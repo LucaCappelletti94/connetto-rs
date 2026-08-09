@@ -395,6 +395,8 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
         "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')",
     )
     .await;
+    // The server refuses to start without its reconnect log (R32).
+    connetto_test_harness::provision_oplog(pool).await;
 }
 
 /// Rewrite a Postgres URL's user info, keeping host, port, and database. Used to
@@ -867,6 +869,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     ] {
         exec(&admin, stmt).await;
     }
+    // The server refuses to start without its reconnect log (R32).
+    connetto_test_harness::provision_oplog(&admin).await;
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 

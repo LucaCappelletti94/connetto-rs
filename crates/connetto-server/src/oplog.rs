@@ -281,6 +281,21 @@ pub trait Oplog: Send + Sync {
     ///
     /// Implementation-defined: a backing-store read failure.
     async fn current_lsn(&self) -> Result<Option<u64>, Self::Error>;
+
+    /// Drop every record at or below `lsn`, because continuity across it can no
+    /// longer be proven.
+    ///
+    /// This is retention with a different trigger, not a new concept: the log
+    /// is a bounded window that already deletes what it no longer covers, and a
+    /// gap in the feed means it no longer covers anything before the point the
+    /// feed resumed. Forgetting is what makes [`catchup_decision`] tell the
+    /// truth afterwards, with no second thing to consult and nothing to keep in
+    /// step (R32).
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store write failure.
+    async fn forget_through(&self, lsn: u64) -> Result<(), Self::Error>;
 }
 
 /// Decide whether a client resuming from `resume_lsn` can catch up from the
@@ -293,10 +308,11 @@ pub trait Oplog: Send + Sync {
 ///   is missing (LSNs greater than `resume_lsn`) is then retained. The check is
 ///   deliberately conservative at the exact boundary, favoring a full resync
 ///   over a replay it cannot prove complete.
-/// * An empty log that never recorded anything (`current_lsn` is `None`) has
-///   nothing to replay, so the client is already current.
-/// * An empty log that did record and then pruned everything away
-///   (`current_lsn` is `Some`) cannot prove completeness, so it resyncs.
+/// * An empty log resyncs, whichever kind of empty it is. Nothing in it can
+///   prove the client has everything, and a log that has recorded nothing is
+///   most often a process that has just started rather than a world in which
+///   nothing happened. Reading it the other way lost data on every restart,
+///   silently, because the shipped binary keeps the log in memory (R32).
 #[must_use]
 pub fn catchup_decision(
     resume_lsn: u64,
@@ -316,12 +332,9 @@ pub fn catchup_decision(
                 CatchupDecision::FullResync
             }
         }
-        // Empty log that never recorded anything: nothing to replay, so the
-        // client is already current.
-        (None, None) => CatchupDecision::Catchup,
-        // Empty log that recorded and then pruned everything away: completeness
-        // cannot be proven, so resync.
-        (None, Some(_)) => CatchupDecision::FullResync,
+        // Empty either way: nothing retained can prove the client is current,
+        // so it resyncs.
+        (None, _) => CatchupDecision::FullResync,
     }
 }
 
@@ -440,6 +453,12 @@ impl Oplog for InMemoryOplog {
     #[allow(clippy::unused_async_trait_impl)]
     async fn current_lsn(&self) -> Result<Option<u64>, Infallible> {
         Ok(self.inner.lock().max_lsn)
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn forget_through(&self, lsn: u64) -> Result<(), Infallible> {
+        self.inner.lock().entries.retain(|e| e.record.lsn() > lsn);
+        Ok(())
     }
 }
 
@@ -670,6 +689,20 @@ mod pg {
         async fn current_lsn(&self) -> Result<Option<u64>, PgOplogError> {
             self.watermark("MAX(lsn)").await
         }
+
+        async fn forget_through(&self, lsn: u64) -> Result<(), PgOplogError> {
+            let lsn = lsn_to_i64(lsn)?;
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let sql = format!(
+                "DELETE FROM {table} WHERE lsn <= $1",
+                table = quote_ident(&self.table),
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(lsn)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
     }
 }
 
@@ -708,10 +741,11 @@ mod tests {
     }
 
     #[test]
-    fn decision_empty_log_states() {
-        // Never recorded: nothing to replay, the client is current.
-        assert_eq!(catchup_decision(5, None, None), CatchupDecision::Catchup);
-        // Recorded then fully pruned: cannot prove completeness, so resync.
+    fn decision_empty_log_resyncs() {
+        // Never recorded, which is what every restart looks like: the log
+        // cannot prove the client is current, so it must not claim to.
+        assert_eq!(catchup_decision(5, None, None), CatchupDecision::FullResync);
+        // Recorded then fully pruned: same answer for the same reason.
         assert_eq!(
             catchup_decision(5, None, Some(9)),
             CatchupDecision::FullResync,

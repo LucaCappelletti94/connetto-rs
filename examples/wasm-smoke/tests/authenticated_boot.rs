@@ -42,6 +42,12 @@
 //!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, \
 //!       last_seq BIGINT NOT NULL)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "CREATE TYPE connetto_change_op AS ENUM ('insert','update','delete','truncate')"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "CREATE TABLE connetto_oplog (lsn BIGINT PRIMARY KEY, table_name TEXT NOT NULL, \
+//!       op connetto_change_op NOT NULL, pk BYTEA NOT NULL, is_tombstone BOOLEAN NOT NULL, \
+//!       event BYTEA NOT NULL, appended_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "$(cat examples/wasm-smoke/roles.sql)"
 //! mkdir -p target/devkeys
 //! openssl genpkey -algorithm ed25519 -out target/devkeys/priv.pem
