@@ -48,8 +48,11 @@ pub use abuse::{
 pub use auth::PermissiveAuth;
 pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
-pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError};
+pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError, ShareLevel};
 pub use guard::{PersonCloseHook, RequestGuard};
+// Re-exported because `ShareError::NotWritable` names one, so an application
+// matching on a refused verb can spell its type.
+pub use subql::visibility::WriteOp;
 // Re-exported so the `connetto_auth_tables!` macro can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.

@@ -30,7 +30,7 @@ use connetto_core::auth::{AuthContext, CapabilitySubject, Principal, Subject, Ve
 use connetto_server::audit::{AuthEvent, AuthOp};
 use connetto_server::{
     AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
-    RowSource, ShareError, SnapshotSource, SourceRow, TokenAuthority,
+    RowSource, ShareError, ShareLevel, SnapshotSource, SourceRow, TokenAuthority,
 };
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -40,7 +40,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl as AsyncRunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres as PgValues, Value};
 use subql::testing::TestEvent;
-use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
+use subql::visibility::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
 use subql::{ParserDB, catalog_helpers};
 
 /// The catalog both the read filter and the snapshot encoder parse. Table DDL
@@ -335,13 +335,25 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
 
     // Alice may share her own paper.
     issuer
-        .issue(&caller(Some("alice"), &[]), "papers", &alice_paper, None)
+        .issue(
+            &caller(Some("alice"), &[]),
+            "papers",
+            &alice_paper,
+            ShareLevel::read(),
+            None,
+        )
         .await
         .expect("alice may share what she owns");
 
     // She may not share bob's, and neither may a caller with nothing at all.
     let refused = issuer
-        .issue(&caller(Some("alice"), &[]), "papers", &bob_paper, None)
+        .issue(
+            &caller(Some("alice"), &[]),
+            "papers",
+            &bob_paper,
+            ShareLevel::read(),
+            None,
+        )
         .await
         .expect_err("alice cannot share a paper she cannot read");
     assert!(
@@ -349,7 +361,13 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
         "expected Unauthorized, got {refused:?}"
     );
     let refused = issuer
-        .issue(&caller(None, &[]), "papers", &alice_paper, None)
+        .issue(
+            &caller(None, &[]),
+            "papers",
+            &alice_paper,
+            ShareLevel::read(),
+            None,
+        )
         .await
         .expect_err("a stranger cannot share anything");
     assert!(
@@ -362,11 +380,11 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     let bearer = caller(None, &[SHARED_KEY]);
     let shared_paper = [Value::<PgValues>::Int(2)];
     issuer
-        .issue(&bearer, "papers", &shared_paper, None)
+        .issue(&bearer, "papers", &shared_paper, ShareLevel::read(), None)
         .await
         .expect("a key holder may reshare what the key opens");
     let refused = issuer
-        .issue(&bearer, "papers", &bob_paper, None)
+        .issue(&bearer, "papers", &bob_paper, ShareLevel::read(), None)
         .await
         .expect_err("the key opens paper 2 only");
     assert!(
@@ -488,6 +506,179 @@ impl RowSource for AlwaysFound {
     }
 }
 
+/// A policy that shows every row and refuses one verb, so the mint's two
+/// questions can disagree.
+///
+/// `RlsAuth` cannot play this part: its `may_write` allows unconditionally by
+/// design (`08-authorization.md`, "The write question survives as the
+/// attachment point despite being inert today"), and the RLS fixture above puts
+/// one policy over every command, so no caller there may read a row and not
+/// change it either. **So this test defends the mint's contract rather than
+/// demonstrating a refusal any shipped deployment can see.** It is
+/// mutation-tested instead: allowing the denied verb below makes it fail.
+struct ReadOnlyPolicy {
+    refuses: WriteOp,
+}
+
+impl VisibilityPolicy for ReadOnlyPolicy {
+    type Watcher = Arc<Principal>;
+    type Error = std::convert::Infallible;
+    type Backend = PgValues;
+
+    fn may_see<R>(
+        &self,
+        _row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        R: RowView<Backend = PgValues> + Sync + ?Sized,
+    {
+        for verdict in verdicts.iter_mut().take(watchers.len()) {
+            *verdict = Verdict::Allow;
+        }
+        async { Ok(()) }
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn may_write<R>(
+        &self,
+        _row: &R,
+        _watcher: &Self::Watcher,
+        op: WriteOp,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = PgValues> + Sync + ?Sized,
+    {
+        Ok(if op == self.refuses {
+            Verdict::Deny
+        } else {
+            Verdict::Allow
+        })
+    }
+}
+
+fn issuer_over(policy: ReadOnlyPolicy) -> CapabilityIssuer<ReadOnlyPolicy, AlwaysFound, String> {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    CapabilityIssuer::new(authority, Arc::new(policy), Arc::new(AlwaysFound), &config)
+}
+
+#[tokio::test]
+async fn a_caller_who_may_read_but_not_write_is_refused_a_write_share() {
+    let issuer = issuer_over(ReadOnlyPolicy {
+        refuses: WriteOp::Update,
+    });
+    let caller = caller(Some("alice"), &[]);
+
+    // The read share is unaffected: the write question is never asked.
+    let read = issuer
+        .issue(&caller, "papers", &[], ShareLevel::read(), None)
+        .await
+        .expect("reading is allowed, so a read share is minted");
+    assert!(
+        read.level.is_read_only(),
+        "the reply reports what was certified, and nothing was"
+    );
+
+    let refused = issuer
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read().with_update(),
+            None,
+        )
+        .await
+        .expect_err("updating is denied, so the share is refused");
+    assert!(
+        matches!(
+            refused,
+            ShareError::NotWritable {
+                op: WriteOp::Update,
+                ..
+            }
+        ),
+        "expected NotWritable naming the denied verb, got {refused:?}"
+    );
+
+    // Every named verb must allow, so one denial among several refuses the lot,
+    // and the refusal names the verb rather than the first one asked.
+    let refused = issuer
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read().with_delete().with_update(),
+            None,
+        )
+        .await
+        .expect_err("one denied verb refuses the whole share");
+    assert!(
+        matches!(
+            refused,
+            ShareError::NotWritable {
+                op: WriteOp::Update,
+                ..
+            }
+        ),
+        "expected the denied verb, got {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_who_may_do_both_gets_both_and_the_reply_says_which() {
+    // Nothing is refused, so this is the positive half: a level the policy
+    // allows is certified in full.
+    let issuer = issuer_over(ReadOnlyPolicy {
+        refuses: WriteOp::Insert,
+    });
+    let caller = caller(Some("alice"), &[]);
+    let level = ShareLevel::read().with_update().with_delete();
+
+    let share = issuer
+        .issue(&caller, "papers", &[], level, None)
+        .await
+        .expect("both verbs are allowed");
+    assert_eq!(
+        share.level, level,
+        "the reply reports exactly the verbs the caller named"
+    );
+    assert!(!share.level.is_read_only());
+
+    // Creating is what this policy refuses, which keeps the positive half
+    // honest: the same issuer can still say no.
+    issuer
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read().with_insert(),
+            None,
+        )
+        .await
+        .expect_err("the one refused verb is still refused");
+}
+
+#[tokio::test]
+async fn a_verb_the_caller_did_not_name_is_never_asked_about() {
+    // The read half of the mint is unchanged, which is what makes a read share
+    // over a row nobody may write still work. Refusing every verb and asking
+    // about none must still mint.
+    for refuses in [WriteOp::Insert, WriteOp::Update, WriteOp::Delete] {
+        issuer_over(ReadOnlyPolicy { refuses })
+            .issue(
+                &caller(Some("alice"), &[]),
+                "papers",
+                &[],
+                ShareLevel::read(),
+                None,
+            )
+            .await
+            .expect("a read share asks no write question");
+    }
+}
+
 #[tokio::test]
 async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
     let config = AuthConfig::new()
@@ -503,7 +694,13 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
     let caller = caller(Some("alice"), &[]);
 
     let refused = issuer
-        .issue(&caller, "papers", &[], Some(Duration::from_secs(601)))
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read(),
+            Some(Duration::from_secs(601)),
+        )
         .await
         .expect_err("over the ceiling");
     assert!(
@@ -511,7 +708,13 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
         "expected TtlTooLong, got {refused:?}"
     );
     issuer
-        .issue(&caller, "papers", &[], Some(Duration::from_secs(600)))
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read(),
+            Some(Duration::from_secs(600)),
+        )
         .await
         .expect("exactly the ceiling is allowed");
 }

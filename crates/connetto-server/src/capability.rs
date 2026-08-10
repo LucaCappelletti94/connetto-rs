@@ -25,7 +25,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use subql::backend::{Postgres, Value};
-use subql::visibility::{Verdict, VisibilityPolicy};
+use subql::visibility::{Verdict, VisibilityPolicy, WriteOp};
 
 use crate::authn::token::{AuthConfig, TokenAuthority, TokenError};
 use crate::reserve::{ReaderGate, ReaderPermit};
@@ -169,6 +169,86 @@ impl CallerBinding {
 /// live and this one not.
 pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 
+/// The write verbs a share certifies, beside the reading every share certifies.
+///
+/// The application is the only party that knows what its own permission row
+/// grants, so it names the verbs and connetto certifies exactly those. A read
+/// share names none, which is [`ShareLevel::read`].
+///
+/// ```
+/// use connetto_server::ShareLevel;
+///
+/// // A share that lets the bearer edit the row but never remove it.
+/// let level = ShareLevel::read().with_update();
+/// assert!(!level.is_read_only());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ShareLevel {
+    insert: bool,
+    update: bool,
+    delete: bool,
+}
+
+impl ShareLevel {
+    /// Certify reading and nothing else.
+    #[must_use]
+    pub const fn read() -> Self {
+        Self {
+            insert: false,
+            update: false,
+            delete: false,
+        }
+    }
+
+    /// Also certify creating the row.
+    #[must_use]
+    pub const fn with_insert(mut self) -> Self {
+        self.insert = true;
+        self
+    }
+
+    /// Also certify replacing the row's values.
+    #[must_use]
+    pub const fn with_update(mut self) -> Self {
+        self.update = true;
+        self
+    }
+
+    /// Also certify removing the row.
+    #[must_use]
+    pub const fn with_delete(mut self) -> Self {
+        self.delete = true;
+        self
+    }
+
+    /// Whether this share certifies no write at all.
+    #[must_use]
+    pub const fn is_read_only(self) -> bool {
+        !self.insert && !self.update && !self.delete
+    }
+
+    /// The named verbs, in a fixed order, so a mint asks the same questions in
+    /// the same sequence however the caller built the level.
+    pub fn verbs(self) -> impl Iterator<Item = WriteOp> {
+        [
+            (self.insert, WriteOp::Insert),
+            (self.update, WriteOp::Update),
+            (self.delete, WriteOp::Delete),
+        ]
+        .into_iter()
+        .filter_map(|(named, op)| named.then_some(op))
+    }
+}
+
+/// One write verb as prose, for a refusal a person reads.
+const fn verb(op: WriteOp) -> &'static str {
+    match op {
+        WriteOp::Insert => "insert into",
+        WriteOp::Update => "update",
+        WriteOp::Delete => "delete from",
+    }
+}
+
 /// A share key that was minted, and the token proving the bearer holds it.
 ///
 /// The application writes the row granting this key access, so the two agree on
@@ -184,6 +264,11 @@ pub struct IssuedCapability<Key> {
     pub token: String,
     /// When the token stops checking out.
     pub expires_at: SystemTime,
+    /// What connetto certified the caller holds, which is what the permission
+    /// row must not exceed. It travels here rather than in the token, because a
+    /// permission inside the token would split authorization between the
+    /// token's contents and the model.
+    pub level: ShareLevel,
 }
 
 /// A share could not be minted.
@@ -194,6 +279,15 @@ pub enum ShareError {
     Unauthorized {
         /// The table the caller named.
         table: String,
+    },
+    /// The caller may read the row but may not perform a verb it asked to
+    /// share, so it may not hand that verb on.
+    #[error("the caller may not {} {table}, so it may not share that", verb(*op))]
+    NotWritable {
+        /// The table the caller named.
+        table: String,
+        /// The first named verb the policy denied.
+        op: WriteOp,
     },
     /// The row could not be reached at all, which is not the same as the
     /// caller not being allowed to share it.
@@ -294,7 +388,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     }
 
     /// Mint a share key over the row `key` names in `table`, on behalf of
-    /// `caller`.
+    /// `caller`, certifying `level`.
     ///
     /// `ttl` overrides the configured default and is refused rather than
     /// quietly shortened when it exceeds the ceiling, so an application's own
@@ -307,16 +401,23 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     /// itself is the same visibility seam every other path goes through,
     /// because a caller must not share what it cannot read.
     ///
+    /// A share certifying a write asks the seam's write question once per verb
+    /// [`ShareLevel`] names, about the row as it stands, and all of them must
+    /// allow (R34). Against the row-level-security policy every write is
+    /// allowed, so the refusal waits on an engine that can answer.
+    ///
     /// # Errors
     ///
-    /// [`ShareError`] when the caller may not read the row, the row cannot be
-    /// reached, the lifetime exceeds the ceiling, signing fails, or an
-    /// unidentified caller finds the unreserved reader share full.
+    /// [`ShareError`] when the caller may not read the row or may not perform
+    /// a verb it named, the row cannot be reached, the lifetime exceeds the
+    /// ceiling, signing fails, or an unidentified caller finds the unreserved
+    /// reader share full.
     pub async fn issue<Key>(
         &self,
         caller: &Principal<Id, Key>,
         table: &str,
         key: &[Value<Postgres>],
+        level: ShareLevel,
         ttl: Option<Duration>,
     ) -> Result<IssuedCapability<Key>, ShareError>
     where
@@ -366,6 +467,22 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         if !matches!(verdicts.as_slice(), [Verdict::Allow, ..]) {
             return Err(unauthorized());
         }
+        // One question per verb the caller named, about the row as it stands,
+        // which is the only version a mint holds. All must allow: a share must
+        // not hand on a verb the sharer does not hold itself.
+        for op in level.verbs() {
+            let verdict = self
+                .policy
+                .may_write(&view, &watchers[0], op)
+                .await
+                .map_err(|err| ShareError::Policy(err.to_string()))?;
+            if !verdict.allowed() {
+                return Err(ShareError::NotWritable {
+                    table: table.to_owned(),
+                    op,
+                });
+            }
+        }
         // Paired with the hook below in one `Option`, so the captured row and
         // the decision to record cannot disagree. Captured here because `key` is
         // shadowed by the minted subject on the next line. The values travel as
@@ -396,6 +513,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             key,
             token,
             expires_at: issued_at + ttl,
+            level,
         })
     }
 }
