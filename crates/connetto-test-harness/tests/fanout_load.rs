@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use connetto_test_harness::Fixture;
-use connetto_test_harness::fanout::fanout_load;
+use connetto_test_harness::fanout::{RowWidth, fanout_load};
 
 /// The small run's subscriber count, matching the counter test.
 const SMALL: u64 = 10;
@@ -50,29 +50,33 @@ async fn baseline_throughput_and_lock_wait() {
     }
 
     let fixture = Fixture::acquire().await;
-    for subscribers in [SMALL, LARGE] {
-        let run = fanout_load(&fixture, subscribers, WINDOW).await;
-        println!("{run}");
+    for width in [RowWidth::Narrow, RowWidth::Wide] {
+        for subscribers in [SMALL, LARGE] {
+            let run = fanout_load(&fixture, subscribers, WINDOW, width).await;
+            println!("{width:?} rows, {run}");
 
-        assert!(
-            run.events > 0,
-            "no event reached a subscriber at {subscribers} subscribers"
-        );
-        assert!(
-            run.writes >= WRITER_MARGIN * run.events,
-            "the writer did not stay clear of the dispatch loop at {subscribers} subscribers, \
-             so this risks measuring the writer: {} rows written against {} events delivered",
-            run.writes,
-            run.events
-        );
-        let dispatched = run.events_dispatched();
-        let ceiling = DELIVERY_SLACK * rounded(run.events);
-        assert!(
-            rounded(dispatched) <= ceiling,
-            "the dispatch loop ran ahead of delivery at {subscribers} subscribers, so frames \
-             queued rather than arriving: {dispatched} dispatched against {} delivered",
-            run.events
-        );
+            assert!(
+                run.events > 0,
+                "no event reached a subscriber at {subscribers} subscribers, {width:?} rows"
+            );
+            assert!(
+                run.writes >= WRITER_MARGIN * run.events,
+                "the writer did not stay clear of the dispatch loop at {subscribers} \
+                 subscribers, {width:?} rows, so this risks measuring the writer: {} rows \
+                 written against {} events delivered",
+                run.writes,
+                run.events
+            );
+            let dispatched = run.events_dispatched();
+            let ceiling = DELIVERY_SLACK * rounded(run.events);
+            assert!(
+                rounded(dispatched) <= ceiling,
+                "the dispatch loop ran ahead of delivery at {subscribers} subscribers, \
+                 {width:?} rows, so frames queued rather than arriving: {dispatched} \
+                 dispatched against {} delivered",
+                run.events
+            );
+        }
     }
 }
 

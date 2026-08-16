@@ -24,7 +24,6 @@ use connetto_server::counters::{self, CountersSnapshot};
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelSubject, StoreUpkeep, SubjectNaming, Translated,
 };
-use connetto_server::parity::ParityAuth;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
@@ -139,15 +138,16 @@ impl PolicyShape {
         }
     }
 
-    /// One row, written so this shape's policy grants every subscriber.
-    fn insert(self, n: u64) -> String {
+    /// One row, written so this shape's policy grants every subscriber, with
+    /// `filler` appended to the label so a run chooses how wide the row is.
+    fn insert(self, n: u64, filler: &str) -> String {
         match self {
-            Self::Row => {
-                format!("INSERT INTO items (id, owner, label) VALUES ({n}, '{OWNER}', 'row-{n}')")
-            }
+            Self::Row => format!(
+                "INSERT INTO items (id, owner, label) VALUES ({n}, '{OWNER}', 'row-{n}{filler}')"
+            ),
             Self::CrossTable => format!(
                 "INSERT INTO items (id, owner, team_id, label) \
-                 VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}')"
+                 VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}{filler}')"
             ),
         }
     }
@@ -160,6 +160,37 @@ impl PolicyShape {
         }
     }
 }
+
+/// How wide the rows a load run writes are, and so how large each event's
+/// compressed patch is.
+///
+/// Two widths because the per-subscriber payload copy scales with patch size as
+/// well as with subscriber count, and `docs/architecture/17-fan-out.md` rests
+/// the case for sharing the payload on that scaling rather than on the narrow
+/// row R0 happened to measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowWidth {
+    /// The two-column row R0 measured, whose compressed patch is tens of bytes.
+    Narrow,
+    /// A row carrying [`WIDE_FILL`] characters of high-entropy text, whose
+    /// compressed patch is kilobytes.
+    Wide,
+}
+
+impl RowWidth {
+    /// The text this width appends to every row's label.
+    fn filler(self) -> String {
+        match self {
+            Self::Narrow => String::new(),
+            Self::Wide => noise(WIDE_FILL),
+        }
+    }
+}
+
+/// Filler characters [`RowWidth::Wide`] carries. Kilobytes, which is the range a
+/// row of a dozen ordinary text columns reaches, rather than a size picked to
+/// flatter either reading.
+pub const WIDE_FILL: usize = 8192;
 
 /// The catalog the cross-table shape serves.
 pub const CROSS_TABLE_PG_DDL: &str = "CREATE TABLE teams (id INT PRIMARY KEY);
@@ -253,7 +284,7 @@ async fn run_through(
 
     let before = counters::snapshot();
     for n in 1..=events {
-        fixture.exec(&shape.insert(n)).await;
+        fixture.exec(&shape.insert(n, "")).await;
     }
     // The dispatch loop delivers subscribers in order per event, so once the
     // last client holds its last patch, every counted operation has happened.
@@ -321,7 +352,7 @@ impl LoadRun {
         Duration::from_nanos(self.counters.materializer_lock_wait_nanos)
     }
 
-    /// That wait as a share of the window, which is the number R14's trigger is
+    /// That wait as a share of the window, which is the number R14's trigger was
     /// read from. The wait is summed across tasks, so a share above one means
     /// callers were queued behind each other rather than merely waiting.
     pub fn lock_wait_fraction(&self) -> f64 {
@@ -386,17 +417,22 @@ impl fmt::Display for LoadRun {
     }
 }
 
-/// Drive one fixed-duration load run at `subscribers` subscribers: provision
-/// the fixture, connect the subscribers, then write rows as fast as Postgres
-/// accepts them while every subscriber consumes what it is sent, and bracket a
-/// `duration` window of that steady state with the dispatch-path counters and a
-/// wall clock.
+/// Drive one fixed-duration load run at `subscribers` subscribers over rows of
+/// `width`: provision the fixture, connect the subscribers, then write rows as
+/// fast as Postgres accepts them while every subscriber consumes what it is
+/// sent, and bracket a `duration` window of that steady state with the
+/// dispatch-path counters and a wall clock.
 ///
 /// Consuming means acknowledging delivery credits as well as reading frames.
 /// Without that the server stops sending after the handshake's credit
 /// allowance and queues the rest, and the run would report the rate at which
 /// frames pile up in memory instead of the rate at which they arrive.
-pub async fn fanout_load(fixture: &Fixture, subscribers: u64, duration: Duration) -> LoadRun {
+pub async fn fanout_load(
+    fixture: &Fixture,
+    subscribers: u64,
+    duration: Duration,
+    width: RowWidth,
+) -> LoadRun {
     let server = provision(fixture, PolicyShape::Row).await;
     let clients = connect_subscribers(&server, subscribers).await;
     tokio::time::sleep(ROUTE_SETTLE).await;
@@ -423,6 +459,7 @@ pub async fn fanout_load(fixture: &Fixture, subscribers: u64, duration: Duration
         fixture.admin().clone(),
         Arc::clone(&written),
         Arc::clone(&stop),
+        width.filler(),
     ));
 
     tokio::time::sleep(WARMUP).await;
@@ -474,6 +511,17 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
     (server, reachable)
 }
 
+/// The row-shaped fixture served through the shipped executor, for a test that
+/// drives what visibility delivers rather than measuring what it costs.
+///
+/// A fan-out run writes every row to one owner so every subscriber sees
+/// everything, which is the opposite of what a visibility test needs. This
+/// provisions the stack and writes nothing beyond the seed row, leaving the
+/// caller to own its rows and their owners.
+pub async fn visibility_fixture(fixture: &Fixture) -> Server {
+    provision_with(fixture, PolicyShape::Row, Executor::Shipped).await
+}
+
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
     provision_with(fixture, shape, Executor::Shipped).await
 }
@@ -516,7 +564,7 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
     statements.push("GRANT SELECT ON ALL TABLES IN SCHEMA public TO r0_reader".into());
     // A row before the store is loaded, so the facts the service answers from
     // exist by the time a subscriber asks.
-    statements.push(shape.insert(0));
+    statements.push(shape.insert(0, ""));
     let borrowed: Vec<&str> = statements.iter().map(String::as_str).collect();
     fixture.setup(&borrowed).await;
     fixture.start_replication(shape.published()).await;
@@ -525,12 +573,9 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
     let snapshot =
         PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl()).expect("snapshot source");
     let (fga, upkeep) = fga_auth(fixture, shape).await;
+    let compared = matches!(executor, Executor::Both);
     let auth = match executor {
-        Executor::Shipped => HarnessAuth::fga(fga),
-        Executor::Both => HarnessAuth::parity(ParityAuth::new(
-            fga,
-            RlsAuth::from_ddl(reader_pool.clone(), shape.ddl()).expect("second opinion"),
-        )),
+        Executor::Shipped | Executor::Both => HarnessAuth::fga(fga),
         // An outage run stages the service going away, so a second opinion that
         // keeps answering would report a disagreement on every held event. It
         // is the one run that compares nothing.
@@ -545,6 +590,15 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
         fixture.admin().clone(),
     );
     server.install_store_upkeep(upkeep);
+    // Since R6 the comparison is asked where the two row versions are still
+    // told apart, at the delivery sites, rather than inside the policy: row-level
+    // security cannot answer about a previous version at all, so a wrapper over
+    // every question would report a difference on each of them.
+    if compared {
+        server.install_second_opinion(Arc::new(
+            RlsAuth::from_ddl(reader_pool, shape.ddl()).expect("second opinion"),
+        ));
+    }
     server
 }
 
@@ -664,13 +718,18 @@ async fn consume(mut client: Client, delivered: Arc<AtomicU64>, stop: Arc<Atomic
 /// Holds one connection for the whole run rather than checking one out per
 /// row, so [`WRITER_SETUP`] applies to every insert and the pool round trip
 /// leaves the writer's rate.
-async fn write_rows(pool: Pool<AsyncPgConnection>, written: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
+async fn write_rows(
+    pool: Pool<AsyncPgConnection>,
+    written: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    filler: String,
+) {
     let mut conn = pool.get().await.expect("writer connection");
     run(&mut conn, WRITER_SETUP.to_owned()).await;
     let mut row: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         row += 1;
-        run(&mut conn, PolicyShape::Row.insert(row)).await;
+        run(&mut conn, PolicyShape::Row.insert(row, &filler)).await;
         written.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -697,4 +756,24 @@ fn rate(count: u64, window: Duration) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Pseudo-random lowercase alphanumerics, `count` of them, from a fixed seed.
+///
+/// High entropy on purpose: repetitive filler compresses away, so a run would
+/// pay a wide row's write cost and still measure a narrow patch. Alphanumeric
+/// on purpose too, since the writer interpolates it into a SQL literal.
+fn noise(count: usize) -> String {
+    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let index = usize::try_from(state % 36).expect("a value below 36 fits a usize");
+        out.push(ALPHABET[index]);
+    }
+    String::from_utf8(out).expect("the alphabet is ASCII")
 }

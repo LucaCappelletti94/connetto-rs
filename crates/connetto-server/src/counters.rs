@@ -6,8 +6,8 @@
 //! Postgres round trip), and gating them would make the measured binary a
 //! different binary from the shipped one. They are a permanent instrument, not
 //! a probe: the fan-out counter test reads them through [`snapshot`] and stays
-//! in the gate as the regression guard on per-event work staying independent
-//! of subscriber count once R5b and R14 deliver that property.
+//! in the gate, pinning the round trips R5b removed at zero and holding the
+//! three per-subscriber costs R14 measured on 2026-08-16 and left in place.
 //!
 //! **This module is instrumentation carried in the shipped binary on purpose,
 //! and it is removable.** Decided with the maintainer on 2026-08-07, settling
@@ -63,8 +63,9 @@ pub static AUTHORIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
 /// up to a client as a row that is there and then is not. A count above zero
 /// is that, caught before anybody sees it.
 ///
-/// Only [`ParityAuth`](crate::parity::ParityAuth) moves it, and only for the
-/// questions row-level security can actually answer.
+/// Only a [`SecondOpinion`](crate::parity::SecondOpinion) moves it, asked from
+/// the two delivery sites about the row as it is now, which is the only version
+/// row-level security can answer about.
 pub static VISIBILITY_DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Increment `counter` by `n`, relaxed.
@@ -80,8 +81,8 @@ pub fn add(counter: &AtomicU64, n: u64) {
 /// acquisition unconditionally would cost two clock reads where the
 /// uncontended take costs one atomic exchange, the same order, so the
 /// instrument would become a visible part of the number it reports once R5b
-/// removes the Postgres round trips that dominate this path today, which is
-/// exactly when R14 re-reads it.
+/// removed the Postgres round trips that used to dominate this path, which is
+/// the state R14 re-read it in on 2026-08-16.
 ///
 /// Trying first cannot cut ahead of a caller already queued: tokio hands a
 /// released permit straight to the head of its wait list and returns it to the

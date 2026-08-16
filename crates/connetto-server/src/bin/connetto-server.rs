@@ -76,10 +76,10 @@ use connetto_server::{
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
     OidcProviderConfig, OplogConfig, PgOplog, PgSnapshotSource, ProviderRegistry, ReaderGate,
     ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
-    ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router, connetto_audit_table,
-    connetto_auth_tables, connetto_ban_table, connetto_watermark_table, is_loopback_host,
-    pg_ban_store, pg_write_target, preflight,
+    ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig, SessionError,
+    SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
+    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
+    is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
@@ -449,16 +449,22 @@ async fn prepare_change_log(
     // watermark table (see `docs/architecture/11-authentication.md`) and the
     // `ConnettoWatermark` reference schema keys on it.
     //
-    // The same rule makes these three a startup refusal rather than a
+    // The same rule makes these four a startup refusal rather than a
     // discovery. Absent, the slot and the publication turn the change stream
     // into a retry loop that never succeeds, and the oplog table turns the
-    // first change into a failure on a boot that looked healthy (R32).
+    // first change into a failure on a boot that looked healthy (R32). The
+    // fourth is a property rather than an object: a replicated table that does
+    // not record the row as it was cannot answer whether a caller could see the
+    // version that has just gone, so the change path refuses that table on
+    // every event (R6). Checked after the publication, since it reads the
+    // publication's own table list.
     preflight::require(
         pool,
         &[
             Artifact::ReplicationSlot(slot),
             Artifact::Publication(publication),
             Artifact::Table(oplog_table),
+            Artifact::PreviousImages { publication },
         ],
     )
     .await?;
@@ -880,13 +886,27 @@ async fn run(
                     .map_err(|err| anyhow!("opening CDC stream: {err}"))
             }
         };
-        if let Err(err) = ingest_manager
+        match ingest_manager
             .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
                 log_reconnect(&event);
             })
             .await
         {
-            tracing::error!(error = %err, "change stream ingest stopped");
+            Ok(()) => {}
+            // The change stream cannot answer what a row looked like before it
+            // changed, and no restart of the stream will change that. Serving on
+            // means choosing between leaving a row on a device its owner may no
+            // longer see and handing its key to somebody who never could, so the
+            // server stops instead and the restart meets the startup refusal
+            // naming the table (R6 decision 4).
+            Err(err @ SessionError::ChangeStreamUnusable(_)) => {
+                tracing::error!(error = %err, "refusing to serve");
+                let told = ingest_manager.shutdown().await;
+                tracing::info!(closed = told, "closed every connection");
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+                std::process::exit(1);
+            }
+            Err(err) => tracing::error!(error = %err, "change stream ingest stopped"),
         }
     });
 

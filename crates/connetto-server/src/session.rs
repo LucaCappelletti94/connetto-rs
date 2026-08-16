@@ -36,8 +36,12 @@ use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
+use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
-use subql::{AggAccumulator, CdcSource, ChangeEvent, ParserDB, PgLsn, SubscriptionId};
+use subql::{
+    AggAccumulator, CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, PgLsn,
+    SubscriptionId, TableLike,
+};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -46,8 +50,8 @@ use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::guard::RequestGuard;
 use crate::materializer::{
-    DeltaAggregateCapture, Materializer, MaterializerError, PlannedWrite, Registration,
-    SqliteRegistration, agg_value_to_json, compress, value_to_json,
+    DeltaAggregateCapture, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
+    Registration, SqliteRegistration, agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::reserve::ReaderPermit;
@@ -316,6 +320,20 @@ pub enum SessionError {
     /// past it.
     #[error("auth service unreachable: {0}")]
     AuthUnavailable(String),
+    /// The change stream cannot answer what a row looked like before it
+    /// changed, for the table named.
+    ///
+    /// Either the table does not record the previous image (`REPLICA IDENTITY`
+    /// is not `FULL`) or the catalog does not know it. **Neither clears by
+    /// itself**, so the ingest loop must not hold the event and retry: the
+    /// server refuses to serve instead, and the restart meets the startup
+    /// refusal naming the table (R6 decision 4).
+    #[error(
+        "the change stream cannot report the previous version of a row in {0}, so \
+         a row that leaves a caller's reach cannot be taken back from them. Run \
+         ALTER TABLE {0} REPLICA IDENTITY FULL"
+    )]
+    ChangeStreamUnusable(String),
 }
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
@@ -598,6 +616,12 @@ pub struct SessionManager<
     /// answered from facts the change already invalidated, and in the allow
     /// direction no later correction takes the row back.
     upkeep: OnceLock<Arc<dyn crate::openfga::StoreUpkeep>>,
+    /// A second executor asked about the row as it is now, alongside the one
+    /// that delivers, so a divergence between them fails a run.
+    ///
+    /// Optional and off by default: it costs one Postgres round trip per watcher
+    /// per changed row, which is the whole cost R5b removed.
+    second_opinion: OnceLock<Arc<dyn crate::parity::SecondOpinion<Id, Key>>>,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -721,6 +745,7 @@ where
             guard,
             auth_retry: RetryPolicy::new(),
             upkeep: OnceLock::new(),
+            second_opinion: OnceLock::new(),
         })
     }
 }
@@ -753,6 +778,94 @@ where
         upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
     ) -> Result<(), Arc<dyn crate::openfga::StoreUpkeep>> {
         self.upkeep.set(upkeep)
+    }
+
+    /// Ask a second executor about every current row alongside the one that
+    /// delivers, so a divergence between them is counted and named.
+    ///
+    /// Set once, for the same reason the upkeep is: replacing a live one would
+    /// compare events either side of the swap against two different executors.
+    /// Off by default, because it costs one Postgres round trip per watcher per
+    /// changed row.
+    ///
+    /// # Errors
+    ///
+    /// The executor handed over, when one is already installed.
+    pub fn install_second_opinion(
+        &self,
+        second: Arc<dyn crate::parity::SecondOpinion<Id, Key>>,
+    ) -> Result<(), Arc<dyn crate::parity::SecondOpinion<Id, Key>>> {
+        self.second_opinion.set(second)
+    }
+
+    /// Which refusal a transition failure is.
+    ///
+    /// A policy that could not answer is the transient case the ingest loop
+    /// holds the event for. The other two do not clear by themselves: a table
+    /// that does not record its previous row image produces the same failure on
+    /// every later change, and so does one the catalog does not know, so the
+    /// server refuses to serve rather than retrying for ever (R6 decision 4).
+    fn transition_refusal(
+        &self,
+        event: &ChangeEvent,
+        err: TransitionError<Auth::Error>,
+    ) -> SessionError {
+        match err {
+            TransitionError::Policy(err) => SessionError::AuthUnavailable(err.to_string()),
+            // `NotARowEvent` is unreachable, because a truncate is answered
+            // before the question is put. Refusing is the direction to fail in
+            // if that ever stops being true.
+            TransitionError::IncompletePreviousImage
+            | TransitionError::UnknownTable
+            | TransitionError::NotARowEvent => {
+                SessionError::ChangeStreamUnusable(self.event_table(event))
+            }
+        }
+    }
+
+    /// The event's table, for a message a person has to act on.
+    fn event_table(&self, event: &ChangeEvent) -> String {
+        let catalog = self.catalog.as_ref();
+        let id = event.table_id(catalog);
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| catalog.table_by_id(index))
+            .map_or_else(
+                || format!("table {id}"),
+                |table| table.table_name().to_owned(),
+            )
+    }
+
+    /// Ask the second opinion about the row as it is now, when one is installed.
+    ///
+    /// Only the current row, and only when the event has one: row-level security
+    /// reads the live table, so it cannot answer about a previous version and
+    /// answers no for everyone about a deleted row. A watcher was told to deliver
+    /// exactly when the shipped executor allowed the current row, which is what
+    /// makes the comparison recoverable here without asking twice.
+    async fn ask_second_opinion(
+        &self,
+        event: &ChangeEvent,
+        watchers: &[Arc<Principal<Id, Key>>],
+        verdicts: &[Transition],
+    ) {
+        let Some(second) = self.second_opinion.get() else {
+            return;
+        };
+        let Some(row) = EventRow::current(event, self.catalog.as_ref()) else {
+            return;
+        };
+        let shipped: Vec<Verdict> = verdicts
+            .iter()
+            .map(|verdict| {
+                if *verdict == Transition::Deliver {
+                    Verdict::Allow
+                } else {
+                    Verdict::Deny
+                }
+            })
+            .collect();
+        second.compare(&row, watchers, &shipped).await;
     }
 
     fn next_connection_num(&self) -> u64 {
@@ -1042,52 +1155,7 @@ where
             counters::add(&counters::FANOUT_ROUTE_CLONES, 1);
             deliveries.push((patch, route));
         }
-
-        // Read filter: deliver only rows a session may see. A delete or a
-        // truncate carries no post-image, which is what `EventRow::current`
-        // reports by answering `None`, and those replay regardless so a client
-        // drops a row it may still hold locally even after it can no longer see
-        // it.
-        let mut verdicts = Vec::new();
-        if let Some(row) = EventRow::current(event, self.catalog.as_ref()) {
-            let watchers: Vec<_> = deliveries
-                .iter()
-                .map(|(_, route)| Arc::clone(&route.principal))
-                .collect();
-            if !watchers.is_empty() {
-                Verdict::reset(&mut verdicts, watchers.len());
-                // Any error means the auth service was unreachable: the
-                // verdicts stay as pre-filled denials. Signal the caller so the
-                // ingest loop can hold this event and retry rather than
-                // silently skipping it.
-                if let Err(err) = self.auth.may_see(&row, &watchers, &mut verdicts).await {
-                    return Err(SessionError::AuthUnavailable(err.to_string()));
-                }
-            }
-        } else {
-            // Nothing to ask about, so nothing is filtered.
-            verdicts.resize(deliveries.len(), Verdict::Allow);
-        }
-
-        for ((patch, route), verdict) in deliveries.into_iter().zip(verdicts) {
-            // A departure notice is exempt, decided with the maintainer for
-            // R44 and for the same reason the filter never sees a delete: it
-            // carries only a primary key this caller was already given, so
-            // withholding it discloses nothing and leaves the row on their
-            // device for ever, which is both the stale answer and the weaker
-            // privacy outcome. This is deliberate, not an oversight.
-            if !patch.departure && !verdict.allowed() {
-                continue;
-            }
-            {
-                counters::timed_lock(&self.materializer)
-                    .await
-                    .advance_cursor(route.session_key, route.sub_id, &patch.cursor)?;
-            }
-            let live = LivePatch::new(route.label, Cursor::new(patch.cursor), patch.payload_zstd);
-            // A dropped session receiver just means the client is gone.
-            let _ = route.tx.send(Outbound::Live(live));
-        }
+        self.fan_out_rows(event, deliveries).await?;
 
         for change in dispatched.aggregates {
             self.deliver_aggregate(change.query_id, change.result_json)
@@ -1120,6 +1188,102 @@ where
         for change in dispatched.delta_aggregates {
             self.deliver_delta_aggregate(change.consumer_id, change.result_json)
                 .await;
+        }
+        Ok(())
+    }
+
+    /// Decide what one event does to every matched caller's copy of the row, and
+    /// send it (R6, the two-check form).
+    ///
+    /// `Deliver` sends the patch this event produced, `Withdraw` sends a plain
+    /// delete that takes the row back, and `Nothing` sends nothing at all, which
+    /// is what stops a deleted row's key reaching a caller who could never see
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::AuthUnavailable`] when the policy could not answer, so the
+    /// ingest loop holds the event, [`SessionError::ChangeStreamUnusable`] when
+    /// the stream cannot report the previous version at all, and
+    /// [`SessionError::Materializer`] when a cursor advance fails.
+    async fn fan_out_rows(
+        &self,
+        event: &ChangeEvent,
+        deliveries: Vec<(MatchedPatch, Route<Id, Key>)>,
+    ) -> Result<(), SessionError> {
+        let watchers: Vec<_> = deliveries
+            .iter()
+            .map(|(_, route)| Arc::clone(&route.principal))
+            .collect();
+        // A truncate names no row, so neither version exists and no question can
+        // be put. It also folds to a patchset with no operations, so replaying it
+        // discloses nothing. R48 owns making it empty the replica.
+        let truncate = event.kind() == EventKind::Truncate;
+        let mut verdicts = Transitions::new();
+        verdicts.reset(watchers.len());
+        if !truncate && !watchers.is_empty() {
+            transitions(
+                &self.auth,
+                event,
+                self.catalog.as_ref(),
+                &watchers,
+                &mut verdicts,
+            )
+            .await
+            .map_err(|err| self.transition_refusal(event, err))?;
+            self.ask_second_opinion(event, &watchers, verdicts.get())
+                .await;
+        }
+
+        // What a caller who may no longer see the row receives. **A delete's own
+        // patch already is exactly that**, one unmarked delete keyed by the image
+        // the caller holds, so only an update needs a second fold: its own patch
+        // carries the new row values the caller has just lost the right to read.
+        // Built once per event when it is needed at all, exactly as the departure
+        // notice is, because the bytes carry a table and a key and nothing
+        // caller-specific.
+        let withdrawal = if event.kind() == EventKind::Delete
+            || !verdicts.get().contains(&Transition::Withdraw)
+        {
+            None
+        } else {
+            let built = counters::timed_lock(&self.materializer)
+                .await
+                .withdrawal_patch(event)?;
+            Some(built.ok_or_else(|| {
+                MaterializerError::Emit(
+                    "a row has to be taken back from a caller and the event folded to no \
+                     operation to take it back with"
+                        .to_owned(),
+                )
+            })?)
+        };
+
+        for ((patch, route), verdict) in deliveries.into_iter().zip(verdicts.get().iter().copied())
+        {
+            // R44's departure notice is no longer exempt from the visibility
+            // question, and retiring that exemption is R6's decision 6. The
+            // exemption existed because a denied subscriber would otherwise be
+            // told nothing and keep the row for ever, which the withdrawal above
+            // now answers properly. What it cost was the notice carrying a key to
+            // a caller who could never see the row.
+            let payload = if truncate {
+                patch.payload_zstd
+            } else {
+                match verdict {
+                    Transition::Nothing => continue,
+                    Transition::Deliver => patch.payload_zstd,
+                    Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
+                }
+            };
+            {
+                counters::timed_lock(&self.materializer)
+                    .await
+                    .advance_cursor(route.session_key, route.sub_id, &patch.cursor)?;
+            }
+            let live = LivePatch::new(route.label, Cursor::new(patch.cursor), payload);
+            // A dropped session receiver just means the client is gone.
+            let _ = route.tx.send(Outbound::Live(live));
         }
         Ok(())
     }
@@ -1267,6 +1431,11 @@ where
                     let started = Instant::now();
                     match self.ingest(&mut source, &mut on_event).await {
                         Ok(()) => return Ok(()),
+                        // Reconnecting cannot help: the same table produces the
+                        // same refusal on the next event, so retrying it would
+                        // spin for ever against a deployment that has to be
+                        // fixed (R6 decision 4).
+                        Err(err @ SessionError::ChangeStreamUnusable(_)) => return Err(err),
                         Err(err) => {
                             if started.elapsed() >= policy.healthy_after {
                                 attempt = 0;
@@ -2446,9 +2615,9 @@ where
     /// entry the subscription matches as a `LivePatch` carrying that entry's
     /// cursor, in the live-path format. Entries past the pre-catchup watermark
     /// are skipped because the live path will deliver them, so replay and live
-    /// delivery never double up. The auth read filter runs per client, but a
-    /// delete tombstone replays regardless so a client drops a row it may still
-    /// hold locally.
+    /// hold locally. The two-check form runs per client, so a row this caller may
+    /// no longer see replays as the plain delete that takes it back, and a
+    /// deleted row this caller could never see replays as nothing at all (R6).
     async fn catch_up_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -2472,10 +2641,10 @@ where
             .entries_since(state.resume_lsn)
             .await
             .map_err(oplog_err)?;
-        // One watcher, this session's caller, so the buffer is one verdict and
-        // is reused across the whole replay.
+        // One watcher, this session's caller, so the buffers hold one verdict
+        // each and are reused across the whole replay.
         let watchers = [Arc::clone(&state.principal)];
-        let mut verdicts = Vec::new();
+        let mut verdicts = Transitions::new();
         for record in entries {
             if record.lsn() > ceiling {
                 continue;
@@ -2486,58 +2655,15 @@ where
                     .await
                     .replay_patch(record.event(), reg.consumer_id)?
             };
-            let Some((payload, departure)) = replayed else {
+            let Some((payload, _departure)) = replayed else {
                 continue;
             };
-            // A delete or a truncate has no post-image and so no question, and
-            // replays regardless, which is what lets a client drop a row it may
-            // still hold. A departure notice is exempt for the same reason,
-            // decided for R44: it carries only a key this caller already has.
-            if !departure
-                && let Some(row) = EventRow::current(record.event(), self.catalog.as_ref())
-            {
-                // Retry the authorization question on error instead of silently
-                // skipping the record: a skip followed by delivering later
-                // records would advance the cursor past this one, making it
-                // permanently unreplayable from the oplog.
-                let mut auth_attempt: u32 = 0;
-                let mut paused = false;
-                loop {
-                    Verdict::reset(&mut verdicts, watchers.len());
-                    match self.auth.may_see(&row, &watchers, &mut verdicts).await {
-                        Ok(()) => {
-                            if paused {
-                                let _ = transport
-                                    .send_control(ControlMessage::DeliveryResumed)
-                                    .await;
-                            }
-                            break;
-                        }
-                        Err(err) => {
-                            auth_attempt = auth_attempt.saturating_add(1);
-                            if !paused {
-                                let _ = transport
-                                    .send_control(ControlMessage::DeliveryPaused {
-                                        cause: PauseCause::AuthServiceUnreachable,
-                                    })
-                                    .await;
-                                paused = true;
-                            }
-                            let backoff = self.auth_retry.backoff(auth_attempt);
-                            tracing::warn!(
-                                attempt = auth_attempt,
-                                backoff_ms = backoff.as_millis(),
-                                error = %err,
-                                "auth service unreachable during catchup replay, retrying"
-                            );
-                            tokio::time::sleep(backoff).await;
-                        }
-                    }
-                }
-                if !verdicts.first().copied().unwrap_or_default().allowed() {
-                    continue;
-                }
-            }
+            let Some(payload) = self
+                .replay_payload(transport, record.event(), &watchers, &mut verdicts, payload)
+                .await?
+            else {
+                continue;
+            };
             let cursor = record.lsn().to_be_bytes().to_vec();
             {
                 self.materializer.lock().await.advance_cursor(
@@ -2557,6 +2683,103 @@ where
             .map_err(transport_err)?;
         }
         Ok(())
+    }
+
+    /// What one replayed event delivers to this caller, or [`None`] when it
+    /// delivers nothing (R6, the two-check form on the catchup path).
+    ///
+    /// `built` is the payload the materializer folded for this record, which is
+    /// R44's marked departure notice when the row left this subscription's
+    /// window.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ChangeStreamUnusable`] when the stream cannot report the
+    /// previous version at all, and [`SessionError::Materializer`] when the
+    /// withdrawal cannot be folded.
+    async fn replay_payload<T: Transport>(
+        &self,
+        transport: &mut T,
+        event: &ChangeEvent,
+        watchers: &[Arc<Principal<Id, Key>>],
+        verdicts: &mut Transitions,
+        built: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        // A truncate carries no row, so no question can be put and it replays as
+        // it stands, exactly as on the live path.
+        if event.kind() == EventKind::Truncate {
+            return Ok(Some(built));
+        }
+        // Retry the authorization question on error instead of silently skipping
+        // the record: a skip followed by delivering later records would advance
+        // the cursor past this one, making it permanently unreplayable from the
+        // oplog.
+        let mut auth_attempt: u32 = 0;
+        let mut paused = false;
+        loop {
+            verdicts.reset(watchers.len());
+            match transitions(&self.auth, event, self.catalog.as_ref(), watchers, verdicts).await {
+                Ok(()) => {
+                    if paused {
+                        let _ = transport
+                            .send_control(ControlMessage::DeliveryResumed)
+                            .await;
+                    }
+                    break;
+                }
+                // Not transient, so retrying it would replay one record for ever.
+                // The live path refuses on the same condition and for the same
+                // reason.
+                Err(
+                    err @ (TransitionError::IncompletePreviousImage
+                    | TransitionError::UnknownTable
+                    | TransitionError::NotARowEvent),
+                ) => return Err(self.transition_refusal(event, err)),
+                Err(TransitionError::Policy(err)) => {
+                    auth_attempt = auth_attempt.saturating_add(1);
+                    if !paused {
+                        let _ = transport
+                            .send_control(ControlMessage::DeliveryPaused {
+                                cause: PauseCause::AuthServiceUnreachable,
+                            })
+                            .await;
+                        paused = true;
+                    }
+                    let backoff = self.auth_retry.backoff(auth_attempt);
+                    tracing::warn!(
+                        attempt = auth_attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %err,
+                        "auth service unreachable during catchup replay, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        self.ask_second_opinion(event, watchers, verdicts.get())
+            .await;
+        // R44's departure notice takes the same three-way answer as the live
+        // path: still visible and out of the window keeps the marked notice, out
+        // of reach becomes the plain delete, and never in reach becomes silence
+        // (R6 decision 6).
+        match verdicts.get().first().copied().unwrap_or_default() {
+            Transition::Nothing => Ok(None),
+            Transition::Deliver => Ok(Some(built)),
+            // A replayed delete's own patch already is the withdrawal, as on the
+            // live path, so only an update pays a second fold.
+            Transition::Withdraw if event.kind() == EventKind::Delete => Ok(Some(built)),
+            Transition::Withdraw => {
+                let withdrawal = { self.materializer.lock().await.withdrawal_patch(event)? };
+                let withdrawal = withdrawal.ok_or_else(|| {
+                    MaterializerError::Emit(
+                        "a replayed row has to be taken back from a caller and the event folded \
+                         to no operation to take it back with"
+                            .to_owned(),
+                    )
+                })?;
+                Ok(Some(withdrawal))
+            }
+        }
     }
 
     /// Bootstrap a captured aggregate through the connector, deliver its initial

@@ -45,7 +45,9 @@ use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
 use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
-use subql::emit::{WireTable, pgoutput_patchset, pgoutput_patchset_builder};
+use subql::emit::{
+    WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
+};
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
 use subql::{
@@ -942,6 +944,46 @@ where
             .delete(PatchDelete::new(op.table().clone(), op.primary_key()).indirect(true))
             .build();
         Some(bytes)
+    }
+
+    /// A compressed patchset carrying one plain delete for the row `event`
+    /// changed, keyed by the image the caller holds.
+    ///
+    /// This is what a caller who may no longer see the row receives (R6). It is
+    /// deliberately not the event's own patch, which for an update carries the
+    /// new row values the caller has just lost the right to read, and
+    /// deliberately not the departure notice, which the client discards
+    /// whenever a sibling subscription still covers the row.
+    ///
+    /// **The key comes from the changeset rather than the patchset, and that is
+    /// the point of building a second fold here.** A patchset update stores the
+    /// key it will apply against, which the pgoutput digest fills from the new
+    /// image, while a changeset update stores the row identity old-first. A
+    /// caller holds the row under the old key, so an update that moved the
+    /// primary key would otherwise be withdrawn by a key nothing on the device
+    /// matches, and the row would stay.
+    ///
+    /// [`None`] when the event folds to no operation, which today means a
+    /// truncate.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
+    /// [`MaterializerError::Compression`] on a compression failure.
+    pub(crate) fn withdrawal_patch(
+        &self,
+        event: &ChangeEvent,
+    ) -> Result<Option<Vec<u8>>, MaterializerError> {
+        let built =
+            pgoutput_changeset_builder(self.engine.inner().database(), std::slice::from_ref(event))
+                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        let Some(op) = built.iter().next() else {
+            return Ok(None);
+        };
+        let bytes = PatchSet::<WireTable, String, Vec<u8>>::new()
+            .delete(PatchDelete::new(op.table().clone(), op.primary_key()))
+            .build();
+        Ok(Some(compress(&bytes)?))
     }
 
     /// The `(table, primary-key bytes)` identity of a CDC event, for the auth

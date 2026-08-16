@@ -25,15 +25,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Grant, Handshake, HandshakeAck, LivePatch,
     MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::openfga::{Counted, FgaAuth};
-use connetto_server::parity::ParityAuth;
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy,
     RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -314,12 +313,6 @@ pub enum HarnessAuth {
     /// Authorize the way the shipped binary does: from the changed row where
     /// the schema decides, and an `OpenFGA` server for the rest.
     Fga(Box<HarnessFga>),
-    /// Both executors on every question, delivering on the shipped one and
-    /// counting any disagreement.
-    ///
-    /// What the fan-out fixture serves through, so every Docker-backed run of
-    /// it is also a parity run and the suites can assert the count is zero.
-    Parity(Box<ParityAuth<Counted<Channel>>>),
     /// The shipped policy, with the service taken away and given back on a
     /// flag.
     ///
@@ -374,12 +367,6 @@ impl HarnessAuth {
     pub fn reachable(reachable: Arc<AtomicBool>, auth: HarnessFga) -> Self {
         Self::Reachable(reachable, Box::new(auth))
     }
-
-    /// Both executors, delivering on the shipped one.
-    #[must_use]
-    pub fn parity(auth: ParityAuth<Counted<Channel>>) -> Self {
-        Self::Parity(Box::new(auth))
-    }
 }
 
 impl VisibilityPolicy for HarnessAuth {
@@ -403,7 +390,6 @@ impl VisibilityPolicy for HarnessAuth {
                 .map_err(|e| match e {}),
             Self::Rls(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
             Self::Fga(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
-            Self::Parity(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
             Self::Reachable(up, auth) => {
                 // Spelled out because diesel's blanket `load` shadows the atomic's.
                 if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
@@ -427,7 +413,6 @@ impl VisibilityPolicy for HarnessAuth {
             Self::Permissive(auth) => auth.may_write(write, watcher).await.map_err(|e| match e {}),
             Self::Rls(auth) => Ok(auth.may_write(write, watcher).await?),
             Self::Fga(auth) => Ok(auth.may_write(write, watcher).await?),
-            Self::Parity(auth) => Ok(auth.may_write(write, watcher).await?),
             Self::Reachable(up, auth) => {
                 // Spelled out because diesel's blanket `load` shadows the atomic's.
                 if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
@@ -537,6 +522,20 @@ impl Server {
         assert!(
             self.manager.install_store_upkeep(upkeep).is_ok(),
             "a store upkeep is already installed on this server"
+        );
+    }
+
+    /// Ask Postgres row-level security about every current row alongside the
+    /// executor that delivers, so the suites can assert the two never disagree.
+    ///
+    /// # Panics
+    ///
+    /// When one is already installed, which would compare events either side of
+    /// the swap against two different executors.
+    pub fn install_second_opinion(&self, second: Arc<RlsAuth>) {
+        assert!(
+            self.manager.install_second_opinion(second).is_ok(),
+            "a second opinion is already installed on this server"
         );
     }
 
@@ -680,6 +679,28 @@ impl Client {
         ack
     }
 
+    /// Send a handshake presenting `grant` and the cursor a client persisted, so
+    /// the server catches the subscription up from that point instead of
+    /// snapshotting it afresh.
+    pub async fn handshake_resuming(
+        &mut self,
+        client_id: &str,
+        grant: &str,
+        cursor: Cursor,
+    ) -> HandshakeAck {
+        let handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+            .with_grant(Grant::new(grant))
+            .with_cursor(cursor);
+        self.transport
+            .send_control(ControlMessage::Handshake(handshake))
+            .await
+            .expect("send handshake");
+        let ControlMessage::HandshakeAck(ack) = self.next_control().await else {
+            panic!("expected handshake ack");
+        };
+        ack
+    }
+
     /// Register a subscription. The snapshot and any live patches follow on the
     /// transport; drain them with [`Client::expect_snapshot`] and
     /// [`Client::wait_for_live`].
@@ -783,15 +804,26 @@ impl Client {
     /// Wait for a live patch to arrive, skipping any interleaved control frames
     /// (keepalive pongs and the like). Panics if none arrives within `timeout`.
     pub async fn wait_for_live(&mut self, timeout: Duration) -> LivePatch {
+        self.try_live(timeout)
+            .await
+            .expect("timed out waiting for a live patch")
+    }
+
+    /// The next live patch, or [`None`] when none arrives within `timeout`.
+    ///
+    /// The waiting form above panics, which cannot express the opposite
+    /// assertion: that nothing is delivered. A confidentiality test needs that
+    /// one, because silence is the correct outcome for a caller who may not see
+    /// the row.
+    pub async fn try_live(&mut self, timeout: Duration) -> Option<LivePatch> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let frame = tokio::time::timeout(remaining, self.transport.recv())
-                .await
-                .expect("timed out waiting for a live patch")
-                .expect("recv frame");
-            match frame {
-                Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => return patch,
+            let Ok(frame) = tokio::time::timeout(remaining, self.transport.recv()).await else {
+                return None;
+            };
+            match frame.expect("recv frame") {
+                Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => return Some(patch),
                 Some(IncomingFrame::Control(_)) => {}
                 other => panic!("expected a live patch, got {other:?}"),
             }

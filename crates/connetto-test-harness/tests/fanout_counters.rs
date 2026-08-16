@@ -9,8 +9,10 @@
 //!
 //! **This file used to assert the opposite** and pinned the defect R5b existed
 //! to remove: one Postgres round trip per subscriber per event. The three other
-//! assertions are unchanged and still pin costs that do grow, because they are
-//! R14's to remove and not this phase's.
+//! assertions are unchanged and still pin costs that do grow. R14 was to remove
+//! them and was dropped on 2026-08-16, measured immaterial beside the per-event
+//! floor, so they travel with the shared payload to the phase that builds the
+//! frame split.
 //!
 //! What the counter does not claim: that no policy ever costs a round trip. A
 //! policy that reads another table is delegated and is linear in the watchers

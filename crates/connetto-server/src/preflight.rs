@@ -8,7 +8,10 @@
 //! change rather than on the boot that introduced it.
 //!
 //! One entry point rather than a check per caller, so a later requirement is a
-//! variant and a list entry instead of a seventh hand-rolled refusal.
+//! variant and a list entry instead of a seventh hand-rolled refusal. Not every
+//! requirement is a thing that exists or does not: a table can be there and
+//! still be unfit to stream, which is why a probe reports three outcomes rather
+//! than a bool.
 
 use diesel::prelude::*;
 use diesel::sql_types::{Bool, Text};
@@ -39,6 +42,36 @@ pub enum Artifact<'a> {
         /// The table a policy reads and the publication must carry.
         table: &'a str,
     },
+    /// Every table the publication carries records the row as it was, which
+    /// Postgres does only under `REPLICA IDENTITY FULL`.
+    ///
+    /// Not a thing the deployment creates but a property of the tables it
+    /// already streams, so its refusal names the tables to fix rather than
+    /// offering to have one provisioned.
+    ///
+    /// **Scoped to the publication rather than the database, and that is
+    /// decision 2 of R6.** subql ships the database-wide audit
+    /// (`REPLICA_IDENTITY_AUDIT_SQL`), which also reports connetto's own
+    /// bookkeeping tables: the watermark, the sessions, the provider tokens,
+    /// the audit log, the ban list and the change log all sit in the same
+    /// database, none of them is replicated, and setting the property on them
+    /// would mean nothing. What connetto needs the previous row image for is
+    /// the change stream, so the tables the change stream carries are exactly
+    /// the tables that must have it.
+    PreviousImages {
+        /// The publication whose tables must all record their previous image.
+        publication: &'a str,
+    },
+}
+
+/// What a probe found.
+enum Found {
+    /// There, and fit to serve.
+    Fit,
+    /// Absent. The deployment provisions it.
+    Absent,
+    /// There and unfit, naming what has to be fixed.
+    Unfit(Vec<String>),
 }
 
 impl Artifact<'_> {
@@ -46,7 +79,7 @@ impl Artifact<'_> {
     const fn noun(&self) -> &'static str {
         match self {
             Self::ReplicationSlot(_) => "replication slot",
-            Self::Publication(_) => "publication",
+            Self::Publication(_) | Self::PreviousImages { .. } => "publication",
             Self::Table(_) => "table",
             Self::PublishedTable { .. } => "replicated table",
         }
@@ -57,10 +90,11 @@ impl Artifact<'_> {
         match self {
             Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
             Self::PublishedTable { table, .. } => table,
+            Self::PreviousImages { publication } => publication,
         }
     }
 
-    /// Whether this exists, on `conn`.
+    /// What `conn` says about this artifact.
     ///
     /// The name is bound rather than interpolated in every case, including the
     /// table, where `to_regclass` takes it as text and so needs no identifier
@@ -77,20 +111,40 @@ impl Artifact<'_> {
     /// Not checked: that the slot's output plugin is `pgoutput`. A slot on the
     /// wrong plugin fails at stream time rather than here.
     ///
-    /// The three catalog probes are raw statements because they read
-    /// `pg_catalog` views that exist to be queried this way, and each binds
-    /// only its own name. The publication membership check needs two binds and
-    /// gets a modelled view instead.
-    async fn exists(&self, conn: &mut AsyncPgConnection) -> Result<bool, diesel::result::Error> {
+    /// The catalog probes are raw statements because they read `pg_catalog`
+    /// views that exist to be queried this way, and each binds only its own
+    /// name. The publication membership check needs two binds and gets a
+    /// modelled view instead. The replica-identity probe joins the view to
+    /// `pg_class` on schema and name, so it reads three catalogs and stays a
+    /// statement of its own.
+    async fn probe(&self, conn: &mut AsyncPgConnection) -> Result<Found, diesel::result::Error> {
         let probe = match self {
             Self::PublishedTable { publication, table } => {
-                return diesel::select(diesel::dsl::exists(
+                let present: bool = diesel::select(diesel::dsl::exists(
                     pg_publication_tables::table
                         .filter(pg_publication_tables::pubname.eq(publication))
                         .filter(pg_publication_tables::tablename.eq(table)),
                 ))
                 .get_result(conn)
-                .await;
+                .await?;
+                return Ok(if present { Found::Fit } else { Found::Absent });
+            }
+            Self::PreviousImages { publication } => {
+                let deficient: Vec<Named> = sql_query(
+                    "SELECT c.relname AS name FROM pg_publication_tables p \
+                     JOIN pg_namespace n ON n.nspname = p.schemaname \
+                     JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename \
+                     WHERE p.pubname = $1 AND c.relreplident <> 'f' \
+                     ORDER BY c.relname",
+                )
+                .bind::<Text, _>(publication)
+                .load(conn)
+                .await?;
+                return Ok(if deficient.is_empty() {
+                    Found::Fit
+                } else {
+                    Found::Unfit(deficient.into_iter().map(|row| row.name).collect())
+                });
             }
             Self::ReplicationSlot(_) => {
                 "SELECT EXISTS (SELECT 1 FROM pg_replication_slots \
@@ -105,7 +159,11 @@ impl Artifact<'_> {
             .bind::<Text, _>(self.name())
             .load(conn)
             .await?;
-        Ok(rows.into_iter().next().is_some_and(|row| row.present))
+        Ok(if rows.into_iter().next().is_some_and(|row| row.present) {
+            Found::Fit
+        } else {
+            Found::Absent
+        })
     }
 }
 
@@ -150,6 +208,25 @@ pub enum PreflightError {
         /// Its name.
         name: String,
     },
+    /// Every table the publication carries is there, and some of them do not
+    /// record the row as it was.
+    ///
+    /// Its own variant because [`Missing`](Self::Missing) offers to have the
+    /// deployment provision the artifact, which is the wrong instruction for a
+    /// table that exists and is configured the wrong way.
+    #[error(
+        "publication {publication} carries tables that do not record the row as it \
+         was before a change: {tables}. connetto has to know that to take a row \
+         back from a caller who may no longer see it, and Postgres records it only \
+         under REPLICA IDENTITY FULL, so run ALTER TABLE <name> REPLICA IDENTITY \
+         FULL on each before the server will start"
+    )]
+    PreviousImage {
+        /// The publication whose tables were audited.
+        publication: String,
+        /// The tables to fix, comma separated.
+        tables: String,
+    },
 }
 
 #[derive(QueryableByName)]
@@ -158,7 +235,15 @@ struct Present {
     present: bool,
 }
 
-/// Refuse unless every artifact exists, naming the first that does not.
+/// One name a probe reported.
+#[derive(QueryableByName)]
+struct Named {
+    #[diesel(sql_type = Text)]
+    name: String,
+}
+
+/// Refuse unless every artifact is there and fit to serve, naming the first
+/// that is not.
 ///
 /// Checked in the order given, so a caller lists the piece a reader would want
 /// named first when several are absent at once, which on a fresh database is
@@ -167,8 +252,9 @@ struct Present {
 /// # Errors
 ///
 /// [`PreflightError::Missing`] naming the absent artifact,
-/// [`PreflightError::Probe`] when the check could not be answered, and
-/// [`PreflightError::Pool`] when no connection was available.
+/// [`PreflightError::PreviousImage`] naming the replicated tables that cannot
+/// report an old row, [`PreflightError::Probe`] when the check could not be
+/// answered, and [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
     pool: &Pool<AsyncPgConnection>,
     artifacts: &[Artifact<'_>],
@@ -178,19 +264,28 @@ pub async fn require(
         .await
         .map_err(|err| PreflightError::Pool(err.to_string()))?;
     for artifact in artifacts {
-        let present = artifact
-            .exists(&mut conn)
+        let found = artifact
+            .probe(&mut conn)
             .await
             .map_err(|source| PreflightError::Probe {
                 noun: artifact.noun(),
                 name: artifact.name().to_owned(),
                 source,
             })?;
-        if !present {
-            return Err(PreflightError::Missing {
-                noun: artifact.noun(),
-                name: artifact.name().to_owned(),
-            });
+        match found {
+            Found::Fit => {}
+            Found::Absent => {
+                return Err(PreflightError::Missing {
+                    noun: artifact.noun(),
+                    name: artifact.name().to_owned(),
+                });
+            }
+            Found::Unfit(tables) => {
+                return Err(PreflightError::PreviousImage {
+                    publication: artifact.name().to_owned(),
+                    tables: tables.join(", "),
+                });
+            }
         }
     }
     Ok(())

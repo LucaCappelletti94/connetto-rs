@@ -1,11 +1,18 @@
 //! Read-filter acceptance test (Docker-free).
 //!
 //! The live dispatch path must deliver a row to a session only when the
-//! session's auth context may see it, except deletes, which replay as
-//! tombstones regardless so a client drops a row it may still hold. This drives
-//! CDC through a session whose auth policy denies one primary key and asserts
-//! the denied insert is withheld while the later delete for that key still
-//! arrives.
+//! session's auth context may see it, and that now includes a delete: a
+//! tombstone names the row, so forwarding one for a row the caller could never
+//! see discloses that it existed. This drives CDC through a session whose auth
+//! policy denies one primary key and asserts that neither the denied insert nor
+//! the later delete for that key reaches the client.
+//!
+//! **Its expectation changed with R6.** Until then every tombstone replayed
+//! unconditionally, on the reasoning that a client has to be able to drop a row
+//! it may still hold. The two-check form answers that properly: a row the caller
+//! could see and can no longer see is withdrawn, and one the caller never saw is
+//! not mentioned. The old rule got the first case right by getting the second
+//! wrong.
 
 #![allow(clippy::too_many_lines)]
 
@@ -20,15 +27,15 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
-    pg_write_target,
+    LoopbackTransport, Materializer, ReconnectPolicy, RequestGuard, SessionConfig, SessionError,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, ChangeEvent, PgLsn, PgSqliteEmuSource};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -146,10 +153,19 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
-async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
-    let fixture = Fixture::acquire().await;
+/// The manager, one connected session with a subscription over the whole table,
+/// and the task serving it. Its empty snapshot is drained, so the next frame a
+/// caller reads is whatever the change path decided.
+type Manager = Arc<SessionManager<EmptySnapshot, DenyId2, ConnettoWatermark>>;
+
+async fn connected_session(
+    fixture: &Fixture,
+    query: &str,
+) -> (
+    Manager,
+    LoopbackTransport,
+    tokio::task::JoinHandle<Result<(), SessionError>>,
+) {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
         materializer,
@@ -161,8 +177,6 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
     );
-    let applier = Materializer::new(PG_DDL).expect("build applier");
-    let mut replica = client_replica();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
@@ -181,7 +195,7 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::new("SELECT * FROM orders WHERE quantity > 0"),
+            spec: SubscriptionSpec::new(query),
         }))
         .await
         .expect("send subscribe");
@@ -198,6 +212,17 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
     let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
         panic!("expected snapshot end");
     };
+    (manager, client, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
+    let fixture = Fixture::acquire().await;
+    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let mut replica = client_replica();
+    let (manager, mut client, server) =
+        connected_session(&fixture, "SELECT * FROM orders WHERE quantity > 0").await;
 
     // Drive three inserts (id 2 is denied) then a delete of the denied id.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -234,11 +259,13 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
         }
     }
 
-    // Two inserts delivered (1 and 3), the denied insert (2) withheld, and the
-    // delete of 2 still replayed as a tombstone: three live patches total.
-    assert_eq!(live, 3, "denied insert withheld, delete replayed");
-    // The replica never saw id 2, and the tombstone delete of the absent row is
-    // an idempotent no-op, so it holds exactly the two authorized rows.
+    // Two inserts delivered (1 and 3). The denied insert (2) is withheld, and so
+    // is the delete of 2, because this caller could see neither version of that
+    // row: telling it the row is gone would tell it the row was there.
+    assert_eq!(
+        live, 2,
+        "the denied insert and the tombstone for the same row are both withheld"
+    );
     assert_eq!(
         orders(&mut replica),
         vec![order(1, 9.5, 3, "a"), order(3, 2.0, 2, "c")],
@@ -247,6 +274,108 @@ async fn live_read_filter_withholds_denied_rows_but_replays_tombstones() {
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
+}
+
+/// A source that yields one event and then ends cleanly, so what the ingest loop
+/// does with that event is the whole of what a run observes.
+struct OneEvent(Option<ChangeEvent>);
+
+impl CdcSource for OneEvent {
+    type Event = ChangeEvent;
+    type Error = std::io::Error;
+
+    fn next_event(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<ChangeEvent>, std::io::Error>> + Send {
+        let next = self.0.take();
+        async move { Ok(next) }
+    }
+
+    // reason: the trait wants a `Send` future and clippy's other arm wants
+    // `async fn`, so one of the two fires whichever form this takes. Matching the
+    // form the rest of this file uses.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn ack(&mut self, _upto: PgLsn) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+/// A change the stream cannot report the previous version of refuses to serve,
+/// rather than being held and retried for ever (R6 decision 4).
+///
+/// The condition is a table definition, so it produces the same failure on every
+/// later change to that table. Holding the event would stop the stream for every
+/// table with nothing said, and the pause a client would see names the
+/// authorization service, which is not what went wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
+    let fixture = Fixture::acquire().await;
+    // No predicate, so the subscription's set is keyed by the primary key alone
+    // and a delete carrying only that key still names this consumer. A predicate
+    // over a column the event does not carry is undecidable, and what the engine
+    // does with that is its own question rather than this one.
+    let (manager, mut client, server) = connected_session(&fixture, "SELECT * FROM orders").await;
+
+    // The row has to be in the subscription's set for its deletion to reach a
+    // caller at all, so it arrives the ordinary way first.
+    let mut seed = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    seed.execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'a')")
+        .expect("execute dml");
+    while let Some(event) = seed.next_event().await.expect("poll source") {
+        manager
+            .dispatch_event(&event)
+            .await
+            .expect("dispatch event");
+    }
+
+    // Exactly what Postgres emits for a delete on a table whose replica identity
+    // is not FULL: the key, and no other column.
+    let mut old = pg_walstream::RowData::with_capacity(1);
+    old.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
+    let event = ChangeEvent::delete(
+        "public",
+        "orders",
+        0,
+        old,
+        pg_walstream::ReplicaIdentity::Default,
+        vec![Arc::from("id")],
+        pg_walstream::Lsn::new(1),
+    );
+
+    let refused = manager.dispatch_event(&event).await.expect_err(
+        "whether this caller could see the row that has gone is not knowable from \
+         the event, so nothing may be delivered for it",
+    );
+    assert!(
+        matches!(&refused, SessionError::ChangeStreamUnusable(table) if table == "orders"),
+        "the refusal has to name the table somebody must alter: {refused}"
+    );
+
+    // The reconnect loop retries a stream failure for ever by design, so the one
+    // thing to prove is that it does not retry this.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.ingest_with_reconnect(
+            || {
+                let event = event.clone();
+                async move { Ok::<_, std::io::Error>(OneEvent(Some(event))) }
+            },
+            &ReconnectPolicy::default(),
+            |_event| {},
+        ),
+    )
+    .await
+    .expect("the loop returned rather than retrying a condition that cannot clear")
+    .expect_err("and it returned the refusal");
+    assert!(
+        matches!(outcome, SessionError::ChangeStreamUnusable(_)),
+        "reconnecting the stream cannot change a table's definition, so this is \
+         the refusal and not a give-up after N attempts: {outcome}"
+    );
+
+    client.close().await.expect("close client");
+    let _ = server.await.expect("join server");
 }
 
 fn orders(conn: &mut SqliteConnection) -> Vec<Order> {
