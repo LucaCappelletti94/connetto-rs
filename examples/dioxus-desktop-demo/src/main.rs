@@ -29,7 +29,9 @@ use connetto_client::auth::{
 };
 use connetto_client::replica::{Replica, replica_db_name};
 use connetto_client::teardown::{ForgetError, PurgeError, forget_device};
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Grant, SqlFunctions};
+use connetto_client::{
+    ClientConfig, ConnettoClient, ConnettoConnection, Grant, PolicyTables, SqlFunctions,
+};
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
@@ -38,6 +40,8 @@ use dioxus::prelude::*;
 use rosetta_uuid::Uuid;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
 /// The translated SQLite DDL, used to seed a replica on first boot.
 const REPLICA_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
@@ -409,7 +413,11 @@ async fn setup_authenticated(
         // this connection to the specific per-identity replica.
         .with_login(Some(Grant::new(session.access_token)))
         .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
-        .with_sql_functions(uuidv4_functions());
+        .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(PolicyTables::from_translation(
+            POLICY_TABLES.iter().copied(),
+            POLICY_VIEWS.iter().copied(),
+        ));
 
     let conn = if existing {
         // Resume: the replica already carries its schema and cursor.

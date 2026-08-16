@@ -25,11 +25,10 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
-
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -39,6 +38,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -52,23 +52,33 @@ fn unique_id() -> i64 {
     30_000_000_000 + millis
 }
 
-async fn connect(name: &str) -> ConnettoConnection<BrowserSocket> {
+async fn connect(name: &str, token: String, identity: String) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig::new(format!("{name}-{}", unique_id()))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
-    ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+    ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        connetto_wasm_smoke::workers::DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 #[wasm_bindgen_test]
 async fn page_live_query_reloads_on_another_clients_write() {
+    let (token, identity) = common::mint_session().await;
     // The observing client runs in a dedicated worker, same as the data tier.
-    let (observer, pump) = ConnettoClient::with_pump(connect("page-observer").await);
+    let (observer, pump) =
+        ConnettoClient::with_pump(connect("page-observer", token.clone(), identity.clone()).await);
     wasm_bindgen_futures::spawn_local(pump);
     let mut live: LiveQuery<Order> = orders::table
         .order(orders::id)
@@ -79,7 +89,7 @@ async fn page_live_query_reloads_on_another_clients_write() {
     // A second, independent client writes: the change must reach the page
     // through the server (apply to Postgres, replication echo, live patch),
     // never through anything local to the observer.
-    let mut writer = connect("page-writer").await;
+    let mut writer = connect("page-writer", token, identity.clone()).await;
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
         .load::<rosetta_uuid::Uuid>(writer.conn())
@@ -87,7 +97,10 @@ async fn page_live_query_reloads_on_another_clients_write() {
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(5_i64))
+        .values((
+            orders::owner_id.eq(identity.as_str()),
+            orders::quantity.eq(5_i64),
+        ))
         .execute(writer.conn())
         .expect("writer insert");
     let id: rosetta_uuid::Uuid = orders::table

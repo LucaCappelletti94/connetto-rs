@@ -20,6 +20,26 @@ pub use connetto_web::{
 /// version at handshake.
 pub const DEMO_SCHEMA_SQL: &str = include_str!("../schema.sql");
 
+// The logical-to-physical table map and view list the build's translation
+// produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
+include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
+
+/// The replica's local name for `current_setting('app.user_id')`, which
+/// `policies.sql` compares `orders.owner_id` against. connetto registers a
+/// function of this name returning the identity the replica belongs to, so the
+/// same policy filters the same rows locally and on the server.
+pub const CALLER_FUNCTION: &str = "current_app_user";
+
+/// The tables `schema.sql` plus `policies.sql` split, for
+/// `ClientConfig::with_policy_tables`.
+#[must_use]
+pub fn demo_policy_tables() -> connetto_client::PolicyTables {
+    connetto_client::PolicyTables::from_translation(
+        POLICY_TABLES.iter().copied(),
+        POLICY_VIEWS.iter().copied(),
+    )
+}
+
 /// The schema version this build was compiled against, for staleness detection.
 /// Every client that reaches the real demo server (directly or through the
 /// relay) presents this so its handshake is not rejected as stale.
@@ -88,17 +108,23 @@ pub mod workers {
 
     /// The demo server every smoke context connects to.
     pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
-    /// The synced replica schema: `orders` is the server-synced table.
-    pub const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT;";
+    /// The synced replica schema, translated from `schema.sql` and
+    /// `policies.sql` by build.rs. Hand-copying it here is what used to keep
+    /// the browser suite off the translator's real output, which for a
+    /// policy-bearing table is a backing table, a view and triggers rather
+    /// than one plain table.
+    pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
+    /// The local tier schema: `notes` is device-private and never synced.
+    pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
     /// The mirror schema for tab clients: both tiers live in the tab's main
     /// schema, because every relayed patch (snapshot, upstream, and local
     /// fan-out alike) applies to main. The hub, not the tab, keeps the tiers
     /// apart.
-    pub const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
-         CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
-    /// The local tier schema: `notes` is device-private and never synced.
-    pub const DEMO_FRONTEND_DDL: &str =
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+    pub const DEMO_TAB_DDL: &str = concat!(
+        include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql")),
+        "\n",
+        include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql")),
+    );
     /// The upstream subscription the DB worker registers.
     pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
     /// The OPFS file holding the DB worker's durable replica.
@@ -138,6 +164,8 @@ pub mod workers {
                 .with_upstream_query(DEMO_QUERY)
                 .with_hub_meta_name("connetto-hub-meta.sqlite")
                 .with_sql_functions(crate::uuidv4_functions())
+                .with_policy_tables(crate::demo_policy_tables())
+                .with_caller_function(crate::CALLER_FUNCTION)
                 .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                     "http://127.0.0.1:18099",
                     "dev-idp",

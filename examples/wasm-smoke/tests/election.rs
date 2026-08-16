@@ -54,6 +54,7 @@ fn relay_worker_breadcrumbs() {
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -63,6 +64,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -88,14 +90,21 @@ fn glue_url() -> String {
     format!("{base}.js")
 }
 
-async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
+async fn connect_server(
+    name: &str,
+    tag: i64,
+    token: String,
+    identity: &str,
+) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -131,6 +140,7 @@ where
 async fn write_row(
     writer: &mut ConnettoConnection<BrowserSocket>,
     nonce: u64,
+    identity: &str,
 ) -> rosetta_uuid::Uuid {
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
@@ -139,7 +149,7 @@ async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(5_i64))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -171,10 +181,13 @@ async fn poll_until(mut pred: impl FnMut() -> bool) {
 async fn election_promotes_a_survivor_and_serves_the_tab() {
     let base = unique_base();
     relay_worker_breadcrumbs();
+    // Writer and tab share one session so the tab's view is configured for
+    // the same owner_id that the writer inserts as.
+    let (token, user_id) = common::mint_session().await;
 
     // A row that exists before anything boots.
-    let mut writer = connect_server("election-writer", base).await;
-    let before_id = write_row(&mut writer, 1).await;
+    let mut writer = connect_server("election-writer", base, token.clone(), &user_id).await;
+    let before_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the first row");
 
     let glue = glue_url();
@@ -208,9 +221,11 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
     let transport = MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         .expect("boot wire");
     let config = ClientConfig::new(client_id.clone())
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, &user_id);
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -244,7 +259,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
 
     // Written while the topology has no worker: only the replacement's cursor
     // resume and oplog catchup can ever deliver this row.
-    let missed_id = write_row(&mut writer, 2).await;
+    let missed_id = write_row(&mut writer, 2, &user_id).await;
     writer.close().await.expect("close writer");
     stage("missed row written");
 

@@ -1,47 +1,129 @@
 //! Build-time schema pipeline: translate each Postgres dialect source
 //! document to SQLite DDL through pg2sqlite and write it out as text, so a
 //! first boot applies the schema through `ConnettoConnection::connect`.
-//! `schema.sql` is the shared tier (the synced replica), `frontend.sql` the
-//! local tier (device-private, attached, never synced). Each document is
-//! translated alone: the two are separate reference universes, so pg2sqlite's
-//! reference-closure validation makes a foreign key crossing the boundary fail
-//! this build. This is the pipeline a generated schema crate would run,
-//! inlined here for the demo.
+//! `schema.sql` plus `policies.sql` is the shared tier (the synced replica),
+//! `frontend.sql` the local tier (device-private, attached, never synced).
+//! Each tier is translated alone: the two are separate reference universes, so
+//! pg2sqlite's reference-closure validation makes a foreign key crossing the
+//! boundary fail this build. This is the pipeline a generated schema crate
+//! would run, inlined here for the demo.
+//!
+//! The synced tier carries row-level security, so its translation splits
+//! `orders` into a backing table, a view of the logical name, and `INSTEAD OF`
+//! triggers. The client rewrites names at its sync boundaries from the map
+//! written here, which comes out of the same run that emitted the DDL and so
+//! cannot drift from it.
 
 use diesel::connection::SimpleConnection;
-use diesel::{Connection, SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TranslationOptions, UuidRepresentation};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use pg2sqlite::prelude::{
+    Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, TranslationOptions, UuidRepresentation,
+    WrapperKind,
+};
 
-/// Translate one source document and write the SQLite DDL to `ddl_path`.
+/// The replica's local name for the caller identity a policy compares against.
+/// The app registers a SQLite function under this name on every connection
+/// connetto opens, returning the identity the replica was opened for.
+const CALLER_FUNCTION: &str = "current_app_user";
+
+/// The synced tier's documents. A table splits only when a policy applies to
+/// it, so the schema and its policies translate as one universe.
+const SYNCED: &[&str] = &["schema.sql", "policies.sql"];
+
+diesel::table! {
+    /// SQLite's own catalogue, read to list the views the translation created.
+    /// Deducing them from the table names instead would bake pg2sqlite's
+    /// naming into this build, which is the drift the generated map avoids.
+    #[sql_name = "sqlite_schema"]
+    sqlite_catalog (name) {
+        /// The object kind: `table`, `view`, `index` or `trigger`.
+        #[sql_name = "type"]
+        kind -> diesel::sql_types::Text,
+        /// The object name.
+        name -> diesel::sql_types::Text,
+    }
+}
+
+fn options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_uuid_function_name("uuidv4")
+        .with_session_variable(SessionVariableMapping::current_setting(
+            "app.user_id",
+            CALLER_FUNCTION,
+        ))
+        .with_rls_audit_table_name("rls_audit".to_string())
+}
+
+/// Parse every document in `documents` into one translator.
+fn parsed(documents: &[&str]) -> Pg2Sqlite {
+    documents
+        .iter()
+        .fold(Pg2Sqlite::default(), |acc, document| {
+            let pg_sql = std::fs::read_to_string(document).expect("read the source document");
+            acc.sql(&pg_sql).expect("parse the Postgres schema")
+        })
+}
+
+/// Translate one tier, write its SQLite DDL to `ddl_path`, and report the
+/// views the translation created.
 ///
 /// The DDL is also applied to a throwaway in-memory database, which is the only
 /// check that SQLite accepts what pg2sqlite emitted. It used to be applied to a
 /// baked template file that first boot imported, and that file is gone: an
-/// encrypted replica cannot be seeded from a plaintext byte image.
-fn translate(document: &str, ddl_path: &std::path::Path) {
-    let pg_sql = std::fs::read_to_string(document).expect("read the source document");
-    let statements = Pg2Sqlite::default()
-        .sql(&pg_sql)
-        .expect("parse the Postgres schema")
-        .translate_to_sql(
-            &Pg2SqliteOptions::default()
-                .with_uuid_representation(UuidRepresentation::Blob)
-                .with_uuid_function_name("uuidv4"),
-        )
+/// encrypted replica cannot be seeded from a plaintext byte image. That same
+/// database is now what the view list is read from, so the artifact records
+/// what the translation actually built rather than what it was expected to.
+fn translate(documents: &[&str], ddl_path: &std::path::Path) -> Vec<String> {
+    let statements = parsed(documents)
+        .translate_to_sql(&options())
         .expect("translate the schema to SQLite");
     let mut ddl = statements.join(";\n");
     ddl.push(';');
     std::fs::write(ddl_path, &ddl).expect("write the translated DDL");
-    SqliteConnection::establish(":memory:")
-        .expect("open the validation database")
+    let mut probe = SqliteConnection::establish(":memory:").expect("open the validation database");
+    probe
         .batch_execute(&ddl)
         .expect("SQLite accepts the translated DDL");
+    sqlite_catalog::table
+        .select(sqlite_catalog::name)
+        .filter(sqlite_catalog::kind.eq("view"))
+        .load::<String>(&mut probe)
+        .expect("list the views the translation created")
+}
+
+/// Write the logical-to-physical map and the view list the client is
+/// configured with, as Rust source the crate includes.
+fn write_policy_tables(documents: &[&str], views: &[String], out: &std::path::Path) {
+    let manifest = parsed(documents)
+        .translation_manifest(&options())
+        .expect("report the translation manifest");
+    let pairs = manifest
+        .iter()
+        .filter(|entry| entry.wrapper == WrapperKind::RlsView)
+        .map(|entry| format!("    ({:?}, {:?}),\n", entry.logical, entry.physical))
+        .collect::<String>();
+    let views = views
+        .iter()
+        .map(|name| format!("    {name:?},\n"))
+        .collect::<String>();
+    let source = format!(
+        "/// Tables the row-level-security translation split, as (logical, physical).\n\
+         pub const POLICY_TABLES: &[(&str, &str)] = &[\n{pairs}];\n\n\
+         /// Every view that translation emitted, which the replica is checked against.\n\
+         pub const POLICY_VIEWS: &[&str] = &[\n{views}];\n"
+    );
+    std::fs::write(out, source).expect("write the policy-table map");
 }
 
 fn main() {
     println!("cargo::rerun-if-changed=schema.sql");
+    println!("cargo::rerun-if-changed=policies.sql");
     println!("cargo::rerun-if-changed=frontend.sql");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    translate("schema.sql", &out_dir.join("replica-ddl.sql"));
-    translate("frontend.sql", &out_dir.join("frontend-ddl.sql"));
+    let synced_views = translate(SYNCED, &out_dir.join("replica-ddl.sql"));
+    translate(&["frontend.sql"], &out_dir.join("frontend-ddl.sql"));
+    // The synced tier only: the local tier is a separate database, attached
+    // under its own schema, and the check the map feeds reads `main`.
+    write_policy_tables(SYNCED, &synced_views, &out_dir.join("replica-tables.rs"));
 }

@@ -45,6 +45,8 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         .with_upstream_query(DEMO_QUERY)
         .with_hub_meta_name("e42-hub-meta.sqlite")
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller_function(connetto_wasm_smoke::CALLER_FUNCTION)
         .with_auth(auth)
         .with_auth_db_name(REFRESH_DB)
 }
@@ -140,6 +142,18 @@ fn install_the_tab() -> Rc<Cell<u32>> {
 /// Each call performs a complete login and returns a distinct session token.
 /// Requires the auth server to be running at `AUTH_BASE`.
 pub async fn mint_token() -> String {
+    mint_session().await.0
+}
+
+/// Mint a fresh access token and report the identity the server binds as
+/// `app.user_id` while it acts for it.
+///
+/// The identity comes off the acquired session rather than out of the token,
+/// which is the same value the server reads from the token's `sub` claim
+/// (`crates/connetto-server/src/authn/token.rs`). A test that owns a row has
+/// to name that identity: writing one the policy would then hide from its own
+/// author is indistinguishable from a rename that did not happen.
+pub async fn mint_session() -> (String, String) {
     let storage = connetto_web::storage::ReplicaStorage::install().await;
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let device = connetto_web::storage::device_key(&keys)
@@ -163,14 +177,13 @@ pub async fn mint_token() -> String {
         Acquired::Access(_) => panic!("a fresh store cannot refresh silently"),
     };
     let (code, state) = walk_the_login(&pending.login_url).await;
-    let token = authenticator
+    let session = authenticator
         .complete::<String>(&pending, &code, &state, &store)
         .await
-        .expect("complete login")
-        .access_token;
+        .expect("complete login");
     // Close the connection before removing the file: deleting an OPFS database
     // out from under a live handle is what trips the sahpool bookkeeping.
     drop(store);
     storage.delete_db(&db_name).ok();
-    token
+    (session.access_token, session.user_id)
 }

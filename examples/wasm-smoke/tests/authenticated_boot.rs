@@ -25,6 +25,8 @@
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "$(cat examples/wasm-smoke/schema.sql)"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
+//!   -c "$(cat examples/wasm-smoke/policies.sql)"
+//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "CREATE PUBLICATION connetto_pub FOR TABLE orders"
 //! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   -c "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')"
@@ -58,6 +60,7 @@
 //!   cargo run --release --all-features -p connetto-server --example auth_stack
 //! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
 //!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
+//!   CONNETTO_PG_POLICIES_FILE=examples/wasm-smoke/policies.sql \
 //!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55471/postgres \
 //!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55471/postgres \
 //!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \

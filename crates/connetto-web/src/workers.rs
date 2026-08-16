@@ -108,6 +108,15 @@ pub struct DbWorkerConfig {
     /// DDL or insert. Empty by default. A synced schema whose key column has a
     /// function-backed `DEFAULT` supplies the matching installer here.
     sql_functions: connetto_client::SqlFunctions,
+    /// The tables the synced replica's row-level-security translation split,
+    /// from the same build that produced `replica_ddl`. Empty by default,
+    /// which is right for a schema with no policies and renames nothing.
+    policy_tables: connetto_client::PolicyTables,
+    /// The SQLite function name a translated policy calls for the caller, from
+    /// the build's `with_session_variable` mapping. Empty when no policy names
+    /// the caller. The worker fills the value from the identity it signed in
+    /// as, which is the same identity the replica is named from.
+    caller_function: &'static str,
     /// Browser OAuth acquisition. `None` uses a placeholder token (dev and the
     /// pre-auth loops). `Some` makes the worker acquire connetto's own token
     /// before connecting: silently from the OPFS-stored refresh token on a cold
@@ -134,6 +143,8 @@ impl DbWorkerConfig {
             hub_meta_name: "",
             schema_version,
             sql_functions: connetto_client::SqlFunctions::default(),
+            policy_tables: connetto_client::PolicyTables::new(),
+            caller_function: "",
             auth: None,
             auth_db_name: "",
         }
@@ -195,6 +206,25 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_sql_functions(mut self, sql_functions: connetto_client::SqlFunctions) -> Self {
         self.sql_functions = sql_functions;
+        self
+    }
+
+    /// The tables the synced replica's translation split, from the build that
+    /// produced the replica DDL.
+    #[must_use]
+    pub fn with_policy_tables(mut self, policy_tables: connetto_client::PolicyTables) -> Self {
+        self.policy_tables = policy_tables;
+        self
+    }
+
+    /// The SQLite function name a translated policy calls for the caller.
+    ///
+    /// The worker supplies the value itself, from the identity it authenticated
+    /// as, so a policy comparing against `current_setting('app.user_id')` on the
+    /// server compares against the same person here.
+    #[must_use]
+    pub fn with_caller_function(mut self, caller_function: &'static str) -> Self {
+        self.caller_function = caller_function;
         self
     }
 
@@ -421,7 +451,10 @@ async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
 #[allow(clippy::too_many_lines)]
 pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<Option<Id>, JsValue>
 where
-    Id: serde::Serialize + serde::de::DeserializeOwned,
+    // `Display` because the server binds this identity as the row-level
+    // security setting through the same rendering, so a policy comparing
+    // against it must see the same string on both ends.
+    Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {
     let storage = crate::storage::ReplicaStorage::install().await;
 
@@ -526,10 +559,23 @@ where
         .map(|session| Grant::new(session.access_token.clone()));
     let identified = session.is_some();
     let identity = session.map(|session| session.user_id);
-    let client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
+    let mut client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
         .with_login(login)
         .with_schema_version(Some(config.schema_version.clone()))
-        .with_sql_functions(config.sql_functions.clone());
+        .with_sql_functions(config.sql_functions.clone())
+        .with_policy_tables(config.policy_tables.clone());
+    if !config.caller_function.is_empty() {
+        // Nobody signed in gets the empty string, which no owner column equals,
+        // so a translated policy hides every row. That is what the server does
+        // too, by leaving the setting unbound so the comparison is NULL.
+        client_config = client_config.with_caller(
+            config.caller_function,
+            identity
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+    }
     // An unreachable server is a state, not a boot failure. The worker comes up
     // on its replica, serves tabs from it, and the hub's reconnect driver
     // attaches a transport when one can be had, declaring the upstream

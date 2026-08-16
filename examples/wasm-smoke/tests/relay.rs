@@ -34,14 +34,12 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// The replica schema: `orders` is the server-synced table, `notes` exists
 /// only in the worker replica and the tab mirrors, giving the routing tests a
 /// second table the server never sees.
-const SQLITE_DDL: &str = "\
-CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;\
-CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -58,6 +56,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -79,17 +78,30 @@ fn unique_base() -> i64 {
     40_000_000_000 + millis
 }
 
-async fn connect(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
+async fn connect(
+    name: &str,
+    tag: i64,
+    token: String,
+    identity: String,
+) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
-    ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect")
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+    ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in
@@ -117,6 +129,7 @@ where
 async fn write_row(
     writer: &mut ConnettoConnection<BrowserSocket>,
     nonce: u64,
+    identity: &str,
 ) -> rosetta_uuid::Uuid {
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
@@ -125,7 +138,7 @@ async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(5_i64))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -148,15 +161,16 @@ async fn write_row(
 #[wasm_bindgen_test]
 async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     let base = unique_base();
+    let (token, identity) = common::mint_session().await;
 
     // A row that exists before the worker connects: it can only reach the
     // tab through the relay's snapshot leg.
-    let mut writer = connect("relay-writer", base).await;
-    let snapshot_id = write_row(&mut writer, 1).await;
+    let mut writer = connect("relay-writer", base, token.clone(), identity.clone()).await;
+    let snapshot_id = write_row(&mut writer, 1, &identity).await;
 
     // The worker-held upstream connection: subscribe and drain to the
     // snapshot end, so its replica holds the current table.
-    let mut worker = connect("relay-worker", base).await;
+    let mut worker = connect("relay-worker", base, token.clone(), identity.clone()).await;
     worker
         .subscribe("relay-upstream", QUERY)
         .await
@@ -183,13 +197,20 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     hub.attach(relay_end);
 
     let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
-    let tab =
-        ConnettoConnection::connect(tab_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("tab connect through relay");
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+    let tab = ConnettoConnection::connect(
+        tab_end,
+        &Replica::in_memory(),
+        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("tab connect through relay");
     let (tab, pump) = ConnettoClient::with_pump(tab);
     wasm_bindgen_futures::spawn_local(pump);
     let mut orders_live: LiveQuery<Order> = orders::table
@@ -230,7 +251,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
     // Live leg: a fresh external write reaches the tab only through server,
     // worker pump, and relay routing.
-    let live_id = write_row(&mut writer, 2).await;
+    let live_id = write_row(&mut writer, 2, &identity).await;
     writer.close().await.expect("close writer");
     loop {
         if orders_live.rows().iter().any(|row| row.id == live_id) {
@@ -246,9 +267,10 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 #[wasm_bindgen_test]
 async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     let base = unique_base();
+    let (token, identity) = common::mint_session().await;
     let stage = |message: &str| web_sys::console::log_1(&message.into());
 
-    let mut worker = connect("port-worker", base).await;
+    let mut worker = connect("port-worker", base, token.clone(), identity.clone()).await;
     worker
         .subscribe("relay-upstream", QUERY)
         .await
@@ -271,13 +293,15 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     stage("hub attached");
 
     let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token.clone())))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
     let mut tab = ConnettoConnection::connect(
         MessageTransport::<MessagePort>::new(channel.port2()),
         &Replica::in_memory(),
-        SQLITE_DDL,
+        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
         &config,
         None,
     )
@@ -302,7 +326,10 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(7_i64))
+        .values((
+            orders::owner_id.eq(identity.as_str()),
+            orders::quantity.eq(7_i64),
+        ))
         .execute(tab.conn())
         .expect("tab insert");
     let write_id: rosetta_uuid::Uuid = orders::table
@@ -317,7 +344,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     // Round trip proof: an independent observer on the real server sees the
     // row, so it landed in Postgres, not just in a local mirror.
-    let mut observer = connect("port-observer", base).await;
+    let mut observer = connect("port-observer", base, token, identity).await;
     observer
         .subscribe("observer", QUERY)
         .await

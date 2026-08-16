@@ -42,6 +42,7 @@ use web_sys::BroadcastChannel;
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -52,6 +53,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Order {
     pub id: rosetta_uuid::Uuid,
+    pub owner_id: String,
     pub quantity: i64,
 }
 
@@ -113,6 +115,7 @@ pub fn glue_url() -> String {
 pub async fn connect_tab(
     client_id: &str,
     token: String,
+    identity: &str,
 ) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
@@ -120,7 +123,9 @@ pub async fn connect_tab(
     let config = ClientConfig::new(client_id.to_owned())
         .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -137,6 +142,7 @@ pub async fn connect_server(
     name: &str,
     tag: i64,
     token: String,
+    identity: &str,
 ) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
@@ -144,7 +150,9 @@ pub async fn connect_server(
     let config = ClientConfig::new(format!("{name}-{tag}"))
         .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -208,6 +216,7 @@ where
 pub async fn write_row(
     writer: &mut ConnettoConnection<BrowserSocket>,
     nonce: u64,
+    identity: &str,
 ) -> rosetta_uuid::Uuid {
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
@@ -216,7 +225,7 @@ pub async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(5_i64))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -262,12 +271,10 @@ impl ParityFixture {
     /// The caller seeds any pre-existing rows through a writer BEFORE calling
     /// this, so both the worker replica and the direct client snapshot them.
     /// `base` names this run's unique id band and the leader lock.
-    pub async fn setup(
-        base: i64,
-        sub_id: &str,
-        direct_token: String,
-        relay_token: String,
-    ) -> ParityFixture {
+    /// `token` and `user_id` come from one `common::mint_session` call:
+    /// both clients share the session so the same `owner_id` is visible
+    /// through each connection's policy view.
+    pub async fn setup(base: i64, sub_id: &str, token: String, user_id: &str) -> ParityFixture {
         relay_worker_breadcrumbs();
 
         // The worker logs in for itself, and only a tab can answer that
@@ -282,7 +289,7 @@ impl ParityFixture {
         stage("db worker ready");
 
         // The direct client: a plain server session, the parity reference.
-        let mut direct = connect_server("parity-direct", base, direct_token).await;
+        let mut direct = connect_server("parity-direct", base, token.clone(), user_id).await;
         direct
             .subscribe(&format!("{sub_id}-direct"), DEMO_QUERY)
             .await
@@ -297,7 +304,7 @@ impl ParityFixture {
         // protocol the hub's reaper requires.
         let client_id = rosetta_uuid::Uuid::new_v4().to_string();
         let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-        let mut relay = connect_tab(&client_id, relay_token).await;
+        let mut relay = connect_tab(&client_id, token, user_id).await;
         relay
             .subscribe(&format!("{sub_id}-relay"), DEMO_QUERY)
             .await

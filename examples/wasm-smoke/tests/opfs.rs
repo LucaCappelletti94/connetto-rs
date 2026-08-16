@@ -40,6 +40,7 @@ fn replica_key() -> ReplicaKey {
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -49,6 +50,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -94,10 +96,13 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
     .await
     .expect("install sahpool vfs");
 
+    let (token, user_id) = common::mint_session().await;
     let config = ClientConfig::new(format!("wasm-opfs-{}", unique_id()))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, &user_id);
     let conn = connect(&config, Some(REPLICA_DDL)).await;
 
     // The pump under spawn_local: the wasm driving mode for the same client
@@ -127,7 +132,10 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
                 .into_iter()
                 .collect();
             diesel::insert_into(orders::table)
-                .values(orders::quantity.eq(3_i64))
+                .values((
+                    orders::owner_id.eq(user_id.as_str()),
+                    orders::quantity.eq(3_i64),
+                ))
                 .execute(conn.conn())?;
             Ok::<rosetta_uuid::Uuid, diesel::result::Error>(
                 orders::table

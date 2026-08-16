@@ -30,7 +30,9 @@
 use std::rc::Rc;
 use std::{cell::RefCell, time::Duration};
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, PolicyTables, Replica,
+};
 use connetto_dioxus::use_live;
 use connetto_web::{
     MessageTransport,
@@ -42,6 +44,8 @@ use dioxus::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, MessageEvent};
+
+include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
@@ -293,6 +297,10 @@ async fn run_db_worker() -> Result<(), JsValue> {
             .with_upstream_query(DEMO_QUERY)
             .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_sql_functions(uuidv4_functions())
+            .with_policy_tables(PolicyTables::from_translation(
+                POLICY_TABLES.iter().copied(),
+                POLICY_VIEWS.iter().copied(),
+            ))
             .with_auth(auth)
             .with_auth_db_name(AUTH_DB_NAME),
     )
@@ -353,7 +361,11 @@ async fn boot_window() -> Result<Boot, JsValue> {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let config = ClientConfig::new(client_id.clone())
         .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
-        .with_sql_functions(uuidv4_functions());
+        .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(PolicyTables::from_translation(
+            POLICY_TABLES.iter().copied(),
+            POLICY_VIEWS.iter().copied(),
+        ));
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

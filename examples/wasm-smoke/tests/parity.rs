@@ -16,7 +16,7 @@
 mod common;
 mod harness;
 
-use common::mint_token;
+use common::mint_session;
 use harness::{ParityFixture, connect_server, stage, unique_base, write_row};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -29,19 +29,18 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 async fn row_live_query_is_relay_transparent() {
     let base = unique_base();
 
-    // Each concurrent client needs a distinct session token.
-    let writer_token = mint_token().await;
-    let direct_token = mint_token().await;
-    let relay_token = mint_token().await;
+    // Writer, direct client, and relay tab share one session so each
+    // sees the same owner_id through its policy view.
+    let (token, user_id) = mint_session().await;
 
     // Seed a row BEFORE the fixture brings up the worker and both clients, so
     // it can only reach either client through the snapshot leg. The DEFAULT
     // mints the id, which the writer reads back for the convergence assertion.
-    let mut writer = connect_server("parity-writer", base, writer_token).await;
-    let snapshot_id = write_row(&mut writer, 1).await;
+    let mut writer = connect_server("parity-writer", base, token.clone(), &user_id).await;
+    let snapshot_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the snapshot row");
 
-    let mut fixture = ParityFixture::setup(base, "parity-orders", direct_token, relay_token).await;
+    let mut fixture = ParityFixture::setup(base, "parity-orders", token, &user_id).await;
 
     // Snapshot parity: both clients received the pre-existing row, and their
     // mirrors are identical.
@@ -51,7 +50,7 @@ async fn row_live_query_is_relay_transparent() {
 
     // Live-patch parity: a write after both subscribed reaches each client as
     // a live patch, not a re-snapshot, and the mirrors stay identical.
-    let live_id = write_row(&mut writer, 2).await;
+    let live_id = write_row(&mut writer, 2, &user_id).await;
     fixture.converge_live_patch(live_id).await;
     fixture.assert_mirrors_match();
     stage("live patch parity verified");
@@ -69,12 +68,12 @@ async fn row_live_query_is_relay_transparent() {
 async fn aggregate_is_relay_transparent() {
     let base = unique_base();
 
-    let writer_token = mint_token().await;
-    let direct_token = mint_token().await;
-    let relay_token = mint_token().await;
+    // Writer and fixture share one session so aggregate counts include the
+    // writer's rows on both the direct and relay paths.
+    let (token, user_id) = mint_session().await;
 
-    let mut writer = connect_server("parity-agg-writer", base, writer_token).await;
-    let mut fixture = ParityFixture::setup(base, "parity-agg", direct_token, relay_token).await;
+    let mut writer = connect_server("parity-agg-writer", base, token.clone(), &user_id).await;
+    let mut fixture = ParityFixture::setup(base, "parity-agg", token, &user_id).await;
 
     // Both clients subscribe to the same global aggregate.
     fixture
@@ -84,7 +83,7 @@ async fn aggregate_is_relay_transparent() {
     stage("aggregate bootstrap parity verified");
 
     // A write after both subscribed bumps the count on both paths by one.
-    write_row(&mut writer, 1).await;
+    write_row(&mut writer, 1, &user_id).await;
     let after = fixture.converge_aggregate("agg-count").await;
     assert_eq!(
         after,

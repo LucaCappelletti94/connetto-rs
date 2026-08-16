@@ -41,6 +41,8 @@ use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
+use openfga_client::tonic::transport::Channel;
 use openidconnect::reqwest;
 use serde_json::json;
 
@@ -55,6 +57,19 @@ const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, 
 const OWNED_SQLITE_DDL: &str =
     "CREATE TABLE owned (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
+/// The policy document the `owned` fixture's server derives its model from.
+///
+/// The schema and the policies reach the binary as two documents, so the
+/// statement enabling row-level security belongs here beside the policy rather
+/// than in [`OWNED_PG_DDL`], which is what clients sync.
+const OWNED_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true));";
+
+/// `orders` carries no policy at all, so its document is empty.
+///
+/// The database filters none of its rows and the model has to agree, which the
+/// translator reports and the change path answers with no round trip.
+const NO_POLICIES: &str = "";
 
 // The client replica's `orders` table, typed for the poller's count query.
 diesel::table! {
@@ -214,12 +229,58 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// What a spawned server needs to build its change-path executor: the policy
+/// text its authorization model is derived from, and the store it writes that
+/// model into.
+///
+/// A store per server rather than one shared, so two tests in one run cannot
+/// read each other's rules or facts.
+struct Authorization {
+    policies: String,
+    endpoint: String,
+    store: String,
+}
+
+impl Authorization {
+    async fn provision(policies: &str) -> Self {
+        let endpoint = std::env::var("CONNETTO_TEST_FGA_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned());
+        let channel = Channel::from_shared(endpoint.clone())
+            .expect("a service endpoint")
+            .connect()
+            .await
+            .unwrap_or_else(|err| panic!("connecting to {endpoint}: {err}"));
+        let store = OpenFgaServiceClient::new(channel)
+            .create_store(CreateStoreRequest {
+                name: format!("connetto-e2e-{}", uuid::Uuid::new_v4()),
+            })
+            .await
+            .expect("create a store")
+            .into_inner()
+            .id;
+        Self {
+            policies: policies.to_owned(),
+            endpoint,
+            store,
+        }
+    }
+
+    fn env_pairs(&self) -> [(&str, &str); 3] {
+        [
+            ("CONNETTO_PG_POLICIES", self.policies.as_str()),
+            ("CONNETTO_FGA_URL", self.endpoint.as_str()),
+            ("CONNETTO_FGA_STORE", self.store.as_str()),
+        ]
+    }
+}
+
 fn spawn_server_cfg(
     database_url: &str,
     bind: &str,
     pg_ddl: &str,
     writable: &str,
     reader_url: Option<&str>,
+    authorization: &Authorization,
     auth_envs: &[(&str, &str)],
 ) -> ChildGuard {
     let mut command = Command::new(server_bin());
@@ -238,6 +299,9 @@ fn spawn_server_cfg(
         command.env_remove("CONNETTO_READER_URL");
     }
     for (k, v) in auth_envs {
+        command.env(k, v);
+    }
+    for (k, v) in authorization.env_pairs() {
         command.env(k, v);
     }
     let child = command.spawn().expect("spawn server");
@@ -656,12 +720,14 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
         .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(NO_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
         PG_DDL,
         "orders",
         Some(&reader_url),
+        &authorization,
         &auth_pairs,
     );
     let secs = Duration::from_secs(20);
@@ -755,12 +821,14 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
         .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(NO_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
         PG_DDL,
         "orders",
         Some(&reader_url),
+        &authorization,
         &auth_pairs,
     );
     let secs = Duration::from_secs(20);
@@ -879,12 +947,14 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let ws = format!("ws://127.0.0.1:{port}/");
     let auth_bind = format!("127.0.0.1:{auth_port}");
 
+    let authorization = Authorization::provision(OWNED_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
         OWNED_PG_DDL,
         "owned",
         Some(&reader_url),
+        &authorization,
         &auth_pairs,
     );
     let secs = Duration::from_secs(20);
@@ -946,6 +1016,84 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         pg_owned_rows(&admin).await,
         vec![(1, alice_id.clone()), (3, alice_id.clone())],
         "RLS did not enforce the write policy through the binaries"
+    );
+}
+
+/// R5b's unrestricted-table evidence, relocated here by R40: R40 added a real
+/// policy to `examples/wasm-smoke`'s `orders` table, the only policy-free table
+/// the original browser-run demonstration used, so the proof now lives here.
+///
+/// The test checks that a server started with empty `CONNETTO_PG_POLICIES`
+/// delivers the seed row from a policy-free `orders` fixture, and delivery
+/// requires the server to answer the visibility question locally from its
+/// unrestricted-table list, because delegating to an authorization service with
+/// an empty model would error and the server would stall fail-closed.
+///
+/// The `AUTHORIZATION_CALLS` counter that proves zero round trips at scale is
+/// not visible from a test that spawns the server binary, so that count is
+/// proven in `fanout_counters.rs`.
+#[tokio::test]
+#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
+async fn e2e_unrestricted_table_delivers_without_policy() {
+    assert!(
+        client_bin().exists(),
+        "client binary missing at {}: build it with the same profile, \
+         `cargo build --release -p connetto-client --bin connetto-client`",
+        client_bin().display()
+    );
+
+    let _serial = PG_SERIAL.lock().await;
+
+    let url = database_url();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+
+    reset_fixture(&pool).await;
+
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_pairs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(NO_POLICIES).await;
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &authorization,
+        &auth_pairs,
+    );
+    let secs = Duration::from_secs(20);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}"
+    );
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    let (token, _) = mint_token(&auth_stack.auth_base).await;
+
+    let mut dir = ReplicaDir::new();
+    let db = dir.replica("client.db");
+    let _client = spawn_client(&ws, &db, "client", &token, None);
+
+    assert_eq!(
+        wait_for_rows(&db, 1, secs).await,
+        1,
+        "unrestricted orders table did not deliver its seed row through an empty-policy server"
     );
 }
 
@@ -1206,6 +1354,10 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     for (key, value) in &auth_stack.env_pairs {
         command.env(key, value);
     }
+    let authorization = Authorization::provision(NO_POLICIES).await;
+    for (key, value) in authorization.env_pairs() {
+        command.env(key, value);
+    }
     let mut server = command.spawn().expect("spawn server");
 
     let secs = Duration::from_secs(20);
@@ -1311,6 +1463,10 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for (key, value) in &auth_stack.env_pairs {
+        command.env(key, value);
+    }
+    let authorization = Authorization::provision(NO_POLICIES).await;
+    for (key, value) in authorization.env_pairs() {
         command.env(key, value);
     }
     let _server = ChildGuard(command.spawn().expect("spawn server"));

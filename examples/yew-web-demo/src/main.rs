@@ -30,7 +30,9 @@
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Replica};
+use connetto_client::{
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, PolicyTables, Replica,
+};
 use connetto_web::auth::WorkerAuthConfig;
 use connetto_web::{MessageTransport, deliver_login_code, leader, locks, workers};
 use connetto_yew::use_live;
@@ -39,6 +41,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, HtmlInputElement, MessageEvent};
+
+include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 use yew::prelude::*;
 
 /// The tab-to-worker transport this window's client rides.
@@ -227,6 +231,10 @@ async fn run_db_worker() -> Result<(), JsValue> {
         .with_upstream_query(DEMO_QUERY)
         .with_hub_meta_name("connetto-hub-meta.sqlite")
         .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(PolicyTables::from_translation(
+            POLICY_TABLES.iter().copied(),
+            POLICY_VIEWS.iter().copied(),
+        ))
         .with_auth(auth)
         .with_auth_db_name("connetto-auth.sqlite"),
     )
@@ -320,7 +328,11 @@ async fn boot_window() -> Result<Boot, JsValue> {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let config = ClientConfig::new(client_id.clone())
         .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
-        .with_sql_functions(uuidv4_functions());
+        .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(PolicyTables::from_translation(
+            POLICY_TABLES.iter().copied(),
+            POLICY_VIEWS.iter().copied(),
+        ));
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

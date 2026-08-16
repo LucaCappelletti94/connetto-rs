@@ -55,6 +55,7 @@ fn relay_worker_breadcrumbs() {
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -64,6 +65,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -95,14 +97,20 @@ fn glue_url() -> String {
 ///
 /// Announces the channel and waits for the worker's attachment ack first,
 /// so the handshake cannot outrun the worker's end of the channel.
-async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
+async fn connect_tab(
+    client_id: &str,
+    token: String,
+    identity: &str,
+) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -114,14 +122,21 @@ async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<Bro
     .expect("tab connect through the wire channel")
 }
 
-async fn connect_server(name: &str, tag: i64) -> ConnettoConnection<BrowserSocket> {
+async fn connect_server(
+    name: &str,
+    tag: i64,
+    token: String,
+    identity: &str,
+) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -177,6 +192,7 @@ where
 async fn write_row(
     writer: &mut ConnettoConnection<BrowserSocket>,
     nonce: u64,
+    identity: &str,
 ) -> rosetta_uuid::Uuid {
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
@@ -185,7 +201,7 @@ async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(5_i64))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -209,11 +225,14 @@ async fn write_row(
 async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     let base = unique_base();
     relay_worker_breadcrumbs();
+    // Writer and both tabs share one session so every owner_id equals the
+    // identity each connection is opened for.
+    let (token, user_id) = common::mint_session().await;
 
     // A pre-existing row: it can only reach a tab through the DB worker's
     // snapshot leg.
-    let mut writer = connect_server("topology-writer", base).await;
-    let snapshot_id = write_row(&mut writer, 1).await;
+    let mut writer = connect_server("topology-writer", base, token.clone(), &user_id).await;
+    let snapshot_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the snapshot row");
 
     // The worker logs in for itself, and only a tab can answer that request.
@@ -229,7 +248,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     // reaper requires.
     let client_a = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_a = locks::hold_lock(&locks::tab_lock_name(&client_a)).await;
-    let mut tab_a = connect_tab(&client_a).await;
+    let mut tab_a = connect_tab(&client_a, token.clone(), &user_id).await;
     stage("tab a connected");
     tab_a
         .subscribe("tab-a-orders", DEMO_QUERY)
@@ -245,7 +264,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     // A second tab client into the SAME DB worker.
     let client_b = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_b = locks::hold_lock(&locks::tab_lock_name(&client_b)).await;
-    let mut tab_b = connect_tab(&client_b).await;
+    let mut tab_b = connect_tab(&client_b, token.clone(), &user_id).await;
     tab_b
         .subscribe("tab-b-orders", DEMO_QUERY)
         .await
@@ -258,7 +277,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
 
     // An external write fans out to both tabs through the one upstream
     // connection the DB worker holds.
-    let fanout_id = write_row(&mut writer, 2).await;
+    let fanout_id = write_row(&mut writer, 2, &user_id).await;
     pump_until_row(&mut tab_a, fanout_id).await;
     pump_until_row(&mut tab_b, fanout_id).await;
     stage("fanout verified");
@@ -273,7 +292,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(7_i64))
+        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(7_i64)))
         .execute(tab_a.conn())
         .expect("tab a insert");
     let tab_write_id: rosetta_uuid::Uuid = orders::table
@@ -306,7 +325,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     stage("tab b reaped");
 
     // The hub keeps serving the survivor after the reap.
-    let post_reap_id = write_row(&mut writer, 3).await;
+    let post_reap_id = write_row(&mut writer, 3, &user_id).await;
     pump_until_row(&mut tab_a, post_reap_id).await;
 
     writer.close().await.expect("close writer");

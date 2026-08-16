@@ -7,4 +7,8 @@
 -- translates it through pg2sqlite into the replica's own DEFAULT (uuidv4()),
 -- which mints the key when a local write omits it. Both ends mint version 4.
 -- The quantity is non-null because every client schema already declares it so.
-CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), quantity BIGINT NOT NULL CHECK (quantity >= 0));
+-- owner_id carries who a row belongs to, which policies.sql compares against
+-- the caller. It has no default: pg2sqlite maps current_setting only inside a
+-- policy expression, so a default naming the caller would translate into a
+-- call the replica cannot resolve, and every write names the owner instead.
+CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0));

@@ -24,12 +24,12 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -39,6 +39,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -81,14 +82,22 @@ async fn full_sync_loop_in_a_dedicated_worker() {
     let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
         .await
         .expect("connect to connetto-server");
+    let (token, identity) = common::mint_session().await;
     let config = ClientConfig::new(format!("wasm-smoke-{}", unique_id()))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
-    let mut conn =
-        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("client connect");
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+    let mut conn = ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        connetto_wasm_smoke::workers::DEMO_SQLITE_DDL,
+        &config,
+        None,
+    )
+    .await
+    .expect("client connect");
 
     // Subscribe and take the snapshot of whatever the backend holds.
     conn.subscribe("orders", QUERY).await.expect("subscribe");
@@ -104,7 +113,10 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values(orders::quantity.eq(7_i64))
+        .values((
+            orders::owner_id.eq(identity.as_str()),
+            orders::quantity.eq(7_i64),
+        ))
         .execute(conn.conn())
         .expect("local insert");
     let id: rosetta_uuid::Uuid = orders::table

@@ -63,6 +63,7 @@ diesel::table! {
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -101,14 +102,20 @@ fn glue_url() -> String {
 
 /// Connect a tab client to the DB worker over its own wire channel. The
 /// tab mirror holds both tiers in its main schema.
-async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
+async fn connect_tab(
+    client_id: &str,
+    token: String,
+    identity: &str,
+) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await;
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(uuidv4_functions());
+        .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -179,6 +186,9 @@ async fn local_tier_notes_fan_out_across_tabs() {
     relay_worker_breadcrumbs();
     let note_id = base;
     let mixed_note_id = base + 1;
+    // All three tabs share one session so the orders policy view on each
+    // tab is configured for the same owner_id.
+    let (token, user_id) = common::mint_session().await;
 
     // The worker logs in for itself, and only a tab can answer that request.
     common::play_the_tab();
@@ -190,13 +200,13 @@ async fn local_tier_notes_fan_out_across_tabs() {
 
     let client_a = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_a = locks::hold_lock(&locks::tab_lock_name(&client_a)).await;
-    let mut tab_a = connect_tab(&client_a).await;
+    let mut tab_a = connect_tab(&client_a, token.clone(), &user_id).await;
     subscribe_notes(&mut tab_a, "tab-a-notes").await;
     stage("tab a subscribed");
 
     let client_b = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_b = locks::hold_lock(&locks::tab_lock_name(&client_b)).await;
-    let mut tab_b = connect_tab(&client_b).await;
+    let mut tab_b = connect_tab(&client_b, token.clone(), &user_id).await;
     subscribe_notes(&mut tab_b, "tab-b-notes").await;
     stage("tab b subscribed");
 
@@ -226,7 +236,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
     // snapshot leg, served from the durable tier file.
     let client_c = rosetta_uuid::Uuid::new_v4().to_string();
     let lock_c = locks::hold_lock(&locks::tab_lock_name(&client_c)).await;
-    let mut tab_c = connect_tab(&client_c).await;
+    let mut tab_c = connect_tab(&client_c, token, &user_id).await;
     subscribe_notes(&mut tab_c, "tab-c-notes").await;
     let snap: Vec<Note> = notes::table
         .filter(notes::id.eq(note_id))
@@ -249,7 +259,10 @@ async fn local_tier_notes_fan_out_across_tabs() {
                 .values((notes::id.eq(mixed_note_id), notes::body.eq("mixed")))
                 .execute(conn)?;
             diesel::insert_into(orders::table)
-                .values(orders::quantity.eq(1_i64))
+                .values((
+                    orders::owner_id.eq(user_id.as_str()),
+                    orders::quantity.eq(1_i64),
+                ))
                 .execute(conn)?;
             Ok(())
         })

@@ -107,10 +107,13 @@ async fn local_tier_placement_dispatch_and_persistence() {
     .await
     .expect("install sahpool vfs");
 
+    let (token, user_id) = common::mint_session().await;
     let config = ClientConfig::new(format!("wasm-tier-{}", unique_id()))
-        .with_login(Some(Grant::new(common::mint_token().await)))
+        .with_login(Some(Grant::new(token)))
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
+        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
+        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, &user_id);
     let mut conn = connect(&config, true).await;
     assert!(
         conn.local_tables().contains("notes"),

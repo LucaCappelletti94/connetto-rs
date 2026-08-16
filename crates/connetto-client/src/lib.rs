@@ -27,7 +27,7 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
-pub use connetto_core::messages::{Grant, SyncStatus};
+pub use connetto_core::messages::{Grant, PauseCause, SyncStatus};
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
@@ -45,8 +45,10 @@ use diesel::connection::{
 use diesel::expression::QueryMetadata;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
-use diesel::sqlite::{CommitDecision, Sqlite, SqliteChangeOps, SqliteUpdateRouter};
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::sqlite::{
+    CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior, SqliteUpdateRouter,
+};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
@@ -173,6 +175,24 @@ pub enum ClientError {
     /// or with an explicit data wipe.
     #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
     ReplicaKeyMissing,
+    /// The replica's schema and the policy-table map disagree about which
+    /// tables the row-level-security translation split.
+    ///
+    /// The map is a build artifact of the same translation that emitted the
+    /// DDL, so a disagreement means the two came from different builds, or
+    /// that the application never passed the map
+    /// ([`ClientConfig::with_policy_tables`]). Either way the sync boundaries
+    /// would rename the wrong set of names, and the resulting loss is silent:
+    /// a patch applied against a policy view reports success and delivers
+    /// nothing. Rebuild the client against the current schema.
+    #[error(
+        "the replica's policy views and the compiled-in table map disagree: {}",
+        .unmapped.join(", ")
+    )]
+    PolicyTablesStale {
+        /// The disagreeing names, each said as which side is missing it.
+        unmapped: Vec<String>,
+    },
 }
 
 /// Why a sign-in switch was refused.
@@ -321,6 +341,127 @@ impl std::fmt::Debug for SqlFunctions {
     }
 }
 
+/// The tables the replica's row-level-security translation split, mapping each
+/// logical Postgres name to the physical table holding its rows.
+///
+/// `pg2sqlite` turns a policy-bearing table into three objects: a suffixed
+/// backing table with the rows, a view carrying the original name, and
+/// `INSTEAD OF` triggers enforcing the policy. That split exists only here.
+/// Postgres enforces its own row-level security and never splits anything, so
+/// the wire speaks logical names in both directions and the client rewrites
+/// them at its two sync boundaries.
+///
+/// **Empty is the correct value for a schema with no policies**, which is
+/// every schema until one is written, and it renames nothing.
+///
+/// Build it from the same translation run that emitted the DDL: the
+/// `(logical, physical)` pairs come from `Pg2Sqlite::translation_manifest`,
+/// and the view names from the throwaway database the build applies the
+/// translation to. Pass it to [`ClientConfig::with_policy_tables`]. Deriving
+/// it instead from the replica's own schema by looking for the suffix would
+/// bake that suffix into connetto, and a suffix that changed upstream would
+/// leave the client matching nothing, renaming nothing, and going silently
+/// empty.
+///
+/// The view list is separate from the pairs and is wider than them, because a
+/// translation emits views of its own beside the one carrying the logical
+/// name. Reading it from the built database rather than deducing it keeps
+/// connetto ignorant of how upstream names those, which is the same argument
+/// again.
+///
+/// ```
+/// use connetto_client::PolicyTables;
+///
+/// let tables = PolicyTables::from_translation(
+///     [("orders", "orders_rls")],
+///     ["orders", "orders_rls_violations"],
+/// );
+/// assert_eq!(tables.physical("orders"), Some("orders_rls"));
+/// assert_eq!(tables.logical("orders_rls"), Some("orders"));
+/// assert_eq!(tables.physical("notes"), None, "an unsplit table is absent");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct PolicyTables {
+    /// Logical to physical, and its exact inverse. Both directions are held
+    /// rather than one being searched, because each is on a per-patch path.
+    to_physical: HashMap<String, String>,
+    to_logical: HashMap<String, String>,
+    /// Every view the translation emitted, which is what the replica's own
+    /// catalogue is checked against at open.
+    views: HashSet<String>,
+}
+
+impl PolicyTables {
+    /// No split table, which renames nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build from the translation's `(logical, physical)` pairs and the views
+    /// it emitted.
+    ///
+    /// Everything is held lowercased, because a name arrives here from three
+    /// places that do not agree on case: the Postgres catalog folds an
+    /// unquoted identifier down, the parsed DDL keeps what the document wrote,
+    /// and SQLite compares identifiers case-insensitively anyway.
+    #[must_use]
+    pub fn from_translation<I, L, P, V, N>(pairs: I, views: V) -> Self
+    where
+        I: IntoIterator<Item = (L, P)>,
+        L: Into<String>,
+        P: Into<String>,
+        V: IntoIterator<Item = N>,
+        N: Into<String>,
+    {
+        let mut tables = Self::default();
+        for (logical, physical) in pairs {
+            let logical = logical.into().to_lowercase();
+            let physical = physical.into().to_lowercase();
+            tables.to_logical.insert(physical.clone(), logical.clone());
+            tables.to_physical.insert(logical, physical);
+        }
+        tables.views = views
+            .into_iter()
+            .map(|name| name.into().to_lowercase())
+            .collect();
+        tables
+    }
+
+    /// The physical table holding `logical`'s rows, or `None` when it was not
+    /// split.
+    #[must_use]
+    pub fn physical(&self, logical: &str) -> Option<&str> {
+        lookup(&self.to_physical, logical)
+    }
+
+    /// The logical name `physical` backs, or `None` when it is not a backing
+    /// table.
+    #[must_use]
+    pub fn logical(&self, physical: &str) -> Option<&str> {
+        lookup(&self.to_logical, physical)
+    }
+
+    /// Whether no table was split.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.to_physical.is_empty()
+    }
+
+    /// The views the translation emitted.
+    fn views(&self) -> &HashSet<String> {
+        &self.views
+    }
+}
+
+/// A case-insensitive lookup that allocates only when the caller's name was
+/// not already lowercase, which on the patch path it always is.
+fn lookup<'map>(map: &'map HashMap<String, String>, key: &str) -> Option<&'map str> {
+    map.get(key)
+        .or_else(|| map.get(&key.to_lowercase()))
+        .map(String::as_str)
+}
+
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -351,11 +492,22 @@ pub struct ClientConfig {
     /// schema whose column `DEFAULT` calls a function (a `uuidv7` key
     /// generator, say) supplies the matching installer here.
     sql_functions: SqlFunctions,
+    /// The tables the replica's row-level-security translation split, from the
+    /// same build that produced the DDL. Empty by default, which is right for
+    /// a schema with no policies and renames nothing.
+    policy_tables: PolicyTables,
+    /// What a translated policy means by the caller: the SQLite function name
+    /// the deployment mapped `current_setting` onto, and the value it returns.
+    ///
+    /// `None` when no policy names the caller, which is every schema until one
+    /// does. Fixed for the life of the connection, because a replica belongs
+    /// to the identity it was named from.
+    caller: Option<(String, String)>,
 }
 
 impl ClientConfig {
     /// Build a config for a client with the given id, no login, no capabilities,
-    /// no schema version, and no custom SQL functions.
+    /// no schema version, no custom SQL functions, and no split tables.
     #[must_use]
     pub fn new(client_id: impl Into<String>) -> Self {
         Self {
@@ -364,6 +516,8 @@ impl ClientConfig {
             capabilities: Vec::new(),
             schema_version: None,
             sql_functions: SqlFunctions::default(),
+            policy_tables: PolicyTables::default(),
+            caller: None,
         }
     }
 
@@ -371,6 +525,22 @@ impl ClientConfig {
     #[must_use]
     pub fn with_login(mut self, login: Option<Grant>) -> Self {
         self.login = login;
+        self
+    }
+
+    /// What the replica's translated policies mean by the caller.
+    ///
+    /// `function` is the SQLite function name the build mapped
+    /// `current_setting('app.user_id')` onto through pg2sqlite's
+    /// `with_session_variable`, and `identity` is what it returns: the same
+    /// value the server binds as that setting, so both ends of the policy
+    /// compare against one identity. connetto registers it on the replica
+    /// connection beside the application's own functions, because the
+    /// generated view and its three `INSTEAD OF` triggers call it and would
+    /// otherwise fail to resolve on the first read.
+    #[must_use]
+    pub fn with_caller(mut self, function: impl Into<String>, identity: impl Into<String>) -> Self {
+        self.caller = Some((function.into(), identity.into()));
         self
     }
 
@@ -385,6 +555,18 @@ impl ClientConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+
+    /// The tables the replica's row-level-security translation split.
+    ///
+    /// Build it from `Pg2Sqlite::translation_manifest` in the same build step
+    /// that emits the replica DDL. Opening a replica whose views disagree with
+    /// this map fails with [`ClientError::PolicyTablesStale`] rather than
+    /// syncing into nothing.
+    #[must_use]
+    pub fn with_policy_tables(mut self, policy_tables: PolicyTables) -> Self {
+        self.policy_tables = policy_tables;
         self
     }
 
@@ -528,6 +710,14 @@ pub enum ClientEvent {
     /// `user_id`) or purge and start fresh (an account switch). Terminal, like
     /// [`Closed`](Self::Closed).
     AuthenticationRequired,
+    /// Live delivery is temporarily paused. No new rows will arrive until
+    /// [`DeliveryResumed`](Self::DeliveryResumed).
+    DeliveryPaused {
+        /// Why delivery is paused.
+        cause: PauseCause,
+    },
+    /// Live delivery has resumed after a pause.
+    DeliveryResumed,
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -620,23 +810,45 @@ impl Drop for SuspendedCapture<'_> {
     }
 }
 
+/// Rewrite the table names in a diffset, returning the original bytes when
+/// nothing matched so an unaffected payload costs no re-encode.
+///
+/// One parse per renamed payload is the price of the split, and callers skip
+/// this entirely when no table was split.
+fn rename_diffset(
+    bytes: Vec<u8>,
+    mut rename: impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<u8>, ClientError> {
+    let mut parsed = ParsedDiffSet::parse(&bytes)
+        .map_err(|err| ClientError::Apply(format!("parsing a diffset to rename it: {err:?}")))?;
+    if parsed.rename_tables(&mut rename) == 0 {
+        return Ok(bytes);
+    }
+    Ok(parsed.into())
+}
+
 /// Decode a pushed changeset into the rows it touched, each as its table and
 /// primary key, for reporting on a rejected or conflicting mutation.
-fn affected_rows(changeset: &[u8]) -> Result<Vec<AffectedRow>, ClientError> {
+///
+/// `tables` maps a split table's backing name back to the logical one the
+/// application wrote against, because a capture records what SQLite actually
+/// changed and the `INSTEAD OF` triggers change the backing table.
+fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
     let parsed = ParsedDiffSet::parse(changeset)
         .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?;
+    let named = |physical: &str| tables.logical(physical).unwrap_or(physical).to_owned();
     let rows = match parsed {
         ParsedDiffSet::Changeset(diff) => diff
             .iter()
             .map(|op| AffectedRow {
-                table: op.table().name().to_owned(),
+                table: named(op.table().name()),
                 key: op.primary_key().into_iter().map(KeyValue::from).collect(),
             })
             .collect(),
         ParsedDiffSet::Patchset(diff) => diff
             .iter()
             .map(|op| AffectedRow {
-                table: op.table().name().to_owned(),
+                table: named(op.table().name()),
                 key: op.primary_key().into_iter().map(KeyValue::from).collect(),
             })
             .collect(),
@@ -696,6 +908,81 @@ fn local_tier_tables(db: &mut SqliteConnection) -> Result<HashSet<String>, Clien
         .into_iter()
         .map(|row| row.name.to_lowercase())
         .collect())
+}
+
+diesel::table! {
+    /// SQLite's own catalogue of the main database, typed for the one question
+    /// connetto asks it: which objects are views rather than tables. The
+    /// attached local tier needs a schema-qualified name, which `table!`
+    /// cannot express, so `local_tier_tables` stays a raw read and this
+    /// serves `main` only.
+    #[sql_name = "sqlite_schema"]
+    sqlite_catalog (name) {
+        /// The object kind: `table`, `view`, `index` or `trigger`.
+        #[sql_name = "type"]
+        kind -> diesel::sql_types::Text,
+        /// The object name.
+        name -> diesel::sql_types::Text,
+    }
+}
+
+/// Refuse to open when the replica's views and the translation's disagree.
+///
+/// A translation that split a table emits a view carrying the logical name,
+/// plus views of its own beside it, and the artifact lists all of them. So the
+/// two sets must be equal, and either direction of a difference means the map
+/// and the DDL came from different builds. Both are silent if allowed
+/// through: a view the map does not name is applied into directly, reports
+/// success and drops every row, and a mapped name with no view renames a patch
+/// onto a table that is not there.
+fn check_policy_tables(
+    db: &mut SqliteConnection,
+    tables: &PolicyTables,
+) -> Result<(), ClientError> {
+    let present: HashSet<String> = sqlite_catalog::table
+        .select(sqlite_catalog::name)
+        .filter(sqlite_catalog::kind.eq("view"))
+        .load::<String>(db)?
+        .into_iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    let declared = tables.views();
+    if &present == declared {
+        return Ok(());
+    }
+    let mut unmapped: Vec<String> =
+        present
+            .difference(declared)
+            .map(|name| format!("{name} is a view the build's translation does not account for"))
+            .chain(declared.difference(&present).map(|name| {
+                format!("{name} is in the build's translation but not in this replica")
+            }))
+            .collect();
+    unmapped.sort();
+    Err(ClientError::PolicyTablesStale { unmapped })
+}
+
+/// Register the SQLite function a translated policy calls for the caller's
+/// identity, returning `identity` for the life of the connection.
+///
+/// The name is the deployment's, chosen when it told pg2sqlite what
+/// `current_setting('app.user_id')` means locally, so it cannot be a function
+/// declared here: it is registered under whatever the build mapped. Marked
+/// deterministic because it is, being a constant per replica, which lets
+/// SQLite hoist it out of the policy predicate that otherwise runs per row,
+/// and innocuous because the generated view and triggers are exactly the
+/// schema objects it has to be callable from.
+fn register_caller(
+    db: &mut SqliteConnection,
+    function: &str,
+    identity: String,
+) -> Result<(), ClientError> {
+    db.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+        function,
+        SqliteFunctionBehavior::DETERMINISTIC | SqliteFunctionBehavior::INNOCUOUS,
+        move || identity.clone(),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the caller function: {e}")))
 }
 
 /// Whether `name` is SQLite's or connetto's own, rather than the application's.
@@ -1172,9 +1459,15 @@ where
             .sql_functions
             .install(&mut db)
             .map_err(|e| ClientError::Session(e.to_string()))?;
+        if let Some((function, identity)) = &config.caller {
+            register_caller(&mut db, function, identity.clone())?;
+        }
         if let Some(ddl) = sqlite_ddl {
             db.batch_execute(ddl)?;
         }
+        // After the schema exists, whether this open created it or a previous
+        // run did: the views are what the map has to agree with.
+        check_policy_tables(&mut db, &config.policy_tables)?;
         db.batch_execute(META_DDL)?;
         db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
         // Once per open, before anything can re-claim: a watch the previous run
@@ -1883,9 +2176,16 @@ where
     /// Send one mutation as its header and patchset frame pair. Shared by
     /// [`push`](Self::push) and the replay in
     /// [`reconcile_pending`](Self::reconcile_pending).
+    ///
+    /// This is the one place a captured changeset leaves for the server, so it
+    /// is where a split table's backing name goes back to the logical Postgres
+    /// name the wire speaks. The durable pending record keeps the physical
+    /// names it was captured under, because that is what a rollback has to
+    /// apply locally, and a replay renames again on its way out.
     async fn send_mutation(&mut self, seq: u64, changeset: &[u8]) -> Result<(), ClientError> {
-        let op_count = count_ops(changeset);
-        let payload = zstd::encode_all(changeset, ZSTD_LEVEL)?;
+        let logical = self.to_logical(changeset.to_vec())?;
+        let op_count = count_ops(&logical);
+        let payload = zstd::encode_all(logical.as_slice(), ZSTD_LEVEL)?;
         self.wire()?
             .transport
             .send_control(ControlMessage::MutationHeader(MutationHeader::new(
@@ -1911,7 +2211,7 @@ where
         let Some(changeset) = self.pending.remove(&client_seq) else {
             return Ok(Vec::new());
         };
-        let rows = affected_rows(&changeset)?;
+        let rows = affected_rows(&changeset, &self.config.policy_tables)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let _suspended = SuspendedCapture::new(&mut self.session);
@@ -1965,18 +2265,31 @@ where
     /// hook, so the tracker stays a plain record of what the connection wrote
     /// and this one boundary decides what counts as an application table for
     /// both consumers, [`Reactive::changed_tables`] and the live-query refresh.
+    ///
+    /// A split table is reported under its logical name for the same reason.
+    /// SQLite's update hook never fires for a view, so a write through the
+    /// `INSTEAD OF` triggers and a server patch applied underneath them both
+    /// report the backing table, while a live query names the table its own SQL
+    /// names. Reporting the physical name would leave every live query over a
+    /// policy-bearing table never refreshing, silently.
     pub fn take_changed(&mut self) -> Vec<String> {
-        let mut tables: Vec<String> = self
+        let tables = &self.config.policy_tables;
+        let mut named: Vec<String> = self
             .changed
             .lock()
             .map(|mut set| {
                 set.drain()
                     .filter(|name| !is_internal_table(name))
+                    .map(|name| match tables.logical(&name) {
+                        Some(logical) => logical.to_owned(),
+                        None => name,
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        tables.sort();
-        tables
+        named.sort();
+        named.dedup();
+        named
     }
 
     /// Close the transport.
@@ -2066,6 +2379,8 @@ where
             ControlMessage::FatalError(fatal) => Ok(ClientEvent::ServerClosed {
                 reason: fatal.reason,
             }),
+            ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
+            ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
             ))),
@@ -2127,15 +2442,25 @@ where
         }
 
         let _suspended = SuspendedCapture::new(&mut self.session);
+        let tables = self.config.policy_tables.clone();
         self.db.transaction::<_, ClientError, _>(|conn| {
             for table in &resyncing.tables {
                 if untouchable.contains(table.as_str()) {
                     continue;
                 }
+                // A split table is cleared at its backing table, not through
+                // the policy view, for the reason the apply path writes there:
+                // the server decides what this replica may hold, and the view
+                // yields only rows the local policy admits, so deleting
+                // through it would strand every row the policy hides where
+                // nothing ever removes it. The predicates name plain columns
+                // of the logical table and the backing table carries the same
+                // columns in the same order, so they are unaffected.
+                let target = tables.physical(table).unwrap_or(table);
                 // The table and the predicates are chosen at runtime from the
                 // subscriptions' own parsed queries, so diesel's compile-time
                 // DSL cannot name them: this is the one raw statement here.
-                let quoted = quote_ident(table);
+                let quoted = quote_ident(target);
                 let statement = match clauses.get(table.as_str()) {
                     Some(surviving) if !surviving.is_empty() => {
                         let kept = surviving
@@ -2158,6 +2483,15 @@ where
     /// never separates an applied change from its resume point. Capture is
     /// suspended throughout: the session never records what the server
     /// already knows.
+    ///
+    /// The wire speaks logical Postgres names, so a split table's rows are
+    /// rewritten onto its backing table before the apply. Applying them to the
+    /// view instead is silent loss rather than an error:
+    /// `sqlite3changeset_apply` resolves the view, synthesizes an implicit
+    /// rowid key because a view declares no primary key, passes its shape
+    /// checks, and then fails every row as a per-row `Constraint` conflict,
+    /// which `server_wins` maps to Omit. Server data is authoritative, so it
+    /// lands underneath the policy triggers rather than through them.
     fn apply_patch(
         &mut self,
         payload_zstd: &[u8],
@@ -2165,7 +2499,12 @@ where
         addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
-        let apply = self.honour_departures(&bytes, addressed_to)?;
+        // Departure filtering weighs the wire's logical names against what the
+        // subscriptions cover, which is also logical, so the rename follows it.
+        let apply = self
+            .honour_departures(&bytes, addressed_to)?
+            .map(|bytes| self.to_physical(bytes))
+            .transpose()?;
         let _suspended = SuspendedCapture::new(&mut self.session);
         self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
@@ -2180,6 +2519,26 @@ where
             }
             Ok(())
         })
+    }
+
+    /// Rewrite a payload from the wire's logical names onto the replica's
+    /// physical ones. A schema with no split table skips the parse entirely.
+    fn to_physical(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ClientError> {
+        let tables = &self.config.policy_tables;
+        if tables.is_empty() {
+            return Ok(bytes);
+        }
+        rename_diffset(bytes, |name| tables.physical(name).map(str::to_owned))
+    }
+
+    /// Rewrite a captured payload from the replica's physical names back onto
+    /// the logical ones the wire and Postgres use.
+    fn to_logical(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ClientError> {
+        let tables = &self.config.policy_tables;
+        if tables.is_empty() {
+            return Ok(bytes);
+        }
+        rename_diffset(bytes, |name| tables.logical(name).map(str::to_owned))
     }
 
     /// What of `bytes` should actually be applied, once departure notices are
@@ -2232,6 +2591,12 @@ where
 
     /// Whether some subscription other than `addressed_to` still wants the row
     /// `pk` identifies in `table`.
+    ///
+    /// `table` is the wire's logical name, so the subscription match below is
+    /// on that, while the row itself is read from the backing table when the
+    /// table was split: the question is what this replica holds for other
+    /// subscriptions, and the view would answer only for the rows the local
+    /// policy admits.
     fn still_covered(
         &mut self,
         table: &TableSchema<String>,
@@ -2264,7 +2629,13 @@ where
         // The key is matched by ordinal, because the wire format carries a
         // primary key's positions and never its column names. The replica's own
         // catalog supplies the names for those positions.
-        let columns = replica_columns(&mut self.db, table.name())?;
+        let physical = self
+            .config
+            .policy_tables
+            .physical(&name)
+            .unwrap_or(table.name())
+            .to_owned();
+        let columns = replica_columns(&mut self.db, &physical)?;
         let mut wheres = Vec::with_capacity(pk.len());
         for (position, value) in pk_ordinals(table).into_iter().zip(pk) {
             let column = columns.get(position).ok_or_else(|| {
@@ -2280,7 +2651,7 @@ where
         }
         let sql = format!(
             "SELECT 1 AS present FROM {} WHERE {} AND ({}) LIMIT 1",
-            quote_ident(table.name()),
+            quote_ident(&physical),
             wheres.join(" AND "),
             clauses.join(" OR ")
         );
