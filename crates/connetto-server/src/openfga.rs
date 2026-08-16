@@ -53,6 +53,7 @@ use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use crate::capability::CapabilityKey;
 use crate::counters::{AUTHORIZATION_CALLS, add};
+use crate::reach::GrantReach;
 
 /// A transport that counts the calls that ask whether a row is visible.
 ///
@@ -128,6 +129,10 @@ impl SubjectNaming {
     /// it.
     const USER_TYPE: &'static str = "user";
 
+    /// The key rls2fga renders a wildcard subject with, so `user:*` reads back
+    /// as everybody rather than as a person of that name.
+    const WILDCARD_KEY: &'static str = "*";
+
     /// Read the naming a deployment's own key setting produced.
     ///
     /// The parameter is matched by the setting it mirrors, `Key::SETTING`,
@@ -149,6 +154,21 @@ impl SubjectNaming {
     #[must_use]
     pub const fn asks_the_caller(&self) -> bool {
         self.subjects_parameter.is_some()
+    }
+
+    /// Read one subject back as who it names.
+    ///
+    /// The inverse of [`ModelSubject::subjects`], which is the one rendering
+    /// every question uses, so this compares against exactly what a live
+    /// caller is named by.
+    #[must_use]
+    pub fn holder(&self, subject: &str) -> GrantHolder {
+        match subject.split_once(':') {
+            Some((kind, key)) if kind == self.user_type && key != Self::WILDCARD_KEY => {
+                GrantHolder::Person(key.to_owned())
+            }
+            _ => GrantHolder::Everybody,
+        }
     }
 }
 
@@ -242,11 +262,13 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
     ///
     /// Built here rather than assembled by a caller so the two cannot end up
     /// reading different indexes. A store maintained against one description
-    /// and questioned against another names rows that do not exist.
+    /// and questioned against another names rows that do not exist. `reach` is
+    /// walked over the model the same translation produced, for the same reason.
     #[must_use]
     pub fn upkeep(
         &self,
         translator: Translator,
+        reach: GrantReach,
         pool: Pool<AsyncPgConnection>,
     ) -> Arc<dyn StoreUpkeep>
     where
@@ -264,6 +286,8 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
             translator,
             delegate: self.inner.inner().clone(),
             pool,
+            reach,
+            naming: Arc::clone(&self.naming),
         })
     }
 
@@ -358,6 +382,13 @@ pub enum SetupError {
     /// The index refused the questions the model would need.
     #[error(transparent)]
     Index(#[from] OpenFgaError),
+    /// The generated rules could not be inverted into what each fact reaches.
+    ///
+    /// Refused for the same reason as an untranslated policy: a rule shape the
+    /// walk cannot follow makes a withdrawal reach nobody, which leaves rows on
+    /// a device and announces nothing (R7).
+    #[error(transparent)]
+    Reach(#[from] crate::reach::ReachError),
 }
 
 /// One translation, read once, so nothing downstream reads a second.
@@ -378,6 +409,7 @@ pub struct Translated {
     model: rls2fga::generator::json_model::AuthorizationModel,
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
     policy_tables: Vec<String>,
+    reach: GrantReach,
 }
 
 impl Translated {
@@ -462,6 +494,9 @@ impl Translated {
         let tuples = outputs.tuple_queries();
         let policy_tables = policy_tables(&outputs);
         drop(outputs);
+        // Walked here rather than where it is first read, so a model this
+        // cannot follow refuses the boot beside every other startup refusal.
+        let reach = GrantReach::of(&model, &naming, &answers)?;
 
         Ok(Self {
             catalog,
@@ -474,6 +509,7 @@ impl Translated {
             model,
             tuples,
             policy_tables,
+            reach,
         })
     }
 
@@ -609,16 +645,18 @@ impl Translated {
         Ok(records)
     }
 
-    /// The index every reader shares, and the translator that reads a replayed
-    /// query's rows back.
+    /// The index every reader shares, the translator that reads a replayed
+    /// query's rows back, and what each kind of fact reaches.
     ///
-    /// Handed over together because the two must describe one schema: the index
-    /// keeps the catalog and lends it, and the translator reads that same
-    /// catalog, so nothing downstream can hold a second opinion about the
-    /// deployment's policies.
+    /// Handed over together because the three must describe one schema: the
+    /// index keeps the catalog and lends it, the translator reads that same
+    /// catalog, and the reach index was walked over the model built from it, so
+    /// nothing downstream can hold a second opinion about the deployment's
+    /// policies.
     #[must_use]
-    pub fn into_parts(self) -> (Arc<Shapes<ParserDB>>, Translator) {
+    pub fn into_parts(self) -> (Arc<Shapes<ParserDB>>, Translator, GrantReach) {
         let translator = self.translator;
+        let reach = self.reach;
         let shapes = Arc::new(
             Shapes::new(self.catalog, &self.relations)
                 .with_row_naming(&self.naming)
@@ -626,7 +664,7 @@ impl Translated {
                 .with_required_parameters(&self.notes)
                 .with_unrestricted_tables(&self.open),
         );
-        (shapes, translator)
+        (shapes, translator, reach)
     }
 }
 
@@ -786,8 +824,40 @@ pub enum UpkeepError {
     Write(String),
 }
 
+/// One authorization fact that moved, and who it concerned.
+///
+/// What the watcher hands the session layer: the tables whose read answer
+/// depends on the fact, and who to tell. The fact itself does not travel,
+/// because nothing downstream can do anything with it (R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantMove {
+    /// Tables whose read answer depends on the fact that moved.
+    ///
+    /// **Never the table the change arrived on.** R6's two-check form already
+    /// takes that one row away from the callers who lost it, precisely, so
+    /// resyncing there would replace a whole subscription over a change one
+    /// delete covers (R7 decision 6).
+    pub tables: Vec<String>,
+    /// Who the fact concerned.
+    pub holder: GrantHolder,
+}
+
+/// Who a moved fact concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantHolder {
+    /// One identity, spelled as the deployment spells it, with the model's type
+    /// prefix taken off so the session layer compares it against the identity
+    /// it already holds.
+    Person(String),
+    /// Everybody subscribed to the reached tables. A wildcard subject, whether
+    /// or not a condition narrows it, and any subject connetto cannot resolve to
+    /// a person: wider than necessary never leaves a row on a device, and
+    /// narrower silently does.
+    Everybody,
+}
+
 /// Bring the authorization store level with one changed row, before that row
-/// reaches anybody.
+/// reaches anybody, and report what moved.
 ///
 /// **The ordering is the point and it is upstream's, not a preference.** Until
 /// the difference is written the store still holds the facts from before the
@@ -801,10 +871,14 @@ pub enum UpkeepError {
 /// hold rather than a bound every test double has to satisfy.
 pub trait StoreUpkeep: Send + Sync {
     /// Apply what `event` moved, and do not return until it is applied.
+    ///
+    /// The returned moves are what the session layer resyncs on. An empty
+    /// vector means nothing about who can reach what changed outside the table
+    /// the event arrived on.
     fn keep_current<'a>(
         &'a self,
         event: &'a subql::ChangeEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), UpkeepError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>>;
 }
 
 /// The upkeep behind [`FgaAuth`], over the same index it answers from.
@@ -813,6 +887,11 @@ struct FgaUpkeep<Id, Key, T> {
     translator: Translator,
     delegate: OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>,
     pool: Pool<AsyncPgConnection>,
+    /// What each kind of fact reaches, walked once at startup.
+    reach: GrantReach,
+    /// How the model spells a person, so a subject can be read back as the
+    /// identity a live session carries.
+    naming: Arc<SubjectNaming>,
 }
 
 impl<Id, Key, T> StoreUpkeep for FgaUpkeep<Id, Key, T>
@@ -828,14 +907,14 @@ where
     fn keep_current<'a>(
         &'a self,
         event: &'a subql::ChangeEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), UpkeepError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
         Box::pin(async move {
             let diff = match self.shapes.diff(event) {
                 Ok(diff) => diff,
                 // A truncate names no row, so nothing single-row moved and
                 // there is nothing here to apply. Everything else means the
                 // difference is not knowable, which is not the same as empty.
-                Err(StoreDiffError::NotARowEvent) => return Ok(()),
+                Err(StoreDiffError::NotARowEvent) => return Ok(Vec::new()),
                 Err(err) => return Err(UpkeepError::Diff(err.to_string())),
             };
             let replayed = self.replay(&diff).await?;
@@ -849,12 +928,50 @@ where
                     .await
                     .map_err(|err| UpkeepError::Write(err.to_string()))?;
             }
-            Ok(())
+            // Read after the store is level, never before: a replacement
+            // snapshot produced against the old facts would hand back exactly
+            // the rows the change took away.
+            Ok(self.moved(event, &diff))
         })
     }
 }
 
 impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
+    /// What this difference changed about who can reach what, outside the table
+    /// the change arrived on.
+    ///
+    /// A grant given counts as much as a grant taken away: rows the caller may
+    /// now see exist already and no row event will announce them, so only a
+    /// replacement carries them.
+    fn moved(&self, event: &subql::ChangeEvent, diff: &StoreDiff<'_, Postgres>) -> Vec<GrantMove> {
+        use subql::backend::CdcEvent as _;
+
+        let catalog = self.shapes.catalog();
+        let arrived_on = subql::catalog_helpers::table_name(catalog, event.table_id(catalog))
+            .unwrap_or_default();
+        let mut moves: Vec<GrantMove> = Vec::new();
+        for record in diff.added.iter().chain(diff.removed.iter()) {
+            let tables: Vec<String> = self
+                .reach
+                .tables_for(&record.object, record.relation.as_str())
+                .iter()
+                .filter(|table| **table != arrived_on)
+                .cloned()
+                .collect();
+            if tables.is_empty() {
+                continue;
+            }
+            let holder = self.naming.holder(&record.subject);
+            let candidate = GrantMove { tables, holder };
+            // Two records of one kind about one person say one thing, and a
+            // shape emitting a record per element of a list column emits many.
+            if !moves.contains(&candidate) {
+                moves.push(candidate);
+            }
+        }
+        moves
+    }
+
     /// Run every query the difference asked for, and read the rows back as
     /// facts.
     ///

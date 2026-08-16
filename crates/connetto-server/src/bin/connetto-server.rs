@@ -71,6 +71,7 @@ use connetto_server::capability::DEFAULT_USER_SETTING;
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
 };
+use connetto_server::reach::GrantReach;
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
@@ -560,9 +561,9 @@ async fn main() -> Result<()> {
     let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?;
-    let (auth, translator) =
+    let (auth, translator, reach) =
         build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
-    let upkeep = auth.upkeep(translator, reader_pool.clone());
+    let upkeep = auth.upkeep(translator, reach, reader_pool.clone());
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
 
@@ -718,7 +719,7 @@ async fn build_authorization(
     reader_pool: &Pool<AsyncPgConnection>,
     pg_ddl: &str,
     publication: &str,
-) -> Result<(ServerAuth, Translator)> {
+) -> Result<(ServerAuth, Translator, GrantReach)> {
     let policies = read_ddl("CONNETTO_PG_POLICIES")?;
     let translated = Translated::of::<String>(pg_ddl, &policies, DEFAULT_USER_SETTING)?;
 
@@ -759,7 +760,7 @@ async fn build_authorization(
         ModelState::Adopted(_) => None,
     };
 
-    let (shapes, translator) = translated.into_parts();
+    let (shapes, translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     if let Some(records) = load {
         tracing::info!(
@@ -788,7 +789,7 @@ async fn build_authorization(
     )
     .map_err(|err| anyhow!("building the authorization delegate: {err}"))?
     .authorization_model_id(model.id().to_owned());
-    Ok((FgaAuth::new(shapes, delegate, naming), translator))
+    Ok((FgaAuth::new(shapes, delegate, naming), translator, reach))
 }
 
 /// Report one change-stream or authorization retry, so reconnect churn and an

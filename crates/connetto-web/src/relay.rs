@@ -356,8 +356,10 @@ struct HubState {
     /// tables.
     resync_tables: HashMap<String, HashSet<String>>,
     /// Worker upstream subs currently between an upstream `FullResync` and the
-    /// fresh snapshot's end. Their `SnapshotEnd` triggers the tab re-snapshot.
-    resyncing: HashSet<String>,
+    /// fresh snapshot's end, each with the reason it arrived with. Their
+    /// `SnapshotEnd` triggers the tab re-snapshot, which carries that reason on
+    /// rather than restating one cause as another.
+    resyncing: HashMap<String, FullResyncReason>,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -1664,16 +1666,16 @@ where
             }
             Ok(())
         }
-        ClientEvent::FullResync { sub_id } => {
+        ClientEvent::FullResync { sub_id, reason } => {
             // The worker's own client clears its replica on this frame and
             // repopulates from the fresh snapshot that follows. Defer the tab
             // fan-out to the matching SnapshotEnd, when that replica is whole.
-            state.resyncing.insert(sub_id);
+            state.resyncing.insert(sub_id, reason);
             Ok(())
         }
         ClientEvent::SnapshotEnd { sub_id } => {
-            if state.resyncing.remove(&sub_id) {
-                resnapshot_after_resync(worker, state, &sub_id)?;
+            if let Some(reason) = state.resyncing.remove(&sub_id) {
+                resnapshot_after_resync(worker, state, &sub_id, reason)?;
             }
             Ok(())
         }
@@ -1719,6 +1721,7 @@ fn resnapshot_after_resync<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     worker_sub: &str,
+    reason: FullResyncReason,
 ) -> Result<(), RelayError>
 where
     U: Transport,
@@ -1746,7 +1749,7 @@ where
             .send(TabOut::Control(ControlMessage::FullResyncRequired(
                 FullResyncRequired {
                     sub_id: tab_sub.clone(),
-                    reason: FullResyncReason::CursorOutsideRetention,
+                    reason,
                 },
             )));
         serve_snapshot(

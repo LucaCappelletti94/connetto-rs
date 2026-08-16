@@ -51,7 +51,12 @@ pub enum SnapshotError {
 /// The translated SQL quotes identifiers, so this takes the ident value,
 /// never its rendering, and the last dotted segment so a schema-qualified
 /// table resolves to the name the catalog knows.
-fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
+///
+/// # Errors
+///
+/// [`SnapshotError::Sql`] when the statement is not a plain single-table
+/// `SELECT`.
+pub(crate) fn table_from_select(sql: &str) -> Result<String, SnapshotError> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|err| SnapshotError::Sql(err.to_string()))?;
     let Some(Statement::Query(query)) = statements.into_iter().next() else {

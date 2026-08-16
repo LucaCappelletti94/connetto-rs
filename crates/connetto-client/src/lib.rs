@@ -27,7 +27,7 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
-pub use connetto_core::messages::{Grant, PauseCause, SyncStatus};
+pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
@@ -633,6 +633,9 @@ pub enum ClientEvent {
     FullResync {
         /// Subscription id.
         sub_id: String,
+        /// Why the rows had to be replaced, carried so a relay tells its own
+        /// consumers the truth rather than restating one cause as another.
+        reason: FullResyncReason,
     },
     /// The server reported a non-fatal error attached to a request, most
     /// commonly a rejected subscription. The session stays open.
@@ -2334,6 +2337,7 @@ where
                 self.clear_subscription_rows(&resync.sub_id)?;
                 Ok(ClientEvent::FullResync {
                     sub_id: resync.sub_id,
+                    reason: resync.reason,
                 })
             }
             ControlMessage::MutationApplied(ack) => {

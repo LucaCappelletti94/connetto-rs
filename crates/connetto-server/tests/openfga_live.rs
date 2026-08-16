@@ -48,7 +48,7 @@ use pg_walstream::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, RowData};
 use subql::backend::{Postgres, Value};
 use subql::catalog_helpers;
 use subql::visibility::openfga::OpenFgaPolicy;
-use subql::visibility::{Verdict, VisibilityPolicy};
+use subql::visibility::{RowWrite, Verdict, VisibilityPolicy};
 
 /// The schema clients sync.
 const SCHEMA: &str = "CREATE TABLE r5b_notes (id INT PRIMARY KEY, owner TEXT NOT NULL);";
@@ -348,7 +348,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         .await
         .expect("the facts load");
 
-    let (shapes, translator) = translated.into_parts();
+    let (shapes, translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -370,7 +370,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(translator, pool.clone());
+    let upkeep = auth.upkeep(translator, reach, pool.clone());
 
     // Row 1 moves from alice to carol. This is the event the change stream
     // would carry, with both images, which is what `REPLICA IDENTITY FULL`
@@ -406,5 +406,199 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         [Verdict::Deny, Verdict::Allow],
         "alice no longer owns the row and carol does, and the store must say so \
          before the row is delivered rather than after"
+    );
+}
+
+/// The schema behind the promise measurement: a grant is a membership row, so
+/// withdrawing one produces no event on the guarded table at all.
+///
+/// One statement per entry, because a prepared statement carries one and the
+/// translator reads them joined.
+const CROSS_SCHEMA_STATEMENTS: [&str; 3] = [
+    "CREATE TABLE r7_teams (id INT PRIMARY KEY)",
+    "CREATE TABLE r7_members (team_id INT REFERENCES r7_teams(id), member TEXT NOT NULL, \
+       PRIMARY KEY (team_id, member))",
+    "CREATE TABLE r7_docs (id INT PRIMARY KEY, team_id INT NOT NULL REFERENCES r7_teams(id))",
+];
+
+/// The schema as the one document the translator is handed.
+fn cross_schema() -> String {
+    CROSS_SCHEMA_STATEMENTS.join(";\n") + ";"
+}
+
+/// `FOR ALL`, so one policy gates the read and the write and both questions are
+/// about the same grant.
+const CROSS_POLICY_STATEMENTS: [&str; 2] = [
+    "ALTER TABLE r7_docs ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY r7_docs_p ON r7_docs FOR ALL USING (\
+       EXISTS (SELECT 1 FROM r7_members \
+               WHERE r7_members.team_id = r7_docs.team_id \
+                 AND r7_members.member = current_setting('app.user_id', true)))",
+];
+
+/// Provision the cross-table fixture, dropping whatever a previous run left.
+async fn provision_cross(pool: &Pool<AsyncPgConnection>) {
+    let mut conn = pool.get().await.expect("a connection");
+    let mut statements = vec!["DROP TABLE IF EXISTS r7_docs, r7_members, r7_teams CASCADE"];
+    statements.extend(CROSS_SCHEMA_STATEMENTS);
+    statements.extend(CROSS_POLICY_STATEMENTS);
+    statements.push("INSERT INTO r7_teams (id) VALUES (1)");
+    statements.push("INSERT INTO r7_members (team_id, member) VALUES (1, 'alice')");
+    statements.push("INSERT INTO r7_docs (id, team_id) VALUES (1, 1)");
+    for statement in statements {
+        diesel::sql_query(statement)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|err| panic!("provisioning `{statement}`: {err}"));
+    }
+}
+
+/// Translate the cross-table policy, put it and its facts on a fresh store, and
+/// compose the executor plus the upkeep that keeps it current.
+async fn cross_executor(
+    pool: &Pool<AsyncPgConnection>,
+) -> (
+    FgaAuth<String, String, Counted<Channel>>,
+    Arc<dyn connetto_server::openfga::StoreUpkeep>,
+    Arc<subql::visibility::shapes::Shapes<subql::ParserDB>>,
+) {
+    let (channel, store) = connect().await;
+    let schema = cross_schema();
+    let translated =
+        Translated::of::<String>(&schema, &CROSS_POLICY_STATEMENTS.join(";\n"), "app.user_id")
+            .expect("a membership policy translates");
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the rules are written");
+    let records = translated.load_records(pool).await.expect("the facts load");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        Arc::clone(&shapes),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned())
+    .write_records(&records)
+    .await
+    .expect("the facts load");
+
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
+    let upkeep = auth.upkeep(translator, reach, pool.clone());
+    (auth, upkeep, shapes)
+}
+
+/// **The promise, measured rather than asserted (R7 decision 3).**
+///
+/// `08-authorization.md` promises that an authorization change takes effect
+/// immediately for writes and within the read cache lifetime for reads. This
+/// takes both questions the instant the withdrawal is in the store, with no
+/// wait anywhere, and both must refuse.
+///
+/// **The read clause has slack today and this records why.** Reads take
+/// `ConsistencyPreference::MinimizeLatency`, so the promise names a ceiling, but
+/// the service ships with all three caches disabled, and the bound below is far
+/// under the 10 second lifetime a cache would get if one were enabled. Turning
+/// `OPENFGA_CHECK_QUERY_CACHE_ENABLED` on is what would make the clause bite,
+/// and is what this measurement would then catch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
+async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
+    let pool = pool().await;
+    provision_cross(&pool).await;
+    let (auth, upkeep, shapes) = cross_executor(&pool).await;
+    let docs = catalog_helpers::table_id(shapes.catalog(), "r7_docs").expect("in the catalog");
+    let row: [Value<Postgres>; 2] = [Value::Int(1), Value::Int(1)];
+    let view = ValuesRow::new(docs, &row);
+    let alice = [caller("alice")];
+
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, 1);
+    auth.may_see(&view, &alice, &mut verdicts)
+        .await
+        .expect("the composition answered");
+    assert_eq!(
+        verdicts,
+        [Verdict::Allow],
+        "a member of the document's team may see it, which is what makes the \
+         refusal below mean anything"
+    );
+    assert!(
+        auth.may_write(
+            RowWrite::Update {
+                old: &view,
+                new: &view
+            },
+            &alice[0]
+        )
+        .await
+        .expect("the composition answered")
+        .allowed(),
+        "and may write it"
+    );
+
+    // The withdrawal, as the change stream carries it.
+    let event = ChangeEvent::delete(
+        "public",
+        "r7_members",
+        0,
+        row_data(&[("team_id", "1"), ("member", "alice")]),
+        ReplicaIdentity::Full,
+        vec![Arc::from("team_id"), Arc::from("member")],
+        Lsn::new(2),
+    );
+    upkeep
+        .keep_current(&event)
+        .await
+        .expect("the withdrawal reached the store");
+
+    // No wait of any kind between the store write and the two questions: that
+    // absence is the measurement.
+    let taken = std::time::Instant::now();
+    Verdict::reset(&mut verdicts, 1);
+    auth.may_see(&view, &alice, &mut verdicts)
+        .await
+        .expect("the composition answered");
+    let read_after = taken.elapsed();
+    assert_eq!(
+        verdicts,
+        [Verdict::Deny],
+        "the read question must reflect the withdrawal with no wait, which the \
+         shipped settings make immediate because no cache is enabled"
+    );
+    let write_taken = std::time::Instant::now();
+    assert!(
+        !auth
+            .may_write(
+                RowWrite::Update {
+                    old: &view,
+                    new: &view
+                },
+                &alice[0]
+            )
+            .await
+            .expect("the composition answered")
+            .allowed(),
+        "the write question uses the strict preference, so it must refuse at once"
+    );
+    let write_after = write_taken.elapsed();
+    println!("read refused after {read_after:?}, write refused after {write_after:?}");
+    assert!(
+        read_after < std::time::Duration::from_secs(2)
+            && write_after < std::time::Duration::from_secs(2),
+        "both refusals must land far inside the 10 second lifetime a cache would \
+         get, or the promise's read clause is no longer slack: read {read_after:?}, \
+         write {write_after:?}"
     );
 }

@@ -149,12 +149,35 @@ fn aggregate_update_round_trip() {
     }));
 }
 
+/// Every [`FullResyncReason`], each one a replacement the server actually
+/// asks for. The wildcard-free match is the guard: adding a variant stops this
+/// file compiling until it is listed here, and listing it is the moment to
+/// notice that nothing sends it.
+fn every_resync_reason() -> Vec<FullResyncReason> {
+    let reasons = vec![
+        // SessionManager::subscribe_row, when the resume cursor has fallen out
+        // of the retained window.
+        FullResyncReason::CursorOutsideRetention,
+        // SessionManager::keep_store_current, when a grant reaching the
+        // subscription's table moved (R7).
+        FullResyncReason::AuthorizationChange,
+    ];
+    for reason in &reasons {
+        match reason {
+            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {}
+        }
+    }
+    reasons
+}
+
 #[test]
 fn resync_control_round_trips() {
-    round_trip_control(&ControlMessage::FullResyncRequired(FullResyncRequired {
-        sub_id: "sub-orders".into(),
-        reason: FullResyncReason::CursorOutsideRetention,
-    }));
+    for reason in every_resync_reason() {
+        round_trip_control(&ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "sub-orders".into(),
+            reason,
+        }));
+    }
 }
 
 #[test]

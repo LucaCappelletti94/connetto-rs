@@ -221,6 +221,17 @@ where
         let _ = self.audit.set(hook);
     }
 
+    /// Append one access change through the attached sink, or drop it when a
+    /// deployment keeps none.
+    ///
+    /// Here rather than on the session manager because the sink is already
+    /// attached here, so a producer needs no second wiring point.
+    pub(crate) fn record(&self, event: AuthEvent<Id>) {
+        if let Some(audit) = self.audit.get() {
+            audit(event);
+        }
+    }
+
     /// Attach the observer that closes a banned person's live connections, once,
     /// after the session manager exists.
     pub fn set_close_hook(&self, hook: PersonCloseHook) {

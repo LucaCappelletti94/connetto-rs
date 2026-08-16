@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, Grant, Handshake, HandshakeAck, LivePatch,
-    MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, FullResyncReason, Grant, Handshake, HandshakeAck,
+    LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -551,6 +551,23 @@ impl Server {
         });
         Client { transport: client }
     }
+
+    /// Connect a new in-process session and hand back the bare client end, for
+    /// the tests that drive a real `ConnettoConnection` from `connetto-client`
+    /// rather than the frame-level [`Client`] above.
+    ///
+    /// A claim about what a device still holds has to be read off a replica the
+    /// real client maintains, because clearing on a resync notice is the
+    /// client's own step.
+    #[must_use]
+    pub fn attach(&self) -> LoopbackTransport {
+        let (server_transport, client) = loopback();
+        let session = Arc::clone(&self.manager);
+        tokio::spawn(async move {
+            let _ = session.serve(server_transport).await;
+        });
+        client
+    }
 }
 
 /// Wire a harness server: build the materializer, write target, and re-execution
@@ -826,6 +843,38 @@ impl Client {
                 Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => return Some(patch),
                 Some(IncomingFrame::Control(_)) => {}
                 other => panic!("expected a live patch, got {other:?}"),
+            }
+        }
+    }
+
+    /// Wait for a server-initiated replacement of one subscription: the resync
+    /// notice, then the snapshot behind it, returned as its patches.
+    ///
+    /// [`None`] when no notice arrives within `timeout`, which is the assertion
+    /// a caller nothing changed for needs: silence.
+    pub async fn try_resync(
+        &mut self,
+        sub_id: &str,
+        timeout: Duration,
+    ) -> Option<(FullResyncReason, Vec<SnapshotPatch>)> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(frame) = tokio::time::timeout(remaining, self.transport.recv()).await else {
+                return None;
+            };
+            match frame.expect("recv frame") {
+                Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(resync))) => {
+                    assert_eq!(resync.sub_id, sub_id, "resync for the wrong subscription");
+                    let patches = self.expect_snapshot(sub_id).await;
+                    return Some((resync.reason, patches));
+                }
+                // A live patch may be in flight from an earlier commit, and a
+                // keepalive pong may interleave. Neither is what this waits for.
+                Some(
+                    IncomingFrame::Bulk(BulkMessage::LivePatch(_)) | IncomingFrame::Control(_),
+                ) => {}
+                other => panic!("expected a resync notice, got {other:?}"),
             }
         }
     }

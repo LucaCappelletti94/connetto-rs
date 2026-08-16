@@ -34,6 +34,7 @@ pub mod oplog;
 pub mod parity;
 pub mod pk;
 pub mod preflight;
+pub mod reach;
 pub mod reserve;
 pub mod row_view;
 pub mod session;

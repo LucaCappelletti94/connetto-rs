@@ -161,10 +161,14 @@ async fn fake_upstream(
     if trigger.await.is_err() {
         return;
     }
+    // The reason a tab is told has to be the reason the upstream gave, so this
+    // sends the one the hub used to overwrite: before R7 the fan-out hardcoded
+    // `CursorOutsideRetention`, and a tab could not tell a routine catch-up
+    // from a permission being withdrawn.
     server
         .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
             sub_id: UPSTREAM_SUB.to_owned(),
-            reason: FullResyncReason::CursorOutsideRetention,
+            reason: FullResyncReason::AuthorizationChange,
         }))
         .await
         .expect("resync signal");
@@ -292,21 +296,23 @@ async fn full_resync_is_relay_transparent() {
 
     // The tab must observe the resync and drop the row deleted during the
     // outage, converging on the survivor exactly as a direct client would.
-    let mut saw_resync = false;
+    let mut saw_resync = None;
     loop {
         match tab.pump_one().await.expect("tab pump") {
-            ClientEvent::FullResync { .. } => saw_resync = true,
+            ClientEvent::FullResync { reason, .. } => saw_resync = Some(reason),
             ClientEvent::Closed => panic!("tab closed before it converged"),
             _ => {}
         }
         let ids: Vec<rosetta_uuid::Uuid> =
             load_orders(&mut tab).into_iter().map(|o| o.id).collect();
-        if saw_resync && ids == vec![survivor_id] {
+        if saw_resync.is_some() && ids == vec![survivor_id] {
             break;
         }
     }
-    assert!(
+    assert_eq!(
         saw_resync,
-        "the tab observed FullResync forwarded through the hub"
+        Some(FullResyncReason::AuthorizationChange),
+        "the tab observed the resync forwarded through the hub, carrying the \
+         reason the upstream gave rather than one restated by the relay"
     );
 }

@@ -46,6 +46,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
 use crate::abuse::{Caller, Reaction};
+use crate::audit::{AuthEvent, AuthOp};
 use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::guard::RequestGuard;
@@ -53,6 +54,7 @@ use crate::materializer::{
     DeltaAggregateCapture, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
     Registration, SqliteRegistration, agg_value_to_json, compress, value_to_json,
 };
+use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
@@ -102,6 +104,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
 /// The products of registering one row subscription, as its delivery needs
 /// them: the engine ids plus the Postgres translation of the query, which
 /// the snapshot read uses instead of the client dialect.
+#[derive(Clone)]
 struct RowRegistration {
     /// The engine consumer bound to this subscription.
     consumer_id: u64,
@@ -406,6 +409,14 @@ enum Outbound {
     /// queue. Used for session-wide notifications such as delivery paused or
     /// resumed.
     Control(ControlMessage),
+    /// Re-read one row subscription and replace what the client holds, because
+    /// a grant reaching its table moved (R7). Carried as an instruction rather
+    /// than as frames because only this session's own task holds the transport,
+    /// and the notice and its replacement must stay one ordered pair.
+    Resnapshot {
+        /// The client-facing label of the subscription to replace.
+        sub_id: String,
+    },
 }
 
 /// Route from a `subql` consumer id back to the owning session's outbound
@@ -422,6 +433,9 @@ struct Route<Id, Key> {
     /// filter before a live patch is delivered. Shared rather than copied,
     /// because the fan-out clones one route per subscriber per event.
     principal: Arc<Principal<Id, Key>>,
+    /// The table this subscription reads, absent when the translated SQL names
+    /// none the parser recognises. What a moved grant is matched against (R7).
+    table: Option<String>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -481,11 +495,24 @@ impl Deliverable {
     }
 }
 
+/// One live row subscription, as the session has to remember it.
+///
+/// The request is kept because a resync re-reads the same set from the server
+/// side: the client is told to discard what it holds and is handed a
+/// replacement, so nothing asks it to describe the subscription again.
+struct RowSub {
+    reg: RowRegistration,
+    sub: Subscribe,
+}
+
 /// Mutable per-session state carried through the run loop.
 struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
-    subs: HashMap<String, (u64, SubscriptionId)>,
+    /// Row subscriptions by client label, each keeping the request that made it
+    /// so the server can re-read the same set without asking the client again
+    /// (R7).
+    subs: HashMap<String, RowSub>,
     agg_subs: HashMap<String, u64>,
     /// Delta aggregate subscriptions by client label: consumer id and engine
     /// subscription id, both needed to tear the subscription down.
@@ -834,6 +861,24 @@ where
                 || format!("table {id}"),
                 |table| table.table_name().to_owned(),
             )
+    }
+
+    /// The changed row's primary key, as connetto observed it on the event.
+    ///
+    /// Empty when the event carries no readable image, which an audit row
+    /// records as a change naming no row rather than as a wrong one.
+    fn event_key(&self, event: &ChangeEvent) -> Vec<subql::backend::Value<Postgres>> {
+        let catalog = self.catalog.as_ref();
+        let Some(row) =
+            EventRow::current(event, catalog).or_else(|| EventRow::previous(event, catalog))
+        else {
+            return Vec::new();
+        };
+        event
+            .pk_columns(catalog)
+            .into_iter()
+            .map_while(|column| subql::visibility::RowView::value_at(&row, column).ok())
+            .collect()
     }
 
     /// Ask the second opinion about the row as it is now, when one is installed.
@@ -1307,13 +1352,83 @@ where
     /// [`SessionError::AuthUnavailable`], because a store that could not be
     /// brought level is the same class of unknown as an unreachable service and
     /// takes the same path.
-    async fn keep_store_current(&self, event: &ChangeEvent) -> Result<(), SessionError> {
+    async fn keep_store_current(
+        &self,
+        event: &ChangeEvent,
+    ) -> Result<Vec<GrantMove>, SessionError> {
         match self.upkeep.get() {
             Some(upkeep) => upkeep
                 .keep_current(event)
                 .await
                 .map_err(|err| SessionError::AuthUnavailable(err.to_string())),
-            None => Ok(()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Tell every live subscription a moved grant reaches to replace its rows.
+    ///
+    /// The instruction goes on the session's own outbound queue, so the notice
+    /// and its replacement are produced by the task that holds the transport.
+    /// A dropped receiver just means the client has gone.
+    ///
+    /// One audit row per connection told, which is connetto's own act: a
+    /// permission change nobody is connected for records nothing here, and the
+    /// grant row itself is the application's to keep (R7 decision 8).
+    async fn announce_grant_moves(&self, event: &ChangeEvent, moves: &[GrantMove]) {
+        if moves.is_empty() {
+            return;
+        }
+        let told: Vec<(SessionId, Option<Id>, String)> = {
+            let routes = self.routes.lock().await;
+            routes
+                .values()
+                .filter_map(|route| {
+                    let table = route.table.as_deref()?;
+                    let concerned = moves.iter().any(|moved| {
+                        moved.tables.iter().any(|reached| reached == table)
+                            && Self::concerns(&route.principal, &moved.holder)
+                    });
+                    if !concerned {
+                        return None;
+                    }
+                    let sent = route.tx.send(Outbound::Resnapshot {
+                        sub_id: route.label.clone(),
+                    });
+                    sent.is_ok().then(|| {
+                        (
+                            route.principal.session_id(),
+                            route
+                                .principal
+                                .identity()
+                                .map(|identity| identity.user_id.clone()),
+                            route.label.clone(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let grant_row = self.event_table(event);
+        let grant_key = self.event_key(event);
+        for (session, user_id, label) in told {
+            tracing::info!(
+                sub_id = %label,
+                grant_table = %grant_row,
+                "a permission change reached this subscription, replacing its rows"
+            );
+            self.guard.record(
+                AuthEvent::new(session, user_id, AuthOp::PermissionChange)
+                    .about_row(grant_row.clone(), grant_key.clone()),
+            );
+        }
+    }
+
+    /// Whether a moved grant concerns this caller.
+    fn concerns(principal: &Principal<Id, Key>, holder: &GrantHolder) -> bool {
+        match holder {
+            GrantHolder::Everybody => true,
+            GrantHolder::Person(person) => principal
+                .identity()
+                .is_some_and(|identity| identity.user_id.to_string() == *person),
         }
     }
 
@@ -1351,8 +1466,13 @@ where
                     loop {
                         let attempt = async {
                             if !levelled {
-                                self.keep_store_current(&event).await?;
+                                // Announced here rather than after dispatch, so
+                                // the notice cannot be produced twice by the
+                                // retry that re-asks the question, and so the
+                                // replacement is read against a level store.
+                                let moved = self.keep_store_current(&event).await?;
                                 levelled = true;
+                                self.announce_grant_moves(&event, &moved).await;
                             }
                             self.dispatch_event(&event).await
                         };
@@ -2029,6 +2149,14 @@ where
                             // a closed transport (the session may have moved on).
                             let _ = transport.send_control(msg).await;
                         }
+                        Outbound::Resnapshot { sub_id } => {
+                            // In this arm rather than a task of its own, so the
+                            // select cannot interleave it into a subscribe, and
+                            // the notice with its replacement is one ordered
+                            // pair on the task that holds the transport (R7).
+                            self.resnapshot_row(&mut transport, &mut state, &sub_id)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -2046,7 +2174,8 @@ where
 
     /// Drop every route and registration this connection held.
     async fn unsubscribe_all(&self, state: SessionState<Id, Key>) {
-        for (consumer_id, sub_id) in state.subs.into_values() {
+        for row in state.subs.into_values() {
+            let (consumer_id, sub_id) = (row.reg.consumer_id, row.reg.sub_id);
             self.remove_route(consumer_id).await;
             self.materializer.lock().await.unregister(sub_id);
         }
@@ -2075,9 +2204,9 @@ where
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
-                if let Some((consumer_id, sub_id)) = state.subs.remove(&unsub.sub_id) {
-                    self.remove_route(consumer_id).await;
-                    self.materializer.lock().await.unregister(sub_id);
+                if let Some(row) = state.subs.remove(&unsub.sub_id) {
+                    self.remove_route(row.reg.consumer_id).await;
+                    self.materializer.lock().await.unregister(row.reg.sub_id);
                 }
                 if let Some(query_id) = state.agg_subs.remove(&unsub.sub_id) {
                     self.remove_agg_route(query_id).await;
@@ -2505,9 +2634,13 @@ where
     /// Both row paths call this before reading anything. Until the route
     /// exists every patch produced for the consumer is discarded, and the
     /// snapshot read plus its bulk transfer is long enough to lose commits.
+    ///
+    /// The route also records the table the subscription reads, taken from the
+    /// translated SQL rather than from the client's text, because that is what
+    /// a moved grant is matched against (R7).
     async fn attach_row_route(
         &self,
-        sub_label: &str,
+        sub: &Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) {
@@ -2516,15 +2649,71 @@ where
             Route {
                 session_key: state.session_id.as_u64_key(),
                 sub_id: reg.sub_id,
-                label: sub_label.to_owned(),
+                label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
                 principal: Arc::clone(&state.principal),
+                table: crate::snapshot::table_from_select(&reg.pg_sql).ok(),
             },
         )
         .await;
-        state
-            .subs
-            .insert(sub_label.to_owned(), (reg.consumer_id, reg.sub_id));
+        state.subs.insert(
+            sub.sub_id.clone(),
+            RowSub {
+                reg: reg.clone(),
+                sub: sub.clone(),
+            },
+        );
+    }
+
+    /// Replace what one subscription holds, because a grant reaching its table
+    /// moved (R7).
+    ///
+    /// The read comes first and the notice second, which `snapshot_row`
+    /// guarantees, so a failed read leaves the client holding what it had and
+    /// nothing is discarded on a promise. That is also why a failure is retried
+    /// rather than reported: the rows are still there, wrongly, until the
+    /// replacement lands. The backoff is the one the ingest loop uses when the
+    /// authorization service is unreachable, because a read failing here is the
+    /// same class of outage.
+    async fn resnapshot_row<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        sub_label: &str,
+    ) -> Result<(), SessionError> {
+        let mut attempt: u32 = 0;
+        loop {
+            // Read afresh each time: an unsubscribe may have landed between
+            // attempts, and then there is nothing left to replace.
+            let Some(row) = state.subs.get(sub_label) else {
+                return Ok(());
+            };
+            let (sub, reg) = (row.sub.clone(), row.reg.clone());
+            match self
+                .snapshot_row(
+                    transport,
+                    sub,
+                    state,
+                    &reg,
+                    Some(FullResyncReason::AuthorizationChange),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(SessionError::Snapshot(detail)) => {
+                    attempt = attempt.saturating_add(1);
+                    let backoff = self.auth_retry.backoff(attempt);
+                    tracing::warn!(
+                        sub_id = %sub_label,
+                        attempt,
+                        error = %detail,
+                        "replacing a subscription after a permission change failed, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     /// Snapshot a row subscription: route first, then read, then resync
@@ -2554,7 +2743,7 @@ where
         reg: &RowRegistration,
         resync: Option<FullResyncReason>,
     ) -> Result<(), SessionError> {
-        self.attach_row_route(&sub.sub_id, state, reg).await;
+        self.attach_row_route(&sub, state, reg).await;
         let snapshot = self
             .snapshot_source
             .snapshot(&reg.pg_sql, &sub.spec.binds, &state.principal)
@@ -2625,7 +2814,7 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
     ) -> Result<(), SessionError> {
-        self.attach_row_route(&sub.sub_id, state, reg).await;
+        self.attach_row_route(&sub, state, reg).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so

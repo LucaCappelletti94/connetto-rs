@@ -522,6 +522,14 @@ pub async fn visibility_fixture(fixture: &Fixture) -> Server {
     provision_with(fixture, PolicyShape::Row, Executor::Shipped).await
 }
 
+/// A server whose policy reads another table: `items` is visible to a member of
+/// the row's team, so a grant is a `team_members` row and the rows it decides
+/// are in `items`. What R7's teardown needs, because withdrawing a grant here
+/// produces no row event on the subscribed table at all.
+pub async fn cross_table_visibility_fixture(fixture: &Fixture) -> Server {
+    provision_with(fixture, PolicyShape::CrossTable, Executor::Shipped).await
+}
+
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
     provision_with(fixture, shape, Executor::Shipped).await
 }
@@ -625,7 +633,7 @@ async fn fga_auth(
         .await
         .expect("the generated queries ran");
 
-    let (shapes, translator) = translated.into_parts();
+    let (shapes, translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -652,7 +660,7 @@ async fn fga_auth(
     // binary, so a row written after the load reaches the service before it
     // reaches a subscriber. Without it a cross-table policy would answer every
     // new row from facts that were never written.
-    let upkeep = auth.upkeep(translator, fixture.admin().clone());
+    let upkeep = auth.upkeep(translator, reach, fixture.admin().clone());
     (auth, upkeep)
 }
 
