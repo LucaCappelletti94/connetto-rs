@@ -68,7 +68,7 @@ Stated explicitly, because the phase exists to replace an assumption with an acc
 
 **The socket write. Inherent.** Bytes must reach each client and no studied system escapes it, including the one that relocates the writes to a CDN. Accepting it is not a concession: it is the floor, and reaching it is the whole objective.
 
-**One verdict per watcher. Accepted.** `may_see` fills a vector with one entry per watcher, so the answer is proportional to watcher count even when computing it is not. **Decided (R5b)**: tier 1 answers by set-membership of the row's derived subject against the watcher list with no round trip, and tier 2 asks once per distinct group the row grants to. Both are local tests per watcher over a bounded number of round trips. Tier 3 is the exception and its cost does grow with subscribers, accepted there because a relation that spans, intersects or subtracts across tables has no local answer and refusing to serve such a policy would be worse than serving it slowly.
+**One verdict per watcher. Accepted.** `may_see` fills a vector with one entry per watcher, so the answer is proportional to watcher count even when computing it is not. **Built (R5b, 2026-08-12)**: `RowPolicy` answers locally with no round trip for every relation the schema decides (the two halves of connetto's own policy, identity comparison and held-key comparison, both fall here), and `OpenFgaPolicy` batches one question per watcher for the rest, capped at 50 per call. For connetto's own policy shape the verdict count is proportional and the round-trip count is zero. The per-watcher cost that remains is one verdict-vector entry and one socket write, both inherent.
 
 **One route lookup per matched consumer. Accepted.** A hash lookup against `routes`, which is not the kind of cost this chapter exists to remove.
 
@@ -121,9 +121,9 @@ The header is a MessagePack-encoded enum mirroring `BulkMessage`'s variants with
 
 **Decided (R16 part B): one frame per distinct pair of handle and event, cloned per socket.** A live frame's three parts are then all shared. The handle is derived from the question. The cursor is already per event rather than per client: `Materializer::dispatch` stamps every `MatchedPatch` with the same value taken from the event's checkpoint. The payload is already computed once. So the whole frame, tag included, is identical for every allowed subscriber on that handle, and a subscriber the verdict denied simply does not receive it.
 
-**Nothing in this mechanism waits on R5b.** The shape it needs is R5a's and is already in the tree: `may_see` takes one row and every watcher and returns one verdict each, so the partition over subscribers exists today. R5b changes how cheaply that partition is computed, not what it is. **No permission-class identifier has to be invented**, which is what the sequencing record expected to be the blocker.
+**Nothing in this mechanism waits on R5b.** The shape it needs is R5a's and is already in the tree: `may_see` takes one row and every watcher and returns one verdict each, so the partition over subscribers exists today. R5b makes that partition cheap enough for the sharing to pay: for connetto's own policy shape the round-trip count is zero, so the work saved by sharing one frame dominates. **No permission-class identifier has to be invented**, which is what the sequencing record expected to be the blocker.
 
-**R5b decides whether it pays, and that is a real gate.** With the per-subscriber round trip in place at roughly 590 microseconds, a saved header encode is noise. Two clients on one handle who fall on different sides of the verdict for a given row still share nothing for that row, which is `08-authorization.md`'s property 4 stated from the delivery side: sharing applies to the allowed subset, and its value is proportional to how often that subset has more than one member.
+**R5b removes the gate once it is the shipped executor.** With the per-subscriber round trip eliminated for connetto's policy shape, the frame sharing overhead is no longer noise, and two clients on one handle who both receive the row share the same bytes. Sharing applies to the allowed subset, and its value is proportional to how often that subset has more than one member.
 
 ### Reaching zero copies
 
@@ -179,7 +179,7 @@ A retained registration produces a `MatchedPatch` on every matching event, disca
 
 **Catchup frames are not shared across clients, and that is correct rather than a gap.** Two clients resuming from different positions receive different sequences, so the sharing above has nothing to key on. Catchup gets the copy elimination and not the frame sharing.
 
-**And it still pays two costs per record per client**, neither addressed here: one predicate match, and one visibility question. **Decided (R5b)** makes the second free in tier 1. The first is `subql`'s interned-predicate evaluation and is left alone.
+**And it still pays two costs per record per client**, neither addressed here: one predicate match, and one visibility question. **Built (R5b, 2026-08-12)** makes the second free for connetto's own policy shape (both arms answered locally by `RowPolicy`, zero round trips). The first is `subql`'s interned-predicate evaluation and is left alone.
 
 ---
 
@@ -231,7 +231,7 @@ Part A established that nothing on the delivery side needs an upstream change, a
 
 ## Cross-references
 
-- `08-authorization.md`: the per-client floor, the six-layer separation, and the five protocol properties this chapter implements. Also the R5b tiers that make the verdict cheap.
+- `08-authorization.md`: the per-client floor, the six-layer separation, and the five protocol properties this chapter implements. Also the two-tier answer shape R5b built (local via `RowPolicy`, server-batch via `OpenFgaPolicy`) and why a group-membership middle tier does not exist.
 - `02-protocol.md`: the two planes and the framing this chapter changes.
 - `06-reconnect.md`: the oplog, its retention window, and the catchup decision.
 - `10-subscription-materializer.md`: the component that owns the fan-out and the boundary with `subql`.

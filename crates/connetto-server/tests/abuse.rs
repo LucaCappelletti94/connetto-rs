@@ -51,7 +51,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::Postgres as PgBackend;
-use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource};
 
 // The reference defaults over `Id = String`, which is what `TestGrantChecker`
@@ -147,9 +147,8 @@ impl VisibilityPolicy for DenyAll {
     #[allow(clippy::unused_async_trait_impl)]
     async fn may_write<R>(
         &self,
-        _row: &R,
+        _write: RowWrite<'_, R>,
         _watcher: &Self::Watcher,
-        _op: WriteOp,
     ) -> Result<Verdict, Self::Error>
     where
         R: RowView<Backend = PgBackend> + Sync + ?Sized,
@@ -265,6 +264,7 @@ fn manager<A>(
 ) -> Arc<SessionManager<KeyedSnapshot, A, ConnettoWatermark>>
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display,
 {
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
@@ -305,6 +305,7 @@ async fn connect<A>(
 ) -> Live
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display,
 {
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);
@@ -337,6 +338,7 @@ async fn handshake_accepted<A>(
 ) -> bool
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display,
 {
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);

@@ -17,7 +17,7 @@ pub mod subscription;
 
 pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
-pub use control::{ControlMessage, SyncStatus};
+pub use control::{ControlMessage, PauseCause, SyncStatus};
 pub use error::{FatalError, FatalErrorReason, NonFatalError, RateLimited, SUBSCRIPTION_REFUSED};
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};

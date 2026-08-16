@@ -116,9 +116,23 @@ CREATE TABLE _connetto_mutations (
     session_id UUID PRIMARY KEY,
     last_seq   BIGINT NOT NULL
 );
+
+CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
+
+CREATE TABLE connetto_oplog (
+    lsn          BIGINT PRIMARY KEY,
+    table_name   TEXT NOT NULL,
+    op           connetto_change_op NOT NULL,
+    pk           BYTEA NOT NULL,
+    is_tombstone BOOLEAN NOT NULL,
+    event        BYTEA NOT NULL,
+    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 **Built (R2).** The watermark keys on the session handle alone. It needs a stable per-client handle, which is what a session is, and it does not need to know who the client is, so the earlier `user_id` column only widened the shape the table has to satisfy.
+
+**The reconnect log is on this list as of R32 (2026-08-09), and the server refuses to start without it.** It holds what a returning client missed, and it used to live only in the server's memory, so it was empty on every boot and answered "you have missed nothing" to every client that came back after a restart, which sent them nothing and left them silently stale. Durable, it answers from evidence. `CONNETTO_OPLOG_TABLE` names it, defaulting to `connetto_oplog`, and `PgOplog::ensure_schema` emits exactly the two statements above for a scratch database.
 
 **A boot-time check on that shape existed and was deleted on 2026-08-06.** It read Postgres's catalogue and refused a table carrying a leftover `user_id`. Two things were wrong with it. It hardcoded connetto's default column names while being generic over `ConnettoWatermarkSchema`, so it would have refused exactly the application-owned table the trait exists to permit, and the trait already carries the typed upsert the compiler checks. And its stated reason, that a mis-keyed record stays silent until a replay, was false: the pre-R2 two-column key fails on the first write with `there is no unique or exclusion constraint matching the ON CONFLICT specification`, and a missing table with `relation "_connetto_mutations" does not exist`. Both are loud, verified against Postgres.
 

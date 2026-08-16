@@ -66,7 +66,7 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | CDC source | Logical replication stream (pgoutput or wal2json) or a slot poll. `subql`'s `CdcSource` holds the replication connection and produces typed events. The Subscription Materializer (§10) drives the consume loop and owns reconnect with backoff. |
 | Subscription matcher | For each incoming event, identifies which active subscriptions are potentially affected. Matching is in-process via `subql` (bitmap prune plus predicate VM) and has no retry surface. Its surrounding CDC ingestion and re-execution reach the database through connections the materializer supplies (§10). |
-| Auth filter | **Decided (R5b), not built.** Per-subscription, per-row check via the authorization service: "can this client see this row after this change?" Rows that fail are to be dropped or replaced with a delete event, failing closed on a transient outage. Today the check runs against Postgres row-level security instead, and it fails closed. |
+| Auth filter | **Built (R5b, 2026-08-12).** Per-event check via `FgaAuth` (`crates/connetto-server/src/openfga.rs`): `RowPolicy` answers locally from the row's own values wherever the schema decides (zero round trips for connetto's own policy shape), and `OpenFgaPolicy` batches one question per watcher for the rest. Rows that fail are dropped or replaced with a delete event. Fails closed on a transport outage: `ControlMessage::DeliveryPaused { cause: PauseCause::AuthServiceUnreachable }` signals the outage to clients. |
 | Delta packager | Groups affected rows into a batch and adds the server LSN for the client's resume position. `subql` folds matched events into `sqlite-diff-rs` patchsets. The Subscription Materializer (§10) selects each session's authorized subset and invokes the builder. |
 | Delivery queue | Per-session outbound queue; respects flow-control window; drops or back-pressures when client is slow. *(Reliability: see §10.)* |
 
@@ -137,7 +137,7 @@ A structured inventory of every component that must exist. This is not a depende
 |---|---|
 | Policy source | PostgreSQL RLS definitions (or a derived equivalent) compiled into a fast in-process policy engine. |
 | Auth context | Per-session identity and claims passed to every policy evaluation. |
-| Read filter | **Built.** Applied to every row before delivery, at snapshot time and on CDC push, and it fails closed: the verdict buffer arrives pre-filled with denials, so a policy that cannot answer denies rather than allows (`RlsAuth::may_see` in `SessionManager::dispatch_event`). The authorization-service form of this is R5b and is not built. |
+| Read filter | **Built.** Applied to every row before delivery, at snapshot time and on CDC push, and it fails closed. On the snapshot path it is Postgres RLS inline in the query, permanently. On the change path it is `FgaAuth` (`crates/connetto-server/src/openfga.rs`), built R5b: `RowPolicy` answers locally from the row and `OpenFgaPolicy` batches to the server for the rest. The verdict buffer arrives pre-filled with denials, so a backend that cannot answer denies rather than allows. |
 | Write gate | Applied to every mutation before it is executed. *(Reliability: see §10.)* |
 | Auth batching | Policies are evaluated in batch per CDC event to avoid per-row round-trips. |
 | File session token | Short-lived token issued for a specific file; gates chunk upload/download without per-chunk auth calls. |

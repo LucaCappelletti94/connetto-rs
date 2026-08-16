@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn handshake_new_presents_nothing() {
         let hs = Handshake::new(1, "client-a");
-        assert!(hs.grants.is_empty());
+        assert_eq!(hs.grants, []);
         assert!(hs.resume_token.is_none());
         assert!(hs.last_cursor.is_none());
     }

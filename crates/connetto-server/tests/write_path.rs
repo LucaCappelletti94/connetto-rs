@@ -29,7 +29,7 @@ use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, U
 use std::convert::Infallible;
 use std::sync::Arc;
 use subql::backend::Postgres;
-use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
@@ -81,9 +81,8 @@ impl VisibilityPolicy for DenyAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn may_write<R>(
         &self,
-        _row: &R,
+        _write: RowWrite<'_, R>,
         _watcher: &Self::Watcher,
-        _op: WriteOp,
     ) -> Result<Verdict, Infallible>
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,

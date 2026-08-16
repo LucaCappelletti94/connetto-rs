@@ -93,7 +93,7 @@ The header is a MessagePack-encoded enum mirroring the bulk variants with the pa
 | `LivePatch` | **Bulk plane.** Incremental CDC patch: `sub_id` + `cursor` + `patchset_zstd` |
 | `AggregateUpdate` | Incremental or full aggregate result update |
 | `MutationApplied` | Mutation accepted: client sequence number echoed |
-| `MutationReject` | Mutation rejected: client sequence number + reason code. **Decided (R5b)**: gains a reason meaning cannot determine, retry, for when the authorization service is unreachable. It must not reuse `Unauthorized`, which asserts the caller lacks permission when the truth is that the server cannot tell, and which makes a client stop retrying and possibly discard the mutation. Adding a variant is a wire change. |
+| `MutationReject` | Mutation rejected: client sequence number + reason code. **Built (R5b, 2026-08-12)**: gains `MutationRejectReason::Indeterminate` for when the authorization service is unreachable. It must not reuse `Unauthorized`, which asserts the caller lacks permission when the truth is that the server cannot tell, and which makes a client stop retrying and possibly discard the mutation. The variant's doc comment states the client MUST retry. |
 | `MutationConflict` | Conflict detected: client sequence number, table, and the server's current copy of the row. **Built (R8).** The row is optional, because a write against a row somebody else deleted conflicts with nothing to send, and it reaches the application rather than being discarded by the client. |
 | `FullResyncRequired` | Server requires the client to re-snapshot a subscription. **Built (R8).** `FullResyncReason` carries exactly the one variant anything sends, `CursorOutsideRetention`. It gains a variant for authorization change in phase R7. Adding a variant is a wire change: the enum has no forward-compatible fallback for an unknown value. |
 | `Pong` | Keepalive reply |
@@ -102,7 +102,7 @@ The header is a MessagePack-encoded enum mirroring the bulk variants with the pa
 | `SyncStatus` | Relay to tab only, on the same control plane: whether the worker's upstream connection stands (`Connected` or `Offline`). **Built (R20, 2026-08-08).** The real server never sends it, because a server cannot tell a client it is not reaching that it is unreachable. The worker derives the state, the relay forwards each change to every handshaken tab, and each newly handshaken tab is told the current value right after its ack. Natively the same state arrives as `ClientEvent::SyncStatus` with no frame involved. |
 | `FatalError` | Server is closing the session: reason code. **Built (R2, R8, R19).** Every variant names a close the server performs, there is no catch-all, and `crates/connetto-core/tests/wire.rs` guards that with a wildcard-free match. R2 wired `SessionRevoked` and `ConnectionSuperseded`, R8 sends `ServerShuttingDown` on SIGINT or SIGTERM by walking the connection registry, R19 added `RateLimited` with its `retry_after_ms` for a caller over its connection or credential-refusal limit, and the client surfaces the reason as `ClientEvent::ServerClosed` instead of treating it as a protocol violation, so it backs off rather than dying silently. |
 
-**Decided (R5b): a delivery-paused signal.** When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to distinguish that from nothing changing. `NonFatalError` carries only `related_to` and an untyped `detail`, so this needs a typed signal rather than a string a client parses. Snapshots are unaffected throughout, because they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
+**Built (R5b, 2026-08-12): a delivery-paused signal.** When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to distinguish that from nothing changing. `ControlMessage::DeliveryPaused { cause: PauseCause }` carries this signal, and `ControlMessage::DeliveryResumed` cancels it. `PauseCause::AuthServiceUnreachable` names the OpenFGA outage, and `PauseCause::ChangeStreamStalled` names a change stream that is connected but not advancing. `NonFatalError` carries only `related_to` and an untyped `detail`, so a typed signal rather than a string a client parses was the right shape. Snapshots are unaffected throughout, because they run on Postgres RLS, so an outage stops live delivery and writes while a fresh connection can still read. See `08-authorization.md`.
 
 ---
 
@@ -152,6 +152,7 @@ See `12-identity-session-capability.md` for the session model.
 ### Snapshot before updates
 
 - After a `Subscribe`, the server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames, then `SnapshotEnd(lsn)` (control).
+- **`SnapshotEnd` cannot overtake the rows it completes. Built (R33, 2026-08-09).** It shares the outbound queue with the `SnapshotPatch` frames rather than going straight to the socket, so a client whose credit window is shut receives neither until it replenishes. It still costs no credit: it waits its turn, it is not rationed. Before this it went out immediately and a backlogged client was told its snapshot was complete over an empty replica, then recorded the resume position that frame carries.
 - No frame goes out until the snapshot read has succeeded (R38). A subscription the server cannot serve draws exactly one `Error` frame, bare and byte-identical whatever the cause, so a refusal never discloses whether the name passed registration.
 - The LSN in `SnapshotEnd` is the point at which the snapshot was taken.
 - Any `LivePatch` frames with LSN > snapshot LSN that arrive after `SnapshotEnd` are applied on top.
@@ -161,9 +162,11 @@ See `12-identity-session-capability.md` for the session model.
 
 ## Flow Control
 
-The client maintains a **receive credit** budget. On connect, the server is granted an initial credit (e.g. 64 messages). Each server message consumes one credit. The client sends `Ack(n)` to replenish `n` credits after processing `n` messages.
+The client maintains a **receive credit** budget. On connect, the server is granted an initial credit (e.g. 64 messages). Each bulk frame consumes one credit, and the client sends `AckCredits(n)` to replenish `n` credits after processing `n` of them. No control frame is ever charged, so keepalive and acknowledgements cannot deadlock behind a full window.
 
-The server pauses delivery when credits reach zero and resumes when credits are replenished.
+The server pauses bulk delivery when credits reach zero and resumes when credits are replenished.
+
+**Not rationed and not ordered are separate properties, and the queue carries both. Decided (R33).** `SnapshotEnd` is the one control frame that waits in the queue: it describes rows the client has not received, so releasing it early is a statement the client would act on wrongly. Everything else on the control plane bypasses the queue entirely.
 
 This is a simple stop-and-wait variant. A sliding-window variant may be needed for high-throughput scenarios.
 

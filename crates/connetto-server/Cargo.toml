@@ -20,12 +20,23 @@ path = "src/bin/connetto-server.rs"
 
 [dependencies]
 connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging", "env"] }
-subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming"] }
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga"] }
+# The policy text this server is given is translated here, and the model it
+# produces is written to the authorization server here. subql takes the same
+# crate with default features off and re-exports none of it, so the types
+# `Shapes::new` needs have to come from a direct dependency.
+rls2fga = { workspace = true }
+# The gRPC client the change-path executor asks, and the store and model calls
+# the startup path makes. Neither subql nor rls2fga re-exports it, and both
+# take the same crates.io version, so one node resolves and the protobuf types
+# on either side of the seam cannot come from two versions.
+openfga-client = { version = "0.6.1", default-features = false }
 # Reverse translation of the client's SQLite-dialect subscription query into the
 # Postgres SQL subql parses, placeholder syntax included (? and ?N become $N).
-# Pinned to the reference-closed FK validation merge (PR #46), which sits on
-# the translation manifest (PR #45) and the read-only deny triggers (PR #44).
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
+# Tracks the branch rather than a revision, matching subql, which takes the
+# same crate that way. A revision here put two copies of it in one graph,
+# because cargo treats a rev source and a branch source as different packages.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 # `signal` is the binary's graceful shutdown: SIGINT and SIGTERM stop the
 # listener and close every live session with ServerShuttingDown.
 tokio = { workspace = true, features = ["signal"] }
@@ -99,6 +110,11 @@ subtle = "2"
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [dev-dependencies]
+# Building a change event by hand, so the store upkeep can be driven without
+# standing up a replication stream. subql re-exports `ChangeEvent` and not the
+# types its fields are made of. Routed to the same fork the root `[patch]` uses,
+# so one node resolves.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
 connetto-core = { workspace = true, features = ["test-support"] }

@@ -31,6 +31,7 @@
 //! the decisions each type reifies (indexed in `open-questions.md`).
 
 pub mod auth;
+pub mod backoff;
 pub mod codec;
 pub mod cursor;
 #[cfg(feature = "env")]
@@ -55,6 +56,7 @@ pub mod write;
 pub use auth::{
     AmbiguousIdentity, AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession,
 };
+pub use backoff::RetryPolicy;
 pub use cursor::Cursor;
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};

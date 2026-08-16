@@ -16,8 +16,8 @@ use connetto_core::{
         AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
         FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
         LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-        MutationRejectReason, NonFatalError, Ping, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, SnapshotBegin,
+        SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -127,6 +127,10 @@ fn mutation_control_frames_round_trip() {
         table: "orders".into(),
         server_row: None,
     }));
+    round_trip_control(&ControlMessage::MutationReject(MutationReject {
+        client_seq: 18,
+        reason: MutationRejectReason::Indeterminate,
+    }));
 }
 
 #[test]
@@ -223,6 +227,32 @@ fn error_control_round_trips() {
     for reason in every_fatal_reason() {
         round_trip_control(&ControlMessage::FatalError(FatalError::new(reason)));
     }
+}
+
+/// Every [`PauseCause`] value. The wildcard-free match below ensures a new
+/// variant stops this file compiling until it is listed here, and listing it
+/// is the moment to add its round-trip assertion.
+fn every_pause_cause() -> Vec<PauseCause> {
+    let causes = vec![
+        // R5b: authorization service unreachable during the change path.
+        PauseCause::AuthServiceUnreachable,
+        // R5b: change feed connected but silent (absence of events).
+        PauseCause::ChangeStreamStalled,
+    ];
+    for cause in &causes {
+        match cause {
+            PauseCause::AuthServiceUnreachable | PauseCause::ChangeStreamStalled => {}
+        }
+    }
+    causes
+}
+
+#[test]
+fn delivery_pause_round_trips() {
+    for cause in every_pause_cause() {
+        round_trip_control(&ControlMessage::DeliveryPaused { cause });
+    }
+    round_trip_control(&ControlMessage::DeliveryResumed);
 }
 
 #[test]

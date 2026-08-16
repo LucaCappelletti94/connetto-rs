@@ -25,7 +25,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use subql::backend::{Postgres, Value};
-use subql::visibility::{Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{RowWrite, Verdict, VisibilityPolicy, WriteOp};
 
 use crate::authn::token::{AuthConfig, TokenAuthority, TokenError};
 use crate::reserve::{ReaderGate, ReaderPermit};
@@ -175,6 +175,16 @@ pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 /// grants, so it names the verbs and connetto certifies exactly those. A read
 /// share names none, which is [`ShareLevel::read`].
 ///
+/// # Why creating is not among them
+///
+/// A share names a table and one row's key, and a write question is judged on
+/// the row versions its verb needs. Creating is judged on the row being
+/// created, which a mint does not hold and cannot: whatever the bearer later
+/// inserts is a different row under a different key, so a question asked now
+/// about the shared row says nothing about it. Handing the row the mint read
+/// over as the row being created asks whether the caller may create a row that
+/// already exists, which is a different question wearing the right name.
+///
 /// ```
 /// use connetto_server::ShareLevel;
 ///
@@ -184,7 +194,6 @@ pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ShareLevel {
-    insert: bool,
     update: bool,
     delete: bool,
 }
@@ -194,17 +203,9 @@ impl ShareLevel {
     #[must_use]
     pub const fn read() -> Self {
         Self {
-            insert: false,
             update: false,
             delete: false,
         }
-    }
-
-    /// Also certify creating the row.
-    #[must_use]
-    pub const fn with_insert(mut self) -> Self {
-        self.insert = true;
-        self
     }
 
     /// Also certify replacing the row's values.
@@ -224,19 +225,35 @@ impl ShareLevel {
     /// Whether this share certifies no write at all.
     #[must_use]
     pub const fn is_read_only(self) -> bool {
-        !self.insert && !self.update && !self.delete
+        !self.update && !self.delete
     }
 
-    /// The named verbs, in a fixed order, so a mint asks the same questions in
-    /// the same sequence however the caller built the level.
-    pub fn verbs(self) -> impl Iterator<Item = WriteOp> {
+    /// The named verbs as questions about `row`, in a fixed order, so a mint
+    /// asks the same questions in the same sequence however the caller built
+    /// the level.
+    ///
+    /// A mint holds one version of the row, so a replacement is asked as
+    /// [`RowWrite::UpdateUsing`], which is subql's question for exactly this
+    /// case: whether the row as it stands may be replaced at all. It is the
+    /// weaker half of the full replacement question, and it is the half a
+    /// delegated permission over a row needs.
+    fn writes<R: ?Sized>(self, row: &R) -> impl Iterator<Item = RowWrite<'_, R>> {
         [
-            (self.insert, WriteOp::Insert),
-            (self.update, WriteOp::Update),
-            (self.delete, WriteOp::Delete),
+            (self.update, RowWrite::UpdateUsing { old: row }),
+            (self.delete, RowWrite::Delete { old: row }),
         ]
         .into_iter()
-        .filter_map(|(named, op)| named.then_some(op))
+        .filter_map(|(named, write)| named.then_some(write))
+    }
+
+    /// The named verbs, in the order the mint asks them, so an
+    /// application can read back what a share certified.
+    ///
+    /// The unit stands in for a row because [`RowWrite::op`] reads the variant
+    /// and never the row, which keeps one ordered list rather than two that
+    /// can drift.
+    pub fn verbs(self) -> impl Iterator<Item = WriteOp> {
+        self.writes(&()).map(|write| write.op())
     }
 }
 
@@ -470,16 +487,16 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         // One question per verb the caller named, about the row as it stands,
         // which is the only version a mint holds. All must allow: a share must
         // not hand on a verb the sharer does not hold itself.
-        for op in level.verbs() {
+        for write in level.writes(&view) {
             let verdict = self
                 .policy
-                .may_write(&view, &watchers[0], op)
+                .may_write(write, &watchers[0])
                 .await
                 .map_err(|err| ShareError::Policy(err.to_string()))?;
             if !verdict.allowed() {
                 return Err(ShareError::NotWritable {
                     table: table.to_owned(),
-                    op,
+                    op: write.op(),
                 });
             }
         }

@@ -27,7 +27,7 @@ use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::{Postgres, Value};
-use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource};
 
 const PG_DDL: &str =
@@ -68,9 +68,8 @@ impl VisibilityPolicy for DenyId2 {
     #[allow(clippy::unused_async_trait_impl)]
     async fn may_write<R>(
         &self,
-        _row: &R,
+        _write: RowWrite<'_, R>,
         _watcher: &Self::Watcher,
-        _op: WriteOp,
     ) -> Result<Verdict, Self::Error>
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,

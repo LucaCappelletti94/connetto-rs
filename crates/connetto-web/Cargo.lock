@@ -1294,6 +1294,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rls2fga"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#61743daf1f95a5b1d236e1656ce1d4e5fa76a04f"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sql-traits",
+ "sqlparser",
+]
+
+[[package]]
 name = "rmp"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1516,7 +1527,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7f3598add255a4559d7a5b9b6c4552d01cddd980"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f903bceb33771214031f9b39cd6aa26dbe2752fa"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -1578,17 +1589,18 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bef86dd6826ea0d87143f59403b12aa3a588bd4f"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
 dependencies = [
  "log",
  "recursive",
+ "serde",
  "sqlparser_derive",
 ]
 
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bef86dd6826ea0d87143f59403b12aa3a588bd4f"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1623,7 +1635,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=c1f725a907af94d8cb5d846840e6529dd09f9426#c1f725a907af94d8cb5d846840e6529dd09f9426"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=e03786bfdf9e4c6c18d4e38e227c258f6765cf8f#e03786bfdf9e4c6c18d4e38e227c258f6765cf8f"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -1636,6 +1648,7 @@ dependencies = [
  "lz4",
  "pg_walstream",
  "postcard",
+ "rls2fga",
  "roaring",
  "seahash",
  "serde",

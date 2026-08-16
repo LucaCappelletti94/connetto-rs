@@ -77,6 +77,14 @@ pub enum MutationRejectReason {
         /// Human-readable detail.
         detail: String,
     },
+    /// The authorization service was unreachable when the server checked
+    /// whether this caller may write.
+    ///
+    /// Reusing `Unauthorized` here would be a data-loss bug: a client that
+    /// receives `Unauthorized` stops retrying and may discard the mutation,
+    /// turning a transient outage into permanent loss. A client that receives
+    /// `Indeterminate` MUST retry rather than retire its pending record.
+    Indeterminate,
 }
 
 /// Server rejects a mutation without applying it.

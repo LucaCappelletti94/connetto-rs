@@ -40,7 +40,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl as AsyncRunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres as PgValues, Value};
 use subql::testing::TestEvent;
-use subql::visibility::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy, WriteOp};
 use subql::{ParserDB, catalog_helpers};
 
 /// The catalog both the read filter and the snapshot encoder parse. Table DDL
@@ -543,14 +543,13 @@ impl VisibilityPolicy for ReadOnlyPolicy {
     #[allow(clippy::unused_async_trait_impl)]
     async fn may_write<R>(
         &self,
-        _row: &R,
+        write: RowWrite<'_, R>,
         _watcher: &Self::Watcher,
-        op: WriteOp,
     ) -> Result<Verdict, Self::Error>
     where
         R: RowView<Backend = PgValues> + Sync + ?Sized,
     {
-        Ok(if op == self.refuses {
+        Ok(if write.op() == self.refuses {
             Verdict::Deny
         } else {
             Verdict::Allow
@@ -628,8 +627,10 @@ async fn a_caller_who_may_read_but_not_write_is_refused_a_write_share() {
 
 #[tokio::test]
 async fn a_caller_who_may_do_both_gets_both_and_the_reply_says_which() {
-    // Nothing is refused, so this is the positive half: a level the policy
-    // allows is certified in full.
+    // Nothing a share can name is refused here, so this is the positive half:
+    // a level the policy allows is certified in full. Creating is the refusal
+    // precisely because a share cannot name it, so it never reaches the
+    // policy.
     let issuer = issuer_over(ReadOnlyPolicy {
         refuses: WriteOp::Insert,
     });
@@ -646,18 +647,20 @@ async fn a_caller_who_may_do_both_gets_both_and_the_reply_says_which() {
     );
     assert!(!share.level.is_read_only());
 
-    // Creating is what this policy refuses, which keeps the positive half
-    // honest: the same issuer can still say no.
-    issuer
-        .issue(
-            &caller,
-            "papers",
-            &[],
-            ShareLevel::read().with_insert(),
-            None,
-        )
-        .await
-        .expect_err("the one refused verb is still refused");
+    // The same shape of issuer can still say no, which keeps the positive half
+    // honest.
+    issuer_over(ReadOnlyPolicy {
+        refuses: WriteOp::Delete,
+    })
+    .issue(
+        &caller,
+        "papers",
+        &[],
+        ShareLevel::read().with_delete(),
+        None,
+    )
+    .await
+    .expect_err("a refused verb is still refused");
 }
 
 #[tokio::test]

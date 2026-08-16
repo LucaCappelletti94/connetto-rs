@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use connetto_core::auth::Principal;
 use subql::backend::Postgres;
-use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 /// A permissive policy that grants every read and write.
 ///
@@ -44,9 +44,8 @@ impl VisibilityPolicy for PermissiveAuth {
     #[allow(clippy::unused_async_trait_impl)]
     async fn may_write<R>(
         &self,
-        _row: &R,
+        _write: RowWrite<'_, R>,
         _watcher: &Self::Watcher,
-        _op: WriteOp,
     ) -> Result<Verdict, Infallible>
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,
@@ -70,7 +69,7 @@ mod rls {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::Postgres;
-    use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+    use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use subql::{DatabaseLike, ParserDB, TableLike};
 
     use crate::capability::{CallerBinding, CapabilityKey};
@@ -287,9 +286,8 @@ mod rls {
         #[allow(clippy::unused_async_trait_impl)]
         async fn may_write<R>(
             &self,
-            _row: &R,
+            _write: RowWrite<'_, R>,
             _watcher: &Self::Watcher,
-            _op: WriteOp,
         ) -> Result<Verdict, RlsAuthError>
         where
             R: RowView<Backend = Postgres> + Sync + ?Sized,

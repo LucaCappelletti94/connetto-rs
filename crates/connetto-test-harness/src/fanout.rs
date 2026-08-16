@@ -21,22 +21,159 @@ use std::time::{Duration, Instant};
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::counters::{self, CountersSnapshot};
-use connetto_server::{PgSnapshotSource, RlsAuth, SessionConfig};
+use connetto_server::openfga::{
+    Counted, FgaAuth, ModelSubject, StoreUpkeep, SubjectNaming, Translated,
+};
+use connetto_server::parity::ParityAuth;
+use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
+use openfga_client::client::OpenFgaServiceClient;
+use subql::backend::Postgres;
+use subql::visibility::openfga::OpenFgaPolicy;
 
 use crate::{
-    Client, Fixture, HarnessAuth, PUBLICATION, Server, ServerConfig, drop_slot, pool_for,
-    spawn_server, with_user,
+    Client, Fixture, HarnessAuth, PUBLICATION, Server, ServerConfig, drop_slot, fga_store,
+    pool_for, spawn_server, with_user,
 };
 
 /// The one-table catalog the fan-out fixture serves.
-pub const FANOUT_PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
+///
+/// It carries an owner column because the executor under measurement answers
+/// from the row's own values, and a table with no policy would leave nothing to
+/// answer and nothing to count.
+pub const FANOUT_PG_DDL: &str =
+    "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, label TEXT);";
+/// The policy every connetto table carries: the caller's identity, or a key the
+/// caller holds.
+///
+/// **The measurement depends on this being the shape deployments write**, not a
+/// shape chosen to make the number look good. Both arms are read from the
+/// changed row, so no watcher costs a round trip, and the counter test asserts
+/// exactly zero rather than merely flat.
+pub const FANOUT_PG_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY items_p ON items FOR ALL USING (
+  owner = current_setting('app.user_id', true)
+  OR owner = ANY(string_to_array(current_setting('app.subjects', true), ','))
+);";
 /// Every subscriber registers this query, so every event matches every one.
 const QUERY: &str = "SELECT * FROM items WHERE id > 0";
-/// The non-superuser role the snapshot source and the RLS read checks run as.
+/// The non-superuser role the snapshot source and the read checks run as.
 const READER: &str = "r0_reader";
+/// The identity every subscriber authenticates as, and the owner of every row
+/// written.
+///
+/// One identity rather than one per subscriber, so every subscriber may see
+/// every row and the per-event delivery counts stay exactly what they were
+/// before the policy existed. Distinct identities would change what is
+/// delivered as well as what is asked, and the run would measure two things at
+/// once.
+const OWNER: &str = "fanout-owner";
+/// The team every row belongs to under [`PolicyShape::CrossTable`].
+const TEAM: i32 = 1;
+
+/// Which policy the fixture serves, and so which half of the criterion the run
+/// measures.
+///
+/// Two shapes rather than one, because the phase claims two different things
+/// and a single fixture can only ever defend one of them. Choosing the shape at
+/// the call site keeps everything else about the run identical, so a difference
+/// in the counters is a difference in the policy and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyShape {
+    /// What every connetto table carries: the caller's identity, or a key the
+    /// caller holds. Both arms are read from the changed row, so nothing is
+    /// asked of the service.
+    Row,
+    /// A policy that has to look in another table, which one row never settles,
+    /// so every watcher becomes a question.
+    CrossTable,
+}
+
+impl PolicyShape {
+    /// The statements that create this shape's tables and policy.
+    fn setup(self) -> Vec<String> {
+        match self {
+            Self::Row => vec![
+                "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, label TEXT)".into(),
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY".into(),
+                "CREATE POLICY items_p ON items FOR ALL USING (\
+                   owner = current_setting('app.user_id', true) \
+                   OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))"
+                    .into(),
+            ],
+            Self::CrossTable => vec![
+                "CREATE TABLE teams (id INT PRIMARY KEY)".into(),
+                format!("INSERT INTO teams (id) VALUES ({TEAM})"),
+                "CREATE TABLE team_members (team_id INT REFERENCES teams(id), \
+                   member TEXT NOT NULL, PRIMARY KEY (team_id, member))"
+                    .into(),
+                format!("INSERT INTO team_members (team_id, member) VALUES ({TEAM}, '{OWNER}')"),
+                "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, \
+                   team_id INT NOT NULL REFERENCES teams(id), label TEXT)"
+                    .into(),
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY".into(),
+                "CREATE POLICY items_p ON items FOR SELECT USING (\
+                   EXISTS (SELECT 1 FROM team_members \
+                           WHERE team_members.team_id = items.team_id \
+                             AND team_members.member = current_setting('app.user_id', true)))"
+                    .into(),
+            ],
+        }
+    }
+
+    /// The catalog the materializer and the snapshot source parse.
+    fn ddl(self) -> &'static str {
+        match self {
+            Self::Row => FANOUT_PG_DDL,
+            Self::CrossTable => CROSS_TABLE_PG_DDL,
+        }
+    }
+
+    /// The policy document the translator reads.
+    fn policies(self) -> &'static str {
+        match self {
+            Self::Row => FANOUT_PG_POLICIES,
+            Self::CrossTable => CROSS_TABLE_PG_POLICIES,
+        }
+    }
+
+    /// One row, written so this shape's policy grants every subscriber.
+    fn insert(self, n: u64) -> String {
+        match self {
+            Self::Row => {
+                format!("INSERT INTO items (id, owner, label) VALUES ({n}, '{OWNER}', 'row-{n}')")
+            }
+            Self::CrossTable => format!(
+                "INSERT INTO items (id, owner, team_id, label) \
+                 VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}')"
+            ),
+        }
+    }
+
+    /// The tables the publication carries.
+    fn published(self) -> &'static [&'static str] {
+        match self {
+            Self::Row => &["items"],
+            Self::CrossTable => &["items", "team_members"],
+        }
+    }
+}
+
+/// The catalog the cross-table shape serves.
+pub const CROSS_TABLE_PG_DDL: &str = "CREATE TABLE teams (id INT PRIMARY KEY);
+CREATE TABLE team_members (team_id INT REFERENCES teams(id), member TEXT NOT NULL, PRIMARY KEY (team_id, member));
+CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, team_id INT NOT NULL REFERENCES teams(id), label TEXT);";
+
+/// The cross-table policy: membership of the row's team, which is not in the
+/// row.
+pub const CROSS_TABLE_PG_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY items_p ON items FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = items.team_id
+            AND team_members.member = current_setting('app.user_id', true))
+);";
 /// How long one live patch may take to arrive before the run is declared hung.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to let routes settle after the last snapshot. The route is
@@ -79,16 +216,44 @@ pub struct FanoutRun {
 /// patch, and return the counter deltas bracketing exactly the
 /// write-and-deliver window. Tears the replication state down afterwards so
 /// the next run starts clean under the same [`Fixture`].
-pub async fn fanout_run(fixture: &Fixture, subscribers: u64, events: u64) -> FanoutRun {
-    let server = provision(fixture).await;
+pub async fn fanout_run(
+    fixture: &Fixture,
+    subscribers: u64,
+    events: u64,
+    shape: PolicyShape,
+) -> FanoutRun {
+    run_through(fixture, subscribers, events, shape, Executor::Shipped).await
+}
+
+/// The same run with both executors answering every question, delivering on the
+/// shipped one.
+///
+/// Its own entry point rather than a flag on the one above, because a parity
+/// run asks Postgres once per watcher per event and so cannot also be the run
+/// that asserts those round trips are gone.
+pub async fn fanout_parity_run(
+    fixture: &Fixture,
+    subscribers: u64,
+    events: u64,
+    shape: PolicyShape,
+) -> FanoutRun {
+    run_through(fixture, subscribers, events, shape, Executor::Both).await
+}
+
+async fn run_through(
+    fixture: &Fixture,
+    subscribers: u64,
+    events: u64,
+    shape: PolicyShape,
+    executor: Executor,
+) -> FanoutRun {
+    let server = provision_with(fixture, shape, executor).await;
     let mut clients = connect_subscribers(&server, subscribers).await;
     tokio::time::sleep(ROUTE_SETTLE).await;
 
     let before = counters::snapshot();
     for n in 1..=events {
-        fixture
-            .exec(&format!("INSERT INTO items VALUES ({n}, 'row-{n}')"))
-            .await;
+        fixture.exec(&shape.insert(n)).await;
     }
     // The dispatch loop delivers subscribers in order per event, so once the
     // last client holds its last patch, every counted operation has happened.
@@ -232,7 +397,7 @@ impl fmt::Display for LoadRun {
 /// allowance and queues the rest, and the run would report the rate at which
 /// frames pile up in memory instead of the rate at which they arrive.
 pub async fn fanout_load(fixture: &Fixture, subscribers: u64, duration: Duration) -> LoadRun {
-    let server = provision(fixture).await;
+    let server = provision(fixture, PolicyShape::Row).await;
     let clients = connect_subscribers(&server, subscribers).await;
     tokio::time::sleep(ROUTE_SETTLE).await;
 
@@ -289,38 +454,152 @@ pub async fn fanout_load(fixture: &Fixture, subscribers: u64, duration: Duration
     }
 }
 
-/// Provision the table, reader role, publication and slot, and start a server
-/// reading and authorizing through that reader role.
-async fn provision(fixture: &Fixture) -> Server {
+/// Provision the table, its policy, the reader role, the publication and the
+/// slot, put the rules and facts on the authorization service, and start a
+/// server answering through the executor the shipped binary answers through.
+/// Provision the row-shaped fixture and serve it behind a flag a test lowers
+/// to stage an authorization-service outage.
+///
+/// The flag starts up. Lowering it makes every question fail the way an
+/// unreachable service makes it fail, so what a test drives through it is
+/// connetto's response rather than the service's failure mode.
+pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
+    let reachable = Arc::new(AtomicBool::new(true));
+    let server = provision_with(
+        fixture,
+        PolicyShape::Row,
+        Executor::Reachable(Arc::clone(&reachable)),
+    )
+    .await;
+    (server, reachable)
+}
+
+async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
+    provision_with(fixture, shape, Executor::Shipped).await
+}
+
+/// Which executor a run serves through.
+///
+/// Separate runs rather than one, because the two measure different things and
+/// mixing them makes each number mean less. A parity run asks Postgres once per
+/// watcher per event, which is exactly the cost the counter runs exist to
+/// assert is gone, so a parity run cannot also be a counter run.
+#[derive(Debug, Clone)]
+enum Executor {
+    /// The shipped one alone, which is what the counters measure.
+    Shipped,
+    /// Both, delivering on the shipped one, which is what parity measures.
+    Both,
+    /// The shipped one behind a flag a test lowers, for an outage run.
+    Reachable(Arc<AtomicBool>),
+}
+
+async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executor) -> Server {
     // A prior suite in the same full run may have left the shared publication
     // behind (Fixture::acquire only cleans the slot), so drop it first.
     fixture
         .exec(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
         .await;
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS items CASCADE",
-            "CREATE TABLE items (id INT PRIMARY KEY, label TEXT)",
-            "ALTER TABLE items REPLICA IDENTITY FULL",
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'r0_reader') \
-             THEN CREATE ROLE r0_reader LOGIN PASSWORD 'r0_reader'; END IF; END $$",
-            "GRANT USAGE ON SCHEMA public TO r0_reader",
-            "GRANT SELECT ON items TO r0_reader",
-        ])
-        .await;
-    fixture.start_replication(&["items"]).await;
+    let mut statements: Vec<String> = vec![
+        "DROP TABLE IF EXISTS items CASCADE".into(),
+        "DROP TABLE IF EXISTS team_members CASCADE".into(),
+        "DROP TABLE IF EXISTS teams CASCADE".into(),
+    ];
+    statements.extend(shape.setup());
+    statements.push("ALTER TABLE items REPLICA IDENTITY FULL".into());
+    statements.push(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'r0_reader') \
+         THEN CREATE ROLE r0_reader LOGIN PASSWORD 'r0_reader'; END IF; END $$"
+            .into(),
+    );
+    statements.push("GRANT USAGE ON SCHEMA public TO r0_reader".into());
+    statements.push("GRANT SELECT ON ALL TABLES IN SCHEMA public TO r0_reader".into());
+    // A row before the store is loaded, so the facts the service answers from
+    // exist by the time a subscriber asks.
+    statements.push(shape.insert(0));
+    let borrowed: Vec<&str> = statements.iter().map(String::as_str).collect();
+    fixture.setup(&borrowed).await;
+    fixture.start_replication(shape.published()).await;
 
     let reader_pool = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
     let snapshot =
-        PgSnapshotSource::from_ddl(reader_pool.clone(), FANOUT_PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(reader_pool, FANOUT_PG_DDL).expect("rls auth"));
-    spawn_server(
-        ServerConfig::new(FANOUT_PG_DDL, fixture.admin_url()),
+        PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl()).expect("snapshot source");
+    let (fga, upkeep) = fga_auth(fixture, shape).await;
+    let auth = match executor {
+        Executor::Shipped => HarnessAuth::fga(fga),
+        Executor::Both => HarnessAuth::parity(ParityAuth::new(
+            fga,
+            RlsAuth::from_ddl(reader_pool.clone(), shape.ddl()).expect("second opinion"),
+        )),
+        // An outage run stages the service going away, so a second opinion that
+        // keeps answering would report a disagreement on every held event. It
+        // is the one run that compares nothing.
+        Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga),
+    };
+    let server = spawn_server(
+        ServerConfig::new(shape.ddl(), fixture.admin_url())
+            .with_writable(RuntimeWritableCatalog::builder().writable("items").build()),
         snapshot,
         auth,
         fixture.admin().clone(),
         fixture.admin().clone(),
+    );
+    server.install_store_upkeep(upkeep);
+    server
+}
+
+/// Translate the fixture's policy, put it on the service with the facts behind
+/// it, and compose the executor the counters are read around.
+async fn fga_auth(
+    fixture: &Fixture,
+    shape: PolicyShape,
+) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>) {
+    let (channel, store) = fga_store().await;
+    let translated = Translated::of::<String>(
+        shape.ddl(),
+        shape.policies(),
+        connetto_server::capability::DEFAULT_USER_SETTING,
     )
+    .expect("the fixture's policy is one rls2fga classifies");
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the service accepted the rules");
+    let records = translated
+        .load_records(fixture.admin())
+        .await
+        .expect("the generated queries ran");
+
+    let (shapes, translator) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        Arc::clone(&shapes),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned())
+    .write_records(&records)
+    .await
+    .expect("the facts loaded");
+
+    // The questions go through the counted transport and the setup above does
+    // not, so the counter reads change-path round trips alone.
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
+    // The store follows the change stream here exactly as it does in the
+    // binary, so a row written after the load reaches the service before it
+    // reaches a subscriber. Without it a cross-table policy would answer every
+    // new row from facts that were never written.
+    let upkeep = auth.upkeep(translator, fixture.admin().clone());
+    (auth, upkeep)
 }
 
 /// Connect `subscribers` clients, each with one subscription over the whole
@@ -330,7 +609,14 @@ async fn connect_subscribers(server: &Server, subscribers: u64) -> Vec<Client> {
     let mut clients = Vec::with_capacity(capacity);
     for i in 0..subscribers {
         let mut client = server.connect();
-        client.handshake(&format!("sub-{i}")).await;
+        // One identity for every subscriber, so the policy grants each of them
+        // every row and the delivery counts stay what they were before it
+        // existed. The run suffix is what keeps them apart: the durable session
+        // handle is hashed from the whole grant, so without it every connection
+        // would supersede the last and only one subscriber would survive.
+        client
+            .handshake_with(&format!("sub-{i}"), &format!("user:{OWNER}#{i}"))
+            .await;
         client.subscribe("fanout", QUERY).await;
         client.expect_snapshot("fanout").await;
         clients.push(client);
@@ -384,11 +670,7 @@ async fn write_rows(pool: Pool<AsyncPgConnection>, written: Arc<AtomicU64>, stop
     let mut row: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         row += 1;
-        run(
-            &mut conn,
-            format!("INSERT INTO items VALUES ({row}, 'row-{row}')"),
-        )
-        .await;
+        run(&mut conn, PolicyShape::Row.insert(row)).await;
         written.fetch_add(1, Ordering::Relaxed);
     }
 }

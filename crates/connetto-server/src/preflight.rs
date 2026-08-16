@@ -10,6 +10,7 @@
 //! One entry point rather than a check per caller, so a later requirement is a
 //! variant and a list entry instead of a seventh hand-rolled refusal.
 
+use diesel::prelude::*;
 use diesel::sql_types::{Bool, Text};
 use diesel::{QueryableByName, sql_query};
 use diesel_async::AsyncPgConnection;
@@ -25,6 +26,19 @@ pub enum Artifact<'a> {
     Publication(&'a str),
     /// A table, by name, resolved through the connection's own `search_path`.
     Table(&'a str),
+    /// A table the change stream must carry, by publication and table name.
+    ///
+    /// Distinct from [`Table`](Self::Table), which asks only whether the table
+    /// exists. A policy reading a table the publication leaves out learns
+    /// nothing when a grant is given or taken away, so the store goes stale
+    /// and then answers confidently and wrongly, which is silent rather than
+    /// loud.
+    PublishedTable {
+        /// The publication the change stream reads.
+        publication: &'a str,
+        /// The table a policy reads and the publication must carry.
+        table: &'a str,
+    },
 }
 
 impl Artifact<'_> {
@@ -34,6 +48,7 @@ impl Artifact<'_> {
             Self::ReplicationSlot(_) => "replication slot",
             Self::Publication(_) => "publication",
             Self::Table(_) => "table",
+            Self::PublishedTable { .. } => "replicated table",
         }
     }
 
@@ -41,10 +56,11 @@ impl Artifact<'_> {
     const fn name(&self) -> &str {
         match self {
             Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
+            Self::PublishedTable { table, .. } => table,
         }
     }
 
-    /// A statement returning one boolean row: whether this exists.
+    /// Whether this exists, on `conn`.
     ///
     /// The name is bound rather than interpolated in every case, including the
     /// table, where `to_regclass` takes it as text and so needs no identifier
@@ -60,8 +76,22 @@ impl Artifact<'_> {
     ///
     /// Not checked: that the slot's output plugin is `pgoutput`. A slot on the
     /// wrong plugin fails at stream time rather than here.
-    const fn probe(&self) -> &'static str {
-        match self {
+    ///
+    /// The three catalog probes are raw statements because they read
+    /// `pg_catalog` views that exist to be queried this way, and each binds
+    /// only its own name. The publication membership check needs two binds and
+    /// gets a modelled view instead.
+    async fn exists(&self, conn: &mut AsyncPgConnection) -> Result<bool, diesel::result::Error> {
+        let probe = match self {
+            Self::PublishedTable { publication, table } => {
+                return diesel::select(diesel::dsl::exists(
+                    pg_publication_tables::table
+                        .filter(pg_publication_tables::pubname.eq(publication))
+                        .filter(pg_publication_tables::tablename.eq(table)),
+                ))
+                .get_result(conn)
+                .await;
+            }
             Self::ReplicationSlot(_) => {
                 "SELECT EXISTS (SELECT 1 FROM pg_replication_slots \
                  WHERE slot_name = $1 AND database = current_database()) AS present"
@@ -70,7 +100,26 @@ impl Artifact<'_> {
                 "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1) AS present"
             }
             Self::Table(_) => "SELECT to_regclass($1) IS NOT NULL AS present",
-        }
+        };
+        let rows: Vec<Present> = sql_query(probe)
+            .bind::<Text, _>(self.name())
+            .load(conn)
+            .await?;
+        Ok(rows.into_iter().next().is_some_and(|row| row.present))
+    }
+}
+
+diesel::table! {
+    /// The catalog view naming which tables a publication carries.
+    ///
+    /// A view rather than a table, and read-only, so only the two columns this
+    /// check reads are modelled. `pubname` is the key diesel needs and is not
+    /// unique here, which costs nothing: nothing loads a row, only `EXISTS`.
+    pg_publication_tables (pubname) {
+        /// The publication's name.
+        pubname -> Text,
+        /// One table it carries, unqualified.
+        tablename -> Text,
     }
 }
 
@@ -129,16 +178,15 @@ pub async fn require(
         .await
         .map_err(|err| PreflightError::Pool(err.to_string()))?;
     for artifact in artifacts {
-        let rows: Vec<Present> = sql_query(artifact.probe())
-            .bind::<Text, _>(artifact.name())
-            .load(&mut *conn)
+        let present = artifact
+            .exists(&mut conn)
             .await
             .map_err(|source| PreflightError::Probe {
                 noun: artifact.noun(),
                 name: artifact.name().to_owned(),
                 source,
             })?;
-        if !rows.into_iter().next().is_some_and(|row| row.present) {
+        if !present {
             return Err(PreflightError::Missing {
                 noun: artifact.noun(),
                 name: artifact.name().to_owned(),

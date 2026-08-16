@@ -207,7 +207,7 @@ mod tests {
         let principal: Principal = Principal::unidentified(handle(1));
         assert_eq!(principal.session_id(), handle(1));
         assert!(principal.identity().is_none());
-        assert!(principal.capabilities().is_empty());
+        assert_eq!(principal.capabilities(), []);
     }
 
     #[test]

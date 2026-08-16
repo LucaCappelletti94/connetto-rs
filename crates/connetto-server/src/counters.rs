@@ -54,6 +54,19 @@ pub static FANOUT_ROUTE_CLONES: AtomicU64 = AtomicU64::new(0);
 /// a counter on the call would read 1 and hide the round trips R5b removes.
 pub static AUTHORIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Rows the two executors disagreed about, one per watcher per changed row.
+///
+/// **Zero is the only acceptable reading and every Docker-backed suite asserts
+/// it.** One policy source compiles to two executors, and nothing else in this
+/// tree can notice them drifting apart: the snapshot answers from row-level
+/// security and the change path answers from the model, so a divergence shows
+/// up to a client as a row that is there and then is not. A count above zero
+/// is that, caught before anybody sees it.
+///
+/// Only [`ParityAuth`](crate::parity::ParityAuth) moves it, and only for the
+/// questions row-level security can actually answer.
+pub static VISIBILITY_DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
+
 /// Increment `counter` by `n`, relaxed.
 #[inline]
 pub fn add(counter: &AtomicU64, n: u64) {
@@ -104,6 +117,8 @@ pub struct CountersSnapshot {
     pub fanout_route_clones: u64,
     /// [`AUTHORIZATION_CALLS`] at the reading.
     pub authorization_calls: u64,
+    /// [`VISIBILITY_DISAGREEMENTS`] at the reading.
+    pub visibility_disagreements: u64,
 }
 
 impl CountersSnapshot {
@@ -117,6 +132,8 @@ impl CountersSnapshot {
             fanout_payload_bytes: self.fanout_payload_bytes - earlier.fanout_payload_bytes,
             fanout_route_clones: self.fanout_route_clones - earlier.fanout_route_clones,
             authorization_calls: self.authorization_calls - earlier.authorization_calls,
+            visibility_disagreements: self.visibility_disagreements
+                - earlier.visibility_disagreements,
         }
     }
 }
@@ -130,6 +147,7 @@ pub fn snapshot() -> CountersSnapshot {
         fanout_payload_bytes: FANOUT_PAYLOAD_BYTES.load(Ordering::Relaxed),
         fanout_route_clones: FANOUT_ROUTE_CLONES.load(Ordering::Relaxed),
         authorization_calls: AUTHORIZATION_CALLS.load(Ordering::Relaxed),
+        visibility_disagreements: VISIBILITY_DISAGREEMENTS.load(Ordering::Relaxed),
     }
 }
 

@@ -1,19 +1,28 @@
-//! R0 part A acceptance: the fan-out scaling defect, stated executably.
+//! R5b acceptance: the change path asks the authorization service nothing.
 //!
-//! Two runs an order of magnitude apart in subscriber count, and per-event
-//! dispatch work is asserted to GROW with that count: one authorization round
-//! trip, one route clone, one materializer lock take, and one full payload
-//! copy per subscriber per event. These assertions pin today's defect rather
-//! than a target. R5b's acceptance criterion is flipping them to their
-//! negation (per-event work independent of subscriber count), so this file is
-//! where that flip lands.
+//! Two runs an order of magnitude apart in subscriber count. **The
+//! authorization counter must read exactly zero in both**, which is stronger
+//! than the "does not grow" the phase originally promised, and it is what
+//! connetto's own policy shape earns: the caller's identity and the keys the
+//! caller holds are both read from the changed row, so no watcher costs a round
+//! trip at any audience size.
+//!
+//! **This file used to assert the opposite** and pinned the defect R5b existed
+//! to remove: one Postgres round trip per subscriber per event. The three other
+//! assertions are unchanged and still pin costs that do grow, because they are
+//! R14's to remove and not this phase's.
+//!
+//! What the counter does not claim: that no policy ever costs a round trip. A
+//! policy that reads another table is delegated and is linear in the watchers
+//! the row does not settle, divided by the batch cap. That case is asserted in
+//! `fanout_delegated.rs`, so neither half can quietly become the other.
 //!
 //! `#[ignore]` by default: it needs a Postgres started with
-//! `wal_level=logical`. Run under Docker with `DATABASE_URL` pointed at it and
-//! `-- --ignored`.
+//! `wal_level=logical` and an `OpenFGA` server. Run under Docker with
+//! `DATABASE_URL` and `CONNETTO_TEST_FGA_URL` pointed at them and `-- --ignored`.
 
 use connetto_test_harness::Fixture;
-use connetto_test_harness::fanout::fanout_run;
+use connetto_test_harness::fanout::{PolicyShape, fanout_run};
 
 /// The small run's subscriber count.
 const SMALL: u64 = 10;
@@ -23,23 +32,22 @@ const LARGE: u64 = 100;
 const EVENTS: u64 = 5;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
-async fn per_event_dispatch_work_grows_with_subscriber_count() {
+#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
+async fn the_change_path_asks_the_service_nothing_whatever_the_audience() {
     let fixture = Fixture::acquire().await;
-    let small = fanout_run(&fixture, SMALL, EVENTS).await;
-    let large = fanout_run(&fixture, LARGE, EVENTS).await;
+    let small = fanout_run(&fixture, SMALL, EVENTS, PolicyShape::Row).await;
+    let large = fanout_run(&fixture, LARGE, EVENTS, PolicyShape::Row).await;
 
-    // One authorization round trip per subscriber per event, exactly: the
-    // whole cost R5b exists to remove from the change path.
+    // Zero, not merely flat. Both arms of the policy are read from the changed
+    // row, so the service is never asked, and a single call here would mean a
+    // relation stopped being decidable from one row.
     assert_eq!(
-        small.counters.authorization_calls,
-        SMALL * EVENTS,
-        "authorization calls at {SMALL} subscribers"
+        small.counters.authorization_calls, 0,
+        "authorization round trips at {SMALL} subscribers"
     );
     assert_eq!(
-        large.counters.authorization_calls,
-        LARGE * EVENTS,
-        "authorization calls at {LARGE} subscribers"
+        large.counters.authorization_calls, 0,
+        "authorization round trips at {LARGE} subscribers"
     );
 
     // One Route clone per subscriber per event, exactly.

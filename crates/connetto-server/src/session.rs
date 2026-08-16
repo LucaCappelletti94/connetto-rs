@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,14 +29,14 @@ use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
+    NonFatalError, PauseCause, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
     SnapshotPatch, Subscribe,
 };
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, SessionId};
+use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
-use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
+use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{AggAccumulator, CdcSource, ChangeEvent, ParserDB, PgLsn, SubscriptionId};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -45,8 +46,8 @@ use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::guard::RequestGuard;
 use crate::materializer::{
-    DeltaAggregateCapture, Materializer, MaterializerError, Registration, SqliteRegistration,
-    agg_value_to_json, compress, value_to_json,
+    DeltaAggregateCapture, Materializer, MaterializerError, PlannedWrite, Registration,
+    SqliteRegistration, agg_value_to_json, compress, value_to_json,
 };
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::reserve::ReaderPermit;
@@ -163,13 +164,8 @@ impl SessionConfig {
 /// stream fails, resuming from the replication slot's confirmed position.
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
-    /// Backoff before the first retry.
-    initial_backoff: Duration,
-    /// Ceiling for the exponential backoff.
-    max_backoff: Duration,
-    /// Give up after this many consecutive failed attempts. `None` retries
-    /// forever, which is what a long-running server wants.
-    max_attempts: Option<u32>,
+    /// Shared exponential backoff parameters.
+    retry: connetto_core::RetryPolicy,
     /// A connection that stayed up at least this long is treated as healthy, so
     /// the backoff resets after it drops.
     healthy_after: Duration,
@@ -178,16 +174,15 @@ pub struct ReconnectPolicy {
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
-            initial_backoff: Duration::from_millis(200),
-            max_backoff: Duration::from_secs(30),
-            max_attempts: None,
+            retry: connetto_core::RetryPolicy::new().with_max_backoff(Duration::from_secs(30)),
             healthy_after: Duration::from_secs(10),
         }
     }
 }
 
 impl ReconnectPolicy {
-    /// Returns the defaults.
+    /// Returns the defaults: 200 ms initial backoff, 30 s ceiling, retry forever,
+    /// 10 s healthy threshold.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -195,22 +190,22 @@ impl ReconnectPolicy {
 
     /// Sets the backoff before the first retry.
     #[must_use]
-    pub const fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
-        self.initial_backoff = initial_backoff;
+    pub fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.retry = self.retry.with_initial_backoff(initial_backoff);
         self
     }
 
     /// Sets the ceiling for the exponential backoff.
     #[must_use]
-    pub const fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
-        self.max_backoff = max_backoff;
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.retry = self.retry.with_max_backoff(max_backoff);
         self
     }
 
     /// Sets the attempt limit. `None` retries forever.
     #[must_use]
-    pub const fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
-        self.max_attempts = max_attempts;
+    pub fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.retry = self.retry.with_max_attempts(max_attempts);
         self
     }
 
@@ -221,16 +216,16 @@ impl ReconnectPolicy {
         self
     }
 
-    /// Backoff before the `attempt`-th retry (1-based): exponential from
-    /// `initial_backoff`, capped at `max_backoff`.
+    /// Attempt limit. `None` retries forever.
+    #[must_use]
+    pub fn max_attempts(&self) -> Option<u32> {
+        self.retry.max_attempts()
+    }
+
+    /// Backoff before the `attempt`-th retry (1-based), delegating to
+    /// [`RetryPolicy::backoff`](connetto_core::RetryPolicy::backoff).
     fn backoff(&self, attempt: u32) -> Duration {
-        let factor = 2u128.saturating_pow(attempt.saturating_sub(1));
-        let millis = self
-            .initial_backoff
-            .as_millis()
-            .saturating_mul(factor)
-            .min(self.max_backoff.as_millis());
-        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+        self.retry.backoff(attempt)
     }
 }
 
@@ -255,6 +250,33 @@ pub enum ReconnectEvent<'a> {
         /// The last failure.
         error: &'a str,
     },
+    /// The authorization service was unreachable for one event, so the ingest
+    /// loop retries after `backoff` without reconnecting the change stream.
+    AuthRetrying {
+        /// Consecutive failed-attempt count (1-based) for this event.
+        attempt: u32,
+        /// Delay before the next authorization attempt.
+        backoff: Duration,
+        /// The error from the authorization service.
+        error: &'a str,
+    },
+}
+
+/// What the write question answered for a whole mutation.
+///
+/// Three answers rather than a boolean, because a refusal and a failure to
+/// reach an answer reach the client as different reasons. Telling a client it
+/// lacks permission when the truth is that the server cannot tell makes it stop
+/// retrying and possibly discard the write, which turns a transient outage into
+/// permanent loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteVerdict {
+    /// Every op is allowed.
+    Allowed,
+    /// The policy refused one.
+    Denied,
+    /// The policy could not be reached, so no answer exists yet.
+    Undetermined,
 }
 
 /// Failure surfaced by the session layer.
@@ -289,6 +311,11 @@ pub enum SessionError {
     /// The resume credential could not be minted.
     #[error("resume credential: {0}")]
     Handle(String),
+    /// The authorization service was unreachable while answering a visibility
+    /// question. The ingest loop retries the same event rather than advancing
+    /// past it.
+    #[error("auth service unreachable: {0}")]
+    AuthUnavailable(String),
 }
 
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
@@ -357,6 +384,10 @@ enum Outbound {
     /// End the session without sending anything. A ban tells the caller
     /// nothing, so it draws no frame and no reason.
     Drop,
+    /// A non-fatal control frame delivered immediately, bypassing the bulk
+    /// queue. Used for session-wide notifications such as delivery paused or
+    /// resumed.
+    Control(ControlMessage),
 }
 
 /// Route from a `subql` consumer id back to the owning session's outbound
@@ -554,6 +585,19 @@ pub struct SessionManager<
     /// Every counter connetto keeps about a caller, shared with the auth
     /// service so the four abuse signals are defined once each.
     guard: Arc<RequestGuard<Id>>,
+    /// Backoff for the authorization-service unreachable path on the change
+    /// pipeline. When `may_see` or `may_write` returns an error, the ingest
+    /// loop retries the same event using this schedule before moving on.
+    auth_retry: RetryPolicy,
+    /// Brings the authorization store level with each changed row before that
+    /// row reaches anybody.
+    ///
+    /// Optional because most policies keep no store: row-level security reads
+    /// the live table and has nothing to maintain. A manager that holds one
+    /// waits for it, because a patch delivered before the store catches up is
+    /// answered from facts the change already invalidated, and in the allow
+    /// direction no later correction takes the row back.
+    upkeep: OnceLock<Arc<dyn crate::openfga::StoreUpkeep>>,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -675,6 +719,8 @@ where
             next_consumer: AtomicU64::new(1),
             config,
             guard,
+            auth_retry: RetryPolicy::new(),
+            upkeep: OnceLock::new(),
         })
     }
 }
@@ -683,6 +729,7 @@ impl<Snap, Auth, C, O, Id, Key, W> SessionManager<Snap, Auth, W, C, O, Id, Key>
 where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
+    Auth::Error: core::fmt::Display,
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
     C::Error: core::fmt::Display,
     O: Oplog,
@@ -690,6 +737,24 @@ where
     Key: CapabilityKey,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
+    /// Maintain the authorization store from the change stream.
+    ///
+    /// Set once, after construction, because the upkeep is built from the
+    /// executor this manager already holds and so cannot be assembled before
+    /// it. A second call is refused rather than allowed to replace a live
+    /// collaborator, which would leave events either side of the swap
+    /// answered against two different stores.
+    ///
+    /// # Errors
+    ///
+    /// The upkeep handed over, when one is already installed.
+    pub fn install_store_upkeep(
+        &self,
+        upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
+    ) -> Result<(), Arc<dyn crate::openfga::StoreUpkeep>> {
+        self.upkeep.set(upkeep)
+    }
+
     fn next_connection_num(&self) -> u64 {
         self.next_session.fetch_add(1, Ordering::Relaxed)
     }
@@ -846,6 +911,22 @@ where
         live.len()
     }
 
+    /// Send a control frame to every currently live session without removing
+    /// any entry from the session registry.
+    async fn broadcast_control(&self, msg: ControlMessage) {
+        let txs: Vec<_> = {
+            self.sessions
+                .lock()
+                .await
+                .values()
+                .map(|live| live.tx.clone())
+                .collect()
+        };
+        for tx in txs {
+            let _ = tx.send(Outbound::Control(msg.clone()));
+        }
+    }
+
     /// Claim `session_id` for this connection, superseding whatever held it.
     ///
     /// One live connection per durable handle, newer wins. Two connections
@@ -973,10 +1054,16 @@ where
                 .iter()
                 .map(|(_, route)| Arc::clone(&route.principal))
                 .collect();
-            Verdict::reset(&mut verdicts, watchers.len());
-            // The buffer arrived pre-filled with denials, so whatever the
-            // policy could not reach stays denied.
-            let _ = self.auth.may_see(&row, &watchers, &mut verdicts).await;
+            if !watchers.is_empty() {
+                Verdict::reset(&mut verdicts, watchers.len());
+                // Any error means the auth service was unreachable: the
+                // verdicts stay as pre-filled denials. Signal the caller so the
+                // ingest loop can hold this event and retry rather than
+                // silently skipping it.
+                if let Err(err) = self.auth.may_see(&row, &watchers, &mut verdicts).await {
+                    return Err(SessionError::AuthUnavailable(err.to_string()));
+                }
+            }
         } else {
             // Nothing to ask about, so nothing is filtered.
             verdicts.resize(deliveries.len(), Verdict::Allow);
@@ -1037,19 +1124,54 @@ where
         Ok(())
     }
 
-    /// Drive a CDC source to completion, dispatching every event and acking its
-    /// checkpoint so the upstream can recycle its log.
+    /// Bring the authorization store level with `event`, if one is maintained.
     ///
-    /// This is the standing ingestor: one per server, fanning out to every
-    /// session. It is generic over the [`CdcSource`], so it runs the same way
-    /// against the SQLite emulator (Docker-free) and a real
-    /// `PgStreamingCdcSource`. Reconnect on a transient source error lands in
-    /// Phase 6; for now an error ends the loop.
+    /// **Called once per event, before it is dispatched, and deliberately not
+    /// from `dispatch_event`.** Until the store holds what the row moved, every
+    /// question about a row those facts reach is answered from a world that has
+    /// moved. But a difference is applied once: an event held through an
+    /// outage is dispatched again when the answer comes back, and re-applying a
+    /// difference already in the store writes facts that are already there,
+    /// which the service refuses. Reached through the ingest loop, which holds
+    /// the event, so the retry retries the question and not the write.
+    ///
+    /// Catchup does not call it, and must not: it replays history whose
+    /// differences were applied when those events were live.
     ///
     /// # Errors
     ///
-    /// [`SessionError`] when a dispatch fails or the source errors.
-    pub async fn ingest<S>(&self, source: &mut S) -> Result<(), SessionError>
+    /// [`SessionError::AuthUnavailable`], because a store that could not be
+    /// brought level is the same class of unknown as an unreachable service and
+    /// takes the same path.
+    async fn keep_store_current(&self, event: &ChangeEvent) -> Result<(), SessionError> {
+        match self.upkeep.get() {
+            Some(upkeep) => upkeep
+                .keep_current(event)
+                .await
+                .map_err(|err| SessionError::AuthUnavailable(err.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Drive a CDC source to completion, dispatching every event and acking its
+    /// checkpoint so the upstream can recycle its log.
+    ///
+    /// When `dispatch_event` returns [`SessionError::AuthUnavailable`] the loop
+    /// holds the event, broadcasts [`ControlMessage::DeliveryPaused`] to every
+    /// live session (once per outage, not per retry), and retries after
+    /// its own retry backoff. On recovery it broadcasts
+    /// [`ControlMessage::DeliveryResumed`] and moves on. The source checkpoint
+    /// is not acknowledged until dispatch succeeds, so the replication slot never
+    /// advances past an unanswered event.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] when a non-auth dispatch fails or the source errors.
+    pub async fn ingest<S>(
+        &self,
+        source: &mut S,
+        on_event: &mut impl FnMut(ReconnectEvent<'_>),
+    ) -> Result<(), SessionError>
     where
         S: CdcSource<Event = ChangeEvent>,
         S::Error: core::fmt::Display,
@@ -1057,7 +1179,47 @@ where
         loop {
             match source.next_event().await {
                 Ok(Some(event)) => {
-                    self.dispatch_event(&event).await?;
+                    let mut auth_attempt: u32 = 0;
+                    let mut paused = false;
+                    // Applied once, then only the question is retried. See
+                    // `keep_store_current` for why re-applying is refused.
+                    let mut levelled = false;
+                    loop {
+                        let attempt = async {
+                            if !levelled {
+                                self.keep_store_current(&event).await?;
+                                levelled = true;
+                            }
+                            self.dispatch_event(&event).await
+                        };
+                        match attempt.await {
+                            Ok(()) => {
+                                if paused {
+                                    self.broadcast_control(ControlMessage::DeliveryResumed)
+                                        .await;
+                                }
+                                break;
+                            }
+                            Err(SessionError::AuthUnavailable(err)) => {
+                                auth_attempt = auth_attempt.saturating_add(1);
+                                if !paused {
+                                    self.broadcast_control(ControlMessage::DeliveryPaused {
+                                        cause: PauseCause::AuthServiceUnreachable,
+                                    })
+                                    .await;
+                                    paused = true;
+                                }
+                                let backoff = self.auth_retry.backoff(auth_attempt);
+                                on_event(ReconnectEvent::AuthRetrying {
+                                    attempt: auth_attempt,
+                                    backoff,
+                                    error: &err,
+                                });
+                                tokio::time::sleep(backoff).await;
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
                     if let Some(lsn) = event.checkpoint() {
                         source
                             .ack(lsn)
@@ -1065,7 +1227,6 @@ where
                             .map_err(|err| SessionError::Transport(err.to_string()))?;
                     }
                 }
-                // A clean source shutdown ends ingestion.
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
@@ -1104,7 +1265,7 @@ where
             let error = match connect().await {
                 Ok(mut source) => {
                     let started = Instant::now();
-                    match self.ingest(&mut source).await {
+                    match self.ingest(&mut source, &mut on_event).await {
                         Ok(()) => return Ok(()),
                         Err(err) => {
                             if started.elapsed() >= policy.healthy_after {
@@ -1117,7 +1278,7 @@ where
                 Err(err) => err.to_string(),
             };
             attempt = attempt.saturating_add(1);
-            if let Some(max) = policy.max_attempts
+            if let Some(max) = policy.max_attempts()
                 && attempt >= max
             {
                 on_event(ReconnectEvent::GaveUp {
@@ -1694,6 +1855,11 @@ where
                             break;
                         }
                         Outbound::Drop => break,
+                        Outbound::Control(msg) => {
+                            // Non-fatal control frame: send immediately, ignore
+                            // a closed transport (the session may have moved on).
+                            let _ = transport.send_control(msg).await;
+                        }
                     }
                 }
             }
@@ -1791,6 +1957,56 @@ where
         }
     }
 
+    /// Ask the write question about every op in `plan`, stopping at the first
+    /// answer that is not an allow.
+    ///
+    /// The question carries the row versions its verb is judged on, so a
+    /// replacement is asked about both rather than about one image standing in
+    /// for two. Judging a replacement on the resulting row alone asks whether
+    /// the **new** owner is the caller, which grants a caller who holds nothing
+    /// and writes itself in.
+    async fn every_op_authorized(
+        &self,
+        plan: &crate::materializer::WritePlan,
+        caller: &Arc<Principal<Id, Key>>,
+    ) -> WriteVerdict {
+        for op in &plan.ops {
+            let answer = match &op.write {
+                PlannedWrite::Insert { new } => {
+                    let new = ValuesRow::new(op.table_id, new);
+                    self.auth
+                        .may_write(RowWrite::Insert { new: &new }, caller)
+                        .await
+                }
+                PlannedWrite::Update { old, new } => {
+                    let old = ValuesRow::new(op.table_id, old);
+                    let new = ValuesRow::new(op.table_id, new);
+                    self.auth
+                        .may_write(
+                            RowWrite::Update {
+                                old: &old,
+                                new: &new,
+                            },
+                            caller,
+                        )
+                        .await
+                }
+                PlannedWrite::Delete { old } => {
+                    let old = ValuesRow::new(op.table_id, old);
+                    self.auth
+                        .may_write(RowWrite::Delete { old: &old }, caller)
+                        .await
+                }
+            };
+            match answer {
+                Ok(verdict) if verdict.allowed() => {}
+                Ok(_) => return WriteVerdict::Denied,
+                Err(_) => return WriteVerdict::Undetermined,
+            }
+        }
+        WriteVerdict::Allowed
+    }
+
     /// Pair a `MutationPatch` with its header, authorize, conflict-check, and
     /// apply. A durable apply (and any replay of one) is confirmed with
     /// [`MutationApplied`], failures reply with their dedicated messages, and
@@ -1843,16 +2059,16 @@ where
             }
         };
 
-        // Authorize every op, fail closed on a denial or an auth error.
-        for op in &plan.ops {
-            let row = ValuesRow::new(op.table_id, &op.row);
-            let allowed = self
-                .auth
-                .may_write(&row, &state.principal, op.op)
-                .await
-                .is_ok_and(Verdict::allowed);
-            if !allowed {
+        match self.every_op_authorized(&plan, &state.principal).await {
+            WriteVerdict::Allowed => {}
+            // Genuine denial: the caller may not perform this operation.
+            WriteVerdict::Denied => {
                 return self.reject_unauthorized(transport, client_seq, state).await;
+            }
+            // The service could not be reached, so whether the caller may
+            // write is unknown. The client must retry rather than discard.
+            WriteVerdict::Undetermined => {
+                return self.reject_indeterminate(transport, client_seq).await;
             }
         }
 
@@ -1927,6 +2143,20 @@ where
             state.closing = true;
         }
         self.reject(transport, client_seq, MutationRejectReason::Unauthorized)
+            .await
+    }
+
+    /// Refuse one write the authorization service could not answer.
+    ///
+    /// The client MUST retry rather than discard its pending record: the
+    /// server could not determine whether the write is permitted, so discarding
+    /// it would turn a transient outage into permanent loss.
+    async fn reject_indeterminate<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+    ) -> Result<(), SessionError> {
+        self.reject(transport, client_seq, MutationRejectReason::Indeterminate)
             .await
     }
 
@@ -2266,8 +2496,44 @@ where
             if !departure
                 && let Some(row) = EventRow::current(record.event(), self.catalog.as_ref())
             {
-                Verdict::reset(&mut verdicts, watchers.len());
-                let _ = self.auth.may_see(&row, &watchers, &mut verdicts).await;
+                // Retry the authorization question on error instead of silently
+                // skipping the record: a skip followed by delivering later
+                // records would advance the cursor past this one, making it
+                // permanently unreplayable from the oplog.
+                let mut auth_attempt: u32 = 0;
+                let mut paused = false;
+                loop {
+                    Verdict::reset(&mut verdicts, watchers.len());
+                    match self.auth.may_see(&row, &watchers, &mut verdicts).await {
+                        Ok(()) => {
+                            if paused {
+                                let _ = transport
+                                    .send_control(ControlMessage::DeliveryResumed)
+                                    .await;
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            auth_attempt = auth_attempt.saturating_add(1);
+                            if !paused {
+                                let _ = transport
+                                    .send_control(ControlMessage::DeliveryPaused {
+                                        cause: PauseCause::AuthServiceUnreachable,
+                                    })
+                                    .await;
+                                paused = true;
+                            }
+                            let backoff = self.auth_retry.backoff(auth_attempt);
+                            tracing::warn!(
+                                attempt = auth_attempt,
+                                backoff_ms = backoff.as_millis(),
+                                error = %err,
+                                "auth service unreachable during catchup replay, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
+                }
                 if !verdicts.first().copied().unwrap_or_default().allowed() {
                     continue;
                 }

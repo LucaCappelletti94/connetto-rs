@@ -29,12 +29,30 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main. c1f725a makes an UPDATE notify every row subscription whose
-# predicate the row satisfies, whichever columns changed, which is what stops a
-# replica keeping a stale value for any column its query does not filter on. It
-# also carries the visibility trait R5a builds on. The base features stay
-# minimal here, each crate states the feature set it consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "c1f725a907af94d8cb5d846840e6529dd09f9426", default-features = false, features = ["std"] }
+# on main. `e03786b` carries the whole row-visibility composition R5b consumes:
+# `RowPolicy` answering from the changed row, `OpenFgaPolicy` terminating it
+# against a server, and one shared `Shapes` index behind both. It also carries
+# the three answers connetto found the composition could not reach: the
+# difference whose tuple key states both sides, the table the database leaves
+# open, and the statement the model refuses, each of which `Shapes` either
+# modelled with no producer or read as a failure to reach an answer. It keeps
+# `c1f725a`'s change, that an UPDATE notifies every row subscription whose
+# predicate the row satisfies whichever columns changed, which is what stops a
+# replica keeping a stale value for any column its query does not filter on.
+# The base features stay minimal here, each crate states the feature set it
+# consumes.
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "e03786bfdf9e4c6c18d4e38e227c258f6765cf8f", default-features = false, features = ["std"] }
+
+# rls2fga: the translator from Postgres row-level-security policy text to an
+# OpenFGA model, the per-relation report of what one row decides, and the
+# writer that puts a model on a running server. Reached directly rather than
+# through subql, which takes it with default features off and re-exports
+# nothing: `Shapes::new` takes `&[RelationShapes]`, which only a `Translation`
+# produces, and the translator is std-only. Tracks the branch rather than a
+# rev, because pinning it by revision put two copies of `sql-traits` in one
+# graph with two incompatible `ParserDB` types, which `[patch]` refuses to
+# merge.
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = ["client"] }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 thiserror = "2"

@@ -52,7 +52,7 @@ diesel = { version = "2", features = ["sqlite"] }
 # cargo allows one package with `links = "sqlite3"` across the whole graph, host
 # build scripts included.
 libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", rev = "d0247132b7a571f70601fb389f119863b32ba94d", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

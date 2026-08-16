@@ -140,14 +140,15 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 
 /// Insert `sql` into the emulated backend and route every resulting CDC event
 /// to the sessions through the manager.
-async fn drive_cdc<
-    S: SnapshotSource,
-    A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>,
->(
+async fn drive_cdc<S, A>(
     source: &mut PgSqliteEmuSource,
     manager: &SessionManager<S, A, ConnettoWatermark>,
     sql: &str,
-) {
+) where
+    S: SnapshotSource,
+    A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>,
+    A::Error: core::fmt::Display,
+{
     source.execute_sql(sql).expect("execute dml");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager

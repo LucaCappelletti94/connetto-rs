@@ -21,6 +21,7 @@
 //! express, which is the sanctioned raw-SQL case. Read-back assertions in a test
 //! MUST instead define a typed `diesel::table!` and load through the DSL.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -31,6 +32,8 @@ use connetto_core::messages::{
     MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_server::openfga::{Counted, FgaAuth};
+use connetto_server::parity::ParityAuth;
 use connetto_server::{
     LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy,
     RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -40,11 +43,14 @@ use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
+use openfga_client::tonic::transport::Channel;
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::reexec::PgAsyncDieselConnector;
-use subql::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+use subql::visibility::openfga::OpenFgaError;
+use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::task::JoinHandle;
 
@@ -146,6 +152,56 @@ pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations 
 /// writer role only needs `SELECT, INSERT, UPDATE` on it, granted separately.
 pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WATERMARK_DDL).await;
+}
+
+/// Where the authorization service the fan-out fixture asks is listening.
+///
+/// Read from the environment rather than started here, following the same rule
+/// as `DATABASE_URL`: the harness attaches to what the run provides and does
+/// not own container lifetimes.
+#[must_use]
+pub fn fga_url() -> String {
+    std::env::var("CONNETTO_TEST_FGA_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned())
+}
+
+/// Open a channel to the authorization service and create a store of its own.
+///
+/// A fresh store per call, so two fixtures in one run cannot see each other's
+/// rules or facts.
+pub async fn fga_store() -> (Channel, String) {
+    let endpoint = fga_url();
+    let channel = Channel::from_shared(endpoint.clone())
+        .expect("a service endpoint")
+        .connect()
+        .await
+        .unwrap_or_else(|err| {
+            panic!("connecting to the authorization service at {endpoint}: {err}")
+        });
+    let store = OpenFgaServiceClient::new(channel.clone())
+        .create_store(CreateStoreRequest {
+            name: format!("connetto-harness-{}", uuid_like()),
+        })
+        .await
+        .expect("create a store")
+        .into_inner()
+        .id;
+    (channel, store)
+}
+
+/// A name no two calls in one process share.
+///
+/// The clock alone is not enough: two fixtures provisioned inside one
+/// millisecond would share a store and then disagree about what is in it.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos()),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The oplog table name the server binary defaults to.
@@ -255,6 +311,43 @@ pub enum HarnessAuth {
     Permissive(PermissiveAuth),
     /// Authorize through Postgres Row-Level Security.
     Rls(Box<RlsAuth>),
+    /// Authorize the way the shipped binary does: from the changed row where
+    /// the schema decides, and an `OpenFGA` server for the rest.
+    Fga(Box<HarnessFga>),
+    /// Both executors on every question, delivering on the shipped one and
+    /// counting any disagreement.
+    ///
+    /// What the fan-out fixture serves through, so every Docker-backed run of
+    /// it is also a parity run and the suites can assert the count is zero.
+    Parity(Box<ParityAuth<Counted<Channel>>>),
+    /// The shipped policy, with the service taken away and given back on a
+    /// flag.
+    ///
+    /// A stand-in for pulling the container out, and faithful in the one way
+    /// that matters: while the flag is down it returns `OpenFgaError::Transport`,
+    /// which is exactly what an unreachable server produces, and which the
+    /// trait documents as failure to reach an answer rather than an answer of
+    /// denied. What is proven through it is connetto's response, not the
+    /// service's failure mode.
+    Reachable(Arc<AtomicBool>, Box<HarnessFga>),
+}
+
+/// The executor the server binary builds, as the harness holds it.
+pub type HarnessFga = FgaAuth<String, String, Counted<Channel>>;
+
+/// Whatever the chosen policy could not answer.
+///
+/// One enum rather than a shared error type, because the two implementations
+/// fail for unrelated reasons and flattening them would make a caller read a
+/// Postgres failure as a service outage.
+#[derive(Debug, thiserror::Error)]
+pub enum HarnessAuthError {
+    /// Row-level security could not answer.
+    #[error(transparent)]
+    Rls(#[from] RlsAuthError),
+    /// The authorization service could not be reached, or refused.
+    #[error(transparent)]
+    Fga(#[from] OpenFgaError),
 }
 
 impl HarnessAuth {
@@ -269,11 +362,29 @@ impl HarnessAuth {
     pub fn rls(auth: RlsAuth) -> Self {
         Self::Rls(Box::new(auth))
     }
+
+    /// The shipped policy: the changed row, then the authorization service.
+    #[must_use]
+    pub fn fga(auth: HarnessFga) -> Self {
+        Self::Fga(Box::new(auth))
+    }
+
+    /// The shipped policy behind a flag a test lowers to stage an outage.
+    #[must_use]
+    pub fn reachable(reachable: Arc<AtomicBool>, auth: HarnessFga) -> Self {
+        Self::Reachable(reachable, Box::new(auth))
+    }
+
+    /// Both executors, delivering on the shipped one.
+    #[must_use]
+    pub fn parity(auth: ParityAuth<Counted<Channel>>) -> Self {
+        Self::Parity(Box::new(auth))
+    }
 }
 
 impl VisibilityPolicy for HarnessAuth {
     type Watcher = std::sync::Arc<Principal>;
-    type Error = RlsAuthError;
+    type Error = HarnessAuthError;
     type Backend = Postgres;
 
     async fn may_see<R>(
@@ -281,7 +392,7 @@ impl VisibilityPolicy for HarnessAuth {
         row: &R,
         watchers: &[Self::Watcher],
         verdicts: &mut [Verdict],
-    ) -> Result<(), RlsAuthError>
+    ) -> Result<(), HarnessAuthError>
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
@@ -290,27 +401,52 @@ impl VisibilityPolicy for HarnessAuth {
                 .may_see(row, watchers, verdicts)
                 .await
                 .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.may_see(row, watchers, verdicts).await,
+            Self::Rls(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
+            Self::Fga(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
+            Self::Parity(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
+            Self::Reachable(up, auth) => {
+                // Spelled out because diesel's blanket `load` shadows the atomic's.
+                if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
+                    Ok(auth.may_see(row, watchers, verdicts).await?)
+                } else {
+                    Err(unreachable_service())
+                }
+            }
         }
     }
 
     async fn may_write<R>(
         &self,
-        row: &R,
+        write: RowWrite<'_, R>,
         watcher: &Self::Watcher,
-        op: WriteOp,
-    ) -> Result<Verdict, RlsAuthError>
+    ) -> Result<Verdict, HarnessAuthError>
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
         match self {
-            Self::Permissive(auth) => auth
-                .may_write(row, watcher, op)
-                .await
-                .map_err(|e| match e {}),
-            Self::Rls(auth) => auth.may_write(row, watcher, op).await,
+            Self::Permissive(auth) => auth.may_write(write, watcher).await.map_err(|e| match e {}),
+            Self::Rls(auth) => Ok(auth.may_write(write, watcher).await?),
+            Self::Fga(auth) => Ok(auth.may_write(write, watcher).await?),
+            Self::Parity(auth) => Ok(auth.may_write(write, watcher).await?),
+            Self::Reachable(up, auth) => {
+                // Spelled out because diesel's blanket `load` shadows the atomic's.
+                if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
+                    Ok(auth.may_write(write, watcher).await?)
+                } else {
+                    Err(unreachable_service())
+                }
+            }
         }
     }
+}
+
+/// The failure an unreachable authorization service produces, spelled the way
+/// the real client spells it so a caller cannot tell the stand-in apart.
+fn unreachable_service() -> HarnessAuthError {
+    HarnessAuthError::Fga(OpenFgaError::Transport {
+        attempts: 3,
+        message: "the authorization service is unreachable".to_owned(),
+    })
 }
 
 /// The concrete manager type the harness serves: real snapshot, the harness auth
@@ -388,6 +524,20 @@ impl Server {
     #[must_use]
     pub fn manager(&self) -> &Arc<HarnessManager> {
         &self.manager
+    }
+
+    /// Maintain the authorization store from the change stream, as the binary
+    /// does.
+    ///
+    /// # Panics
+    ///
+    /// When one is already installed, which would answer events either side of
+    /// the swap against two different stores.
+    pub fn install_store_upkeep(&self, upkeep: Arc<dyn connetto_server::openfga::StoreUpkeep>) {
+        assert!(
+            self.manager.install_store_upkeep(upkeep).is_ok(),
+            "a store upkeep is already installed on this server"
+        );
     }
 
     /// Connect a new in-process client over a loopback transport. The server

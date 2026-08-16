@@ -133,7 +133,7 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 2. Run bounded `SqliteConnection::incremental_vacuum` (diesel #5145). The page-limit parameter is a latency control: a large freelist does not stall the pump in a single step. The helper drives the pragma to completion, which matters because the pragma frees one page per result row, so a consumer that steps it once reclaims one page regardless of the limit it passed.
 
-3. Run `wal_checkpoint(None, WalCheckpointMode::Truncate)`, still a proposal in `docs/upstream-diesel-wal-checkpoint.md` and the one mechanism here that has not landed. Pages reclaimed by `incremental_vacuum` could otherwise reappear inside a grown WAL file, leaving the file occupying the same space at the filesystem level. The `Truncate` mode moves WAL frames into the database file and shrinks the WAL file to zero bytes.
+3. Run `wal_checkpoint(None, WalCheckpointMode::Truncate)`, which merged upstream on 2026-08-14 and is the one mechanism here the pinned fork branch does not yet carry. Pages reclaimed by `incremental_vacuum` could otherwise reappear inside a grown WAL file, leaving the file occupying the same space at the filesystem level. The `Truncate` mode moves WAL frames into the database file and shrinks the WAL file to zero bytes.
 
 4. Inspect `WalCheckpointOutcome.busy`. A checkpoint blocked by an open reader reports the blockage through the `busy` field and does not fail. The pass records that it did not complete fully and defers to the next maintenance window rather than retrying in a tight loop.
 
@@ -173,7 +173,7 @@ A full `VACUUM` rewrite is expensive in the browser: it requires up to twice the
 
 ## Upstream dependency
 
-**Four of the five landed upstream, and the fifth was never filed.** The proposal documents are deleted: a merged pull request is a better record than a copy of its own argument, and the API each one asked for is now diesel's public surface.
+**All five landed upstream.** The proposal documents are deleted: a merged pull request is a better record than a copy of its own argument, and the API each one asked for is now diesel's public surface.
 
 | Mechanism | Where it is |
 |---|---|
@@ -181,9 +181,9 @@ A full `VACUUM` rewrite is expensive in the browser: it requires up to twice the
 | `SqliteConnection::page_count`, `freelist_count` | diesel #5129, merged 2026-08-02 |
 | `SqliteConnection::incremental_vacuum` | diesel #5145, merged 2026-08-05 |
 | `SqliteConnection::vacuum`, `vacuum_into` | diesel #5146, merged 2026-08-07 |
-| `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` | unfiled, `docs/upstream-diesel-wal-checkpoint.md` |
+| `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` | diesel #5150, merged 2026-08-14 |
 
-**The pin reaches the merges since 2026-08-07.** All six workspace locks moved to the rebased fork branch, so the four landed APIs are callable here and both test baselines held. Clearing the pin cost one thing worth knowing: the rebase dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is now documented and a new table must be too. `docs/upstream-diesel-future-branch-sync.md` is the record.
+**The pin reaches the first four and not yet the fifth.** All six workspace locks moved to the rebased fork branch on 2026-08-07, so those four APIs are callable here and both test baselines held. `wal_checkpoint` merged a week later into upstream `main` as `b2984fe1`, and this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch, pinned at `ac4cdfc3`, which predates it. **So the one thing left is a rebase and a lock move, not a request.** Clearing the pin last time cost something worth knowing and will cost it again: the rebase dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is documented and a new table must be too.
 
 ## Open questions
 

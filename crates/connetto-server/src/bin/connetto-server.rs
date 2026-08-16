@@ -67,16 +67,26 @@ use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::HandshakeAuthority;
 use connetto_core::{SchemaVersion, SessionId};
 use connetto_server::audit::pg_audit_hook;
+use connetto_server::capability::DEFAULT_USER_SETTING;
+use connetto_server::openfga::{
+    Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
+};
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
     OidcProviderConfig, OplogConfig, PgOplog, PgSnapshotSource, ProviderRegistry, ReaderGate,
     ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
-    ResolvedIdentity, RetainedProviderToken, RlsAuth, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router, connetto_audit_table,
+    connetto_auth_tables, connetto_ban_table, connetto_watermark_table, is_loopback_host,
+    pg_ban_store, pg_write_target, preflight,
 };
+use openfga_client::client::OpenFgaServiceClient;
+use openfga_client::tonic::transport::Channel;
+use rls2fga::translator::Translator;
+use subql::backend::Postgres;
+use subql::visibility::openfga::OpenFgaPolicy;
+
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -86,6 +96,10 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+/// The change-path executor this binary serves through, named once because the
+/// session manager's type parameter and the function that builds it must agree.
+type ServerAuth = FgaAuth<String, String, Counted<Channel>>;
 
 /// Whether `origin` is a loopback origin, so script served from it may read a
 /// login response without being listed.
@@ -540,8 +554,9 @@ async fn main() -> Result<()> {
     let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?;
-    let auth = RlsAuth::from_ddl(reader_pool.clone(), &pg_ddl)
-        .map_err(|err| anyhow!("building RLS auth: {err}"))?;
+    let (auth, translator) =
+        build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
+    let upkeep = auth.upkeep(translator, reader_pool.clone());
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
 
@@ -556,6 +571,14 @@ async fn main() -> Result<()> {
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
     );
+    // The store follows the change stream from here: every changed row's
+    // difference is written before the row reaches anybody.
+    if manager.install_store_upkeep(upkeep).is_err() {
+        return Err(anyhow!(
+            "the authorization store upkeep was installed twice, which would answer \
+             events either side of the swap against two different stores"
+        ));
+    }
     // Revoking a session closes its live connection rather than only refusing
     // its next handshake. The hook fires synchronously inside the revoke, so
     // the close itself rides a spawned task.
@@ -677,13 +700,132 @@ async fn shutdown_signal() {
     }
 }
 
+/// The change path's executor: translate the deployment's policies, put the
+/// rules on the authorization service, fill the facts behind them if they are
+/// new, and answer through the composition.
+///
+/// Two clients over one endpoint. Questions go through [`Counted`], which is
+/// where `AUTHORIZATION_CALLS` counts round trips, and the setup calls do not,
+/// so writing a model does not read as a change-path question.
+async fn build_authorization(
+    owner_pool: &Pool<AsyncPgConnection>,
+    reader_pool: &Pool<AsyncPgConnection>,
+    pg_ddl: &str,
+    publication: &str,
+) -> Result<(ServerAuth, Translator)> {
+    let policies = read_ddl("CONNETTO_PG_POLICIES")?;
+    let translated = Translated::of::<String>(pg_ddl, &policies, DEFAULT_USER_SETTING)?;
+
+    // A policy reading a table the change stream does not carry never hears
+    // that a grant was given or taken away, so the store goes stale and then
+    // answers confidently and wrongly. The publication is known and the
+    // policies are known, so this is a set difference that names the table.
+    let required: Vec<Artifact<'_>> = translated
+        .policy_tables()
+        .iter()
+        .map(|table| Artifact::PublishedTable { publication, table })
+        .collect();
+    preflight::require(owner_pool, &required).await?;
+
+    let endpoint = var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081");
+    let store_id = std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
+        anyhow!(
+            "set CONNETTO_FGA_STORE to the authorization store this deployment owns: \
+             connetto writes the rules it derives from your policies into a store, and \
+             it does not create one"
+        )
+    })?;
+    let channel = Channel::from_shared(endpoint.clone())
+        .with_context(|| format!("parsing CONNETTO_FGA_URL {endpoint}"))?
+        .connect()
+        .await
+        .with_context(|| format!("connecting to the authorization service at {endpoint}"))?;
+
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated.install_model(&mut setup, &store_id).await?;
+    // The rules being new means nothing on the service stands behind them yet.
+    // An unchanged description means the facts were loaded on the boot that
+    // wrote it, and the change stream has kept them current since. Read before
+    // the index is built, because both come out of the one translation and the
+    // index consumes it.
+    let load = match &model {
+        ModelState::Written(_) => Some(translated.load_records(reader_pool).await?),
+        ModelState::Adopted(_) => None,
+    };
+
+    let (shapes, translator) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    if let Some(records) = load {
+        tracing::info!(
+            model = model.id(),
+            facts = records.len(),
+            "authorization rules are new, loading the facts behind them"
+        );
+        // The same writer the per-row upkeep uses, over the same index, on the
+        // uncounted client so a load does not read as change-path questions.
+        OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+            Arc::clone(&shapes),
+            setup,
+            store_id.clone(),
+        )
+        .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
+        .authorization_model_id(model.id().to_owned())
+        .write_records(&records)
+        .await
+        .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
+    }
+
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store_id,
+    )
+    .map_err(|err| anyhow!("building the authorization delegate: {err}"))?
+    .authorization_model_id(model.id().to_owned());
+    Ok((FgaAuth::new(shapes, delegate, naming), translator))
+}
+
+/// Report one change-stream or authorization retry, so reconnect churn and an
+/// authorization outage are both visible to whatever the embedder already runs.
+fn log_reconnect(event: &ReconnectEvent<'_>) {
+    let millis =
+        |backoff: &std::time::Duration| u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+    match event {
+        ReconnectEvent::Retrying {
+            attempt,
+            backoff,
+            error,
+        } => tracing::warn!(
+            attempt,
+            backoff_ms = millis(backoff),
+            error,
+            "change stream lost, retrying"
+        ),
+        ReconnectEvent::GaveUp { attempts, error } => tracing::error!(
+            attempts,
+            error,
+            "change stream gave up reconnecting, live delivery has stopped"
+        ),
+        ReconnectEvent::AuthRetrying {
+            attempt,
+            backoff,
+            error,
+        } => tracing::warn!(
+            attempt,
+            backoff_ms = millis(backoff),
+            error,
+            "authorization service unreachable, holding the event and retrying"
+        ),
+    }
+}
+
 /// Start CDC ingestion and serve connections until the listener fails or a
 /// shutdown signal arrives.
 async fn run(
     manager: &Arc<
         SessionManager<
             PgSnapshotSource,
-            RlsAuth,
+            ServerAuth,
             ConnettoWatermark,
             PgAsyncDieselConnector,
             PgOplog,
@@ -739,22 +881,8 @@ async fn run(
             }
         };
         if let Err(err) = ingest_manager
-            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| match event {
-                ReconnectEvent::Retrying {
-                    attempt,
-                    backoff,
-                    error,
-                } => tracing::warn!(
-                    attempt,
-                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-                    error,
-                    "change stream lost, retrying"
-                ),
-                ReconnectEvent::GaveUp { attempts, error } => tracing::error!(
-                    attempts,
-                    error,
-                    "change stream gave up reconnecting, live delivery has stopped"
-                ),
+            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
+                log_reconnect(&event);
             })
             .await
         {

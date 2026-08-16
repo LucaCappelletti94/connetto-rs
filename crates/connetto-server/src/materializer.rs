@@ -48,7 +48,6 @@ use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
 use subql::emit::{WireTable, pgoutput_patchset, pgoutput_patchset_builder};
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
-use subql::visibility::WriteOp;
 use subql::{
     AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, DatabaseLike, DefaultIds,
     OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId,
@@ -219,20 +218,48 @@ impl RuntimeWritableCatalogBuilder {
     }
 }
 
+/// The write one op performs, carrying the row versions its verb is judged on.
+///
+/// The owned mirror of subql's `RowWrite`, which the write question is asked
+/// through. Owned because a plan outlives the upload it was parsed from, and
+/// shaped the same way for the same reason: a replacement is judged on two
+/// versions, and pairing a verb with the wrong number of images is not
+/// representable.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedWrite {
+    /// Creating the row.
+    Insert {
+        /// The row as it will be.
+        new: Vec<PgValue<Postgres>>,
+    },
+    /// Replacing the row.
+    ///
+    /// A changeset carries two slots per column, so both images come from the
+    /// upload. **A column the upload left out of both slots is absent from
+    /// each**, which is the residual R5a recorded: a policy reading a column
+    /// the client did not touch cannot be answered from the image, and the
+    /// question falls to whatever sits behind the row-answering wrapper.
+    Update {
+        /// The row as it is, from the old slots.
+        old: Vec<PgValue<Postgres>>,
+        /// The row as it will be, the changed columns over the old ones.
+        new: Vec<PgValue<Postgres>>,
+    },
+    /// Removing the row.
+    Delete {
+        /// The row as it is.
+        old: Vec<PgValue<Postgres>>,
+    },
+}
+
 /// One op parsed from a mutation upload, ready for the session write path.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedOp {
     /// Catalog id of the target table, naming the row the write check asks
     /// about.
     pub table_id: TableId,
-    /// The verb, for the authorization check.
-    pub op: WriteOp,
-    /// The row the op writes, in catalog column order. An insert and a delete
-    /// carry a full image. A changeset update carries the new value where the
-    /// upload changed the column and the old one otherwise, so a column the
-    /// upload left out of both slots reads as absent, the same residual an
-    /// event carries under `REPLICA IDENTITY DEFAULT`.
-    pub row: Vec<PgValue<Postgres>>,
+    /// The write, and the row versions its verb is judged on.
+    pub write: PlannedWrite,
     /// Present when this op must be conflict-checked (a version-bearing update
     /// or delete).
     pub conflict: Option<PlannedConflict>,
@@ -1003,32 +1030,52 @@ where
         }
         let table_id = self.table_id(&table)?;
         let pk_values = op.primary_key();
-        let (verb, row, conflict) = match op {
-            ChangesetOp::Insert { values, .. } => (WriteOp::Insert, row_image(values), None),
+        let (write, conflict) = match op {
+            ChangesetOp::Insert { values, .. } => (
+                PlannedWrite::Insert {
+                    new: row_image(values),
+                },
+                None,
+            ),
             ChangesetOp::Update { values, .. } => {
                 let conflict = self.plan_conflict(schema, &pk_values, |idx| {
                     values.get(idx).and_then(|cell| cell.0.clone())
                 })?;
-                // New over old, so the row is the one the update leaves behind.
-                let row = values
+                // The old slots alone are the row as it is, and the new slots
+                // over them are the row the update leaves behind. A column the
+                // upload touched in neither slot reads absent from both, which
+                // is the same residual an event carries under `REPLICA
+                // IDENTITY DEFAULT`.
+                let old = values
+                    .iter()
+                    .map(|(old, _)| match old {
+                        Some(value) => crate::pk::from_wire(value),
+                        None => PgValue::Missing,
+                    })
+                    .collect();
+                let new = values
                     .iter()
                     .map(|(old, new)| match new.as_ref().or(old.as_ref()) {
                         Some(value) => crate::pk::from_wire(value),
                         None => PgValue::Missing,
                     })
                     .collect();
-                (WriteOp::Update, row, conflict)
+                (PlannedWrite::Update { old, new }, conflict)
             }
             ChangesetOp::Delete { old_values, .. } => {
                 let conflict =
                     self.plan_conflict(schema, &pk_values, |idx| old_values.get(idx).cloned())?;
-                (WriteOp::Delete, row_image(old_values), conflict)
+                (
+                    PlannedWrite::Delete {
+                        old: row_image(old_values),
+                    },
+                    conflict,
+                )
             }
         };
         Ok(PlannedOp {
             table_id,
-            op: verb,
-            row,
+            write,
             conflict,
         })
     }
@@ -1044,8 +1091,9 @@ where
         match op {
             PatchsetOp::Insert { values, .. } => Ok(PlannedOp {
                 table_id: self.table_id(&table)?,
-                op: WriteOp::Insert,
-                row: row_image(values),
+                write: PlannedWrite::Insert {
+                    new: row_image(values),
+                },
                 conflict: None,
             }),
             // A patchset carries no prior image, so an update or delete cannot

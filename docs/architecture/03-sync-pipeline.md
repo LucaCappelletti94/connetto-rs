@@ -92,7 +92,7 @@ This is an index lookup: subscriptions are indexed by the tables they reference.
 
 ### 3. Authorization filter
 
-**Built (R5a): one question per changed row, asked once for every watcher.** `may_see` takes the row and all matched watchers and returns one verdict each, so authorization is evaluated in batch rather than per-subscription serially. Behind the seam the RLS implementation still runs one `SELECT EXISTS` round trip per watcher, which R0 measured as the whole throughput ceiling and R5b replaces.
+**Built (R5a, R5b): one question per changed row, asked once for every watcher.** `may_see` takes the row and all matched watchers and returns one verdict each, so authorization is evaluated in batch rather than per-subscription serially. Behind the seam `FgaAuth` (`crates/connetto-server/src/openfga.rs`) is built as of R5b (2026-08-12): `RowPolicy` answers locally from the row's own values (zero round trips for connetto's own policy shape) and `OpenFgaPolicy` batches the rest. The binary constructs it as of 2026-08-12, replacing the `RlsAuth` round trip per watcher that R0 measured as the whole throughput ceiling.
 
 **What the filter consults today is the current row version only, and the two-check form is Decided (R6), not built.** The built behaviour and its two consequences:
 
@@ -119,6 +119,8 @@ On receiving `LivePatch`:
 2. Honour the departure marker: an indirect delete applies only when no surviving subscription's predicate still matches the row (R44).
 3. Persist the frame's cursor as the resume position, atomically with the apply.
 4. Return flow-control credit to the server (`AckCredits`).
+
+**A resume position is never recorded for data the replica has not applied. Invariant, R33.** It is a promise that everything up to it is already here, and the next attach asks the server only for what follows, so recording one early loses the rows in between with nothing on either side able to notice. The live path holds it by writing the cursor and the rows in one transaction, step 3 above. The snapshot path has no rows of its own to bind to, because its resume position arrives in `SnapshotEnd` rather than on the patch, and holds it instead by that frame sharing the delivery queue with the rows (`02-protocol.md`).
 
 ---
 

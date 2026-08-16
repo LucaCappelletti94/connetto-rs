@@ -26,6 +26,24 @@ pub enum SyncStatus {
     Offline,
 }
 
+/// Why live delivery has paused.
+///
+/// Carried by [`ControlMessage::DeliveryPaused`] so the client can show a
+/// precise status rather than a generic message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PauseCause {
+    /// The authorization service cannot be reached.
+    ///
+    /// Change delivery requires authorization checks, so the server holds
+    /// new rows rather than forwarding them without verifying the caller.
+    AuthServiceUnreachable,
+    /// The change stream is connected but no events are arriving.
+    ///
+    /// This is an absence of events rather than an event, which is why no
+    /// log line catches it: the stream is alive but silent.
+    ChangeStreamStalled,
+}
+
 use super::{
     aggregate::AggregateUpdate,
     error::{FatalError, NonFatalError, RateLimited},
@@ -93,4 +111,11 @@ pub enum ControlMessage {
     SyncStatus(SyncStatus),
     /// Session-terminating error.
     FatalError(FatalError),
+    /// Server reports that live delivery is temporarily paused.
+    DeliveryPaused {
+        /// Why delivery is paused.
+        cause: PauseCause,
+    },
+    /// Server reports that live delivery has resumed after a pause.
+    DeliveryResumed,
 }
