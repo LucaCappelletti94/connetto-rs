@@ -14,10 +14,10 @@ use connetto_core::{
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -234,7 +234,7 @@ async fn use_live_renders_and_follows_cdc() {
     let manager = SessionManager::with_connector(
         materializer,
         EmptySnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("dioxus-test").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -277,16 +277,26 @@ async fn use_live_renders_and_follows_cdc() {
     })
     .await;
 
-    // One CDC insert updates both the row query and the aggregate.
+    // One allowed CDC insert and one withheld one drive the change path. The row
+    // hook sees only the allowed row, so rows:1 rather than rows:2 proves the
+    // policy is consulted. The aggregate counts both, because connetto delivers an
+    // aggregate without asking the policy at all (session.rs, delta aggregates are
+    // global by construction since subql refuses an aggregator on a policy-bearing
+    // table).
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     source
         .execute_sql("INSERT INTO orders (id, quantity) VALUES (1, 5)")
         .expect("emu insert");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, quantity) VALUES ({WITHHELD_ID}, 1)",
+        ))
+        .expect("emu insert withheld");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager.dispatch_event(&event).await.expect("dispatch");
     }
     render_until(&mut vdom, |html| {
-        html.contains("rows:1") && html.contains("count:Some(1)")
+        html.contains("rows:1") && html.contains("count:Some(2)")
     })
     .await;
 
@@ -308,7 +318,7 @@ async fn use_live_fn_follows_a_boxed_row_query() {
     let manager = SessionManager::new(
         materializer,
         SeedOneOrder,
-        PermissiveAuth,
+        RosterAuth::granting("dioxus-fn-test").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -348,13 +358,18 @@ async fn use_live_fn_follows_a_boxed_row_query() {
     // established before the CDC insert below.
     render_until(&mut vdom, |html| html.contains("boxed-rows:1")).await;
 
-    // A second row via CDC refreshes the boxed query. The typed insert into the
-    // emulator binds the integer columns the wire carries.
+    // A second allowed row and one withheld row drive the change path. The
+    // withheld row has quantity=1 (matching the filter quantity > 0), so
+    // boxed-rows:2 (not boxed-rows:3) proves RosterAuth was consulted.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     diesel::insert_into(orders::table)
         .values((orders::id.eq(2_i64), orders::quantity.eq(5_i64)))
         .execute(source.connection())
         .expect("emu insert");
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(WITHHELD_ID), orders::quantity.eq(1_i64)))
+        .execute(source.connection())
+        .expect("emu insert withheld");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager.dispatch_event(&event).await.expect("dispatch");
     }

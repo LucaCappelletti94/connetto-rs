@@ -18,11 +18,11 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PermissiveAuth,
-    PgOplog, PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PgOplog,
+    PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    loopback, pg_write_target,
 };
-use connetto_test_harness::ConnettoWatermark;
+use connetto_test_harness::{ConnettoWatermark, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -357,7 +357,8 @@ async fn async_pg_reexec_bootstraps_min() {
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        // Aggregate results never go through the policy.
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connector,
         target,
@@ -686,7 +687,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connector,
         target,

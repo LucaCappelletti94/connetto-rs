@@ -32,6 +32,7 @@ use connetto_server::{
     AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
     RowSource, ShareError, ShareLevel, SnapshotSource, SourceRow, TokenAuthority,
 };
+use connetto_test_harness::{RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -506,8 +507,28 @@ impl RowSource for AlwaysFound {
     }
 }
 
-/// A policy that shows every row and refuses one verb, so the mint's two
-/// questions can disagree.
+/// A row source that always returns a row whose first column is the fixed
+/// integer, so the roster policy can detect the row as withheld.
+struct FixedRow(i64);
+
+impl RowSource for FixedRow {
+    type Error = std::convert::Infallible;
+
+    fn read_row(
+        &self,
+        _caller: &Principal,
+        _table: &str,
+        _key: &[Value<PgValues>],
+    ) -> impl Future<Output = Result<Option<SourceRow>, Self::Error>> {
+        std::future::ready(Ok(Some(SourceRow {
+            table_id: 0,
+            values: vec![Value::Int(self.0)],
+        })))
+    }
+}
+
+/// A policy that shows the caller its fixture named and refuses one verb, so the
+/// mint's two questions can disagree.
 ///
 /// `RlsAuth` cannot play this part: its `may_write` allows unconditionally by
 /// design (`08-authorization.md`, "The write question survives as the
@@ -516,8 +537,22 @@ impl RowSource for AlwaysFound {
 /// change it either. **So this test defends the mint's contract rather than
 /// demonstrating a refusal any shipped deployment can see.** It is
 /// mutation-tested instead: allowing the denied verb below makes it fail.
+///
+/// The read half is the shared stand-in rather than a yes to everybody (R9), so
+/// this double cannot pass a test that stopped asking the read question.
 struct ReadOnlyPolicy {
     refuses: WriteOp,
+    reads: RosterAuth,
+}
+
+impl ReadOnlyPolicy {
+    /// Refuse `verb` for the one caller this fixture mints as.
+    fn refusing(verb: WriteOp) -> Self {
+        Self {
+            refuses: verb,
+            reads: RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        }
+    }
 }
 
 impl VisibilityPolicy for ReadOnlyPolicy {
@@ -527,17 +562,14 @@ impl VisibilityPolicy for ReadOnlyPolicy {
 
     fn may_see<R>(
         &self,
-        _row: &R,
+        row: &R,
         watchers: &[Self::Watcher],
         verdicts: &mut [Verdict],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         R: RowView<Backend = PgValues> + Sync + ?Sized,
     {
-        for verdict in verdicts.iter_mut().take(watchers.len()) {
-            *verdict = Verdict::Allow;
-        }
-        async { Ok(()) }
+        self.reads.may_see(row, watchers, verdicts)
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -565,9 +597,7 @@ fn issuer_over(policy: ReadOnlyPolicy) -> CapabilityIssuer<ReadOnlyPolicy, Alway
 
 #[tokio::test]
 async fn a_caller_who_may_read_but_not_write_is_refused_a_write_share() {
-    let issuer = issuer_over(ReadOnlyPolicy {
-        refuses: WriteOp::Update,
-    });
+    let issuer = issuer_over(ReadOnlyPolicy::refusing(WriteOp::Update));
     let caller = caller(Some("alice"), &[]);
 
     // The read share is unaffected: the write question is never asked.
@@ -631,9 +661,7 @@ async fn a_caller_who_may_do_both_gets_both_and_the_reply_says_which() {
     // a level the policy allows is certified in full. Creating is the refusal
     // precisely because a share cannot name it, so it never reaches the
     // policy.
-    let issuer = issuer_over(ReadOnlyPolicy {
-        refuses: WriteOp::Insert,
-    });
+    let issuer = issuer_over(ReadOnlyPolicy::refusing(WriteOp::Insert));
     let caller = caller(Some("alice"), &[]);
     let level = ShareLevel::read().with_update().with_delete();
 
@@ -649,18 +677,16 @@ async fn a_caller_who_may_do_both_gets_both_and_the_reply_says_which() {
 
     // The same shape of issuer can still say no, which keeps the positive half
     // honest.
-    issuer_over(ReadOnlyPolicy {
-        refuses: WriteOp::Delete,
-    })
-    .issue(
-        &caller,
-        "papers",
-        &[],
-        ShareLevel::read().with_delete(),
-        None,
-    )
-    .await
-    .expect_err("a refused verb is still refused");
+    issuer_over(ReadOnlyPolicy::refusing(WriteOp::Delete))
+        .issue(
+            &caller,
+            "papers",
+            &[],
+            ShareLevel::read().with_delete(),
+            None,
+        )
+        .await
+        .expect_err("a refused verb is still refused");
 }
 
 #[tokio::test]
@@ -669,7 +695,7 @@ async fn a_verb_the_caller_did_not_name_is_never_asked_about() {
     // over a row nobody may write still work. Refusing every verb and asking
     // about none must still mint.
     for refuses in [WriteOp::Insert, WriteOp::Update, WriteOp::Delete] {
-        issuer_over(ReadOnlyPolicy { refuses })
+        issuer_over(ReadOnlyPolicy::refusing(refuses))
             .issue(
                 &caller(Some("alice"), &[]),
                 "papers",
@@ -690,7 +716,7 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let issuer = CapabilityIssuer::new(
         authority,
-        Arc::new(connetto_server::PermissiveAuth),
+        Arc::new(RosterAuth::granting("alice").withholding(WITHHELD_ID)),
         Arc::new(AlwaysFound),
         &config,
     );
@@ -720,6 +746,36 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
         )
         .await
         .expect("exactly the ceiling is allowed");
+}
+
+#[tokio::test]
+async fn the_withheld_row_cannot_be_minted_into_a_share() {
+    // The roster withholds one row from everybody, including a granted caller.
+    // When the issuer reads that row and asks the policy, the verdict is never
+    // set to Allow, and the mint returns Unauthorized rather than a token.
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let policy = RosterAuth::granting("alice").withholding(WITHHELD_ID);
+    let issuer = CapabilityIssuer::new(
+        authority,
+        Arc::new(policy),
+        Arc::new(FixedRow(WITHHELD_ID)),
+        &config,
+    );
+    let refused = issuer
+        .issue(
+            &caller(Some("alice"), &[]),
+            "papers",
+            &[],
+            ShareLevel::read(),
+            None,
+        )
+        .await
+        .expect_err("the withheld row is refused to every caller");
+    assert!(
+        matches!(refused, ShareError::Unauthorized { .. }),
+        "expected Unauthorized for the withheld row, got {refused:?}"
+    );
 }
 
 #[tokio::test]

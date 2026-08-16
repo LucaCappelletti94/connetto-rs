@@ -30,11 +30,11 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_server::{
-    AbuseConfig, LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReaderReserve,
-    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, loopback,
+    AbuseConfig, LoopbackTransport, Materializer, PgSnapshotSource, ReaderReserve, RequestGuard,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, with_user};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID, with_user};
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -136,7 +136,7 @@ async fn setup(fixture: &Fixture, snail_secs: f64) -> Pool<AsyncPgConnection> {
     .await
 }
 
-type Manager = Arc<SessionManager<PgSnapshotSource, PermissiveAuth, ConnettoWatermark>>;
+type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark>>;
 
 /// Build a manager over the reader pool whose only unusual setting is the
 /// reserve, wired exactly as the binary wires it: the snapshot source, the
@@ -160,7 +160,13 @@ fn manager(reader: &Pool<AsyncPgConnection>) -> Manager {
         )
         .expect("build materializer"),
         PgSnapshotSource::from_ddl(reader.clone(), PG_DDL).expect("build snapshot source"),
-        PermissiveAuth,
+        // The unnamed caller is admitted because this fixture's whole subject is
+        // what the reader reserve does to an anonymous mutation: if the policy
+        // refused it first, the reserve boundary would never be reached and the
+        // test would observe an authorization refusal instead of the deferral.
+        RosterAuth::granting("alice")
+            .and_the_unnamed_caller()
+            .withholding(WITHHELD_ID),
         authority,
         pg_write_target::<ConnettoWatermark>(reader.clone(), PG_DDL).expect("build write target"),
         Arc::new(guard),
@@ -374,6 +380,34 @@ async fn an_identified_caller_completes_under_anonymous_saturation() {
     assert!(matches!(served_a, ControlMessage::SnapshotEnd(_)));
     let served_b = settle(&mut anon_b).await;
     assert!(matches!(served_b, ControlMessage::SnapshotEnd(_)));
+
+    // The withheld row is refused by the policy before any write reaches the
+    // database. Added after the occupancy assertion and after both slow reads
+    // settle, so this rejection (which never checks out a pool connection) does
+    // not affect the counts the test measured above.
+    {
+        let table = SimpleTable::new("fast_rows", &["id", "body"], &[0]);
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(WITHHELD_ID))
+            .expect("set withheld id")
+            .set(1, Value::Text("withheld".to_owned()))
+            .expect("set body");
+        let changeset = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+            .insert(insert)
+            .build();
+        let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress");
+        alice
+            .send_control(ControlMessage::MutationHeader(MutationHeader::new(1, 1)))
+            .await
+            .expect("send header");
+        alice
+            .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(1, payload)))
+            .await
+            .expect("send patch");
+        let ControlMessage::MutationReject(_) = next_control(&mut alice).await else {
+            panic!("the policy refuses writes to the withheld row");
+        };
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

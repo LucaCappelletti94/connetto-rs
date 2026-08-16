@@ -34,11 +34,10 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    AbuseConfig, LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, ThrottleConfig, TierLimits, loopback,
-    pg_write_target,
+    AbuseConfig, LoopbackTransport, Materializer, RequestGuard, SessionConfig, SessionManager,
+    Snapshot, SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
@@ -80,7 +79,7 @@ impl SnapshotSource for SeedSnapshot {
     }
 }
 
-type Manager = Arc<SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>>;
+type Manager = Arc<SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>>;
 
 /// Build a manager whose only unusual setting is the throttle.
 fn manager(fixture: &Fixture, throttle: ThrottleConfig) -> Manager {
@@ -88,7 +87,8 @@ fn manager(fixture: &Fixture, throttle: ThrottleConfig) -> Manager {
     SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        // Rows come from the SeedSnapshot stub, not the live path.
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -441,7 +441,7 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(CountingAuthority(Arc::clone(&checked))),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),

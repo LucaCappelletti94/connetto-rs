@@ -21,10 +21,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
 
@@ -91,10 +91,11 @@ async fn arrive(
 ) -> Arrival {
     let snapshot = CapturingSnapshot::default();
     let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
+    // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot.clone(),
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),

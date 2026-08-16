@@ -21,10 +21,10 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -138,7 +138,7 @@ async fn spawn_server(
     fixture: &Fixture,
     sessions: usize,
 ) -> (
-    Arc<SessionManager<RecordingSnapshot, PermissiveAuth, ConnettoWatermark>>,
+    Arc<SessionManager<RecordingSnapshot, RosterAuth, ConnettoWatermark>>,
     Arc<Mutex<Vec<String>>>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -151,7 +151,7 @@ async fn spawn_server(
     let manager = SessionManager::new(
         materializer,
         recorder,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -545,6 +545,32 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
         }
         joined.changed().await.expect("local join refresh");
     }
+
+    // Drive the withheld row through CDC. A matching note on the local side
+    // of the join gives the inner join a chance to produce a result if the
+    // policy failed to withhold the order.
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(notes::table)
+                .values((notes::id.eq(WITHHELD_ID), notes::body.eq("withheld")))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("seed withheld note");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, quantity) VALUES ({WITHHELD_ID}, 1)"
+        ))
+        .expect("withheld emu insert");
+    while let Some(event) = source.next_event().await.expect("poll event") {
+        manager.dispatch_event(&event).await.expect("dispatch");
+    }
+    client.ping(9).await.expect("ping");
+    wait_broadcast_strict(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 9 })).await;
+    assert!(
+        !joined.rows().iter().any(|row| row.0 == WITHHELD_ID),
+        "the withheld row must not reach the join"
+    );
 
     // Dropping the handle retires its whole-table subscriptions cleanly.
     drop(joined);

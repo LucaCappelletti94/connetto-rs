@@ -23,10 +23,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PermissiveAuth, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager,
-    Snapshot, SnapshotSource, loopback, pg_write_target,
+    Materializer, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
@@ -165,7 +165,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         EmptySnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("reader").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -250,6 +250,16 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
     // the reconnected stream, not the dying original.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    // The withheld row has quantity=1 (matching the predicate quantity > 0).
+    // It is inserted before id=2 so that once drain_until confirms id=2 arrived,
+    // the WITHHELD_ID event has already been processed and filtered.
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 3.0, 1, 'withheld')",
+        ),
+    )
+    .await;
     // Second insert must arrive once the ingest loop reconnects and resumes.
     exec(
         &admin,
@@ -266,5 +276,16 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         )
         .await,
         "client did not receive the post-drop insert, so CDC did not resume"
+    );
+    // WITHHELD_ID was inserted before id=2 on the reconnected stream. Now that
+    // id=2 is in the replica, all prior events (including WITHHELD_ID) have been
+    // processed. Assert the policy refused it.
+    let ids: Vec<i64> = orders::table
+        .select(orders::id)
+        .load(&mut replica)
+        .expect("read replica");
+    assert!(
+        !ids.contains(&WITHHELD_ID),
+        "withheld row reached the replica, policy was not consulted on the reconnected stream"
     );
 }

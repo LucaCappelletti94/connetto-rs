@@ -24,11 +24,11 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PermissiveAuth, PgOplog,
-    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PgOplog, RequestGuard,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -445,7 +445,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -501,6 +501,11 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')")
         .expect("insert 7");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager
             .dispatch_event(&event)
@@ -550,6 +555,32 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         "the local write is visible in the local replica",
     );
 
+    // A mutation targeting the withheld key is refused by the auth policy.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(client.conn())
+        .expect("optimistic withheld insert");
+    let withheld_seq = client
+        .push()
+        .await
+        .expect("push")
+        .expect("withheld mutation sent");
+    assert_eq!(withheld_seq, 1, "withheld mutation carries client_seq 1");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -588,7 +619,7 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -642,6 +673,11 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')")
         .expect("insert 7");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
     while let Some(event) = source.next_event().await.expect("poll source") {
         manager
             .dispatch_event(&event)
@@ -698,6 +734,31 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         ],
     );
 
+    // A mutation targeting the withheld key is refused by the auth policy.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(client.conn())
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -715,7 +776,7 @@ async fn connection_is_a_diesel_connection() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -798,6 +859,31 @@ async fn connection_is_a_diesel_connection() {
         "the typed write auto-submitted to the server",
     );
 
+    // A mutation targeting the withheld key is refused by the auth policy.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -813,7 +899,7 @@ async fn rejected_write_rolls_back_locally() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -903,6 +989,32 @@ async fn rejected_write_rolls_back_locally() {
         "the rejected write was rolled back locally",
     );
 
+    // A mutation targeting the withheld key is also refused (withheld overrides
+    // the writable catalog, but both are denied here regardless).
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -924,7 +1036,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -1021,6 +1133,31 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         "the conflicting write was rolled back locally",
     );
 
+    // A mutation targeting the withheld key is refused by the auth policy.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -1071,7 +1208,7 @@ async fn conflicting_write_converges_to_server_after_rollback() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -1181,6 +1318,11 @@ async fn conflicting_write_converges_to_server_after_rollback() {
             "INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 3, 'server')",
         )
         .expect("emu authoritative row");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
     while let Some(event) = source.next_event().await.expect("poll event") {
         manager
             .dispatch_event(&event)
@@ -1197,6 +1339,31 @@ async fn conflicting_write_converges_to_server_after_rollback() {
         orders(client_a.conn()),
         vec![order(1, 1.0, 3, "server")],
         "A converged to the server's authoritative row",
+    );
+
+    // A mutation targeting the withheld key is refused by the auth policy.
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client_a)
+        .expect("optimistic withheld insert");
+    client_a
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client_a, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
+            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused",
     );
 
     client_a.close().await.expect("close A");
@@ -1325,7 +1492,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -1411,7 +1578,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -1466,7 +1633,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
 /// Drive the emulator to completion, dispatching every produced CDC event
 /// through the manager so delta aggregates fold in-process.
 async fn drain_events<S, C, O>(
-    manager: &SessionManager<S, PermissiveAuth, ConnettoWatermark, C, O>,
+    manager: &SessionManager<S, RosterAuth, ConnettoWatermark, C, O>,
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
@@ -1547,7 +1714,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -1716,7 +1883,7 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -1798,7 +1965,7 @@ async fn an_aggregates_first_frame_is_its_full_result() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -1860,7 +2027,7 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -1923,7 +2090,7 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -1987,7 +2154,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -2070,6 +2237,26 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         }
     }
 
+    // Drive the withheld row through the change path. It must not reach the row
+    // replica. The aggregate folds it (an aggregate never consults the policy),
+    // and the row subscription denies it.
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
+    drain_events(&manager, &mut source).await;
+    client.ping(99).await.expect("ping");
+    pump_until(
+        &mut client,
+        |e| matches!(e, ClientEvent::Pong { nonce } if *nonce == 99),
+    )
+    .await;
+    assert!(
+        !orders(client.conn()).iter().any(|o| o.id == WITHHELD_ID),
+        "withheld row must not reach the row replica",
+    );
+
     client.close().await.expect("close");
     server.await.expect("join server");
 }
@@ -2087,7 +2274,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -2193,7 +2380,7 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -2255,6 +2442,11 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
         .expect("emu insert");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
     drain_events(&manager, &mut source).await;
     tokio::time::timeout(Duration::from_secs(5), live.changed())
         .await
@@ -2322,7 +2514,7 @@ async fn live_value_tracks_a_server_aggregate() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -2449,7 +2641,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -2535,7 +2727,7 @@ async fn identical_row_watches_share_one_subscription() {
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -2607,6 +2799,11 @@ async fn identical_row_watches_share_one_subscription() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 7, 'live')")
         .expect("emu insert");
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+        ))
+        .expect("emu insert withheld");
     drain_events(&manager, &mut source).await;
     tokio::time::timeout(Duration::from_secs(5), live_a.changed())
         .await
@@ -2690,7 +2887,7 @@ async fn distinct_row_queries_do_not_collapse() {
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -2770,7 +2967,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
     let manager = SessionManager::with_connector(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
@@ -2919,7 +3116,7 @@ async fn watch_fn_drives_a_boxed_row_query() {
     let manager = SessionManager::new(
         materializer,
         seed,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         gadgets_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -3036,7 +3233,7 @@ async fn watch_fn_shares_a_subscription_with_watch() {
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -3117,7 +3314,7 @@ async fn watch_fn_rejects_an_aggregate_query() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -3164,7 +3361,7 @@ async fn gated_server(
     release: &Arc<Notify>,
     rows: Vec<Order>,
 ) -> (
-    Arc<SessionManager<GatedSnapshot, PermissiveAuth, ConnettoWatermark>>,
+    Arc<SessionManager<GatedSnapshot, RosterAuth, ConnettoWatermark>>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
 ) {
@@ -3177,7 +3374,7 @@ async fn gated_server(
             release: Arc::clone(release),
             rows,
         },
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(fixture),
         Arc::new(RequestGuard::default()),
@@ -3198,7 +3395,7 @@ async fn gated_server(
 /// as the standing CDC ingestor does.
 async fn drive_cdc<S: SnapshotSource>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<S, PermissiveAuth, ConnettoWatermark>,
+    manager: &SessionManager<S, RosterAuth, ConnettoWatermark>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -3242,6 +3439,10 @@ async fn a_change_committed_during_the_snapshot_reaches_the_replica() {
         "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')",
     )
     .await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+    );
+    drive_cdc(&mut source, &manager, &withheld_sql).await;
 
     release.notify_one();
     pump_until(&mut client, |e| {
@@ -3303,6 +3504,10 @@ async fn the_snapshot_overlap_converges_on_the_later_value() {
         "UPDATE orders SET quantity = 6, status = 'v2' WHERE id = 7",
     )
     .await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+    );
+    drive_cdc(&mut source, &manager, &withheld_sql).await;
 
     release.notify_one();
     pump_until(&mut client, |e| {
@@ -3340,7 +3545,7 @@ async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -3388,6 +3593,10 @@ async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
         "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 9, 'busy')",
     )
     .await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 5, 'withheld')"
+    );
+    drive_cdc(&mut source, &manager, &withheld_sql).await;
     pump_for(&mut client, Duration::from_secs(2)).await;
     assert_eq!(
         orders(client.conn()),
@@ -3441,7 +3650,7 @@ async fn a_row_that_leaves_its_only_subscription_is_removed() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -3479,6 +3688,10 @@ async fn a_row_that_leaves_its_only_subscription_is_removed() {
         "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 9, 'busy')",
     )
     .await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 5, 'withheld')"
+    );
+    drive_cdc(&mut source, &manager, &withheld_sql).await;
     pump_for(&mut client, Duration::from_secs(2)).await;
     assert_eq!(
         orders(client.conn()),
@@ -3542,7 +3755,7 @@ async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         CursoredSeed,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         server_write_target(&fixture),
         Arc::new(RequestGuard::default()),
@@ -3644,11 +3857,11 @@ fn status_manager<O: Oplog>(
     fixture: &Fixture,
     status: &'static str,
     oplog: O,
-) -> Arc<SessionManager<StatusSnapshot, PermissiveAuth, ConnettoWatermark, NoConnector, O>> {
+) -> Arc<SessionManager<StatusSnapshot, RosterAuth, ConnettoWatermark, NoConnector, O>> {
     SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
         StatusSnapshot { status },
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
         oplog,
@@ -3661,7 +3874,7 @@ fn status_manager<O: Oplog>(
 /// Drive one insert through `manager`, whatever oplog it holds.
 async fn drive_insert<O: Oplog>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<StatusSnapshot, PermissiveAuth, ConnettoWatermark, NoConnector, O>,
+    manager: &SessionManager<StatusSnapshot, RosterAuth, ConnettoWatermark, NoConnector, O>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -3723,6 +3936,15 @@ async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
     )
     .await;
     pump_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+    );
+    drive_insert(&mut source, &first, &withheld_sql).await;
+    pump_for(&mut client, Duration::from_millis(500)).await;
+    assert!(
+        !orders(client.conn()).iter().any(|o| o.id == WITHHELD_ID),
+        "withheld row must not reach the replica on the live change path",
+    );
     assert!(
         persisted_cursor(client.conn()).is_some(),
         "the client leaves the first run holding a real resume position",
@@ -3818,6 +4040,15 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
     )
     .await;
     pump_until(&mut client, |e| matches!(e, ClientEvent::LivePatch { .. })).await;
+    let withheld_sql = format!(
+        "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
+    );
+    drive_insert(&mut source, &first, &withheld_sql).await;
+    pump_for(&mut client, Duration::from_millis(500)).await;
+    assert!(
+        !orders(client.conn()).iter().any(|o| o.id == WITHHELD_ID),
+        "withheld row must not reach the replica on the live change path",
+    );
     drop(client);
     server_one.abort();
 
@@ -3840,6 +4071,11 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
         "INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'late')",
     )
     .await;
+    // The row already exists from the first run, so this leg updates it. An
+    // update whose both versions are invisible delivers nothing at all, which is
+    // the case the catchup path has to get right.
+    let withheld_sql2 = format!("UPDATE orders SET status = 'withheld2' WHERE id = {WITHHELD_ID}");
+    drive_insert(&mut source, &second, &withheld_sql2).await;
     let mut client = connect_client(addr, "client-a", &db_path).await;
     client.subscribe("orders", QUERY).await.expect("subscribe");
     let seen = pump_for(&mut client, Duration::from_secs(2)).await;
@@ -3860,6 +4096,10 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
         ],
         "the missed change arrived on its own, and the snapshot's newer value \
          did not, which is what makes this a catchup rather than a resync",
+    );
+    assert!(
+        !orders(client.conn()).iter().any(|o| o.id == WITHHELD_ID),
+        "withheld row must not arrive via the reconnect catchup path",
     );
 
     drop(client);

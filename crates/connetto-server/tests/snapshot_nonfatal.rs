@@ -19,10 +19,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, OplogConfig, PermissiveAuth, RequestGuard,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, OplogConfig, RequestGuard, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
 use subql::{CdcSource, PgSqliteEmuSource};
 
@@ -63,10 +63,11 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     let manager = SessionManager::new(
         materializer,
         BrokenSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -152,7 +153,7 @@ async fn refusals_are_byte_identical_across_causes() {
     let manager = SessionManager::new(
         materializer,
         BrokenSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -263,7 +264,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
     let manager = SessionManager::with_oplog(
         materializer,
         BrokenSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
         oplog,

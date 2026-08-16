@@ -41,11 +41,13 @@ use connetto_server::audit::{AUTH_OP_TYPE, AuthOp, pg_audit_hook};
 use connetto_server::ban::Instant;
 use connetto_server::{
     AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
-    EnforcementPolicy, LoopbackTransport, Materializer, NewBan, PermissiveAuth, PersonLimits,
-    RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, ThrottleConfig,
-    TierLimits, connetto_audit_table, connetto_ban_table, loopback, pg_ban_store, pg_write_target,
+    EnforcementPolicy, LoopbackTransport, Materializer, NewBan, PersonLimits, RequestGuard,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, ThrottleConfig, TierLimits,
+    connetto_audit_table, connetto_ban_table, loopback, pg_ban_store, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RowValue, insert_changeset};
+use connetto_test_harness::{
+    ConnettoWatermark, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
+};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -400,6 +402,19 @@ async fn probe(client: &mut LoopbackTransport, sub_id: &str) {
     assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
 }
 
+/// The policy for a fixture that puts no question to it (R9).
+///
+/// Every test here either has its handshake refused, or probes a table that
+/// does not resolve and is refused before any row moves, or takes a snapshot
+/// from the `KeyedSnapshot` stub, and connetto routes a snapshot through the
+/// database rather than through the policy. The one test that dispatches a
+/// change installs `DenyAll` instead, because a filtered read is what it is
+/// about. So the roster grants nobody, and `granting_nobody` is greppable as
+/// the census of fixtures that ask nothing.
+fn silent_policy() -> RosterAuth {
+    RosterAuth::granting_nobody().withholding(WITHHELD_ID)
+}
+
 /// The ban on `user`, read with the owner's connection.
 async fn ban_row(pool: &Pool<AsyncPgConnection>, user: &str) -> Option<(String, Option<Instant>)> {
     let mut conn = pool.get().await.expect("owner connection");
@@ -476,7 +491,7 @@ async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut live = connect(&manager, "prober", &["user:alice#one"]).await;
     probe(&mut live.client, "ghost-0").await;
@@ -523,7 +538,7 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
             asked: Arc::clone(&asked),
         })),
     );
-    let bounded_manager = manager(&fixture, PermissiveAuth, &bounded);
+    let bounded_manager = manager(&fixture, silent_policy(), &bounded);
     let mut live = connect(&bounded_manager, "bounded", &["user:carol#one"]).await;
     probe(&mut live.client, "ghost-0").await;
     probe(&mut live.client, "ghost-1").await;
@@ -545,7 +560,7 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
             asked: Arc::clone(&declined),
         })),
     );
-    let lenient_manager = manager(&fixture, PermissiveAuth, &lenient);
+    let lenient_manager = manager(&fixture, silent_policy(), &lenient);
     let mut tolerated = connect(&lenient_manager, "lenient", &["user:dave#one"]).await;
     probe(&mut tolerated.client, "ghost-0").await;
     probe(&mut tolerated.client, "ghost-1").await;
@@ -569,7 +584,7 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
     let bans = pg_ban_store::<ConnettoBans>(fixture.admin().clone());
     let session = connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4());
 
@@ -711,7 +726,7 @@ async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
             asked: Arc::clone(&asked),
         })),
     );
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut live = connect(&manager, "visitor", &[]).await;
     probe(&mut live.client, "ghost-0").await;
@@ -751,7 +766,7 @@ async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone(
         .await;
 
     let guard = guard(&fixture, limits(2, 1), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
     let bans = pg_ban_store::<ConnettoBans>(fixture.admin().clone());
     bans.impose(NewBan::starting_now(
         "heidi".to_owned(),
@@ -861,7 +876,7 @@ async fn a_persons_tally_survives_signing_out_and_back_in() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(3, 2), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut first = connect(&manager, "judy", &["user:judy#one"]).await;
     probe(&mut first.client, "ghost-0").await;
@@ -889,7 +904,7 @@ async fn one_person_on_two_connections_accumulates_once_and_both_close() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(3, 2), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut laptop = connect(&manager, "ken-laptop", &["user:ken#laptop"]).await;
     let mut phone = connect(&manager, "ken-phone", &["user:ken#phone"]).await;
@@ -915,7 +930,7 @@ async fn revoking_a_share_produces_no_grant_refusal() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut live = connect(&manager, "holder", &[REVOKED_KEY]).await;
     let settled = subscribe(&mut live.client, "shared", QUERY).await;
@@ -973,7 +988,7 @@ async fn a_tripped_credential_limit_still_counts_its_refusals() {
         abuse,
         None,
     );
-    let manager = manager(&fixture, PermissiveAuth, &guard);
+    let manager = manager(&fixture, silent_policy(), &guard);
 
     // Each attempt spends its whole credential allowance and is closed for it,
     // so nothing here ever reaches the run loop.

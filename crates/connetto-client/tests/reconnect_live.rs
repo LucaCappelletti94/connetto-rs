@@ -18,10 +18,10 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -108,7 +108,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
+type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>;
 
 /// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
 type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
@@ -152,6 +152,25 @@ async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
             .await
             .expect("dispatch event");
     }
+}
+
+/// Drive the one row the policy withholds, so a test can assert it never
+/// arrives (R9).
+async fn drive_withheld(source: &mut PgSqliteEmuSource, manager: &Manager) {
+    drive(
+        source,
+        manager,
+        &format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"
+        ),
+    )
+    .await;
+}
+
+/// The file-backed replica, opened under the test key.
+fn file_replica(path: &str) -> Replica<'_, connetto_client::Encrypted> {
+    Replica::encrypted_file(path, Some(connetto_core::test_support::replica_key()))
+        .expect("key provided")
 }
 
 /// The latest serve task, so a test can kill the live session.
@@ -236,7 +255,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -301,6 +320,15 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         live.changed().await.expect("live refresh after resume");
     }
 
+    // Drive the withheld row: whole-table subscription, no predicate, so
+    // it would arrive if the policy allowed it.
+    drive_withheld(&mut source, &manager).await;
+    fence(&client, 2).await;
+    assert!(
+        !live.rows().iter().any(|row| row.id == WITHHELD_ID),
+        "the withheld row must not arrive via the change path"
+    );
+
     // The event stream pins the mechanism: attempts were announced, the
     // session resumed exactly once, and the initial subscribe was the only
     // snapshot (catchup replays, it never re-snapshots).
@@ -345,7 +373,7 @@ async fn offline_write_reflushes_after_resume() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -402,16 +430,43 @@ async fn offline_write_reflushes_after_resume() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The upload was accepted, never rejected or conflicted.
-    while let Ok(event) = events.try_recv() {
+    // Only now the withheld write, and deliberately not in the offline batch
+    // above: a mutation is refused whole when one of its operations is, so
+    // capturing both together would have refused the row this test is about.
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(orders::table)
+                .values((
+                    orders::id.eq(WITHHELD_ID),
+                    orders::price.eq(1.0_f64),
+                    orders::quantity.eq(1_i64),
+                    orders::status.eq("withheld"),
+                ))
+                .execute(conn.conn())
+                .expect("withheld insert")
+        })
+        .await;
+
+    // Wait for the policy to refuse the withheld write.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("timeout waiting for withheld write refusal")
+            .expect("event stream closed");
         assert!(
-            !matches!(
-                event,
-                ClientEvent::MutationRejected { .. } | ClientEvent::MutationConflict { .. }
-            ),
-            "the re-flushed write must apply cleanly, got {event:?}"
+            !matches!(event, ClientEvent::MutationConflict { .. }),
+            "unexpected conflict: {event:?}"
         );
+        if matches!(event, ClientEvent::MutationRejected { .. }) {
+            break;
+        }
     }
+    // The withheld row must not have reached the server target.
+    assert!(
+        target_rows(&fixture, WITHHELD_ID).await.is_empty(),
+        "the withheld write must not reach the server"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -429,7 +484,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -445,11 +500,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let first = config("restart-first");
     let conn = ConnettoConnection::connect(
         transport,
-        &Replica::encrypted_file(
-            &replica_path,
-            Some(connetto_core::test_support::replica_key()),
-        )
-        .expect("key provided"),
+        &file_replica(&replica_path),
         SQLITE_DDL,
         &first,
         None,
@@ -495,11 +546,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let second = config("restart-second");
     let conn = ConnettoConnection::connect_existing(
         transport,
-        &Replica::encrypted_file(
-            &replica_path,
-            Some(connetto_core::test_support::replica_key()),
-        )
-        .expect("key provided"),
+        &file_replica(&replica_path),
         &second,
         None,
     )
@@ -521,6 +568,15 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     while !live.rows().iter().any(|row| row.id == 50) {
         live.changed().await.expect("second live refresh");
     }
+
+    // Drive the withheld row: whole-table subscription, no predicate, so
+    // it would arrive if the policy allowed it.
+    drive_withheld(&mut source, &manager).await;
+    fence(&client, 2).await;
+    assert!(
+        !live.rows().iter().any(|row| row.id == WITHHELD_ID),
+        "the withheld row must not arrive via catchup"
+    );
 
     // Catchup replayed the missed row: no snapshot leg ran at all.
     let mut snapshots = 0;

@@ -34,9 +34,8 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::openfga::{Counted, FgaAuth};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, PgSnapshotSource, ReconnectPolicy,
-    RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    loopback, pg_write_target,
+    LoopbackTransport, Materializer, PgSnapshotSource, ReconnectPolicy, RequestGuard, RlsAuth,
+    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -54,6 +53,9 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::task::JoinHandle;
 
 pub mod fanout;
+pub mod roster;
+
+pub use roster::{RosterAuth, WITHHELD_ID};
 
 /// The value type carried in an uploaded changeset: SQLite text keys and blob
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
@@ -306,8 +308,8 @@ impl Fixture {
 /// methods do not otherwise guarantee it for a generic parameter. Mirrors the
 /// server binary's `ServerAuth`.
 pub enum HarnessAuth {
-    /// Authorize every read and write (no RLS).
-    Permissive(PermissiveAuth),
+    /// Authorize the callers a fixture wrote down, and nobody else (R9).
+    Roster(RosterAuth),
     /// Authorize through Postgres Row-Level Security.
     Rls(Box<RlsAuth>),
     /// Authorize the way the shipped binary does: from the changed row where
@@ -344,10 +346,10 @@ pub enum HarnessAuthError {
 }
 
 impl HarnessAuth {
-    /// The permissive policy: every read and write is allowed.
+    /// The stand-in policy: it grants the callers the fixture named.
     #[must_use]
-    pub fn permissive() -> Self {
-        Self::Permissive(PermissiveAuth)
+    pub const fn roster(auth: RosterAuth) -> Self {
+        Self::Roster(auth)
     }
 
     /// The RLS policy: reads and writes run under Postgres Row-Level Security.
@@ -384,7 +386,7 @@ impl VisibilityPolicy for HarnessAuth {
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
         match self {
-            Self::Permissive(auth) => auth
+            Self::Roster(auth) => auth
                 .may_see(row, watchers, verdicts)
                 .await
                 .map_err(|e| match e {}),
@@ -410,7 +412,7 @@ impl VisibilityPolicy for HarnessAuth {
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
         match self {
-            Self::Permissive(auth) => auth.may_write(write, watcher).await.map_err(|e| match e {}),
+            Self::Roster(auth) => auth.may_write(write, watcher).await.map_err(|e| match e {}),
             Self::Rls(auth) => Ok(auth.may_write(write, watcher).await?),
             Self::Fga(auth) => Ok(auth.may_write(write, watcher).await?),
             Self::Reachable(up, auth) => {

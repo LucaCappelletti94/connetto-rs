@@ -18,10 +18,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, WebSocketTransport, loopback, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
+    WebSocketTransport, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -167,7 +167,7 @@ async fn loopback_session_full_lifecycle() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -260,6 +260,17 @@ async fn loopback_session_full_lifecycle() {
         vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 5, "paid")]
     );
 
+    // 3 credits remain after the id=7 patch consumed one. The withheld row
+    // travels the change path but the policy suppresses it. Credits are open,
+    // so absence proves the policy, not credit starvation.
+    drive_cdc(
+        &mut source,
+        &manager,
+        &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
+    )
+    .await;
+    expect_idle(&mut client).await;
+
     // Unsubscribe, then confirm no further delivery for that subscription.
     client
         .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -296,7 +307,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("client-ws").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -374,6 +385,16 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         orders(&mut replica),
         vec![order(1, 1.0, 3, "seed"), order(7, 9.5, 5, "paid")]
     );
+
+    // The withheld row travels the change path but the policy suppresses it.
+    // quantity=1 matches the subscription predicate, so absence proves the policy.
+    drive_cdc(
+        &mut source,
+        &manager,
+        &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
+    )
+    .await;
+    expect_idle(&mut client).await;
 
     client.close().await.expect("close client");
     server.await.expect("join server");

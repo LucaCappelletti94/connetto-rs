@@ -17,11 +17,11 @@ use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Tra
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
     AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, Materializer,
-    OidcProviderConfig, PermissiveAuth, ProviderRegistry, RedirectPolicy, RequestGuard,
-    ResolvedIdentity, SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority,
-    auth_router, loopback, pg_write_target,
+    OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
+    pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use oauth2_test_server::{IssuerConfig, OAuthTestServer};
 use openidconnect::reqwest;
 use serde_json::json;
@@ -87,11 +87,12 @@ fn manager_with(
     authority: Arc<dyn HandshakeAuthority>,
     snapshot: CapturingSnapshot,
     fixture: &Fixture,
-) -> Arc<SessionManager<CapturingSnapshot, PermissiveAuth, ConnettoWatermark>> {
+) -> Arc<SessionManager<CapturingSnapshot, RosterAuth, ConnettoWatermark>> {
+    // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         snapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),

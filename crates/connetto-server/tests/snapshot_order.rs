@@ -24,10 +24,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
@@ -117,10 +117,11 @@ async fn drain_to_barrier<T: Transport>(transport: &mut T, nonce: u64) -> Vec<St
 #[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn snapshot_order_holds_when_the_credit_window_is_closed() {
     let fixture = Fixture::acquire().await;
+    // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),

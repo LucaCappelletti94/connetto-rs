@@ -25,10 +25,10 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::QueryableByName;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -234,7 +234,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         target,
         Arc::new(RequestGuard::default()),
@@ -269,6 +269,23 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     match barrier(&mut client, 2).await {
         ControlMessage::Pong(_) => {}
         other => panic!("expected pong after reject, got {other:?}"),
+    }
+
+    // The stand-in refuses the withheld key. The owner is "alice" so Postgres
+    // would permit it, and refusal comes from the roster alone.
+    upload(
+        &mut client,
+        3,
+        insert_changeset(WITHHELD_ID, "alice", "withheld", "t1"),
+    )
+    .await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 3),
+        other => panic!("stand-in must refuse the withheld key, got {other:?}"),
+    }
+    match barrier(&mut client, 3).await {
+        ControlMessage::Pong(_) => {}
+        other => panic!("expected pong after withheld reject, got {other:?}"),
     }
 
     // Postgres holds only the owned row.
@@ -306,7 +323,7 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         target,
         Arc::new(RequestGuard::default()),
@@ -331,6 +348,23 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
     match barrier(&mut client, 1).await {
         ControlMessage::Pong(_) => {}
         other => panic!("expected pong after the reject, got {other:?}"),
+    }
+
+    // The stand-in refuses the withheld key. The owner is "alice" so Postgres
+    // would permit it, and refusal comes from the roster alone.
+    upload(
+        &mut client,
+        3,
+        insert_changeset(WITHHELD_ID, "alice", "withheld", "t1"),
+    )
+    .await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 3),
+        other => panic!("stand-in must refuse the withheld key, got {other:?}"),
+    }
+    match barrier(&mut client, 3).await {
+        ControlMessage::Pong(_) => {}
+        other => panic!("expected pong after withheld reject, got {other:?}"),
     }
 
     // The row is untouched, so nothing was left half-applied.
@@ -366,7 +400,12 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
         SessionManager::new(
             materializer,
             NoSnapshot,
-            PermissiveAuth,
+            // Admit the unnamed caller so the seq-1 refusal comes from Postgres, not from
+            // here. If the stand-in refused it, both inserts would fail the same way and
+            // the test would prove nothing about the capability.
+            RosterAuth::granting(KEY)
+                .and_the_unnamed_caller()
+                .withholding(WITHHELD_ID),
             Arc::new(TestGrantChecker),
             pg_write_target::<ConnettoWatermark>(writer_pool.clone(), PG_DDL)
                 .expect("build write target"),
@@ -411,6 +450,22 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
         other => panic!("expected pong after the reject, got {other:?}"),
     }
 
+    // seq 3: the stand-in refuses the withheld key. The owner is KEY so Postgres
+    // would permit it, and the refusal comes from the roster alone.
+    upload(
+        &mut client,
+        3,
+        insert_changeset(WITHHELD_ID, KEY, "withheld", "t1"),
+    )
+    .await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => assert_eq!(reject.client_seq, 3),
+        other => panic!("stand-in must refuse the withheld key, got {other:?}"),
+    }
+    match barrier(&mut client, 2).await {
+        ControlMessage::Pong(_) => {}
+        other => panic!("expected pong after withheld reject, got {other:?}"),
+    }
     assert_eq!(notes(&admin).await, vec![(1, KEY.to_owned())]);
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");

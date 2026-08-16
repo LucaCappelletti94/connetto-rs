@@ -17,10 +17,10 @@ use connetto_core::auth::Principal;
 use connetto_core::messages::{ControlMessage, MutationRejectReason};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
+    SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture};
+use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -220,7 +220,7 @@ async fn write_path_applies_conflicts_and_dedups() {
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("writer").withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -311,6 +311,22 @@ async fn write_path_applies_conflicts_and_dedups() {
         ]
     );
 
+    client
+        .upload(5, insert_changeset(WITHHELD_ID, "withheld", "tw"))
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected rejection of withheld-row write");
+    };
+    assert_eq!(reject.client_seq, 5);
+    assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+    assert!(
+        !notes(fixture.admin())
+            .await
+            .iter()
+            .any(|n| i64::from(n.id) == WITHHELD_ID),
+        "withheld row must not appear in Postgres"
+    );
+
     client.close().await;
     server.await.expect("join server").expect("session ok");
 }
@@ -377,7 +393,9 @@ async fn watermark_survives_reconnect_reusing_session() {
     let manager = SessionManager::new(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("alice")
+            .and("bob")
+            .withholding(WITHHELD_ID),
         test_verifier(),
         target,
         Arc::new(RequestGuard::default()),
@@ -455,6 +473,22 @@ async fn watermark_survives_reconnect_reusing_session() {
         ],
         "the replay applied nothing new: exactly-once held across the reconnect"
     );
+    client
+        .upload(4, insert_changeset(WITHHELD_ID, "withheld", "tw"))
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected rejection of withheld-row write");
+    };
+    assert_eq!(reject.client_seq, 4);
+    assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+    assert!(
+        !notes(fixture.admin())
+            .await
+            .iter()
+            .any(|n| i64::from(n.id) == WITHHELD_ID),
+        "withheld row must not appear in Postgres"
+    );
+
     client.close().await;
     server.await.expect("join server 2").expect("session 2 ok");
 

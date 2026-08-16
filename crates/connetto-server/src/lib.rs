@@ -48,7 +48,6 @@ pub use abuse::{
     AbuseConfig, AbuseConfigError, AbuseLimits, ConnectionLimits, Crossing, Enforcement,
     EnforcementFuture, EnforcementPolicy, PersonLimits, Signal,
 };
-pub use auth::PermissiveAuth;
 pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
 pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError, ShareLevel};

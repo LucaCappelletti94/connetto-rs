@@ -15,10 +15,10 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
@@ -95,7 +95,7 @@ impl SnapshotSource for NoSnapshot {
     }
 }
 
-type Manager = SessionManager<NoSnapshot, PermissiveAuth, ConnettoWatermark, QueuedConnector>;
+type Manager = SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark, QueuedConnector>;
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
@@ -137,7 +137,8 @@ async fn reexec_bootstraps_folds_and_retriggers() {
     let manager = SessionManager::with_connector(
         materializer,
         NoSnapshot,
-        PermissiveAuth,
+        // Aggregate results never go through the policy.
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connector,
         target,

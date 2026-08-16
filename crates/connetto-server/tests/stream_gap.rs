@@ -27,11 +27,11 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, Oplog, OplogConfig, PermissiveAuth,
-    PgOplog, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    catchup_decision, loopback, pg_write_target, slot,
+    CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, Oplog, OplogConfig, PgOplog,
+    RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, catchup_decision,
+    loopback, pg_write_target, slot,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, PgSqliteEmuSource};
 
 /// Its own slot and table names, so this never contends with the shared fixture
@@ -242,7 +242,8 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
     let manager = SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
         NoSnapshot,
-        PermissiveAuth,
+        // This suite opens no subscription, so the policy is never consulted.
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connetto_server::NoConnector,
         PgOplog::new(admin.clone(), OPLOG, OplogConfig::default()),

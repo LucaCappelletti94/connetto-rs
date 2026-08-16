@@ -26,15 +26,15 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, PermissiveAuth,
-    RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
-    pg_write_target,
+    InMemoryOplog, LoopbackTransport, Materializer, NoConnector, OplogConfig, RequestGuard,
+    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::backend::CdcEvent;
+use subql::backend::{CdcEvent, Postgres};
+use subql::visibility::VisibilityPolicy;
 use subql::{CdcSource, ChangeEvent, PgSqliteEmuSource};
 
 const PG_DDL: &str =
@@ -153,11 +153,15 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// Execute `sql` against the emulated backend, route every resulting event
 /// through the manager (which appends to the oplog), and return the events.
 /// The emulator stamps monotonic LSNs, which the LSN-keyed oplog relies on.
-async fn drive(
+async fn drive<A>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>,
+    manager: &SessionManager<SeedSnapshot, A, ConnettoWatermark>,
     sql: &str,
-) -> Vec<ChangeEvent> {
+) -> Vec<ChangeEvent>
+where
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
+    A::Error: core::fmt::Display,
+{
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();
     while let Some(event) = source.next_event().await.expect("poll source") {
@@ -181,11 +185,18 @@ fn cursor_of(event: &ChangeEvent) -> Cursor {
 
 /// Open a session on `manager`, send the handshake carrying `resume`, and read
 /// the ack. Returns the client half and the server task handle.
-async fn open_session(
-    manager: &Arc<SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>>,
+async fn open_session<A>(
+    manager: &Arc<SessionManager<SeedSnapshot, A, ConnettoWatermark>>,
     client_id: &str,
     resume: Option<Cursor>,
-) -> (LoopbackTransport, tokio::task::JoinHandle<()>) {
+) -> (LoopbackTransport, tokio::task::JoinHandle<()>)
+where
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>
+        + Send
+        + Sync
+        + 'static,
+    A::Error: core::fmt::Display + Send,
+{
     let (server_transport, mut client) = loopback();
     let server = manager.clone();
     let handle = tokio::spawn(async move {
@@ -226,7 +237,7 @@ async fn catchup_within_window_streams_missed_ops() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -272,6 +283,15 @@ async fn catchup_within_window_streams_missed_ops() {
         .await,
     );
     events.extend(drive(&mut source, &manager, "DELETE FROM orders WHERE id = 2").await);
+    // Drive the withheld row into the oplog while the client is disconnected.
+    // quantity=1 matches the subscription predicate, so its absence after
+    // reconnect proves the policy suppresses it on the catchup path.
+    drive(
+        &mut source,
+        &manager,
+        &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
+    )
+    .await;
     assert_eq!(events.len(), 5, "one CDC event per statement");
 
     // Build the client's replica as of the second event (the synced prefix).
@@ -337,7 +357,7 @@ async fn cursor_outside_window_forces_full_resync() {
     let manager = SessionManager::with_oplog(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
         oplog,
@@ -384,6 +404,16 @@ async fn cursor_outside_window_forces_full_resync() {
     assert_eq!(end.sub_id, "orders");
     expect_idle(&mut client).await;
 
+    // Drive the withheld row through the live change path after the resync.
+    // quantity=1 matches the subscription predicate, so absence proves the policy.
+    drive(
+        &mut source,
+        &manager,
+        &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
+    )
+    .await;
+    expect_idle(&mut client).await;
+
     client.close().await.expect("close client");
     server.await.expect("join server");
 }
@@ -396,7 +426,7 @@ async fn tombstone_replays_the_delete() {
     let manager = SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -416,6 +446,15 @@ async fn tombstone_replays_the_delete() {
         .await,
     );
     events.extend(drive(&mut source, &manager, "DELETE FROM orders WHERE id = 1").await);
+    // Drive the withheld row into the oplog before reconnect so it falls in the
+    // catchup window. quantity=1 matches the subscription predicate, so its
+    // absence after reconnect proves the policy suppresses it on the catchup path.
+    drive(
+        &mut source,
+        &manager,
+        &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
+    )
+    .await;
     assert_eq!(events.len(), 2);
 
     // The client synced through the insert and holds the row locally.

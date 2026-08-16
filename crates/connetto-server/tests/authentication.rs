@@ -18,10 +18,10 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession};
 use connetto_server::{
-    Materializer, PermissiveAuth, RequestGuard, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, loopback, pg_write_target,
+    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
+    pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
 
@@ -115,10 +115,11 @@ async fn absent_grant_yields_an_unidentified_run() {
     let fixture = Fixture::acquire().await;
     let capture = CapturingSnapshot::default();
     let seen = Arc::clone(&capture.seen);
+    // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -180,7 +181,7 @@ async fn refused_grant_yields_an_unidentified_run() {
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(AlwaysReject),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -243,7 +244,7 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
         capture,
-        PermissiveAuth,
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(FixedVerifier(resolved.clone())),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),

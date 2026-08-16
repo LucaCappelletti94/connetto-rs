@@ -13,10 +13,11 @@ use std::str::FromStr as _;
 use std::time::Duration;
 
 use connetto_core::SessionId;
-use connetto_core::messages::{ControlMessage, FatalErrorReason};
+use connetto_core::messages::{ControlMessage, FatalErrorReason, MutationRejectReason};
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, insert_changeset, provision_watermark, spawn_server,
+    Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, insert_changeset,
+    provision_watermark, spawn_server,
 };
 use sqlite_diff_rs::Value;
 
@@ -45,7 +46,12 @@ async fn serve(fixture: &Fixture) -> Server {
                 .build(),
         ),
         snapshot,
-        HarnessAuth::permissive(),
+        HarnessAuth::roster(
+            RosterAuth::granting("alice")
+                .and("bob")
+                .and("carol")
+                .withholding(WITHHELD_ID),
+        ),
         fixture.admin().clone(),
         fixture.admin().clone(),
     )
@@ -190,6 +196,15 @@ async fn a_second_connection_on_one_handle_supersedes_the_first() {
     // The survivor is fully live: it subscribes and receives its snapshot.
     second.subscribe("notes", "SELECT * FROM notes").await;
     let _ = second.expect_snapshot("notes").await;
+    fixture
+        .exec(&format!(
+            "INSERT INTO notes (id, body, edited_at) VALUES ({WITHHELD_ID}, 'withheld', 't0')"
+        ))
+        .await;
+    assert!(
+        second.try_live(Duration::from_secs(5)).await.is_none(),
+        "the withheld row must not reach the subscriber"
+    );
     second.close().await;
     drop(server);
 }
@@ -224,6 +239,15 @@ async fn a_handle_does_not_survive_a_change_of_caller() {
     // Superseding alice's handle would have closed bob, so prove bob is live.
     bob.subscribe("notes", "SELECT * FROM notes").await;
     let _ = bob.expect_snapshot("notes").await;
+    fixture
+        .exec(&format!(
+            "INSERT INTO notes (id, body, edited_at) VALUES ({WITHHELD_ID}, 'withheld', 't0')"
+        ))
+        .await;
+    assert!(
+        bob.try_live(Duration::from_secs(5)).await.is_none(),
+        "the withheld row must not reach bob"
+    );
     bob.close().await;
     drop(server);
 }
@@ -247,6 +271,15 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     match first.next_control().await {
         ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
         other => panic!("the upload should apply, got {other:?}"),
+    }
+    first.upload(2, note(WITHHELD_ID, "withheld")).await;
+    match first.next_control().await {
+        ControlMessage::MutationReject(reject) => assert_eq!(
+            reject.reason,
+            MutationRejectReason::Unauthorized,
+            "the withheld write must be refused as unauthorized"
+        ),
+        other => panic!("the withheld write must be refused, got {other:?}"),
     }
     first.close().await;
 

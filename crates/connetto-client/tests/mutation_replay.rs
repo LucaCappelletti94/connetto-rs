@@ -19,10 +19,10 @@ use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
-    LoopbackTransport, Materializer, PermissiveAuth, RequestGuard, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -112,7 +112,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, PermissiveAuth, ConnettoWatermark>;
+type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>;
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
@@ -141,7 +141,7 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
     SessionManager::new(
         materializer,
         SeedSnapshot,
-        PermissiveAuth,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
@@ -298,6 +298,27 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
         "the replay applied"
     );
     assert_eq!(pending_count(&mut conn), 0, "the ack retired the record");
+    insert_local(&mut conn, WITHHELD_ID);
+    let withheld_seq = conn
+        .push()
+        .await
+        .expect("push")
+        .expect("withheld mutation sent");
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationRejected { client_seq, .. } => {
+                assert_eq!(client_seq, withheld_seq, "withheld row write refused");
+                break;
+            }
+            ClientEvent::Closed => panic!("closed before withheld rejection"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        target_rows(&fixture, WITHHELD_ID).await.len(),
+        0,
+        "withheld row must not appear in Postgres"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -354,6 +375,27 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
         target_rows(&fixture, 61).await.len(),
         1,
         "exactly one apply, the dedupe swallowed the would-be replay"
+    );
+    insert_local(&mut conn, WITHHELD_ID);
+    let withheld_seq = conn
+        .push()
+        .await
+        .expect("push")
+        .expect("withheld mutation sent");
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationRejected { client_seq, .. } => {
+                assert_eq!(client_seq, withheld_seq, "withheld row write refused");
+                break;
+            }
+            ClientEvent::Closed => panic!("closed before withheld rejection"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        target_rows(&fixture, WITHHELD_ID).await.len(),
+        0,
+        "withheld row must not appear in Postgres"
     );
 }
 
@@ -415,4 +457,25 @@ async fn restart_replays_persisted_pending() {
         "the restart replay applied"
     );
     assert_eq!(pending_count(&mut conn), 0, "the ack retired the record");
+    insert_local(&mut conn, WITHHELD_ID);
+    let withheld_seq = conn
+        .push()
+        .await
+        .expect("push")
+        .expect("withheld mutation sent");
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationRejected { client_seq, .. } => {
+                assert_eq!(client_seq, withheld_seq, "withheld row write refused");
+                break;
+            }
+            ClientEvent::Closed => panic!("closed before withheld rejection"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        target_rows(&fixture, WITHHELD_ID).await.len(),
+        0,
+        "withheld row must not appear in Postgres"
+    );
 }

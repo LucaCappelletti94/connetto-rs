@@ -2,57 +2,11 @@
 //!
 //! Every authorization question goes through subql's [`VisibilityPolicy`], so
 //! what answers it is an implementation detail rather than a structural
-//! commitment. Until `OpenFGA` and `rls2fga` land, [`PermissiveAuth`] is the
-//! stand-in and [`RlsAuth`] is the real one.
+//! commitment. The shipped answer is `FgaAuth` (R5b) and [`RlsAuth`] is the
+//! row-level-security one, kept as the second opinion `ParityAuth` compares
+//! against.
 //!
 //! [`VisibilityPolicy`]: subql::visibility::VisibilityPolicy
-
-use std::convert::Infallible;
-use std::sync::Arc;
-
-use connetto_core::auth::Principal;
-use subql::backend::Postgres;
-use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-
-/// A permissive policy that grants every read and write.
-///
-/// The stand-in until `OpenFGA` and `rls2fga` land. It authorizes
-/// unconditionally, so it must not front a production deployment.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PermissiveAuth;
-
-impl VisibilityPolicy for PermissiveAuth {
-    type Watcher = Arc<Principal>;
-    type Error = Infallible;
-    type Backend = Postgres;
-
-    fn may_see<R>(
-        &self,
-        _row: &R,
-        watchers: &[Self::Watcher],
-        verdicts: &mut [Verdict],
-    ) -> impl Future<Output = Result<(), Infallible>> + Send
-    where
-        R: RowView<Backend = Postgres> + Sync + ?Sized,
-    {
-        for verdict in verdicts.iter_mut().take(watchers.len()) {
-            *verdict = Verdict::Allow;
-        }
-        async { Ok(()) }
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn may_write<R>(
-        &self,
-        _write: RowWrite<'_, R>,
-        _watcher: &Self::Watcher,
-    ) -> Result<Verdict, Infallible>
-    where
-        R: RowView<Backend = Postgres> + Sync + ?Sized,
-    {
-        Ok(Verdict::Allow)
-    }
-}
 
 pub use rls::{RlsAuth, RlsAuthError};
 
