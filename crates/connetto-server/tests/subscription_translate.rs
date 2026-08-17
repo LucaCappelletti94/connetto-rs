@@ -197,3 +197,43 @@ fn registers_the_exact_shape_diesel_renders() {
         row.pg_sql,
     );
 }
+
+/// **Every aggregate connetto serves has to survive the reverse translation.**
+///
+/// A client's query reaches `register_sqlite` in the SQLite dialect, so an
+/// aggregate whose name the reverse translator does not recognise is refused
+/// before subql ever sees it, and the client is told only `subscription
+/// refused`. That is not hypothetical: a pg2sqlite revision refused `var_pop`,
+/// `var_samp`, `stddev_pop` and `stddev_samp` as names PostgreSQL does not have,
+/// which took out the whole variance family and was caught by one Docker-gated
+/// aggregate test rather than here.
+///
+/// The list is the nine the materializer classifies, plus `variance` and
+/// `stddev`, PostgreSQL's own aliases for `var_samp` and `stddev_samp`, which a
+/// client is equally free to write.
+#[test]
+fn every_aggregate_survives_the_reverse_translation() {
+    let mat = materializer();
+    for name in [
+        "COUNT",
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "VAR_POP",
+        "VAR_SAMP",
+        "STDDEV_POP",
+        "STDDEV_SAMP",
+        "VARIANCE",
+        "STDDEV",
+    ] {
+        let query = format!("SELECT {name}(amount) FROM t");
+        let pg = mat
+            .translate_subscription_sql(&query)
+            .unwrap_or_else(|err| panic!("{name} has to survive the translation: {err}"));
+        assert!(
+            pg.to_uppercase().contains(name),
+            "{name} should reach Postgres under its own name, got {pg}"
+        );
+    }
+}

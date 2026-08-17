@@ -12,3 +12,11 @@
 -- policy expression, so a default naming the caller would translate into a
 -- call the replica cannot resolve, and every write names the owner instead.
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0));
+
+-- The lines of an order, keyed by the order and the line number together. It is
+-- the one table here whose key spans two columns, and the translation below
+-- splits it like any policy-bearing table, so its INSTEAD OF triggers match a
+-- row on both key columns rather than one. owner_id repeats rather than being
+-- read through the parent order, so the policy settles from the row itself,
+-- which is what keeps the change path free of a round trip.
+CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no INTEGER NOT NULL, owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0), PRIMARY KEY (order_id, line_no));

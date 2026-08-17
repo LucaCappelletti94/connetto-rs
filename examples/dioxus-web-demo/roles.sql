@@ -10,4 +10,5 @@ DO $$ BEGIN
 END $$;
 GRANT USAGE ON SCHEMA public TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO connetto_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO connetto_reader;

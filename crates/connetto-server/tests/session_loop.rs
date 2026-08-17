@@ -399,3 +399,260 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
     client.close().await.expect("close client");
     server.await.expect("join server");
 }
+
+// ── Composite-key table fixtures ─────────────────────────────────────────────
+
+const READINGS_PG_DDL: &str = "CREATE TABLE readings (\
+    tenant_id INT NOT NULL, \
+    reading_id INT NOT NULL, \
+    quantity BIGINT NOT NULL, \
+    PRIMARY KEY (tenant_id, reading_id)\
+);";
+
+const READINGS_SQLITE_DDL: &str = "CREATE TABLE readings (\
+    tenant_id INTEGER NOT NULL, \
+    reading_id INTEGER NOT NULL, \
+    quantity INTEGER NOT NULL, \
+    PRIMARY KEY (tenant_id, reading_id)\
+);";
+
+/// Snapshot source seeding two rows that share `tenant_id` 7 and differ on
+/// `reading_id`.
+///
+/// Two rows sharing the first key column is the minimum that lets a live update
+/// or delete of one of them assert the other was left alone, which is the whole
+/// difference between a two-column key and its first column.
+struct SeedReadings;
+
+impl SnapshotSource for SeedReadings {
+    type Error = std::convert::Infallible;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &connetto_core::Principal,
+    ) -> Result<Snapshot, Self::Error> {
+        let table = SimpleTable::new(
+            "readings",
+            &["tenant_id", "reading_id", "quantity"],
+            &[0, 1],
+        );
+        let row1 = Insert::<_, String, Vec<u8>>::from(table.clone())
+            .set(0, Value::Integer(7))
+            .expect("set tenant_id")
+            .set(1, Value::Integer(1))
+            .expect("set reading_id")
+            .set(2, Value::Integer(100))
+            .expect("set quantity");
+        let row2 = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(7))
+            .expect("set tenant_id")
+            .set(1, Value::Integer(2))
+            .expect("set reading_id")
+            .set(2, Value::Integer(200))
+            .expect("set quantity");
+        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+            .insert(row1)
+            .insert(row2)
+            .build();
+        Ok(Snapshot {
+            patchset,
+            cursor: Cursor::new(Vec::new()),
+        })
+    }
+}
+
+diesel::table! {
+    /// Row from the readings composite-key test fixture.
+    readings (tenant_id, reading_id) {
+        /// Tenant partition, first key column.
+        tenant_id -> diesel::sql_types::BigInt,
+        /// Reading identifier, second key column.
+        reading_id -> diesel::sql_types::BigInt,
+        /// Measured quantity.
+        quantity -> diesel::sql_types::BigInt,
+    }
+}
+
+#[derive(Queryable, Selectable, Debug, PartialEq)]
+#[diesel(table_name = readings)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct Sample {
+    tenant_id: i64,
+    reading_id: i64,
+    quantity: i64,
+}
+
+fn reading(tenant_id: i64, reading_id: i64, quantity: i64) -> Sample {
+    Sample {
+        tenant_id,
+        reading_id,
+        quantity,
+    }
+}
+
+fn all_readings(conn: &mut SqliteConnection) -> Vec<Sample> {
+    readings::table
+        .order((readings::tenant_id, readings::reading_id))
+        .select(Sample::as_select())
+        .load(conn)
+        .expect("read readings")
+}
+
+/// In-memory SQLite replica for the readings table.
+///
+/// Table DDL cannot be expressed through the diesel query DSL, so `sql_query`
+/// is the sanctioned form here, mirroring `client_replica` above.
+fn reading_replica() -> SqliteConnection {
+    let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
+    sql_query(READINGS_SQLITE_DDL)
+        .execute(&mut conn)
+        .expect("create readings table");
+    conn
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
+async fn loopback_session_composite_key_sync() {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::new(READINGS_PG_DDL).expect("build materializer");
+    let manager = SessionManager::new(
+        materializer,
+        SeedReadings,
+        RosterAuth::granting("client-ck"),
+        Arc::new(TestGrantChecker),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), READINGS_PG_DDL)
+            .expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+
+    let applier = Materializer::new(READINGS_PG_DDL).expect("build client applier");
+    let mut replica = reading_replica();
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+
+    // Handshake.
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-ck")
+                .with_grant(connetto_core::messages::Grant::new("user:client-ck")),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+
+    // Subscribe: snapshot delivers both seed rows.
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "readings".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM readings"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(begin) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    assert_eq!(begin.sub_id, "readings");
+    let BulkMessage::SnapshotPatch(snapshot) = next_bulk(&mut client).await else {
+        panic!("expected snapshot patch");
+    };
+    applier
+        .apply_diffset(&snapshot.patchset_zstd, &mut replica)
+        .expect("apply snapshot");
+    let ControlMessage::SnapshotEnd(end) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+    assert_eq!(end.sub_id, "readings");
+    assert_eq!(
+        all_readings(&mut replica),
+        vec![reading(7, 1, 100), reading(7, 2, 200)],
+        "snapshot delivered both seed rows"
+    );
+
+    // The emu CDC source is an independent in-memory SQLite; it knows nothing
+    // about rows the snapshot source seeded. Insert fresh rows (7,3) and (7,4)
+    // so the emu source can track them for UPDATE and DELETE events, and to
+    // avoid a unique-violation when applying the live INSERT on top of the
+    // snapshot-seeded (7,1) and (7,2).
+    let mut source = PgSqliteEmuSource::open_in_memory(READINGS_PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO readings (tenant_id, reading_id, quantity) VALUES (7, 3, 300)",
+    )
+    .await;
+    let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+        panic!("expected live patch for insert of (7,3)");
+    };
+    applier
+        .apply_diffset(&live.patchset_zstd, &mut replica)
+        .expect("apply insert (7,3) live patch");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO readings (tenant_id, reading_id, quantity) VALUES (7, 4, 400)",
+    )
+    .await;
+    let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+        panic!("expected live patch for insert of (7,4)");
+    };
+    applier
+        .apply_diffset(&live.patchset_zstd, &mut replica)
+        .expect("apply insert (7,4) live patch");
+
+    // Update (7, 3) only. Sibling (7, 4) shares tenant_id=7 and must keep its
+    // original quantity=400. A handler that matched on only the first key column
+    // would update both (7,3) and (7,4), making (7,4).quantity != 400.
+    drive_cdc(
+        &mut source,
+        &manager,
+        "UPDATE readings SET quantity = 999 WHERE tenant_id = 7 AND reading_id = 3",
+    )
+    .await;
+    let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+        panic!("expected live patch for update of (7,3)");
+    };
+    applier
+        .apply_diffset(&live.patchset_zstd, &mut replica)
+        .expect("apply update live patch");
+    assert_eq!(
+        all_readings(&mut replica),
+        vec![
+            reading(7, 1, 100),
+            reading(7, 2, 200),
+            reading(7, 3, 999),
+            reading(7, 4, 400),
+        ],
+        "update to (7,3) changed its quantity and left sibling (7,4) untouched"
+    );
+
+    // Delete (7, 4) only. Sibling (7, 3) shares tenant_id=7 and must survive
+    // with the updated quantity. A handler that matched on only the first key
+    // column would delete both (7,3) and (7,4), failing the assertion.
+    drive_cdc(
+        &mut source,
+        &manager,
+        "DELETE FROM readings WHERE tenant_id = 7 AND reading_id = 4",
+    )
+    .await;
+    let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+        panic!("expected live patch for delete of (7,4)");
+    };
+    applier
+        .apply_diffset(&live.patchset_zstd, &mut replica)
+        .expect("apply delete live patch");
+    assert_eq!(
+        all_readings(&mut replica),
+        vec![reading(7, 1, 100), reading(7, 2, 200), reading(7, 3, 999)],
+        "delete of (7,4) left sibling (7,3) intact"
+    );
+
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
+}

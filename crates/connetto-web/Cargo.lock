@@ -1296,7 +1296,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#61743daf1f95a5b1d236e1656ce1d4e5fa76a04f"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#124250f93af33bdd9c3a72d76526863122aaf720"
 dependencies = [
  "serde",
  "serde_json",
@@ -1635,7 +1635,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=e03786bfdf9e4c6c18d4e38e227c258f6765cf8f#e03786bfdf9e4c6c18d4e38e227c258f6765cf8f"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=2eddc98101cafd6fd56b4b02108d35c2e8b360c6#2eddc98101cafd6fd56b4b02108d35c2e8b360c6"
 dependencies = [
  "arc-swap",
  "async-lock",

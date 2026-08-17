@@ -978,6 +978,12 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// These are the facts no single row settles, so they come from the
     /// database rather than from the event, which is why this is the caller's
     /// half of the split.
+    ///
+    /// **The row shape is asked rather than assumed**, exactly as
+    /// [`Translated::load_records`] asks it: `BoundQuery::condition` says
+    /// whether the query projects three columns or five, so a clock-dependent
+    /// or request-dependent policy is replayed with the condition its rows
+    /// carry instead of being read as if it had none.
     async fn replay(&self, diff: &StoreDiff<'_, Postgres>) -> Result<Vec<Record>, UpkeepError> {
         use diesel_async::RunQueryDsl as _;
 
@@ -995,43 +1001,59 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             .map_err(|err| UpkeepError::Replay(err.to_string()))?;
         let mut records = Vec::new();
         for requery in &diff.requeries {
-            let query = sql_query(&requery.query.sql).into_boxed();
-            let query = bind_key(query, &requery.key)?;
-            let rows: Vec<PlainRow> = query
-                .load(&mut *conn)
-                .await
-                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-            TupleRows::Plain(rows)
-                .read_into(&outputs, &mut records)
+            let rows = if requery.query.condition.is_some() {
+                let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
+                let wide: Vec<WideRow> = query
+                    .load(&mut *conn)
+                    .await
+                    .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+                TupleRows::Conditional(wide)
+            } else {
+                let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
+                let plain: Vec<PlainRow> = query
+                    .load(&mut *conn)
+                    .await
+                    .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+                TupleRows::Plain(plain)
+            };
+            rows.read_into(&outputs, &mut records)
                 .map_err(|err| UpkeepError::Replay(err.to_string()))?;
         }
         Ok(records)
     }
 }
 
-/// Bind one key value as `$1`, refusing a type no placeholder carries.
+/// Bind every column of one key as `$1` through `$n`, refusing a type no
+/// placeholder carries.
+///
+/// One key rather than several, so a composite key binds in
+/// `BoundQuery::key_columns` order and a single-column key is the same code
+/// path with one value.
 ///
 /// Refusing rather than skipping: a query left unreplayed leaves the store
 /// holding facts the change already invalidated, which is the failure the
 /// whole path exists to remove.
 fn bind_key<'a>(
-    query: BoxedSqlQuery<'a, Pg, SqlQuery>,
-    key: &Value<Postgres>,
+    mut query: BoxedSqlQuery<'a, Pg, SqlQuery>,
+    key: &[Value<Postgres>],
 ) -> Result<BoxedSqlQuery<'a, Pg, SqlQuery>, UpkeepError> {
-    Ok(match key {
-        Value::Bool(value) => query.bind::<Bool, _>(*value),
-        Value::Int(value) => query.bind::<BigInt, _>(*value),
-        Value::Float(value) => query.bind::<Double, _>(*value),
-        Value::String(value) => query.bind::<Text, _>(value.clone()),
-        Value::Bytes(value) => query.bind::<Binary, _>(value.clone()),
-        Value::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
-        other => {
-            return Err(UpkeepError::Replay(format!(
-                "a replayed query keys on a {:?}, which no placeholder here carries",
-                other.scalar_kind()
-            )));
-        }
-    })
+    for value in key {
+        query = match value {
+            Value::Bool(value) => query.bind::<Bool, _>(*value),
+            Value::Int(value) => query.bind::<BigInt, _>(*value),
+            Value::Float(value) => query.bind::<Double, _>(*value),
+            Value::String(value) => query.bind::<Text, _>(value.clone()),
+            Value::Bytes(value) => query.bind::<Binary, _>(value.clone()),
+            Value::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
+            other => {
+                return Err(UpkeepError::Replay(format!(
+                    "a replayed query keys on a {:?}, which no placeholder here carries",
+                    other.scalar_kind()
+                )));
+            }
+        };
+    }
+    Ok(query)
 }
 
 #[cfg(test)]

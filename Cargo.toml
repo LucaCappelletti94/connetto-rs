@@ -41,7 +41,7 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # replica keeping a stale value for any column its query does not filter on.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "e03786bfdf9e4c6c18d4e38e227c258f6765cf8f", default-features = false, features = ["std"] }
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2eddc98101cafd6fd56b4b02108d35c2e8b360c6", default-features = false, features = ["std"] }
 
 # rls2fga: the translator from Postgres row-level-security policy text to an
 # OpenFGA model, the per-relation report of what one row decides, and the

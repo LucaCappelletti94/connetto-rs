@@ -10,3 +10,13 @@
 -- which mints the key when a local write omits it. Both ends mint version 4.
 -- The quantity is non-null because every client schema already declares it so.
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), quantity BIGINT NOT NULL CHECK (quantity >= 0), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+-- The lines of an order, keyed by the order and the line number together. It is
+-- the one table here whose key spans two columns, which the replica's own schema
+-- and every key connetto encodes on the wire have to carry as a pair.
+CREATE TABLE order_lines (
+  order_id UUID NOT NULL REFERENCES orders(id),
+  line_no INTEGER NOT NULL,
+  quantity BIGINT NOT NULL CHECK (quantity >= 0),
+  PRIMARY KEY (order_id, line_no)
+);
