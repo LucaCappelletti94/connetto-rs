@@ -120,7 +120,7 @@ where
     let mut seen = None;
     pump_until(conn, |event| match event {
         ClientEvent::FullResync { reason, .. } => {
-            seen = Some(*reason);
+            seen = Some(reason.clone());
             false
         }
         ClientEvent::SnapshotEnd { .. } => seen.is_some(),

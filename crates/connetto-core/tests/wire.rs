@@ -161,10 +161,18 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         // SessionManager::keep_store_current, when a grant reaching the
         // subscription's table moved (R7).
         FullResyncReason::AuthorizationChange,
+        // SessionManager::fan_out_rows and catch_up_row, when a table the
+        // subscription reads was emptied and the patchset folded for it carries
+        // no operations (R48).
+        FullResyncReason::TableTruncated {
+            table: "orders".to_owned(),
+        },
     ];
     for reason in &reasons {
         match reason {
-            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {}
+            FullResyncReason::CursorOutsideRetention
+            | FullResyncReason::AuthorizationChange
+            | FullResyncReason::TableTruncated { .. } => {}
         }
     }
     reasons

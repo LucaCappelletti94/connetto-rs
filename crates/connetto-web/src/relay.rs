@@ -1683,7 +1683,7 @@ where
         }
         ClientEvent::SnapshotEnd { sub_id } => {
             if let Some(reason) = state.resyncing.remove(&sub_id) {
-                resnapshot_after_resync(worker, state, &sub_id, reason)?;
+                resnapshot_after_resync(worker, state, &sub_id, &reason)?;
             }
             Ok(())
         }
@@ -1729,7 +1729,7 @@ fn resnapshot_after_resync<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     worker_sub: &str,
-    reason: FullResyncReason,
+    reason: &FullResyncReason,
 ) -> Result<(), RelayError>
 where
     U: Transport,
@@ -1757,7 +1757,7 @@ where
             .send(TabOut::Control(ControlMessage::FullResyncRequired(
                 FullResyncRequired {
                     sub_id: tab_sub.clone(),
-                    reason,
+                    reason: reason.clone(),
                 },
             )));
         serve_snapshot(

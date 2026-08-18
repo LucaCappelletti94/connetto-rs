@@ -1357,6 +1357,11 @@ pub struct ConnettoConnection<T: Transport> {
     /// subscriptions (R27). Kept out of the application-facing changed-tables
     /// signal, unconditionally, while the live-query refresh still sees them.
     hidden_tables: HashSet<String>,
+    /// Subscriptions whose replacement snapshot has not ended yet, so the
+    /// pending writes their clear took off the replica are still owed a
+    /// re-apply (R48 decision 3). Held per subscription because two can be
+    /// replaced at once, and cleared when each one's `SnapshotEnd` lands.
+    resyncing: HashSet<String>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -1546,6 +1551,7 @@ where
             token_source: None,
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
+            resyncing: HashSet::new(),
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -2370,6 +2376,9 @@ where
                     persist_cursor(&mut self.db, &end.cursor)?;
                     self.last_cursor = Some(end.cursor);
                 }
+                if self.resyncing.remove(&end.sub_id) {
+                    self.reapply_pending()?;
+                }
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
             ControlMessage::AggregateUpdate(update) => Ok(ClientEvent::Aggregate {
@@ -2379,7 +2388,13 @@ where
                 is_full_result: update.is_full_result,
             }),
             ControlMessage::FullResyncRequired(resync) => {
-                self.clear_subscription_rows(&resync.sub_id)?;
+                self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
+                // The replacement snapshot is on its way, and the pending writes
+                // this clear just took off the replica go back after it ends
+                // rather than now: a snapshot row landing on top under
+                // `server_wins` would take the local edit off the screen again
+                // (R48 decision 3).
+                self.resyncing.insert(resync.sub_id.clone());
                 Ok(ClientEvent::FullResync {
                     sub_id: resync.sub_id,
                     reason: resync.reason,
@@ -2461,9 +2476,21 @@ where
     /// statement deletes the complement of what the survivors want. Dropping a
     /// subscription never names it: it simply stops contributing a clause.
     ///
+    /// **A truncate is the one case entitled to ignore the survivors, and it has
+    /// to (R48).** Every row of an emptied table is stale whatever a sibling's
+    /// filter says, and sparing the complement leaves two subscriptions with
+    /// overlapping predicates protecting each other's rows through both passes,
+    /// so a row satisfying both survives for ever over a table that is empty
+    /// upstream. Only the named table is treated that way: the subscription's
+    /// other tables were not emptied and keep the ordinary rule.
+    ///
     /// Capture is suspended so the deletes are never re-uploaded as a local
     /// mutation. An unknown or aggregate sub id is a no-op.
-    fn clear_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
+    fn clear_subscription_rows(
+        &mut self,
+        sub_id: &str,
+        reason: &FullResyncReason,
+    ) -> Result<(), ClientError> {
         let declared = subscriptions::declared(&mut self.db)?;
         let Some(resyncing) = declared
             .iter()
@@ -2504,11 +2531,22 @@ where
             }
         }
 
+        // The emptied table, when a truncate is what asked for this. Compared
+        // case-insensitively because the server names it from the catalog and a
+        // subscription names it as its query spelled it.
+        let emptied = match reason {
+            FullResyncReason::TableTruncated { table } => Some(table.to_lowercase()),
+            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {
+                None
+            }
+        };
+
         let _suspended = SuspendedCapture::new(&mut self.session);
         let tables = self.config.policy_tables.clone();
         self.db.transaction::<_, ClientError, _>(|conn| {
             for table in &resyncing.tables {
-                if untouchable.contains(table.as_str()) {
+                let truncated = emptied.as_deref() == Some(table.to_lowercase().as_str());
+                if untouchable.contains(table.as_str()) && !truncated {
                     continue;
                 }
                 // A split table is cleared at its backing table, not through
@@ -2525,7 +2563,10 @@ where
                 // DSL cannot name them: this is the one raw statement here.
                 let quoted = quote_ident(target);
                 let statement = match clauses.get(table.as_str()) {
-                    Some(surviving) if !surviving.is_empty() => {
+                    // An emptied table takes the whole delete whatever the
+                    // survivors claim, which is the exception the doc above
+                    // explains.
+                    Some(surviving) if !surviving.is_empty() && !truncated => {
                         let kept = surviving
                             .iter()
                             .map(|clause| format!("({clause})"))
@@ -2536,6 +2577,44 @@ where
                     _ => format!("DELETE FROM {quoted}"),
                 };
                 diesel::sql_query(statement).execute(conn)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Put this replica's own unacknowledged writes back after a replacement
+    /// snapshot has landed.
+    ///
+    /// **The clear ahead of a resync deletes rows the server has never seen.**
+    /// A local insert that is still queued lives in the replica and in
+    /// `_connetto_pending`, and the replacement snapshot cannot carry it back
+    /// because the server does not have it yet, so without this the user watches
+    /// their own unsaved work vanish and it returns only if and when the write is
+    /// acknowledged. This is R15's un-acked rule, which until R48 was written
+    /// down and not enforced.
+    ///
+    /// **After the snapshot ends rather than right after the clear**, or a
+    /// snapshot row for the same key lands on top under `server_wins` and takes
+    /// the local edit off the screen again. An emptied table's snapshot is empty
+    /// so the order would not show there, which is exactly why this belongs on
+    /// the resync path rather than on the truncate branch (R48 decision 3), where
+    /// it also repairs the same loss under `CursorOutsideRetention` and
+    /// `AuthorizationChange`.
+    ///
+    /// A queued update or delete whose row the resync did not restore applies to
+    /// nothing and is omitted, which is correct: there is no row left to change,
+    /// and the server refuses the upload for the same reason. Capture stays
+    /// suspended so re-applying does not queue the writes a second time.
+    fn reapply_pending(&mut self) -> Result<(), ClientError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let queued: Vec<Vec<u8>> = self.pending.values().cloned().collect();
+        let _suspended = SuspendedCapture::new(&mut self.session);
+        self.db.transaction::<_, ClientError, _>(|conn| {
+            for changeset in &queued {
+                conn.apply_changeset(changeset, server_wins)
+                    .map_err(|err| ClientError::Apply(err.to_string()))?;
             }
             Ok(())
         })

@@ -491,12 +491,17 @@ enum Outbound {
     /// resumed.
     Control(ControlMessage),
     /// Re-read one row subscription and replace what the client holds, because
-    /// a grant reaching its table moved (R7). Carried as an instruction rather
-    /// than as frames because only this session's own task holds the transport,
-    /// and the notice and its replacement must stay one ordered pair.
+    /// a grant reaching its table moved (R7) or a table it reads was emptied
+    /// (R48). Carried as an instruction rather than as frames because only this
+    /// session's own task holds the transport, and the notice and its
+    /// replacement must stay one ordered pair.
     Resnapshot {
         /// The client-facing label of the subscription to replace.
         sub_id: String,
+        /// What the client is told, which decides how much it clears: only a
+        /// truncate entitles it to delete a whole table regardless of what a
+        /// sibling subscription still claims.
+        reason: FullResyncReason,
     },
 }
 
@@ -1391,12 +1396,32 @@ where
             .map(|(_, route)| Arc::clone(&route.principal))
             .collect();
         // A truncate names no row, so neither version exists and no question can
-        // be put. It also folds to a patchset with no operations, so replaying it
-        // discloses nothing. R48 owns making it empty the replica.
-        let truncate = event.kind() == EventKind::Truncate;
+        // be put, and it folds to a patchset with no operations, so delivering it
+        // applies nothing and leaves the emptied table populated for ever. The
+        // subscription is replaced instead (R48): the client deletes the table
+        // and takes a fresh snapshot, which is the cheapest replacement there is
+        // because the table is now empty and the snapshot returns no rows.
+        //
+        // The cursor is deliberately not advanced here. The replacement carries
+        // its own, and a client that reconnects before the replacement lands
+        // meets the same truncate again in catchup and resyncs there, which is
+        // idempotent. Advancing first would lose the event with nothing having
+        // acted on it.
+        if event.kind() == EventKind::Truncate {
+            let table = self.event_table(event);
+            for (_, route) in deliveries {
+                let _ = route.tx.send(Outbound::Resnapshot {
+                    sub_id: route.label,
+                    reason: FullResyncReason::TableTruncated {
+                        table: table.clone(),
+                    },
+                });
+            }
+            return Ok(());
+        }
         let mut verdicts = Transitions::new();
         verdicts.reset(watchers.len());
-        if !truncate && !watchers.is_empty() {
+        if !watchers.is_empty() {
             transitions(
                 &self.auth,
                 event,
@@ -1442,14 +1467,10 @@ where
             // told nothing and keep the row for ever, which the withdrawal above
             // now answers properly. What it cost was the notice carrying a key to
             // a caller who could never see the row.
-            let payload = if truncate {
-                patch.payload_zstd
-            } else {
-                match verdict {
-                    Transition::Nothing => continue,
-                    Transition::Deliver => patch.payload_zstd,
-                    Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
-                }
+            let payload = match verdict {
+                Transition::Nothing => continue,
+                Transition::Deliver => patch.payload_zstd,
+                Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
             {
                 counters::timed_lock(&self.materializer)
@@ -1510,6 +1531,7 @@ where
             if !served {
                 let _ = route.tx.send(Outbound::Resnapshot {
                     sub_id: route.label.clone(),
+                    reason: FullResyncReason::AuthorizationChange,
                 });
             }
         }
@@ -1765,6 +1787,7 @@ where
                     }
                     let sent = route.tx.send(Outbound::Resnapshot {
                         sub_id: route.label.clone(),
+                        reason: FullResyncReason::AuthorizationChange,
                     });
                     sent.is_ok().then(|| {
                         (
@@ -2526,12 +2549,12 @@ where
                             // a closed transport (the session may have moved on).
                             let _ = transport.send_control(msg).await;
                         }
-                        Outbound::Resnapshot { sub_id } => {
+                        Outbound::Resnapshot { sub_id, reason } => {
                             // In this arm rather than a task of its own, so the
                             // select cannot interleave it into a subscribe, and
                             // the notice with its replacement is one ordered
                             // pair on the task that holds the transport (R7).
-                            self.resnapshot_row(&mut transport, &mut state, &sub_id)
+                            self.resnapshot_row(&mut transport, &mut state, &sub_id, &reason)
                                 .await?;
                         }
                     }
@@ -3287,7 +3310,7 @@ where
     }
 
     /// Replace what one subscription holds, because a grant reaching its table
-    /// moved (R7).
+    /// moved (R7) or a table it reads was emptied (R48).
     ///
     /// The read comes first and the notice second, which `snapshot_row`
     /// guarantees, so a failed read leaves the client holding what it had and
@@ -3301,6 +3324,7 @@ where
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         sub_label: &str,
+        reason: &FullResyncReason,
     ) -> Result<(), SessionError> {
         let mut attempt: u32 = 0;
         loop {
@@ -3311,13 +3335,7 @@ where
             };
             let (sub, reg) = (row.sub.clone(), row.reg.clone());
             match self
-                .snapshot_row(
-                    transport,
-                    sub,
-                    state,
-                    &reg,
-                    Some(FullResyncReason::AuthorizationChange),
-                )
+                .snapshot_row(transport, sub, state, &reg, Some(reason.clone()))
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -3328,7 +3346,7 @@ where
                         sub_id = %sub_label,
                         attempt,
                         error = %detail,
-                        "replacing a subscription after a permission change failed, retrying"
+                        "replacing a subscription failed, retrying"
                     );
                     tokio::time::sleep(backoff).await;
                 }
@@ -3468,6 +3486,20 @@ where
             let Some((payload, _departure)) = replayed else {
                 continue;
             };
+            // The `Some` above is what says this subscription reads the truncated
+            // table. A truncate replays as a patchset with no operations, so
+            // applying it would leave the emptied table populated exactly as the
+            // live path used to (R48). Everything after it arrives again in the
+            // replacement snapshot, so the rest of this replay is abandoned
+            // rather than sent and then undone.
+            if record.event().kind() == EventKind::Truncate {
+                let reason = FullResyncReason::TableTruncated {
+                    table: self.event_table(record.event()),
+                };
+                return self
+                    .resnapshot_row(transport, state, &sub.sub_id, &reason)
+                    .await;
+            }
             let Some(payload) = self
                 .replay_payload(transport, record.event(), &watchers, &mut verdicts, payload)
                 .await?
@@ -3515,11 +3547,9 @@ where
         verdicts: &mut Transitions,
         built: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        // A truncate carries no row, so no question can be put and it replays as
-        // it stands, exactly as on the live path.
-        if event.kind() == EventKind::Truncate {
-            return Ok(Some(built));
-        }
+        // A truncate never reaches here: `catch_up_row` turns one into a
+        // replacement before asking anything about it (R48).
+        debug_assert_ne!(event.kind(), EventKind::Truncate);
         // Retry the authorization question on error instead of silently skipping
         // the record: a skip followed by delivering later records would advance
         // the cursor past this one, making it permanently unreplayable from the
