@@ -607,16 +607,11 @@ async fn main() -> Result<()> {
     let (auth, translator, reach) =
         build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
     // The membership term's subquery classifies against the deployment's own
-    // policies, so the materializer's engine gets the same translator the
-    // change-path executor keeps current.
-    let materializer = Materializer::with_translation(
-        &pg_ddl,
-        writable_catalog(),
-        translator.clone(),
-        caller_mapping(),
-    )
-    .map_err(|err| anyhow!("building materializer: {err}"))?;
-    let upkeep = auth.upkeep(translator, reach, reader_pool.clone());
+    // policies, so the materializer's engine gets the translator that read them.
+    let materializer =
+        Materializer::with_translation(&pg_ddl, writable_catalog(), translator, caller_mapping())
+            .map_err(|err| anyhow!("building materializer: {err}"))?;
+    let upkeep = auth.upkeep(reach);
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
 

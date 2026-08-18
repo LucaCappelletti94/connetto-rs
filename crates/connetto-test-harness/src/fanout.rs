@@ -708,7 +708,6 @@ async fn fga_auth(
         .expect("the generated queries ran");
 
     let (shapes, translator, reach) = translated.into_parts();
-    let engine_translator = translator.clone();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -735,8 +734,8 @@ async fn fga_auth(
     // binary, so a row written after the load reaches the service before it
     // reaches a subscriber. Without it a cross-table policy would answer every
     // new row from facts that were never written.
-    let upkeep = auth.upkeep(translator, reach, fixture.admin().clone());
-    (auth, upkeep, engine_translator)
+    let upkeep = auth.upkeep(reach);
+    (auth, upkeep, translator)
 }
 
 /// Connect `subscribers` clients, each with one subscription over the whole

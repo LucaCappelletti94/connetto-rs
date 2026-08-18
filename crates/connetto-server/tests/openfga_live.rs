@@ -42,10 +42,7 @@ use connetto_server::row_view::ValuesRow;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use openfga_client::client::{
-    ConsistencyPreference, CreateStoreRequest, OpenFgaServiceClient, ReadRequest,
-    ReadRequestTupleKey,
-};
+use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
 use openfga_client::tonic::transport::Channel;
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, RowData};
 use subql::backend::{Postgres, Value};
@@ -351,7 +348,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         .await
         .expect("the facts load");
 
-    let (shapes, translator, reach) = translated.into_parts();
+    let (shapes, _translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -373,7 +370,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(translator, reach, pool.clone());
+    let upkeep = auth.upkeep(reach);
 
     // Row 1 moves from alice to carol. This is the event the change stream
     // would carry, with both images, which is what `REPLICA IDENTITY FULL`
@@ -477,7 +474,7 @@ async fn cross_executor(
         .expect("the rules are written");
     let records = translated.load_records(pool).await.expect("the facts load");
 
-    let (shapes, translator, reach) = translated.into_parts();
+    let (shapes, _translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -498,7 +495,7 @@ async fn cross_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(translator, reach, pool.clone());
+    let upkeep = auth.upkeep(reach);
     (auth, upkeep, shapes)
 }
 
@@ -603,162 +600,5 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
         "both refusals must land far inside the 10 second lifetime a cache would \
          get, or the promise's read clause is no longer slack: read {read_after:?}, \
          write {write_after:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// A key that spans two columns
-// ---------------------------------------------------------------------------
-
-/// A table whose primary key spans two columns, under a policy no row settles.
-///
-/// `now()` is what makes it unsettleable: the answer changes with the clock, so
-/// the records cannot be read off the changed row and have to be read back from
-/// the database. That read is keyed on the changed row's own primary key, which
-/// is the only place a compound key reaches the replay path.
-const COMPOUND_SCHEMA_STATEMENTS: [&str; 1] = [
-    "CREATE TABLE r27_readings (tenant_id INT, reading_id INT, starts_at TIMESTAMPTZ NOT NULL, \
-       PRIMARY KEY (tenant_id, reading_id))",
-];
-
-const COMPOUND_POLICY_STATEMENTS: [&str; 2] = [
-    "ALTER TABLE r27_readings ENABLE ROW LEVEL SECURITY",
-    "CREATE POLICY r27_readings_p ON r27_readings FOR SELECT USING (starts_at <= now())",
-];
-
-/// Two readings of one tenant, which is what makes the key's second column
-/// matter: they share the first.
-async fn provision_compound(pool: &Pool<AsyncPgConnection>) {
-    let mut conn = pool.get().await.expect("a connection");
-    let mut statements = vec!["DROP TABLE IF EXISTS r27_readings CASCADE"];
-    statements.extend(COMPOUND_SCHEMA_STATEMENTS);
-    statements.extend(COMPOUND_POLICY_STATEMENTS);
-    statements.push(
-        "INSERT INTO r27_readings (tenant_id, reading_id, starts_at) VALUES \
-           (7, 1, now() - interval '1 hour'), (7, 2, now() + interval '1 hour')",
-    );
-    for statement in statements {
-        diesel::sql_query(statement)
-            .execute(&mut *conn)
-            .await
-            .unwrap_or_else(|err| panic!("provisioning `{statement}`: {err}"));
-    }
-}
-
-/// The event the change stream carries for one reading.
-fn reading_event(tenant: &str, reading: &str, starts_at: &str) -> ChangeEvent {
-    ChangeEvent::insert(
-        "public",
-        "r27_readings",
-        0,
-        row_data(&[
-            ("tenant_id", tenant),
-            ("reading_id", reading),
-            ("starts_at", starts_at),
-        ]),
-        Lsn::new(3),
-    )
-}
-
-/// **A replayed query names one row, so every column of its key is bound and
-/// every column it projects is read.**
-///
-/// Two upstream contracts meet here and each fails loudly on its own.
-/// `rls2fga` renders this query with `$1` and `$2`, so a caller binding a prefix
-/// of the key is refused by Postgres for supplying fewer parameters than the
-/// statement declares. And `BoundQuery::condition` says the rows carry a
-/// condition, so a caller reading them as three columns is refused by the model
-/// with `grants nothing without a condition`. Both were mutation-tested here:
-/// binding only the first value, and forcing the plain row shape, each fail.
-///
-/// **The verdict is deliberately not asserted.** A policy comparing against
-/// `now()` is a request-scoped gate, so answering it needs a parameter the
-/// caller supplies per check, which connetto does not supply yet: `may_see`
-/// returns `Incomplete { questions: 1 }` here and that is the contract rather
-/// than a defect. The tuples the replay wrote are read back instead, which is
-/// direct evidence about the replay and needs no such parameter.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
-async fn a_replayed_query_binds_every_column_of_a_compound_key() {
-    let pool = pool().await;
-    provision_compound(&pool).await;
-
-    let (channel, store) = connect().await;
-    let schema = COMPOUND_SCHEMA_STATEMENTS.join(";\n") + ";";
-    let translated = Translated::of::<String>(
-        &schema,
-        &(COMPOUND_POLICY_STATEMENTS.join(";\n") + ";"),
-        "app.user_id",
-    )
-    .expect("a clock-dependent policy translates");
-    let mut setup = OpenFgaServiceClient::new(channel.clone());
-    let model = translated
-        .install_model(&mut setup, &store)
-        .await
-        .expect("the rules are written");
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    let delegate = OpenFgaPolicy::new(
-        Arc::clone(&shapes),
-        OpenFgaServiceClient::new(Counted::new(channel)),
-        store.clone(),
-    )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
-    let auth: FgaAuth<String, String, Counted<Channel>> =
-        FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(translator, reach, pool.clone());
-
-    // No facts are loaded up front, so every tuple read back below was written by
-    // the replay rather than by the boot.
-    for (reading, starts_at) in [
-        ("1", "2020-01-01 00:00:00+00"),
-        ("2", "2999-01-01 00:00:00+00"),
-    ] {
-        upkeep
-            .keep_current(&reading_event("7", reading, starts_at))
-            .await
-            .unwrap_or_else(|err| {
-                panic!("the replay for reading {reading} reached the store: {err}")
-            });
-    }
-
-    // The object key joins both columns of the primary key, so the two readings
-    // are separate objects even though they share a tenant.
-    let mut contexts = Vec::new();
-    for reading in [1, 2] {
-        let tuples = setup
-            .read(ReadRequest {
-                store_id: store.clone(),
-                tuple_key: Some(ReadRequestTupleKey {
-                    user: String::new(),
-                    relation: String::new(),
-                    object: format!("r27_readings:7|{reading}"),
-                }),
-                page_size: None,
-                continuation_token: String::new(),
-                consistency: ConsistencyPreference::HigherConsistency as i32,
-            })
-            .await
-            .expect("read the store back")
-            .into_inner()
-            .tuples;
-        let [tuple] = tuples.as_slice() else {
-            panic!("reading {reading} has exactly one tuple, got {tuples:?}");
-        };
-        let key = tuple.key.as_ref().expect("a tuple carries its key");
-        let condition = key
-            .condition
-            .as_ref()
-            .unwrap_or_else(|| panic!("reading {reading}'s gate carries its condition"));
-        contexts.push(format!("{:?}", condition.context));
-    }
-
-    assert_ne!(
-        contexts[0], contexts[1],
-        "each reading's tuple carries its own row's context, which is what says \
-         the replay read the row it was keyed on rather than a sibling sharing \
-         the first key column: {contexts:?}"
     );
 }

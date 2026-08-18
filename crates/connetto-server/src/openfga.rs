@@ -27,10 +27,8 @@ use std::task::{Context, Poll};
 
 use connetto_core::auth::Principal;
 use diesel::QueryableByName;
-use diesel::pg::Pg;
-use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Binary, Bool, Double, Jsonb, Text};
+use diesel::sql_types::{Jsonb, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::{
@@ -40,11 +38,11 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http};
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-use rls2fga::generator::records::Record;
+use rls2fga::generator::records::{Record, RecordDerivation};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
 use subql::ParserDB;
-use subql::backend::{Postgres, Value};
+use subql::backend::Postgres;
 use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
@@ -265,12 +263,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
     /// and questioned against another names rows that do not exist. `reach` is
     /// walked over the model the same translation produced, for the same reason.
     #[must_use]
-    pub fn upkeep(
-        &self,
-        translator: Translator,
-        reach: GrantReach,
-        pool: Pool<AsyncPgConnection>,
-    ) -> Arc<dyn StoreUpkeep>
+    pub fn upkeep(&self, reach: GrantReach) -> Arc<dyn StoreUpkeep>
     where
         Id: Display + Send + Sync + 'static,
         Key: CapabilityKey,
@@ -283,9 +276,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
     {
         Arc::new(FgaUpkeep {
             shapes: Arc::clone(self.inner.shapes()),
-            translator,
             delegate: self.inner.inner().clone(),
-            pool,
             reach,
             naming: Arc::clone(&self.naming),
         })
@@ -389,6 +380,28 @@ pub enum SetupError {
     /// a device and announces nothing (R7).
     #[error(transparent)]
     Reach(#[from] crate::reach::ReachError),
+    /// A policy shape whose withdrawals cannot reach the store.
+    ///
+    /// Refused for the same reason as the two above, by a third cause. A shape
+    /// whose records span more than the changed row reports nothing removed and
+    /// hands over a query to re-run instead, and re-running it only ever writes
+    /// what is still true. So deleting the row that carried a permission leaves
+    /// that permission in the store, the change path answers from the store, and
+    /// live delivery continues to somebody whose access has already gone (R49).
+    ///
+    /// **Revisit this when the upstream repair lands.** The refusal is as wide as
+    /// the gap is today, not as wide as the gap has to be: four of the six shapes
+    /// it covers read one table and look repairable by classifying them as
+    /// settled, and once they are, refusing them costs a deployment a shape that
+    /// became safe. `upstream/subql-joined-shape-never-removes.md` carries the
+    /// finding and its reproduction.
+    #[error(
+        "these policy shapes keep their permissions current by re-running a query, which \
+         never removes one, so a withdrawal would leave the store granting access the \
+         database has taken away. Change the schema, or wait for the upstream repair that \
+         will narrow this refusal: {0}"
+    )]
+    Unwithdrawable(String),
 }
 
 /// One translation, read once, so nothing downstream reads a second.
@@ -497,6 +510,10 @@ impl Translated {
         // Walked here rather than where it is first read, so a model this
         // cannot follow refuses the boot beside every other startup refusal.
         let reach = GrantReach::of(&model, &naming, &answers)?;
+        let unwithdrawable = unwithdrawable_shapes(&relations);
+        if !unwithdrawable.is_empty() {
+            return Err(SetupError::Unwithdrawable(unwithdrawable.join("; ")));
+        }
 
         Ok(Self {
             catalog,
@@ -645,8 +662,8 @@ impl Translated {
         Ok(records)
     }
 
-    /// The index every reader shares, the translator that reads a replayed
-    /// query's rows back, and what each kind of fact reaches.
+    /// The index every reader shares, the translator the materializer's engine
+    /// classifies with, and what each kind of fact reaches.
     ///
     /// Handed over together because the three must describe one schema: the
     /// index keeps the catalog and lends it, the translator reads that same
@@ -802,6 +819,38 @@ fn policy_tables<DB: subql::DatabaseLike>(
     tables
 }
 
+/// Every shape whose facts travel as a query to re-run, named for the refusal.
+///
+/// **One question rather than a classification connetto invents.** Whether a
+/// shape carries a re-run query is exactly whether its withdrawals can reach the
+/// store, because the re-run is the only path its facts take and that path only
+/// writes. Naming a narrower set would mean deciding upstream's business here,
+/// off a reason string.
+///
+/// Read off the relation descriptions rather than off `Shapes`, which indexes the
+/// same thing but keeps it private, and which is built after this has already
+/// refused.
+fn unwithdrawable_shapes(
+    relations: &[rls2fga::generator::relations::RelationShapes],
+) -> Vec<String> {
+    let mut named = Vec::new();
+    for entry in relations {
+        for shape in &entry.shapes {
+            if let RecordDerivation::Joined { reason, .. } = &shape.derivation {
+                named.push(format!(
+                    "{}#{} over {} ({reason})",
+                    entry.type_name,
+                    entry.relation,
+                    shape.tables.join(", ")
+                ));
+            }
+        }
+    }
+    named.sort_unstable();
+    named.dedup();
+    named
+}
+
 // ---------------------------------------------------------------------------
 // Keeping the store current
 // ---------------------------------------------------------------------------
@@ -816,9 +865,6 @@ pub enum UpkeepError {
     /// What the row moved could not be worked out.
     #[error("what the changed row moved could not be worked out: {0}")]
     Diff(String),
-    /// A query the difference asked to be replayed could not be run.
-    #[error("replaying a query the changed row requires: {0}")]
-    Replay(String),
     /// The store refused the write.
     #[error("writing the difference to the authorization store: {0}")]
     Write(String),
@@ -884,9 +930,7 @@ pub trait StoreUpkeep: Send + Sync {
 /// The upkeep behind [`FgaAuth`], over the same index it answers from.
 struct FgaUpkeep<Id, Key, T> {
     shapes: Arc<Shapes<ParserDB>>,
-    translator: Translator,
     delegate: OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>,
-    pool: Pool<AsyncPgConnection>,
     /// What each kind of fact reaches, walked once at startup.
     reach: GrantReach,
     /// How the model spells a person, so a subject can be read back as the
@@ -917,17 +961,10 @@ where
                 Err(StoreDiffError::NotARowEvent) => return Ok(Vec::new()),
                 Err(err) => return Err(UpkeepError::Diff(err.to_string())),
             };
-            let replayed = self.replay(&diff).await?;
             self.delegate
                 .apply(&diff)
                 .await
                 .map_err(|err| UpkeepError::Write(err.to_string()))?;
-            if !replayed.is_empty() {
-                self.delegate
-                    .write_records(&replayed)
-                    .await
-                    .map_err(|err| UpkeepError::Write(err.to_string()))?;
-            }
             // Read after the store is level, never before: a replacement
             // snapshot produced against the old facts would hand back exactly
             // the rows the change took away.
@@ -971,89 +1008,6 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         }
         moves
     }
-
-    /// Run every query the difference asked for, and read the rows back as
-    /// facts.
-    ///
-    /// These are the facts no single row settles, so they come from the
-    /// database rather than from the event, which is why this is the caller's
-    /// half of the split.
-    ///
-    /// **The row shape is asked rather than assumed**, exactly as
-    /// [`Translated::load_records`] asks it: `BoundQuery::condition` says
-    /// whether the query projects three columns or five, so a clock-dependent
-    /// or request-dependent policy is replayed with the condition its rows
-    /// carry instead of being read as if it had none.
-    async fn replay(&self, diff: &StoreDiff<'_, Postgres>) -> Result<Vec<Record>, UpkeepError> {
-        use diesel_async::RunQueryDsl as _;
-
-        if diff.requeries.is_empty() {
-            return Ok(Vec::new());
-        }
-        let outputs = self
-            .translator
-            .translate(self.shapes.catalog())
-            .outputs_accepting_gaps();
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-        let mut records = Vec::new();
-        for requery in &diff.requeries {
-            let rows = if requery.query.condition.is_some() {
-                let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
-                let wide: Vec<WideRow> = query
-                    .load(&mut *conn)
-                    .await
-                    .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-                TupleRows::Conditional(wide)
-            } else {
-                let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
-                let plain: Vec<PlainRow> = query
-                    .load(&mut *conn)
-                    .await
-                    .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-                TupleRows::Plain(plain)
-            };
-            rows.read_into(&outputs, &mut records)
-                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-        }
-        Ok(records)
-    }
-}
-
-/// Bind every column of one key as `$1` through `$n`, refusing a type no
-/// placeholder carries.
-///
-/// One key rather than several, so a composite key binds in
-/// `BoundQuery::key_columns` order and a single-column key is the same code
-/// path with one value.
-///
-/// Refusing rather than skipping: a query left unreplayed leaves the store
-/// holding facts the change already invalidated, which is the failure the
-/// whole path exists to remove.
-fn bind_key<'a>(
-    mut query: BoxedSqlQuery<'a, Pg, SqlQuery>,
-    key: &[Value<Postgres>],
-) -> Result<BoxedSqlQuery<'a, Pg, SqlQuery>, UpkeepError> {
-    for value in key {
-        query = match value {
-            Value::Bool(value) => query.bind::<Bool, _>(*value),
-            Value::Int(value) => query.bind::<BigInt, _>(*value),
-            Value::Float(value) => query.bind::<Double, _>(*value),
-            Value::String(value) => query.bind::<Text, _>(value.clone()),
-            Value::Bytes(value) => query.bind::<Binary, _>(value.clone()),
-            Value::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
-            other => {
-                return Err(UpkeepError::Replay(format!(
-                    "a replayed query keys on a {:?}, which no placeholder here carries",
-                    other.scalar_kind()
-                )));
-            }
-        };
-    }
-    Ok(query)
 }
 
 #[cfg(test)]
@@ -1189,6 +1143,60 @@ mod tests {
             matches!(refused, Err(super::SetupError::Untranslated(_))),
             "an expression rls2fga cannot read must stop the server rather than \
              quietly narrow what the change path delivers"
+        );
+    }
+
+    /// A share written as a row of a join table, whose facts travel as a query
+    /// to re-run.
+    ///
+    /// Row-level security stays off `paper_shares` on purpose: the guarded form
+    /// is refused by the translator for a different reason, and the unguarded
+    /// one is what reaches this refusal.
+    const SHARE_SCHEMA: &str = "
+        CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
+        ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+        CREATE TABLE paper_shares(paper_id INTEGER, viewer TEXT, PRIMARY KEY(paper_id, viewer));
+    ";
+
+    const SHARE_POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
+        owner = current_setting('app.user_id', true) \
+        OR EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
+          AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))))";
+
+    /// R49's refusal, which is the leak direction rather than the vanish one.
+    ///
+    /// Deleting the share row leaves the grant in the store, so the change path
+    /// keeps delivering to a caller whose access has gone. Measured before the
+    /// refusal existed: the key holder was still allowed after the row was gone,
+    /// against a real Postgres and a real `OpenFGA`, and `Shapes::diff` reported
+    /// nothing removed, one query to re-run, and nothing uncovered.
+    #[test]
+    fn a_share_written_as_a_join_table_row_refuses_startup() {
+        let refusal =
+            match Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING) {
+                Err(super::SetupError::Unwithdrawable(named)) => {
+                    assert!(
+                        named.contains("paper_shares"),
+                        "the refusal names the table whose changes cannot be turned into a \
+                     removal, or an operator cannot find the policy to change: {named}"
+                    );
+                    super::SetupError::Unwithdrawable(named)
+                }
+                Err(other) => panic!("refused, but for the wrong reason: {other}"),
+                Ok(_) => panic!(
+                    "a withdrawal on this shape reaches nothing, so it must stop the \
+                 server rather than serve access the database has taken away"
+                ),
+            };
+        // The refusal is as wide as the gap is today rather than as wide as it has
+        // to be, so the message says the boot will start working again. An
+        // operator reading only the sentence above concludes the shape is
+        // permanently unsupported and rewrites a schema that did not need it.
+        let shown = refusal.to_string();
+        assert!(
+            shown.contains("upstream repair"),
+            "the message an operator sees has to say the refusal narrows later, \
+             not only the rustdoc they never read: {shown}"
         );
     }
 }
