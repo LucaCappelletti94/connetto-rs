@@ -528,15 +528,14 @@ impl RowSource for FixedRow {
 }
 
 /// A policy that shows the caller its fixture named and refuses one verb, so the
-/// mint's two questions can disagree.
+/// mint's two questions can disagree over a fixed row and every share level.
 ///
-/// `RlsAuth` cannot play this part: its `may_write` allows unconditionally by
-/// design (`08-authorization.md`, "The write question survives as the
-/// attachment point despite being inert today"), and the RLS fixture above puts
-/// one policy over every command, so no caller there may read a row and not
-/// change it either. **So this test defends the mint's contract rather than
-/// demonstrating a refusal any shipped deployment can see.** It is
-/// mutation-tested instead: allowing the denied verb below makes it fail.
+/// Since R50 the row-level-security answerer refuses a verb the caller cannot
+/// perform too, proven against a real policy in `rls_write_question.rs`. This
+/// double stays because it is cheap, needs no Postgres, and covers every level
+/// combination, while that suite covers the shipped answerer over a real one.
+/// The exemption this comment used to record, that the answerer allowed every
+/// write by design and so could not play this part, is gone.
 ///
 /// The read half is the shared stand-in rather than a yes to everybody (R9), so
 /// this double cannot pass a test that stopped asking the read question.

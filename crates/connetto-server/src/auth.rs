@@ -15,6 +15,7 @@ mod rls {
     use std::sync::Arc;
 
     use connetto_core::auth::Principal;
+    use diesel::OptionalExtension;
     use diesel::QueryableByName;
     use diesel::sql_query;
     use diesel::sql_types::Bool;
@@ -29,6 +30,14 @@ mod rls {
     use crate::capability::{CallerBinding, CapabilityKey};
     use crate::key_filter::{KeyError, KeyFilter};
     use connetto_core::quote_ident;
+
+    /// How long a locking read waits for a conflicting writer.
+    ///
+    /// A mint is not a hot path, but it holds a pooled connection while it
+    /// waits, so an unbounded wait would let one stuck transaction exhaust the
+    /// pool. An expired wait is an error, which the mint reports as an undecided
+    /// answer rather than a denial.
+    const LOCK_WAIT: &str = "3s";
 
     /// Failure surfaced by [`RlsAuth`].
     #[derive(Debug, thiserror::Error)]
@@ -52,6 +61,15 @@ mod rls {
             table: String,
             /// The scalar kind that is not yet bindable.
             kind: String,
+        },
+        /// The write question has no answer for this table, so the caller must
+        /// refuse rather than take a yes or a no from it.
+        #[error("cannot decide a write on {table}: {detail}")]
+        Undecidable {
+            /// The table whose rules cannot be spoken for.
+            table: String,
+            /// Why the answer is unavailable.
+            detail: String,
         },
     }
 
@@ -141,8 +159,13 @@ mod rls {
             })
         }
 
-        /// Build the `SELECT EXISTS` for `row`, reading its key off the view.
-        fn question<R>(&self, row: &R) -> Result<Question, RlsAuthError>
+        /// Name the row: its table and the bound equality over its primary key.
+        ///
+        /// [`None`] where the row is unanswerable at all: a table the catalog
+        /// does not know, a table with no primary key, or a key cell carrying no
+        /// value. Every caller denies in those cases, which is what asking the
+        /// database would have returned.
+        fn locate<R>(&self, row: &R) -> Result<Option<(String, KeyFilter)>, RlsAuthError>
         where
             R: RowView<Backend = Postgres> + ?Sized,
         {
@@ -160,14 +183,24 @@ mod rls {
             else {
                 return Ok(None);
             };
-            Ok(Some((
-                format!(
-                    "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
-                    quote_ident(&table),
-                    filter.predicate(),
-                ),
-                filter,
-            )))
+            Ok(Some((table, filter)))
+        }
+
+        /// Build the `SELECT EXISTS` for `row`, reading its key off the view.
+        fn question<R>(&self, row: &R) -> Result<Question, RlsAuthError>
+        where
+            R: RowView<Backend = Postgres> + ?Sized,
+        {
+            Ok(self.locate(row)?.map(|(table, filter)| {
+                (
+                    format!(
+                        "SELECT EXISTS(SELECT 1 FROM {} WHERE {}) AS present",
+                        quote_ident(&table),
+                        filter.predicate(),
+                    ),
+                    filter,
+                )
+            }))
         }
     }
 
@@ -198,6 +231,79 @@ mod rls {
                 })
                 .await?;
             Ok(present)
+        }
+
+        /// Ask Postgres whether `caller` may take the existing row for a write.
+        ///
+        /// A locking read is the question: Postgres applies the table's update
+        /// rule to `SELECT ... FOR UPDATE`, so a row the caller may not change
+        /// comes back empty while one it may comes back present. The transaction
+        /// commits at once, which releases the lock, and it bounds its wait
+        /// first, because a mint holds a pooled connection while it waits and an
+        /// unbounded wait would let one stuck writer exhaust the pool. A wait
+        /// that expires is an error, so the caller reports an undecided answer
+        /// rather than a denial.
+        async fn takeable(
+            &self,
+            table: &str,
+            filter: &KeyFilter,
+            caller: &Principal<String, Key>,
+        ) -> Result<bool, RlsAuthError> {
+            let sql = format!(
+                "SELECT true AS present FROM {} WHERE {} FOR UPDATE",
+                quote_ident(table),
+                filter.predicate(),
+            );
+            let query = filter.bind(sql_query(sql).into_boxed::<diesel::pg::Pg>());
+            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|err| RlsAuthError::Pool(err.to_string()))?;
+            let present = conn
+                .transaction::<Option<Present>, diesel::result::Error, _>(|c| {
+                    async move {
+                        sql_query(format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
+                            .execute(c)
+                            .await?;
+                        binding.apply(c).await?;
+                        crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
+                        query.get_result(c).await.optional()
+                    }
+                    .scope_boxed()
+                })
+                .await?;
+            Ok(present.is_some())
+        }
+
+        /// Whether every row-level-security rule on `table` covers every
+        /// command.
+        ///
+        /// A locking read is judged by the update rule, so it speaks for a delete
+        /// only when one rule governs both. The moment a table writes any rule
+        /// for a single command the two can differ, and the dangerous case is
+        /// not only a stricter delete rule: a table with an update rule and no
+        /// delete rule permits no delete at all while the locking read still
+        /// answers yes.
+        ///
+        /// Asked per question rather than cached, because a cached answer goes
+        /// stale exactly when a deployment tightens a rule.
+        async fn one_rule_for_every_command(&self, table: &str) -> Result<bool, RlsAuthError> {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|err| RlsAuthError::Pool(err.to_string()))?;
+            let narrowed: Present = sql_query(
+                "SELECT EXISTS(SELECT 1 FROM pg_policies \
+                 WHERE schemaname = current_schema() AND tablename = $1 AND cmd <> 'ALL') \
+                 AS present",
+            )
+            .bind::<diesel::sql_types::Text, _>(table.to_owned())
+            .get_result(&mut *conn)
+            .await?;
+            Ok(!narrowed.present)
         }
     }
 
@@ -235,18 +341,48 @@ mod rls {
             }
         }
 
-        /// The write applies under the caller's own RLS context, so Postgres
-        /// `WITH CHECK` is the gate. Nothing to add here.
-        #[allow(clippy::unused_async_trait_impl)]
+        /// Answer the two verbs a share can certify, and pass the rest through.
+        ///
+        /// The two verbs a share names both carry an existing row, so both are
+        /// answerable: a locking read is what the update rule judges. An insert
+        /// and the resulting-row half of an update carry no existing row, and
+        /// their only caller applies the write to Postgres immediately
+        /// afterwards, so the database is their gate and answering them here
+        /// would be a second evaluator that can disagree with it.
+        ///
+        /// A verb this does not know refuses rather than guessing, which is what
+        /// subql's own documentation asks of an implementation.
         async fn may_write<R>(
             &self,
-            _write: RowWrite<'_, R>,
-            _watcher: &Self::Watcher,
+            write: RowWrite<'_, R>,
+            watcher: &Self::Watcher,
         ) -> Result<Verdict, RlsAuthError>
         where
             R: RowView<Backend = Postgres> + Sync + ?Sized,
         {
-            Ok(Verdict::Allow)
+            let old = match write {
+                RowWrite::Insert { .. } | RowWrite::Update { .. } => return Ok(Verdict::Allow),
+                RowWrite::UpdateUsing { old } | RowWrite::Delete { old } => old,
+                _ => return Ok(Verdict::Deny),
+            };
+            let Some((table, filter)) = self.locate(old)? else {
+                return Ok(Verdict::Deny);
+            };
+            if matches!(write, RowWrite::Delete { .. })
+                && !self.one_rule_for_every_command(&table).await?
+            {
+                return Err(RlsAuthError::Undecidable {
+                    table,
+                    detail: "the table writes a rule for a single command, and a locking read \
+                             speaks only for the update rule"
+                        .to_owned(),
+                });
+            }
+            if self.takeable(&table, &filter, watcher).await? {
+                Ok(Verdict::Allow)
+            } else {
+                Ok(Verdict::Deny)
+            }
         }
     }
 }

@@ -34,9 +34,12 @@
 //!
 //! # What it does not compare
 //!
-//! Writes. `RlsAuth::may_write` allows unconditionally by design, so comparing
-//! it would report a disagreement on every genuine refusal and the counter would
-//! stop meaning anything.
+//! Writes. Since R50 `RlsAuth::may_write` answers the two verbs that carry an
+//! existing row and passes the insert and resulting-row halves through, whose
+//! gate is the database write that follows them. So a comparison would disagree
+//! on that pass-through pair by construction, and the counter would stop meaning
+//! anything. The two answered verbs reach it from the minting path alone, which
+//! this wrapper does not sit on.
 //!
 //! Deletions, and truncates. Neither has a current row, so there is nothing
 //! row-level security can be asked, and the site skips the comparison rather

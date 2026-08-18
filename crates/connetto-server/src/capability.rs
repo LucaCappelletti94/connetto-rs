@@ -306,6 +306,21 @@ pub enum ShareError {
         /// The first named verb the policy denied.
         op: WriteOp,
     },
+    /// The policy could not decide whether the caller may perform a verb it
+    /// asked to share, so nothing is certified.
+    ///
+    /// Distinct from [`NotWritable`](Self::NotWritable) on purpose: that one
+    /// says the caller may not perform the verb, and this one says the question
+    /// was not answerable, which is a different thing to tell an operator.
+    #[error("the policy cannot decide whether the caller may {} {table}, so it certifies nothing: {detail}", verb(*op))]
+    WriteUndecidable {
+        /// The table the caller named.
+        table: String,
+        /// The verb the policy could not decide.
+        op: WriteOp,
+        /// What the policy reported about why.
+        detail: String,
+    },
     /// The row could not be reached at all, which is not the same as the
     /// caller not being allowed to share it.
     #[error("reading the row to share failed: {0}")]
@@ -487,12 +502,22 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         // One question per verb the caller named, about the row as it stands,
         // which is the only version a mint holds. All must allow: a share must
         // not hand on a verb the sharer does not hold itself.
+        //
+        // A question that fails to answer refuses too, and says so in its own
+        // words: no database write follows a mint, so this loop is the only gate
+        // there is, and reporting an unanswered question as a denial would tell
+        // an operator the row is unwritable when the truth is that nothing knew.
         for write in level.writes(&view) {
+            let op = write.op();
             let verdict = self
                 .policy
                 .may_write(write, &watchers[0])
                 .await
-                .map_err(|err| ShareError::Policy(err.to_string()))?;
+                .map_err(|err| ShareError::WriteUndecidable {
+                    table: table.to_owned(),
+                    op,
+                    detail: err.to_string(),
+                })?;
             if !verdict.allowed() {
                 return Err(ShareError::NotWritable {
                     table: table.to_owned(),
