@@ -65,6 +65,7 @@ pub mod cipher;
 mod clock;
 pub mod dsl;
 mod grant_expiry;
+pub mod harden;
 pub mod live;
 pub mod reconnect;
 pub mod replica;
@@ -287,6 +288,15 @@ pub type SqlFunctionInstaller = Arc<dyn Fn(&mut SqliteConnection) -> QueryResult
 /// it opens. Empty by default: connetto ships no built-in functions, so each
 /// app registers the functions its schema names (a `uuidv7` key generator, for
 /// instance) through [`with`](SqlFunctions::with).
+///
+/// A replica connection runs with trusted schema off (see
+/// [`crate::harden`]), so a function a schema object reaches (a column
+/// `DEFAULT`, a view, a trigger, a `CHECK`, a generated column, an expression
+/// index) must be registered with `SqliteFunctionBehavior::INNOCUOUS`, through
+/// `register_impl_with_behavior` rather than `register_impl` or
+/// `register_nondeterministic_impl`. Without it SQLite refuses the call as
+/// "unsafe use of `f()`" when the schema object runs, not when the function is
+/// registered.
 #[derive(Clone, Default)]
 pub struct SqlFunctions(Vec<SqlFunctionInstaller>);
 
@@ -1456,6 +1466,9 @@ where
             cipher::unlock(&mut db, key)?;
         }
         db.batch_execute("PRAGMA journal_mode=WAL")?;
+        // Before any statement carrying outside input, and before the first
+        // attach: R18's hardening surface, one helper for both open paths.
+        harden::harden_replica_connection(&mut db)?;
         // Register app-supplied functions before any DDL or insert, so a
         // column DEFAULT that calls one fires on the first write.
         config
@@ -1539,20 +1552,24 @@ where
         match tier {
             Tier::None => Ok(()),
             Tier::Existing { path } => {
-                let create_was_enabled = self.db.is_attach_create_enabled()?;
-                if create_was_enabled {
-                    self.db.set_attach_create_enabled(false)?;
-                }
-                let attached = self.db.attach_database(path, LOCAL_SCHEMA);
-                if create_was_enabled {
-                    self.db.set_attach_create_enabled(true)?;
-                }
-                attached?;
+                // Write allowed so the tier stays writable, creation refused so
+                // a missing tier file fails instead of starting an empty one.
+                harden::attach_in_window(
+                    &mut self.db,
+                    path,
+                    LOCAL_SCHEMA,
+                    harden::AttachPermits::Write,
+                )?;
                 self.local_tables = local_tier_tables(&mut self.db)?;
                 Ok(())
             }
             Tier::Create { path, ddl } => {
-                self.db.attach_database(path, LOCAL_SCHEMA)?;
+                harden::attach_in_window(
+                    &mut self.db,
+                    path,
+                    LOCAL_SCHEMA,
+                    harden::AttachPermits::CreateAndWrite,
+                )?;
                 // An attached database with no tables is a fresh one, on every
                 // target and with no filesystem probe, which wasm does not have.
                 if local_tier_tables(&mut self.db)?.is_empty() {

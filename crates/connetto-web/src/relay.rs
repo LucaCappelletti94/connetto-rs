@@ -326,6 +326,9 @@ const LOCAL_SCHEMA: &str = "connetto_local";
 /// lives. Named so a snapshot reads the same way for either tier.
 const MAIN_SCHEMA: &str = "main";
 
+/// The schema the hub's own durable state is attached under.
+const HUB_SCHEMA: &str = "connetto_hub";
+
 /// Core state threaded through the hub loop.
 #[derive(Default)]
 struct HubState {
@@ -516,9 +519,14 @@ impl RelayHub {
         // and the page codec gives it the main database's derived key. Creating
         // it here through the keyed connection is also what makes its key salt
         // agree with the replica's, which is what lets a later run re-attach it.
-        worker
-            .conn()
-            .batch_execute(&format!("ATTACH DATABASE '{hub_meta}' AS connetto_hub"))?;
+        connetto_client::harden::attach_in_window(
+            worker.conn(),
+            hub_meta,
+            HUB_SCHEMA,
+            // The file does not exist on the first run of a device, and this is
+            // where it is created.
+            connetto_client::harden::AttachPermits::CreateAndWrite,
+        )?;
         worker.conn().batch_execute(HUB_META_DDL)?;
         // The tier is already attached to this same connection by the client,
         // which is what keeps one handle on that file. Its watermark table is
@@ -2051,7 +2059,14 @@ fn snapshot_patchset(
         return Ok(Vec::new());
     }
     if !blank.attached {
-        conn.batch_execute("ATTACH DATABASE ':memory:' AS blank")?;
+        // An in-memory database needs no creation permit, only the write one:
+        // the twins below are created inside it.
+        connetto_client::harden::attach_in_window(
+            conn,
+            ":memory:",
+            "blank",
+            connetto_client::harden::AttachPermits::Write,
+        )?;
         blank.attached = true;
     }
     for row in &matching {
@@ -2336,5 +2351,37 @@ mod tests {
         conn.batch_execute("UPDATE drafts SET body = 'filled' WHERE id = 1")
             .expect("write");
         session.changeset().expect("changeset")
+    }
+
+    /// R18: the generic snapshot's scratch database still attaches, even though
+    /// the replica connection refuses every attach at rest.
+    ///
+    /// The hub's own meta database is covered by the `logout_refusal` suite,
+    /// which builds a real hub. This one is the mid-session attach, which no
+    /// suite reaches through a tab.
+    #[wasm_bindgen_test]
+    fn the_snapshot_scratch_database_attaches_through_a_window() {
+        let mut conn = seeded("under lockdown");
+        connetto_client::harden::harden_replica_connection(&mut conn).expect("harden");
+        assert_eq!(
+            conn.get_limit(diesel::sqlite::SqliteLimit::Attached),
+            0,
+            "nothing is attached, so nothing may be"
+        );
+
+        let mut blank = super::BlankState::default();
+        let tables: std::collections::HashSet<String> =
+            core::iter::once("drafts".to_owned()).collect();
+        let patchset = super::snapshot_patchset(&mut conn, super::MAIN_SCHEMA, &tables, &mut blank)
+            .expect("the snapshot attaches its scratch database and diffs against it");
+        assert!(
+            !patchset.is_empty(),
+            "the seeded row has to appear in the patchset"
+        );
+        assert_eq!(
+            conn.get_limit(diesel::sqlite::SqliteLimit::Attached),
+            1,
+            "the ceiling followed the scratch attach and closed behind it"
+        );
     }
 }

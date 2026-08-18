@@ -122,11 +122,16 @@ extern "SQL" {
 
 /// The registrar connetto installs on every connection it opens for this app.
 /// Nondeterministic, so SQLite calls `uuidv4()` per row instead of folding the
-/// DEFAULT to a constant.
+/// DEFAULT to a constant, and `INNOCUOUS` because the replica runs with trusted
+/// schema off and a column DEFAULT is a schema object.
 fn uuidv4_functions() -> connetto_client::SqlFunctions {
     connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
         |conn: &mut diesel::SqliteConnection| {
-            uuidv4_utils::register_nondeterministic_impl(conn, rosetta_uuid::Uuid::new_v4)
+            uuidv4_utils::register_impl_with_behavior(
+                conn,
+                diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+                rosetta_uuid::Uuid::new_v4,
+            )
         },
     ))
 }

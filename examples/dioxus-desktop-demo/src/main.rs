@@ -102,10 +102,16 @@ extern "SQL" {
 /// The registrar connetto installs on the replica connection: `uuidv4()` mints
 /// a fresh `rosetta_uuid::Uuid` (the same strongly typed key the `orders`
 /// schema uses on SQLite and Postgres). Nondeterministic, so SQLite calls it
-/// per row instead of folding the DEFAULT to a constant.
+/// per row instead of folding the DEFAULT to a constant, and `INNOCUOUS`
+/// because the replica runs with trusted schema off and a column DEFAULT is a
+/// schema object.
 fn uuidv4_functions() -> SqlFunctions {
     SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
-        uuidv4_utils::register_nondeterministic_impl(conn, Uuid::new_v4)
+        uuidv4_utils::register_impl_with_behavior(
+            conn,
+            diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+            Uuid::new_v4,
+        )
     }))
 }
 
