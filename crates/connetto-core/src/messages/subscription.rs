@@ -126,6 +126,29 @@ pub struct Unsubscribe {
     pub sub_id: String,
 }
 
+/// Server announces a membership subscription it opened on the client's
+/// behalf (R27 decisions 3, 4 and 7).
+///
+/// A subscription whose filter narrows through a membership table needs that
+/// table's rows on the replica, both for the offline answer and for the
+/// policy view a translated schema reads, so the server opens one standing
+/// subscription over the caller's own membership rows and tells the client
+/// with this frame, ahead of its `SnapshotBegin`. The client keeps the table
+/// out of the application-facing changed-tables signal, unconditionally. The
+/// subscription is the server's: it is counted against the caller's
+/// allowance, reopened when a term subscription registers again, and torn
+/// down with the last term subscription that needs it, so the client never
+/// re-declares it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipOpened {
+    /// The hidden subscription's label, server-chosen and stable per
+    /// membership table: `connetto-membership:<member_table>`.
+    pub sub_id: String,
+    /// The membership table it reads, by its catalog name, which is the
+    /// table the client hides from the changed-tables signal.
+    pub member_table: String,
+}
+
 /// Server marks the start of an initial snapshot for a subscription.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBegin {

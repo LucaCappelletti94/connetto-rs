@@ -115,7 +115,7 @@ mod pg {
 
     use diesel::row::{Field, NamedRow, Row};
     use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
-    use diesel::{QueryableByName, sql_query};
+    use diesel::{ExpressionMethods, QueryDsl, QueryableByName, sql_query};
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -130,7 +130,7 @@ mod pg {
     use super::{RowSource, SnapshotError, SourceRow, table_from_select};
     use crate::capability::{CallerBinding, CapabilityKey};
     use crate::key_filter::KeyFilter;
-    use crate::session::{Snapshot, SnapshotSource};
+    use crate::session::{Snapshot, SnapshotSource, TermSeedRead};
     use connetto_core::quote_ident;
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a
@@ -140,6 +140,10 @@ mod pg {
         catalog: DB,
         /// The setting a policy reads the caller's identity from.
         user_setting: std::sync::Arc<str>,
+        /// The publication the change stream reads, when the deployment named
+        /// it, so a membership term's table can be verified as replicated at
+        /// registration (R27). Without one, every membership term is refused.
+        publication: Option<std::sync::Arc<str>>,
     }
 
     impl PgSnapshotSource<ParserDB> {
@@ -158,6 +162,7 @@ mod pg {
                 pool,
                 catalog,
                 user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+                publication: None,
             })
         }
     }
@@ -174,6 +179,14 @@ mod pg {
             self
         }
 
+        /// Name the publication the change stream reads, so a membership
+        /// term's table can be verified as replicated at registration (R27).
+        #[must_use]
+        pub fn with_publication(mut self, publication: impl Into<std::sync::Arc<str>>) -> Self {
+            self.publication = Some(publication.into());
+            self
+        }
+
         /// Build over a connection pool and an existing catalog.
         ///
         /// Not `const`: the default identity setting is a shared string, which
@@ -183,6 +196,7 @@ mod pg {
                 pool,
                 catalog,
                 user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+                publication: None,
             }
         }
     }
@@ -393,6 +407,93 @@ mod pg {
                 patchset,
                 cursor: Cursor::new(cursor),
             })
+        }
+
+        async fn term_seed(
+            &self,
+            seed_sql: &str,
+            member_table: &str,
+            caller: &Principal<Id, Key>,
+        ) -> Result<Option<TermSeedRead>, SnapshotError> {
+            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let seed = seed_sql.to_owned();
+            let probe_table = member_table.to_owned();
+            let publication = self.publication.clone();
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let (rows, published) = conn
+                .transaction::<(Vec<BinaryRow>, Option<bool>), diesel::result::Error, _>(|c| {
+                    async move {
+                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                        // The caller's own binding, so the seed and the
+                        // snapshot answer from the same identity by
+                        // construction.
+                        binding.apply(c).await?;
+                        // Raw SQL for the same reason the snapshot read is:
+                        // the query text and the table it reads come from the
+                        // deployment's runtime DDL, so no `table!` schema can
+                        // name them at compile time.
+                        let rows: Vec<BinaryRow> = sql_query(seed).load(c).await?;
+                        // The publication probe is typed against preflight's
+                        // modelled catalog view, in the same transaction as
+                        // the seed so the two answers name one moment.
+                        let published = match publication {
+                            Some(publication) => {
+                                use crate::preflight::pg_publication_tables as pubs;
+                                let present: bool = diesel::select(diesel::dsl::exists(
+                                    pubs::table
+                                        .filter(pubs::pubname.eq(&*publication))
+                                        .filter(pubs::tablename.eq(&probe_table)),
+                                ))
+                                .get_result(c)
+                                .await?;
+                                Some(present)
+                            }
+                            None => None,
+                        };
+                        Ok((rows, published))
+                    }
+                    .scope_boxed()
+                })
+                .await
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            // Lower through the same encoder the snapshot uses, so a seed
+            // value and the same value delivered on the change path are one
+            // value, and the term lookup keyed by it matches.
+            let column_names: Vec<&str> = rows
+                .as_slice()
+                .first()
+                .map(|row| row.names.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let cells: Vec<Vec<Option<&[u8]>>> = rows
+                .iter()
+                .map(|row| row.cells.iter().map(|cell| cell.as_deref()).collect())
+                .collect();
+            let mut decoded = Vec::with_capacity(cells.len());
+            if !cells.is_empty() {
+                let built = subql::emit::pgbinary_patchset_builder(
+                    &self.catalog,
+                    member_table,
+                    &column_names,
+                    &cells,
+                )
+                .map_err(|err| SnapshotError::Encode(err.to_string()))?;
+                for op in built.iter() {
+                    let PatchsetOp::Insert { values, .. } = op else {
+                        return Err(SnapshotError::Encode(
+                            "the seed encoder produced something other than an insert".into(),
+                        ));
+                    };
+                    decoded.push(values.iter().map(crate::pk::from_wire).collect());
+                }
+            }
+            Ok(Some(TermSeedRead {
+                rows: decoded,
+                published,
+            }))
         }
     }
 }

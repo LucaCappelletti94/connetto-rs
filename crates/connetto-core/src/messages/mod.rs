@@ -27,6 +27,6 @@ pub use mutation::{
 };
 pub use reconnect::{FullResyncReason, FullResyncRequired};
 pub use subscription::{
-    BindValue, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority, SubscriptionSpec,
-    Unsubscribe,
+    BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
+    SubscriptionSpec, Unsubscribe,
 };

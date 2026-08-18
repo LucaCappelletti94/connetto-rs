@@ -84,6 +84,7 @@ use connetto_server::{
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
+use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
@@ -498,6 +499,63 @@ async fn prepare_change_log(
         OplogConfig::default(),
     ))
 }
+/// The deployment's caller pairing for reverse translation (R27): the SQLite
+/// function `CONNETTO_CALLER_FUNCTION` names, paired against the identity
+/// setting. Empty means unset, and without it a subscription naming the
+/// caller's local function is refused at registration.
+fn caller_mapping() -> Option<SessionVariableMapping> {
+    let function = var_or("CONNETTO_CALLER_FUNCTION", "");
+    (!function.is_empty())
+        .then(|| SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, function))
+}
+
+/// The concrete manager this binary serves.
+type ServerManager = SessionManager<
+    PgSnapshotSource,
+    ServerAuth,
+    ConnettoWatermark,
+    PgAsyncDieselConnector,
+    PgOplog,
+>;
+
+/// R27 decision 6: move-out withdrawals are read on `DATABASE_URL`'s pool,
+/// because the policy that made those rows visible to the caller is exactly
+/// the membership that ended, so a read as the caller finds nothing precisely
+/// when there is something to withdraw. Keys only are sent, and only what the
+/// change-path executor denies.
+fn install_withdrawals(
+    manager: &ServerManager,
+    pool: &Pool<AsyncPgConnection>,
+    pg_ddl: &str,
+) -> Result<()> {
+    let withdrawals = PgSnapshotSource::from_ddl(pool.clone(), pg_ddl)
+        .map_err(|err| anyhow!("building the withdrawal source: {err}"))?;
+    if manager.install_withdrawal_source(withdrawals).is_err() {
+        return Err(anyhow!("the withdrawal source was installed twice"));
+    }
+    Ok(())
+}
+
+/// The reader pool's size and its reserved share (R39). Both explicit so the
+/// reserve is expressed against a number the operator can see, with the split
+/// refused up front when no such split exists.
+fn reader_split() -> Result<(u32, crate::ReaderGate)> {
+    let total = env_u32("CONNETTO_READER_POOL_SIZE", ReaderReserve::DEFAULT_TOTAL)?;
+    let reserved = env_u32("CONNETTO_READER_RESERVE", ReaderReserve::DEFAULT_RESERVED)?;
+    if reserved > total {
+        return Err(anyhow!(
+            "CONNETTO_READER_RESERVE ({reserved}) exceeds \
+             CONNETTO_READER_POOL_SIZE ({total}), so no split exists"
+        ));
+    }
+    Ok((
+        total,
+        ReaderReserve::new()
+            .with_total(total)
+            .with_reserved(reserved)
+            .gate(),
+    ))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -514,24 +572,8 @@ async fn main() -> Result<()> {
     let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     let oplog = prepare_change_log(&pool, &slot, &publication, &oplog_table).await?;
     let connector = PgAsyncDieselConnector::new(pool.clone());
-    let materializer = Materializer::with_write_catalog(&pg_ddl, writable_catalog())
-        .map_err(|err| anyhow!("building materializer: {err}"))?;
 
-    // The reader pool's size and its reserved share (R39). Both explicit so
-    // the reserve is expressed against a number the operator can see, with
-    // the split refused up front when no such split exists.
-    let reader_pool_size = env_u32("CONNETTO_READER_POOL_SIZE", ReaderReserve::DEFAULT_TOTAL)?;
-    let reader_reserve = env_u32("CONNETTO_READER_RESERVE", ReaderReserve::DEFAULT_RESERVED)?;
-    if reader_reserve > reader_pool_size {
-        return Err(anyhow!(
-            "CONNETTO_READER_RESERVE ({reader_reserve}) exceeds \
-             CONNETTO_READER_POOL_SIZE ({reader_pool_size}), so no split exists"
-        ));
-    }
-    let reader_gate = ReaderReserve::new()
-        .with_total(reader_pool_size)
-        .with_reserved(reader_reserve)
-        .gate();
+    let (reader_pool_size, reader_gate) = reader_split()?;
 
     // The handshake authority is a required constructor argument with no
     // default (R2), so the auth service is built first and the server refuses
@@ -560,9 +602,20 @@ async fn main() -> Result<()> {
     })?;
     let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
-        .map_err(|err| anyhow!("building snapshot source: {err}"))?;
+        .map_err(|err| anyhow!("building snapshot source: {err}"))?
+        .with_publication(publication.as_str());
     let (auth, translator, reach) =
         build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
+    // The membership term's subquery classifies against the deployment's own
+    // policies, so the materializer's engine gets the same translator the
+    // change-path executor keeps current.
+    let materializer = Materializer::with_translation(
+        &pg_ddl,
+        writable_catalog(),
+        translator.clone(),
+        caller_mapping(),
+    )
+    .map_err(|err| anyhow!("building materializer: {err}"))?;
     let upkeep = auth.upkeep(translator, reach, reader_pool.clone());
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
@@ -578,6 +631,7 @@ async fn main() -> Result<()> {
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
     );
+
     // The store follows the change stream from here: every changed row's
     // difference is written before the row reaches anybody.
     if manager.install_store_upkeep(upkeep).is_err() {
@@ -586,6 +640,7 @@ async fn main() -> Result<()> {
              events either side of the swap against two different stores"
         ));
     }
+    install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing
     // its next handshake. The hook fires synchronously inside the revoke, so
     // the close itself rides a spawned task.

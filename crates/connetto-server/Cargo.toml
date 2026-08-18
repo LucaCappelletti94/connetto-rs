@@ -20,7 +20,7 @@ path = "src/bin/connetto-server.rs"
 
 [dependencies]
 connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging", "env"] }
-subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga"] }
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term"] }
 # The policy text this server is given is translated here, and the model it
 # produces is written to the authorization server here. subql takes the same
 # crate with default features off and re-exports none of it, so the types

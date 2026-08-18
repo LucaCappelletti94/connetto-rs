@@ -27,13 +27,16 @@ use std::time::{Duration, Instant};
 use connetto_core::auth::{Principal, Subject};
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MutationApplied,
-    MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError, PauseCause, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe,
+    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MembershipOpened,
+    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
+    MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited, SUBSCRIPTION_REFUSED,
+    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
+use sqlite_diff_rs::{
+    DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
+};
 use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
@@ -52,7 +55,8 @@ use crate::counters;
 use crate::guard::RequestGuard;
 use crate::materializer::{
     DeltaAggregateCapture, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
-    Registration, SqliteRegistration, agg_value_to_json, compress, value_to_json,
+    Registration, SqliteRegistration, TermMove, TermSeed, agg_value_to_json, compress,
+    narrowed_sql, typed_subscriber, value_to_json,
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
@@ -69,6 +73,59 @@ pub struct Snapshot {
     /// Cursor at which the snapshot was read. Live updates strictly greater
     /// than this apply on top on the client.
     pub cursor: Cursor,
+}
+
+/// The caller's own membership rows for a term at registration, read by a
+/// [`SnapshotSource`] that can run the seed under the caller's own binding.
+pub struct TermSeedRead {
+    /// Full membership rows in catalog column order, decoded the same way the
+    /// snapshot decodes, so the seed and the snapshot agree by construction.
+    pub rows: Vec<Vec<PgValue<Postgres>>>,
+    /// Whether the membership table is carried by the publication this source
+    /// was configured with, or `None` when it has none to check against.
+    pub published: Option<bool>,
+}
+
+/// Why a subscription was not registered, beyond the materializer's own
+/// refusals. Every cause is answered on the wire with the one fixed
+/// `SUBSCRIPTION_REFUSED` detail (R38), so this exists for the structured log.
+#[derive(Debug, thiserror::Error)]
+enum SubscribeRefusal {
+    /// Translation or registration was refused.
+    #[error(transparent)]
+    Materializer(#[from] MaterializerError),
+    /// The seed read failed.
+    #[error("the membership seed read failed: {0}")]
+    Seed(String),
+    /// A membership term filters for a caller, and this one has no identity.
+    #[error("a membership term needs an identified caller")]
+    Anonymous,
+    /// The identity cannot be read at the membership column's kind. A
+    /// mistyped subscriber would admit nobody in silence, so it refuses.
+    #[error("the caller's identity cannot be read at the membership column's kind")]
+    Mistyped,
+    /// The membership table is not replicated, so no membership change would
+    /// ever move rows and the term would go stale silently.
+    #[error(
+        "membership table {0} is not carried by the publication, so a membership change would never move rows"
+    )]
+    Unpublished(String),
+    /// The snapshot source has no publication to verify against.
+    #[error(
+        "no publication is configured on the snapshot source, so a membership table cannot be verified as replicated"
+    )]
+    NoPublication,
+    /// The snapshot source cannot run a seed read.
+    #[error("this snapshot source cannot seed a membership term")]
+    Unseedable,
+}
+
+/// The server-chosen label of the membership subscription over `member_table`
+/// (R27 decision 7). Deterministic, so a term registering again on the same
+/// session finds the one already open instead of opening a second, and the
+/// prefix is a reserved wire namespace the client can classify by.
+fn membership_label(member_table: &str) -> String {
+    format!("connetto-membership:{member_table}")
 }
 
 /// Produces a subscription's initial snapshot for a given identity.
@@ -99,6 +156,27 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
         binds: &[BindValue],
         caller: &Principal<Id, Key>,
     ) -> Result<Snapshot, Self::Error>;
+
+    /// Read the caller's own membership rows for a term at registration:
+    /// `seed_sql` run as `caller` under the same binding the snapshot uses,
+    /// plus whether `member_table` is carried by the configured publication.
+    ///
+    /// The default cannot seed and returns `Ok(None)`, which refuses the
+    /// registration: a term served without its seed admits nobody in silence,
+    /// and a membership table outside the publication never narrows.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backend read or decode failure.
+    async fn term_seed(
+        &self,
+        seed_sql: &str,
+        member_table: &str,
+        caller: &Principal<Id, Key>,
+    ) -> Result<Option<TermSeedRead>, Self::Error> {
+        let _ = (seed_sql, member_table, caller);
+        Ok(None)
+    }
 }
 
 /// The products of registering one row subscription, as its delivery needs
@@ -112,6 +190,9 @@ struct RowRegistration {
     sub_id: SubscriptionId,
     /// The subscription query reverse translated to Postgres.
     pg_sql: String,
+    /// The membership tables the subscription's terms watch, empty for a
+    /// filter naming none (R27).
+    member_tables: std::sync::Arc<[(String, String)]>,
 }
 
 /// Per-session server configuration.
@@ -436,6 +517,17 @@ struct Route<Id, Key> {
     /// The table this subscription reads, absent when the translated SQL names
     /// none the parser recognises. What a moved grant is matched against (R7).
     table: Option<String>,
+    /// The subscription's Postgres SQL, for the move-in read a membership
+    /// narrowing triggers (R27). Shared, because the fan-out clones one route
+    /// per subscriber per event.
+    pg_sql: std::sync::Arc<str>,
+    /// The subscription's bind values, paired with `pg_sql`'s placeholders.
+    binds: std::sync::Arc<[BindValue]>,
+    /// The membership tables this subscription's terms watch, empty for a
+    /// filter naming none. A grant moved by a change to one of these tables is
+    /// served incrementally by the term's own move (R27 decision 2), so the
+    /// R7 resend is suppressed for exactly these tables.
+    member_tables: std::sync::Arc<[(String, String)]>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -649,6 +741,14 @@ pub struct SessionManager<
     /// Optional and off by default: it costs one Postgres round trip per watcher
     /// per changed row, which is the whole cost R5b removed.
     second_opinion: OnceLock<Arc<dyn crate::parity::SecondOpinion<Id, Key>>>,
+    /// Reads the rows a membership move-out withdraws, on the privileged pool
+    /// (R27 decision 6): when a membership ends, the policy that made those
+    /// rows visible is exactly what ended, so a read as the caller comes back
+    /// empty precisely when there is something to withdraw.
+    ///
+    /// Optional like the upkeep. Without one, a move-out escalates to the R7
+    /// replace instead of withdrawing incrementally.
+    withdrawal_source: OnceLock<Snap>,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -773,6 +873,7 @@ where
             auth_retry: RetryPolicy::new(),
             upkeep: OnceLock::new(),
             second_opinion: OnceLock::new(),
+            withdrawal_source: OnceLock::new(),
         })
     }
 }
@@ -823,6 +924,20 @@ where
         second: Arc<dyn crate::parity::SecondOpinion<Id, Key>>,
     ) -> Result<(), Arc<dyn crate::parity::SecondOpinion<Id, Key>>> {
         self.second_opinion.set(second)
+    }
+
+    /// Read move-out withdrawals on the privileged pool (R27 decision 6).
+    ///
+    /// Set once, after construction, like the store upkeep. The source's pool
+    /// is what makes it privileged: the caller binding is inert where
+    /// row-level security does not apply, and nothing read through it is sent
+    /// as data, only denied keys as indirect deletes.
+    ///
+    /// # Errors
+    ///
+    /// The source handed over, when one is already installed.
+    pub fn install_withdrawal_source(&self, source: Snap) -> Result<(), Snap> {
+        self.withdrawal_source.set(source)
     }
 
     /// Which refusal a transition failure is.
@@ -1173,6 +1288,19 @@ where
     /// [`SessionError`] when dispatch, a cursor advance, an install, or the
     /// oplog append fails.
     pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
+        self.dispatch_with_grants(event, &[]).await
+    }
+
+    /// [`dispatch_event`](Self::dispatch_event) with this event's grant moves,
+    /// as the ingest loop computed them before dispatching: a membership
+    /// move-out may withdraw rows only when the same event moved a grant
+    /// reaching the subscribed table for that watcher, because only then did
+    /// policy visibility of held rows flip (see `move_out`).
+    async fn dispatch_with_grants(
+        &self,
+        event: &ChangeEvent,
+        grant_moves: &[GrantMove],
+    ) -> Result<(), SessionError> {
         let dispatched = {
             counters::timed_lock(&self.materializer)
                 .await
@@ -1201,6 +1329,8 @@ where
             deliveries.push((patch, route));
         }
         self.fan_out_rows(event, deliveries).await?;
+        self.fan_out_moves(event, dispatched.narrowings, grant_moves)
+            .await;
 
         for change in dispatched.aggregates {
             self.deliver_aggregate(change.query_id, change.result_json)
@@ -1333,6 +1463,235 @@ where
         Ok(())
     }
 
+    /// How many times a membership move read retries in place before the
+    /// subscription is replaced through the R7 machinery instead.
+    const MOVE_ATTEMPTS: u32 = 3;
+
+    /// Serve the rows one membership move affects (R27 step 4): a value that
+    /// entered a subscription's set is answered with the subscription's own
+    /// SELECT narrowed to that value, and a value that left with an indirect
+    /// delete per key the policy no longer grants.
+    ///
+    /// A failure never fails the event and never skips silently: the engine's
+    /// membership set has already moved, so a redispatched event would re-fire
+    /// no narrowing, and instead the subscription is replaced whole through
+    /// the same ordered notice-and-replacement instruction a moved grant uses
+    /// (R7). The healthy path stays incremental, which is what the phase's
+    /// proof asserts.
+    async fn fan_out_moves(
+        &self,
+        event: &ChangeEvent,
+        moves: Vec<TermMove>,
+        grant_moves: &[GrantMove],
+    ) {
+        if moves.is_empty() {
+            return;
+        }
+        let cursor = event
+            .checkpoint()
+            .map(|lsn| lsn.0.to_be_bytes().to_vec())
+            .unwrap_or_default();
+        for term_move in moves {
+            let route = {
+                self.routes
+                    .lock()
+                    .await
+                    .values()
+                    .find(|route| route.sub_id == term_move.sub_id)
+                    .cloned()
+            };
+            let Some(route) = route else { continue };
+            let served = if term_move.entered {
+                self.move_in(&route, &term_move, &cursor).await
+            } else {
+                self.move_out(&route, &term_move, &cursor, grant_moves)
+                    .await
+            };
+            if !served {
+                let _ = route.tx.send(Outbound::Resnapshot {
+                    sub_id: route.label.clone(),
+                });
+            }
+        }
+    }
+
+    /// Deliver the rows a value entering the set admits: the subscription's
+    /// own SELECT narrowed to the value, read as the caller under row-level
+    /// security, which is the snapshot-time visibility question, so a row the
+    /// policy forbids never arrives however much the term admits it. Returns
+    /// whether the move was served.
+    async fn move_in(&self, route: &Route<Id, Key>, term_move: &TermMove, cursor: &[u8]) -> bool {
+        let Some(sql) = narrowed_sql(&route.pg_sql, &term_move.column, &term_move.value) else {
+            return false;
+        };
+        let mut attempt: u32 = 0;
+        let snapshot = loop {
+            match self
+                .snapshot_source
+                .snapshot(&sql, &route.binds, &route.principal)
+                .await
+            {
+                Ok(snapshot) => break snapshot,
+                Err(err) => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt >= Self::MOVE_ATTEMPTS {
+                        tracing::warn!(
+                            sub_id = %route.label,
+                            error = %err,
+                            "a move-in read kept failing, replacing the subscription"
+                        );
+                        return false;
+                    }
+                    tokio::time::sleep(self.auth_retry.backoff(attempt)).await;
+                }
+            }
+        };
+        let has_rows = matches!(
+            ParsedDiffSet::parse(&snapshot.patchset),
+            Ok(ParsedDiffSet::Patchset(set)) if set.iter().next().is_some()
+        );
+        if !has_rows {
+            // The policy admitted nothing under this value. Delivering an
+            // empty patch would say something moved when nothing did.
+            return true;
+        }
+        let Ok(payload) = compress(&snapshot.patchset) else {
+            return false;
+        };
+        self.send_move(route, cursor, payload).await
+    }
+
+    /// Withdraw what a value leaving the set no longer shows: the rows under
+    /// the moved value, read on the privileged pool per decision 6, because
+    /// the policy that made them visible is exactly what ended and a read as
+    /// the caller finds nothing precisely when there is something to
+    /// withdraw. Each row still goes through the change-path executor, and
+    /// only what is denied is sent, keys only, as indirect deletes: a row the
+    /// policy still admits through something other than the term stays put,
+    /// and the replica's own membership copy answers the local query. Returns
+    /// whether the move was served.
+    async fn move_out(
+        &self,
+        route: &Route<Id, Key>,
+        term_move: &TermMove,
+        cursor: &[u8],
+        grant_moves: &[GrantMove],
+    ) -> bool {
+        // Only an event that moved a grant reaching the subscribed table for
+        // this watcher can have flipped the policy's answer for rows the
+        // client held. Any other membership exit is interest-only: nothing is
+        // sent, and the replica's own membership copy stops the local query
+        // matching. The deny-now set under a parent also contains keys the
+        // caller never held, and a delete for a never-held key is the
+        // disclosure R6 forbids, which is what this gate closes.
+        let policy_moved = grant_moves.iter().any(|moved| {
+            route
+                .table
+                .as_deref()
+                .is_some_and(|table| moved.tables.iter().any(|reached| reached == table))
+                && Self::concerns(&route.principal, &moved.holder)
+        });
+        if !policy_moved {
+            return true;
+        }
+        let Some(source) = self.withdrawal_source.get() else {
+            return false;
+        };
+        let base = format!(
+            "SELECT * FROM {}",
+            connetto_core::quote_ident(&term_move.table)
+        );
+        let Some(sql) = narrowed_sql(&base, &term_move.column, &term_move.value) else {
+            return false;
+        };
+        let mut attempt: u32 = 0;
+        let snapshot = loop {
+            match source.snapshot(&sql, &[], &route.principal).await {
+                Ok(snapshot) => break snapshot,
+                Err(err) => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt >= Self::MOVE_ATTEMPTS {
+                        tracing::warn!(
+                            sub_id = %route.label,
+                            error = %err,
+                            "a move-out read kept failing, replacing the subscription"
+                        );
+                        return false;
+                    }
+                    tokio::time::sleep(self.auth_retry.backoff(attempt)).await;
+                }
+            }
+        };
+        let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
+            return false;
+        };
+        let Some(table_id) =
+            subql::catalog_helpers::table_id(self.catalog.as_ref(), &term_move.table)
+        else {
+            return false;
+        };
+        let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
+        let mut any = false;
+        for op in set.iter() {
+            let PatchsetOp::Insert { values, .. } = &op else {
+                continue;
+            };
+            let row: Vec<PgValue<Postgres>> = values.iter().map(crate::pk::from_wire).collect();
+            let view = ValuesRow::new(table_id, &row);
+            let watchers = [Arc::clone(&route.principal)];
+            let mut verdicts = Vec::new();
+            let mut asked: u32 = 0;
+            let allowed = loop {
+                Verdict::reset(&mut verdicts, watchers.len());
+                match self.auth.may_see(&view, &watchers, &mut verdicts).await {
+                    Ok(()) => break matches!(verdicts.as_slice(), [Verdict::Allow, ..]),
+                    Err(err) => {
+                        asked = asked.saturating_add(1);
+                        if asked >= Self::MOVE_ATTEMPTS {
+                            tracing::warn!(
+                                sub_id = %route.label,
+                                error = %err,
+                                "a move-out visibility question kept failing, replacing the subscription"
+                            );
+                            return false;
+                        }
+                        tokio::time::sleep(self.auth_retry.backoff(asked)).await;
+                    }
+                }
+            };
+            if allowed {
+                continue;
+            }
+            deletes = deletes
+                .delete(PatchDelete::new(op.table().clone(), op.primary_key()).indirect(true));
+            any = true;
+        }
+        if !any {
+            return true;
+        }
+        let Ok(payload) = compress(&deletes.build()) else {
+            return false;
+        };
+        self.send_move(route, cursor, payload).await
+    }
+
+    /// Advance the subscription's cursor to the causing event and queue one
+    /// live patch for it. Returns whether it was queued.
+    async fn send_move(&self, route: &Route<Id, Key>, cursor: &[u8], payload: Vec<u8>) -> bool {
+        let advanced = {
+            counters::timed_lock(&self.materializer)
+                .await
+                .advance_cursor(route.session_key, route.sub_id, cursor)
+        };
+        if advanced.is_err() {
+            return false;
+        }
+        let live = LivePatch::new(route.label.clone(), Cursor::new(cursor.to_vec()), payload);
+        // A dropped session receiver just means the client is gone.
+        let _ = route.tx.send(Outbound::Live(live));
+        true
+    }
+
     /// Bring the authorization store level with `event`, if one is maintained.
     ///
     /// **Called once per event, before it is dispatched, and deliberately not
@@ -1378,6 +1737,7 @@ where
         if moves.is_empty() {
             return;
         }
+        let moved_table = self.event_table(event);
         let told: Vec<(SessionId, Option<Id>, String)> = {
             let routes = self.routes.lock().await;
             routes
@@ -1389,6 +1749,18 @@ where
                             && Self::concerns(&route.principal, &moved.holder)
                     });
                     if !concerned {
+                        return None;
+                    }
+                    // A subscription whose own term watches the moved grant's
+                    // table is served incrementally by the membership move
+                    // this same event produces (R27 decision 2). The resend
+                    // would double-deliver what the move already sends, and
+                    // the phase's proof asserts its absence.
+                    if route
+                        .member_tables
+                        .iter()
+                        .any(|(member, _)| member == &moved_table)
+                    {
                         return None;
                     }
                     let sent = route.tx.send(Outbound::Resnapshot {
@@ -1463,6 +1835,10 @@ where
                     // Applied once, then only the question is retried. See
                     // `keep_store_current` for why re-applying is refused.
                     let mut levelled = false;
+                    // Remembered across auth retries: the store is levelled
+                    // once, so the moves exist only on the first attempt, and
+                    // a retried dispatch still owes the withdrawal they gate.
+                    let mut grant_moves: Vec<GrantMove> = Vec::new();
                     loop {
                         let attempt = async {
                             if !levelled {
@@ -1473,8 +1849,9 @@ where
                                 let moved = self.keep_store_current(&event).await?;
                                 levelled = true;
                                 self.announce_grant_moves(&event, &moved).await;
+                                grant_moves = moved;
                             }
-                            self.dispatch_event(&event).await
+                            self.dispatch_with_grants(&event, &grant_moves).await
                         };
                         match attempt.await {
                             Ok(()) => {
@@ -2207,6 +2584,24 @@ where
                 if let Some(row) = state.subs.remove(&unsub.sub_id) {
                     self.remove_route(row.reg.consumer_id).await;
                     self.materializer.lock().await.unregister(row.reg.sub_id);
+                    // R27 decision 7: a membership subscription is torn down
+                    // with the last term subscription that needed it.
+                    for (member_table, _) in row.reg.member_tables.iter() {
+                        let still_needed = state.subs.values().any(|sibling| {
+                            sibling
+                                .reg
+                                .member_tables
+                                .iter()
+                                .any(|(table, _)| table == member_table)
+                        });
+                        if still_needed {
+                            continue;
+                        }
+                        if let Some(hidden) = state.subs.remove(&membership_label(member_table)) {
+                            self.remove_route(hidden.reg.consumer_id).await;
+                            self.materializer.lock().await.unregister(hidden.reg.sub_id);
+                        }
+                    }
                 }
                 if let Some(query_id) = state.agg_subs.remove(&unsub.sub_id) {
                     self.remove_agg_route(query_id).await;
@@ -2488,6 +2883,88 @@ where
             .map_err(transport_err)
     }
 
+    /// Translate and register one subscription, seeding a membership term.
+    ///
+    /// A filter naming no term registers as before. A term is seeded per R27:
+    /// the subscriber typed at `member_subject`'s own catalog kind and the
+    /// values read from the membership table as the caller. The materializer
+    /// lock is held across the seed read and the register (decision 11), so
+    /// no dispatch lands between the seed's snapshot and the engine watching,
+    /// which would silently lose that membership change for good. The
+    /// lock-then-connection order cannot deadlock: no other path holds this
+    /// lock and a pooled connection at once, verified against
+    /// `dispatch_event` and `handle_mutation`.
+    async fn register_subscription(
+        &self,
+        consumer_id: u64,
+        sub: &Subscribe,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(SqliteRegistration, std::sync::Arc<[(String, String)]>), SubscribeRefusal> {
+        let mut materializer = self.materializer.lock().await;
+        let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
+        let terms = materializer.membership_terms(&pg_sql);
+        let seed = match terms.as_slice() {
+            [] => None,
+            [first, rest @ ..] => {
+                let identity = state
+                    .principal
+                    .identity()
+                    .ok_or(SubscribeRefusal::Anonymous)?;
+                if rest
+                    .iter()
+                    .any(|term| term.subject_kind != first.subject_kind)
+                {
+                    return Err(SubscribeRefusal::Mistyped);
+                }
+                let subscriber =
+                    typed_subscriber(&identity.user_id.to_string(), first.subject_kind)
+                        .ok_or(SubscribeRefusal::Mistyped)?;
+                let mut term_values = Vec::with_capacity(terms.len());
+                for term in &terms {
+                    let read = self
+                        .snapshot_source
+                        .term_seed(&term.seed_sql, &term.member_table, &state.principal)
+                        .await
+                        .map_err(|err| SubscribeRefusal::Seed(err.to_string()))?
+                        .ok_or(SubscribeRefusal::Unseedable)?;
+                    match read.published {
+                        Some(true) => {}
+                        Some(false) => {
+                            return Err(SubscribeRefusal::Unpublished(term.member_table.clone()));
+                        }
+                        None => return Err(SubscribeRefusal::NoPublication),
+                    }
+                    let values: Vec<PgValue<Postgres>> = read
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.get(term.member_key_ordinal))
+                        .filter(|value| !matches!(value, PgValue::Missing | PgValue::Null))
+                        .cloned()
+                        .collect();
+                    term_values.push((term.column.clone(), values));
+                }
+                Some(TermSeed {
+                    subscriber,
+                    term_values,
+                })
+            }
+        };
+        let member_tables: std::sync::Arc<[(String, String)]> = terms
+            .iter()
+            .map(|term| (term.member_table.clone(), term.member_subject.clone()))
+            .collect::<Vec<_>>()
+            .into();
+        let registration =
+            materializer.register_translated(consumer_id, &pg_sql, &sub.spec.binds, seed)?;
+        Ok((
+            SqliteRegistration {
+                registration,
+                pg_sql,
+            },
+            member_tables,
+        ))
+    }
+
     async fn handle_subscribe<T: Transport>(
         &self,
         transport: &mut T,
@@ -2512,15 +2989,11 @@ where
             return Ok(());
         }
         let consumer_id = self.next_consumer_id();
-        let SqliteRegistration {
-            registration,
-            pg_sql,
-        } = match self.materializer.lock().await.register_sqlite(
-            consumer_id,
-            &sub.spec.query,
-            &sub.spec.binds,
-        ) {
-            Ok(registration) => registration,
+        let (registration, member_tables) = match self
+            .register_subscription(consumer_id, &sub, state)
+            .await
+        {
+            Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 // Naming something that does not resolve is one of the four
@@ -2543,48 +3016,20 @@ where
                 return Ok(());
             }
         };
+        let SqliteRegistration {
+            registration,
+            pg_sql,
+        } = registration;
 
         match registration {
             Registration::Row(sub_id) => {
-                // One share permit spans the whole row delivery (R39): the
-                // snapshot read or the catchup replay's visibility questions,
-                // which check out reader connections one at a time, so an
-                // unidentified caller counts once for the operation however
-                // many checkouts it makes. Aggregates bootstrap through the
-                // re-execution connector on the owner pool and take none.
-                let Some(_reader_permit) = self
-                    .subscribe_reader_permit(transport, tier, &sub.sub_id, sub_id)
-                    .await?
-                else {
-                    return Ok(());
-                };
-                let sub_label = sub.sub_id.clone();
                 let reg = RowRegistration {
                     consumer_id,
                     sub_id,
                     pg_sql,
+                    member_tables,
                 };
-                match self.subscribe_row(transport, sub, state, reg).await {
-                    // A snapshot failure is scoped to this one subscription:
-                    // the registration is rolled back and the session (with
-                    // every sibling subscription) stays alive. Transport and
-                    // oplog failures stay fatal.
-                    Err(SessionError::Snapshot(detail)) => {
-                        tracing::warn!(sub_id = %sub_label, error = %detail, "snapshot failed");
-                        state.subs.remove(&sub_label);
-                        self.remove_route(consumer_id).await;
-                        self.materializer.lock().await.unregister(sub_id);
-                        transport
-                            .send_control(ControlMessage::NonFatalError(NonFatalError {
-                                related_to: Some(sub_label),
-                                detail: SUBSCRIPTION_REFUSED.to_owned(),
-                            }))
-                            .await
-                            .map_err(transport_err)?;
-                        Ok(())
-                    }
-                    other => other,
-                }
+                self.serve_term_row(transport, sub, state, tier, reg).await
             }
             Registration::Aggregate(capture) => {
                 self.subscribe_aggregate(transport, sub, state, capture)
@@ -2594,6 +3039,92 @@ where
                 self.subscribe_delta_aggregate(transport, sub, state, capture)
                     .await
             }
+        }
+    }
+
+    /// Serve one registered row subscription: the R39 reader permit, the R27
+    /// allowance pre-charge for the membership subscription a term needs, the
+    /// snapshot or catchup, and the membership open behind it.
+    async fn serve_term_row<T: Transport>(
+        &self,
+        transport: &mut T,
+        sub: Subscribe,
+        state: &mut SessionState<Id, Key>,
+        tier: Tier,
+        reg: RowRegistration,
+    ) -> Result<(), SessionError> {
+        // One share permit spans the whole row delivery (R39): the snapshot
+        // read or the catchup replay's visibility questions, which check out
+        // reader connections one at a time, so an unidentified caller counts
+        // once for the operation however many checkouts it makes. Aggregates
+        // bootstrap through the re-execution connector on the owner pool and
+        // take none.
+        let Some(_reader_permit) = self
+            .subscribe_reader_permit(transport, tier, &sub.sub_id, reg.sub_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let sub_label = sub.sub_id.clone();
+        let (consumer_id, sub_id) = (reg.consumer_id, reg.sub_id);
+        // R27 decisions 4 and 7: the membership subscription this term needs
+        // is counted against the same allowance before anything is served, so
+        // a caller at its ceiling is refused as a unit rather than served
+        // half.
+        for (member_table, _) in reg.member_tables.iter() {
+            if state.subs.contains_key(&membership_label(member_table)) {
+                continue;
+            }
+            if let Some(wait) = self.guard.subscription(state.session_id, tier) {
+                let retry_after_ms = retry_ms(wait);
+                self.materializer.lock().await.unregister(sub_id);
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(sub_label),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
+        }
+        let members = std::sync::Arc::clone(&reg.member_tables);
+        match self.subscribe_row(transport, sub, state, reg).await {
+            // A snapshot failure is scoped to this one subscription: the
+            // registration is rolled back and the session (with every sibling
+            // subscription) stays alive. Transport and oplog failures stay
+            // fatal.
+            Err(SessionError::Snapshot(detail)) => {
+                tracing::warn!(sub_id = %sub_label, error = %detail, "snapshot failed");
+                state.subs.remove(&sub_label);
+                self.remove_route(consumer_id).await;
+                self.materializer.lock().await.unregister(sub_id);
+                transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(sub_label),
+                        detail: SUBSCRIPTION_REFUSED.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(())
+            }
+            Ok(()) => {
+                // R27 decision 7: the server opens the membership
+                // subscription the term needs, after the term's own frames so
+                // the announce precedes the hidden subscription's snapshot.
+                for (member_table, member_subject) in members.iter() {
+                    self.open_membership_subscription(
+                        transport,
+                        state,
+                        tier,
+                        member_table,
+                        member_subject,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            other => other,
         }
     }
 
@@ -2628,6 +3159,93 @@ where
         self.snapshot_row(transport, sub, state, &reg, resync).await
     }
 
+    /// Open the membership subscription a term needs, on the client's behalf
+    /// (R27 decisions 3, 4, 7 and 12): the caller's own membership rows and
+    /// nothing wider, announced ahead of its snapshot, hidden from the
+    /// changed-tables signal by the client, and torn down with the last term
+    /// subscription that needs it. Idempotent per session through the
+    /// deterministic label, which also covers a reconnect registering the
+    /// same term again.
+    async fn open_membership_subscription<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        tier: Tier,
+        member_table: &str,
+        member_subject: &str,
+    ) -> Result<(), SessionError> {
+        let label = membership_label(member_table);
+        if state.subs.contains_key(&label) {
+            return Ok(());
+        }
+        // `register_subscription` requires an identified caller for any term,
+        // so the membership subscription always has an identity to filter by.
+        let Some(identity) = state.principal.identity() else {
+            return Err(SessionError::Snapshot(
+                "a membership subscription needs an identified caller".to_owned(),
+            ));
+        };
+        // The caller's own rows only (decision 12): a membership table
+        // typically carries no policy of its own, so an unfiltered read would
+        // snapshot every tenant's membership rows to every client. The
+        // identity rides as a bind rather than as the caller function,
+        // because a filter naming the caller directly is itself a term to
+        // subql and would ask for a seed of its own, while a bound literal is
+        // an ordinary predicate. The requirement, never the spelling, is what
+        // decision 12 fixed.
+        let query = format!(
+            "SELECT * FROM {} WHERE {} = ?",
+            connetto_core::quote_ident(member_table),
+            connetto_core::quote_ident(member_subject),
+        );
+        let hidden = Subscribe {
+            sub_id: label.clone(),
+            spec: SubscriptionSpec::new(query)
+                .with_binds(vec![BindValue::Text(identity.user_id.to_string())]),
+        };
+        transport
+            .send_control(ControlMessage::MembershipOpened(MembershipOpened {
+                sub_id: label.clone(),
+                member_table: member_table.to_owned(),
+            }))
+            .await
+            .map_err(transport_err)?;
+        let consumer_id = self.next_consumer_id();
+        let registration = match self
+            .register_subscription(consumer_id, &hidden, state)
+            .await
+        {
+            Ok((registration, _)) => registration,
+            // The query is the server's own rendering over its own catalog,
+            // so a refusal here is a server-side defect, never something the
+            // caller sent, and it fails loudly rather than serving the term
+            // without the rows its local answer needs.
+            Err(err) => return Err(SessionError::Snapshot(err.to_string())),
+        };
+        let SqliteRegistration {
+            registration,
+            pg_sql,
+        } = registration;
+        let Registration::Row(sub_id) = registration else {
+            return Err(SessionError::Snapshot(
+                "a membership subscription registered as something other than rows".to_owned(),
+            ));
+        };
+        let Some(_reader_permit) = self
+            .subscribe_reader_permit(transport, tier, &label, sub_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let reg = RowRegistration {
+            consumer_id,
+            sub_id,
+            pg_sql,
+            member_tables: std::sync::Arc::from(Vec::new()),
+        };
+        self.subscribe_row(transport, hidden, state, reg).await
+    }
+
     /// Install the live route and record the subscription, so `dispatch_event`
     /// starts delivering to this consumer.
     ///
@@ -2653,6 +3271,9 @@ where
                 tx: state.outbound.clone(),
                 principal: Arc::clone(&state.principal),
                 table: crate::snapshot::table_from_select(&reg.pg_sql).ok(),
+                pg_sql: reg.pg_sql.as_str().into(),
+                binds: sub.spec.binds.clone().into(),
+                member_tables: reg.member_tables.clone(),
             },
         )
         .await;

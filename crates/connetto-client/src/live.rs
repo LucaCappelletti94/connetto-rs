@@ -35,7 +35,9 @@ use diesel::query_dsl::RunQueryDsl;
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sqlite::Sqlite;
 use serde::de::DeserializeOwned;
-use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement, visit_relations};
+use sqlparser::ast::{
+    Expr, GroupByExpr, SelectItem, SetExpr, Statement, TableFactor, visit_relations,
+};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 use subql::backend::Value as SqliteValue;
@@ -278,17 +280,48 @@ pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, C
     }
     let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
         .map_err(|err| ClientError::Session(err.to_string()))?;
-    let predicate = match statements.as_slice() {
+    // Only the outer query's own tables cover this subscription's rows. A
+    // membership term reads a second table inside an `IN (SELECT ...)`, which
+    // `visit_relations` (and so `parsed.tables`) collects for refresh routing,
+    // but a changed row of that table is never a row of the subscribed table,
+    // so a departure there must not be tested against this predicate.
+    let (tables, predicate) = match statements.as_slice() {
         [Statement::Query(query)] => match query.body.as_ref() {
-            SetExpr::Select(select) => select.selection.as_ref().map(ToString::to_string),
-            _ => None,
+            SetExpr::Select(select) => (
+                outer_tables(select),
+                select.selection.as_ref().map(ToString::to_string),
+            ),
+            _ => (parsed.tables, None),
         },
-        _ => None,
+        _ => (parsed.tables, None),
     };
-    Ok(Some(Coverage {
-        tables: parsed.tables,
-        predicate,
-    }))
+    Ok(Some(Coverage { tables, predicate }))
+}
+
+/// The base tables named in a query's own `FROM` and `JOIN`s, excluding any
+/// relation that appears only inside a subquery. A membership term's `IN
+/// (SELECT ... FROM member_table ...)` names `member_table`, which belongs to
+/// refresh routing but not to the set whose row departures this subscription
+/// answers for.
+fn outer_tables(select: &sqlparser::ast::Select) -> HashSet<String> {
+    let mut tables = HashSet::new();
+    for from in &select.from {
+        collect_relation(&from.relation, &mut tables);
+        for join in &from.joins {
+            collect_relation(&join.relation, &mut tables);
+        }
+    }
+    tables
+}
+
+/// Insert the lowercased base-table name a [`TableFactor`] names, if it names
+/// one. A derived table (a subquery in `FROM`) names none and is skipped.
+fn collect_relation(relation: &TableFactor, tables: &mut HashSet<String>) {
+    if let TableFactor::Table { name, .. } = relation
+        && let Some(ident) = name.0.last().and_then(|part| part.as_ident())
+    {
+        tables.insert(ident.value.to_lowercase());
+    }
 }
 
 /// One SQL literal for a wire value, so a primary key can be matched inside a
@@ -1584,7 +1617,7 @@ async fn pump<T, F, S>(
 
 /// Re-run every live query whose tables were touched since the last step.
 fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
-    let changed = state.conn.take_changed();
+    let changed = state.conn.take_changed_unfiltered();
     if changed.is_empty() {
         return;
     }
@@ -1764,5 +1797,34 @@ mod tests {
                 .expect("parse")
         );
         assert!(subscription_is_aggregate("NOT SQL AT ALL (").is_err());
+    }
+
+    // A membership term reads a second table inside `IN (SELECT ...)`. Refresh
+    // routing needs both tables, so `parse_subscription` keeps them, but a
+    // subscription answers departures only for its own rows, so `coverage_of`
+    // drops the membership table: a `project_members` change must never be
+    // tested against the `docs` predicate.
+    #[test]
+    fn coverage_of_excludes_the_membership_subquery_table() {
+        let query = "SELECT * FROM docs WHERE project_id IN \
+                     (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
+        let parsed = parse_subscription(query).expect("parse");
+        assert!(
+            parsed.tables.contains("project_members"),
+            "refresh routing must still watch the membership table, got {:?}",
+            parsed.tables
+        );
+        let coverage = coverage_of(&SubscriptionSpec::new(query))
+            .expect("coverage")
+            .expect("a row subscription has coverage");
+        assert_eq!(
+            coverage.tables,
+            HashSet::from(["docs".to_owned()]),
+            "coverage answers only for the subscribed table"
+        );
+        assert!(
+            coverage.predicate.is_some(),
+            "the term predicate is kept so still_covered can re-test it"
+        );
     }
 }

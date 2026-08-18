@@ -25,12 +25,16 @@ subql = { workspace = true, features = [
     "pg-streaming",
     "executor-diesel-async-postgres",
     "visibility-openfga",
+    "membership-term",
 ] }
 # The fan-out fixture serves through the executor the binary serves through, so
 # it needs the client that talks to the authorization service and the translator
 # that produces what goes into it.
 openfga-client = { version = "0.6.1", default-features = false }
 rls2fga = { workspace = true }
+# Naming the caller mapping reverse translation rewrites the client's local
+# caller function with, mirroring the server binary's materializer wiring.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 thiserror.workspace = true
 tokio.workspace = true
 # The admin and role pools that reset the fixture and back the write, snapshot,

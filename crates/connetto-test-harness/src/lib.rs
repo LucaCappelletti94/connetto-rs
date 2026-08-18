@@ -29,6 +29,7 @@ use connetto_core::auth::Principal;
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, FullResyncReason, Grant, Handshake, HandshakeAck,
     LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
+    Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -43,6 +44,8 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
 use openfga_client::tonic::transport::Channel;
+use pg2sqlite::prelude::SessionVariableMapping;
+use rls2fga::translator::Translator;
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
@@ -455,6 +458,13 @@ pub struct ServerConfig {
     /// The counters the server meters and tallies against. Supply one built
     /// from tight thresholds to trip a limit or a ban inside a test.
     guard: Arc<RequestGuard<String>>,
+    /// The deployment's rls2fga translator, handed to the materializer's engine
+    /// so a membership subquery classifies at registration. `None` for a
+    /// fixture with no membership term.
+    translator: Option<Translator>,
+    /// The caller mapping reverse translation rewrites the client's local caller
+    /// function with. `None` when no policy names the caller.
+    caller: Option<SessionVariableMapping>,
 }
 
 impl ServerConfig {
@@ -467,6 +477,8 @@ impl ServerConfig {
             writable: RuntimeWritableCatalog::default(),
             session: SessionConfig::default(),
             guard: Arc::new(RequestGuard::default()),
+            translator: None,
+            caller: None,
         }
     }
 
@@ -488,6 +500,20 @@ impl ServerConfig {
     #[must_use]
     pub fn with_guard(mut self, guard: Arc<RequestGuard<String>>) -> Self {
         self.guard = guard;
+        self
+    }
+
+    /// Hand the materializer's engine the deployment's translator so a
+    /// membership subquery classifies at registration, and the caller mapping
+    /// reverse translation rewrites the client's local caller function with.
+    #[must_use]
+    pub fn with_translation(
+        mut self,
+        translator: Translator,
+        caller: Option<SessionVariableMapping>,
+    ) -> Self {
+        self.translator = Some(translator);
+        self.caller = caller;
         self
     }
 }
@@ -593,11 +619,17 @@ pub fn spawn_server(
         admin_url,
         session,
         guard,
+        translator,
+        caller,
     } = config;
-    let materializer =
-        Materializer::with_write_catalog(&pg_ddl, writable).expect("build materializer");
+    let materializer = match translator {
+        Some(translator) => Materializer::with_translation(&pg_ddl, writable, translator, caller)
+            .expect("build materializer"),
+        None => Materializer::with_write_catalog(&pg_ddl, writable).expect("build materializer"),
+    };
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
+    let withdrawal_pool = connector_pool.clone();
     let connector = PgAsyncDieselConnector::new(connector_pool);
     // The manager requires a handshake authority with no default (R2). The
     // harness is test-only, so it installs the `test-support` stand-in that
@@ -615,6 +647,15 @@ pub fn spawn_server(
         write,
         guard,
         session,
+    );
+    // R27 decision 6: move-out withdrawals are read on the admin pool, as the
+    // binary reads them on DATABASE_URL's, because the caller can no longer
+    // see the rows a lost membership exposes. Keys only are sent.
+    let withdrawals =
+        PgSnapshotSource::from_ddl(withdrawal_pool, &pg_ddl).expect("build withdrawal source");
+    assert!(
+        manager.install_withdrawal_source(withdrawals).is_ok(),
+        "nothing else installs a withdrawal source"
     );
 
     let ingest_manager = Arc::clone(&manager);
@@ -731,6 +772,16 @@ impl Client {
             }))
             .await
             .expect("send subscribe");
+    }
+
+    /// Cancel a subscription.
+    pub async fn unsubscribe(&mut self, sub_id: &str) {
+        self.transport
+            .send_control(ControlMessage::Unsubscribe(Unsubscribe {
+                sub_id: sub_id.to_owned(),
+            }))
+            .await
+            .expect("send unsubscribe");
     }
 
     /// Upload one mutation: a header naming the op count, then the compressed

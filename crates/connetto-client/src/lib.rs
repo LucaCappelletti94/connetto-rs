@@ -647,6 +647,17 @@ pub enum ClientEvent {
         /// consumers the truth rather than restating one cause as another.
         reason: FullResyncReason,
     },
+    /// The server opened a membership subscription on this client's behalf
+    /// (R27): a filter narrowing through a membership table needs that
+    /// table's rows on the replica for the offline answer and for the policy
+    /// view. Its table stays out of [`Reactive::changed_tables`], and the
+    /// server owns its lifecycle, so nothing needs doing with this event.
+    MembershipOpened {
+        /// The hidden subscription's server-chosen label.
+        sub_id: String,
+        /// The membership table it reads.
+        member_table: String,
+    },
     /// The server reported a non-fatal error attached to a request, most
     /// commonly a rejected subscription. The session stays open.
     NonFatal {
@@ -1342,6 +1353,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// replica named, empty when it named none. Live
     /// queries dispatch on it: a local table never reaches the wire.
     local_tables: HashSet<String>,
+    /// Lowercased names of membership tables served by server-opened hidden
+    /// subscriptions (R27). Kept out of the application-facing changed-tables
+    /// signal, unconditionally, while the live-query refresh still sees them.
+    hidden_tables: HashSet<String>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -1530,6 +1545,7 @@ where
             config: config.clone(),
             token_source: None,
             local_tables: HashSet::new(),
+            hidden_tables: HashSet::new(),
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -2293,6 +2309,18 @@ where
     /// names. Reporting the physical name would leave every live query over a
     /// policy-bearing table never refreshing, silently.
     pub fn take_changed(&mut self) -> Vec<String> {
+        let mut named = self.take_changed_unfiltered();
+        // R27 decisions 4 and 7: a membership table served by a hidden
+        // subscription stays out of the application-facing signal,
+        // unconditionally, even when the application also subscribed to it.
+        named.retain(|name| !self.hidden_tables.contains(&name.to_lowercase()));
+        named
+    }
+
+    /// [`take_changed`](Self::take_changed) without the hidden-table filter,
+    /// for the live-query refresh: a query narrowed through a membership
+    /// still has to re-run when the membership moves (R27).
+    pub(crate) fn take_changed_unfiltered(&mut self) -> Vec<String> {
         let tables = &self.config.policy_tables;
         let mut named: Vec<String> = self
             .changed
@@ -2402,6 +2430,20 @@ where
             }),
             ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
             ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
+            ControlMessage::MembershipOpened(opened) => {
+                // R27 decisions 3, 4 and 7: the server opened a membership
+                // subscription on this client's behalf. Its data frames apply
+                // like any other subscription's, while the table stays out of
+                // the application-facing changed-tables signal. The server
+                // owns its lifecycle, so nothing is declared or re-declared
+                // here.
+                self.hidden_tables
+                    .insert(opened.member_table.to_lowercase());
+                Ok(ClientEvent::MembershipOpened {
+                    sub_id: opened.sub_id,
+                    member_table: opened.member_table,
+                })
+            }
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
             ))),

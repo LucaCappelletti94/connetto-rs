@@ -51,7 +51,7 @@ use super::{
     handshake::{Handshake, HandshakeAck},
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
-    subscription::{SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
+    subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
 };
 
 /// Every control-plane frame flowing between client and server.
@@ -92,6 +92,9 @@ pub enum ControlMessage {
 
     /// Server tells the client the subscription cannot resume incrementally.
     FullResyncRequired(FullResyncRequired),
+    /// Server announces a membership subscription it opened on the client's
+    /// behalf (R27). Precedes that subscription's `SnapshotBegin`.
+    MembershipOpened(MembershipOpened),
 
     /// Client heartbeat probe.
     Ping(Ping),

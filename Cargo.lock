@@ -631,6 +631,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "openfga-client",
+ "pg2sqlite",
  "rls2fga",
  "sqlite-diff-rs",
  "sqlparser",

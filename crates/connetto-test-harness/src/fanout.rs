@@ -29,6 +29,8 @@ use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
+use pg2sqlite::prelude::SessionVariableMapping;
+use rls2fga::translator::Translator;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
 
@@ -88,6 +90,11 @@ pub enum PolicyShape {
     /// A policy that has to look in another table, which one row never settles,
     /// so every watcher becomes a question.
     CrossTable,
+    /// The cross-table catalog with a policy that never reads the membership:
+    /// items are visible to their owner alone. The membership term expresses
+    /// interest through `team_members` while permission ignores it, so the two
+    /// can disagree and R27's intersection is observable in both directions.
+    OwnerOverTeams,
 }
 
 impl PolicyShape {
@@ -119,6 +126,21 @@ impl PolicyShape {
                              AND team_members.member = current_setting('app.user_id', true)))"
                     .into(),
             ],
+            Self::OwnerOverTeams => vec![
+                "CREATE TABLE teams (id INT PRIMARY KEY)".into(),
+                format!("INSERT INTO teams (id) VALUES ({TEAM})"),
+                "CREATE TABLE team_members (team_id INT REFERENCES teams(id), \
+                   member TEXT NOT NULL, PRIMARY KEY (team_id, member))"
+                    .into(),
+                format!("INSERT INTO team_members (team_id, member) VALUES ({TEAM}, '{OWNER}')"),
+                "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, \
+                   team_id INT NOT NULL REFERENCES teams(id), label TEXT)"
+                    .into(),
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY".into(),
+                "CREATE POLICY items_p ON items FOR SELECT USING (\
+                   owner = current_setting('app.user_id', true))"
+                    .into(),
+            ],
         }
     }
 
@@ -126,7 +148,7 @@ impl PolicyShape {
     fn ddl(self) -> &'static str {
         match self {
             Self::Row => FANOUT_PG_DDL,
-            Self::CrossTable => CROSS_TABLE_PG_DDL,
+            Self::CrossTable | Self::OwnerOverTeams => CROSS_TABLE_PG_DDL,
         }
     }
 
@@ -135,6 +157,7 @@ impl PolicyShape {
         match self {
             Self::Row => FANOUT_PG_POLICIES,
             Self::CrossTable => CROSS_TABLE_PG_POLICIES,
+            Self::OwnerOverTeams => OWNER_OVER_TEAMS_PG_POLICIES,
         }
     }
 
@@ -145,7 +168,7 @@ impl PolicyShape {
             Self::Row => format!(
                 "INSERT INTO items (id, owner, label) VALUES ({n}, '{OWNER}', 'row-{n}{filler}')"
             ),
-            Self::CrossTable => format!(
+            Self::CrossTable | Self::OwnerOverTeams => format!(
                 "INSERT INTO items (id, owner, team_id, label) \
                  VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}{filler}')"
             ),
@@ -156,7 +179,7 @@ impl PolicyShape {
     fn published(self) -> &'static [&'static str] {
         match self {
             Self::Row => &["items"],
-            Self::CrossTable => &["items", "team_members"],
+            Self::CrossTable | Self::OwnerOverTeams => &["items", "team_members"],
         }
     }
 }
@@ -205,6 +228,11 @@ CREATE POLICY items_p ON items FOR SELECT USING (
           WHERE team_members.team_id = items.team_id
             AND team_members.member = current_setting('app.user_id', true))
 );";
+
+/// An owner-only policy over the cross-table catalog, for the intersection
+/// half of R27's proof.
+pub const OWNER_OVER_TEAMS_PG_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY items_p ON items FOR SELECT USING (owner = current_setting('app.user_id', true));";
 /// How long one live patch may take to arrive before the run is declared hung.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to let routes settle after the last snapshot. The route is
@@ -278,7 +306,7 @@ async fn run_through(
     shape: PolicyShape,
     executor: Executor,
 ) -> FanoutRun {
-    let server = provision_with(fixture, shape, executor).await;
+    let server = provision_with(fixture, shape, executor, None).await;
     let mut clients = connect_subscribers(&server, subscribers).await;
     tokio::time::sleep(ROUTE_SETTLE).await;
 
@@ -506,6 +534,7 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
         fixture,
         PolicyShape::Row,
         Executor::Reachable(Arc::clone(&reachable)),
+        None,
     )
     .await;
     (server, reachable)
@@ -519,7 +548,7 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
 /// provisions the stack and writes nothing beyond the seed row, leaving the
 /// caller to own its rows and their owners.
 pub async fn visibility_fixture(fixture: &Fixture) -> Server {
-    provision_with(fixture, PolicyShape::Row, Executor::Shipped).await
+    provision_with(fixture, PolicyShape::Row, Executor::Shipped, None).await
 }
 
 /// A server whose policy reads another table: `items` is visible to a member of
@@ -527,11 +556,46 @@ pub async fn visibility_fixture(fixture: &Fixture) -> Server {
 /// are in `items`. What R7's teardown needs, because withdrawing a grant here
 /// produces no row event on the subscribed table at all.
 pub async fn cross_table_visibility_fixture(fixture: &Fixture) -> Server {
-    provision_with(fixture, PolicyShape::CrossTable, Executor::Shipped).await
+    provision_with(fixture, PolicyShape::CrossTable, Executor::Shipped, None).await
+}
+
+/// The membership-policy stack with the term enabled end to end: the engine
+/// carries the deployment's translator, reverse translation carries the caller
+/// pairing, and the snapshot source knows the publication, which is the
+/// binary's wiring exactly (R27).
+pub async fn membership_term_fixture(fixture: &Fixture) -> Server {
+    provision_with(
+        fixture,
+        PolicyShape::CrossTable,
+        Executor::Shipped,
+        Some(caller_mapping()),
+    )
+    .await
+}
+
+/// The term over a policy that never reads the membership, so R27's
+/// intersection is observable in both directions.
+pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
+    provision_with(
+        fixture,
+        PolicyShape::OwnerOverTeams,
+        Executor::Shipped,
+        Some(caller_mapping()),
+    )
+    .await
+}
+
+/// The pairing every example build uses: `current_setting('app.user_id')`
+/// spelled `current_app_user()` on the replica.
+fn caller_mapping() -> SessionVariableMapping {
+    SessionVariableMapping::current_setting(
+        connetto_server::capability::DEFAULT_USER_SETTING,
+        "current_app_user",
+    )
 }
 
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
-    provision_with(fixture, shape, Executor::Shipped).await
+    provision_with(fixture, shape, Executor::Shipped, None).await
 }
 
 /// Which executor a run serves through.
@@ -550,7 +614,12 @@ enum Executor {
     Reachable(Arc<AtomicBool>),
 }
 
-async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executor) -> Server {
+async fn provision_with(
+    fixture: &Fixture,
+    shape: PolicyShape,
+    executor: Executor,
+    caller: Option<SessionVariableMapping>,
+) -> Server {
     // A prior suite in the same full run may have left the shared publication
     // behind (Fixture::acquire only cleans the slot), so drop it first.
     fixture
@@ -563,6 +632,9 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
     ];
     statements.extend(shape.setup());
     statements.push("ALTER TABLE items REPLICA IDENTITY FULL".into());
+    if shape.published().contains(&"team_members") {
+        statements.push("ALTER TABLE team_members REPLICA IDENTITY FULL".into());
+    }
     statements.push(
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'r0_reader') \
          THEN CREATE ROLE r0_reader LOGIN PASSWORD 'r0_reader'; END IF; END $$"
@@ -578,9 +650,10 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
     fixture.start_replication(shape.published()).await;
 
     let reader_pool = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
-    let snapshot =
-        PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl()).expect("snapshot source");
-    let (fga, upkeep) = fga_auth(fixture, shape).await;
+    let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl())
+        .expect("snapshot source")
+        .with_publication(PUBLICATION);
+    let (fga, upkeep, translator) = fga_auth(fixture, shape).await;
     let compared = matches!(executor, Executor::Both);
     let auth = match executor {
         Executor::Shipped | Executor::Both => HarnessAuth::fga(fga),
@@ -591,7 +664,8 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
     };
     let server = spawn_server(
         ServerConfig::new(shape.ddl(), fixture.admin_url())
-            .with_writable(RuntimeWritableCatalog::builder().writable("items").build()),
+            .with_writable(RuntimeWritableCatalog::builder().writable("items").build())
+            .with_translation(translator, caller),
         snapshot,
         auth,
         fixture.admin().clone(),
@@ -615,7 +689,7 @@ async fn provision_with(fixture: &Fixture, shape: PolicyShape, executor: Executo
 async fn fga_auth(
     fixture: &Fixture,
     shape: PolicyShape,
-) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>) {
+) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
     let (channel, store) = fga_store().await;
     let translated = Translated::of::<String>(
         shape.ddl(),
@@ -634,6 +708,7 @@ async fn fga_auth(
         .expect("the generated queries ran");
 
     let (shapes, translator, reach) = translated.into_parts();
+    let engine_translator = translator.clone();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
@@ -661,7 +736,7 @@ async fn fga_auth(
     // reaches a subscriber. Without it a cross-table policy would answer every
     // new row from facts that were never written.
     let upkeep = auth.upkeep(translator, reach, fixture.admin().clone());
-    (auth, upkeep)
+    (auth, upkeep, engine_translator)
 }
 
 /// Connect `subscribers` clients, each with one subscription over the whole
