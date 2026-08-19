@@ -2489,8 +2489,14 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         }
     }
     assert!(!saw_patch, "no patch may arrive after the unsubscribe");
+    // R15: dropping the zero-grace watch ended the subscription, so the pass
+    // evicted the two rows no other subscription covered. That the third insert
+    // never arrived is asserted above by the absence of any patch.
     let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
-    assert_eq!(replica_rows, 2, "the replica never saw the third insert");
+    assert_eq!(
+        replica_rows, 0,
+        "ending the watch evicted its uncovered rows"
+    );
 
     // Dropping the last client handle ends the pump and closes the transport.
     drop(client);
@@ -2866,8 +2872,10 @@ async fn identical_row_watches_share_one_subscription() {
         !saw_patch,
         "no patch may arrive after the last sharer drops"
     );
+    // R15: the last sharer dropped, ending the zero-grace subscription, so the
+    // pass evicted the three rows no other subscription still covered.
     let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
-    assert_eq!(replica_rows, 3, "the replica never saw the fourth insert");
+    assert_eq!(replica_rows, 0, "ending the shared watch evicted its rows");
 
     drop(client);
     server.await.expect("join server");

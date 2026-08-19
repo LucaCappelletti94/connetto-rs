@@ -169,6 +169,19 @@ fn fresh_quantity() -> i64 {
     (r as i64 + 1) * 5
 }
 
+/// The tab mirror's physical footprint, read straight off the replica the
+/// client holds: total pages and the free pages a trim can reclaim.
+async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
+    client
+        .with_conn(|conn| {
+            let db = conn.conn();
+            let pages = db.page_count(None).unwrap_or(0);
+            let free = db.freelist_count(None).unwrap_or(0);
+            (pages, free)
+        })
+        .await
+}
+
 // --- Auth helpers ------------------------------------------------------------
 
 /// If the page URL carries `?code=...&state=...`, return the pair.
@@ -354,7 +367,9 @@ struct Boot {
 /// wrap the connection in the reconnecting client so a worker swap recovers.
 async fn boot_window() -> Result<Boot, JsValue> {
     let glue = glue_url();
-    let client_id = format!("tab-{}", js_sys::Date::now());
+    // The relay hub keys each tab's mutation watermark by a typed UUID, so the
+    // tab id must parse as one (the worker mints its own the same way).
+    let client_id = rosetta_uuid::Uuid::new_v4().to_string();
 
     // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
     // import and `main` boots the tier, so no separate bootstrap is needed.
@@ -373,7 +388,11 @@ async fn boot_window() -> Result<Boot, JsValue> {
         .with_policy_tables(PolicyTables::from_translation(
             POLICY_TABLES.iter().copied(),
             POLICY_VIEWS.iter().copied(),
-        ));
+        ))
+        // A low threshold so the free-up-space affordance reclaims after a
+        // modest deletion, rather than only once the freelist is a quarter of
+        // the file. Trimming still runs only when the pass is called.
+        .with_trim_threshold(5);
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -442,6 +461,7 @@ const CSS: &str = r"
     .badge { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; }
     .synced { background: #e6f0ff; color: #14458c; }
     .local { background: #fde6e6; color: #8c1414; }
+    .trim { background: #eef7e6; color: #2e6b14; }
     .status { color: #555; font-family: monospace; }
     table { border-collapse: collapse; width: 100%; margin-top: 8px; }
     th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
@@ -758,6 +778,25 @@ fn Dashboard() -> Element {
 
     let mut note_text = use_signal(String::new);
 
+    // R15 retention readout: the tab mirror's page footprint, refreshed on
+    // mount and whenever the covered rows move.
+    let mut footprint = use_signal(|| (0_i64, 0_i64));
+    {
+        let client = client.clone();
+        use_effect(move || {
+            let _covered = orders.value().read().len() + notes.value().read().len();
+            let client = client.clone();
+            spawn(async move {
+                footprint.set(replica_footprint(&client).await);
+            });
+        });
+    }
+    let (pages, free) = *footprint.read();
+    let kb = pages * 4;
+    let tidy_client = client.clone();
+    let remove_order_client = client.clone();
+    let newest_order = order_rows.last().map(|order| order.id);
+
     let add_order_client = client.clone();
     let save_note_client = client;
 
@@ -786,6 +825,27 @@ fn Dashboard() -> Element {
                             });
                         },
                         "Add order"
+                    }
+                    if let Some(id) = newest_order {
+                        button {
+                            onclick: move |_| {
+                                let client = remove_order_client.clone();
+                                spawn(async move {
+                                    let result = client
+                                        .with_conn(move |conn| {
+                                            diesel::delete(
+                                                orders::table.filter(orders::id.eq(id)),
+                                            )
+                                            .execute(conn.conn())
+                                        })
+                                        .await;
+                                    if let Err(err) = result {
+                                        tracing::error!(error = %err, "order remove failed");
+                                    }
+                                });
+                            },
+                            "Remove newest"
+                        }
                     }
                 }
                 if let Some(err) = orders_error {
@@ -852,6 +912,25 @@ fn Dashboard() -> Element {
                                 td { {body} }
                             }
                         }
+                    }
+                }
+            }
+            div { class: "pane",
+                h2 { "retention " span { class: "badge trim", "R15" } }
+                p { "Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {order_count + note_count}." }
+                p { "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }
+                div { class: "row",
+                    button {
+                        onclick: move |_| {
+                            let client = tidy_client.clone();
+                            spawn(async move {
+                                if let Err(err) = client.tidy().await {
+                                    tracing::error!(error = %err, "free up space failed");
+                                }
+                                footprint.set(replica_footprint(&client).await);
+                            });
+                        },
+                        "Free up space"
                     }
                 }
             }

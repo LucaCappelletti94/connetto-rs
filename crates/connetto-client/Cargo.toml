@@ -59,6 +59,7 @@ connetto-core.workspace = true
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
 diesel = { workspace = true, features = [
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+    "returning_clauses_for_sqlite_3_35",
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.

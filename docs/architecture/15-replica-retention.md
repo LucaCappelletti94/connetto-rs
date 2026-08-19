@@ -1,6 +1,6 @@
 # 15: Replica retention, eviction, and physical trimming
 
-**Status**: normative. The coverage model is built: watches with a grace period, named pins, the persisted subscription set and the complement-of-union resync delete landed with R29 (2026-08-08), and the departure distinction with R44 the same day. R15's own machinery (eviction, physical trimming, the `auto_vacuum` create path, rotation, the write-time interest marks) is unbuilt. Every normative statement is marked **Decided** or **Built**, naming its phase in `plans/master-implementation-plan.md`. Four of the five diesel APIs the trimming pass needs landed upstream and are reachable from this workspace since 2026-08-07, so what R15 waits on now is the fifth. See "Upstream dependency".
+**Status**: normative. The coverage model is built: watches with a grace period, named pins, the persisted subscription set and the complement-of-union resync delete landed with R29 (2026-08-08), and the departure distinction with R44 the same day. R15's own machinery (eviction, physical trimming, the `auto_vacuum` create path, rotation, the write-time interest marks) is built too. Every normative statement is marked **Decided** or **Built**, naming its phase in `plans/master-implementation-plan.md`. All five diesel APIs the trimming pass needs are upstream and reachable from this workspace's pin. See "Upstream dependency".
 
 ---
 
@@ -16,7 +16,7 @@ This chapter is about the client-side replica, a SQLite file that holds a local 
 
 **Decided (R15).** The replica holds the union of every subscribed query result the client has ever received. It grows because subscriptions widen or accumulate, not because of a leak. A subscription that covers more rows, a new subscription against an additional table, or a time window that advances each day to include another batch of rows: each causes the replica to grow by the rows it adds. No maintenance pass changes the fact that a broadly-subscribed client holds more data than a narrowly-subscribed one.
 
-The primary control on replica size is therefore subscription shape, not deletion. The trimming mechanisms in this chapter reclaim space freed by eviction, but they do not substitute for a subscription design that bounds what the client holds.
+The primary control on replica size is therefore subscription shape, not deletion. The trimming mechanisms in this chapter reclaim space freed by eviction, and the callable free-up-space pass reclaims space a deletion freed besides, but they do not substitute for a subscription design that bounds what the client holds.
 
 ---
 
@@ -52,9 +52,9 @@ The client is the only party that can determine when a row is uncovered. A row t
 
 **Decided (R15).** Eviction removes from the replica any row that no active subscription covers, where active means a watch-backed subscription still within its grace or a pin. The client determines this by scanning its active subscription set against the local rows.
 
-**Decided (R15).** The pass runs by itself when a subscription ends, that is when a watch's grace expires or the application unpins, and is scoped to the tables that subscription read. A callable tidy pass exists besides, for a free-up-space affordance. Automatic won over app-only triggering because retention exists to bound the replica by default, and the application already expressed its intent by letting the subscription end. The stated cost: deletes run at moments the application did not schedule, though only ever on uncovered rows.
+**Decided (R15).** The pass runs by itself when a subscription ends, that is when a watch's grace expires or the application unpins, and is scoped to the tables that subscription read. A callable tidy pass exists besides, for a free-up-space affordance, sweeping the union of every declared subscription's tables. **Decided (R15, D4, 2026-08-19): the callable pass trims the freelist whether or not the eviction removed a row**, so pages the application freed by deleting covered rows return to the filesystem too, not only pages an eviction freed, while the automatic per-subscription pass trims only when it evicted something. Automatic won over app-only triggering because retention exists to bound the replica by default, and the application already expressed its intent by letting the subscription end. The stated cost: deletes run at moments the application did not schedule, though only ever on uncovered rows.
 
-**Decided (R15).** Two guards on the pass. Rows referenced by a pending, un-acknowledged mutation are never evicted: the write-time interest marks (see What covers a row) exclude their keys from the complement delete, protection is bounded by the pending queue's cap and expires by itself on ack, and the keys are already extractable by the same decode `affected_rows` uses for rejection reporting. And the pass does not run while the transport is down, because a row discarded offline cannot be re-fetched until connectivity returns, which is the empty-screen case. Grace clocks keep running offline, only the pass waits.
+**Decided (R15).** Two guards on the eviction. Rows referenced by a pending, un-acknowledged mutation are never evicted: the write-time interest marks (see What covers a row) exclude their keys from the complement delete, protection is bounded by the pending queue's cap and expires by itself on ack, and the keys are already extractable by the same decode `affected_rows` uses for rejection reporting. And eviction does not run while the transport is down, because a row discarded offline cannot be re-fetched until connectivity returns, which is the empty-screen case. Grace clocks keep running offline, only the eviction waits. The callable pass still trims while the transport is down (D4), because reclaiming freelist pages discards nothing and needs no server, which is what lets a free-up-space control reclaim after an idle spell when the relay wire has gone quiet.
 
 Eviction must run with the capture session suspended. `SuspendedCapture` in `crates/connetto-client/src/lib.rs` is the existing mechanism, used when server patches apply so that server-originated writes are never re-uploaded. A captured eviction delete would be uploaded as a real client mutation and applied to the Postgres backend, discarding server data the user did not ask to delete.
 
@@ -127,7 +127,7 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 ### The trimming pass
 
-**Decided (R15).** The trimming pass runs after each eviction. This chapter records only the policy that drives it. The mechanisms themselves are diesel's, and the verified SQLite facts, version floors and traps that justified each one now live in its merged pull request rather than in this repository.
+**Decided (R15).** The trimming pass runs after each eviction, and the callable free-up-space pass runs it whether or not the eviction removed a row (D4, 2026-08-19), so a freelist grown by ordinary deletes of covered rows is reclaimed too. This chapter records only the policy that drives it. The mechanisms themselves are diesel's, and the verified SQLite facts, version floors and traps that justified each one now live in its merged pull request rather than in this repository.
 
 1. Read `SqliteConnection::freelist_count` and `SqliteConnection::page_count` (diesel #5129). If the ratio of free pages to total pages is below a threshold, skip the pass. Triggering on ratio rather than a schedule avoids reclaiming a file that has no slack.
 
@@ -137,25 +137,22 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 4. Inspect `WalCheckpointOutcome.busy`. A checkpoint blocked by an open reader reports the blockage through the `busy` field and does not fail. The pass records that it did not complete fully and defers to the next maintenance window rather than retrying in a tight loop.
 
-### When the mode is NONE
-
-**Decided (R15).** A replica opened on a file created before R15 may have `auto_vacuum = NONE`. `SqliteConnection::auto_vacuum` (diesel #5130) lets the trimming pass read the mode defensively before running, so it can detect this case rather than issuing `incremental_vacuum` against a file that cannot shrink incrementally. If the mode is `NONE` and a full compaction is requested, `vacuum` or `vacuum_into` (diesel #5146) can rewrite the file. `vacuum_into` writes a compacted copy to a new path without modifying the source, which suits an offline background operation whose output the caller then swaps in.
-
 ---
 
 ## The create path
 
 **Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `connect_inner` in `crates/connetto-client/src/lib.rs`.
 
-**Built.** The existing pragma sequence in `connect_inner`, documented in `docs/architecture/14-at-rest-encryption.md`, is:
+**Built.** The existing pragma sequence in `open_inner`, documented in `docs/architecture/14-at-rest-encryption.md`, is:
 
 1. `cipher::unlock` (the key pragma, must be the first SQL statement on any encrypted connection)
 2. `PRAGMA journal_mode=WAL`
-3. `SqlFunctions` installation
-4. Application DDL (`sqlite_ddl`)
-5. `META_DDL` (connetto's `_connetto_meta` and `_connetto_pending` tables)
+3. `harden::harden_replica_connection` (R18: defensive mode, trusted schema off, four limits, and the attach lockdown)
+4. `SqlFunctions` installation
+5. Application DDL (`sqlite_ddl`)
+6. `META_DDL` (connetto's `_connetto_meta` and `_connetto_pending` tables)
 
-**Decided (R15).** `PRAGMA auto_vacuum = INCREMENTAL` joins this sequence after step 2 and before step 4. After step 2 because the key pragma in step 1 must precede any statement that reads the database header, and WAL is established immediately after it. Before step 4 because both the application DDL and `META_DDL` create tables, and the mode must precede the first `CREATE TABLE`. On the `connect_existing` path the database already has its schema and the mode is already stored in the file from the original create, so the pragma applies only on the `connect` path.
+**Decided (R15).** `PRAGMA auto_vacuum = INCREMENTAL` joins this sequence after step 2 and before step 5. After step 2 because the key pragma in step 1 must precede any statement that reads the database header, and WAL is established immediately after it. Before step 5 because both the application DDL and `META_DDL` create tables, and the mode must precede the first `CREATE TABLE`. On the `connect_existing` path the database already has its schema and the mode is already stored in the file from the original create, so the pragma applies only on the `connect` path.
 
 Chapter 14 is the authoritative source for the unlock ordering constraint. This chapter records only that `auto_vacuum` joins that sequence and where it lands relative to the DDL steps.
 
@@ -163,28 +160,23 @@ Chapter 14 is the authoritative source for the unlock ordering constraint. This 
 
 ## Browser constraints
 
-**Decided (R15).** OPFS quota is the scarce resource in the browser. A replica that grows large faces a higher eviction risk under storage pressure. Physical trimming is therefore more consequential in the browser than natively.
-
-A full `VACUUM` rewrite is expensive in the browser: it requires up to twice the file size in temporary space and must complete before a new write can land. Bounded `incremental_vacuum` is the appropriate tool for foreground maintenance, since it reclaims a configurable number of pages per call and does not block the pump.
-
-`vacuum_into` is the natural candidate for a full offline compaction in the browser, since it writes to a new path rather than modifying the source. Whether OPFS permits an atomic rename or swap to bring the compacted file into service in place of the original is an open question.
+**Decided (R15).** OPFS quota is the scarce resource in the browser, so a replica that grows large faces a higher eviction risk under storage pressure, and the bounded `incremental_vacuum` the trimming pass runs matters more there than natively: it reclaims a configurable number of pages per call and never blocks the pump. No full-compaction path exists, in the browser or anywhere else, because every replica is `INCREMENTAL` from creation (see The auto_vacuum mode and The create path), so no `VACUUM` rewrite and no `vacuum_into` output to swap into service ever arise.
 
 ---
 
 ## Upstream dependency
 
-**All five landed upstream.** The proposal documents are deleted: a merged pull request is a better record than a copy of its own argument, and the API each one asked for is now diesel's public surface.
+**All five landed upstream and the pin reaches every one.** The proposal documents are deleted: a merged pull request is a better record than a copy of its own argument, and the API each one asked for is now diesel's public surface.
 
 | Mechanism | Where it is |
 |---|---|
 | `SqliteConnection::auto_vacuum`, `set_auto_vacuum`, `AutoVacuumMode` | diesel #5130, merged 2026-08-02 |
 | `SqliteConnection::page_count`, `freelist_count` | diesel #5129, merged 2026-08-02 |
 | `SqliteConnection::incremental_vacuum` | diesel #5145, merged 2026-08-05 |
-| `SqliteConnection::vacuum`, `vacuum_into` | diesel #5146, merged 2026-08-07 |
 | `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` | diesel #5150, merged 2026-08-14 |
 
-**The pin reaches the first four and not yet the fifth.** All six workspace locks moved to the rebased fork branch on 2026-08-07, so those four APIs are callable here and both test baselines held. `wal_checkpoint` merged a week later into upstream `main` as `b2984fe1`, and this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch, pinned at `ac4cdfc3`, which predates it. **So the one thing left is a rebase and a lock move, not a request.** Clearing the pin last time cost something worth knowing and will cost it again: the rebase dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is documented and a new table must be too.
+**Nothing upstream gates this phase.** The workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch, pinned at `705e4340` in `Cargo.lock`, which carries `wal_checkpoint` and `WalCheckpointMode` alongside the other four, verified by reading the pinned sources rather than inferred from a merge date. Clearing the earlier pin cost something worth keeping: the rebase onto upstream dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is documented and a new table must be too.
 
 ## Open questions
 
-One question is genuinely unresolved: whether OPFS provides an atomic path for swapping a `vacuum_into`-produced file into service in place of the original, which determines whether full compaction is practical in the browser. Two others were resolved. How eviction interacts with pending local writes is decided: written rows carry transient interest until the ack, the pass pauses offline, and post-ack interest is explicit at the write site (see Local eviction and What covers a row), so the `docs/roadmap.md` deferral no longer waits on it. And per-table retention declarations in the synql schema were resolved by rejection: coverage comes from watches and pins alone, so there is nothing for a schema declaration to add (see What covers a row).
+None remain open. The one that was, whether OPFS provides an atomic path for swapping a `vacuum_into` output into service, is dissolved: R15 keeps every replica `INCREMENTAL` from creation and builds no full-compaction path, so nothing ever produces a file to swap (see Browser constraints and The create path). How eviction interacts with pending local writes was resolved: written rows carry transient interest until the ack, the pass pauses offline, and post-ack interest is explicit at the write site (see Local eviction and What covers a row). And per-table retention declarations in the synql schema were resolved by rejection: coverage comes from watches and pins alone, so there is nothing for a schema declaration to add (see What covers a row).

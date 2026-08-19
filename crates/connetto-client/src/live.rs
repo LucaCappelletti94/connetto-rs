@@ -29,11 +29,15 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use connetto_core::messages::{BindValue, SubscriptionSpec};
 use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
-use diesel::SqliteConnection;
-use diesel::query_builder::QueryFragment;
+use diesel::associations::{HasTable, Identifiable};
+use diesel::dsl::Find;
+use diesel::query_builder::{
+    AsChangeset, AsQuery, InsertStatement, IntoUpdateTarget, QueryFragment, UpdateStatement,
+};
 use diesel::query_dsl::RunQueryDsl;
-use diesel::query_dsl::methods::LoadQuery;
+use diesel::query_dsl::methods::{FindDsl, LoadQuery};
 use diesel::sqlite::Sqlite;
+use diesel::{Insertable, SqliteConnection};
 use serde::de::DeserializeOwned;
 use sqlparser::ast::{
     Expr, GroupByExpr, SelectItem, SetExpr, Statement, TableFactor, visit_relations,
@@ -966,6 +970,27 @@ where
         Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        self.register_watch(&mut state, build, grace).await
+    }
+
+    /// Register a live query against already-locked state: render it, read the
+    /// initial rows, wire the subscription, and return the handle. Shared by
+    /// [`watch_fn_with_grace`](Self::watch_fn_with_grace) and the write-and-keep
+    /// surface, so an insert and the watch over its row land under one lock.
+    async fn register_watch<F, Q, R>(
+        &self,
+        state: &mut State<T>,
+        build: F,
+        grace: Duration,
+    ) -> Result<LiveQuery<R>, ClientError>
+    where
+        F: Fn() -> Q + Send + 'static,
+        Q: QueryFragment<Sqlite>,
+        Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
+        R: Clone + PartialEq + Send + Sync + 'static,
+    {
         let (sql, binds) = render_query(&build())?;
         let parsed = parse_subscription(&sql)?;
         if parsed.shape == QueryShape::Aggregate {
@@ -977,10 +1002,6 @@ where
         let tables = parsed.tables;
         let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("live-{seq}");
-
-        // Interrupt the pump's idle wait so the FIFO lock admits us promptly.
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
 
         let initial: Vec<R> = build()
             .load(state.conn.conn())
@@ -1015,7 +1036,7 @@ where
         });
         let mut wire_ids = Vec::with_capacity(specs.len());
         for spec in specs {
-            let (wire_id, _) = attach_wire(&mut state, &self.shared.next_wire, spec, grace).await?;
+            let (wire_id, _) = attach_wire(state, &self.shared.next_wire, spec, grace).await?;
             wire_ids.push(wire_id);
         }
         let reads_synced = !wire_ids.is_empty();
@@ -1032,6 +1053,161 @@ where
             reads_synced,
             ever_synced: Arc::clone(&self.shared.ever_synced),
         })
+    }
+
+    /// Insert `values` and keep the inserted row live: the returned
+    /// [`LiveQuery`] tracks exactly that row, so it survives eviction while any
+    /// handle holds it and reports the row vanishing when it is deleted.
+    ///
+    /// The table is the value's own, inferred at the type level from the
+    /// returned row rather than named. The insert appends a `RETURNING` clause,
+    /// reads the primary key from the row's [`Identifiable`] impl, and watches
+    /// `table.find(key)`. Single-column primary keys only: a composite key uses
+    /// the two-call pattern (`with_conn` write, then `watch(table.find(key))`).
+    ///
+    /// Until the server acknowledges this write the row is spared eviction by
+    /// the pending-write guard, so the write and the watch need not be atomic
+    /// even though they share one lock here (R15 step 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the insert or the watch registration fails.
+    pub async fn insert_watched_with_grace<V, R, K>(
+        &self,
+        values: V,
+        grace: Duration,
+    ) -> Result<(R, LiveQuery<R>), ClientError>
+    where
+        V: Insertable<R::Table>,
+        R: HasTable + Clone + PartialEq + Send + Sync + 'static,
+        for<'a> &'a R: Identifiable<Id = &'a K>,
+        K: Clone + Send + Sync + 'static,
+        R::Table: FindDsl<K> + Send + 'static,
+        Find<R::Table, K>: QueryFragment<Sqlite> + for<'q> LoadQuery<'q, SqliteConnection, R>,
+        InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
+            for<'q> LoadQuery<'q, SqliteConnection, R>,
+    {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        let row: R = diesel::insert_into(<R as HasTable>::table())
+            .values(values)
+            .get_result(state.conn.conn())
+            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let key: K = (*Identifiable::id(&row)).clone();
+        let live = self
+            .register_watch(
+                &mut state,
+                move || <R as HasTable>::table().find(key.clone()),
+                grace,
+            )
+            .await?;
+        Ok((row, live))
+    }
+
+    /// Insert `values` and keep the inserted row live with the default grace.
+    /// See [`insert_watched_with_grace`](Self::insert_watched_with_grace).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the insert or the watch registration fails.
+    pub async fn insert_watched<V, R, K>(&self, values: V) -> Result<(R, LiveQuery<R>), ClientError>
+    where
+        V: Insertable<R::Table>,
+        R: HasTable + Clone + PartialEq + Send + Sync + 'static,
+        for<'a> &'a R: Identifiable<Id = &'a K>,
+        K: Clone + Send + Sync + 'static,
+        R::Table: FindDsl<K> + Send + 'static,
+        Find<R::Table, K>: QueryFragment<Sqlite> + for<'q> LoadQuery<'q, SqliteConnection, R>,
+        InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
+            for<'q> LoadQuery<'q, SqliteConnection, R>,
+    {
+        self.insert_watched_with_grace(values, DEFAULT_GRACE).await
+    }
+
+    /// Insert `values` and pin the inserted row under `name`, the durable form
+    /// of keeping a written row: it survives restarts and being offline until
+    /// [`unpin`](Self::unpin). Returns the inserted row.
+    ///
+    /// The table is inferred from the row and its primary key read from the
+    /// row's [`Identifiable`] impl, as in [`insert_watched`](Self::insert_watched).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the insert or the pin fails.
+    pub async fn insert_pinned<V, R, K>(&self, name: &str, values: V) -> Result<R, ClientError>
+    where
+        V: Insertable<R::Table>,
+        R: HasTable,
+        for<'a> &'a R: Identifiable<Id = &'a K>,
+        K: Clone,
+        R::Table: FindDsl<K>,
+        Find<R::Table, K>: QueryFragment<Sqlite>,
+        InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
+            for<'q> LoadQuery<'q, SqliteConnection, R>,
+    {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        let row: R = diesel::insert_into(<R as HasTable>::table())
+            .values(values)
+            .get_result(state.conn.conn())
+            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let key: K = (*Identifiable::id(&row)).clone();
+        let query = <R as HasTable>::table().find(key);
+        let (sql, binds) = render_query(&query)?;
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        let (wire_id, _) = attach_wire(
+            &mut state,
+            &self.shared.next_wire,
+            spec.clone(),
+            DEFAULT_GRACE,
+        )
+        .await?;
+        state.conn.pin_subscription(name, &wire_id, &spec)?;
+        Ok(row)
+    }
+
+    /// Update the rows `target` names and keep the updated row live: the update
+    /// twin of [`insert_watched`](Self::insert_watched). `target` is an
+    /// identifiable row reference or a `table.find(key)`, `changeset` the diesel
+    /// change to apply. Returns the updated row and a [`LiveQuery`] over it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the update or the watch registration fails.
+    pub async fn update_watched<Tgt, C, R, K>(
+        &self,
+        target: Tgt,
+        changeset: C,
+    ) -> Result<(R, LiveQuery<R>), ClientError>
+    where
+        Tgt: IntoUpdateTarget,
+        C: AsChangeset<Target = <Tgt as HasTable>::Table>,
+        R: HasTable + Clone + PartialEq + Send + Sync + 'static,
+        for<'a> &'a R: Identifiable<Id = &'a K>,
+        K: Clone + Send + Sync + 'static,
+        R::Table: FindDsl<K> + Send + 'static,
+        Find<R::Table, K>: QueryFragment<Sqlite> + for<'q> LoadQuery<'q, SqliteConnection, R>,
+        UpdateStatement<
+            <Tgt as HasTable>::Table,
+            <Tgt as IntoUpdateTarget>::WhereClause,
+            <C as AsChangeset>::Changeset,
+        >: AsQuery + for<'q> LoadQuery<'q, SqliteConnection, R>,
+    {
+        self.shared.wake.notify_one();
+        let mut state = self.shared.state.lock().await;
+        let row: R = diesel::update(target)
+            .set(changeset)
+            .get_result(state.conn.conn())
+            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let key: K = (*Identifiable::id(&row)).clone();
+        let live = self
+            .register_watch(
+                &mut state,
+                move || <R as HasTable>::table().find(key.clone()),
+                DEFAULT_GRACE,
+            )
+            .await?;
+        Ok((row, live))
     }
 
     /// Watch a server-maintained scalar aggregate, decoding each push with
@@ -1305,6 +1481,22 @@ where
         state.conn.pins()
     }
 
+    /// Reclaim replica space now: evict every row no live subscription covers
+    /// and return the freed pages to the filesystem.
+    ///
+    /// The automatic pass already runs when a subscription ends. This is the
+    /// application-callable form for a free-up-space affordance, sweeping every
+    /// declared table at once. It is a no-op while the transport is down and
+    /// spares every pending write, exactly like the automatic pass.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a replica read or write failure.
+    pub async fn tidy(&self) -> Result<(), ClientError> {
+        let mut state = self.shared.state.lock().await;
+        state.conn.tidy()
+    }
+
     /// Send a keepalive probe. The matching [`ClientEvent::Pong`] on the
     /// [`events`](Self::events) stream doubles as a barrier: the server
     /// processes frames in order, so the pong proves every frame sent before
@@ -1472,12 +1664,22 @@ where
     // the record reads. The record carries the durable claim and the reference
     // count carries the handles, and an unpin arriving while a handle is open
     // would otherwise unsubscribe a live query out from under it.
-    for sub_id in state.conn.expired_subscriptions()? {
-        if state.wire.iter().any(|w| w.wire_id == sub_id && w.refs > 0) {
-            continue;
+    //
+    // Grace expiry and unpin both surface here as an expired record. The whole
+    // pass waits while the transport is down: the record is left in place so the
+    // next connected step retires it, because a row evicted offline could not be
+    // re-fetched (R15 D3).
+    if state.conn.is_connected() {
+        for sub_id in state.conn.expired_subscriptions()? {
+            if state.wire.iter().any(|w| w.wire_id == sub_id && w.refs > 0) {
+                continue;
+            }
+            // Evict scoped to this subscription's tables before the record goes,
+            // sparing rows a survivor or a pending write still wants.
+            state.conn.evict_subscription_rows(&sub_id)?;
+            state.wire.retain(|w| w.wire_id != sub_id);
+            state.conn.unsubscribe(&sub_id).await?;
         }
-        state.wire.retain(|w| w.wire_id != sub_id);
-        state.conn.unsubscribe(&sub_id).await?;
     }
     Ok(())
 }

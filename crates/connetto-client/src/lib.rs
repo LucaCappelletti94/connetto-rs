@@ -46,7 +46,8 @@ use diesel::expression::QueryMetadata;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
 use diesel::sqlite::{
-    CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior, SqliteUpdateRouter,
+    AutoVacuumMode, CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior,
+    SqliteUpdateRouter, WalCheckpointMode,
 };
 use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{
@@ -472,6 +473,16 @@ fn lookup<'map>(map: &'map HashMap<String, String>, key: &str) -> Option<&'map s
         .map(String::as_str)
 }
 
+/// Default percentage of the replica's pages that must sit on the freelist
+/// before the trimming pass reclaims any. A file with little slack is left
+/// alone rather than vacuumed for nothing (R15).
+pub const DEFAULT_TRIM_THRESHOLD: u8 = 25;
+
+/// Default number of pages one `incremental_vacuum` call reclaims, so a large
+/// freelist is returned to the filesystem in bounded steps rather than one
+/// stalling pass (R15).
+pub const DEFAULT_TRIM_BUDGET: u32 = 1000;
+
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -513,6 +524,15 @@ pub struct ClientConfig {
     /// does. Fixed for the life of the connection, because a replica belongs
     /// to the identity it was named from.
     caller: Option<(String, String)>,
+    /// Percentage of `page_count` the freelist must reach before the trimming
+    /// pass runs. Local to this device and never sent to the server: trimming
+    /// is a whole-replica operation, not a handshake input. Defaults to
+    /// [`DEFAULT_TRIM_THRESHOLD`].
+    trim_threshold: u8,
+    /// Pages one `incremental_vacuum` call reclaims, bounding a single step so a
+    /// large freelist never stalls the pump. Local, like `trim_threshold`.
+    /// Defaults to [`DEFAULT_TRIM_BUDGET`].
+    trim_budget: u32,
 }
 
 impl ClientConfig {
@@ -528,6 +548,8 @@ impl ClientConfig {
             sql_functions: SqlFunctions::default(),
             policy_tables: PolicyTables::default(),
             caller: None,
+            trim_threshold: DEFAULT_TRIM_THRESHOLD,
+            trim_budget: DEFAULT_TRIM_BUDGET,
         }
     }
 
@@ -584,6 +606,24 @@ impl ClientConfig {
     #[must_use]
     pub fn with_sql_functions(mut self, sql_functions: SqlFunctions) -> Self {
         self.sql_functions = sql_functions;
+        self
+    }
+
+    /// The percentage of the replica's pages that must sit on the freelist
+    /// before the trimming pass reclaims any, clamped to `0..=100`. A larger
+    /// value trims less often and lets the file hold more slack. Defaults to
+    /// [`DEFAULT_TRIM_THRESHOLD`].
+    #[must_use]
+    pub fn with_trim_threshold(mut self, percent: u8) -> Self {
+        self.trim_threshold = percent.min(100);
+        self
+    }
+
+    /// The number of pages one `incremental_vacuum` call reclaims, bounding the
+    /// work of a single trimming step. Defaults to [`DEFAULT_TRIM_BUDGET`].
+    #[must_use]
+    pub fn with_trim_budget(mut self, pages: u32) -> Self {
+        self.trim_budget = pages;
         self
     }
 }
@@ -1486,6 +1526,15 @@ where
             cipher::unlock(&mut db, key)?;
         }
         db.batch_execute("PRAGMA journal_mode=WAL")?;
+        // Incremental auto-vacuum keeps the freelist bookkeeping current at
+        // every commit so the trimming pass can later hand pages back to the
+        // filesystem. The mode is stored in the file and fixed at the first
+        // table, so it is set on the create path alone: an existing replica
+        // already carries it, and setting it after the first table is a silent
+        // no-op (R15).
+        if sqlite_ddl.is_some() {
+            db.set_auto_vacuum(None, AutoVacuumMode::Incremental)?;
+        }
         // Before any statement carrying outside input, and before the first
         // attach: R18's hardening surface, one helper for both open paths.
         harden::harden_replica_connection(&mut db)?;
@@ -2018,9 +2067,12 @@ where
             if record.live {
                 self.send_subscribe(&record.sub_id, record.spec).await?;
             } else {
-                // Past its grace, so it is ended rather than re-declared and
-                // its rows become evictable. The server never saw it on this
-                // connection, so there is nothing to unsubscribe.
+                // Past its grace, so it is ended rather than re-declared. Its
+                // rows are evicted here, the first connected moment that can
+                // honour the transport-down guard, before the record goes (R15
+                // D3). The server never saw it on this connection, so there is
+                // nothing to unsubscribe.
+                self.evict_subscription_rows(&record.sub_id)?;
                 let _suspended = SuspendedCapture::new(&mut self.session);
                 subscriptions::forget(&mut self.db, &record.sub_id)?;
             }
@@ -2465,27 +2517,17 @@ where
         }
     }
 
-    /// Drop the replica rows of a row subscription's tables ahead of a
-    /// full-resync snapshot, sparing every row a sibling subscription still
-    /// covers.
+    /// Drop a row subscription's tables ahead of a full-resync snapshot,
+    /// sparing every row a sibling subscription still covers.
     ///
     /// The fresh snapshot carries only the resyncing subscription's currently
-    /// authorized rows, so the insert-only apply would leave rows deleted
-    /// during the outage behind. Deleting the whole table instead destroys a
-    /// sibling's rows over that table, which nothing then restores, so the
-    /// statement deletes the complement of what the survivors want. Dropping a
-    /// subscription never names it: it simply stops contributing a clause.
-    ///
-    /// **A truncate is the one case entitled to ignore the survivors, and it has
-    /// to (R48).** Every row of an emptied table is stale whatever a sibling's
-    /// filter says, and sparing the complement leaves two subscriptions with
-    /// overlapping predicates protecting each other's rows through both passes,
-    /// so a row satisfying both survives for ever over a table that is empty
-    /// upstream. Only the named table is treated that way: the subscription's
-    /// other tables were not emptied and keep the ordinary rule.
-    ///
-    /// Capture is suspended so the deletes are never re-uploaded as a local
-    /// mutation. An unknown or aggregate sub id is a no-op.
+    /// authorized rows, so an insert-only apply over an unwiped table would
+    /// leave rows deleted during the outage behind, and wiping the whole table
+    /// destroys a sibling's rows over it. [`delete_uncovered`](Self::delete_uncovered)
+    /// deletes the complement of what the survivors want instead. A truncate
+    /// empties the named table whatever the survivors claim (R48). Pending
+    /// writes are not spared here: [`reapply_pending`](Self::reapply_pending)
+    /// puts them back after the replacement snapshot lands.
     fn clear_subscription_rows(
         &mut self,
         sub_id: &str,
@@ -2500,25 +2542,58 @@ where
         else {
             return Ok(());
         };
+        // Compared case-insensitively because the server names it from the
+        // catalog and a subscription names it as its query spelled it.
+        let emptied = match reason {
+            FullResyncReason::TableTruncated { table } => Some(table.to_lowercase()),
+            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {
+                None
+            }
+        };
+        self.delete_uncovered(
+            &resyncing.tables,
+            Some(sub_id),
+            emptied.as_deref(),
+            &HashMap::new(),
+        )?;
+        Ok(())
+    }
 
-        // Every other subscription's claim on those tables, as SQL. A survivor
-        // with no predicate wants the whole table, so nothing there may go.
+    /// The complement-of-union delete a resync clear and an eviction run share.
+    ///
+    /// Over the `scope` tables, delete every row no live subscription other than
+    /// `exclude` still covers. A subscription is never named: it stops
+    /// contributing a clause, so a row another subscription still wants matches
+    /// that clause and survives, and a table no survivor claims takes the whole
+    /// delete. `spare` holds extra keep-clauses per physical table (the eviction
+    /// pass passes its pending-write keys, a resync passes none). `emptied`
+    /// names the one table a truncate emptied, which deletes whole regardless of
+    /// a survivor's filter, because every row of an emptied table is stale
+    /// whatever a sibling's predicate says (R48). Returns the rows removed.
+    ///
+    /// Capture is suspended so the deletes are never re-uploaded as a local
+    /// mutation.
+    fn delete_uncovered(
+        &mut self,
+        scope: &HashSet<String>,
+        exclude: Option<&str>,
+        emptied: Option<&str>,
+        spare: &HashMap<String, Vec<String>>,
+    ) -> Result<usize, ClientError> {
+        // Every surviving subscription's claim on the scoped tables, as SQL. A
+        // survivor with no predicate wants the whole table, so nothing there may
+        // go. A subscription past its grace no longer wants anything.
+        let declared = subscriptions::declared(&mut self.db)?;
         let mut clauses: HashMap<&str, Vec<String>> = HashMap::new();
         let mut untouchable: HashSet<&str> = HashSet::new();
         for record in &declared {
-            // A subscription past its grace no longer wants anything, so it
-            // contributes no clause and its rows are the pass's to remove.
-            if record.sub_id == sub_id || !record.live {
+            if exclude == Some(record.sub_id.as_str()) || !record.live {
                 continue;
             }
             let Some(coverage) = crate::live::coverage_of(&record.spec)? else {
                 continue;
             };
-            for table in resyncing
-                .tables
-                .iter()
-                .filter(|t| coverage.tables.contains(*t))
-            {
+            for table in scope.iter().filter(|t| coverage.tables.contains(*t)) {
                 match &coverage.predicate {
                     Some(predicate) => clauses
                         .entry(table.as_str())
@@ -2531,55 +2606,200 @@ where
             }
         }
 
-        // The emptied table, when a truncate is what asked for this. Compared
-        // case-insensitively because the server names it from the catalog and a
-        // subscription names it as its query spelled it.
-        let emptied = match reason {
-            FullResyncReason::TableTruncated { table } => Some(table.to_lowercase()),
-            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {
-                None
-            }
-        };
-
         let _suspended = SuspendedCapture::new(&mut self.session);
         let tables = self.config.policy_tables.clone();
         self.db.transaction::<_, ClientError, _>(|conn| {
-            for table in &resyncing.tables {
-                let truncated = emptied.as_deref() == Some(table.to_lowercase().as_str());
+            let mut removed = 0usize;
+            for table in scope {
+                let truncated = emptied == Some(table.to_lowercase().as_str());
                 if untouchable.contains(table.as_str()) && !truncated {
                     continue;
                 }
-                // A split table is cleared at its backing table, not through
-                // the policy view, for the reason the apply path writes there:
-                // the server decides what this replica may hold, and the view
-                // yields only rows the local policy admits, so deleting
-                // through it would strand every row the policy hides where
-                // nothing ever removes it. The predicates name plain columns
-                // of the logical table and the backing table carries the same
-                // columns in the same order, so they are unaffected.
+                // A split table is cleared at its backing table, not through the
+                // policy view: the view yields only rows the local policy admits,
+                // so deleting through it would strand every row the policy hides.
+                // The predicates name plain columns of the logical table and the
+                // backing table carries the same columns in the same order.
                 let target = tables.physical(table).unwrap_or(table);
+                let quoted = quote_ident(target);
+                // Survivor predicates plus any spared pending-write keys: a row
+                // matching any of them stays. A truncate ignores both, since
+                // every row of an emptied table is stale.
+                let mut kept: Vec<String> = Vec::new();
+                if !truncated {
+                    if let Some(surviving) = clauses.get(table.as_str()) {
+                        kept.extend(surviving.iter().map(|clause| format!("({clause})")));
+                    }
+                    if let Some(spared) = spare.get(&target.to_lowercase()) {
+                        kept.extend(spared.iter().cloned());
+                    }
+                }
                 // The table and the predicates are chosen at runtime from the
                 // subscriptions' own parsed queries, so diesel's compile-time
                 // DSL cannot name them: this is the one raw statement here.
-                let quoted = quote_ident(target);
-                let statement = match clauses.get(table.as_str()) {
-                    // An emptied table takes the whole delete whatever the
-                    // survivors claim, which is the exception the doc above
-                    // explains.
-                    Some(surviving) if !surviving.is_empty() && !truncated => {
-                        let kept = surviving
-                            .iter()
-                            .map(|clause| format!("({clause})"))
-                            .collect::<Vec<_>>()
-                            .join(" OR ");
-                        format!("DELETE FROM {quoted} WHERE NOT ({kept})")
-                    }
-                    _ => format!("DELETE FROM {quoted}"),
+                let statement = if kept.is_empty() {
+                    format!("DELETE FROM {quoted}")
+                } else {
+                    format!("DELETE FROM {quoted} WHERE NOT ({})", kept.join(" OR "))
                 };
-                diesel::sql_query(statement).execute(conn)?;
+                removed += diesel::sql_query(statement).execute(conn)?;
             }
-            Ok(())
+            Ok(removed)
         })
+    }
+
+    /// The pending, un-acknowledged writes as per-table primary-key match
+    /// clauses, so the eviction pass spares a row this client has written but
+    /// not yet had the server acknowledge.
+    ///
+    /// Keyed by the lowercased physical table the delete runs against, each
+    /// value a list of `(col IS literal AND ...)` clauses. Decoded from
+    /// `self.pending` the same way [`affected_rows`] reads a changeset's touched
+    /// keys, so the protection is bounded by the queue's cap and clears itself
+    /// when an ack retires the mutation. A captured mutation is a changeset,
+    /// whose op carries the backing table's own schema, so the primary-key
+    /// columns and ordinals come straight from it.
+    fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
+        let mut spare: HashMap<String, Vec<String>> = HashMap::new();
+        let changesets: Vec<Vec<u8>> = self.pending.values().cloned().collect();
+        for changeset in &changesets {
+            let ParsedDiffSet::Changeset(diff) =
+                ParsedDiffSet::parse(changeset).map_err(|err| {
+                    ClientError::Apply(format!("parsing a pending changeset: {err:?}"))
+                })?
+            else {
+                continue;
+            };
+            for op in diff.iter() {
+                let table = op.table();
+                let physical = table.name().to_lowercase();
+                let columns = replica_columns(&mut self.db, &physical)?;
+                let ordinals = pk_ordinals(table);
+                let pk = op.primary_key();
+                let mut wheres = Vec::with_capacity(ordinals.len());
+                let mut complete = !ordinals.is_empty();
+                for (position, value) in ordinals.into_iter().zip(&pk) {
+                    let Some(column) = columns.get(position) else {
+                        complete = false;
+                        break;
+                    };
+                    wheres.push(format!(
+                        "{} IS {}",
+                        quote_ident(column),
+                        crate::live::bind_literal_of(value)?
+                    ));
+                }
+                if complete {
+                    spare
+                        .entry(physical)
+                        .or_default()
+                        .push(format!("({})", wheres.join(" AND ")));
+                }
+            }
+        }
+        Ok(spare)
+    }
+
+    /// Return freelist pages to the filesystem: reclaim in
+    /// bounded `incremental_vacuum` steps once the freelist is a large enough
+    /// fraction of the file (D1), then truncate the write-ahead log so the pages
+    /// leave the file rather than reappearing inside a grown WAL.
+    ///
+    /// Self-gates on the freelist ratio, so calling it after a pass that freed
+    /// little costs two pragma reads. Runs outside any transaction, since
+    /// `wal_checkpoint` fails inside one. A checkpoint a reader blocks reports
+    /// busy and is left for the next pass rather than spun on.
+    fn trim_replica(&mut self) -> Result<(), ClientError> {
+        let total = self.db.page_count(None)?;
+        if total == 0 {
+            return Ok(());
+        }
+        let free = self.db.freelist_count(None)?;
+        if free.saturating_mul(100) < i64::from(self.config.trim_threshold).saturating_mul(total) {
+            return Ok(());
+        }
+        // Each call frees up to the budget and runs to completion for that
+        // bound, so a large freelist drains over several calls without one
+        // stalling step. Stop when the freelist stops shrinking, which also ends
+        // the loop if a page cannot be reclaimed.
+        let budget = self.config.trim_budget;
+        loop {
+            let before = self.db.freelist_count(None)?;
+            if before == 0 {
+                break;
+            }
+            self.db
+                .incremental_vacuum(None, (budget > 0).then_some(budget))?;
+            let after = self.db.freelist_count(None)?;
+            if after >= before {
+                break;
+            }
+        }
+        // Move the reclaimed pages out of the WAL and shrink it to zero so the
+        // file actually contracts. Busy means a reader held it, which the next
+        // pass retries, so it is not treated as an error here.
+        let _ = self.db.wal_checkpoint(None, WalCheckpointMode::Truncate)?;
+        Ok(())
+    }
+
+    /// Evict the replica rows of a subscription that has ended, sparing every
+    /// row a surviving subscription still covers and every row a pending write
+    /// awaits an ack for, then trim the pages the delete freed.
+    ///
+    /// The transport-down guard lives here: a row discarded offline could not be
+    /// re-fetched, so the pass is a no-op until connectivity returns, and the
+    /// ended record is left in place for the next connected pass (D3).
+    pub(crate) fn evict_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        if !self.is_connected() {
+            return Ok(());
+        }
+        let declared = subscriptions::declared(&mut self.db)?;
+        let Some(coverage) = declared
+            .iter()
+            .find(|record| record.sub_id == sub_id)
+            .and_then(|record| crate::live::coverage_of(&record.spec).transpose())
+            .transpose()?
+        else {
+            return Ok(());
+        };
+        let spare = self.pending_spare()?;
+        let removed = self.delete_uncovered(&coverage.tables, Some(sub_id), None, &spare)?;
+        if removed > 0 {
+            self.trim_replica()?;
+        }
+        Ok(())
+    }
+
+    /// The callable free-up-space pass: evict every uncovered row across every
+    /// table any declared subscription names, then trim the freelist.
+    ///
+    /// The trim runs whether or not the eviction removed a row, so pages an
+    /// application freed by deleting covered rows are returned to the filesystem
+    /// too, not only pages an eviction freed. The trim keeps its own ratio gate,
+    /// reclaiming only once the freelist is a large enough fraction of the file.
+    ///
+    /// Only the eviction waits on the transport, because a row discarded offline
+    /// cannot be re-fetched. Trimming discards nothing and reclaims local pages,
+    /// so it runs whether or not a server is reachable. Every pending write is
+    /// spared.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a replica read or write failure.
+    pub fn tidy(&mut self) -> Result<(), ClientError> {
+        if self.is_connected() {
+            let declared = subscriptions::declared(&mut self.db)?;
+            let mut scope: HashSet<String> = HashSet::new();
+            for record in &declared {
+                if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
+                    scope.extend(coverage.tables);
+                }
+            }
+            let spare = self.pending_spare()?;
+            self.delete_uncovered(&scope, None, None, &spare)?;
+        }
+        self.trim_replica()?;
+        Ok(())
     }
 
     /// Put this replica's own unacknowledged writes back after a replacement
