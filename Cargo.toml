@@ -8,7 +8,7 @@ members = [
     "crates/connetto-yew",
     "crates/connetto-test-harness",
 ]
-exclude = ["examples/dioxus-desktop-demo"]
+exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 
 # Additional crates land here as their real content is ready:
 #   - crates/connetto-server         # session manager + subscription materializer

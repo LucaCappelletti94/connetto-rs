@@ -134,7 +134,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // Nothing is stored, so there is nothing to refresh from and the worker asks
     // for an interactive login.
     let pending = match authenticator
-        .acquire::<String>(&store)
+        .acquire::<String, _>(&store)
         .await
         .expect("acquire")
     {
@@ -156,7 +156,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // this path has ever carried a request, and persists the rotated refresh token
     // into the encrypted OPFS store.
     let session = authenticator
-        .complete::<String>(&pending, &code, &state, &store)
+        .complete::<String, _>(&pending, &code, &state, &store)
         .await
         .expect("complete the login");
     assert!(
@@ -175,7 +175,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // A cold start or a leader failover refreshes silently: no interactive login,
     // the same identity, and a rotated token.
     let refreshed = match authenticator
-        .acquire::<String>(&store)
+        .acquire::<String, _>(&store)
         .await
         .expect("acquire again")
     {
@@ -251,7 +251,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // And the copy is dead, which is what the revoke bought: without it this would
     // refresh happily and the logout would be local theatre.
     match authenticator
-        .acquire::<String>(&revoked_store)
+        .acquire::<String, _>(&revoked_store)
         .await
         .expect("acquire with the revoked credential")
     {

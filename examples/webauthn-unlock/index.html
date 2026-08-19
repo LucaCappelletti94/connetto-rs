@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>webauthn-unlock harness</title>
+</head>
+<body>
+  <p>Current result: <span id="result">(waiting)</span></p>
+  <script type="module">
+    // Load the wasm-pack output and call init_page, passing the glue URL so
+    // the worker can import the same module.
+    import init, * as wasm from '/pkg/connetto_webauthn_unlock.js';
+    await init();
+    const glueUrl = new URL('/pkg/connetto_webauthn_unlock.js', location.origin).href;
+    await wasm.init_page(glueUrl);
+  </script>
+</body>
+</html>

@@ -108,7 +108,8 @@ pub mod workers {
     use web_sys::Worker;
 
     pub use connetto_web::workers::{
-        DB_ALIVE_LOCK, HELLO_CHANNEL, announce_tab, await_db_worker_ready, sleep, tab_wire_factory,
+        DB_ALIVE_LOCK, HELLO_CHANNEL, announce_tab, await_db_worker_ready, request_custody, sleep,
+        tab_wire_factory,
     };
 
     /// The demo server every smoke context connects to.
@@ -134,6 +135,9 @@ pub mod workers {
     pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
     /// The OPFS file holding the DB worker's durable replica.
     pub const DB_NAME: &str = "connetto-relay.sqlite";
+    /// OPFS file for unlock-protocol tests, separate from DB_NAME so the two
+    /// suites do not share a replica when running in the same browser session.
+    pub const UNLOCK_DB_NAME: &str = "connetto-unlock-relay.sqlite";
 
     /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
     ///
@@ -177,6 +181,39 @@ pub mod workers {
                     "http://127.0.0.1:18099/dev/landing",
                 )))
                 .with_auth_db_name("connetto-auth.sqlite"),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// DB worker entry point for the unlock-protocol test binary. Same as
+    /// `db_worker_boot` except the passkey unlock protocol is enabled.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, acquisition, or subscribe failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_unlock_boot() -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
+        connetto_web::workers::boot_db_worker::<String>(
+            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
+                .with_ws_url(DEMO_WS_URL)
+                .with_replica_db_prefix(UNLOCK_DB_NAME)
+                .with_replica_ddl(DEMO_SQLITE_DDL)
+                .with_frontend_ddl(DEMO_FRONTEND_DDL)
+                .with_upstream_sub_id("db-unlock-upstream")
+                .with_upstream_query(DEMO_QUERY)
+                .with_hub_meta_name("connetto-unlock-hub-meta.sqlite")
+                .with_sql_functions(crate::uuidv4_functions())
+                .with_policy_tables(crate::demo_policy_tables())
+                .with_caller_function(crate::CALLER_FUNCTION)
+                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
+                    "http://127.0.0.1:18099",
+                    "dev-idp",
+                    "http://127.0.0.1:18099/dev/landing",
+                )))
+                .with_auth_db_name("connetto-unlock-auth.sqlite")
+                .with_unlock(true),
         )
         .await
         .map(drop)

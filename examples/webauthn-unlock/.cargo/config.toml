@@ -1,0 +1,5 @@
+# WebAuthn extension bindings (the prf extension output and AuthenticatorExtensionsClientOutputs)
+# are behind the unstable-APIs gate in web-sys. The getrandom backend matches
+# wasm-smoke so any indirect getrandom usage picks up the browser CSPRNG.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis", "--cfg=getrandom_backend=\"wasm_js\""]

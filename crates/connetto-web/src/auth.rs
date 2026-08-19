@@ -81,7 +81,31 @@ pub enum AuthError {
     /// and a corrupt file are indistinguishable to the page codec.
     #[error("the database does not decrypt under the key supplied: {0}")]
     Undecryptable(String),
+    /// A key operation was refused because a credential is enrolled but no
+    /// derived key-encryption key is held, or because this build cannot reach
+    /// the one that would unlock it. The detail names which.
+    ///
+    /// The message always begins with [`LOCKED_MESSAGE`], so a caller can
+    /// recognise the refusal without parsing the rest.
+    #[error("{LOCKED_MESSAGE}: {detail}")]
+    Locked {
+        /// Which of the two refusals this is.
+        detail: String,
+    },
 }
+
+/// The error string a JS caller receives when the key store is locked.
+///
+/// The refusal message always starts with this, so a caller recognises it by
+/// prefix and the detail after it stays free to change.
+pub const LOCKED_MESSAGE: &str = "connetto-locked";
+
+/// Fixed PRF extension input for the at-rest key. Never per-identity, because
+/// the refresh store opens before any identity is known.
+pub const AT_REST_PRF_INPUT: &[u8] = b"connetto/at-rest/v1";
+
+/// HKDF label for the key-encryption key derived from the PRF output.
+pub const AT_REST_KEK_LABEL: &[u8] = b"connetto kek v1";
 
 fn js_error(context: &str, value: &JsValue) -> AuthError {
     AuthError::Request(format!("{context}: {value:?}"))
@@ -260,6 +284,61 @@ impl RefreshTokenStore for RefreshStore {
     }
 }
 
+/// A refresh store that writes nowhere, for the one boot where there is nothing
+/// yet to write under.
+///
+/// A first run cannot persist its credential before the gate resolves. The
+/// device key that encrypts [`RefreshStore`] is a record in [`IdbKeyStore`], so
+/// writing it before enrolment would mint a stored key-encryption key, and
+/// enrolment could then only delete that record, which does not erase the bytes
+/// underneath. A snapshot of the profile taken in between would hold the stored
+/// key and therefore the replica key. So acquisition runs against this, and
+/// [`take`](Self::take) hands the rows to the real store once the gate is
+/// settled and the device key resolves under whichever key-encryption key won.
+///
+/// Only a run that finds no existing store uses it. With a store already on
+/// disk a stored key already exists, so deferring buys nothing and reading the
+/// credential that is there saves the user an interactive login.
+#[derive(Default)]
+pub(crate) struct DeferredRefreshStore {
+    rows: RefCell<Vec<(String, String)>>,
+}
+
+impl DeferredRefreshStore {
+    /// Every row written, in write order, leaving this store empty.
+    pub(crate) fn take(&self) -> Vec<(String, String)> {
+        self.rows.take()
+    }
+}
+
+impl RefreshTokenStore for DeferredRefreshStore {
+    type Error = AuthError;
+
+    fn load(&self, account: &str) -> Result<Option<String>, AuthError> {
+        Ok(self
+            .rows
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(name, _)| name == account)
+            .map(|(_, value)| value.clone()))
+    }
+
+    fn store(&self, account: &str, token: &str) -> Result<(), AuthError> {
+        let mut rows = self.rows.borrow_mut();
+        match rows.iter_mut().find(|(name, _)| name == account) {
+            Some(row) => token.clone_into(&mut row.1),
+            None => rows.push((account.to_owned(), token.to_owned())),
+        }
+        Ok(())
+    }
+
+    fn clear(&self, account: &str) -> Result<(), AuthError> {
+        self.rows.borrow_mut().retain(|(name, _)| name != account);
+        Ok(())
+    }
+}
+
 /// A login message on [`LOGIN_CHANNEL`]. Deliberately tokenless: the worker
 /// sends [`LoginMessage::Request`] with only a URL, and a tab replies with
 /// [`LoginMessage::Code`] carrying only the authorization code and state. No
@@ -371,54 +450,327 @@ impl<Id> From<TokenResponse<Id>> for BrowserSession<Id> {
 
 /// `IndexedDB` database name for the key store.
 const KEY_STORE_DB: &str = "connetto-key-store";
-/// Object store holding the non-extractable KEK.
+/// Object store holding the non-extractable KEK for the ungated rung.
 const STORE_KEK: &str = "kek";
 /// Object store holding per-identity IV-plus-ciphertext records.
+///
+/// Record keys are `"{name}#{holder}"` where `holder` is the base64url-no-pad
+/// credential id for enrolled profiles, or the empty string for the ungated rung.
 const STORE_WRAPPED: &str = "wrapped";
-/// Fixed record key for the sole KEK entry.
+/// Object store holding enrolled credential ids in the clear.
+const STORE_CREDENTIALS: &str = "credentials";
+/// Fixed record key for the sole ungated KEK entry in `STORE_KEK`.
 const KEK_KEY: u32 = 1;
-/// AES-GCM IV length in bytes. Used for slice operations.
+/// AES-GCM IV length in bytes.
 const AES_GCM_IV_LEN: usize = 12;
 
-/// Wraps and unwraps per-identity replica keys in `IndexedDB` using a
-/// non-extractable AES-GCM-256 key-encryption key (KEK).
+/// Wraps and unwraps per-identity replica keys in `IndexedDB`.
 ///
-/// The KEK is generated once per browser profile, stored as a
-/// structured-cloneable `CryptoKey` value in `IndexedDB`, and marked
-/// non-extractable so its raw bytes cannot be read by script. Each replica
-/// key is stored as a record keyed by the caller-supplied identity name,
-/// containing a 12-byte random IV followed by the AES-GCM ciphertext.
+/// Two rungs exist: an ungated rung backed by a stored non-extractable AES-GCM
+/// key in `kek`, used while nobody has enrolled, and a passkey-derived rung
+/// where the key-encryption key comes from a PRF assertion and is held only in
+/// memory. Calling [`use_derived`](Self::use_derived) or
+/// [`adopt_derived`](Self::adopt_derived) sets the in-memory derived key and
+/// switches all subsequent reads and writes to it.
 ///
-/// This design defends against two specific threats: script-level
-/// exfiltration of the raw key bytes (the KEK is non-extractable, so
-/// reading the IDB store yields only opaque ciphertext), and an off-device
-/// copy of the `IndexedDB` contents alone (without the KEK the ciphertext is
-/// inert). It does not defend against a resident attacker who can call
-/// `load` directly through this store, and it does not necessarily defend
-/// against an attacker who has access to the full browser profile directory,
-/// which includes both the IDB files and the backing storage for
-/// non-extractable keys.
+/// While `derived` is set, the `kek` store is irrelevant and nothing writes to
+/// it. While it is absent and the `credentials` store is empty, the ungated kek
+/// is used and minted on first write. Once credentials are enrolled and no
+/// derived key is held, reads and writes return [`AuthError::Locked`]: the
+/// caller must unlock before proceeding.
+///
+/// It deliberately reports no custody level. Telling a gate nobody has set up
+/// from a platform that has none needs to know whether this browser can run the
+/// ceremony at all, which is a tab property no key store can see, so any answer
+/// here would over-claim. See [`connetto_core::NoGate`].
+/// The single authority is [`crate::unlock::custody`], written by whoever asked
+/// the tab, and [`enrolled`](Self::enrolled) is the storage half a caller
+/// composes with.
 pub struct IdbKeyStore {
     db: IdbDatabase,
+    /// The derived key-encryption key, held only in memory. Populated by
+    /// [`use_derived`](Self::use_derived) or [`adopt_derived`](Self::adopt_derived).
+    /// The second element is the credential id whose PRF output it came from.
+    derived: RefCell<Option<(web_sys::CryptoKey, Vec<u8>)>>,
 }
 
 impl IdbKeyStore {
-    /// Open (creating if needed) the key-store `IndexedDB` database.
+    /// Open (creating if needed) the key-store database at version 2.
+    ///
+    /// Upgrading from version 1 drops and recreates `kek` and `wrapped` (the
+    /// old shapes carried no holder suffix and cannot be unlocked) and creates
+    /// `credentials`. The development profile therefore starts clean rather
+    /// than carrying records nothing can unwrap.
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the database cannot be opened.
+    /// [`AuthError::Store`] if the database cannot be opened or upgraded.
     pub async fn open() -> Result<Self, AuthError> {
         let db = IdbDatabase::open(KEY_STORE_DB)
-            .with_version(1u8)
+            .with_version(2u8)
             .with_on_upgrade_needed(|_event, db| {
+                // Drop old stores if present so no legacy records survive.
+                let _ = db.delete_object_store(STORE_KEK);
+                let _ = db.delete_object_store(STORE_WRAPPED);
                 db.create_object_store(STORE_KEK).build()?;
                 db.create_object_store(STORE_WRAPPED).build()?;
+                db.create_object_store(STORE_CREDENTIALS).build()?;
                 Ok(())
             })
             .await
             .map_err(|e| AuthError::Store(format!("open key store: {e}")))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            derived: RefCell::new(None),
+        })
+    }
+
+    /// The credential ids enrolled on this profile, in store order.
+    ///
+    /// An empty result means nobody has enrolled: the ungated rung is in use.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB failure.
+    pub async fn enrolled(&self) -> Result<Vec<Vec<u8>>, AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_CREDENTIALS)
+            .build()
+            .map_err(|e| AuthError::Store(format!("enrolled tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_CREDENTIALS)
+            .map_err(|e| AuthError::Store(format!("enrolled store: {e}")))?;
+        let keys: Vec<String> = store
+            .get_all_keys::<String>()
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("enrolled keys: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("enrolled keys await: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AuthError::Store(format!("enrolled decode: {e}")))?;
+        keys.into_iter()
+            .map(|k| {
+                URL_SAFE_NO_PAD
+                    .decode(k.as_bytes())
+                    .map_err(|e| AuthError::Store(format!("enrolled id decode: {e}")))
+            })
+            .collect()
+    }
+
+    /// Derive the key-encryption key for this handle from `hkdf` without
+    /// touching storage. Subsequent reads and writes use the derived key.
+    ///
+    /// Call this on the unlock path when a profile is already enrolled.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the HKDF derivation or AES-GCM import fails.
+    pub async fn use_derived(
+        &self,
+        hkdf: web_sys::CryptoKey,
+        credential_id: &[u8],
+    ) -> Result<(), AuthError> {
+        let kek = derive_kek(&hkdf).await?;
+        self.derived.replace(Some((kek, credential_id.to_vec())));
+        Ok(())
+    }
+
+    /// Derive the key-encryption key, re-wrap every existing record under it,
+    /// record the credential id, and delete the stored ungated KEK.
+    ///
+    /// Serves both a first enrolment and a later one. After this call,
+    /// `custody()` returns `Custody::Verified`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB or `SubtleCrypto` failure.
+    pub async fn adopt_derived(
+        &self,
+        hkdf: web_sys::CryptoKey,
+        credential_id: &[u8],
+    ) -> Result<(), AuthError> {
+        // One holder per replica, a recorded out-of-scope decision: every copy
+        // lives in this same store and is lost together. Refusing here also
+        // keeps the re-wrap below total, since it walks the ungated records and
+        // a second credential would orphan the first one's.
+        if !self.enrolled().await?.is_empty() {
+            return Err(AuthError::Store(
+                "a credential is already enrolled on this profile".into(),
+            ));
+        }
+        let derived_kek = derive_kek(&hkdf).await?;
+        let holder_b64 = URL_SAFE_NO_PAD.encode(credential_id);
+        self.rewrap_ungated_under(&derived_kek, &holder_b64).await?;
+        self.forget_stored_kek().await?;
+        self.record_credential(&holder_b64).await?;
+        self.derived
+            .replace(Some((derived_kek, credential_id.to_vec())));
+        Ok(())
+    }
+
+    /// Move every ungated record onto `derived_kek` under the `holder` suffix.
+    ///
+    /// The decrypt and encrypt happen outside any open transaction, because
+    /// `SubtleCrypto` awaits and an `IndexedDB` transaction closes the moment
+    /// the event loop turns without pending work on it.
+    async fn rewrap_ungated_under(
+        &self,
+        derived_kek: &web_sys::CryptoKey,
+        holder: &str,
+    ) -> Result<(), AuthError> {
+        let stored_kek = self.load_kek().await?;
+        let all_keys = self.wrapped_keys().await?;
+
+        // For each ungated record (key ends with `#`): load, decrypt, re-encrypt.
+        // WebCrypto runs outside any open IDB transaction.
+        let mut rewrapped: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for old_key in &all_keys {
+            if !old_key.ends_with('#') {
+                continue;
+            }
+            let base = old_key.trim_end_matches('#');
+            let raw = {
+                let tx = self
+                    .db
+                    .transaction(STORE_WRAPPED)
+                    .build()
+                    .map_err(|e| AuthError::Store(format!("adopt read tx: {e}")))?;
+                let store = tx
+                    .object_store(STORE_WRAPPED)
+                    .map_err(|e| AuthError::Store(format!("adopt read store: {e}")))?;
+                store
+                    .get(old_key.as_str())
+                    .primitive()
+                    .map_err(|e| AuthError::Store(format!("adopt get: {e}")))?
+                    .await
+                    .map_err(|e| AuthError::Store(format!("adopt get await: {e}")))?
+            };
+            let Some(raw) = raw else {
+                continue;
+            };
+            let buf = js_sys::Uint8Array::new(&raw).to_vec();
+            if buf.len() <= AES_GCM_IV_LEN {
+                return Err(AuthError::Store("adopt: record truncated".into()));
+            }
+            let stored_kek_ref = stored_kek
+                .as_ref()
+                .ok_or_else(|| AuthError::Store("adopt: no stored kek to re-wrap".into()))?;
+            let (iv_bytes, ct_bytes) = buf.split_at(AES_GCM_IV_LEN);
+            let iv = js_sys::Uint8Array::from(iv_bytes);
+            let params = aes_gcm_params(&iv);
+            let ct_buf = ct_bytes.to_vec();
+            let plain_js = JsFuture::from(
+                subtle()?
+                    .decrypt_with_object_and_u8_array(&params, stored_kek_ref, &ct_buf)
+                    .map_err(|e| AuthError::Store(format!("adopt decrypt: {e:?}")))?,
+            )
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt decrypt await: {e:?}")))?;
+            let plain = js_sys::Uint8Array::new(&plain_js).to_vec();
+            let new_record = encrypt_with_kek(derived_kek, &plain).await?;
+            rewrapped.push((old_key.clone(), format!("{base}#{holder}"), new_record));
+        }
+        if rewrapped.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("adopt write tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("adopt write store: {e}")))?;
+        for (old_key, new_key, record_bytes) in &rewrapped {
+            let arr = js_sys::Uint8Array::from(record_bytes.as_slice());
+            let val: JsValue = arr.into();
+            store
+                .put(val)
+                .with_key(new_key.as_str())
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("adopt put: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("adopt put await: {e}")))?;
+            store
+                .delete(old_key.as_str())
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("adopt del: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("adopt del await: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt write commit: {e}")))
+    }
+
+    /// Every key in the `wrapped` store.
+    async fn wrapped_keys(&self) -> Result<Vec<String>, AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .build()
+            .map_err(|e| AuthError::Store(format!("wrapped list tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("wrapped list store: {e}")))?;
+        store
+            .get_all_keys::<String>()
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("wrapped list keys: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("wrapped list keys await: {e}")))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| AuthError::Store(format!("wrapped list decode: {e}")))
+    }
+
+    /// Destroy the stored key-encryption key, which is what makes an enrolled
+    /// profile hold nothing that opens the replica.
+    async fn forget_stored_kek(&self) -> Result<(), AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_KEK)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("adopt kek del tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_KEK)
+            .map_err(|e| AuthError::Store(format!("adopt kek store: {e}")))?;
+        store
+            .delete(KEK_KEY)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("adopt kek del: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt kek del await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt kek commit: {e}")))
+    }
+
+    /// Note the credential id in the clear. It is not secret, and an assertion
+    /// has to be scoped to it on the next boot.
+    async fn record_credential(&self, holder: &str) -> Result<(), AuthError> {
+        let tx = self
+            .db
+            .transaction(STORE_CREDENTIALS)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("adopt cred tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_CREDENTIALS)
+            .map_err(|e| AuthError::Store(format!("adopt cred store: {e}")))?;
+        // The id is the key, so the value only has to exist.
+        store
+            .put(JsValue::TRUE)
+            .with_key(holder)
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("adopt cred put: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt cred put await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("adopt cred commit: {e}")))
     }
 
     async fn load_kek(&self) -> Result<Option<web_sys::CryptoKey>, AuthError> {
@@ -476,6 +828,50 @@ impl IdbKeyStore {
             .map_err(|e| AuthError::Store(format!("kek commit: {e}")))?;
         Ok(kek_js.unchecked_into::<web_sys::CryptoKey>())
     }
+
+    /// Resolve the kek and record key for a `load` or `store` call.
+    async fn resolve_kek_for_read(
+        &self,
+        name: &str,
+    ) -> Result<Option<(web_sys::CryptoKey, String)>, AuthError> {
+        if let Some((kek, cred_id)) = self.derived.borrow().clone() {
+            let holder = URL_SAFE_NO_PAD.encode(&cred_id);
+            return Ok(Some((kek, format!("{name}#{holder}"))));
+        }
+        // No derived key. An enrolled profile is LOCKED, which is not the same
+        // as holding no key, and the difference matters: `None` tells a boot
+        // that nothing was ever cached, so it would mint a fresh key and strand
+        // the replica this one still opens.
+        if !self.enrolled().await?.is_empty() {
+            return Err(AuthError::Locked {
+                detail: "a credential is enrolled and no derived key is held, unlock first".into(),
+            });
+        }
+        let Some(kek) = self.load_kek().await? else {
+            return Ok(None);
+        };
+        Ok(Some((kek, format!("{name}#"))))
+    }
+
+    /// Resolve the kek and record key for a `store` call, refusing when enrolled
+    /// but no derived key is held.
+    async fn resolve_kek_for_write(
+        &self,
+        name: &str,
+    ) -> Result<(web_sys::CryptoKey, String), AuthError> {
+        if let Some((kek, cred_id)) = self.derived.borrow().clone() {
+            let holder = URL_SAFE_NO_PAD.encode(&cred_id);
+            return Ok((kek, format!("{name}#{holder}")));
+        }
+        // No derived key. If enrolled, refuse rather than mint a stored kek.
+        if !self.enrolled().await?.is_empty() {
+            return Err(AuthError::Locked {
+                detail: "a credential is enrolled and no derived key is held, unlock first".into(),
+            });
+        }
+        let kek = self.get_or_create_kek().await?;
+        Ok((kek, format!("{name}#")))
+    }
 }
 
 impl ReplicaKeyStore for IdbKeyStore {
@@ -483,14 +879,17 @@ impl ReplicaKeyStore for IdbKeyStore {
 
     /// Load the replica key for `name`, or `None` if no key has been saved.
     ///
-    /// `name` is the caller-supplied record key, typically the value returned
-    /// by `connetto_client::replica_db_name`.
+    /// Uses the derived key-encryption key when one is held in memory (enrolled
+    /// and unlocked), otherwise the stored ungated KEK. Returns `None` when no
+    /// KEK is available rather than an error.
     ///
     /// # Errors
     ///
     /// [`AuthError::Store`] on any IDB or `SubtleCrypto` failure.
+    /// [`AuthError::Locked`] when credentials are enrolled but no derived key
+    /// is held.
     async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, AuthError> {
-        let Some(kek) = self.load_kek().await? else {
+        let Some((kek, record_key)) = self.resolve_kek_for_read(name).await? else {
             return Ok(None);
         };
         let tx = self
@@ -502,7 +901,7 @@ impl ReplicaKeyStore for IdbKeyStore {
             .object_store(STORE_WRAPPED)
             .map_err(|e| AuthError::Store(format!("load store: {e}")))?;
         let record: Option<JsValue> = store
-            .get(name)
+            .get(record_key.as_str())
             .primitive()
             .map_err(|e| AuthError::Store(format!("load get: {e}")))?
             .await
@@ -536,14 +935,16 @@ impl ReplicaKeyStore for IdbKeyStore {
 
     /// Persist `key` for `name`, overwriting any prior value.
     ///
-    /// `name` is the caller-supplied record key, typically the value returned
-    /// by `connetto_client::replica_db_name`.
+    /// Uses the derived key-encryption key when one is held in memory.
+    /// Otherwise uses the stored ungated KEK, minting it on first use, unless a
+    /// credential is enrolled in which case it returns [`AuthError::Locked`].
     ///
     /// # Errors
     ///
     /// [`AuthError::Store`] on any IDB or `SubtleCrypto` failure.
+    /// [`AuthError::Locked`] when enrolled but no derived key is held.
     async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), AuthError> {
-        let kek = self.get_or_create_kek().await?;
+        let (kek, record_key) = self.resolve_kek_for_write(name).await?;
         let iv_bytes = random_iv();
         let iv = js_sys::Uint8Array::from(iv_bytes.as_ref());
         let params = aes_gcm_params(&iv);
@@ -560,7 +961,6 @@ impl ReplicaKeyStore for IdbKeyStore {
         // not outlive the call. A plain fill would be elidable, zeroize is not.
         key_buf.zeroize();
         let ct = js_sys::Uint8Array::new(&ct_js);
-        // Store IV (12 bytes) followed by ciphertext in one Uint8Array.
         let record = js_sys::Uint8Array::new_with_length(12u32 + ct.length());
         record.set(&iv, 0);
         record.set(&ct, 12u32);
@@ -576,7 +976,7 @@ impl ReplicaKeyStore for IdbKeyStore {
         let record_val: JsValue = record.into();
         store
             .put(record_val)
-            .with_key(name)
+            .with_key(record_key.as_str())
             .primitive()
             .map_err(|e| AuthError::Store(format!("save put: {e}")))?
             .await
@@ -589,13 +989,42 @@ impl ReplicaKeyStore for IdbKeyStore {
 
     /// Remove the wrapped key for `name`.
     ///
-    /// E3 calls this during a data-wipe cycle. It is a no-op when no record
-    /// exists for `name`.
+    /// Enumerates the `wrapped` store to find whichever holder suffix the
+    /// record carries, since the caller knows only the base name. No-op when no
+    /// record for `name` exists under any holder.
     ///
     /// # Errors
     ///
     /// [`AuthError::Store`] on any IDB failure.
     async fn clear(&self, name: &str) -> Result<(), AuthError> {
+        let prefix = format!("{name}#");
+        // Read all keys, then delete matching ones in a write tx.
+        let all_keys: Vec<String> = {
+            let tx = self
+                .db
+                .transaction(STORE_WRAPPED)
+                .build()
+                .map_err(|e| AuthError::Store(format!("clear list tx: {e}")))?;
+            let store = tx
+                .object_store(STORE_WRAPPED)
+                .map_err(|e| AuthError::Store(format!("clear list store: {e}")))?;
+            store
+                .get_all_keys::<String>()
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("clear list keys: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("clear list keys await: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AuthError::Store(format!("clear list decode: {e}")))?
+        };
+        let to_delete: Vec<&str> = all_keys
+            .iter()
+            .filter(|k| k.starts_with(&prefix))
+            .map(String::as_str)
+            .collect();
+        if to_delete.is_empty() {
+            return Ok(());
+        }
         let tx = self
             .db
             .transaction(STORE_WRAPPED)
@@ -605,12 +1034,14 @@ impl ReplicaKeyStore for IdbKeyStore {
         let store = tx
             .object_store(STORE_WRAPPED)
             .map_err(|e| AuthError::Store(format!("clear store: {e}")))?;
-        store
-            .delete(name)
-            .primitive()
-            .map_err(|e| AuthError::Store(format!("clear delete: {e}")))?
-            .await
-            .map_err(|e| AuthError::Store(format!("clear delete await: {e}")))?;
+        for key in to_delete {
+            store
+                .delete(key)
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("clear delete: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("clear delete await: {e}")))?;
+        }
         tx.commit()
             .await
             .map_err(|e| AuthError::Store(format!("clear commit: {e}")))?;
@@ -665,8 +1096,8 @@ pub async fn provision_replica_key<S: ReplicaKeyStore<Error = AuthError>>(
 /// # Errors
 ///
 /// [`AuthError::Store`] if the record cannot be encoded or written.
-pub fn remember_identity<Id: serde::Serialize>(
-    store: &RefreshStore,
+pub fn remember_identity<Id: serde::Serialize, S: RefreshTokenStore<Error = AuthError>>(
+    store: &S,
     user_id: &Id,
 ) -> Result<(), AuthError> {
     let encoded = connetto_client::encode_identity(user_id)
@@ -685,8 +1116,11 @@ pub fn remember_identity<Id: serde::Serialize>(
 /// [`AuthError::Store`] if the record cannot be read, or if it does not decode
 /// as this build's id type, which means a build whose id type differed wrote
 /// it. The recovery is a fresh login, which rewrites it.
-pub fn remembered_identity<Id: serde::de::DeserializeOwned>(
-    store: &RefreshStore,
+pub fn remembered_identity<
+    Id: serde::de::DeserializeOwned,
+    S: RefreshTokenStore<Error = AuthError>,
+>(
+    store: &S,
 ) -> Result<Option<Id>, AuthError> {
     let Some(record) = store.load(connetto_client::IDENTITY_RECORD)? else {
         return Ok(None);
@@ -758,9 +1192,12 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError::Store`] if the refresh store cannot be read.
-    pub async fn acquire<Id: serde::de::DeserializeOwned + serde::Serialize>(
+    pub async fn acquire<
+        Id: serde::de::DeserializeOwned + serde::Serialize,
+        S: RefreshTokenStore<Error = AuthError>,
+    >(
         &self,
-        store: &RefreshStore,
+        store: &S,
     ) -> Result<Acquired<Id>, AuthError> {
         if let Some(refresh) = store.load(&self.account)? {
             match self.refresh_tokens(&refresh).await {
@@ -807,12 +1244,15 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError`] on a state mismatch, a failed exchange, or a store write.
-    pub async fn complete<Id: serde::de::DeserializeOwned + serde::Serialize>(
+    pub async fn complete<
+        Id: serde::de::DeserializeOwned + serde::Serialize,
+        S: RefreshTokenStore<Error = AuthError>,
+    >(
         &self,
         pending: &PendingLogin,
         code: &str,
         state: &str,
-        store: &RefreshStore,
+        store: &S,
     ) -> Result<BrowserSession<Id>, AuthError> {
         if state != pending.state {
             return Err(AuthError::StateMismatch);
@@ -1109,4 +1549,81 @@ fn random_iv() -> [u8; AES_GCM_IV_LEN] {
     let mut iv = [0u8; AES_GCM_IV_LEN];
     getrandom::fill(&mut iv).unwrap_throw();
     iv
+}
+
+/// Derive the AES-GCM-256 key-encryption key from an HKDF `CryptoKey`.
+///
+/// The HKDF key carries the PRF extension output (32 uniformly random bytes)
+/// imported by the tab as `importKey("raw", ..., "HKDF", false, ["deriveBits"])`.
+/// Derivation uses a zero-length salt (the extension output is already
+/// uniformly random) and [`AT_REST_KEK_LABEL`] as the purpose label.
+pub(crate) async fn derive_kek(hkdf: &web_sys::CryptoKey) -> Result<web_sys::CryptoKey, AuthError> {
+    let params = js_sys::Object::new();
+    js_sys::Reflect::set(&params, &JsValue::from("name"), &JsValue::from("HKDF")).unwrap_throw();
+    js_sys::Reflect::set(&params, &JsValue::from("hash"), &JsValue::from("SHA-256")).unwrap_throw();
+    js_sys::Reflect::set(
+        &params,
+        &JsValue::from("salt"),
+        &js_sys::Uint8Array::new_with_length(0),
+    )
+    .unwrap_throw();
+    js_sys::Reflect::set(
+        &params,
+        &JsValue::from("info"),
+        &js_sys::Uint8Array::from(AT_REST_KEK_LABEL),
+    )
+    .unwrap_throw();
+    let bits_js = JsFuture::from(
+        subtle()?
+            .derive_bits_with_object(&params, hkdf, 256u32)
+            .map_err(|e| AuthError::Store(format!("derive bits: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AuthError::Store(format!("derive bits await: {e:?}")))?;
+    let bits_u8 = js_sys::Uint8Array::new(&bits_js);
+    let aes_params = aes_key_gen_params();
+    let usages = js_sys::Array::new();
+    usages.push(&JsValue::from_str("encrypt"));
+    usages.push(&JsValue::from_str("decrypt"));
+    let kek_js = JsFuture::from(
+        subtle()?
+            .import_key_with_object(
+                "raw",
+                bits_u8.unchecked_ref::<js_sys::Object>(),
+                &aes_params,
+                false,
+                &usages,
+            )
+            .map_err(|e| AuthError::Store(format!("import kek: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AuthError::Store(format!("import kek await: {e:?}")))?;
+    Ok(kek_js.unchecked_into::<web_sys::CryptoKey>())
+}
+
+/// Encrypt `plaintext` with `kek` under a fresh random IV and return the
+/// `IV || ciphertext` byte vector.
+pub(crate) async fn encrypt_with_kek(
+    kek: &web_sys::CryptoKey,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AuthError> {
+    let iv_bytes = random_iv();
+    let iv = js_sys::Uint8Array::from(iv_bytes.as_ref());
+    let params = aes_gcm_params(&iv);
+    let mut buf = plaintext.to_vec();
+    let ct_js = JsFuture::from(
+        subtle()?
+            .encrypt_with_object_and_u8_array(&params, kek, &buf)
+            .map_err(|e| AuthError::Store(format!("encrypt: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AuthError::Store(format!("encrypt await: {e:?}")))?;
+    buf.zeroize();
+    let ct = js_sys::Uint8Array::new(&ct_js);
+    let ct_len = usize::try_from(ct.length())
+        .map_err(|e| AuthError::Store(format!("encrypt ct len: {e}")))?;
+    let mut out = Vec::with_capacity(AES_GCM_IV_LEN + ct_len);
+    out.extend_from_slice(&iv_bytes);
+    out.extend(ct.to_vec());
+    Ok(out)
 }

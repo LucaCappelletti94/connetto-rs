@@ -1,0 +1,65 @@
+[package]
+name = "connetto-webauthn-unlock"
+description = "End-to-end proof of the R23 passkey gate: enrol under a simulated authenticator, write, restart the worker, re-derive the same key, then refuse once the authenticator is deleted."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+# Both a cdylib for wasm-pack and a rlib so the native driver test can link
+# against the crate (which is empty on the native target).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Wasm-only page dependencies: pulled into the graph only when building for
+# wasm32. The native check sees none of them, so it stays fast and clean.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+connetto-web = { path = "../../crates/connetto-web" }
+# Needed to bring ReplicaKeyStore::load into scope for the test record read.
+connetto-core = { path = "../../crates/connetto-core" }
+# Error handling for internal application helpers (not the FFI boundary).
+anyhow = "1"
+base64 = { version = "0.22", features = ["std"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# Pinned exactly, as `connetto-web` and `wasm-smoke` are: 0.3.104 renamed the
+# `LockManager` request bindings that `connetto-web` calls, so a workspace that
+# floats here fails to build a path dependency that builds everywhere else.
+web-sys = { version = "=0.3.103", features = [
+    "BroadcastChannel",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "console",
+] }
+
+# Native driver test dependencies.
+[dev-dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+
+[workspace]
+
+# Mirror of the root workspace and wasm-smoke patch blocks. Cargo patches do
+# not cross workspace boundaries, so any wasm32 build that pulls connetto-web
+# through its path dependency needs the same routing here.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

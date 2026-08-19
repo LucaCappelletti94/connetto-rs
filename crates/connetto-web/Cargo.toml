@@ -26,28 +26,53 @@ sqlite-wasm-vfs = "0.2"
 sqlite-wasm-rs = { version = "0.5", default-features = false }
 thiserror = "2"
 web-sys = { version = "0.3", features = [
+    "AuthenticationExtensionsClientInputs",
+    "AuthenticationExtensionsClientOutputs",
+    "AuthenticationExtensionsPrfInputs",
+    "AuthenticationExtensionsPrfOutputs",
+    "AuthenticationExtensionsPrfValues",
+    "AuthenticatorAssertionResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorResponse",
+    "AuthenticatorSelectionCriteria",
     "BinaryType",
     "Blob",
     "BlobPropertyBag",
     "BroadcastChannel",
     "CloseEvent",
+    "Credential",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "CredentialsContainer",
     "Crypto",
     "CryptoKey",
+    "DedicatedWorkerGlobalScope",
     "Event",
     "ErrorEvent",
+    "Headers",
+    "Location",
     "Lock",
     "LockManager",
     "LockOptions",
     "MessageChannel",
     "MessageEvent",
     "MessagePort",
-    "Headers",
+    "Navigator",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialDescriptor",
+    "PublicKeyCredentialParameters",
+    "PublicKeyCredentialRequestOptions",
+    "PublicKeyCredentialRpEntity",
+    "PublicKeyCredentialType",
+    "PublicKeyCredentialUserEntity",
     "Request",
     "RequestInit",
+    "ResidentKeyRequirement",
     "Response",
-    "Navigator",
     "SubtleCrypto",
     "Url",
+    "UserVerificationRequirement",
     "WebSocket",
     "Window",
     "Worker",
@@ -108,6 +133,9 @@ rosetta-uuid = { version = "0.1.3", features = ["serde", "sqlite"] }
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 indexed_db_futures = "0.6"
+# Encoding credential ids as base64url-no-pad in the key-store tests.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+wasm-bindgen-futures = "0.4"
 # The shared fake transport the account-switch suite drives a real connection with.
 connetto-core = { path = "../connetto-core", features = ["test-support"] }
 

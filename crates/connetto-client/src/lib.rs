@@ -28,6 +28,7 @@
 //! writes.
 
 pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
+pub use connetto_core::{Custody, NoGate};
 
 use connetto_core::messages::{
     AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
@@ -533,6 +534,11 @@ pub struct ClientConfig {
     /// large freelist never stalls the pump. Local, like `trim_threshold`.
     /// Defaults to [`DEFAULT_TRIM_BUDGET`].
     trim_budget: u32,
+    /// How the key protecting this connection is held. The default is honest
+    /// for every native target today: no native gate exists until R51 and R52
+    /// land, so reporting anything stronger would claim protection connetto
+    /// does not yet provide.
+    custody: Custody,
 }
 
 impl ClientConfig {
@@ -550,6 +556,7 @@ impl ClientConfig {
             caller: None,
             trim_threshold: DEFAULT_TRIM_THRESHOLD,
             trim_budget: DEFAULT_TRIM_BUDGET,
+            custody: Custody::Unverified(NoGate::Unsupported),
         }
     }
 
@@ -624,6 +631,19 @@ impl ClientConfig {
     #[must_use]
     pub fn with_trim_budget(mut self, pages: u32) -> Self {
         self.trim_budget = pages;
+        self
+    }
+
+    /// The custody level to report for this connection.
+    ///
+    /// The right value to pass here is the one the platform's key-management
+    /// layer can honestly claim. Passing [`Custody::Verified`] without a real
+    /// user-verified gate in place would report protection connetto does not
+    /// provide. The default, `Custody::Unverified(NoGate::Unsupported)`, is
+    /// the honest value for every native target until R51 and R52 land.
+    #[must_use]
+    pub fn with_custody(mut self, custody: Custody) -> Self {
+        self.custody = custody;
         self
     }
 }
@@ -1402,6 +1422,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// re-apply (R48 decision 3). Held per subscription because two can be
     /// replaced at once, and cleared when each one's `SnapshotEnd` lands.
     resyncing: HashSet<String>,
+    /// Whether the replica is backed by a file rather than `:memory:`. An
+    /// in-memory replica has no durable key, so `custody()` overrides the
+    /// configured level to `Ephemeral` whenever this is false.
+    durable: bool,
 }
 
 impl<T> ConnettoConnection<T>
@@ -1601,6 +1625,11 @@ where
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
+            // A key is what custody is about, so the absence of one is the
+            // signal rather than the path: `Replica::in_memory` is the only
+            // constructor that carries none, and `encrypted_file` refuses
+            // without one.
+            durable: replica.key().is_some(),
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -1901,6 +1930,27 @@ where
     #[must_use]
     pub const fn local_tables(&self) -> &HashSet<String> {
         &self.local_tables
+    }
+
+    /// How the key protecting this replica is held.
+    ///
+    /// Returns [`Custody::Ephemeral`] whenever the replica is in-memory,
+    /// regardless of what was configured, because an in-memory replica has no
+    /// durable key by construction.
+    #[must_use]
+    pub const fn custody(&self) -> Custody {
+        if self.durable {
+            self.config.custody
+        } else {
+            Custody::Ephemeral
+        }
+    }
+
+    /// Update the custody level, for example after a gate is enrolled while the
+    /// process runs. Has no effect on an in-memory replica: `custody()` still
+    /// reports `Ephemeral` for one, because no durable key was ever written.
+    pub fn set_custody(&mut self, custody: Custody) {
+        self.config.custody = custody;
     }
 
     /// Declare a subscription from a SQLite-dialect `SELECT`, the same dialect
@@ -3108,5 +3158,40 @@ impl<T: Transport + Send> LoadConnection<DefaultLoadingMode> for ConnettoConnect
         Self::Backend: QueryMetadata<Q::SqlType>,
     {
         self.db.load(source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use connetto_core::test_support::FakeTransport;
+
+    const DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+
+    #[test]
+    fn in_memory_replica_is_always_ephemeral() {
+        // Even when the config explicitly asks for Verified, an in-memory
+        // replica reports Ephemeral: nothing durable is ever written.
+        let config = ClientConfig::new("custody-test").with_custody(Custody::Verified);
+        let conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        assert_eq!(conn.custody(), Custody::Ephemeral);
+    }
+
+    #[test]
+    fn durable_replica_reports_configured_custody_and_respects_set_custody() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("custody.db");
+        let path_str = path.to_str().expect("path is utf-8");
+        let key = ReplicaKey::from_bytes([0x42; ReplicaKey::LEN]);
+        let replica = Replica::encrypted_file(path_str, Some(key)).expect("replica");
+        let config =
+            ClientConfig::new("custody-test").with_custody(Custody::Unverified(NoGate::Offerable));
+        let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config, None)
+            .expect("open durable replica");
+        assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
+        conn.set_custody(Custody::Verified);
+        assert_eq!(conn.custody(), Custody::Verified);
     }
 }

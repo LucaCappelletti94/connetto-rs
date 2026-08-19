@@ -44,8 +44,9 @@ use connetto_client::{
     ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ReplicaStorage as StorageKind,
     Tier,
 };
+use connetto_core::custody::{Custody, NoGate};
 use connetto_core::messages::SubscriptionSpec;
-use connetto_core::traits::ReplicaKeyStore as _;
+use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore as _};
 
 /// The shared rendezvous channel for worker readiness and tab announcements.
 pub const HELLO_CHANNEL: &str = "connetto-hello";
@@ -125,6 +126,17 @@ pub struct DbWorkerConfig {
     /// The OPFS database holding the worker-only refresh token, used only when
     /// `auth` is set.
     auth_db_name: &'static str,
+    /// Whether to serve the passkey unlock protocol. Defaults to `false`.
+    ///
+    /// When `false` the worker never posts to the tab, mints or reads the
+    /// stored KEK, and reports `Custody::Unverified(NoGate::Offerable)`.
+    /// Every existing consumer keeps this default and needs no change.
+    ///
+    /// When `true` the worker installs the private-port handler, asks the tab
+    /// to unlock an enrolled profile before reading anything, and asks the tab
+    /// to enrol on a fresh profile after the session is acquired. The tab must
+    /// call [`crate::unlock::serve_unlock`] before the worker boots.
+    unlock: bool,
 }
 
 impl DbWorkerConfig {
@@ -147,6 +159,7 @@ impl DbWorkerConfig {
             caller_function: "",
             auth: None,
             auth_db_name: "",
+            unlock: false,
         }
     }
 
@@ -240,6 +253,21 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_auth_db_name(mut self, auth_db_name: &'static str) -> Self {
         self.auth_db_name = auth_db_name;
+        self
+    }
+
+    /// Enable the passkey unlock protocol.
+    ///
+    /// Set to `true` only when the tab calls
+    /// [`crate::unlock::serve_unlock`] before the worker boots, otherwise the
+    /// worker blocks indefinitely waiting for a tab answer.
+    ///
+    /// Consumers that do not call this leave the default `false` and behave
+    /// exactly as before: stored KEK, no tab interaction, and
+    /// `Custody::Unverified(NoGate::Offerable)` reported.
+    #[must_use]
+    pub fn with_unlock(mut self, unlock: bool) -> Self {
+        self.unlock = unlock;
         self
     }
 }
@@ -395,10 +423,52 @@ async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
+    let store = open_refresh_store(auth_db_name, storage, key_store).await?;
+    drive_acquisition(auth, &store).await
+}
+
+/// Acquire without persisting anything, for a first run that has not settled its
+/// gate yet. See [`crate::auth::DeferredRefreshStore`] for why the write cannot
+/// simply happen first and be re-wrapped afterwards.
+async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Serialize>(
+    auth: &crate::auth::WorkerAuthConfig,
+) -> Result<
+    (
+        crate::auth::BrowserSession<Id>,
+        crate::auth::DeferredRefreshStore,
+    ),
+    JsValue,
+> {
+    let deferred = crate::auth::DeferredRefreshStore::default();
+    let session = drive_acquisition(auth, &deferred).await?;
+    Ok((session, deferred))
+}
+
+/// Write a deferred acquisition through to the real store, now that the gate has
+/// settled and the device key resolves under whichever key-encryption key won.
+async fn persist_deferred(
+    deferred: &crate::auth::DeferredRefreshStore,
+    auth_db_name: &str,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+) -> Result<(), JsValue> {
+    let store = open_refresh_store(auth_db_name, storage, key_store).await?;
+    for (account, token) in deferred.take() {
+        RefreshTokenStore::store(&store, &account, &token).map_err(to_js)?;
+    }
+    Ok(())
+}
+
+/// Open the refresh store under this device's own key.
+async fn open_refresh_store(
+    auth_db_name: &str,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+) -> Result<crate::auth::RefreshStore, JsValue> {
     let device_key = crate::storage::device_key(key_store).await.map_err(to_js)?;
     let auth_db_url = storage.db_url(auth_db_name);
-    let store = match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
-        Ok(store) => store,
+    match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
+        Ok(store) => Ok(store),
         Err(crate::auth::AuthError::Undecryptable(detail)) => {
             tracing::warn!(
                 detail = %detail,
@@ -406,20 +476,32 @@ async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
                  fresh login"
             );
             storage.delete_db(auth_db_name).map_err(to_js)?;
-            crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)?
+            crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)
         }
-        Err(err) => return Err(to_js(err)),
-    };
+        Err(err) => Err(to_js(err)),
+    }
+}
+
+/// Drive the authenticator against `store`: a silent refresh from whatever it
+/// holds, or an interactive tab login when it holds nothing.
+async fn drive_acquisition<Id, S>(
+    auth: &crate::auth::WorkerAuthConfig,
+    store: &S,
+) -> Result<crate::auth::BrowserSession<Id>, JsValue>
+where
+    Id: serde::de::DeserializeOwned + serde::Serialize,
+    S: RefreshTokenStore<Error = crate::auth::AuthError>,
+{
     let authenticator =
         crate::auth::BrowserAuthenticator::new(auth.clone(), crate::auth::REFRESH_RECORD);
-    match authenticator.acquire(&store).await.map_err(to_js)? {
+    match authenticator.acquire(store).await.map_err(to_js)? {
         crate::auth::Acquired::Access(session) => Ok(session),
         crate::auth::Acquired::NeedLogin(pending) => {
             let (code, state) = crate::auth::await_login_code(&pending.login_url)
                 .await
                 .map_err(to_js)?;
             authenticator
-                .complete(&pending, &code, &state, &store)
+                .complete(&pending, &code, &state, store)
                 .await
                 .map_err(to_js)
         }
@@ -475,7 +557,72 @@ where
     // Opened whether or not authentication is configured. A durable replica is
     // encrypted, and with no auth there is simply no identity in the record name,
     // which is the same shape `device_key` already uses for the refresh store.
-    let key_store = crate::auth::IdbKeyStore::open().await.map_err(to_js)?;
+    let key_store = Rc::new(crate::auth::IdbKeyStore::open().await.map_err(to_js)?);
+
+    // Install the private-port handler and register the key store for late
+    // enrolments. Done unconditionally so the thread-local is always valid,
+    // even though actual tab communication only happens when `unlock` is true.
+    if config.unlock {
+        crate::unlock::install_worker_handler()?;
+    }
+    // Default custody for a durable replica: the gate is available but nobody
+    // has adopted it yet. This gets overwritten below if the profile is enrolled
+    // or if the session is ephemeral.
+    crate::unlock::init_worker(
+        Rc::clone(&key_store),
+        Custody::Unverified(NoGate::Offerable),
+    );
+
+    let enrolled_ids = key_store.enrolled().await.map_err(to_js)?;
+    let was_enrolled = !enrolled_ids.is_empty();
+
+    // A stale configuration: credentials were enrolled (requiring the protocol
+    // to have been served at some point) but the caller did not enable it this
+    // boot. Refusing here is safer than silently ignoring the enrolled state and
+    // falling back to the stored key, which no longer exists after enrolment.
+    if was_enrolled && !config.unlock {
+        return Err(to_js(crate::auth::AuthError::Locked {
+            detail: "a credential is enrolled but this build did not enable the unlock \
+                     protocol, so nothing here can derive the key"
+                .into(),
+        }));
+    }
+
+    // Enrolled path: derive the KEK before reading anything encrypted.
+    // A Declined or Unsupported answer refuses the boot.
+    if was_enrolled {
+        match crate::unlock::ask_unlock(enrolled_ids)
+            .await
+            .map_err(to_js)?
+        {
+            crate::unlock::TabAnswer::Key { credential_id, key } => {
+                key_store
+                    .use_derived(key, &credential_id)
+                    .await
+                    .map_err(to_js)?;
+                crate::unlock::set_custody(Custody::Verified);
+            }
+            // Nothing is destroyed on any of these: the application offers the
+            // ceremony again, and a genuine lockout is recovered by the user
+            // asking for a wipe. A dismissal and a credential that is gone are
+            // the same `NotAllowedError`, so the detail names only what is known.
+            crate::unlock::TabAnswer::Declined => {
+                return Err(to_js(crate::auth::AuthError::Locked {
+                    detail: "the ceremony was dismissed or the credential is gone".into(),
+                }));
+            }
+            crate::unlock::TabAnswer::Unsupported => {
+                return Err(to_js(crate::auth::AuthError::Locked {
+                    detail: "this browsing context cannot run the ceremony that enrolled this \
+                             profile"
+                        .into(),
+                }));
+            }
+            crate::unlock::TabAnswer::Failed { detail } => {
+                return Err(to_js(crate::auth::AuthError::Locked { detail }));
+            }
+        }
+    }
 
     // Every wipe the application asked for is carried out here, before the login
     // and before anything is opened.
@@ -495,7 +642,7 @@ where
     // A failure is fatal to the boot rather than logged past: the record is already
     // taken, so continuing would open a replica the user asked to destroy.
     for name in crate::storage::take_pending_wipes().await.map_err(to_js)? {
-        crate::storage::wipe_replica(&storage, &key_store, &name, &[], true)
+        crate::storage::wipe_replica(&storage, &*key_store, &name, &[], true)
             .await
             .map_err(to_js)?;
         tracing::info!(replica = %name, "db worker: carried out a pending data wipe");
@@ -507,12 +654,75 @@ where
     // trade.
     storage.reserve(BOOT_SLOTS).await.map_err(to_js)?;
 
-    let session = match &config.auth {
-        Some(auth_config) => Some(
-            acquire_session::<Id>(auth_config, config.auth_db_name, &storage, &key_store).await?,
+    // A fresh profile that may still enrol must not write its credential first.
+    // The device key that encrypts the refresh store is a record in the key
+    // store, so writing it before the gate settles mints a stored
+    // key-encryption key, and enrolment could then only delete that record,
+    // which does not erase the bytes underneath. Deferred only when there is no
+    // store yet: with one already on disk a stored key already exists, so
+    // deferring buys nothing and reading the credential that is there saves the
+    // user an interactive login.
+    let defer = config.unlock
+        && !was_enrolled
+        && config.auth.is_some()
+        && !storage.exists(config.auth_db_name);
+    let (session, deferred) = match &config.auth {
+        Some(auth_config) if defer => {
+            let (session, deferred) = acquire_deferred::<Id>(auth_config).await?;
+            (Some(session), Some(deferred))
+        }
+        Some(auth_config) => (
+            Some(
+                acquire_session::<Id>(auth_config, config.auth_db_name, &storage, &key_store)
+                    .await?,
+            ),
+            None,
         ),
-        None => None,
+        None => {
+            // Nothing durable: the replica is in memory and there is no key.
+            crate::unlock::set_custody(Custody::Ephemeral);
+            (None, None)
+        }
     };
+
+    // Unenrolled path with unlock enabled: ask the tab to enrol now that an
+    // identity exists, so the credential the platform saves carries the account
+    // the user just signed in as rather than a device label.
+    if config.unlock
+        && !was_enrolled
+        && let Some(session) = &session
+    {
+        let label = session.user_id.to_string();
+        match crate::unlock::ask_enrol(&label).await.map_err(to_js)? {
+            crate::unlock::TabAnswer::Key { credential_id, key } => {
+                key_store
+                    .adopt_derived(key, &credential_id)
+                    .await
+                    .map_err(to_js)?;
+                crate::unlock::set_custody(Custody::Verified);
+            }
+            crate::unlock::TabAnswer::Declined => {
+                crate::unlock::set_custody(Custody::Unverified(NoGate::Declined));
+            }
+            crate::unlock::TabAnswer::Unsupported => {
+                crate::unlock::set_custody(Custody::Unverified(NoGate::Unsupported));
+            }
+            // A fault is not a platform limitation. Downgrading custody here
+            // would blame the browser for a bug and quietly ship an ungated
+            // profile, so the boot fails and names what threw.
+            crate::unlock::TabAnswer::Failed { detail } => {
+                return Err(to_js(crate::auth::AuthError::Context(format!(
+                    "the enrolment ceremony failed: {detail}"
+                ))));
+            }
+        }
+    }
+
+    // The gate has settled, so the device key now resolves under whichever
+    // key-encryption key won and the credential can land.
+    if let Some(deferred) = &deferred {
+        persist_deferred(deferred, config.auth_db_name, &storage, &key_store).await?;
+    }
     // Identity continuity by file selection: each identity owns the replica
     // named from its own id, so an account switch opens a different file and
     // can neither adopt the previous identity's rows nor upload its pending
@@ -545,7 +755,7 @@ where
         key_store.load(&replica_db_name).await.map_err(to_js)?
     } else {
         Some(
-            crate::auth::provision_replica_key(&key_store, &replica_db_name)
+            crate::auth::provision_replica_key(&*key_store, &replica_db_name)
                 .await
                 .map_err(to_js)?,
         )
@@ -716,6 +926,9 @@ where
             };
             if message == "ask" {
                 let _ = hello.post_message(&JsValue::from_str("ready"));
+            } else if message == "custody?" {
+                let encoded = encode_custody(crate::unlock::custody());
+                let _ = hello.post_message(&JsValue::from_str(&format!("custody:{encoded}")));
             } else if let Some(wire) = message.strip_prefix("tab:") {
                 match MessageTransport::<BroadcastChannel>::new(wire) {
                     Ok(transport) => {
@@ -976,4 +1189,77 @@ async fn open_replica<S: StorageKind>(
 
 fn to_js(err: impl core::fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
+}
+
+/// Encode a [`Custody`] value as a compact, stable ASCII string for the
+/// hello-channel wire. Decode with [`decode_custody`]; encode and decode must
+/// stay adjacent so they cannot drift.
+///
+/// Encoding:
+/// - `"v"` = `Verified`
+/// - `"e"` = `Ephemeral`
+/// - `"u:us"` = `Unverified(Unsupported)`
+/// - `"u:off"` = `Unverified(Offerable)`
+/// - `"u:dec"` = `Unverified(Declined)`
+fn encode_custody(c: Custody) -> &'static str {
+    match c {
+        Custody::Verified => "v",
+        Custody::Ephemeral => "e",
+        Custody::Unverified(NoGate::Unsupported) => "u:us",
+        Custody::Unverified(NoGate::Offerable) => "u:off",
+        Custody::Unverified(NoGate::Declined) => "u:dec",
+    }
+}
+
+/// Decode a custody string produced by [`encode_custody`], or `None` when the
+/// value is not one this build knows.
+///
+/// It refuses to guess rather than defaulting: a level connetto cannot vouch for
+/// is worse than no answer, and the only caller is waiting for a reply anyway,
+/// so an unrecognised string simply is not one.
+fn decode_custody(s: &str) -> Option<Custody> {
+    match s {
+        "v" => Some(Custody::Verified),
+        "e" => Some(Custody::Ephemeral),
+        "u:us" => Some(Custody::Unverified(NoGate::Unsupported)),
+        "u:off" => Some(Custody::Unverified(NoGate::Offerable)),
+        "u:dec" => Some(Custody::Unverified(NoGate::Declined)),
+        _ => None,
+    }
+}
+
+/// Page side: ask the worker for the current custody level over the hello
+/// channel. Follows the [`await_db_worker_ready`] / [`announce_tab`] pattern:
+/// posts `"custody?"` and waits for `"custody:<encoding>"`.
+///
+/// The answer reflects the state at the moment the worker processes the
+/// message, so call this after [`await_db_worker_ready`] to be sure boot has
+/// settled.
+pub async fn request_custody() -> Custody {
+    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let result: Rc<Cell<Option<Custody>>> = Rc::new(Cell::new(None));
+    let on_message = {
+        let result = Rc::clone(&result);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if let Some(text) = event.data().as_string()
+                && let Some(encoded) = text.strip_prefix("custody:")
+                && let Some(custody) = decode_custody(encoded)
+            {
+                result.set(Some(custody));
+            }
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    let mut answered = result.get();
+    while answered.is_none() {
+        // Asks posted before the intake existed are lost rather than queued,
+        // exactly as `await_db_worker_ready` found, so this repeats the ask.
+        let _ = channel.post_message(&JsValue::from_str("custody?"));
+        sleep_ms(10).await;
+        answered = result.get();
+    }
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    answered.unwrap_or(Custody::Ephemeral)
 }

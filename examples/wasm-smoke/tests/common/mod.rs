@@ -169,7 +169,7 @@ pub async fn mint_session() -> (String, String) {
     let store = RefreshStore::open(&storage.db_url(&db_name), &device).expect("open refresh store");
     let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
     let pending = match authenticator
-        .acquire::<String>(&store)
+        .acquire::<String, _>(&store)
         .await
         .expect("acquire")
     {
@@ -178,7 +178,7 @@ pub async fn mint_session() -> (String, String) {
     };
     let (code, state) = walk_the_login(&pending.login_url).await;
     let session = authenticator
-        .complete::<String>(&pending, &code, &state, &store)
+        .complete::<String, _>(&pending, &code, &state, &store)
         .await
         .expect("complete login");
     // Close the connection before removing the file: deleting an OPFS database

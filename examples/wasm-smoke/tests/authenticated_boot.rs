@@ -139,7 +139,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
             .expect("open the refresh store");
         let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
         let pending = match authenticator
-            .acquire::<String>(&store)
+            .acquire::<String, _>(&store)
             .await
             .expect("acquire")
         {
@@ -148,7 +148,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
         };
         let (code, state) = walk_the_login(&pending.login_url).await;
         authenticator
-            .complete::<String>(&pending, &code, &state, &store)
+            .complete::<String, _>(&pending, &code, &state, &store)
             .await
             .expect("complete the first login")
             .user_id

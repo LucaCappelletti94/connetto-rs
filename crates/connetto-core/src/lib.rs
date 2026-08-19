@@ -9,6 +9,7 @@
 //!   [`RefreshTokenStore`], and [`ReplicaKeyStore`] seams the server, native
 //!   client, and `WASM` client each fill with a platform-specific
 //!   implementation.
+//! * [`custody`] reports how the key protecting an open replica is held.
 //! * [`sql`] and [`percent`] hold the text helpers every side would otherwise
 //!   paste: SQL identifier quoting and query-value percent-encoding.
 //!
@@ -34,6 +35,7 @@ pub mod auth;
 pub mod backoff;
 pub mod codec;
 pub mod cursor;
+pub mod custody;
 #[cfg(feature = "env")]
 pub mod env;
 pub mod error;
@@ -58,6 +60,7 @@ pub use auth::{
 };
 pub use backoff::RetryPolicy;
 pub use cursor::Cursor;
+pub use custody::{Custody, NoGate};
 pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
 pub use percent::{percent_decode, percent_encode};
