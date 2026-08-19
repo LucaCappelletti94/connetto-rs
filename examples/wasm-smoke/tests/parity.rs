@@ -29,14 +29,16 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 async fn row_live_query_is_relay_transparent() {
     let base = unique_base();
 
-    // Writer, direct client, and relay tab share one session so each
-    // sees the same owner_id through its policy view.
+    // The direct client and the relay tab share one session. The writer takes
+    // its own login of the same user, so it does not collide with the direct
+    // client's connection, and it still owns the rows it writes.
     let (token, user_id) = mint_session().await;
+    let (writer_token, _) = mint_session().await;
 
     // Seed a row BEFORE the fixture brings up the worker and both clients, so
     // it can only reach either client through the snapshot leg. The DEFAULT
     // mints the id, which the writer reads back for the convergence assertion.
-    let mut writer = connect_server("parity-writer", base, token.clone(), &user_id).await;
+    let mut writer = connect_server("parity-writer", base, writer_token, &user_id).await;
     let snapshot_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the snapshot row");
 
@@ -68,11 +70,13 @@ async fn row_live_query_is_relay_transparent() {
 async fn aggregate_is_relay_transparent() {
     let base = unique_base();
 
-    // Writer and fixture share one session so aggregate counts include the
-    // writer's rows on both the direct and relay paths.
+    // The fixture's direct client and relay tab share one session. The writer
+    // takes its own login of the same user, so it does not collide with the
+    // direct client, and its rows still count on both paths.
     let (token, user_id) = mint_session().await;
+    let (writer_token, _) = mint_session().await;
 
-    let mut writer = connect_server("parity-agg-writer", base, token.clone(), &user_id).await;
+    let mut writer = connect_server("parity-agg-writer", base, writer_token, &user_id).await;
     let mut fixture = ParityFixture::setup(base, "parity-agg", token, &user_id).await;
 
     // Both clients subscribe to the same global aggregate.

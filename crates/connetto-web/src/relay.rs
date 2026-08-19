@@ -62,8 +62,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
-    AffectedRow, ClientError, ClientEvent, ConnettoConnection, subscription_is_aggregate,
-    subscription_tables,
+    AffectedRow, ClientError, ClientEvent, ConnettoConnection, PolicyTables,
+    subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
@@ -1542,11 +1542,18 @@ where
         )));
         return Ok(());
     }
+    // The tab sent this under logical names, exactly as it would to the
+    // server, because its own send path renames split tables back. Applying
+    // raw would hit a split table's view, which the changeset apply refuses
+    // row by row. Rename to the physical backing tables first, mirroring the
+    // client's own apply direction.
+    let map = worker.policy_tables().clone();
+    let changeset = rename_to_physical(changeset, &map).map_err(TabFault::from)?;
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
     let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
-        conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
+        conn.apply_changeset(&changeset, |_conflict| ConflictAction::Abort)
             .map_err(|err| TabApplyError::Apply(err.to_string()))?;
         // sql_query is kept because connetto_hub._tab_mutations is in an
         // ATTACHED schema that diesel's table! macro does not model for SQLite.
@@ -1585,6 +1592,20 @@ where
         }
     }
     Ok(())
+}
+
+/// Rewrite a tab's logical-named changeset onto the physical backing tables,
+/// returning the bytes unchanged when no table was split.
+fn rename_to_physical(changeset: &[u8], map: &PolicyTables) -> Result<Vec<u8>, RelayError> {
+    if map.is_empty() {
+        return Ok(changeset.to_vec());
+    }
+    let mut parsed = ParsedDiffSet::parse(changeset)
+        .map_err(|err| RelayError::Patch(format!("renaming a tab mutation: {err:?}")))?;
+    if parsed.rename_tables(&mut |table: &str| map.physical(table).map(str::to_owned)) == 0 {
+        return Ok(changeset.to_vec());
+    }
+    Ok(parsed.into())
 }
 
 /// Handle one upstream event from the worker connection.
@@ -1938,7 +1959,8 @@ where
     let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     if !synced.is_empty() {
-        let patchset = snapshot_patchset(worker.conn(), MAIN_SCHEMA, &synced, blank)?;
+        let map = worker.policy_tables().clone();
+        let patchset = synced_snapshot(worker.conn(), &map, &synced, blank)?;
         if !patchset.is_empty() {
             payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
         }
@@ -2016,6 +2038,45 @@ fn flush_tab_bulk(tab: &mut TabState) {
             }
         }
     }
+}
+
+/// Build the synced-tier snapshot for `tables` (logical names), reading each
+/// policy-split table through its physical backing table and renaming the
+/// patchset back, so the tab-facing payload speaks logical names exactly like
+/// the server does.
+///
+/// The logical name of a split table is a view in the replica, which a
+/// session cannot diff, and the plain read used to match nothing and serve an
+/// empty snapshot silently.
+fn synced_snapshot(
+    conn: &mut SqliteConnection,
+    map: &PolicyTables,
+    tables: &HashSet<String>,
+    blank: &mut BlankState,
+) -> Result<Vec<u8>, RelayError> {
+    let mut read = HashSet::with_capacity(tables.len());
+    let mut back: HashMap<String, String> = HashMap::new();
+    for name in tables {
+        match map.physical(name) {
+            Some(physical) => {
+                read.insert(physical.to_owned());
+                back.insert(physical.to_owned(), name.clone());
+            }
+            None => {
+                read.insert(name.clone());
+            }
+        }
+    }
+    let patchset = snapshot_patchset(conn, MAIN_SCHEMA, &read, blank)?;
+    if back.is_empty() || patchset.is_empty() {
+        return Ok(patchset);
+    }
+    let mut parsed = ParsedDiffSet::parse(&patchset)
+        .map_err(|err| RelayError::Patch(format!("renaming a split snapshot: {err:?}")))?;
+    if parsed.rename_tables(&mut |table: &str| back.get(&table.to_lowercase()).cloned()) == 0 {
+        return Ok(patchset);
+    }
+    Ok(parsed.into())
 }
 
 /// Build one insert patchset holding every current row of the requested
@@ -2383,5 +2444,38 @@ mod tests {
             1,
             "the ceiling followed the scratch attach and closed behind it"
         );
+    }
+
+    /// The hub's snapshot must see a policy-split table: the logical name is
+    /// a view, the rows live under the backing table, and the served patchset
+    /// has to come back under the logical name. This served an empty snapshot
+    /// silently before the worker's map was threaded through.
+    #[wasm_bindgen_test]
+    fn a_split_table_snapshot_reads_the_backing_table_and_speaks_logically() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open");
+        conn.batch_execute(
+            "CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL);
+             CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls;
+             INSERT INTO orders_rls VALUES (7, 'alice');",
+        )
+        .expect("split schema");
+        let map =
+            connetto_client::PolicyTables::from_translation([("orders", "orders_rls")], ["orders"]);
+        let tables: std::collections::HashSet<String> =
+            core::iter::once("orders".to_owned()).collect();
+        let mut blank = super::BlankState::default();
+        let patchset =
+            super::synced_snapshot(&mut conn, &map, &tables, &mut blank).expect("snapshot");
+        assert!(
+            !patchset.is_empty(),
+            "the seeded backing-table row has to appear in the patchset"
+        );
+        let sqlite_diff_rs::ParsedDiffSet::Patchset(set) =
+            sqlite_diff_rs::ParsedDiffSet::parse(&patchset).expect("parse")
+        else {
+            panic!("a session patchset parses as a patchset");
+        };
+        let names: Vec<String> = set.iter().map(|op| op.table().name().clone()).collect();
+        assert_eq!(names, ["orders"], "one insert, under the logical name");
     }
 }

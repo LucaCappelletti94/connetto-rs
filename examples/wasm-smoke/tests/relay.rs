@@ -162,10 +162,14 @@ async fn write_row(
 async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     let base = unique_base();
     let (token, identity) = common::mint_session().await;
+    // The writer holds its own login of the same user: the hub's upstream
+    // connection below presents `token`, and two direct connections under one
+    // login evict each other.
+    let (writer_token, _) = common::mint_session().await;
 
     // A row that exists before the worker connects: it can only reach the
     // tab through the relay's snapshot leg.
-    let mut writer = connect("relay-writer", base, token.clone(), identity.clone()).await;
+    let mut writer = connect("relay-writer", base, writer_token, identity.clone()).await;
     let snapshot_id = write_row(&mut writer, 1, &identity).await;
 
     // The worker-held upstream connection: subscribe and drain to the
@@ -268,6 +272,10 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     let base = unique_base();
     let (token, identity) = common::mint_session().await;
+    // The observer's own login of the same user: the hub's upstream holds
+    // `token`, and a second direct connection under it would evict the worker
+    // and kill the relay mid-test.
+    let (observer_token, _) = common::mint_session().await;
     let stage = |message: &str| web_sys::console::log_1(&message.into());
 
     let mut worker = connect("port-worker", base, token.clone(), identity.clone()).await;
@@ -344,7 +352,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     // Round trip proof: an independent observer on the real server sees the
     // row, so it landed in Postgres, not just in a local mirror.
-    let mut observer = connect("port-observer", base, token, identity).await;
+    let mut observer = connect("port-observer", base, observer_token, identity).await;
     observer
         .subscribe("observer", QUERY)
         .await

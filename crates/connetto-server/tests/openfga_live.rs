@@ -602,3 +602,123 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
          write {write_after:?}"
     );
 }
+
+/// A UUID-keyed table shaped like the demo's `orders`, so a client uploads its
+/// primary key as a sixteen-byte blob rather than a typed value.
+const ORDERS_SCHEMA: &str = "CREATE TABLE r40_orders (id UUID PRIMARY KEY, owner TEXT NOT NULL);";
+
+/// The same owner policy `r5b_notes` carries, on the UUID-keyed table.
+const ORDERS_POLICY_STATEMENTS: [&str; 2] = [
+    "ALTER TABLE r40_orders ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY r40_orders_p ON r40_orders FOR ALL USING (\
+       owner = current_setting('app.user_id', true) \
+       OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
+];
+
+fn orders_policies() -> String {
+    ORDERS_POLICY_STATEMENTS.join(";\n") + ";"
+}
+
+/// Provision the UUID-keyed table with one owned row, dropping a prior run's.
+async fn provision_orders(pool: &Pool<AsyncPgConnection>) {
+    let mut conn = pool.get().await.expect("a connection");
+    let mut statements = vec!["DROP TABLE IF EXISTS r40_orders CASCADE", ORDERS_SCHEMA];
+    statements.extend(ORDERS_POLICY_STATEMENTS);
+    statements.push(
+        "INSERT INTO r40_orders (id, owner) VALUES \
+         ('11111111-1111-1111-1111-111111111111', 'alice')",
+    );
+    for statement in statements {
+        diesel::sql_query(statement)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|err| panic!("provisioning `{statement}`: {err}"));
+    }
+}
+
+/// R40 regression: a `UUID` primary key an upload carries as a sixteen-byte
+/// blob must name the row the same way the catalog-typed read path does, or the
+/// owner grant is never found and an owned write is refused.
+///
+/// The demo's `orders` has exactly this shape, and this drives the same
+/// `FgaAuth::may_write` path a mutation upload takes. It asks the identical
+/// owned insert twice, differing only in the key's spelling: once as the
+/// `Value::Uuid` the type-directed codec now produces, once as the
+/// `Value::Bytes` it produced before. The authorization seam cannot spell
+/// bytes (`render_text` returns `None`), so the row could not be named and the
+/// write was refused. An allow for the typed key and a refusal for the bytes is
+/// the divergence the fix removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
+async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
+    let pool = pool().await;
+    provision_orders(&pool).await;
+    let (channel, store) = connect().await;
+
+    let translated = Translated::of::<String>(ORDERS_SCHEMA, &orders_policies(), "app.user_id")
+        .expect("connetto's own policy shape translates");
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the rules are written");
+    let records = translated
+        .load_records(&pool)
+        .await
+        .expect("the generated queries ran and their rows spell facts");
+
+    let shapes = translated.shapes();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        Arc::clone(&shapes),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned())
+    .write_records(&records)
+    .await
+    .expect("the facts load");
+
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
+
+    let orders = catalog_helpers::table_id(shapes.catalog(), "r40_orders").expect("in the catalog");
+    let id = uuid::Uuid::from_u128(0xab4a_f609_f3d2_5ebd_b482_fbe8_b7db_00c6);
+    let alice = caller("alice");
+
+    // The key as the type-directed codec produces it: the row names itself
+    // `r40_orders:ab4af609-...` and alice owns it, so the write is allowed.
+    let typed: [Value<Postgres>; 2] = [Value::Uuid(id), Value::String("alice".to_owned())];
+    let typed_view = ValuesRow::new(orders, &typed);
+    assert!(
+        auth.may_write(RowWrite::Insert { new: &typed_view }, &alice)
+            .await
+            .expect("the composition answered")
+            .allowed(),
+        "alice inserting a row she owns, keyed by a UUID, must be allowed"
+    );
+
+    // The same UUID as the untyped codec produced it: raw bytes, which cannot
+    // be spelled, so the row cannot be named and the owned write is refused. An
+    // allow here would be the regression this test guards.
+    let untyped: [Value<Postgres>; 2] = [
+        Value::Bytes(id.as_bytes().to_vec()),
+        Value::String("alice".to_owned()),
+    ];
+    let untyped_view = ValuesRow::new(orders, &untyped);
+    let refused = auth
+        .may_write(RowWrite::Insert { new: &untyped_view }, &alice)
+        .await;
+    assert!(
+        !matches!(&refused, Ok(verdict) if verdict.allowed()),
+        "a blob-shaped UUID key cannot be named, so the same owned write must \
+         not be allowed: {refused:?}"
+    );
+}

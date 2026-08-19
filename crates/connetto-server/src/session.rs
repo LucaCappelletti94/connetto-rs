@@ -1658,7 +1658,7 @@ where
             let PatchsetOp::Insert { values, .. } = &op else {
                 continue;
             };
-            let row: Vec<PgValue<Postgres>> = values.iter().map(crate::pk::from_wire).collect();
+            let row = crate::pk::row_from_wire(self.catalog.as_ref(), table_id, values);
             let view = ValuesRow::new(table_id, &row);
             let watchers = [Arc::clone(&route.principal)];
             let mut verdicts = Vec::new();

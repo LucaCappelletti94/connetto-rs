@@ -68,12 +68,6 @@ use subql::patchset::PgAdapter;
 /// The wire `Value` flavor a parsed upload carries: owned text and blobs.
 type WireValue = Value<String, Vec<u8>>;
 
-/// Map a full uploaded row image to the canonical value shape the row view
-/// hands to the authorization seam.
-fn row_image(values: &[WireValue]) -> Vec<PgValue<Postgres>> {
-    values.iter().map(crate::pk::from_wire).collect()
-}
-
 /// Zstd level for bulk payloads. Level 3 is the library default: a sound size
 /// versus speed tradeoff for patchset-sized blobs.
 const ZSTD_LEVEL: i32 = 3;
@@ -1365,11 +1359,12 @@ where
             return Err(MaterializerError::NotWritable(table));
         }
         let table_id = self.table_id(&table)?;
+        let db = self.catalog();
         let pk_values = op.primary_key();
         let (write, conflict) = match op {
             ChangesetOp::Insert { values, .. } => (
                 PlannedWrite::Insert {
-                    new: row_image(values),
+                    new: crate::pk::row_from_wire(db, table_id, values),
                 },
                 None,
             ),
@@ -1384,17 +1379,27 @@ where
                 // IDENTITY DEFAULT`.
                 let old = values
                     .iter()
-                    .map(|(old, _)| match old {
-                        Some(value) => crate::pk::from_wire(value),
+                    .enumerate()
+                    .map(|(ordinal, (old, _))| match old {
+                        Some(value) => crate::pk::from_wire(
+                            value,
+                            crate::pk::scalar_kind(db, table_id, ordinal),
+                        ),
                         None => PgValue::Missing,
                     })
                     .collect();
                 let new = values
                     .iter()
-                    .map(|(old, new)| match new.as_ref().or(old.as_ref()) {
-                        Some(value) => crate::pk::from_wire(value),
-                        None => PgValue::Missing,
-                    })
+                    .enumerate()
+                    .map(
+                        |(ordinal, (old, new))| match new.as_ref().or(old.as_ref()) {
+                            Some(value) => crate::pk::from_wire(
+                                value,
+                                crate::pk::scalar_kind(db, table_id, ordinal),
+                            ),
+                            None => PgValue::Missing,
+                        },
+                    )
                     .collect();
                 (PlannedWrite::Update { old, new }, conflict)
             }
@@ -1403,7 +1408,7 @@ where
                     self.plan_conflict(schema, &pk_values, |idx| old_values.get(idx).cloned())?;
                 (
                     PlannedWrite::Delete {
-                        old: row_image(old_values),
+                        old: crate::pk::row_from_wire(db, table_id, old_values),
                     },
                     conflict,
                 )
@@ -1425,13 +1430,16 @@ where
             return Err(MaterializerError::NotWritable(table));
         }
         match op {
-            PatchsetOp::Insert { values, .. } => Ok(PlannedOp {
-                table_id: self.table_id(&table)?,
-                write: PlannedWrite::Insert {
-                    new: row_image(values),
-                },
-                conflict: None,
-            }),
+            PatchsetOp::Insert { values, .. } => {
+                let table_id = self.table_id(&table)?;
+                Ok(PlannedOp {
+                    table_id,
+                    write: PlannedWrite::Insert {
+                        new: crate::pk::row_from_wire(self.catalog(), table_id, values),
+                    },
+                    conflict: None,
+                })
+            }
             // A patchset carries no prior image, so an update or delete cannot
             // be conflict-checked. Fail closed.
             PatchsetOp::Update { .. } | PatchsetOp::Delete { .. } => {

@@ -89,7 +89,11 @@ async fn page_live_query_reloads_on_another_clients_write() {
     // A second, independent client writes: the change must reach the page
     // through the server (apply to Postgres, replication echo, live patch),
     // never through anything local to the observer.
-    let mut writer = connect("page-writer", token, identity.clone()).await;
+    // A separate login, so the writer holds its own session rather than
+    // superseding the observer's. Same fixed user, so it owns what it writes
+    // and the observer, that user too, is allowed to see it.
+    let (writer_token, _) = common::mint_session().await;
+    let mut writer = connect("page-writer", writer_token, identity.clone()).await;
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
         .load::<rosetta_uuid::Uuid>(writer.conn())

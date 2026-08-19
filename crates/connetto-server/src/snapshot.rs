@@ -319,7 +319,7 @@ mod pg {
             };
             Ok(Some(SourceRow {
                 table_id,
-                values: values.iter().map(crate::pk::from_wire).collect(),
+                values: crate::pk::row_from_wire(&self.catalog, table_id, values),
             }))
         }
     }
@@ -474,6 +474,7 @@ mod pg {
                 .collect();
             let mut decoded = Vec::with_capacity(cells.len());
             if !cells.is_empty() {
+                let member_table_id = catalog_helpers::table_id(&self.catalog, member_table);
                 let built = subql::emit::pgbinary_patchset_builder(
                     &self.catalog,
                     member_table,
@@ -487,7 +488,14 @@ mod pg {
                             "the seed encoder produced something other than an insert".into(),
                         ));
                     };
-                    decoded.push(values.iter().map(crate::pk::from_wire).collect());
+                    let row = match member_table_id {
+                        Some(table_id) => crate::pk::row_from_wire(&self.catalog, table_id, values),
+                        None => values
+                            .iter()
+                            .map(|value| crate::pk::from_wire(value, None))
+                            .collect(),
+                    };
+                    decoded.push(row);
                 }
             }
             Ok(Some(TermSeedRead {

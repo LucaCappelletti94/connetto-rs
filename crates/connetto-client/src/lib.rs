@@ -1854,6 +1854,16 @@ where
             .and_then(|run| run.schema_version.as_ref())
     }
 
+    /// The logical-to-physical table map this connection renames with.
+    ///
+    /// An embedder that serves other consumers from this replica (the relay
+    /// hub) must read a split table through the same map the connection
+    /// applies with, or the two disagree silently.
+    #[must_use]
+    pub fn policy_tables(&self) -> &PolicyTables {
+        &self.config.policy_tables
+    }
+
     /// The application's local connection, for ordinary diesel reads and writes.
     /// Writes here are captured for upload on the next [`push`](Self::push).
     pub const fn conn(&mut self) -> &mut SqliteConnection {
