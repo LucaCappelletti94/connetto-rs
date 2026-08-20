@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/connetto-core",
-    "crates/connetto-server",
-    "crates/connetto-client",
-    "crates/connetto-dioxus",
-    "crates/connetto-yew",
-    "crates/connetto-test-harness",
+  "crates/connetto-core",
+  "crates/connetto-server",
+  "crates/connetto-client",
+  "crates/connetto-dioxus",
+  "crates/connetto-yew",
+  "crates/connetto-test-harness",
 ]
 exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 
@@ -41,7 +41,9 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # replica keeping a stale value for any column its query does not filter on.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2eddc98101cafd6fd56b4b02108d35c2e8b360c6", default-features = false, features = ["std"] }
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2eddc98101cafd6fd56b4b02108d35c2e8b360c6", default-features = false, features = [
+  "std",
+] }
 
 # rls2fga: the translator from Postgres row-level-security policy text to an
 # OpenFGA model, the per-relation report of what one row decides, and the
@@ -52,9 +54,19 @@ subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2eddc98101c
 # rev, because pinning it by revision put two copies of `sql-traits` in one
 # graph with two incompatible `ParserDB` types, which `[patch]` refuses to
 # merge.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = ["client"] }
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = [
+  "client",
+] }
 
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  "io-util",
+] }
 thiserror = "2"
 # Routed to the LucaCappelletti94 diesel `future` fork by the [patch] blocks below.
 diesel = { version = "2", features = ["sqlite"] }
@@ -89,6 +101,7 @@ unused_import_braces = "forbid"
 unused_must_use = "forbid"
 unsafe_code = "forbid"
 deprecated = "deny"
+unknown_lints = "allow"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "forbid"

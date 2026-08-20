@@ -21,7 +21,8 @@ use connetto_client::teardown::{
 };
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, Replica, ReplicaKey, provision_replica_key, replica_db_name,
+    NativeAuthenticator, Replica, ReplicaKey, encode_identity, provision_replica_key,
+    replica_db_name,
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
@@ -292,8 +293,9 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
 
     let refresh: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync> =
         Arc::new(MemoryRefreshStore::default());
+    let alice_account = encode_identity("alice").expect("encode alice account");
     refresh
-        .store("alice", "session-id.secret")
+        .store(&alice_account, "session-id.secret")
         .expect("seed a credential");
     // Port 1 is reserved and nothing listens there. The revoke can therefore
     // never land, which is deliberate: the guard must refuse before the request
@@ -302,7 +304,7 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
         "http://127.0.0.1:1",
         "permissive",
         Arc::clone(&refresh),
-        "alice",
+        Some(alice_account.clone()),
     );
 
     match forget_device(&authenticator, &path, &keys, &record, &unsynced, false).await {
@@ -311,7 +313,7 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
         Ok(()) => panic!("forget_device must not silently drop queued writes"),
     }
     assert_eq!(
-        refresh.load("alice").expect("load").as_deref(),
+        refresh.load(&alice_account).expect("load").as_deref(),
         Some("session-id.secret"),
         "the credential is intact, so the queued writes can still be uploaded"
     );

@@ -34,10 +34,14 @@
 //!   anonymous database access off. Must not exceed
 //!   `CONNETTO_READER_POOL_SIZE`. See
 //!   `docs/architecture/16-server-capacity.md`.
-//! - `CONNETTO_OIDC_PROVIDER`: which identity provider `CONNETTO_AUTH` logs
-//!   users in with, one of `google`, `microsoft`, or `generic` (lowercase).
-//!   Anything else, including an unset or miscapitalised value, refuses
-//!   startup.
+//! - `CONNETTO_OIDC_PROVIDERS`: which identity providers `CONNETTO_AUTH` logs
+//!   users in with, as a comma-separated list of provider names. Each name is
+//!   what a client puts in `?provider=`, and each reads its own settings from
+//!   `CONNETTO_OIDC_<NAME>_*`: `KIND` (one of `google`, `microsoft` or
+//!   `generic`, lowercase), `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URL`,
+//!   `ISSUER` and `SCOPES`. An empty list, an unset kind, or a miscapitalised
+//!   one refuses startup. Several providers is the ordinary case: a deployment
+//!   offering both a corporate login and Google registers two.
 //! - `CONNETTO_BANS`: set to `database` to ban an identity that crosses an
 //!   abuse threshold, reading and writing `connetto_bans` on the owner pool.
 //!   Unset, a crossing is logged and nothing is banned, because the table is
@@ -317,62 +321,122 @@ async fn build_auth(
     Ok(Some((service, registry)))
 }
 
-/// Build the provider registry from `CONNETTO_OIDC_PROVIDER`.
+/// Build the provider registry from `CONNETTO_OIDC_PROVIDERS`.
 ///
-/// `google` and `microsoft` discover the respective provider and `generic`
-/// discovers `CONNETTO_OIDC_ISSUER`. Anything else, including an unset or
+/// The value is a comma-separated list of provider names, and each name is the
+/// string a client puts in `?provider=`. Every other setting is read per name,
+/// from `CONNETTO_OIDC_<NAME>_*`, where `<NAME>` is the name upper-cased with
+/// every character outside `A-Z0-9` turned into an underscore. So a deployment
+/// offering Google and its own issuer sets
+/// `CONNETTO_OIDC_PROVIDERS=google,acme` and then
+/// `CONNETTO_OIDC_GOOGLE_KIND`, `CONNETTO_OIDC_GOOGLE_CLIENT_ID`, and the same
+/// under `CONNETTO_OIDC_ACME_`.
+///
+/// The name is the key rather than a slot invented for the purpose, because the
+/// name already has to be unique: it is what a login request selects on. Two
+/// names that differ only outside `A-Z0-9` would collide into one prefix, so
+/// that is refused by name rather than resolved by precedence.
+///
+/// Per name, `KIND` is `google`, `microsoft` or `generic`, where the first two
+/// discover the respective provider and `generic` discovers
+/// `CONNETTO_OIDC_<NAME>_ISSUER`. Anything else, including an unset or
 /// miscapitalised value, refuses startup naming the value, so a typo cannot
-/// silently select a different provider. A provider reads
-/// `CONNETTO_OIDC_CLIENT_ID`, `CONNETTO_OIDC_CLIENT_SECRET` (optional),
-/// `CONNETTO_OIDC_REDIRECT_URL`, and `CONNETTO_OIDC_SCOPES` (comma-separated).
+/// silently select a different provider. Each also reads `CLIENT_ID`,
+/// `CLIENT_SECRET` (optional), `REDIRECT_URL`, and `SCOPES` (comma-separated).
 async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
-    let mut registry = ProviderRegistry::new();
-    let kind = var_or("CONNETTO_OIDC_PROVIDER", "");
-    match kind.as_str() {
-        "google" | "microsoft" | "generic" => {
-            let http = openidconnect::reqwest::ClientBuilder::new()
-                .redirect(openidconnect::reqwest::redirect::Policy::none())
-                .build()
-                .context("building the OIDC HTTP client")?;
-            let provider_config = oidc_config_from_env(config)?;
-            let provider = match kind.as_str() {
-                "google" => GenericOidcProvider::google(provider_config, http).await,
-                "microsoft" => GenericOidcProvider::microsoft(provider_config, http).await,
-                _ => GenericOidcProvider::discover(provider_config, http).await,
-            }
-            .map_err(|err| anyhow!("configuring the {kind} provider: {err}"))?;
-            registry.register(Arc::new(provider));
-        }
-        "" => {
-            return Err(anyhow!(
-                "CONNETTO_OIDC_PROVIDER is unset, expected one of google, microsoft, or generic"
-            ));
-        }
-        other => {
-            return Err(anyhow!(
-                "unrecognised CONNETTO_OIDC_PROVIDER {other:?}, expected one of google, \
-                 microsoft, or generic (names are lowercase)"
-            ));
-        }
+    let names = var_or("CONNETTO_OIDC_PROVIDERS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(anyhow!(
+            "CONNETTO_OIDC_PROVIDERS is unset, expected a comma-separated list of provider \
+             names, each configured under CONNETTO_OIDC_<NAME>_*"
+        ));
     }
+    let mut prefixes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(names.len());
+    let mut registry = ProviderRegistry::new();
+    let http = openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()
+        .context("building the OIDC HTTP client")?;
+    for name in &names {
+        let prefix = env_prefix(name);
+        if let Some(other) = prefixes.insert(prefix.clone(), name.clone()) {
+            return Err(anyhow!(
+                "provider names {other:?} and {name:?} both read their settings from \
+                 CONNETTO_OIDC_{prefix}_, so one would silently take the other's credentials"
+            ));
+        }
+        let kind = var_or(&format!("CONNETTO_OIDC_{prefix}_KIND"), "");
+        let provider_config = oidc_config_from_env(config, name, &prefix)?;
+        let provider = match kind.as_str() {
+            "google" => GenericOidcProvider::google(provider_config, http.clone()).await,
+            "microsoft" => GenericOidcProvider::microsoft(provider_config, http.clone()).await,
+            "generic" => GenericOidcProvider::discover(provider_config, http.clone()).await,
+            "" => {
+                return Err(anyhow!(
+                    "CONNETTO_OIDC_{prefix}_KIND is unset for provider {name:?}, expected one \
+                     of google, microsoft, or generic"
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "unrecognised CONNETTO_OIDC_{prefix}_KIND {other:?} for provider {name:?}, \
+                     expected one of google, microsoft, or generic (names are lowercase)"
+                ));
+            }
+        }
+        .map_err(|err| anyhow!("configuring the {kind} provider {name:?}: {err}"))?;
+        registry.register(Arc::new(provider));
+    }
+    tracing::info!(providers = ?names, "identity providers registered");
     Ok(registry)
 }
 
-/// The generic provider configuration from the `CONNETTO_OIDC_*` environment.
-fn oidc_config_from_env(config: &AuthConfig) -> Result<OidcProviderConfig> {
-    let scopes = var_or("CONNETTO_OIDC_SCOPES", "")
+/// The environment prefix a provider's settings live under: the name upper-cased
+/// with everything outside `A-Z0-9` turned into an underscore, so a name like
+/// `dev-idp` reads `CONNETTO_OIDC_DEV_IDP_*`.
+fn env_prefix(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// One provider's configuration from its own `CONNETTO_OIDC_<NAME>_*` settings.
+fn oidc_config_from_env(
+    config: &AuthConfig,
+    name: &str,
+    prefix: &str,
+) -> Result<OidcProviderConfig> {
+    let scopes = var_or(&format!("CONNETTO_OIDC_{prefix}_SCOPES"), "")
         .split(',')
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let client_id = std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_ID"))
+        .with_context(|| format!("set CONNETTO_OIDC_{prefix}_CLIENT_ID for provider {name:?}"))?;
+    let redirect =
+        std::env::var(format!("CONNETTO_OIDC_{prefix}_REDIRECT_URL")).with_context(|| {
+            format!("set CONNETTO_OIDC_{prefix}_REDIRECT_URL for provider {name:?}")
+        })?;
     Ok(OidcProviderConfig::new(
-        var_or("CONNETTO_OIDC_NAME", "oidc"),
-        std::env::var("CONNETTO_OIDC_CLIENT_ID").context("set CONNETTO_OIDC_CLIENT_ID")?,
-        var_or("CONNETTO_OIDC_ISSUER", config.issuer()),
-        std::env::var("CONNETTO_OIDC_REDIRECT_URL").context("set CONNETTO_OIDC_REDIRECT_URL")?,
+        name,
+        client_id,
+        var_or(&format!("CONNETTO_OIDC_{prefix}_ISSUER"), config.issuer()),
+        redirect,
     )
-    .with_client_secret(std::env::var("CONNETTO_OIDC_CLIENT_SECRET").ok())
+    .with_client_secret(std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_SECRET")).ok())
     .with_scopes(scopes))
 }
 

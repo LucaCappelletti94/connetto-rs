@@ -110,7 +110,6 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 /// is nothing to check. R3 removed `AuthenticationFailed`: a missing credential
 /// never closes the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn absent_grant_yields_an_unidentified_run() {
     let fixture = Fixture::acquire().await;
     let capture = CapturingSnapshot::default();
@@ -173,7 +172,6 @@ async fn absent_grant_yields_an_unidentified_run() {
 /// unidentified and the snapshot sees no identity. R3 removed
 /// `AuthenticationFailed`: refusals are not fatal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn refused_grant_yields_an_unidentified_run() {
     let fixture = Fixture::acquire().await;
     let capture = CapturingSnapshot::default();
@@ -234,7 +232,6 @@ async fn refused_grant_yields_an_unidentified_run() {
 /// the client claims as its id. The spoofing hole is closed: identity comes
 /// from the checked grant, not from the client-supplied `client_id`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn verified_identity_ignores_a_spoofed_client_id() {
     let fixture = Fixture::acquire().await;
     // The authority resolves the identity, and the client claims a different id.

@@ -5,9 +5,7 @@
 //! addresses for revocation and supersession, and it survives a reconnect
 //! where the per-connection counter never could.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with
-//! `wal_level=logical`. Run under Docker with `DATABASE_URL` pointed at it and
-//! `-- --ignored`.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::str::FromStr as _;
 use std::time::Duration;
@@ -17,7 +15,7 @@ use connetto_core::messages::{ControlMessage, FatalErrorReason, MutationRejectRe
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, insert_changeset,
-    provision_watermark, spawn_server,
+    spawn_server,
 };
 use sqlite_diff_rs::Value;
 
@@ -30,12 +28,9 @@ async fn serve(fixture: &Fixture) -> Server {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP PUBLICATION IF EXISTS connetto_pub",
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-            "ALTER TABLE notes REPLICA IDENTITY FULL",
         ])
         .await;
-    provision_watermark(fixture.admin()).await;
     fixture.start_replication(&["notes"]).await;
     let snapshot =
         PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source");
@@ -76,7 +71,6 @@ fn note(id: i64, body: &str) -> Vec<u8> {
 /// all. That is the case the per-subscription route map cannot serve, so it is
 /// the one that proves the connection registry exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn revocation_closes_an_idle_connection() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -105,7 +99,6 @@ async fn revocation_closes_an_idle_connection() {
 /// client backs off instead of reconnecting immediately into a dying process.
 /// Two callers, because the registry is walked rather than closed one by one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn shutdown_closes_every_live_connection() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -135,7 +128,6 @@ async fn shutdown_closes_every_live_connection() {
 /// served. Both directions are proven so a future change cannot quietly move
 /// revocation back onto the routes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn revocation_closes_a_subscribed_connection() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -165,7 +157,6 @@ async fn revocation_closes_a_subscribed_connection() {
 /// a handle, because the handle keys the per-subscription cursors and the
 /// pending buffer, and two readers would each consume the other's changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn a_second_connection_on_one_handle_supersedes_the_first() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -213,7 +204,6 @@ async fn a_second_connection_on_one_handle_supersedes_the_first() {
 /// different handle and inherits nothing, which is what stops the next person
 /// on a shared device from resuming the previous one's session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn a_handle_does_not_survive_a_change_of_caller() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -256,7 +246,6 @@ async fn a_handle_does_not_survive_a_change_of_caller() {
 /// to the same session sees its own applied sequence and replays nothing,
 /// while a different caller starts clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
@@ -313,7 +302,6 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
 /// The handle the ack carries is the one the client presents on reconnect, so
 /// a resumed connection is recognisably the same run rather than a new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn the_ack_carries_a_parseable_durable_handle() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;

@@ -159,7 +159,6 @@ async fn drive_cdc<S, A>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn loopback_session_full_lifecycle() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -300,7 +299,6 @@ async fn loopback_session_full_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn websocket_session_delivers_snapshot_and_live_patch() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -514,7 +512,6 @@ fn reading_replica() -> SqliteConnection {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn loopback_session_composite_key_sync() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(READINGS_PG_DDL).expect("build materializer");

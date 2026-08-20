@@ -18,6 +18,7 @@
 //! hand any same-origin script the ability to unwrap the replica key.
 
 use std::cell::{Cell, RefCell};
+use std::pin::Pin;
 use std::rc::Rc;
 
 use base64::Engine;
@@ -41,6 +42,12 @@ use crate::auth::{AT_REST_PRF_INPUT, AuthError, IdbKeyStore};
 /// has room to find a sensor and be verified.
 const CEREMONY_TIMEOUT_MS: u32 = 60_000;
 
+/// What the application registers to answer the worker's account question.
+///
+/// It receives every account whose credential is stored and returns who to sign in
+/// as.
+type AccountChooser = dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = AccountChoice>>>;
+
 // ────────────────────────────────────────────────────────── thread locals ──
 
 thread_local! {
@@ -56,6 +63,15 @@ thread_local! {
     /// call `adopt_derived` without a handle being threaded through every closure.
     static WORKER_KEY_STORE: RefCell<Option<Rc<IdbKeyStore>>> =
         const { RefCell::new(None) };
+
+    /// What answers the worker's account question, registered by the application
+    /// on the page side. Absent means no picker, which takes the default.
+    static CHOOSER: RefCell<Option<Rc<AccountChooser>>> = const { RefCell::new(None) };
+
+    /// An account a switch asked for, answered in place of consulting the
+    /// chooser and cleared once used. Only ever set on the page that owns the
+    /// worker, so leadership moving cannot resurrect a stale target.
+    static PENDING_SWITCH: RefCell<Option<AccountChoice>> = const { RefCell::new(None) };
 }
 
 // ─────────────────────────────────────────────────────────── public types ──
@@ -81,6 +97,45 @@ pub enum TabAnswer {
         /// What the platform said, for the boot error that carries it.
         detail: String,
     },
+    /// Which account the tab chose to sign in as.
+    Account(AccountChoice),
+}
+
+/// Who a boot should sign in as, answered by the tab against the accounts the
+/// worker offered.
+///
+/// Three cases rather than an optional account, because "nobody yet" and "the
+/// usual one" are different instructions and collapsing them makes a second
+/// account unreachable: without [`New`](Self::New) the only way to sign one in is
+/// to sign the current one out, which deletes the credential that would have made
+/// it the second account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChoice {
+    /// Sign in as this stored account. It must be one the worker offered, and a
+    /// name that was not is refused rather than answered with a login, because it
+    /// is a caller bug rather than a stale credential.
+    Named(String),
+    /// Take the last-used account, which is what an application with no picker
+    /// gets and what a dismissed picker should fall back to.
+    LastUsed,
+    /// Sign in as somebody new, leaving every stored credential alone.
+    ///
+    /// This is what puts a second account on the device. The boot addresses no
+    /// stored credential, so it goes straight to an interactive login and the new
+    /// credential lands beside the others.
+    New,
+}
+
+/// What a [`TabAnswer`] is, for an error that has to name an answer it did not
+/// expect.
+pub(crate) fn answer_kind(answer: &TabAnswer) -> &'static str {
+    match answer {
+        TabAnswer::Key { .. } => "a derived key",
+        TabAnswer::Declined => "a dismissal",
+        TabAnswer::Unsupported => "no support",
+        TabAnswer::Failed { .. } => "a failure",
+        TabAnswer::Account(_) => "an account",
+    }
 }
 
 // ──────────────────────────────────────────────────────────── worker side ──
@@ -99,6 +154,17 @@ pub fn custody() -> Custody {
 pub(crate) fn init_worker(key_store: Rc<IdbKeyStore>, initial: Custody) {
     CUSTODY.with(|c| c.set(initial));
     WORKER_KEY_STORE.with(|ks| ks.borrow_mut().replace(key_store));
+}
+
+/// The worker's own key store, the one whose derived key-encryption key an
+/// unlock put in memory.
+///
+/// Anything in the worker that needs the device key after the gate must use this
+/// rather than opening a second store: the derived key lives on the instance, so
+/// a freshly opened one is locked on an enrolled profile even though the worker
+/// is unlocked.
+pub(crate) fn worker_key_store() -> Option<Rc<IdbKeyStore>> {
+    WORKER_KEY_STORE.with(|slot| slot.borrow().clone())
 }
 
 /// Update the worker-side custody after an unlock or enrol outcome.
@@ -161,6 +227,7 @@ fn handle_worker_message(event: &MessageEvent) {
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "no detail".to_owned()),
         },
+        Some("account") => TabAnswer::Account(decode_choice(&data)),
         _ => return,
     };
 
@@ -207,27 +274,70 @@ pub(crate) async fn ask_unlock(credentials: Vec<Vec<u8>>) -> Result<TabAnswer, A
         Reflect::set(&obj, &JsValue::from_str("credentials"), &arr).unwrap_throw();
         JsValue::from(obj)
     };
-    post_to_tab(&msg)?;
-    await_answer().await
+    ask_tab(msg).await
 }
 
 /// Ask the tab to enrol for the first time and await its response.
 ///
-/// Posts `{ kind: "enrol", label: "<label>" }` to the page. The label is the
-/// signed-in identity, used only for the authenticator UI prompt.
+/// Posts `{ kind: "enrol" }` to the page. It carries no identity: the credential
+/// is one per device rather than one per account, so the tab names it after the
+/// origin. See the plan's R23 decision 10.
 ///
 /// # Errors
 ///
 /// [`AuthError::Context`] if posting fails or no reply arrives.
-pub(crate) async fn ask_enrol(label: &str) -> Result<TabAnswer, AuthError> {
+pub(crate) async fn ask_enrol() -> Result<TabAnswer, AuthError> {
     let msg = {
         let obj = Object::new();
         set_str(&obj, "kind", "enrol");
-        set_str(&obj, "label", label);
         JsValue::from(obj)
     };
-    post_to_tab(&msg)?;
-    await_answer().await
+    ask_tab(msg).await
+}
+
+/// Ask the tab which account to sign in as, and await its answer.
+///
+/// Posts `{ kind: "account", accounts: ["<encoded id>", ...] }` to the page.
+/// Sent after the gate, because the list comes out of the credential store and
+/// that store does not open until the ceremony has run. One gesture to unlock
+/// the device, then a choice of who, which is also the only order that costs a
+/// single gesture.
+///
+/// # Errors
+///
+/// [`AuthError::Context`] if posting fails or no reply arrives.
+pub(crate) async fn ask_account(accounts: &[String]) -> Result<TabAnswer, AuthError> {
+    let msg = {
+        let obj = Object::new();
+        set_str(&obj, "kind", "account");
+        let arr = js_sys::Array::new();
+        for account in accounts {
+            arr.push(&JsValue::from_str(account));
+        }
+        Reflect::set(&obj, &JsValue::from_str("accounts"), &arr).unwrap_throw();
+        JsValue::from(obj)
+    };
+    ask_tab(msg).await
+}
+
+/// Read an [`AccountChoice`] off a tab answer.
+///
+/// An unrecognised or missing choice reads as [`AccountChoice::LastUsed`], which
+/// is the one answer that can never be wrong: it is what an application with no
+/// picker gets, so a garbled message costs the default rather than a login or
+/// somebody else's account.
+fn decode_choice(data: &JsValue) -> AccountChoice {
+    let choice = Reflect::get(data, &JsValue::from_str("choice"))
+        .ok()
+        .and_then(|v| v.as_string());
+    match choice.as_deref() {
+        Some("new") => AccountChoice::New,
+        Some("named") => Reflect::get(data, &JsValue::from_str("account"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .map_or(AccountChoice::LastUsed, AccountChoice::Named),
+        _ => AccountChoice::LastUsed,
+    }
 }
 
 fn post_to_tab(msg: &JsValue) -> Result<(), AuthError> {
@@ -239,9 +349,24 @@ fn post_to_tab(msg: &JsValue) -> Result<(), AuthError> {
         .map_err(|e| AuthError::Context(format!("unlock post: {e:?}")))
 }
 
-async fn await_answer() -> Result<TabAnswer, AuthError> {
+async fn ask_tab(msg: JsValue) -> Result<TabAnswer, AuthError> {
     let (tx, rx) = futures_channel::oneshot::channel::<TabAnswer>();
-    PENDING.with(|p| p.borrow_mut().replace(tx));
+    let installed = PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.is_some() {
+            false
+        } else {
+            pending.replace(tx);
+            true
+        }
+    });
+    if !installed {
+        return Err(AuthError::Context("unlock: overlapping tab request".into()));
+    }
+    if let Err(err) = post_to_tab(&msg) {
+        PENDING.with(|p| p.borrow_mut().take());
+        return Err(err);
+    }
     rx.await.map_err(|_| AuthError::Cancelled)
 }
 
@@ -251,13 +376,14 @@ fn set_str(obj: &Object, key: &str, val: &str) {
 
 // ──────────────────────────────────────────────────────────────── tab side ──
 
-/// Install the permanent handler on `worker.onmessage` that answers unlock
-/// and enrol requests from the DB worker by running the `WebAuthn` ceremony.
+/// Install the permanent handler on `worker.onmessage` that answers unlock,
+/// enrol and account requests from the DB worker.
 ///
-/// Both request kinds are handled: an `unlock` request performs an assertion
-/// using the listed credential ids, while an `enrol` request creates a new
-/// credential. On success the tab imports the PRF output as an HKDF key and
-/// posts it back. On failure it posts `declined` or `unsupported`.
+/// An `unlock` request performs an assertion using the listed credential ids, an
+/// `enrol` request creates a new credential, and both import the PRF output as an
+/// HKDF key and post it back, or post `declined` or `unsupported` on failure. An
+/// `account` request is answered by whatever [`serve_account_choice`] registered,
+/// or with the default when nothing did.
 ///
 /// An unsolicited key (received while no request is outstanding) is treated by
 /// the worker as a late enrolment.
@@ -279,13 +405,8 @@ pub fn serve_unlock(worker: &Worker) -> Result<(), JsValue> {
                     let credentials = collect_credentials(&data);
                     handle_unlock_request(&worker, credentials).await;
                 }
-                Some("enrol") => {
-                    let label = Reflect::get(&data, &JsValue::from_str("label"))
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_default();
-                    handle_enrol_request(&worker, &label).await;
-                }
+                Some("enrol") => handle_enrol_request(&worker).await,
+                Some("account") => handle_account_request(&worker, collect_accounts(&data)).await,
                 _ => {}
             }
         });
@@ -306,12 +427,42 @@ pub fn serve_unlock(worker: &Worker) -> Result<(), JsValue> {
 /// # Errors
 ///
 /// [`JsValue`] if the ceremony fails or the key cannot be posted.
-pub async fn enrol(worker: &Worker, label: &str) -> Result<(), JsValue> {
-    let key_and_id = create_credential(label).await?;
+pub async fn enrol(worker: &Worker) -> Result<(), JsValue> {
+    let key_and_id = create_credential().await?;
     match key_and_id {
         Some((credential_id, hkdf_key)) => post_key_to_worker(worker, &credential_id, &hkdf_key),
         None => post_unsupported(worker),
     }
+}
+
+/// Register what answers the worker's "which account?" question.
+///
+/// The chooser receives every account whose credential this profile holds, each
+/// the encoded form of a user id, and returns who to sign in as. Returning
+/// [`AccountChoice::LastUsed`] is what happens when no chooser is registered too,
+/// so forgetting to register one costs the default rather than the boot, and
+/// [`AccountChoice::New`] is how a second account gets onto the device.
+///
+/// Call it before the worker boots, alongside [`serve_unlock`], and only when the
+/// worker configuration asks for the account question. The list arrives after the
+/// unlock ceremony, because it comes out of the credential store.
+pub fn serve_account_choice<F, Fut>(chooser: F)
+where
+    F: Fn(Vec<String>) -> Fut + 'static,
+    Fut: Future<Output = AccountChoice> + 'static,
+{
+    let boxed: Rc<AccountChooser> = Rc::new(move |accounts| Box::pin(chooser(accounts)));
+    CHOOSER.with(|slot| slot.borrow_mut().replace(boxed));
+}
+
+/// Record who the next worker boot must sign in as.
+///
+/// Set by a switch or by adding an account, both of which replace the worker, so
+/// the replacement's account question is answered with this instead of reaching
+/// the chooser. It is consumed by the first answer, so it cannot outlive the
+/// switch that set it.
+pub(crate) fn set_pending_switch(choice: AccountChoice) {
+    PENDING_SWITCH.with(|slot| slot.borrow_mut().replace(choice));
 }
 
 // ─────────────────────────── tab-side ceremony helpers ─────────────────────
@@ -324,29 +475,72 @@ async fn handle_unlock_request(worker: &Worker, credential_ids: Vec<Vec<u8>>) {
     answer(worker, assert_credential(&credential_ids).await);
 }
 
-async fn handle_enrol_request(worker: &Worker, label: &str) {
-    answer(worker, create_credential(label).await);
+async fn handle_enrol_request(worker: &Worker) {
+    answer(worker, create_credential().await);
 }
 
-/// Post the outcome of a ceremony, keeping the three failure kinds apart.
+/// Answer the worker's account question.
+async fn handle_account_request(worker: &Worker, accounts: Vec<String>) {
+    let chosen = chosen_account(accounts).await;
+    let _ = post_account(worker, &chosen);
+}
+
+/// Which account to answer with: the switch target if a switch set one, otherwise
+/// whatever the application registered, otherwise the last-used default.
+///
+/// A switch target wins because it is the more recent statement of intent: the
+/// user asked for that account after the chooser was registered. It is consumed by
+/// the one answer it was set for, so the boot after a switch reaches the chooser
+/// again rather than flipping back.
+///
+/// Split from the posting so the precedence can be exercised without a worker to
+/// post to. Every borrow is released before anything is awaited, because a chooser
+/// that re-entered this while a slot was still borrowed would panic.
+pub(crate) async fn chosen_account(accounts: Vec<String>) -> AccountChoice {
+    if let Some(target) = PENDING_SWITCH.with(|slot| slot.borrow_mut().take()) {
+        // A switch names an account the requester already saw in a list, so it
+        // travels as-is and the worker refuses it if it is not stored.
+        return target;
+    }
+    let chooser = CHOOSER.with(|slot| slot.borrow().clone());
+    match chooser {
+        Some(chooser) => chooser(accounts).await,
+        None => AccountChoice::LastUsed,
+    }
+}
+
+/// Post the outcome of a ceremony, keeping the failure kinds apart.
 ///
 /// `Ok(None)` means the platform ran the ceremony and returned no extension
 /// output, which is the honest unsupported case. A thrown `NotAllowedError` is a
 /// dismissal or a credential that is gone, which `WebAuthn` deliberately does not
-/// distinguish. Anything else is a fault and travels as one, because reporting it
-/// as unsupported would downgrade custody over a bug and blame the platform.
+/// distinguish.
+///
+/// A `SecurityError` is unsupported rather than a fault, and it took running a
+/// demo to find out: `WebAuthn` refuses an origin whose host is not a registrable
+/// domain, so anything served from a bare IP address throws "this is an invalid
+/// domain" on every attempt. That is a permanent property of where the
+/// application is served, exactly like a browsing context with no `WebAuthn` at
+/// all, so it must not fail the boot. Retrying cannot help and the operator's fix
+/// is a hostname, which the custody reason is the right place to surface.
+///
+/// Anything else is a fault and travels as one, because reporting it as
+/// unsupported would downgrade custody over a bug and blame the platform.
 fn answer(worker: &Worker, outcome: Result<Option<(Vec<u8>, web_sys::CryptoKey)>, JsValue>) {
     let _ = match outcome {
         Ok(Some((cred_id, hkdf_key))) => post_key_to_worker(worker, &cred_id, &hkdf_key),
         Ok(None) => post_unsupported(worker),
         Err(err) if is_not_allowed(&err) => post_declined(worker),
+        Err(err) if error_name(&err).as_deref() == Some("SecurityError") => {
+            post_unsupported(worker)
+        }
         Err(err) => post_failed(worker, &format!("{err:?}")),
     };
 }
 
 /// Create a new credential with PRF support. Returns the raw credential id and
 /// the imported HKDF key on success, or `None` when PRF is not enabled.
-async fn create_credential(label: &str) -> Result<Option<(Vec<u8>, web_sys::CryptoKey)>, JsValue> {
+async fn create_credential() -> Result<Option<(Vec<u8>, web_sys::CryptoKey)>, JsValue> {
     let creds = window_creds()?;
 
     let challenge = random_challenge()?;
@@ -357,19 +551,27 @@ async fn create_credential(label: &str) -> Result<Option<(Vec<u8>, web_sys::Cryp
     // re-enrols, which is a stated property rather than a defect.
     let rp = web_sys::PublicKeyCredentialRpEntity::new(&origin_host());
 
-    // user.name is what a password manager shows the user later, so it carries
-    // the account they just signed in as. user.id stays a fixed literal
-    // because the gate is one device-scoped credential rather than one per
-    // identity, and platform authenticators deduplicate by rp.id plus user.id,
-    // so a second sign-in does not mint a second passkey. The bytes spell
-    // connetto/gate/v1.
+    // The user entity names the device, never a person, because this credential
+    // is one per device and unwraps every account's records: labelling it after
+    // whoever enrolled first would show one person's name standing for all of
+    // them, permanently, since WebAuthn has no rename and a second enrolment is
+    // refused. See the plan's R23 decision 10. Both strings are display only,
+    // and neither names connetto, which is a library an embedder's users should
+    // never be shown.
+    //
+    // user.id stays a fixed literal for the same reason: platform
+    // authenticators deduplicate by rp.id plus user.id, so a second sign-in does
+    // not mint a second passkey. The bytes spell connetto/gate/v1.
     let user_id_bytes: [u8; 16] = [
         0x63, 0x6f, 0x6e, 0x6e, 0x65, 0x74, 0x74, 0x6f, 0x2f, 0x67, 0x61, 0x74, 0x65, 0x2f, 0x76,
         0x31,
     ];
     let user_id_arr = Uint8Array::from(&user_id_bytes[..]);
-    let user =
-        web_sys::PublicKeyCredentialUserEntity::new_with_u8_array(label, label, &user_id_arr);
+    let user = web_sys::PublicKeyCredentialUserEntity::new_with_u8_array(
+        "this device",
+        &format!("local data on {}", origin_host()),
+        &user_id_arr,
+    );
 
     let params = pub_key_params();
     let opts = web_sys::PublicKeyCredentialCreationOptions::new_with_u8_array(
@@ -564,12 +766,28 @@ fn collect_credentials(data: &JsValue) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn is_not_allowed(err: &JsValue) -> bool {
+fn collect_accounts(data: &JsValue) -> Vec<String> {
+    let arr = Reflect::get(data, &JsValue::from_str("accounts"))
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Array>().ok());
+    let Some(arr) = arr else {
+        return Vec::new();
+    };
+    (0..arr.length())
+        .filter_map(|i| arr.get(i).as_string())
+        .collect()
+}
+
+/// The `DOMException` name a rejected ceremony carries, which is what tells a
+/// dismissal from an origin that cannot host the gate.
+fn error_name(err: &JsValue) -> Option<String> {
     Reflect::get(err, &JsValue::from_str("name"))
         .ok()
         .and_then(|v| v.as_string())
-        .as_deref()
-        == Some("NotAllowedError")
+}
+
+fn is_not_allowed(err: &JsValue) -> bool {
+    error_name(err).as_deref() == Some("NotAllowedError")
 }
 
 fn post_key_to_worker(
@@ -586,6 +804,25 @@ fn post_key_to_worker(
     )
     .unwrap_throw();
     Reflect::set(&obj, &JsValue::from_str("key"), hkdf_key.as_ref()).unwrap_throw();
+    worker.post_message(&JsValue::from(obj))
+}
+
+/// Post who to sign in as.
+///
+/// Two fields rather than one nullable account, because three answers have to be
+/// told apart and a null cannot carry the difference between "the usual one" and
+/// "somebody new".
+fn post_account(worker: &Worker, choice: &AccountChoice) -> Result<(), JsValue> {
+    let obj = Object::new();
+    set_str(&obj, "kind", "account");
+    match choice {
+        AccountChoice::Named(account) => {
+            set_str(&obj, "choice", "named");
+            set_str(&obj, "account", account);
+        }
+        AccountChoice::LastUsed => set_str(&obj, "choice", "last-used"),
+        AccountChoice::New => set_str(&obj, "choice", "new"),
+    }
     worker.post_message(&JsValue::from(obj))
 }
 
@@ -626,4 +863,74 @@ fn post_failed(worker: &Worker, detail: &str) -> Result<(), JsValue> {
     )
     .unwrap_throw();
     worker.post_message(&JsValue::from(obj))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccountChoice, chosen_account, serve_account_choice, set_pending_switch};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    /// R42: a switch names the account, and it does so exactly once.
+    ///
+    /// One test rather than three, because the registration is a thread-local with
+    /// no way back: a sibling asserting that no chooser is registered would pass or
+    /// fail on the order the binary happened to run in.
+    ///
+    /// The single-use half is what stops a switch from being sticky. Without it the
+    /// target would answer every later boot in this page's life, so a user who
+    /// switched once could never be asked again, and the chooser an application
+    /// registered would be dead code from then on.
+    #[wasm_bindgen_test]
+    async fn a_switch_target_answers_once_and_then_the_chooser_does() {
+        let offered = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&offered);
+        serve_account_choice(move |accounts: Vec<String>| {
+            let seen = Rc::clone(&seen);
+            async move {
+                seen.borrow_mut().push(accounts.len());
+                AccountChoice::Named("\"alice\"".to_owned())
+            }
+        });
+
+        set_pending_switch(AccountChoice::Named("\"bob\"".to_owned()));
+        let accounts = vec!["\"alice\"".to_owned(), "\"bob\"".to_owned()];
+        assert_eq!(
+            chosen_account(accounts.clone()).await,
+            AccountChoice::Named("\"bob\"".to_owned()),
+            "the switch target wins over the chooser"
+        );
+        assert!(
+            offered.borrow().is_empty(),
+            "and the chooser was not even consulted"
+        );
+
+        assert_eq!(
+            chosen_account(accounts.clone()).await,
+            AccountChoice::Named("\"alice\"".to_owned()),
+            "the target was consumed, so the next boot reaches the chooser"
+        );
+        assert_eq!(
+            offered.borrow().as_slice(),
+            [2],
+            "which was handed both stored accounts to choose between"
+        );
+
+        // R54: adding an account travels the same way, and it is the only choice
+        // that reaches an interactive login with credentials already stored.
+        set_pending_switch(AccountChoice::New);
+        assert_eq!(
+            chosen_account(accounts).await,
+            AccountChoice::New,
+            "adding an account overrides the chooser exactly as a switch does"
+        );
+        assert_eq!(
+            offered.borrow().as_slice(),
+            [2],
+            "and it did not consult the chooser either"
+        );
+    }
 }

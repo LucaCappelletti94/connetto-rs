@@ -151,7 +151,7 @@ pub trait Store {
 /// database in the browser. Neither needs to await, so this stays synchronous
 /// while [`ReplicaKeyStore`] does not.
 ///
-/// Every method names the account whose token it addresses. The store itself is
+/// Every accessor names the account whose token it addresses. The store itself is
 /// therefore not scoped to anybody, which is what the browser bootstrap
 /// requires: the refresh token is what reveals the account, so something has to
 /// be readable before any account is known, and a store constructed for an
@@ -180,6 +180,29 @@ pub trait RefreshTokenStore {
     ///
     /// [`Self::Error`] if the backing store cannot be cleared.
     fn clear(&self, account: &str) -> Result<(), Self::Error>;
+
+    /// Every account this store holds a token for, in unspecified order.
+    ///
+    /// This is what lets an application offer a choice of who to be. Connetto's
+    /// own reserved records are not accounts and never appear here, and no
+    /// account key can collide with one, because an account key is a serialized
+    /// id and a reserved name is not valid JSON.
+    ///
+    /// The two targets answer differently because only one of them can. The
+    /// browser reads the rows the tokens themselves live in, so its answer
+    /// cannot disagree with what is stored. `keyring` 3.6.3 exposes no
+    /// enumeration on any of its backends, so the native store maintains an
+    /// index record and answers from that, which an out-of-band keychain edit
+    /// can leave stale. A stale entry costs an interactive login, never a wrong
+    /// identity.
+    ///
+    /// Order carries no meaning, so a caller wanting the boot default reads the
+    /// last-used marker rather than taking the first entry.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] if the backing store cannot be read.
+    fn accounts(&self) -> Result<Vec<String>, Self::Error>;
 }
 
 /// Where a device caches the per-replica encryption keys it minted.

@@ -7,6 +7,8 @@
 //! The factory's offline gate makes the outage deterministic: reconnect
 //! attempts fail while the flag is set, so everything driven in between is
 //! strictly missed and must arrive through resume machinery.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -248,7 +250,6 @@ fn config(client_id: &str) -> ClientConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -349,7 +350,6 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn offline_write_reflushes_after_resume() {
     let fixture = Fixture::acquire().await;
 
@@ -470,7 +470,6 @@ async fn offline_write_reflushes_after_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let fixture = Fixture::acquire().await;
     let replica_file = tempfile::NamedTempFile::new().expect("replica file");

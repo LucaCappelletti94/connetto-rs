@@ -167,15 +167,6 @@ impl WorkerAuthConfig {
     }
 }
 
-/// The refresh-store record holding the credential this device signed in with,
-/// the one that is not addressed by an identity.
-///
-/// The refresh token is what reveals the identity, so the store has to be read
-/// before any identity is known and no derived name could address it. A derived
-/// replica name is always a prefix followed by a hash, so it can never collide
-/// with this literal, exactly as `connetto-device-key` cannot.
-pub const REFRESH_RECORD: &str = "connetto-device-refresh";
-
 /// The rotating refresh token, persisted worker-only in an OPFS-backed SQLite
 /// database so a cold start or leader failover can silently refresh. When OPFS
 /// is unavailable the same code runs against the in-memory VFS, so the session
@@ -282,6 +273,19 @@ impl RefreshTokenStore for RefreshStore {
             .map_err(|err| AuthError::Store(format!("clear: {err}")))?;
         Ok(())
     }
+
+    /// Enumerated from the rows the tokens live in, so it cannot disagree with
+    /// what is stored. No index is kept here, and none is needed.
+    fn accounts(&self) -> Result<Vec<String>, AuthError> {
+        let names = connetto_refresh::table
+            .select(connetto_refresh::account)
+            .load::<String>(&mut *self.conn.borrow_mut())
+            .map_err(|err| AuthError::Store(format!("accounts: {err}")))?;
+        Ok(names
+            .into_iter()
+            .filter(|name| !connetto_client::is_reserved_record(name))
+            .collect())
+    }
 }
 
 /// A refresh store that writes nowhere, for the one boot where there is nothing
@@ -336,6 +340,17 @@ impl RefreshTokenStore for DeferredRefreshStore {
     fn clear(&self, account: &str) -> Result<(), AuthError> {
         self.rows.borrow_mut().retain(|(name, _)| name != account);
         Ok(())
+    }
+
+    /// The pending rows, which is every account this boot has written so far.
+    fn accounts(&self) -> Result<Vec<String>, AuthError> {
+        Ok(self
+            .rows
+            .borrow()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !connetto_client::is_reserved_record(name))
+            .collect())
     }
 }
 
@@ -1087,7 +1102,13 @@ pub async fn provision_replica_key<S: ReplicaKeyStore<Error = AuthError>>(
     Ok(minted)
 }
 
-/// Write which account this device signed in as, beside its credential.
+/// Persist what a token response established: the credential under the account
+/// it belongs to, and that same account as the last-used marker.
+///
+/// Keyed off the response rather than off whatever the caller was told to try,
+/// because a first login has no account to key on and learns it here. One
+/// encoding serves both records, so the marker's value is literally the key of
+/// the row it points at.
 ///
 /// The browser mirror of the same write on `NativeAuthenticator`. Both token
 /// paths do it, because either can be the one that establishes who this device
@@ -1095,14 +1116,17 @@ pub async fn provision_replica_key<S: ReplicaKeyStore<Error = AuthError>>(
 ///
 /// # Errors
 ///
-/// [`AuthError::Store`] if the record cannot be encoded or written.
-pub fn remember_identity<Id: serde::Serialize, S: RefreshTokenStore<Error = AuthError>>(
+/// [`AuthError::Store`] if the account cannot be encoded or either record
+/// written.
+fn persist_session<Id: serde::Serialize, S: RefreshTokenStore<Error = AuthError>>(
     store: &S,
     user_id: &Id,
+    refresh_token: &str,
 ) -> Result<(), AuthError> {
-    let encoded = connetto_client::encode_identity(user_id)
+    let account = connetto_client::encode_identity(user_id)
         .map_err(|err| AuthError::Store(err.to_string()))?;
-    store.store(connetto_client::IDENTITY_RECORD, &encoded)
+    store.store(&account, refresh_token)?;
+    store.store(connetto_client::IDENTITY_RECORD, &account)
 }
 
 /// The account this device last signed in as, if it ever did.
@@ -1128,6 +1152,22 @@ pub fn remembered_identity<
     connetto_client::decode_identity(&record)
         .map(Some)
         .map_err(|err| AuthError::Store(err.to_string()))
+}
+
+/// The account key this device last signed in under, if it ever did.
+///
+/// The same record [`remembered_identity`] decodes, read raw, because a boot
+/// needs the store key rather than the typed id: it is what addresses the
+/// credential to try. Kept apart from the typed read so a boot never has to
+/// decode an id only to re-encode it.
+///
+/// # Errors
+///
+/// [`AuthError::Store`] if the record cannot be read.
+pub fn remembered_account<S: RefreshTokenStore<Error = AuthError>>(
+    store: &S,
+) -> Result<Option<String>, AuthError> {
+    store.load(connetto_client::IDENTITY_RECORD)
 }
 
 /// A fresh key from the platform RNG.
@@ -1163,24 +1203,26 @@ pub struct PendingLogin {
 
 /// Acquires and refreshes connetto's own tokens in the worker.
 ///
-/// It holds the record its credential lives under, rather than passing one at
-/// each call, so every method addresses the same record by construction and no
-/// two call sites can disagree about which credential this is.
+/// It holds the account whose stored credential it should try, rather than
+/// passing one at each call, so no two call sites can disagree about which
+/// credential this is.
 pub struct BrowserAuthenticator {
     config: WorkerAuthConfig,
-    account: String,
+    account: Option<String>,
 }
 
 impl BrowserAuthenticator {
-    /// Build over the worker auth configuration and the record naming this
-    /// credential in the refresh store. Before anybody has signed in that is
-    /// [`REFRESH_RECORD`], because the token is what reveals the account.
+    /// Build over the worker auth configuration and the account whose stored
+    /// credential to try.
+    ///
+    /// `None` means there is nothing to try, which is a first run and any boot
+    /// where no account was chosen and none was ever remembered. It is not a
+    /// placeholder for an unknown account: the token is what reveals the account,
+    /// so a run with no account skips the silent attempt entirely rather than
+    /// addressing a literal.
     #[must_use]
-    pub fn new(config: WorkerAuthConfig, account: impl Into<String>) -> Self {
-        Self {
-            config,
-            account: account.into(),
-        }
+    pub fn new(config: WorkerAuthConfig, account: Option<String>) -> Self {
+        Self { config, account }
     }
 
     /// Try a silent refresh from the stored token, on failure or absence
@@ -1199,11 +1241,12 @@ impl BrowserAuthenticator {
         &self,
         store: &S,
     ) -> Result<Acquired<Id>, AuthError> {
-        if let Some(refresh) = store.load(&self.account)? {
+        if let Some(account) = self.account.as_deref()
+            && let Some(refresh) = store.load(account)?
+        {
             match self.refresh_tokens(&refresh).await {
                 Ok(tokens) => {
-                    store.store(&self.account, &tokens.refresh_token)?;
-                    remember_identity(store, &tokens.user_id)?;
+                    persist_session(store, &tokens.user_id, &tokens.refresh_token)?;
                     return Ok(Acquired::Access(tokens.into()));
                 }
                 // A transient refresh fault must not force an interactive login:
@@ -1258,8 +1301,7 @@ impl BrowserAuthenticator {
             return Err(AuthError::StateMismatch);
         }
         let tokens = self.exchange_code(code, &pending.verifier).await?;
-        store.store(&self.account, &tokens.refresh_token)?;
-        remember_identity(store, &tokens.user_id)?;
+        persist_session(store, &tokens.user_id, &tokens.refresh_token)?;
         Ok(tokens.into())
     }
 
@@ -1291,12 +1333,18 @@ impl BrowserAuthenticator {
     /// after the local clear, or [`AuthError::Store`] if the store cannot be read
     /// or cleared.
     pub async fn logout(&self, store: &RefreshStore) -> Result<(), AuthError> {
-        let Some(refresh) = store.load(&self.account)? else {
+        // Signing out is per account: the others keep their credentials, and the
+        // marker is left pointing at an account with none, which the next boot
+        // answers with an interactive login rather than by picking somebody else.
+        let Some(account) = self.account.as_deref() else {
+            return Ok(());
+        };
+        let Some(refresh) = store.load(account)? else {
             return Ok(());
         };
         let body = serde_json::json!({ "refresh_token": refresh }).to_string();
         let revoked = post_json(&format!("{}/auth/logout", self.config.auth_base_url), &body).await;
-        store.clear(&self.account)?;
+        store.clear(account)?;
         revoked.map(drop)
     }
 

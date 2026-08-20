@@ -1,9 +1,7 @@
-//! Docker-gated async Postgres apply test.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Exercises the real-Postgres write path: `subql`'s diesel-async apply over a
 //! bb8-pooled `AsyncPgConnection`, driven by [`Materializer::apply_diffset_async`].
-//! `#[ignore]` by default because it needs a running Postgres. Point
-//! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
 // A Docker-gated test that stands up a database, drives DML and asserts several
 // properties of one round trip is legitimately long, and splitting it would
@@ -22,7 +20,7 @@ use connetto_server::{
     PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
     loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -92,10 +90,9 @@ fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn async_pg_apply_inserts_row() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     let mut conn = pool.get().await.expect("get connection");
@@ -143,10 +140,9 @@ struct Order {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn async_pg_snapshot_reads_rows() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     {
@@ -244,10 +240,9 @@ const THINGS_PG_DDL: &str = "CREATE TABLE things (id UUID PRIMARY KEY, n BIGINT)
 /// [`PgSnapshotSource`] and asserts the produced insert carries the raw 16 uuid
 /// bytes as a blob and the bigint as an integer.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn async_pg_snapshot_uuid_is_blob16() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     let id = uuid::Uuid::from_bytes([
@@ -324,10 +319,9 @@ impl SnapshotSource for NoSnapshot {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn async_pg_reexec_bootstraps_min() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     {
@@ -424,10 +418,9 @@ struct TypeNameRow {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn pg_oplog_appends_and_reads_back() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
@@ -561,13 +554,12 @@ async fn pg_oplog_appends_and_reads_back() {
 /// single-column key, and until this one the stored key was written, read back,
 /// and never compared to anything.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn pg_oplog_round_trips_a_composite_key() {
     const PAIRS_DDL: &str = "CREATE TABLE pairs (tenant TEXT NOT NULL, id INT NOT NULL, note TEXT, \
          PRIMARY KEY (tenant, id));";
 
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     {
@@ -646,15 +638,14 @@ async fn bootstrap_agg<T: Transport>(client: &mut T, sub_id: &str, query: &str) 
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn async_pg_delta_aggregate_bootstraps_family() {
     // The delta aggregate family seeds through the real connector's
     // multi-column `execute_scalar_row`, which the SQLite-emulator tests cannot
     // exercise. It pins the Postgres decode: `SUM` over a `BIGINT` column comes
     // back as `NUMERIC` and must decode to a double, and the two- and
     // three-column seeds (`AVG`, `VAR_POP`) must line up with the accumulator.
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     {
@@ -766,10 +757,9 @@ struct TranslatedRow {
 /// [`PgSnapshotSource`] with the bind attached. The registration's
 /// translation is the snapshot's input, never the client dialect.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder().build(manager).await.expect("build pool");
     {

@@ -230,7 +230,6 @@ async fn subscribe<T: Transport>(client: &mut T) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn catchup_within_window_streams_missed_ops() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -344,7 +343,6 @@ async fn catchup_within_window_streams_missed_ops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn cursor_outside_window_forces_full_resync() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -419,7 +417,6 @@ async fn cursor_outside_window_forces_full_resync() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn tombstone_replays_the_delete() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");

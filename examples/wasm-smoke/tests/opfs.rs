@@ -8,9 +8,6 @@
 //! the pump, and a second connection to the same OPFS file proves the write
 //! persisted and still decrypts.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test opfs`
 
 #![cfg(target_arch = "wasm32")]
 

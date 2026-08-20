@@ -1,10 +1,9 @@
-//! Phase 2 authentication authority acceptance tests (Docker-free).
+//! Phase 2 authentication authority acceptance tests.
 //!
 //! These exercise the whole in-memory path: minting and verifying connetto's
 //! own access token, the rotating refresh token with reuse detection, the
 //! handshake liveness check that makes revocation authoritative, and the login
-//! and refresh HTTP endpoints. A login-minted token is proven to open a real
-//! handshake and then to be refused once its session is revoked.
+//! and refresh HTTP endpoints backed by a containerised OIDC provider.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -17,12 +16,13 @@ use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Tra
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
     AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, Materializer,
-    OidcProviderConfig, ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
+    ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity, SessionConfig,
+    SessionManager, Snapshot, SnapshotSource, TokenAuthority, auth_router, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
-use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use connetto_test_harness::{
+    ConnettoWatermark, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
+};
 use openidconnect::reqwest;
 use serde_json::json;
 use tower::ServiceExt;
@@ -102,7 +102,6 @@ fn manager_with(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let fixture = Fixture::acquire().await;
     let (authority, svc) = service();
@@ -213,12 +212,11 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
 /// R2: revoking a session closes its live connection rather than only refusing
 /// the next handshake, and it does so through the real logout path.
 ///
-/// The deployment wires `AuthService`'s revocation observer at the manager,
-/// exactly as the server binary does, so a logout reaches the connection
-/// registry. Without the hook a revoked caller keeps streaming until it
-/// happens to reconnect, which is the gap this closes.
+/// The server binary wires `AuthService`'s revocation observer at the manager,
+/// so a logout reaches the connection registry. Without the hook a revoked
+/// caller keeps streaming until it happens to reconnect, which is the gap this
+/// closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn logout_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
     let (_authority, svc) = service();
@@ -283,7 +281,6 @@ async fn logout_closes_the_live_connection_it_revoked() {
 /// revocation observer and the caller kept streaming until it chose to
 /// reconnect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn token_reuse_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
     let (_authority, svc) = service();
@@ -472,30 +469,12 @@ async fn get_request(router: &axum::Router, uri: &str) -> axum::http::Response<B
     router.clone().oneshot(request).await.expect("route")
 }
 
-/// Start a real OIDC provider with `subject` as the user id and return an Arc'd
-/// registry containing the discovered "mock-idp" provider. Keep the returned
-/// [`OAuthTestServer`] alive for the test's duration or the provider socket dies.
-async fn oidc_registry(subject: &str) -> (OAuthTestServer, Arc<ProviderRegistry>) {
+/// Start a real OIDC provider and return an Arc'd registry containing it.
+async fn oidc_registry() -> (MockOauth, Arc<ProviderRegistry>) {
     const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
-    let idp = OAuthTestServer::start_with_config(IssuerConfig {
-        host: "127.0.0.1".into(),
-        port: 0,
-        default_user_id: subject.into(),
-        ..IssuerConfig::default()
-    })
-    .await;
-    let issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
-    let client = idp
-        .register_client(json!({
-            "redirect_uris": [CALLBACK],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "scope": "openid",
-        }))
-        .await;
+    let idp = MockOauth::start().await;
     let provider = GenericOidcProvider::discover(
-        OidcProviderConfig::new("mock-idp", client.client_id.clone(), issuer, CALLBACK)
-            .with_client_secret(client.client_secret.clone()),
+        idp.oidc_config(MOCK_OAUTH_PROVIDER, CALLBACK),
         reqwest::Client::new(),
     )
     .await
@@ -505,18 +484,18 @@ async fn oidc_registry(subject: &str) -> (OAuthTestServer, Arc<ProviderRegistry>
     (idp, Arc::new(registry))
 }
 
-/// GET the IDP's authorize URL with redirect following disabled and return the
-/// `code` and `state` query values from the resulting redirect location.
-async fn authorize_hop(authorize_url: &str) -> (String, String) {
+/// POST the username to the provider and read the redirected `code` and `state`.
+async fn authorize_hop(authorize_url: &str, subject: &str) -> (String, String) {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build http client");
     let resp = client
-        .get(authorize_url)
+        .post(authorize_url)
+        .form(&[("username", subject)])
         .send()
         .await
-        .expect("GET authorize");
+        .expect("POST authorize");
     let location = resp
         .headers()
         .get("location")
@@ -532,11 +511,15 @@ async fn authorize_hop(authorize_url: &str) -> (String, String) {
 #[tokio::test]
 async fn http_oauth_flow_then_refresh_roundtrip() {
     let (_authority, svc) = service();
-    let (_idp, registry) = oidc_registry("erin").await;
+    let (_idp, registry) = oidc_registry().await;
     let router = auth_router(svc, registry, RedirectPolicy::default());
 
     // Start: a redirect whose Location is the IDP authorize URL.
-    let start = get_request(&router, "/auth/login?provider=mock-idp").await;
+    let start = get_request(
+        &router,
+        &format!("/auth/login?provider={MOCK_OAUTH_PROVIDER}"),
+    )
+    .await;
     assert_eq!(start.status(), StatusCode::TEMPORARY_REDIRECT);
     let idp_authorize_url = start
         .headers()
@@ -547,8 +530,8 @@ async fn http_oauth_flow_then_refresh_roundtrip() {
         .to_owned();
     let state = query_value(&idp_authorize_url, "state");
 
-    // Authorize hop: GET the IDP's authorize URL to obtain the real code.
-    let (code, _) = authorize_hop(&idp_authorize_url).await;
+    // Authorize hop: POST the username to obtain the real code.
+    let (code, _) = authorize_hop(&idp_authorize_url, "erin").await;
 
     // Callback: connetto exchanges the real code with the provider and mints its
     // own tokens. No provider token reaches the response.
@@ -651,19 +634,18 @@ async fn location_of(router: &axum::Router, uri: &str) -> String {
         .to_owned()
 }
 
-/// Drive the loopback halves (start then callback) and return the one-time
-/// connetto code delivered to the client redirect.
-async fn loopback_code(router: &axum::Router) -> String {
+/// Drive the loopback halves and return the one-time connetto code.
+async fn loopback_code(router: &axum::Router, subject: &str) -> String {
     let idp_authorize_url = location_of(
         router,
         &format!(
-            "/auth/login?provider=mock-idp&redirect_uri=http://127.0.0.1:9999/cb\
+            "/auth/login?provider={MOCK_OAUTH_PROVIDER}&redirect_uri=http://127.0.0.1:9999/cb\
              &code_challenge={PKCE_CHALLENGE}&state=client-state-xyz"
         ),
     )
     .await;
     let connetto_state = query_value(&idp_authorize_url, "state");
-    let (code, _) = authorize_hop(&idp_authorize_url).await;
+    let (code, _) = authorize_hop(&idp_authorize_url, subject).await;
     let client_redirect = location_of(
         router,
         &format!("/auth/callback?code={code}&state={connetto_state}"),
@@ -677,10 +659,10 @@ async fn loopback_code(router: &axum::Router) -> String {
 #[tokio::test]
 async fn loopback_code_exchange_with_pkce() {
     let (_authority, svc) = service();
-    let (_idp, registry) = oidc_registry("frank").await;
+    let (_idp, registry) = oidc_registry().await;
     let router = auth_router(svc, registry, RedirectPolicy::default());
 
-    let code = loopback_code(&router).await;
+    let code = loopback_code(&router, "frank").await;
     let (status, body) = post_json(
         router.clone(),
         "/auth/token",
@@ -715,7 +697,7 @@ async fn loopback_code_exchange_with_pkce() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "code cannot be reused");
 
     // A fresh code with the wrong PKCE verifier is refused.
-    let fresh = loopback_code(&router).await;
+    let fresh = loopback_code(&router, "frank").await;
     let (status, _) = post_json(
         router,
         "/auth/token",
@@ -728,13 +710,13 @@ async fn loopback_code_exchange_with_pkce() {
 #[tokio::test]
 async fn redirect_policy_gates_the_client_redirect() {
     let (_authority, svc) = service();
-    let (_idp, registry) = oidc_registry("grace").await;
+    let (_idp, registry) = oidc_registry().await;
     let router = auth_router(svc, registry, RedirectPolicy::default());
 
     // A non-loopback redirect with no allowlist entry is refused before any mint.
     let resp = get_request(
         &router,
-        "/auth/login?provider=mock-idp&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge=abc&state=s",
+        &format!("/auth/login?provider={MOCK_OAUTH_PROVIDER}&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge=abc&state=s"),
     )
     .await;
     assert_eq!(
@@ -746,7 +728,7 @@ async fn redirect_policy_gates_the_client_redirect() {
     // A loopback redirect is accepted: a temporary redirect to the provider.
     let resp = get_request(
         &router,
-        "/auth/login?provider=mock-idp&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback&code_challenge=abc&state=s",
+        &format!("/auth/login?provider={MOCK_OAUTH_PROVIDER}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback&code_challenge=abc&state=s"),
     )
     .await;
     assert_eq!(
@@ -758,7 +740,7 @@ async fn redirect_policy_gates_the_client_redirect() {
     // A redirect without its PKCE challenge is refused as a partial pair.
     let resp = get_request(
         &router,
-        "/auth/login?provider=mock-idp&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback",
+        &format!("/auth/login?provider={MOCK_OAUTH_PROVIDER}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9000%2Fcallback"),
     )
     .await;
     assert_eq!(
@@ -771,13 +753,13 @@ async fn redirect_policy_gates_the_client_redirect() {
 #[tokio::test]
 async fn redirect_policy_admits_an_allowlisted_https_callback() {
     let (_authority, svc) = service();
-    let (_idp, registry) = oidc_registry("heidi").await;
+    let (_idp, registry) = oidc_registry().await;
     let policy = RedirectPolicy::new(vec!["https://app.example/cb".to_owned()]);
     let router = auth_router(svc, registry, policy);
 
     let resp = get_request(
         &router,
-        "/auth/login?provider=mock-idp&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&code_challenge=abc&state=s",
+        &format!("/auth/login?provider={MOCK_OAUTH_PROVIDER}&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&code_challenge=abc&state=s"),
     )
     .await;
     assert_eq!(

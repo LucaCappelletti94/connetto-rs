@@ -26,61 +26,61 @@ sqlite-wasm-vfs = "0.2"
 sqlite-wasm-rs = { version = "0.5", default-features = false }
 thiserror = "2"
 web-sys = { version = "0.3", features = [
-    "AuthenticationExtensionsClientInputs",
-    "AuthenticationExtensionsClientOutputs",
-    "AuthenticationExtensionsPrfInputs",
-    "AuthenticationExtensionsPrfOutputs",
-    "AuthenticationExtensionsPrfValues",
-    "AuthenticatorAssertionResponse",
-    "AuthenticatorAttestationResponse",
-    "AuthenticatorResponse",
-    "AuthenticatorSelectionCriteria",
-    "BinaryType",
-    "Blob",
-    "BlobPropertyBag",
-    "BroadcastChannel",
-    "CloseEvent",
-    "Credential",
-    "CredentialCreationOptions",
-    "CredentialRequestOptions",
-    "CredentialsContainer",
-    "Crypto",
-    "CryptoKey",
-    "DedicatedWorkerGlobalScope",
-    "Event",
-    "ErrorEvent",
-    "Headers",
-    "Location",
-    "Lock",
-    "LockManager",
-    "LockOptions",
-    "MessageChannel",
-    "MessageEvent",
-    "MessagePort",
-    "Navigator",
-    "PublicKeyCredential",
-    "PublicKeyCredentialCreationOptions",
-    "PublicKeyCredentialDescriptor",
-    "PublicKeyCredentialParameters",
-    "PublicKeyCredentialRequestOptions",
-    "PublicKeyCredentialRpEntity",
-    "PublicKeyCredentialType",
-    "PublicKeyCredentialUserEntity",
-    "Request",
-    "RequestInit",
-    "ResidentKeyRequirement",
-    "Response",
-    "SubtleCrypto",
-    "Url",
-    "UserVerificationRequirement",
-    "WebSocket",
-    "Window",
-    "Worker",
-    "WorkerGlobalScope",
-    "WorkerNavigator",
-    "WorkerOptions",
-    "WorkerType",
-    "console",
+  "AuthenticationExtensionsClientInputs",
+  "AuthenticationExtensionsClientOutputs",
+  "AuthenticationExtensionsPrfInputs",
+  "AuthenticationExtensionsPrfOutputs",
+  "AuthenticationExtensionsPrfValues",
+  "AuthenticatorAssertionResponse",
+  "AuthenticatorAttestationResponse",
+  "AuthenticatorResponse",
+  "AuthenticatorSelectionCriteria",
+  "BinaryType",
+  "Blob",
+  "BlobPropertyBag",
+  "BroadcastChannel",
+  "CloseEvent",
+  "Credential",
+  "CredentialCreationOptions",
+  "CredentialRequestOptions",
+  "CredentialsContainer",
+  "Crypto",
+  "CryptoKey",
+  "DedicatedWorkerGlobalScope",
+  "Event",
+  "ErrorEvent",
+  "Headers",
+  "Location",
+  "Lock",
+  "LockManager",
+  "LockOptions",
+  "MessageChannel",
+  "MessageEvent",
+  "MessagePort",
+  "Navigator",
+  "PublicKeyCredential",
+  "PublicKeyCredentialCreationOptions",
+  "PublicKeyCredentialDescriptor",
+  "PublicKeyCredentialParameters",
+  "PublicKeyCredentialRequestOptions",
+  "PublicKeyCredentialRpEntity",
+  "PublicKeyCredentialType",
+  "PublicKeyCredentialUserEntity",
+  "Request",
+  "RequestInit",
+  "ResidentKeyRequirement",
+  "Response",
+  "SubtleCrypto",
+  "Url",
+  "UserVerificationRequirement",
+  "WebSocket",
+  "Window",
+  "Worker",
+  "WorkerGlobalScope",
+  "WorkerNavigator",
+  "WorkerOptions",
+  "WorkerType",
+  "console",
 ] }
 # The relay builds generic snapshots with a throwaway capture session
 # (Session::diff against an attached blank schema twin) and applies forwarded
@@ -93,7 +93,10 @@ sqlite-diff-rs = { version = "0.9.0", default-features = false }
 zstd = "0.13"
 # tokio::select! races the hub's channels against the upstream pump, and the
 # tokio mpsc channels carry frames between the hub core and its tab shovels.
-tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
+tokio = { version = "1", default-features = false, features = [
+  "macros",
+  "sync",
+] }
 # Browser OAuth acquisition (docs/architecture/11-authentication.md phase 5):
 # the worker mints PKCE with getrandom plus sha2 and base64, posts to
 # connetto-server's token and refresh endpoints through web-sys fetch, and
@@ -118,8 +121,14 @@ zeroize = { version = "1", default-features = false }
 # Structured logging (R12): every module emits through `tracing`, and
 # `logging::init_console` installs the developer-console destination that a
 # browser program needs because it has no stdout.
-tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tracing = { version = "0.1", default-features = false, features = [
+  "std",
+  "attributes",
+] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "std",
+] }
 
 # Per-tab durable write counter: the tab's SQLite watermark table keys on a
 # UUID blob column, mirroring the server's session_id UUID primary key.
@@ -166,6 +175,7 @@ unused_import_braces = "forbid"
 unused_must_use = "forbid"
 unsafe_code = "forbid"
 deprecated = "deny"
+unknown_lints = "allow"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "forbid"

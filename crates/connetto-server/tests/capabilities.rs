@@ -16,9 +16,7 @@
 //! subject in one and forgetting the other would show a shared row once and
 //! then never update it.
 //!
-//! `#[ignore]` on everything needing Postgres. Point `DATABASE_URL` at one and
-//! run with `--ignored`. A superuser bypasses RLS entirely, so the checks run
-//! as `app_reader` and privileged setup runs as the admin role.
+//! Needs Docker: the fixture starts its own Postgres.
 
 #![allow(clippy::too_many_lines)]
 
@@ -32,10 +30,9 @@ use connetto_server::{
     AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
     RowSource, ShareError, ShareLevel, SnapshotSource, SourceRow, TokenAuthority,
 };
-use connetto_test_harness::{RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID, pool_for, with_user};
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl as AsyncRunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -70,23 +67,6 @@ const SHARED_KEY: &str = "key:shared-with-me";
 /// A key the fixture grants nothing to.
 const IDLE_KEY: &str = "key:grants-nothing";
 
-fn admin_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
-
-/// Rewrite a Postgres URL's user info, keeping host, port, and database.
-fn with_user(url: &str, user: &str, password: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    format!("{scheme}://{user}:{password}@{host}")
-}
-
-async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
-    Pool::builder().build(manager).await.expect("build pool")
-}
-
 /// Create the tables, the rows, the policies and the reader role, then hand
 /// back a pool connected as a role that RLS actually applies to.
 ///
@@ -94,8 +74,8 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 /// is granted. `paper_shares` needs its own read policy or the `EXISTS` above
 /// finds nothing, and its insert policy is what closes the gap between the
 /// resource connetto checked and the row the application writes.
-async fn setup() -> Pool<AsyncPgConnection> {
-    let admin = pool_for(&admin_url()).await;
+async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    let admin = fixture.admin();
     let mut conn = admin.get().await.expect("admin connection");
     let statements = [
         "DROP TABLE IF EXISTS papers, paper_shares CASCADE",
@@ -129,7 +109,7 @@ async fn setup() -> Pool<AsyncPgConnection> {
     }
     grant(&mut conn, 2, SHARED_KEY).await;
     drop(conn);
-    pool_for(&with_user(&admin_url(), "app_reader", "app_reader")).await
+    pool_for(&with_user(fixture.admin_url(), "app_reader", "app_reader")).await
 }
 
 /// Write one permission row as the admin, which is how the application would,
@@ -222,9 +202,9 @@ async fn visible_in_snapshot(source: &PgSnapshotSource, caller: &Principal) -> V
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_capability_grants_exactly_its_relations_and_nothing_else() {
-    let reader = setup().await;
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture).await;
     let auth = RlsAuth::from_ddl(reader.clone(), CATALOG_DDL).expect("build RlsAuth");
     let source = PgSnapshotSource::from_ddl(reader, CATALOG_DDL).expect("build snapshot source");
 
@@ -257,9 +237,9 @@ async fn a_capability_grants_exactly_its_relations_and_nothing_else() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_signed_in_caller_holding_a_key_sees_exactly_the_union() {
-    let reader = setup().await;
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture).await;
     let auth = RlsAuth::from_ddl(reader.clone(), CATALOG_DDL).expect("build RlsAuth");
     let source = PgSnapshotSource::from_ddl(reader, CATALOG_DDL).expect("build snapshot source");
 
@@ -281,15 +261,15 @@ async fn a_signed_in_caller_holding_a_key_sees_exactly_the_union() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn deleting_the_relation_removes_the_access() {
-    let reader = setup().await;
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture).await;
     let auth = RlsAuth::from_ddl(reader.clone(), CATALOG_DDL).expect("build RlsAuth");
     let source = PgSnapshotSource::from_ddl(reader.clone(), CATALOG_DDL).expect("build source");
     let bearer = caller(None, &[SHARED_KEY]);
     assert_eq!(visible_on_change_path(&auth, &bearer).await, vec![2]);
 
-    let admin = pool_for(&admin_url()).await;
+    let admin = fixture.admin();
     let mut conn = admin.get().await.expect("admin connection");
     AsyncRunQueryDsl::execute(
         sql_query(format!(
@@ -314,9 +294,9 @@ async fn deleting_the_relation_removes_the_access() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
-    let reader = setup().await;
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture).await;
     let auth = Arc::new(RlsAuth::from_ddl(reader.clone(), CATALOG_DDL).expect("build RlsAuth"));
     let rows =
         Arc::new(PgSnapshotSource::from_ddl(reader, CATALOG_DDL).expect("build snapshot source"));
@@ -420,13 +400,13 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_grant_row_itself_is_refused_when_the_sharer_cannot_read_the_paper() {
     // Connetto checks the resource the caller names and hands back a key, and
     // the application then writes the permission row. Nothing in connetto sees
     // that insert, so what stops it naming a different paper is the policy on
     // the sharing table, which is the same policy source as everything else.
-    let reader = setup().await;
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture).await;
     let mut conn = reader.get().await.expect("reader connection");
     AsyncRunQueryDsl::execute(
         sql_query("SELECT set_config('app.user_id', 'bob', false)"),

@@ -9,9 +9,6 @@
 //! sibling tab, releasing a tab's liveness lock gets it reaped without
 //! disturbing the survivor, and the survivor keeps receiving patches afterward.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test topology`
 
 #![cfg(target_arch = "wasm32")]
 
@@ -241,7 +238,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     // This page wins the leader election and owns the DB worker. A
     // multi-page app races the same leader lock, and the winner runs this.
     let membership = leader::join(&format!("connetto-leader-{base}"), &glue_url());
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
     stage("db worker ready");
 
     // Tab A holds its liveness lock BEFORE connecting, the protocol the

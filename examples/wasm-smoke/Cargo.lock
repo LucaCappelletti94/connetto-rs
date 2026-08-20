@@ -321,6 +321,7 @@ dependencies = [
  "connetto-web",
  "diesel",
  "futures-channel",
+ "indexed_db_futures",
  "js-sys",
  "libsqlite3-sys",
  "pg2sqlite",

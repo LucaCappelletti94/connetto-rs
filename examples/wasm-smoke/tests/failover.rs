@@ -8,9 +8,6 @@
 //! so the tab's transport watches the lock the worker holds for its whole
 //! life and injects a clean close when the browser releases it.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test failover`
 
 #![cfg(target_arch = "wasm32")]
 
@@ -197,7 +194,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let leader_lock = locks::hold_lock(&format!("connetto-leader-{base}")).await;
     let glue = glue_url();
     let worker_one = spawn_db_worker(&glue).expect("spawn worker one");
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
     stage("worker one ready");
 
     // The tab client reconnects through the factory: fresh wire channel per
@@ -281,7 +278,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     assert!(reconnecting >= 1, "at least one announced attempt");
     assert_eq!(reconnected, 1, "exactly one successful resume");
 
-    drop(worker_two);
+    worker_two.terminate();
     tab_lock.release();
     leader_lock.release();
 }

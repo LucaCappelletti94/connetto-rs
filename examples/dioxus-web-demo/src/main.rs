@@ -23,21 +23,29 @@
 //! Run: start the dev IdP (`cargo run --release -p connetto-server --example
 //! dev_idp`) with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set, source
 //! `target/dev-idp.env`, start the server with `CONNETTO_AUTH`,
-//! `CONNETTO_AUTH_BIND`, the `CONNETTO_OIDC_*` vars, `CONNETTO_READER_URL`,
-//! `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
+//! `CONNETTO_AUTH_BIND`, the OIDC provider vars from `target/dev-idp.env`,
+//! `CONNETTO_READER_URL`, `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
 //! `CONNETTO_PG_DDL_FILE`, then `dx serve --port 9912` from this directory.
 
 use std::rc::Rc;
-use std::{cell::RefCell, time::Duration};
+use std::{
+    cell::RefCell,
+    time::{Duration, SystemTime},
+};
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, PolicyTables, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Custody, NoGate, PolicyTables,
+    Replica,
+    teardown::{ExpiryWarning, expiry_warning},
 };
+use connetto_core::messages::FatalErrorReason;
 use connetto_dioxus::use_live;
 use connetto_web::{
     MessageTransport,
     auth::{LogoutOutcome, WorkerAuthConfig, deliver_login_code, request_logout, request_unsynced},
-    leader, locks, workers,
+    leader, locks,
+    unlock::{AccountChoice, serve_account_choice},
+    workers,
 };
 use diesel::prelude::*;
 use dioxus::prelude::*;
@@ -86,6 +94,8 @@ const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 const AUTH_PROVIDER: &str = "dev-idp";
 /// Path the dev IdP redirects back to after login.
 const AUTH_CALLBACK_PATH: &str = "/auth/callback";
+/// Channel the page uses to respond to the worker's provider query at each boot.
+const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
 
 diesel::table! {
     orders (id) {
@@ -282,14 +292,50 @@ fn main() {
     dioxus::launch(App);
 }
 
+/// Worker context: ask the page which OIDC provider to use for this boot.
+///
+/// The page responds with the user's last choice within a few milliseconds.
+/// Falls back to [`AUTH_PROVIDER`] after 200 ms so a page that never answers
+/// does not stall the boot indefinitely.
+async fn worker_provider() -> String {
+    let Ok(ch) = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL) else {
+        return AUTH_PROVIDER.to_owned();
+    };
+    let received: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let received_clone = Rc::clone(&received);
+    let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        if let Some(text) = e.data().as_string()
+            && text != "provider?"
+        {
+            *received_clone.borrow_mut() = Some(text);
+        }
+    });
+    ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+    let _ = ch.post_message(&JsValue::from_str("provider?"));
+    for _ in 0..8 {
+        workers::sleep(core::time::Duration::from_millis(25)).await;
+        if received.borrow().is_some() {
+            break;
+        }
+    }
+    ch.set_onmessage(None);
+    ch.close();
+    drop(on_msg);
+    received
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| AUTH_PROVIDER.to_owned())
+}
+
 /// Boot the connetto DB tier in the worker context.
 ///
 /// Calls [`workers::boot_db_worker`] with the auth config built from the
 /// worker's own origin. Once the session is acquired, `boot_db_worker` returns
-/// the resolved `user_id` which is broadcast on [`DEMO_UID_CHANNEL`] so the
-/// page can display which account owns the replica. The broadcast happens after
-/// `boot_db_worker` returns, so the identity arrives after the worker has posted
-/// "ready" and the Dashboard is already visible.
+/// the identity, account key, and session deadline, which are all broadcast on
+/// [`DEMO_UID_CHANNEL`] so the page can display which account is live, filter
+/// switch-account buttons, and warn before an offline session lapses. The
+/// broadcast happens after `boot_db_worker` returns, so it arrives after the
+/// worker has posted "ready" and the Dashboard is already visible.
 ///
 /// # Errors
 ///
@@ -300,7 +346,7 @@ async fn run_db_worker() -> Result<(), JsValue> {
     let auth = Some(
         WorkerAuthConfig::new(
             origin.clone(),
-            AUTH_PROVIDER,
+            worker_provider().await,
             format!("{origin}{AUTH_CALLBACK_PATH}"),
         )
         // The login is a navigation, which the dev server's proxy does not
@@ -308,7 +354,7 @@ async fn run_db_worker() -> Result<(), JsValue> {
         // no CORS either way.
         .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
     );
-    let user_id = workers::boot_db_worker::<String>(
+    let booted = workers::boot_db_worker::<String>(
         &workers::DbWorkerConfig::new(connetto_core::SchemaVersion::from_source(SCHEMA_SQL))
             .with_ws_url(DEMO_WS_URL)
             .with_replica_db_prefix(DB_NAME)
@@ -323,12 +369,38 @@ async fn run_db_worker() -> Result<(), JsValue> {
                 POLICY_VIEWS.iter().copied(),
             ))
             .with_auth(auth)
-            .with_auth_db_name(AUTH_DB_NAME),
+            .with_auth_db_name(AUTH_DB_NAME)
+            // Gate the replica with a passkey. leader::join installs serve_unlock,
+            // so the tab handler is in place before the worker can ask.
+            .with_unlock(true)
+            // Ask the tab which account to sign in as when more than one is stored.
+            .with_pick_account(true),
     )
     .await?;
-    // Post the identity so the page can show which account owns the replica.
-    if let (Some(uid), Ok(ch)) = (user_id, BroadcastChannel::new(DEMO_UID_CHANNEL)) {
-        let _ = ch.post_message(&JsValue::from_str(&uid));
+    // Post all three session fields in one JS object so the page can show the
+    // live account, warn before expiry, and populate switch-account buttons.
+    if let Ok(ch) = BroadcastChannel::new(DEMO_UID_CHANNEL) {
+        let obj = js_sys::Object::new();
+        if let Some(uid) = &booted.identity {
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("uid"), &JsValue::from_str(uid));
+        }
+        if let Some(acc) = &booted.account {
+            let _ =
+                js_sys::Reflect::set(&obj, &JsValue::from_str("account"), &JsValue::from_str(acc));
+        }
+        if let Some(secs) = booted.session_expires_at {
+            // Unix seconds fit in f64 exactly: 2^53 (~9e15) >> any plausible session deadline.
+            debug_assert!(
+                secs <= (1u64 << 53),
+                "session_expires_at exceeds f64 exact range"
+            );
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("session_expires_at"),
+                &JsValue::from_f64(secs as f64),
+            );
+        }
+        let _ = ch.post_message(&obj);
         ch.close();
     }
     Ok(())
@@ -355,7 +427,9 @@ fn glue_url() -> String {
 /// liveness lock (dropped on unmount, so the worker reaps this tab).
 struct Boot {
     client: ConnettoClient<Tab>,
-    _membership: leader::Membership,
+    /// Shared rather than owned, because the gate ceremony is awaited and the
+    /// handle has to outlive the borrow that reaches it.
+    membership: Rc<leader::Membership>,
     _tab_lock: locks::HeldLock,
 }
 
@@ -414,7 +488,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
     spawn_local(pump);
     Ok(Boot {
         client,
-        _membership: membership,
+        membership: Rc::new(membership),
         _tab_lock: tab_lock,
     })
 }
@@ -442,6 +516,19 @@ fn status_label(event: &ClientEvent) -> Option<String> {
                     row.row_json
                 )
             },
+        )),
+        // The reconnect policy uses a fixed backoff and never reads retry_after_ms,
+        // so this value is informational only.
+        ClientEvent::RateLimited {
+            related_to: _,
+            retry_after_ms,
+        } => Some(format!(
+            "rate-limited by server: retry after {retry_after_ms} ms"
+        )),
+        ClientEvent::ServerClosed {
+            reason: FatalErrorReason::RateLimited { retry_after_ms },
+        } => Some(format!(
+            "connection closed: server rate-limited this client (retry after {retry_after_ms} ms)"
         )),
         ClientEvent::ServerClosed { reason } => {
             Some(format!("server closed the session: {reason:?}"))
@@ -475,6 +562,8 @@ const CSS: &str = r"
     .logout-confirm { background: #fff8e1; border: 1px solid #f0c040;
                       border-radius: 6px; padding: 8px 12px; }
     .logout-confirm p { margin: 0 0 6px; }
+    .warn { color: #8c4400; font-weight: bold; background: #fff8e1;
+            border: 1px solid #f0c040; border-radius: 4px; padding: 4px 8px; margin: 4px 0; }
 ";
 
 /// The pending login URL, wrapped so the context lookup does not collide with the
@@ -482,6 +571,33 @@ const CSS: &str = r"
 #[derive(Clone, Copy)]
 struct LoginPrompt(Signal<Option<String>>);
 
+/// Holds the Boot value so child components can borrow the Membership.
+#[derive(Clone)]
+struct BootHold(Rc<RefCell<Option<Boot>>>);
+
+/// The credential-store key of the account currently signed in on this device.
+#[derive(Clone, Copy)]
+struct LiveAccount(Signal<Option<String>>);
+
+/// Unix-second deadline after which the session lapses if never refreshed.
+#[derive(Clone, Copy)]
+struct SessionExpiresAt(Signal<Option<u64>>);
+
+/// Passkey-gate custody level, fetched once after the worker reports ready.
+#[derive(Clone, Copy)]
+struct CustodyLevel(Signal<Option<Custody>>);
+
+/// All stored account keys, filled by the first account-chooser invocation.
+#[derive(Clone, Copy)]
+struct AllAccounts(Signal<Vec<String>>);
+
+/// Whether the account-chooser dialog is waiting for a user click.
+#[derive(Clone, Copy)]
+struct PickerActive(Signal<bool>);
+
+/// The account the user chose in the picker; set by button click, consumed by the chooser.
+#[derive(Clone, Copy)]
+struct AccountAnswer(Signal<Option<AccountChoice>>);
 // Dioxus components are PascalCase by convention; the `rsx!` call sites name
 // them as elements, so keep the component name and silence the lint.
 #[allow(non_snake_case)]
@@ -500,24 +616,98 @@ fn App() -> Element {
     // The login URL the worker is waiting on. A popup can only be opened from a
     // real click, so the URL is parked here and a button offers it.
     let login_prompt: Signal<Option<String>> = use_signal(|| None);
+    // Multi-account, custody, and session-expiry state broadcast from the worker.
+    let mut live_account: Signal<Option<String>> = use_signal(|| None);
+    let mut session_expires_at: Signal<Option<u64>> = use_signal(|| None);
+    let mut custody_level: Signal<Option<Custody>> = use_signal(|| None);
+    let mut all_accounts: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut picker_active: Signal<bool> = use_signal(|| false);
+    let mut account_answer: Signal<Option<AccountChoice>> = use_signal(|| None);
 
     use_context_provider(|| client_slot);
     use_context_provider(|| status);
     use_context_provider(|| user_id);
     use_context_provider(|| LoginPrompt(login_prompt));
+    use_context_provider(|| LiveAccount(live_account));
+    use_context_provider(|| SessionExpiresAt(session_expires_at));
+    use_context_provider(|| CustodyLevel(custody_level));
+    use_context_provider(|| AllAccounts(all_accounts));
+    use_context_provider(|| PickerActive(picker_active));
+    use_context_provider(|| AccountAnswer(account_answer));
 
-    // Listen for the user id the worker broadcasts after boot_db_worker returns.
-    // The broadcast arrives AFTER the worker posts "ready", so the Dashboard is
-    // already visible when this fires and the banner updates reactively from
-    // "authenticating..." to the actual account name. Wrapped in Rc<RefCell<_>>
-    // because Closure<dyn FnMut> is not Clone, but use_hook requires Clone.
+    // Register the account chooser before the worker boots. For a single stored
+    // credential the chooser returns immediately without blocking the UI. For
+    // multiple it parks the list in a signal and polls for a button click.
+    use_hook(|| {
+        serve_account_choice(move |accounts| async move {
+            if accounts.len() <= 1 {
+                all_accounts.set(accounts);
+                return AccountChoice::LastUsed;
+            }
+            all_accounts.set(accounts);
+            picker_active.set(true);
+            loop {
+                let maybe_choice: Option<AccountChoice> = account_answer.read().clone();
+                if let Some(choice) = maybe_choice {
+                    picker_active.set(false);
+                    account_answer.set(None);
+                    return choice;
+                }
+                workers::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    });
+
+    // Respond to the worker's provider query. The worker sends "provider?" on
+    // DEMO_PROVIDER_CHANNEL at each boot, and this page always replies with the
+    // one provider the dev stack registers.
+    let _provider_listener = use_hook(move || {
+        Rc::new(RefCell::new({
+            let ch = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL).expect("provider channel");
+            let resp = ch.clone();
+            let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                if e.data().as_string().as_deref() == Some("provider?") {
+                    let _ = resp.post_message(&JsValue::from_str(AUTH_PROVIDER));
+                }
+            });
+            ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+            (ch, on_msg)
+        }))
+    });
+
+    // Listen for the session fields the worker broadcasts after boot_db_worker
+    // returns. uid, account key, and session_expires_at are packed into one
+    // JS object so a single listener wires all three signals.
     let _uid_listener = use_hook(move || {
         Rc::new(RefCell::new({
             let ch = BroadcastChannel::new(DEMO_UID_CHANNEL).expect("uid channel");
             let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-                if let Some(uid) = e.data().as_string() {
+                let data = e.data();
+                if let Some(uid) = js_sys::Reflect::get(&data, &JsValue::from_str("uid"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                {
                     user_id.set(Some(uid));
                 }
+                live_account.set(
+                    js_sys::Reflect::get(&data, &JsValue::from_str("account"))
+                        .ok()
+                        .and_then(|v| v.as_string()),
+                );
+                session_expires_at.set(
+                    js_sys::Reflect::get(&data, &JsValue::from_str("session_expires_at"))
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .map(|f| {
+                            // Recovering unix seconds that were sent as f64.
+                            // Always finite and << u64::MAX for any plausible deadline.
+                            debug_assert!(
+                                f.is_finite() && f >= 0.0,
+                                "session_expires_at from broadcast must be finite"
+                            );
+                            f as u64 // deliberate truncation: integer seconds recovered from f64
+                        }),
+                );
             });
             ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
             (ch, on_msg)
@@ -568,16 +758,20 @@ fn App() -> Element {
         }))
     });
 
-    let boot_hold = use_hook(|| Rc::new(RefCell::new(None::<Boot>)));
+    let raw_boot_hold: Rc<RefCell<Option<Boot>>> = use_hook(|| Rc::new(RefCell::new(None::<Boot>)));
+    use_context_provider(|| BootHold(raw_boot_hold.clone()));
+
     use_hook(move || {
-        let boot_hold = boot_hold.clone();
+        let boot_inner = raw_boot_hold.clone();
         spawn(async move {
             match boot_window().await {
                 Ok(boot) => {
+                    // Fetch the custody level now that the worker has settled.
+                    custody_level.set(Some(workers::request_custody().await));
                     let mut events = boot.client.events();
                     client_slot.set(Some(boot.client.clone()));
                     status.set("connected".to_owned());
-                    *boot_hold.borrow_mut() = Some(boot);
+                    *boot_inner.borrow_mut() = Some(boot);
                     while let Ok(event) = events.recv().await {
                         if let Some(label) = status_label(&event) {
                             status.set(label);
@@ -608,24 +802,60 @@ fn App() -> Element {
 /// Auth status banner shown above the dashboard.
 ///
 /// Shows the login button when interactive auth is needed, or the authenticated
-/// account and logout controls once the session is acquired.
+/// account, custody level, expiry warning, account controls, and logout controls
+/// once the session is acquired.
 #[component]
 #[allow(non_snake_case)]
 fn AuthBanner() -> Element {
-    let user_id = use_context::<Signal<Option<String>>>();
+    let mut user_id = use_context::<Signal<Option<String>>>();
     let login_prompt = use_context::<LoginPrompt>().0;
+    let mut live_account = use_context::<LiveAccount>().0;
+    let session_expires_at = use_context::<SessionExpiresAt>().0;
+    let mut custody = use_context::<CustodyLevel>().0;
+    let all_accounts = use_context::<AllAccounts>().0;
+    let picker_active = use_context::<PickerActive>().0;
+    let mut account_answer = use_context::<AccountAnswer>().0;
+    let boot_hold = use_context::<BootHold>();
+
+    // Recomputed whenever session_expires_at changes: fetches the worker's
+    // unsynced queue and warns when the session is within 7 days of lapsing.
+    let mut expiry_warn: Signal<Option<ExpiryWarning>> = use_signal(|| None);
+    let mut enrol_msg: Signal<Option<String>> = use_signal(|| None);
+    use_effect(move || {
+        let expires_secs = *session_expires_at.read();
+        spawn(async move {
+            let Some(secs) = expires_secs else {
+                expiry_warn.set(None);
+                return;
+            };
+            let unsynced = request_unsynced().await.unwrap_or_default();
+            let now_f64 = js_sys::Date::now();
+            // Deliberate truncation: milliseconds since epoch, always finite and non-negative.
+            debug_assert!(
+                now_f64.is_finite() && now_f64 >= 0.0,
+                "Date::now() must be finite"
+            );
+            let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
+            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            expiry_warn.set(expiry_warning(
+                now,
+                expires_at,
+                Duration::from_secs(7 * 24 * 3600),
+                unsynced,
+            ));
+        });
+    });
 
     if user_id.read().is_none() && login_prompt.read().is_some() {
         // The worker is waiting for an interactive login. A popup keeps this page
-        // and its worker alive, and it can only be opened from a real click, so the
-        // prompt is a button rather than something that fires on its own.
+        // and its worker alive, and it can only be opened from a real click.
         let url = login_prompt.read().clone().unwrap_or_default();
         rsx! {
             div { class: "auth-banner auth-signed-in",
                 p { "Sign in to begin." }
                 button {
                     onclick: move |_| open_login_popup(&url),
-                    "Sign in with dev-idp"
+                    "Sign in"
                 }
             }
         }
@@ -634,9 +864,206 @@ fn AuthBanner() -> Element {
             .read()
             .clone()
             .unwrap_or_else(|| "authenticating...".to_owned());
+        let live_acc = live_account.read().clone();
+        let accounts = all_accounts.read().clone();
+        let is_active_picker = *picker_active.read();
+
+        // Custody description and derived flags.
+        let custody_snap = *custody.read();
+        let enrol_offerable = matches!(custody_snap, Some(Custody::Unverified(NoGate::Offerable)));
+        let custody_text = custody_snap.as_ref().map(|c| match c {
+            Custody::Verified => "gate: verified by passkey".to_owned(),
+            Custody::Unverified(NoGate::Offerable) => {
+                "gate: not verified (passkey available)".to_owned()
+            }
+            Custody::Unverified(NoGate::Declined) => {
+                "gate: not verified (passkey declined)".to_owned()
+            }
+            Custody::Unverified(NoGate::Unsupported) => {
+                "gate: not verified (passkey not available on this device)".to_owned()
+            }
+            Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
+        });
+
+        // Session expiry warning text, computed outside RSX to keep the template flat.
+        let expiry_line = expiry_warn.read().clone().map(|warn| {
+            let n = warn.unsynced.len();
+            let secs = warn
+                .session_expires_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now_f64 = js_sys::Date::now();
+            // Deliberate truncation: ms to seconds, always finite and non-negative.
+            debug_assert!(
+                now_f64.is_finite() && now_f64 >= 0.0,
+                "Date::now() must be finite"
+            );
+            let now_secs = (now_f64 / 1000.0) as u64;
+            let days = secs.saturating_sub(now_secs) / 86400;
+            format!(
+                "Session lapses in {days} day(s). {n} local write(s) at risk. Connect to refresh."
+            )
+        });
+
+        // Accounts the user can switch to: all stored minus the live one.
+        let switch_targets: Vec<(String, String)> = accounts
+            .iter()
+            .filter(|a| Some(*a) != live_acc.as_ref())
+            .map(|a| (a.clone(), a.clone()))
+            .collect();
+        // Each picker button needs its own (key, label) pair so closures can
+        // capture the key by move without consuming the label.
+        let picker_accounts: Vec<(String, String)> =
+            accounts.iter().map(|a| (a.clone(), a.clone())).collect();
+
         rsx! {
             div { class: "auth-banner auth-signed-in",
-                p { "Signed in as: " strong { {uid_text} } }
+                p {
+                    "Signed in as: "
+                    strong { {uid_text} }
+                    if let Some(acc) = live_acc.clone() {
+                        span { " (account: " code { {acc} } ")" }
+                    }
+                }
+                if let Some(ct) = custody_text {
+                    p { {ct} }
+                }
+                if enrol_offerable {
+                    div { class: "row",
+                        button {
+                            onclick: {
+                                let bh = boot_hold.clone();
+                                move |_| {
+                                    let bh = bh.clone();
+                                    spawn(async move {
+                                        // The ceremony runs for as long as the user
+                                        // takes to present a finger, so the handle is
+                                        // cloned out and the borrow released first.
+                                        // Holding one across that await would panic
+                                        // the moment anything took a mutable borrow.
+                                        let membership = {
+                                            let held = bh.0.borrow();
+                                            match held.as_ref() {
+                                                Some(bt) => Rc::clone(&bt.membership),
+                                                None => return,
+                                            }
+                                        };
+                                        let result = membership.enrol_gate().await;
+                                        match result {
+                                            Ok(true) => {
+                                                custody.set(Some(
+                                                    workers::request_custody().await,
+                                                ));
+                                                enrol_msg.set(None);
+                                            }
+                                            Ok(false) => {
+                                                enrol_msg.set(Some(
+                                                    "Passkey gate can only be set up in the \
+                                                     window that owns the database."
+                                                        .to_owned(),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                enrol_msg.set(Some(format!(
+                                                    "Enrolment failed: {e:?}"
+                                                )));
+                                            }
+                                        }
+                                    });
+                                }
+                            },
+                            "Enrol passkey gate"
+                        }
+                    }
+                    if let Some(msg) = enrol_msg.read().clone() {
+                        p { {msg} }
+                    }
+                }
+                if let Some(line) = expiry_line {
+                    p { class: "warn", {line} }
+                }
+                if is_active_picker {
+                    p { "Choose an account to sign in as:" }
+                    div { class: "row",
+                        for (acc_key, acc_label) in picker_accounts {
+                            button {
+                                key: "{acc_label}",
+                                onclick: move |_| {
+                                    account_answer
+                                        .set(Some(AccountChoice::Named(acc_key.clone())))
+                                },
+                                "Sign in as {acc_label}"
+                            }
+                        }
+                        button {
+                            onclick: move |_| account_answer.set(Some(AccountChoice::LastUsed)),
+                            "Last used"
+                        }
+                    }
+                }
+                div { class: "row",
+                    for (acc_key, acc_label) in switch_targets {
+                        button {
+                            key: "{acc_label}",
+                            onclick: {
+                                let bh = boot_hold.clone();
+                                move |_| {
+                                    let key = acc_key.clone();
+                                    let bh = bh.clone();
+                                    spawn(async move {
+                                        // Cleared before the reboot, not after it.
+                                        // The banner hides the login prompt while an
+                                        // identity is held, and the replacement
+                                        // worker may need one, so a stale identity
+                                        // would hide the very control it is waiting
+                                        // for. The worker rebroadcasts both once it
+                                        // is up, which is what repopulates these.
+                                        user_id.set(None);
+                                        live_account.set(None);
+                                        let result = {
+                                            let b = bh.0.borrow();
+                                            b.as_ref().map_or(Ok(()), |bt| {
+                                                bt.membership.switch_account(&key)
+                                            })
+                                        };
+                                        if let Err(e) = result {
+                                            tracing::error!(error = ?e, "switch account failed");
+                                        }
+                                    });
+                                }
+                            },
+                            "Switch to {acc_label}"
+                        }
+                    }
+                    button {
+                        onclick: {
+                            let bh = boot_hold.clone();
+                            move |_| {
+                                let bh = bh.clone();
+                                spawn(async move {
+                                    // Same reason as the switch above, and it matters
+                                    // more here: adding an account always needs an
+                                    // interactive login, so the prompt must be
+                                    // reachable. Nothing is reloaded either way,
+                                    // because the pending choice lives in this page
+                                    // and a reload would discard it.
+                                    user_id.set(None);
+                                    live_account.set(None);
+                                    let result = {
+                                        let b = bh.0.borrow();
+                                        b.as_ref()
+                                            .map_or(Ok(()), |bt| bt.membership.add_account())
+                                    };
+                                    if let Err(e) = result {
+                                        tracing::error!(error = ?e, "add account failed");
+                                    }
+                                });
+                            }
+                        },
+                        "Add another account"
+                    }
+                }
                 LogoutControls {}
             }
         }

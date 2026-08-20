@@ -19,7 +19,7 @@
 //! since R36 so one call per site defines the moment for the rate limit and the
 //! abuse tally alike.
 //!
-//! `#[ignore]` by default: the write target needs a running Postgres.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,7 +165,6 @@ fn subscription_limits(identified: u32, anonymous: u32) -> ThrottleConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_over_limit_subscription_is_refused_and_the_session_survives() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture, subscription_limits(2, 2));
@@ -204,7 +203,6 @@ async fn an_over_limit_subscription_is_refused_and_the_session_survives() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_two_tiers_are_different_allowances() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture, subscription_limits(3, 1));
@@ -244,7 +242,6 @@ async fn the_two_tiers_are_different_allowances() {
 /// handle connetto minted and handed back, which is exactly the key a
 /// per-connection counter would throw away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_anonymous_limit_holds_across_a_reconnection() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture, subscription_limits(2, 2));
@@ -271,7 +268,6 @@ async fn the_anonymous_limit_holds_across_a_reconnection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_rate_refusal_and_a_schema_refusal_stay_distinguishable() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture, subscription_limits(2, 2));
@@ -312,7 +308,6 @@ async fn a_rate_refusal_and_a_schema_refusal_stay_distinguishable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn too_many_connections_on_one_handle_are_closed() {
     let fixture = Fixture::acquire().await;
     let throttle = ThrottleConfig::new()
@@ -368,7 +363,6 @@ async fn too_many_connections_on_one_handle_are_closed() {
 /// the run. An anonymous tier without a working bound is the unauthenticated
 /// cost centre this phase exists to close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_anonymous_caller_cannot_reconnect_past_its_connection_limit() {
     let fixture = Fixture::acquire().await;
     let manager = manager(
@@ -430,7 +424,6 @@ impl HandshakeAuthority for CountingAuthority {
 /// MiB, so a limit that is recorded and then ignored for the rest of the loop
 /// bounds nothing: the caller still buys every signature check it asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_tripped_credential_limit_stops_checking_grants() {
     const LIMIT: u32 = 3;
     const PRESENTED: usize = 500;

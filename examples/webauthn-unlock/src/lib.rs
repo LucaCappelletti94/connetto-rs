@@ -249,13 +249,6 @@ mod inner {
             &JsValue::from_str("enrol"),
         )
         .map_err(|e| js_err("Reflect::set kind", e))?;
-        Reflect::set(
-            &req,
-            &JsValue::from_str("label"),
-            &JsValue::from_str("harness"),
-        )
-        .map_err(|e| js_err("Reflect::set label", e))?;
-
         let reply = ask_tab(&req).await?;
         let kind = str_field(&reply, "kind")?;
 

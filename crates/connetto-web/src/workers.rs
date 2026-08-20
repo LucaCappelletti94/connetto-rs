@@ -137,6 +137,16 @@ pub struct DbWorkerConfig {
     /// to enrol on a fresh profile after the session is acquired. The tab must
     /// call [`crate::unlock::serve_unlock`] before the worker boots.
     unlock: bool,
+    /// Whether to ask the tab which account to sign in as. Defaults to `false`.
+    ///
+    /// When `false` the boot takes the last-used account, which is what an
+    /// application with one account per person wants and needs no code.
+    ///
+    /// When `true` the worker offers the stored accounts to the tab after the
+    /// gate and signs in as whichever one it names. The tab registers the answer
+    /// with [`crate::unlock::serve_account_choice`]. Nothing registered takes the
+    /// default, so this cannot strand a boot on a missing picker.
+    pick_account: bool,
 }
 
 impl DbWorkerConfig {
@@ -160,6 +170,7 @@ impl DbWorkerConfig {
             auth: None,
             auth_db_name: "",
             unlock: false,
+            pick_account: false,
         }
     }
 
@@ -270,6 +281,19 @@ impl DbWorkerConfig {
         self.unlock = unlock;
         self
     }
+
+    /// Ask the tab which account to sign in as, rather than taking the last-used
+    /// one.
+    ///
+    /// The list of stored accounts only exists after the gate has run, so the
+    /// question is asked there: one gesture to unlock the device, then a choice of
+    /// who. Register the answer with
+    /// [`crate::unlock::serve_account_choice`] before the worker boots.
+    #[must_use]
+    pub fn with_pick_account(mut self, pick_account: bool) -> Self {
+        self.pick_account = pick_account;
+        self
+    }
 }
 
 /// How the leader launches the dedicated DB worker, which differs only by how
@@ -330,7 +354,15 @@ fn generated_bootstrap_url(glue_url: &str) -> Result<String, JsValue> {
         |base| format!("{base}_bg.wasm"),
     );
     let source = format!(
-        "try {{\n  const mod = await import({glue});\n  await mod.default({{ module_or_path: {wasm} }});\n}} catch (err) {{\n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker bootstrap FAILED: \" + err);\n  throw err;\n}}\n",
+        r#"try {{
+  const mod = await import({glue});
+  await mod.default({{ module_or_path: {wasm} }});
+}} catch (err) {{
+  new BroadcastChannel("connetto-debug").postMessage("db worker bootstrap FAILED: " + err);
+  new BroadcastChannel("connetto-hello").postMessage("failed:" + err);
+  throw err;
+}}
+"#,
         glue = js_string_literal(glue_url),
         wasm = js_string_literal(&wasm_url),
     );
@@ -359,26 +391,61 @@ fn js_string_literal(value: &str) -> String {
 }
 
 /// Page side: resolve once the DB worker's intake answers on the hello
-/// channel. Asks repeatedly, since asks posted before the worker's boot
-/// finished are lost, not queued.
-pub async fn await_db_worker_ready() {
-    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
-    let ready = Rc::new(Cell::new(false));
+/// channel.
+///
+/// The worker reports boot failures on the same channel. A stale or absent
+/// stack therefore fails here by name rather than spinning until the browser
+/// runner kills the test.
+pub async fn await_db_worker_ready() -> Result<(), JsValue> {
+    const POLL_MS: i32 = 50;
+    const TIMEOUT_MS: f64 = 15_000.0;
+
+    enum Ready {
+        Waiting,
+        Up,
+        Failed(String),
+    }
+
+    let channel = BroadcastChannel::new(HELLO_CHANNEL)
+        .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
+    let state = Rc::new(RefCell::new(Ready::Waiting));
     let on_message = {
-        let ready = Rc::clone(&ready);
+        let state = Rc::clone(&state);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if event.data().as_string().as_deref() == Some("ready") {
-                ready.set(true);
+            let Some(message) = event.data().as_string() else {
+                return;
+            };
+            if message == "ready" {
+                *state.borrow_mut() = Ready::Up;
+            } else if let Some(detail) = message.strip_prefix("failed:") {
+                *state.borrow_mut() = Ready::Failed(detail.to_owned());
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    while !ready.get() {
+    let started = js_sys::Date::now();
+    loop {
+        match &*state.borrow() {
+            Ready::Up => break,
+            Ready::Failed(detail) => {
+                let detail = detail.clone();
+                channel.set_onmessage(None);
+                channel.close();
+                return Err(JsValue::from_str(&format!("db worker boot failed: {detail}")));
+            }
+            Ready::Waiting => {}
+        }
+        if js_sys::Date::now() - started >= TIMEOUT_MS {
+            channel.set_onmessage(None);
+            channel.close();
+            return Err(JsValue::from_str("db worker did not answer readiness"));
+        }
         let _ = channel.post_message(&JsValue::from_str("ask"));
-        sleep_ms(50).await;
+        sleep_ms(POLL_MS).await;
     }
     channel.set_onmessage(None);
     channel.close();
+    Ok(())
 }
 
 /// Page side: announce a tab's wire channel and wait for the worker's
@@ -422,9 +489,61 @@ async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
     auth_db_name: &str,
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
+    pick_account: bool,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
     let store = open_refresh_store(auth_db_name, storage, key_store).await?;
-    drive_acquisition(auth, &store).await
+    let account = choose_account(&store, pick_account).await?;
+    drive_acquisition(auth, &store, account).await
+}
+
+/// Which account this boot signs in as: the one the tab named, or the one this
+/// device last used, or nobody.
+///
+/// Nobody means an interactive login, which is a first run, a profile whose
+/// accounts were all signed out, and a marker naming an account whose credential
+/// is gone or refused. Falling back to another stored account is deliberately not
+/// done: it would open one identity's data when the user expected another's.
+///
+/// Asked here rather than earlier because the list comes out of the credential
+/// store, and that store does not open until the gate has run.
+async fn choose_account(
+    store: &crate::auth::RefreshStore,
+    pick_account: bool,
+) -> Result<Option<String>, JsValue> {
+    let remembered = crate::auth::remembered_account(store).map_err(to_js)?;
+    if !pick_account {
+        return Ok(remembered);
+    }
+    let accounts = RefreshTokenStore::accounts(store).map_err(to_js)?;
+    if accounts.is_empty() && remembered.is_none() {
+        // Nothing stored and nothing remembered, so there is nothing to choose
+        // between and asking would put a picker in front of somebody who has no
+        // account to pick.
+        return Ok(None);
+    }
+    match crate::unlock::ask_account(&accounts).await.map_err(to_js)? {
+        crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::Named(chosen)) => {
+            // A name that was never offered is a caller bug, not a stale
+            // credential, so it is refused rather than answered with a login.
+            if !accounts.contains(&chosen) {
+                return Err(to_js(crate::auth::AuthError::Context(
+                    "the tab named an account that was not offered".into(),
+                )));
+            }
+            Ok(Some(chosen))
+        }
+        // The application declined to override, so the default applies.
+        crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::LastUsed) => Ok(remembered),
+        // Somebody new, so no stored credential is addressed and the acquisition
+        // runs an interactive login. Every credential already stored is left
+        // alone, which is what makes this the second account rather than a
+        // replacement for the first.
+        crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::New) => Ok(None),
+        other => Err(to_js(crate::auth::AuthError::Context(format!(
+            "the tab answered the account question with {}",
+            crate::unlock::answer_kind(&other)
+        )))),
+    }
 }
 
 /// Acquire without persisting anything, for a first run that has not settled its
@@ -440,7 +559,9 @@ async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Serialize>(
     JsValue,
 > {
     let deferred = crate::auth::DeferredRefreshStore::default();
-    let session = drive_acquisition(auth, &deferred).await?;
+    // A first run has no store, so there is nothing stored to try and nothing to
+    // offer a picker.
+    let session = drive_acquisition(auth, &deferred, None).await?;
     Ok((session, deferred))
 }
 
@@ -487,13 +608,13 @@ async fn open_refresh_store(
 async fn drive_acquisition<Id, S>(
     auth: &crate::auth::WorkerAuthConfig,
     store: &S,
+    account: Option<String>,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue>
 where
     Id: serde::de::DeserializeOwned + serde::Serialize,
     S: RefreshTokenStore<Error = crate::auth::AuthError>,
 {
-    let authenticator =
-        crate::auth::BrowserAuthenticator::new(auth.clone(), crate::auth::REFRESH_RECORD);
+    let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone(), account);
     match authenticator.acquire(store).await.map_err(to_js)? {
         crate::auth::Acquired::Access(session) => Ok(session),
         crate::auth::Acquired::NeedLogin(pending) => {
@@ -508,6 +629,34 @@ where
     }
 }
 
+/// What a boot resolved about the session it opened.
+///
+/// One value rather than three returns, because they arrive together from one
+/// token response and an application showing who is signed in usually wants the
+/// rest of it too. All three are absent together when no authentication was
+/// configured, which is the anonymous run that keeps nothing durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootedSession<Id> {
+    /// The identity the session was acquired for.
+    pub identity: Option<Id>,
+    /// Unix seconds when the local session lapses if it is never refreshed again.
+    ///
+    /// What an application needs to warn somebody before an offline session
+    /// lapses, through
+    /// [`expiry_warning`](connetto_client::teardown::expiry_warning). The worker
+    /// refreshes silently while it can reach the server, so this moves outward on
+    /// every acquisition and a warning is only ever about a device that has been
+    /// offline a long time.
+    pub session_expires_at: Option<u64>,
+    /// The credential-store key this identity's account is addressed by.
+    ///
+    /// The same value the last-used marker holds. An application offering an
+    /// account picker needs it to say which of the stored accounts is the live
+    /// one, and it is already computed here, so recomputing it in the application
+    /// would be a second encoding of one fact.
+    pub account: Option<String>,
+}
+
 /// DB worker context: install the OPFS VFS, acquire connetto's session, open
 /// the replica that identity owns (resuming an existing one from its persisted
 /// cursor), connect upstream, wait for the subscription to be fully served,
@@ -520,18 +669,18 @@ where
 /// when `config.auth` is `None`, where no identity is ever acquired and the
 /// replica keeps `config.replica_db_prefix` verbatim.
 ///
-/// Returns the identity the session was acquired for, or `None` when
-/// `config.auth` is unset. An application that shows who is signed in wants this:
-/// without it the only way to learn the identity is to acquire a second session
-/// alongside this one, which duplicates the acquisition and rotates the refresh
-/// token twice per boot.
+/// Returns what the boot resolved about the session it opened, or a
+/// [`BootedSession`] carrying nothing when `config.auth` is unset. An application
+/// wants all three: without them the only way to learn any of them is to acquire a
+/// second session alongside this one, which duplicates the acquisition and rotates
+/// the refresh token twice per boot.
 ///
 /// # Errors
 ///
 /// A string describing the VFS, acquisition, upstream connect, or subscribe
 /// failure.
 #[allow(clippy::too_many_lines)]
-pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<Option<Id>, JsValue>
+pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, JsValue>
 where
     // `Display` because the server binds this identity as the row-level
     // security setting through the same rendering, so a policy comparing
@@ -621,6 +770,15 @@ where
             crate::unlock::TabAnswer::Failed { detail } => {
                 return Err(to_js(crate::auth::AuthError::Locked { detail }));
             }
+            // An answer to a question this was not: the tab's handler is confused
+            // about which request it is serving, which is a bug and not a platform
+            // outcome, so it must not downgrade custody.
+            other @ crate::unlock::TabAnswer::Account(_) => {
+                return Err(to_js(crate::auth::AuthError::Context(format!(
+                    "the unlock request was answered with {}",
+                    crate::unlock::answer_kind(&other)
+                ))));
+            }
         }
     }
 
@@ -673,8 +831,14 @@ where
         }
         Some(auth_config) => (
             Some(
-                acquire_session::<Id>(auth_config, config.auth_db_name, &storage, &key_store)
-                    .await?,
+                acquire_session::<Id>(
+                    auth_config,
+                    config.auth_db_name,
+                    &storage,
+                    &key_store,
+                    config.pick_account,
+                )
+                .await?,
             ),
             None,
         ),
@@ -685,15 +849,12 @@ where
         }
     };
 
-    // Unenrolled path with unlock enabled: ask the tab to enrol now that an
-    // identity exists, so the credential the platform saves carries the account
-    // the user just signed in as rather than a device label.
-    if config.unlock
-        && !was_enrolled
-        && let Some(session) = &session
-    {
-        let label = session.user_id.to_string();
-        match crate::unlock::ask_enrol(&label).await.map_err(to_js)? {
+    // Unenrolled path with unlock enabled: ask the tab to enrol now that somebody
+    // is signed in, because an anonymous run keeps nothing durable and has
+    // nothing to gate. No identity is passed: the credential is one per device
+    // and names the origin, per the plan's R23 decision 10.
+    if config.unlock && !was_enrolled && session.is_some() {
+        match crate::unlock::ask_enrol().await.map_err(to_js)? {
             crate::unlock::TabAnswer::Key { credential_id, key } => {
                 key_store
                     .adopt_derived(key, &credential_id)
@@ -713,6 +874,12 @@ where
             crate::unlock::TabAnswer::Failed { detail } => {
                 return Err(to_js(crate::auth::AuthError::Context(format!(
                     "the enrolment ceremony failed: {detail}"
+                ))));
+            }
+            other @ crate::unlock::TabAnswer::Account(_) => {
+                return Err(to_js(crate::auth::AuthError::Context(format!(
+                    "the enrolment request was answered with {}",
+                    crate::unlock::answer_kind(&other)
                 ))));
             }
         }
@@ -737,6 +904,13 @@ where
                 .map_err(to_js)?
         }
         None => config.replica_db_prefix.to_owned(),
+    };
+    // The account key of whoever is signed in, which is what a logout has to name
+    // so that signing one account out leaves the others signed in. The same
+    // encoding the credential row and the last-used marker are keyed by.
+    let active_account = match &session {
+        Some(session) => Some(connetto_client::encode_identity(&session.user_id).map_err(to_js)?),
+        None => None,
     };
     // A replica left by a previous worker generation of the SAME identity
     // resumes: the persisted cursor rides the handshake and the subscription
@@ -768,6 +942,7 @@ where
         .as_ref()
         .map(|session| Grant::new(session.access_token.clone()));
     let identified = session.is_some();
+    let session_expires_at = session.as_ref().map(|session| session.session_expires_at);
     let identity = session.map(|session| session.user_id);
     let mut client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
         .with_login(login)
@@ -910,6 +1085,7 @@ where
             auth_config.clone(),
             config.auth_db_name,
             &replica_db_name,
+            active_account.clone(),
             hub.clone(),
         )?;
     }
@@ -946,7 +1122,11 @@ where
     // The intake handler lives for the worker's whole life.
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
-    Ok(identity)
+    Ok(BootedSession {
+        identity,
+        session_expires_at,
+        account: active_account,
+    })
 }
 
 /// Serve [`LOGOUT_CHANNEL`](crate::auth::LOGOUT_CHANNEL) for this worker's life,
@@ -969,6 +1149,7 @@ pub fn serve_logout_requests(
     auth: crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     replica_db_name: &str,
+    account: Option<String>,
     hub: crate::relay::RelayHub,
 ) -> Result<(), JsValue> {
     let auth_db_name = auth_db_name.to_owned();
@@ -989,9 +1170,17 @@ pub fn serve_logout_requests(
             let auth = auth.clone();
             let auth_db_name = auth_db_name.clone();
             let replica_db_name = replica_db_name.clone();
+            let account = account.clone();
             spawn_local(async move {
-                if let Some(reply) =
-                    serve_logout(&request, &hub, &auth, &auth_db_name, &replica_db_name).await
+                if let Some(reply) = serve_logout(
+                    &request,
+                    &hub,
+                    &auth,
+                    &auth_db_name,
+                    &replica_db_name,
+                    account.as_deref(),
+                )
+                .await
                 {
                     match serde_json::to_string(&reply) {
                         Ok(encoded) => {
@@ -1036,6 +1225,7 @@ async fn serve_logout(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     replica_db_name: &str,
+    account: Option<&str>,
 ) -> Option<crate::auth::LogoutMessage> {
     use crate::auth::LogoutMessage;
 
@@ -1077,7 +1267,7 @@ async fn serve_logout(
     // The credential is gone locally either way. A failed revoke leaves the
     // session alive on the server until it expires, which is worth logging but
     // does not make this tab any less logged out.
-    match logout_locally(auth, auth_db_name).await {
+    match logout_locally(auth, auth_db_name, account).await {
         Ok(()) => {}
         Err(err) => tracing::warn!(
             error = %err,
@@ -1087,16 +1277,27 @@ async fn serve_logout(
     Some(LogoutMessage::Done { deleted: delete })
 }
 
-/// Revoke the session and clear the stored credential.
+/// Revoke the session and clear the stored credential of one account.
+///
+/// Uses the worker's own key store rather than opening a second one. The derived
+/// key-encryption key lives on the instance, so a fresh store is locked on an
+/// enrolled profile: opening one here left the credential in place while the tab
+/// was told it had logged out.
 async fn logout_locally(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
+    account: Option<&str>,
 ) -> Result<(), crate::auth::AuthError> {
     let storage = crate::storage::ReplicaStorage::install().await;
-    let keys = crate::auth::IdbKeyStore::open().await?;
-    let device = crate::storage::device_key(&keys).await?;
+    let keys = match crate::unlock::worker_key_store() {
+        Some(keys) => keys,
+        // No worker store registered means no gate was ever installed, so a
+        // freshly opened one holds everything it needs.
+        None => std::rc::Rc::new(crate::auth::IdbKeyStore::open().await?),
+    };
+    let device = crate::storage::device_key(&*keys).await?;
     let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name), &device)?;
-    crate::auth::BrowserAuthenticator::new(auth.clone(), crate::auth::REFRESH_RECORD)
+    crate::auth::BrowserAuthenticator::new(auth.clone(), account.map(ToOwned::to_owned))
         .logout(&store)
         .await
 }
@@ -1122,7 +1323,7 @@ pub fn tab_wire_factory(
             js_sys::Date::now()
         );
         Box::pin(async move {
-            await_db_worker_ready().await;
+            await_db_worker_ready().await.expect("db worker ready");
             announce_tab(&wire).await;
             MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         })

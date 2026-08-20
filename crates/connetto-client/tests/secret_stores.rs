@@ -8,9 +8,10 @@
 //! caller working on both targets rather than by the rename.
 #![cfg(feature = "native-auth")]
 
-use connetto_client::{MemoryKeyStore, MemoryRefreshStore};
+use connetto_client::{IDENTITY_RECORD, MemoryKeyStore, MemoryRefreshStore};
 use connetto_core::test_support::{
-    two_accounts_keep_their_own_key, two_accounts_keep_their_own_token,
+    every_stored_account_is_listed, two_accounts_keep_their_own_key,
+    two_accounts_keep_their_own_token,
 };
 
 #[test]
@@ -18,19 +19,24 @@ fn the_in_memory_refresh_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_token(&MemoryRefreshStore::default(), "alice", "bob");
 }
 
+/// R42: the account list the picker is built on, against the enumerable store.
+#[test]
+fn the_in_memory_refresh_store_lists_every_account_it_holds() {
+    every_stored_account_is_listed(
+        &MemoryRefreshStore::default(),
+        "alice",
+        "bob",
+        IDENTITY_RECORD,
+    );
+}
+
 #[tokio::test]
 async fn the_in_memory_key_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_key(&MemoryKeyStore::default(), "alice", "bob").await;
 }
 
-/// The production stores, against the real OS keyring rather than a fake.
-///
-/// One service, one record per account, and the record names are unique to this
-/// test so a rerun neither collides with a developer's own entries nor with a
-/// concurrent run of the suite. Ignored by default because it writes to the
-/// machine's secure storage, which a headless or locked session may refuse.
+/// The production stores use names unique to this process, so reruns do not collide.
 #[test]
-#[ignore = "writes to the OS keyring; run explicitly"]
 fn the_keyring_refresh_store_keeps_two_accounts_apart() {
     use connetto_client::KeyringStore;
 
@@ -38,8 +44,16 @@ fn the_keyring_refresh_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_token(&KeyringStore::new(service), "alice", "bob");
 }
 
+/// R42: the same property against the store that cannot be enumerated.
+#[test]
+fn the_keyring_refresh_store_lists_every_account_it_holds() {
+    use connetto_client::KeyringStore;
+
+    let service = format!("connetto-r42-refresh-{}", std::process::id());
+    every_stored_account_is_listed(&KeyringStore::new(service), "alice", "bob", IDENTITY_RECORD);
+}
+
 #[tokio::test]
-#[ignore = "writes to the OS keyring; run explicitly"]
 async fn the_keyring_key_store_keeps_two_accounts_apart() {
     use connetto_client::KeyringKeyStore;
 

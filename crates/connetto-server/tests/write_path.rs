@@ -8,8 +8,7 @@
 //! is read back through the admin pool; the `notes` table carries its own
 //! version column (`edited_at`).
 //!
-//! `#[ignore]` by default: it needs a running Postgres. Point `DATABASE_URL` at
-//! one and run with `--ignored` under Docker.
+//! Needs Docker: the fixture starts its own Postgres.
 
 #![allow(clippy::too_many_lines)]
 
@@ -208,7 +207,6 @@ fn update_changeset(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn write_path_applies_conflicts_and_dedups() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
@@ -332,7 +330,6 @@ async fn write_path_applies_conflicts_and_dedups() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn write_path_rejects_unauthorized() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
@@ -381,7 +378,6 @@ async fn write_path_rejects_unauthorized() {
 /// so no primary-key collision occurs. A genuinely different token is a new
 /// session and correctly starts fresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watermark_survives_reconnect_reusing_session() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;

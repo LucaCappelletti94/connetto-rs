@@ -1,0 +1,377 @@
+---
+name: CI
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable rustfmt
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+  lint:
+    name: Lint ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root native
+            cwd: .
+            target: ""
+          - name: connetto-web wasm
+            cwd: crates/connetto-web
+            target: --target wasm32-unknown-unknown
+          - name: wasm-smoke wasm
+            cwd: examples/wasm-smoke
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-web-demo wasm
+            cwd: examples/dioxus-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: yew-web-demo wasm
+            cwd: examples/yew-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: webauthn-unlock wasm
+            cwd: examples/webauthn-unlock
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-desktop-demo native
+            cwd: examples/dioxus-desktop-demo
+            target: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable clippy
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component clippy
+
+      - name: Add wasm target
+        if: matrix.target != ''
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install desktop dependencies
+        if: matrix.cwd == 'examples/dioxus-desktop-demo'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            lld
+
+      - name: Run clippy
+        working-directory: ${{ matrix.cwd }}
+        run: |
+          cargo +stable clippy \
+            --all-targets \
+            --all-features \
+            ${{ matrix.target }} \
+            -- \
+            -D warnings
+
+  nightly-lint:
+    name: Nightly lint ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root native
+            cwd: .
+            target: ""
+          - name: connetto-web wasm
+            cwd: crates/connetto-web
+            target: --target wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-nightly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-nightly-${{ runner.os }}-
+
+      - name: Install nightly clippy
+        run: |
+          rustup toolchain install nightly \
+            --profile minimal \
+            --component clippy
+
+      - name: Add wasm target
+        if: matrix.target != ''
+        run: rustup target add wasm32-unknown-unknown --toolchain nightly
+
+      - name: Run nightly clippy
+        working-directory: ${{ matrix.cwd }}
+        run: |
+          cargo +nightly clippy \
+            --all-targets \
+            --all-features \
+            ${{ matrix.target }} \
+            -- \
+            -D warnings
+
+  docs:
+    name: Docs ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root native
+            cwd: .
+            target: ""
+          - name: connetto-web wasm
+            cwd: crates/connetto-web
+            target: --target wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable rustdoc
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add wasm target
+        if: matrix.target != ''
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Check docs
+        working-directory: ${{ matrix.cwd }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" \
+            cargo +stable doc \
+              --no-deps \
+              --all-features \
+              ${{ matrix.target }}
+
+  compile:
+    name: Compile ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root native
+            cwd: .
+            target: ""
+          - name: connetto-web wasm
+            cwd: crates/connetto-web
+            target: --target wasm32-unknown-unknown
+          - name: wasm-smoke wasm
+            cwd: examples/wasm-smoke
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-web-demo wasm
+            cwd: examples/dioxus-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: yew-web-demo wasm
+            cwd: examples/yew-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: webauthn-unlock wasm
+            cwd: examples/webauthn-unlock
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-desktop-demo native
+            cwd: examples/dioxus-desktop-demo
+            target: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add wasm target
+        if: matrix.target != ''
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install desktop dependencies
+        if: matrix.cwd == 'examples/dioxus-desktop-demo'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            lld
+
+      - name: Check workspace
+        working-directory: ${{ matrix.cwd }}
+        run: |
+          cargo +stable check \
+            --all-targets \
+            --all-features \
+            ${{ matrix.target }}
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Cache rust test output
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: t-rust-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            t-rust-tests-${{ runner.os }}-
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install keyring helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y keyutils
+
+      - name: Run Rust suite
+        run: keyctl session -- cargo +stable test --release --all-features
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf target/debug/incremental
+          rm -rf target/release/incremental
+          rm -rf target/wasm32-unknown-unknown/debug/incremental
+          rm -rf target/wasm32-unknown-unknown/release/incremental
+          rm -rf target/tmp
+
+  browser-tests:
+    name: Browser tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable browser toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.14.0
+
+      - name: Configure ChromeDriver
+        run: |
+          echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
+          echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
+
+      - name: Run browser suites
+        run: |
+          cargo +stable run \
+            -p connetto-test-harness \
+            --bin connetto-browser-stack

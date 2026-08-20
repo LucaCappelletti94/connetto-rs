@@ -6,8 +6,7 @@
 //! still reaches a subscribed client. This is the Phase 6 reliability contract:
 //! a dropped replication connection does not lose events.
 //!
-//! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`.
-//! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 
 #![allow(clippy::too_many_lines)]
@@ -26,11 +25,12 @@ use connetto_server::{
     Materializer, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager, Snapshot,
     SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{
+    ConnettoWatermark, Fixture, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID,
+};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
@@ -39,19 +39,7 @@ const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
-const SLOT: &str = "connetto_slot";
-const PUBLICATION: &str = "connetto_pub";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-
-fn admin_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
-
-async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
-    Pool::builder().build(manager).await.expect("build pool")
-}
 
 async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
     let mut conn = pool.get().await.expect("admin connection");
@@ -141,26 +129,13 @@ async fn drain_until<T: Transport>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker); run after explicit approval"]
 async fn cdc_ingest_reconnects_after_walsender_drop() {
     let fixture = Fixture::acquire().await;
-    let admin = pool_for(&admin_url()).await;
-    exec(&admin, "DROP TABLE IF EXISTS orders CASCADE").await;
-    exec(
-        &admin,
-        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-         WHERE slot_name = 'connetto_slot'",
-    )
-    .await;
-    exec(&admin, "DROP PUBLICATION IF EXISTS connetto_pub").await;
-    exec(&admin, PG_DDL).await;
-    exec(&admin, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
-    exec(&admin, "CREATE PUBLICATION connetto_pub FOR TABLE orders").await;
-    exec(
-        &admin,
-        "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')",
-    )
-    .await;
+    let admin = fixture.admin().clone();
+    fixture
+        .setup(&["DROP TABLE IF EXISTS orders CASCADE", PG_DDL])
+        .await;
+    fixture.start_replication(&["orders"]).await;
 
     let manager = SessionManager::new(
         Materializer::new(PG_DDL).expect("build materializer"),
@@ -199,7 +174,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .with_max_backoff(Duration::from_secs(2))
         .with_max_attempts(Some(50))
         .with_healthy_after(Duration::from_secs(1));
-    let url = admin_url();
+    let url = fixture.admin_url().to_owned();
     let ingest_manager = manager.clone();
     let _ingest = tokio::spawn(async move {
         let connect = || {

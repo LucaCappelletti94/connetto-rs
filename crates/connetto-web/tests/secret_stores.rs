@@ -11,7 +11,8 @@
 //! stores address the account per call instead of baking it into the object.
 
 use connetto_core::test_support::{
-    two_accounts_keep_their_own_key, two_accounts_keep_their_own_token,
+    every_stored_account_is_listed, two_accounts_keep_their_own_key,
+    two_accounts_keep_their_own_token,
 };
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_web::auth::{IdbKeyStore, RefreshStore};
@@ -23,6 +24,9 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// The OPFS file this suite keeps its refresh store in, distinct from every
 /// other suite's so a shared origin cannot cross them.
 const REFRESH_DB: &str = "r41-secret-stores.sqlite";
+/// The OPFS file the account-list exercise uses, kept apart from the one above so
+/// neither test's reserved-record write can be mistaken for the other's.
+const ACCOUNTS_DB: &str = "r42-account-list.sqlite";
 
 #[wasm_bindgen_test]
 async fn the_browser_key_store_keeps_two_accounts_apart() {
@@ -45,6 +49,27 @@ async fn the_browser_refresh_store_keeps_two_accounts_apart() {
     let store =
         RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("open the refresh store");
     two_accounts_keep_their_own_token(&store, "r41-alice", "r41-bob");
+}
+
+/// R42: the account list an application's picker is built on, against the store
+/// that answers it from the rows the tokens live in.
+#[wasm_bindgen_test]
+async fn the_browser_refresh_store_lists_every_account_it_holds() {
+    let storage = ReplicaStorage::install().await;
+    let keys = IdbKeyStore::open().await.expect("open the key store");
+    storage
+        .delete_db(ACCOUNTS_DB)
+        .expect("clear any earlier file");
+
+    let device = device_key(&keys).await.expect("mint the device key");
+    let store =
+        RefreshStore::open(&storage.db_url(ACCOUNTS_DB), &device).expect("open the refresh store");
+    every_stored_account_is_listed(
+        &store,
+        "r42-alice",
+        "r42-bob",
+        connetto_client::IDENTITY_RECORD,
+    );
 }
 
 /// The case decision 4 of R41 turns on, and the one native has no equivalent of.

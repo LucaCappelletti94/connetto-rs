@@ -12,28 +12,7 @@
 //! consistent with a trusting stand-in that accepts anything, so the proof
 //! that verification is on is that a forged token is refused.
 //!
-//! Ignored by default, because it needs the dev stack up:
-//!
-//! ```text
-//! docker run -d --rm --name connetto-dev-pg -e POSTGRES_PASSWORD=postgres \
-//!   -p 55470:5432 postgres:16 -c wal_level=logical
-//! # apply examples/wasm-smoke/schema.sql, a publication, a slot,
-//! # _connetto_mutations, connetto_sessions, connetto_provider_tokens,
-//! # the connetto_change_op enum and the connetto_oplog table (see
-//! # docs/architecture/11-authentication.md for both), and
-//! # examples/wasm-smoke/roles.sql for the reader role
-//! cargo run --release -p connetto-server --example dev_idp
-//! set -a && . target/dev-idp.env && set +a
-//! CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \
-//!   CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
-//!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55470/postgres \
-//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55470/postgres \
-//!   cargo run --release -p connetto-server --bin connetto-server
-//!
-//! cargo test --release -p connetto-client --features native-auth \
-//!   --test verified_topology -- --ignored
-//! ```
+//! The browser-stack runner supplies the server binary and service environment.
 
 #![cfg(feature = "native-auth")]
 
@@ -42,8 +21,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
 use connetto_core::transport::WebSocketTransport;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, Instant, sleep, timeout};
 
 /// The server's auth endpoints, its `CONNETTO_AUTH_BIND`.
 fn auth_base() -> String {
@@ -58,6 +38,75 @@ fn ws_url() -> String {
 /// The provider name `dev_idp` registers.
 fn provider() -> String {
     std::env::var("CONNETTO_TEST_PROVIDER").unwrap_or_else(|_| "dev-idp".to_owned())
+}
+
+fn bind_from_ws(url: &str) -> String {
+    url.strip_prefix("ws://")
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_owned()
+}
+
+fn bind_from_http(base: &str) -> String {
+    base.strip_prefix("http://")
+        .unwrap_or(base)
+        .split('/')
+        .next()
+        .unwrap_or(base)
+        .to_owned()
+}
+
+struct ServerGuard(Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+async fn wait_for_child_port(child: &mut Child, bind: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if TcpStream::connect(bind).await.is_ok() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("check connetto-server status") {
+            panic!("connetto-server exited before opening {bind}: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connetto-server did not open {bind}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn maybe_spawn_server() -> Option<ServerGuard> {
+    let bin = std::env::var("CONNETTO_SERVER_BIN").ok()?;
+    let bind = bind_from_ws(&ws_url());
+    let auth_bind = bind_from_http(&auth_base());
+    let mut command = Command::new(&bin);
+    command
+        .env("CONNETTO_BIND", &bind)
+        .env("CONNETTO_AUTH_BIND", &auth_bind)
+        .env("CONNETTO_AUTH", "database")
+        .env("CONNETTO_WRITABLE", "orders")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Ok(path) = std::env::var("CONNETTO_TEST_PG_DDL_FILE") {
+        command.env("CONNETTO_PG_DDL_FILE", path);
+    }
+    if let Ok(path) = std::env::var("CONNETTO_TEST_PG_POLICIES_FILE") {
+        command.env("CONNETTO_PG_POLICIES_FILE", path);
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|err| panic!("spawning connetto-server at {bin}: {err}"));
+    wait_for_child_port(&mut child, &bind).await;
+    wait_for_child_port(&mut child, &auth_bind).await;
+    Some(ServerGuard(child))
 }
 
 /// The upstream schema version, hashed from the very file the server was started
@@ -95,24 +144,18 @@ fn encode_query_value(value: &str) -> String {
         .replace('/', "%2F")
 }
 
-/// Answer one request on a loopback port and return its path plus query.
-///
-/// This stands in for the listener a native client binds for its redirect. The
-/// client here is the test, so it plays that part itself rather than driving
-/// `NativeAuthenticator`, whose own flow is covered by `native_auth.rs`.
-async fn catch_one_redirect(listener: TcpListener) -> String {
-    let (mut stream, _) = listener.accept().await.expect("accept the redirect");
-    let mut buffer = [0u8; 4096];
-    let read = stream.read(&mut buffer).await.expect("read the request");
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-        .await
-        .expect("answer the redirect");
-    let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-    request
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or_default()
+fn redirect_location(response: &reqwest::Response, step: &str) -> String {
+    assert!(
+        response.status().is_redirection(),
+        "{step} returned {}",
+        response.status()
+    );
+    response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .unwrap_or_else(|| panic!("{step} did not return a Location header"))
+        .to_str()
+        .unwrap_or_else(|err| panic!("{step} returned a non UTF-8 Location header: {err}"))
         .to_owned()
 }
 
@@ -123,39 +166,41 @@ async fn log_in() -> String {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token();
 
-    // Bound before the walk, because the last hop of the chain is a redirect to
-    // this very port and the walk follows it.
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a loopback redirect");
-    let redirect = format!(
-        "http://{}/cb",
-        listener.local_addr().expect("the bound address")
-    );
-    let caught = tokio::spawn(catch_one_redirect(listener));
-
-    // No cookie jar: the dev provider auto-grants consent, so no step of the chain
-    // carries session state.
-    let http = reqwest::Client::new();
+    let redirect = "http://127.0.0.1:1/cb";
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build the HTTP client");
     let login = format!(
         "{}/auth/login?provider={}&redirect_uri={}&code_challenge={challenge}&state={state}",
         auth_base(),
         provider(),
-        encode_query_value(&redirect),
+        encode_query_value(redirect),
     );
-    let walked = http
+    let login_response = http
         .get(&login)
         .send()
         .await
-        .expect("the dev stack must be up: see this file's header");
-    assert!(
-        walked.status().is_success(),
-        "the login chain ended at {}",
-        walked.status()
-    );
-
-    let path = caught.await.expect("the redirect catcher ran");
-    let query = path
+        .expect("start the login with connetto");
+    let form_url = redirect_location(&login_response, "login start");
+    let callback_response = http
+        .post(&form_url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body("username=verified")
+        .send()
+        .await
+        .expect("submit the provider login");
+    let callback_url = redirect_location(&callback_response, "provider login");
+    let client_response = http
+        .get(&callback_url)
+        .send()
+        .await
+        .expect("complete the provider callback");
+    let client_url = redirect_location(&client_response, "server callback");
+    let query = client_url
         .split_once('?')
         .expect("the redirect carries a query")
         .1;
@@ -235,17 +280,23 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
 }
 
 #[tokio::test]
-#[ignore = "requires the dev stack (Postgres, dev_idp, connetto-server with CONNETTO_AUTH=database)"]
+#[ignore = "requires connetto-browser-stack or equivalent server environment"]
 async fn the_server_verifies_the_tokens_it_mints_and_the_rest_identify_nobody() {
+    let _server = maybe_spawn_server().await;
+
     // A token this server minted, for a session it stored, is accepted, and the
     // run it opens is the one the store already knows: presenting the same
     // token twice continues the same run rather than starting a second.
-    let token = log_in().await;
-    let first = handshake_with(&token)
+    let token = timeout(Duration::from_secs(15), log_in())
         .await
+        .expect("the login flow completes");
+    let first = timeout(Duration::from_secs(15), handshake_with(&token))
+        .await
+        .expect("the first verified handshake returns")
         .expect("a token this server minted is accepted at its own handshake");
-    let again = handshake_with(&token)
+    let again = timeout(Duration::from_secs(15), handshake_with(&token))
         .await
+        .expect("the repeated verified handshake returns")
         .expect("the same token opens the same run");
     assert_eq!(
         first, again,
@@ -258,11 +309,13 @@ async fn the_server_verifies_the_tokens_it_mints_and_the_rest_identify_nobody() 
     // handshake gets a freshly minted run of its own instead of the login's.
     // This is what proves the checking is real. The trusting default would have
     // put the forged caller on a run derived from what it claimed to be.
-    let forged = handshake_with("not-a-token")
+    let forged = timeout(Duration::from_secs(15), handshake_with("not-a-token"))
         .await
+        .expect("the first refused handshake returns")
         .expect("a refused grant does not close the connection");
-    let forged_again = handshake_with("not-a-token")
+    let forged_again = timeout(Duration::from_secs(15), handshake_with("not-a-token"))
         .await
+        .expect("the second refused handshake returns")
         .expect("a refused grant does not close the connection");
     assert_ne!(
         forged, first,
@@ -276,9 +329,13 @@ async fn the_server_verifies_the_tokens_it_mints_and_the_rest_identify_nobody() 
     // And a well-formed token for a session this server never issued lands the
     // same way, so the check is against the signature and the store rather than
     // merely against the shape.
-    let tampered = handshake_with(&format!("{token}tampered"))
-        .await
-        .expect("a refused grant does not close the connection");
+    let tampered = timeout(
+        Duration::from_secs(15),
+        handshake_with(&format!("{token}tampered")),
+    )
+    .await
+    .expect("the tampered handshake returns")
+    .expect("a refused grant does not close the connection");
     assert_ne!(
         tampered, first,
         "a tampered token must not land on the login's run"

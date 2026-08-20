@@ -7,8 +7,7 @@
 //! patch. The row is then read back through the admin pool (RLS off) to confirm
 //! it actually landed.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
-//! Run under Docker with `DATABASE_URL` pointed at it and `-- --ignored`.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::time::Duration;
 
@@ -62,18 +61,15 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<(i32, String)> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn write_lands_under_rls_and_fans_out_over_cdc() {
     let fixture = Fixture::acquire().await;
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS _connetto_mutations",
-            "DROP PUBLICATION IF EXISTS connetto_pub",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT)",
-            "ALTER TABLE notes REPLICA IDENTITY FULL",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
             "CREATE POLICY notes_p ON notes \
              USING (owner = current_setting('app.user_id', true)) \
@@ -82,8 +78,6 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
         ])
         .await;
-    // The watermark table is provisioned by the admin, as a deployment would:
-    // the restricted writer role cannot CREATE in schema public.
     connetto_test_harness::provision_watermark(fixture.admin()).await;
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")

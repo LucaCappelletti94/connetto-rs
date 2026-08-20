@@ -35,8 +35,8 @@ use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
 
 use crate::{
-    Client, Fixture, HarnessAuth, PUBLICATION, Server, ServerConfig, drop_slot, fga_store,
-    pool_for, spawn_server, with_user,
+    Client, Fixture, HarnessAuth, PUBLICATION, Server, ServerConfig, drop_slot, pool_for,
+    spawn_server, with_user,
 };
 
 /// The one-table catalog the fan-out fixture serves.
@@ -620,21 +620,12 @@ async fn provision_with(
     executor: Executor,
     caller: Option<SessionVariableMapping>,
 ) -> Server {
-    // A prior suite in the same full run may have left the shared publication
-    // behind (Fixture::acquire only cleans the slot), so drop it first.
-    fixture
-        .exec(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
-        .await;
     let mut statements: Vec<String> = vec![
         "DROP TABLE IF EXISTS items CASCADE".into(),
         "DROP TABLE IF EXISTS team_members CASCADE".into(),
         "DROP TABLE IF EXISTS teams CASCADE".into(),
     ];
     statements.extend(shape.setup());
-    statements.push("ALTER TABLE items REPLICA IDENTITY FULL".into());
-    if shape.published().contains(&"team_members") {
-        statements.push("ALTER TABLE team_members REPLICA IDENTITY FULL".into());
-    }
     statements.push(
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'r0_reader') \
          THEN CREATE ROLE r0_reader LOGIN PASSWORD 'r0_reader'; END IF; END $$"
@@ -690,7 +681,7 @@ async fn fga_auth(
     fixture: &Fixture,
     shape: PolicyShape,
 ) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
-    let (channel, store) = fga_store().await;
+    let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String>(
         shape.ddl(),
         shape.policies(),

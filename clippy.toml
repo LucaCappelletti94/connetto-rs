@@ -1,0 +1,13 @@
+doc-valid-idents = [
+    "DDL",
+    "MiB",
+    "OAuth",
+    "OpenFGA",
+    "Postgres",
+    "PostgreSQL",
+    "PRAGMA",
+    "SELECT",
+    "SQL",
+    "SQLite",
+    "WebSocket",
+]

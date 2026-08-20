@@ -59,7 +59,6 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -145,7 +144,6 @@ async fn first_reply<T: Transport>(client: &mut T, sub_id: &str, query: &str) ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn refusals_are_byte_identical_across_causes() {
     let logs = logging::install_once();
     let fixture = Fixture::acquire().await;
@@ -249,7 +247,6 @@ async fn refusals_are_byte_identical_across_causes() {
 /// read would both mark the name as registered and cost the client its data.
 /// No frame may precede the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");

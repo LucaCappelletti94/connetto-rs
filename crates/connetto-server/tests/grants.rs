@@ -151,7 +151,6 @@ async fn arrive(
 // nothing else.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn presenting_nothing_arrives_with_neither_identity_nor_capability() {
     let fixture = Fixture::acquire().await;
     let arrival = arrive(&fixture, "visitor", &[], None).await;
@@ -169,7 +168,6 @@ async fn presenting_nothing_arrives_with_neither_identity_nor_capability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn presenting_a_login_arrives_with_an_identity_and_no_capability() {
     let fixture = Fixture::acquire().await;
     let arrival = arrive(&fixture, "alice-client", &["user:alice"], None).await;
@@ -182,7 +180,6 @@ async fn presenting_a_login_arrives_with_an_identity_and_no_capability() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn presenting_a_key_arrives_with_a_capability_and_no_identity() {
     let fixture = Fixture::acquire().await;
     let arrival = arrive(&fixture, "bearer", &["key:abc123"], None).await;
@@ -201,7 +198,6 @@ async fn presenting_a_key_arrives_with_a_capability_and_no_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn presenting_both_arrives_with_both() {
     let fixture = Fixture::acquire().await;
     let arrival = arrive(
@@ -222,7 +218,6 @@ async fn presenting_both_arrives_with_both() {
 // What a refusal does, which is the half no client can observe.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn one_good_grant_beside_one_bad_one_signs_in_and_sees_less() {
     let fixture = Fixture::acquire().await;
     let both = arrive(
@@ -254,7 +249,6 @@ async fn one_good_grant_beside_one_bad_one_signs_in_and_sees_less() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn two_logins_leave_the_caller_unidentified_whichever_arrived_first() {
     let fixture = Fixture::acquire().await;
     let alice_first = arrive(&fixture, "confused", &["user:alice", "user:bob"], None).await;
@@ -270,7 +264,6 @@ async fn two_logins_leave_the_caller_unidentified_whichever_arrived_first() {
 // The handle a run with no identity comes back on.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_unidentified_run_resumes_on_the_handle_it_was_given() {
     let fixture = Fixture::acquire().await;
     let first = arrive(&fixture, "visitor", &[], None).await;
@@ -283,7 +276,6 @@ async fn an_unidentified_run_resumes_on_the_handle_it_was_given() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_invented_handle_is_refused_and_a_fresh_run_starts() {
     let fixture = Fixture::acquire().await;
     let victim = arrive(&fixture, "visitor", &[], None).await;
@@ -302,7 +294,6 @@ async fn an_invented_handle_is_refused_and_a_fresh_run_starts() {
 // is the whole visibility story and it is asserted rather than eyeballed.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_refused_grant_names_the_caller_and_which_grant_in_the_log() {
     let fixture = Fixture::acquire().await;
     let buffer = logging::install_once();

@@ -3,9 +3,6 @@
 //! promotes the survivor, which spawns a replacement worker and serves the tab
 //! a row written while the topology had no worker at all.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test election`
 
 #![cfg(target_arch = "wasm32")]
 
@@ -199,7 +196,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
     // Candidate A joins first: the lock is free, so it wins and spawns the
     // first DB worker.
     let membership_a = leader::join(&leader_lock, &glue);
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
     poll_until(|| membership_a.is_leader()).await;
     stage("candidate a leads, worker one ready");
 

@@ -12,8 +12,7 @@
 //! never reads the membership, so interest and permission can disagree in both
 //! directions.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`
-//! and an `OpenFGA` server (Docker).
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::time::Duration;
 
@@ -239,7 +238,6 @@ async fn no_live_for(client: &mut Client, sub_id: &str, timeout: Duration) {
 /// shortcut decision 2 refuses. The subscribed rows never change, so both
 /// moves are driven by the membership row alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_membership_change_moves_rows_without_a_resync() {
     let fixture = Fixture::acquire().await;
     let server = membership_term_fixture(&fixture).await;
@@ -349,7 +347,6 @@ async fn a_membership_change_moves_rows_without_a_resync() {
 /// nor a resync: the withdrawal question is `may_see` on the current row, and
 /// an allowed row is the replica's own membership copy's to stop matching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn the_term_intersects_the_policy_and_never_widens_it() {
     let fixture = Fixture::acquire().await;
     let server = term_over_owner_fixture(&fixture).await;

@@ -126,7 +126,6 @@ async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn reexec_bootstraps_folds_and_retriggers() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");

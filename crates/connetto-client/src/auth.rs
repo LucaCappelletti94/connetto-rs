@@ -13,7 +13,7 @@
 //! so a reconnect silently refreshes with no user interaction.
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -30,11 +30,49 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 
+fn ensure_keyring_store() -> Result<(), ClientError> {
+    static STORE: OnceLock<Result<(), Arc<str>>> = OnceLock::new();
+    STORE
+        .get_or_init(|| install_keyring_store().map_err(|err| Arc::<str>::from(err.to_string())))
+        .as_ref()
+        .copied()
+        .map_err(|err| ClientError::Auth(format!("keyring setup: {err}")))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+)))]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    Err(keyring_core::Error::Invalid(
+        "platform".to_owned(),
+        "native auth has no keyring store for this platform".to_owned(),
+    ))
+}
+
 /// The keyring sequence both secret stores here perform.
 ///
-/// One service holds one entry per name, and both stores need the first-run
-/// quirk [`entry`](Self::entry) documents, so the sequence lives here once and
-/// each store adds only what its own secret needs on top.
+/// One service holds one entry per name, so the sequence lives here once.
 struct Keyring {
     service: String,
 }
@@ -46,58 +84,42 @@ impl Keyring {
         }
     }
 
-    /// The keyring entry for `name`, or `None` when this platform's backend
-    /// reports that no such entry exists.
-    ///
-    /// Some backends resolve the credential when the entry is constructed rather
-    /// than when it is read, so "not stored yet" can surface here instead of from
-    /// [`get_password`](keyring::Entry::get_password). Reporting that as an error
-    /// would make a first run fatal, when it only means there is nothing to load.
-    fn entry(&self, name: &str) -> Result<Option<keyring::Entry>, ClientError> {
-        match keyring::Entry::new(&self.service, name) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring open: {err}"))),
-        }
+    /// The keyring entry for `name`.
+    fn entry(&self, name: &str) -> Result<keyring_core::Entry, ClientError> {
+        ensure_keyring_store()?;
+        keyring_core::Entry::new(&self.service, name)
+            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))
     }
 
     /// The secret stored under `name`, or `None` when none was stored.
     fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
-        let Some(entry) = self.entry(name)? else {
-            return Ok(None);
-        };
+        let entry = self.entry(name)?;
         match entry.get_password() {
             Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
         }
     }
 
     /// Persist `secret` under `name`, replacing any prior one.
     fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
-        // A backend that reports no entry before one is written still has to accept
-        // the write, so this asks for the entry again rather than reusing `entry`.
-        keyring::Entry::new(&self.service, name)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))?
+        self.entry(name)?
             .set_password(secret)
             .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
     }
 
     /// Remove the entry stored under `name`, if any.
     fn clear(&self, name: &str) -> Result<(), ClientError> {
-        let Some(entry) = self.entry(name)? else {
-            return Ok(());
-        };
+        let entry = self.entry(name)?;
         match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
         }
     }
 }
 
-/// OS secure storage for the refresh token: Keychain on macOS, Credential
-/// Manager on Windows, and the kernel keyutils keyring on Linux (daemon-free,
-/// session-scoped by default).
+/// OS secure storage for the refresh token: Keychain on Apple platforms,
+/// Credential Manager on Windows, and keyutils on Linux.
 ///
 /// One service holds one entry per account, exactly as [`KeyringKeyStore`]
 /// holds one per replica record.
@@ -113,6 +135,55 @@ impl KeyringStore {
             keyring: Keyring::new(service),
         }
     }
+
+    /// The indexed accounts, empty when nothing was ever stored.
+    ///
+    /// An index that does not parse is treated as absent rather than fatal: it is
+    /// a hint about what to offer, and refusing to open the store over it would
+    /// turn a listing problem into a lockout. The credentials themselves are
+    /// untouched, and the next sign-in rewrites it.
+    fn index(&self) -> Result<Vec<String>, ClientError> {
+        let Some(raw) = self.keyring.read(crate::replica::ACCOUNTS_RECORD)? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    fn write_index(&self, accounts: &[String]) -> Result<(), ClientError> {
+        let encoded = serde_json::to_string(accounts)
+            .map_err(|err| ClientError::Auth(format!("encoding the account index: {err}")))?;
+        self.keyring
+            .write(crate::replica::ACCOUNTS_RECORD, &encoded)
+    }
+}
+
+/// `known` with `account` added, or `None` when the index already says what it
+/// needs to and no write is worth its round trip.
+///
+/// A reserved record is never indexed: it shares the key namespace with the
+/// accounts, and offering one as somebody to sign in as would put a credential
+/// nobody owns in front of a user.
+fn indexed_with(known: &[String], account: &str) -> Option<Vec<String>> {
+    if crate::is_reserved_record(account) || known.iter().any(|name| name == account) {
+        return None;
+    }
+    let mut updated = known.to_vec();
+    updated.push(account.to_owned());
+    Some(updated)
+}
+
+/// `known` with `account` removed, or `None` when it was not there.
+fn indexed_without(known: &[String], account: &str) -> Option<Vec<String>> {
+    if crate::is_reserved_record(account) || !known.iter().any(|name| name == account) {
+        return None;
+    }
+    Some(
+        known
+            .iter()
+            .filter(|name| *name != account)
+            .cloned()
+            .collect(),
+    )
 }
 
 impl RefreshTokenStore for KeyringStore {
@@ -122,12 +193,36 @@ impl RefreshTokenStore for KeyringStore {
         self.keyring.read(account)
     }
 
+    /// Writes the entry, then records the account in the index so
+    /// [`accounts`](Self::accounts) can answer at all.
+    ///
+    /// The index is maintained here rather than by the authenticator so that no
+    /// caller can write a credential without it being listable. A reserved
+    /// record is not an account and is not indexed.
     fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
-        self.keyring.write(account, token)
+        self.keyring.write(account, token)?;
+        match indexed_with(&self.index()?, account) {
+            Some(updated) => self.write_index(&updated),
+            None => Ok(()),
+        }
     }
 
+    /// Removes the entry and drops the account from the index.
+    ///
+    /// The entry goes first, so an interruption leaves a listed account with no
+    /// credential, which costs an interactive login. The other order would leave
+    /// a credential nothing can list, which is a secret the user cannot see or
+    /// reach.
     fn clear(&self, account: &str) -> Result<(), ClientError> {
-        self.keyring.clear(account)
+        self.keyring.clear(account)?;
+        match indexed_without(&self.index()?, account) {
+            Some(updated) => self.write_index(&updated),
+            None => Ok(()),
+        }
+    }
+
+    fn accounts(&self) -> Result<Vec<String>, ClientError> {
+        self.index()
     }
 }
 
@@ -164,6 +259,39 @@ impl RefreshTokenStore for MemoryRefreshStore {
             .remove(account);
         Ok(())
     }
+
+    /// Enumerated from the map itself, so it cannot disagree with what is stored.
+    fn accounts(&self) -> Result<Vec<String>, ClientError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("refresh store lock")
+            .keys()
+            .filter(|name| !crate::is_reserved_record(name))
+            .cloned()
+            .collect())
+    }
+}
+
+/// The account key this device last signed in under, if it ever did.
+///
+/// This is what a start reads to know which stored credential to try, and it is
+/// also what makes a start with no network possible at all: the replica file is
+/// named from the account, and the account otherwise only arrives inside a token
+/// response, which needs the network to fetch.
+///
+/// Decode it into the deployment's own id type with
+/// [`decode_identity`](crate::decode_identity) when the caller wants to show who
+/// it is rather than address a record.
+///
+/// # Errors
+///
+/// [`ClientError`] if the store cannot be read.
+pub fn remembered_account<S>(store: &S) -> Result<Option<String>, ClientError>
+where
+    S: RefreshTokenStore<Error = ClientError> + ?Sized,
+{
+    store.load(IDENTITY_RECORD)
 }
 
 /// The effective key for the replica `name`, minting one when this device has
@@ -362,14 +490,14 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
 /// Acquires and refreshes connetto's own tokens for a native client, driving the
 /// loopback Authorization Code plus PKCE flow against connetto-server.
 ///
-/// It holds the account whose record it reads and writes, rather than passing
-/// one at each call, so every method addresses the same record by construction
-/// and no two call sites can disagree about which credential this is.
+/// It holds the account whose stored credential it should try, rather than
+/// passing one at each call, so no two call sites can disagree about which
+/// credential this is.
 pub struct NativeAuthenticator {
     server_base: String,
     provider: String,
     store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
-    account: String,
+    account: Option<String>,
     opener: BrowserOpener,
     http: reqwest::Client,
 }
@@ -377,20 +505,26 @@ pub struct NativeAuthenticator {
 impl NativeAuthenticator {
     /// Build over connetto-server's auth base URL (for example
     /// `http://127.0.0.1:8081`), the provider name to log in with, a refresh
-    /// token store, and the account naming this credential's record in it.
-    /// Uses the system browser.
+    /// token store, and the account whose stored credential to try. Uses the
+    /// system browser.
+    ///
+    /// `account` is `None` when there is nothing to try, which is a first run and
+    /// any start where nothing was remembered. It is not a placeholder for an
+    /// unknown account: the token is what reveals the account, so a run with none
+    /// skips the silent attempt rather than addressing a literal. Read the
+    /// remembered one with [`remembered_account`].
     #[must_use]
     pub fn new(
         server_base: impl Into<String>,
         provider: impl Into<String>,
         store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
-        account: impl Into<String>,
+        account: Option<String>,
     ) -> Self {
         Self {
             server_base: server_base.into(),
             provider: provider.into(),
             store,
-            account: account.into(),
+            account,
             opener: system_browser_opener(),
             http: reqwest::Client::new(),
         }
@@ -415,7 +549,8 @@ impl NativeAuthenticator {
     pub async fn acquire<Id: DeserializeOwned + serde::Serialize>(
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
-        if self.store.load(&self.account)?.is_some()
+        if let Some(account) = self.account.as_deref()
+            && self.store.load(account)?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
             return Ok(session);
@@ -446,9 +581,13 @@ impl NativeAuthenticator {
     /// has no id type to decode into, so it must not be forced to name one it
     /// could then write to the identity record.
     async fn refresh_tokens<Id: DeserializeOwned>(&self) -> Result<TokenResponse<Id>, ClientError> {
+        let account = self
+            .account
+            .as_deref()
+            .ok_or_else(|| ClientError::Auth("no account to refresh".to_owned()))?;
         let refresh = self
             .store
-            .load(&self.account)?
+            .load(account)?
             .ok_or_else(|| ClientError::Auth("no stored refresh token".to_owned()))?;
         let response: TokenResponse<Id> = self
             .post_json(
@@ -456,7 +595,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await?;
-        self.store.store(&self.account, &response.refresh_token)?;
+        self.store.store(account, &response.refresh_token)?;
         Ok(response)
     }
 
@@ -501,7 +640,13 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "code": code, "code_verifier": verifier }),
             )
             .await?;
-        self.store.store(&self.account, &response.refresh_token)?;
+        // Keyed off the response, because a first login has no account to key on
+        // and learns it here. The marker's value is the same encoding, so it is
+        // literally the key of the record it points at.
+        self.store.store(
+            &encode_identity(&response.user_id)?,
+            &response.refresh_token,
+        )?;
         self.remember(&response.user_id)?;
         Ok(response.into())
     }
@@ -569,7 +714,13 @@ impl NativeAuthenticator {
     /// after the local clear. [`ClientError::Auth`] if the store cannot be read
     /// or cleared.
     pub async fn logout(&self) -> Result<(), ClientError> {
-        let Some(refresh) = self.store.load(&self.account)? else {
+        // Signing out is per account: any other stored credential survives, and
+        // the marker is left naming an account with none, which the next start
+        // answers with an interactive login rather than by picking somebody else.
+        let Some(account) = self.account.as_deref() else {
+            return Ok(());
+        };
+        let Some(refresh) = self.store.load(account)? else {
             return Ok(());
         };
         let revoked = self
@@ -578,7 +729,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await;
-        self.store.clear(&self.account)?;
+        self.store.clear(account)?;
         revoked.map(drop)
     }
 
@@ -682,8 +833,77 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{MemoryKeyStore, provision_replica_key};
+    use super::{MemoryKeyStore, indexed_with, indexed_without, provision_replica_key};
     use connetto_core::traits::ReplicaKeyStore as _;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    /// R42: the native account index, which is the only thing that can answer
+    /// what the OS keyring holds. `keyring` 3.6.3 exposes no enumeration on any
+    /// backend, so a wrong answer here is a picker offering accounts that are not
+    /// there or hiding ones that are.
+    ///
+    /// The integration twin against the real keyring is
+    /// `the_keyring_refresh_store_lists_every_account_it_holds`, which a headless
+    /// or locked session cannot run. This half needs no secure storage.
+    #[test]
+    fn the_account_index_records_each_account_once() {
+        assert_eq!(
+            indexed_with(&[], "\"alice\"").as_deref(),
+            Some(names(&["\"alice\""]).as_slice()),
+            "a first account enters the index"
+        );
+        assert_eq!(
+            indexed_with(&names(&["\"alice\""]), "\"bob\"").as_deref(),
+            Some(names(&["\"alice\"", "\"bob\""]).as_slice()),
+            "and a second joins it rather than replacing it, which is the phase"
+        );
+        assert_eq!(
+            indexed_with(&names(&["\"alice\""]), "\"alice\""),
+            None,
+            "a rotation re-stores the same account, and must not duplicate it"
+        );
+    }
+
+    /// Connetto's own records share the key namespace with the accounts, so the
+    /// marker must never reach the index. It is written on every single token
+    /// acquisition, so getting this wrong offers it to every picker.
+    #[test]
+    fn the_account_index_refuses_connettos_own_records() {
+        assert_eq!(
+            indexed_with(&[], crate::IDENTITY_RECORD),
+            None,
+            "the last-used marker is not somebody to sign in as"
+        );
+        assert_eq!(
+            indexed_with(&[], super::super::replica::ACCOUNTS_RECORD),
+            None,
+            "and neither is the index itself"
+        );
+    }
+
+    /// Signing one account out leaves the others listed, which is what makes the
+    /// remaining ones still signed in.
+    #[test]
+    fn the_account_index_drops_only_the_account_signed_out() {
+        assert_eq!(
+            indexed_without(&names(&["\"alice\"", "\"bob\""]), "\"alice\"").as_deref(),
+            Some(names(&["\"bob\""]).as_slice()),
+            "the other account stays signed in"
+        );
+        assert_eq!(
+            indexed_without(&names(&["\"bob\""]), "\"alice\""),
+            None,
+            "clearing an account that was never there writes nothing"
+        );
+        assert_eq!(
+            indexed_without(&names(&["\"bob\""]), crate::IDENTITY_RECORD),
+            None,
+            "and clearing the marker leaves the accounts alone"
+        );
+    }
 
     fn key_from_byte(b: u8) -> ReplicaKey {
         ReplicaKey::from_bytes([b; ReplicaKey::LEN])

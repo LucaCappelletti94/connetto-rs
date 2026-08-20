@@ -10,7 +10,9 @@
 //! acknowledgement (a connection that died just before the ack arrived).
 //!
 //! The server write target is the real Postgres path, so the exactly-once
-//! landing is read back from Postgres. `#[ignore]` by default: needs Docker.
+//! landing is read back from Postgres.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
 
@@ -258,7 +260,6 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn sent_but_unprocessed_mutation_replays_after_resume() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -322,7 +323,6 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn applied_but_unacked_mutation_dedupes_on_resume() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -400,7 +400,6 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn restart_replays_persisted_pending() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;

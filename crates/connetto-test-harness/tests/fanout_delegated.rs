@@ -15,8 +15,7 @@
 //! The count is exact rather than a bound: watchers divided by the cap, rounded
 //! up, per event.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with
-//! `wal_level=logical` and an `OpenFGA` server.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{PolicyShape, fanout_run};
@@ -38,7 +37,6 @@ const fn calls_per_event(watchers: u64) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_policy_the_row_does_not_settle_costs_one_batch_per_fifty_watchers() {
     let fixture = Fixture::acquire().await;
     let small = fanout_run(&fixture, SMALL, EVENTS, PolicyShape::CrossTable).await;

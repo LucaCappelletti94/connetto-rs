@@ -99,7 +99,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("hub pump");
     });
-    serve_logout_requests(unused_auth(), AUTH_DB, REPLICA, hub.clone())
+    serve_logout_requests(unused_auth(), AUTH_DB, REPLICA, None, hub.clone())
         .expect("install the logout service");
 
     // The query reports the stranded work, so a prompt can name it.

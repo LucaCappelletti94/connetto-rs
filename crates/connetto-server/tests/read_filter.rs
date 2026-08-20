@@ -216,7 +216,6 @@ async fn connected_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
     let fixture = Fixture::acquire().await;
     let applier = Materializer::new(PG_DDL).expect("build applier");
@@ -308,7 +307,6 @@ impl CdcSource for OneEvent {
 /// table with nothing said, and the pause a client would see names the
 /// authorization service, which is not what went wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
     let fixture = Fixture::acquire().await;
     // No predicate, so the subscription's set is keyed by the primary key alone

@@ -5,7 +5,6 @@
 //! button would: ask how much is unsynced, log out keeping the data, log out
 //! destroying it.
 //!
-//! Needs the stack up. See `authenticated_boot.rs` for the commands.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -15,7 +14,7 @@ use common::{REFRESH_DB, auth_config, play_the_tab, worker_config};
 use connetto_core::traits::RefreshTokenStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    IdbKeyStore, LogoutOutcome, REFRESH_RECORD, RefreshStore, request_logout, request_unsynced,
+    IdbKeyStore, LogoutOutcome, RefreshStore, request_logout, request_unsynced,
 };
 use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key, take_pending_wipes};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -65,10 +64,7 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
     let store =
         RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("the store still opens");
     assert!(
-        store
-            .load(REFRESH_RECORD)
-            .expect("read the store")
-            .is_none(),
+        store.accounts().expect("list accounts").is_empty(),
         "the credential is gone, so the next boot cannot refresh silently"
     );
     drop(store);

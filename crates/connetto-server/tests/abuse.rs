@@ -22,8 +22,7 @@
 //! * **revoking a share produces no refusal at all**, which is the correction
 //!   this whole phase rests on.
 //!
-//! `#[ignore]` by default: the ban list, the audit table and the write target
-//! all need a running Postgres.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -486,7 +485,6 @@ async fn expect_dropped(live: Live) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -523,7 +521,6 @@ async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -579,7 +576,6 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
 /// An expiry that passes stops applying with nothing having run, and a lift is
 /// the only way a ban ends with a record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -651,7 +647,6 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
 /// subscribes successfully and then has every row withheld by the policy, which
 /// is what a filtered read is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn filtered_reads_drive_no_counter() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -713,7 +708,6 @@ async fn filtered_reads_drive_no_counter() {
 /// An unidentified caller is closed and the application is never asked, because
 /// a verdict about a caller nobody can ban would mean nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -749,7 +743,6 @@ async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
 /// The reader half is the assertion that matters: on that pool the row is not an
 /// error but zero rows, so a regression here fails silently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -810,7 +803,6 @@ async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone(
 /// An offline queue flushing rejected writes must not reach the threshold, since
 /// that is the honest burst the shipped numbers have to clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_offline_queue_of_rejected_writes_does_not_reach_the_threshold() {
     const FLUSHED: u64 = 100;
 
@@ -871,7 +863,6 @@ async fn an_offline_queue_of_rejected_writes_does_not_reach_the_threshold() {
 /// logins do, so a tally keyed on the handle would start over on the second and
 /// never cross.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_persons_tally_survives_signing_out_and_back_in() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -899,7 +890,6 @@ async fn a_persons_tally_survives_signing_out_and_back_in() {
 /// Two connections of one person accumulate once, and a ban ends both, since a
 /// person holds one connection per device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn one_person_on_two_connections_accumulates_once_and_both_close() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -925,7 +915,6 @@ async fn one_person_on_two_connections_accumulates_once_and_both_close() {
 /// this connection. The withdrawn key still checks out, so the handshake
 /// completes, the caller counts nothing, and the rows simply stop matching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn revoking_a_share_produces_no_grant_refusal() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
@@ -972,7 +961,6 @@ async fn revoking_a_share_produces_no_grant_refusal() {
 /// which is the realistic shape: a signed-in caller working through a list of
 /// keys it should not hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_tripped_credential_limit_still_counts_its_refusals() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;

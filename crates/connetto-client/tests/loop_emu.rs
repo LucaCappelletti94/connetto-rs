@@ -10,6 +10,8 @@
 //!    the mutation land on the server's write target.
 //!
 //! Reads on both sides go through typed diesel queries; backend DML stays SQL.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
 
 #![allow(clippy::too_many_lines)]
 
@@ -434,7 +436,6 @@ async fn pump_for(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -607,7 +608,6 @@ async fn step_until(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn connection_autosubmits_writes_and_reports_changed_tables() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -764,7 +764,6 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn connection_is_a_diesel_connection() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -889,7 +888,6 @@ async fn connection_is_a_diesel_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rejected_write_rolls_back_locally() {
     let fixture = Fixture::acquire().await;
     // A materializer with no writable tables rejects every client mutation, so
@@ -1020,7 +1018,6 @@ async fn rejected_write_rolls_back_locally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn conflicting_write_rolls_back_and_reports_keys() {
     let fixture = Fixture::acquire().await;
     // orders.status is the declared version column. The snapshot seeds the
@@ -1192,7 +1189,6 @@ async fn connect_client(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn conflicting_write_converges_to_server_after_rollback() {
     let fixture = Fixture::acquire().await;
     // Two clients share one server. Client B lands an update that moves the
@@ -1477,7 +1473,6 @@ fn aggregate_result(event: ClientEvent) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let fixture = Fixture::acquire().await;
     // The client subscribes to MIN(quantity). The server bootstraps the value
@@ -1568,7 +1563,6 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn unsupported_subscription_is_rejected_without_closing() {
     let fixture = Fixture::acquire().await;
     // A query subql cannot register (a grouped aggregate) is refused at
@@ -1694,7 +1688,6 @@ async fn first_aggregate_frame(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     let fixture = Fixture::acquire().await;
     // The client subscribes to COUNT(*), SUM(quantity), and AVG(quantity) at
@@ -1865,7 +1858,6 @@ impl AsyncConnector for GatedSeed {
 /// accumulated value, permanently short by one. The second insert is what
 /// makes that visible, since it forces a delivery whose value can be checked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -1949,7 +1941,6 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
 /// the subscribe. Moving the initial send onto its own task would break that
 /// with nothing else failing, which is what this asserts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_aggregates_first_frame_is_its_full_result() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -2015,7 +2006,6 @@ async fn an_aggregates_first_frame_is_its_full_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn aggregate_on_rls_table_is_rejected_without_closing() {
     // subql rejects an aggregator on an RLS-protected table at registration.
     // connetto surfaces that as a NonFatal event, leaving the session intact.
@@ -2077,7 +2067,6 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
     let fixture = Fixture::acquire().await;
     // A valid COUNT(*) registers as a delta aggregate, but this manager has no
@@ -2140,7 +2129,6 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn row_subscription_and_delta_aggregate_coexist() {
     let fixture = Fixture::acquire().await;
     // One client holds a row subscription and a COUNT(*) delta aggregate on the
@@ -2262,7 +2250,6 @@ async fn row_subscription_and_delta_aggregate_coexist() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn unsubscribing_a_delta_aggregate_stops_updates() {
     let fixture = Fixture::acquire().await;
     // After an Unsubscribe, the server drops the accumulator and the route, so a
@@ -2369,7 +2356,6 @@ async fn wait_broadcast(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     let fixture = Fixture::acquire().await;
     // The full live-query loop: a typed diesel query becomes a LiveQuery whose
@@ -2504,7 +2490,6 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_value_tracks_a_server_aggregate() {
     let fixture = Fixture::acquire().await;
     // A typed aggregate query becomes a LiveValue fed exclusively by server
@@ -2626,7 +2611,6 @@ async fn live_value_tracks_a_server_aggregate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn live_value_decodes_a_temporal_aggregate() {
     // A typed live() over MAX of a TIMESTAMP column. subql re-executes MIN/MAX
     // on any orderable type, so a scalar outside the old numeric and text
@@ -2718,7 +2702,6 @@ async fn live_value_decodes_a_temporal_aggregate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn identical_row_watches_share_one_subscription() {
     let fixture = Fixture::acquire().await;
     // Two components rendering the same query must collapse to ONE wire
@@ -2882,7 +2865,6 @@ async fn identical_row_watches_share_one_subscription() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn distinct_row_queries_do_not_collapse() {
     let fixture = Fixture::acquire().await;
     // Dedup must key on the query: two different predicates each open their own
@@ -2961,7 +2943,6 @@ async fn distinct_row_queries_do_not_collapse() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cache() {
     let fixture = Fixture::acquire().await;
     // Two identical aggregate watches share one wire sub. The connector holds
@@ -3101,7 +3082,6 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_drives_a_boxed_row_query() {
     let fixture = Fixture::acquire().await;
     // The load-bearing case for watch_fn: a boxed (.into_boxed()) row query is
@@ -3227,7 +3207,6 @@ async fn watch_fn_drives_a_boxed_row_query() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_shares_a_subscription_with_watch() {
     let fixture = Fixture::acquire().await;
     // A boxed watch_fn and a typed live() watch that render the same spec
@@ -3312,7 +3291,6 @@ async fn watch_fn_shares_a_subscription_with_watch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn watch_fn_rejects_an_aggregate_query() {
     let fixture = Fixture::acquire().await;
     // watch_fn drives rows. A boxed aggregate shape is refused with the
@@ -3420,7 +3398,6 @@ async fn drive_cdc<S: SnapshotSource>(
 /// materializer up front but its route was installed only after `SnapshotEnd`,
 /// so `dispatch_event` built the patch and dropped it, and nothing replayed it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_change_committed_during_the_snapshot_reaches_the_replica() {
     let fixture = Fixture::acquire().await;
     let entered = Arc::new(Notify::new());
@@ -3476,7 +3453,6 @@ async fn a_change_committed_during_the_snapshot_reaches_the_replica() {
 /// later value and appears exactly once, which is why no discard rule is
 /// needed. See `04-subscriptions.md`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_snapshot_overlap_converges_on_the_later_value() {
     let fixture = Fixture::acquire().await;
     let entered = Arc::new(Notify::new());
@@ -3545,7 +3521,6 @@ async fn the_snapshot_overlap_converges_on_the_later_value() {
 /// ever and the middle assertion passed for the wrong reason, which is why the
 /// last assertion is what proves a departure is delivered at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -3650,7 +3625,6 @@ async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
 /// is invisible to a test with a second subscription, because there the row is
 /// meant to stay, which is why this one exists separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_row_that_leaves_its_only_subscription_is_removed() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -3756,7 +3730,6 @@ fn persisted_cursor(conn: &mut SqliteConnection) -> Option<Vec<u8>> {
 /// therefore pumps for a bounded period and asserts what did and did not land,
 /// rather than waiting for a frame that must stop arriving once the fix is in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -3906,7 +3879,6 @@ async fn drive_insert<O: Oplog>(
 /// Demonstrating: this failed before the fix, the second run producing
 /// `[SyncStatus(Connected)]` and no frame of any kind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
@@ -4005,7 +3977,6 @@ async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
 /// restart, and it says so because a passing catchup is otherwise hard to tell
 /// apart from a resync that happened to deliver the same rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_durable_log_lets_a_restart_resume_incrementally() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;

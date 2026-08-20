@@ -2,9 +2,8 @@
 //!
 //! A locally minted, locally signed ID token exercises the real verification
 //! path: the mapping to a [`ResolvedIdentity`](connetto_server::ResolvedIdentity), the nonce and audience checks,
-//! and the MFA assurance bar, all with no network. The retained-token accessor
-//! is driven through a real OIDC provider on a loopback socket, so its
-//! refresh and persistence are exercised against real token responses.
+//! and the MFA assurance bar. The retained-token accessor uses the containerised
+//! OIDC provider so refresh and persistence run against real token responses.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -17,7 +16,7 @@ use connetto_server::{
     InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, RequestGuard,
     TokenAuthority, VerifiedLogin,
 };
-use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     CoreRsaPrivateSigningKey,
@@ -173,43 +172,27 @@ async fn service_with_real_provider() -> (
     Arc<TokenAuthority>,
     AuthService<InMemoryAuthStore>,
     VerifiedLogin,
-    OAuthTestServer,
+    MockOauth,
 ) {
     const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
-    let idp = OAuthTestServer::start_with_config(IssuerConfig {
-        host: "127.0.0.1".into(),
-        port: 0,
-        ..IssuerConfig::default()
-    })
-    .await;
-    let issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
-    let client = idp
-        .register_client(serde_json::json!({
-            "redirect_uris": [CALLBACK],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "scope": "openid",
-        }))
-        .await;
-    let provider: Arc<dyn IdentityProvider> = Arc::new(
-        GenericOidcProvider::discover(
-            OidcProviderConfig::new("mock-idp", client.client_id.clone(), issuer, CALLBACK)
-                .with_client_secret(client.client_secret.clone()),
-            reqwest::Client::new(),
-        )
-        .await
-        .expect("discover provider"),
-    );
+    let idp = MockOauth::start().await;
+    let provider = GenericOidcProvider::discover(
+        idp.oidc_config(MOCK_OAUTH_PROVIDER, CALLBACK),
+        reqwest::Client::new(),
+    )
+    .await
+    .expect("discover provider");
     let redirect = provider.begin_login().expect("begin login");
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build http client");
     let resp = http
-        .get(&redirect.authorize_url)
+        .post(&redirect.authorize_url)
+        .form(&[("username", "provider-user")])
         .send()
         .await
-        .expect("GET authorize");
+        .expect("POST authorize");
     let location = resp
         .headers()
         .get("location")
@@ -226,6 +209,7 @@ async fn service_with_real_provider() -> (
         .complete_login(&code, &redirect.pkce_verifier, &redirect.nonce)
         .await
         .expect("complete login");
+    let provider: Arc<dyn IdentityProvider> = Arc::new(provider);
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
     let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));

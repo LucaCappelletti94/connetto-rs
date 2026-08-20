@@ -307,6 +307,89 @@ pub fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
     store.clear(bob).expect("clear bob");
 }
 
+/// Every stored account is listed, and connetto's own records are not, driven
+/// through a [`RefreshTokenStore`](crate::traits::RefreshTokenStore) by name
+/// alone.
+///
+/// The sibling of [`two_accounts_keep_their_own_token`] and the same doctrine:
+/// one caller written against the trait, run against every implementation on both
+/// targets, because the two answer it by different means. The browser reads the
+/// rows the tokens live in, and the native store reads an index it maintains,
+/// since `keyring` exposes no enumeration on any backend.
+///
+/// `reserved` is one of connetto's own record names, which the caller supplies
+/// because the core does not define them. Writing it and finding it absent from
+/// the list is the load-bearing assertion here: a reserved record shares the key
+/// namespace with the accounts, and offering one as somebody to sign in as would
+/// put a credential nobody owns in front of a user.
+///
+/// Order carries no meaning, so nothing here asserts one.
+///
+/// # Panics
+///
+/// If a stored account is missing from the list, a cleared one survives in it, or
+/// a reserved record appears in it.
+pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
+    store: &S,
+    alice: &str,
+    bob: &str,
+    reserved: &str,
+) {
+    assert_ne!(alice, bob, "the two accounts must differ");
+    for name in [alice, bob, reserved] {
+        store.clear(name).expect("clear");
+    }
+
+    let listed = store.accounts().expect("list an empty store");
+    assert!(
+        !listed.contains(&alice.to_owned()) && !listed.contains(&bob.to_owned()),
+        "an empty store offers neither account, got {listed:?}"
+    );
+
+    store.store(alice, "alice-refresh").expect("store alice");
+    let listed = store.accounts().expect("list one account");
+    assert!(listed.contains(&alice.to_owned()), "alice is listed");
+    assert!(
+        !listed.contains(&bob.to_owned()),
+        "bob is not, having stored nothing"
+    );
+
+    store.store(bob, "bob-refresh").expect("store bob");
+    let listed = store.accounts().expect("list two accounts");
+    assert!(
+        listed.contains(&alice.to_owned()) && listed.contains(&bob.to_owned()),
+        "both accounts are signed in at once, got {listed:?}"
+    );
+
+    store
+        .store(reserved, "not-an-account")
+        .expect("store the reserved record");
+    let listed = store.accounts().expect("list past a reserved record");
+    assert!(
+        !listed.contains(&reserved.to_owned()),
+        "connetto's own record is not somebody to sign in as, got {listed:?}"
+    );
+    assert!(
+        listed.contains(&alice.to_owned()) && listed.contains(&bob.to_owned()),
+        "and it hid neither account, got {listed:?}"
+    );
+
+    store.clear(alice).expect("clear alice");
+    let listed = store.accounts().expect("list after a clear");
+    assert!(
+        !listed.contains(&alice.to_owned()),
+        "a signed-out account is no longer offered, got {listed:?}"
+    );
+    assert!(
+        listed.contains(&bob.to_owned()),
+        "and the other stays signed in, got {listed:?}"
+    );
+
+    for name in [bob, reserved] {
+        store.clear(name).expect("clear");
+    }
+}
+
 /// Two accounts on one device, driven through a
 /// [`ReplicaKeyStore`](crate::traits::ReplicaKeyStore) by name alone. The
 /// awaiting twin of [`two_accounts_keep_their_own_token`], and the same

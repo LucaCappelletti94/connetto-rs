@@ -17,96 +17,19 @@
 //! the branch fired. The fourth, recovering from a refresh store that no longer
 //! decrypts, is in `authenticated_boot_recovery.rs`.
 //!
-//! **Needs the stack up.** Database, single-origin auth stack, and sync server:
-//!
-//! ```text
-//! docker run -d --rm --name connetto-smoke-pg -e POSTGRES_PASSWORD=postgres \
-//!   -p 55471:5432 postgres:16 -c wal_level=logical
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "$(cat examples/wasm-smoke/schema.sql)"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "$(cat examples/wasm-smoke/policies.sql)"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE PUBLICATION connetto_pub FOR TABLE orders"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TABLE connetto_sessions (session_id UUID PRIMARY KEY, \
-//!       user_id TEXT NOT NULL, current_refresh_hash BYTEA NOT NULL, \
-//!       idle_deadline TIMESTAMPTZ NOT NULL, absolute_deadline TIMESTAMPTZ NOT NULL, \
-//!       revoked BOOLEAN NOT NULL DEFAULT FALSE)"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TABLE connetto_provider_tokens (session_id UUID PRIMARY KEY \
-//!       REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
-//!       issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
-//!       expires_at TIMESTAMPTZ)"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TABLE _connetto_mutations (session_id UUID PRIMARY KEY, \
-//!       last_seq BIGINT NOT NULL)"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TYPE connetto_change_op AS ENUM ('insert','update','delete','truncate')"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "CREATE TABLE connetto_oplog (lsn BIGINT PRIMARY KEY, table_name TEXT NOT NULL, \
-//!       op connetto_change_op NOT NULL, pk BYTEA NOT NULL, is_tombstone BOOLEAN NOT NULL, \
-//!       event BYTEA NOT NULL, appended_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-//! psql postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   -c "$(cat examples/wasm-smoke/roles.sql)"
-//! mkdir -p target/devkeys
-//! openssl genpkey -algorithm ed25519 -out target/devkeys/priv.pem
-//! openssl pkey -in target/devkeys/priv.pem -pubout -out target/devkeys/pub.pem
-//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
-//!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
-//!   cargo run --release --all-features -p connetto-server --example auth_stack
-//! CONNETTO_BIND=127.0.0.1:7777 CONNETTO_WRITABLE=orders \
-//!   CONNETTO_PG_DDL_FILE=examples/wasm-smoke/schema.sql \
-//!   CONNETTO_PG_POLICIES_FILE=examples/wasm-smoke/policies.sql \
-//!   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55471/postgres \
-//!   CONNETTO_READER_URL=postgres://connetto_reader:connetto_reader@127.0.0.1:55471/postgres \
-//!   CONNETTO_JWT_PRIVATE_KEY_FILE=target/devkeys/priv.pem \
-//!   CONNETTO_JWT_PUBLIC_KEY_FILE=target/devkeys/pub.pem \
-//!   CONNETTO_AUTH=database CONNETTO_AUTH_BIND=127.0.0.1:18081 \
-//!   CONNETTO_OIDC_PROVIDER=generic CONNETTO_OIDC_NAME=dev-idp \
-//!   CONNETTO_OIDC_ISSUER=http://127.0.0.1:18099 CONNETTO_OIDC_CLIENT_ID=unused \
-//!   CONNETTO_OIDC_REDIRECT_URL=http://127.0.0.1:18081/auth/callback \
-//!   cargo run --release --all-features -p connetto-server --bin connetto-server
-//! wasm-pack test --headless --chrome examples/wasm-smoke --test authenticated_boot
-//! ```
-//!
-//! Both processes select `DbAuthStore` because `DATABASE_URL` is set, so the two
-//! session tables have to exist before either starts, and `connetto_sessions` is
-//! first because `connetto_provider_tokens` references it. The watermark table
-//! deliberately references nothing: every run has a handle and only a login has
-//! a row in `connetto_sessions`, so a foreign key there would fail on the first
-//! write by a caller with no identity, and the server now refuses to start
-//! against a table that still declares one. They belong to the deployment, not
-//! to connetto, which emits no server DDL: the shape is the reference SQL under
-//! "Migrations" in `docs/architecture/11-authentication.md`, over the `TEXT`
-//! `user_id` the reference binary's `String` id maps to. The reader role needs no
-//! grant on them, since both processes reach the store through the owner pool.
-//!
-//! The login server has to be `auth_stack` rather than `dev_idp` behind the sync
-//! server's own auth router: a worker walks the login with `fetch`, and a chain
-//! that hops to a second origin and back cannot be followed, so every hop stays
-//! on one origin. The two processes share the token keys and the session store,
-//! which is what makes a token the stack mints verify at the sync handshake. The
-//! sync server's own login routes are never reached from a test, so its
-//! `CONNETTO_OIDC_*` values only have to build a registry.
-//!
-//! The server reads the schema from the same file the client hashes, because
-//! the handshake compares them and a reworded copy is a different schema.
+//! The browser-stack runner supplies Postgres, OpenFGA, the provider, keys, and the sync server.
 
 #![cfg(target_arch = "wasm32")]
 
 mod common;
 
 use common::{REFRESH_DB, auth_config, play_the_tab, walk_the_login, worker_config};
-use connetto_client::replica_db_name;
+use connetto_client::{encode_identity, replica_db_name};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, REFRESH_RECORD, RefreshStore,
-    provision_replica_key, remembered_identity,
+    Acquired, BrowserAuthenticator, IdbKeyStore, RefreshStore, provision_replica_key,
+    remembered_account, remembered_identity,
 };
 use connetto_web::storage::{
     ReplicaStorage, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
@@ -137,7 +60,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let user_id = {
         let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device)
             .expect("open the refresh store");
-        let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
+        let authenticator = BrowserAuthenticator::new(auth_config(), None);
         let pending = match authenticator
             .acquire::<String, _>(&store)
             .await
@@ -186,7 +109,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     // first login named. An application needs this to say who is signed in without
     // acquiring a second session of its own.
     assert_eq!(
-        booted_as.as_deref(),
+        booted_as.identity.as_deref(),
         Some(user_id.as_str()),
         "the startup reports the account it opened the replica for"
     );
@@ -252,6 +175,14 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
         remembered.as_deref(),
         Some(user_id.as_str()),
         "the startup remembered the account it signed in as"
+    );
+    let account = remembered_account(&store)
+        .expect("read account")
+        .expect("startup stored an account marker");
+    let expected_account = encode_identity(&user_id).expect("encode the account key");
+    assert_eq!(
+        account, expected_account,
+        "the account marker holds the encoded id and is the store key for the credential"
     );
     assert_eq!(
         replica_db_name(DB_NAME, &remembered.expect("remembered")).expect("derive"),

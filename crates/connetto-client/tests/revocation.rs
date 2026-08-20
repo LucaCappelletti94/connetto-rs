@@ -10,8 +10,7 @@
 //! reads the replica rather than a frame: what makes this a leak rather than a
 //! missing notification is that the rows are still on the device afterwards.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`
-//! and an `OpenFGA` server.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::time::Duration;
 
@@ -168,7 +167,6 @@ where
 /// **The phase's proof.** A withdrawn grant takes the rows away from the person
 /// who lost it, and disturbs nobody else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     let fixture = Fixture::acquire().await;
     let server = cross_table_visibility_fixture(&fixture).await;

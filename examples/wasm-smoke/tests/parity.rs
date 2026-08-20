@@ -9,7 +9,6 @@
 //! failing assertion for the leg it fixes (an aggregate value, a full-resync
 //! deletion, a conflict distinction), then implements until it passes.
 //!
-//! Run with the demo stack up. See `authenticated_boot.rs` for the commands.
 
 #![cfg(target_arch = "wasm32")]
 

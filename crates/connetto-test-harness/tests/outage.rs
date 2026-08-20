@@ -23,8 +23,7 @@
 //! makes it fail. What that proves is connetto's response, which is the part
 //! this phase owns.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`
-//! and an `OpenFGA` server.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -47,7 +46,6 @@ const QUIET: Duration = Duration::from_secs(3);
 const RECOVERY: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn an_outage_stalls_delivery_loudly_and_recovers_without_a_reconnect() {
     let fixture = Fixture::acquire().await;
     let (server, reachable) = outage_fixture(&fixture).await;
@@ -161,7 +159,6 @@ async fn an_outage_stalls_delivery_loudly_and_recovers_without_a_reconnect() {
 /// so collapsing an outage into a refusal turns something transient into
 /// permanent loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_write_the_server_cannot_judge_is_not_called_unauthorized() {
     let fixture = Fixture::acquire().await;
     let (server, reachable) = outage_fixture(&fixture).await;

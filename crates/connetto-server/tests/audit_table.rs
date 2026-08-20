@@ -1,18 +1,16 @@
-//! Docker-gated test for the `auth_events` schema contract.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Exercises the [`ConnettoAuditSchema`] default the `connetto_audit_table!`
 //! macro generates: that a deployment can create the documented table, that
 //! every `op` value survives a round trip through the Postgres enum, and that
-//! the row a share mint names is preserved. `#[ignore]` by default because it
-//! needs a running Postgres. Point `DATABASE_URL` at one and run with
-//! `--ignored` after explicit approval.
+//! the row a share mint names is preserved.
 
 use connetto_core::SessionId;
 use connetto_server::audit::{AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema};
 use connetto_server::connetto_audit_table;
+use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use subql::backend::Value;
@@ -58,15 +56,6 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
     }
 }
 
-async fn pool() -> Pool<AsyncPgConnection> {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
-    Pool::builder()
-        .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(url))
-        .await
-        .expect("pool")
-}
-
 /// Every value the contract declares must survive Postgres.
 ///
 /// The `op` column is a Postgres enum rather than text precisely so a value
@@ -75,12 +64,11 @@ async fn pool() -> Pool<AsyncPgConnection> {
 /// fails on write, and one Postgres accepts but Rust cannot decode fails on
 /// read, so the round trip is the assertion that keeps the two in step.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn every_auth_op_round_trips_through_postgres() {
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_audit_table(&pool).await;
-    let mut conn = pool.get().await.expect("connection");
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
 
     let all = [
         AuthOp::LoggedOut,
@@ -118,12 +106,11 @@ async fn every_auth_op_round_trips_through_postgres() {
 /// This is what the enum column buys over text, so it is asserted rather than
 /// assumed.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_undeclared_op_label_is_refused() {
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_audit_table(&pool).await;
-    let mut conn = pool.get().await.expect("connection");
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
 
     let refused = sql_query(format!(
         "INSERT INTO auth_events (session, op) VALUES ('{}', 'grant_rejected')",
@@ -139,12 +126,11 @@ async fn an_undeclared_op_label_is_refused() {
 
 /// A share mint names the row it shared, and nothing else does.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_mint_names_its_row_and_a_logout_does_not() {
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_audit_table(&pool).await;
-    let mut conn = pool.get().await.expect("connection");
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
 
     let mint_session = SessionId::from_uuid(uuid::Uuid::new_v4());
     let shared_row = uuid::Uuid::new_v4();
@@ -205,7 +191,6 @@ async fn a_mint_names_its_row_and_a_logout_does_not() {
 
 /// The database clock stamps the row, not the emitting process.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_database_clock_stamps_the_row() {
     #[derive(QueryableByName)]
     struct Skew {
@@ -213,9 +198,9 @@ async fn the_database_clock_stamps_the_row() {
         secs: i64,
     }
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_audit_table(&pool).await;
-    let mut conn = pool.get().await.expect("connection");
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
 
     let session = SessionId::from_uuid(uuid::Uuid::new_v4());
     diesel_async::RunQueryDsl::execute(

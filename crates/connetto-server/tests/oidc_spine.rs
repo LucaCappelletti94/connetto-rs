@@ -16,13 +16,10 @@
 //! the JWKS fetch had never executed, and the provider's authorize endpoint had
 //! never been requested by anything.
 //!
-//! Here `GenericOidcProvider` is pointed, unchanged, at `oauth2-test-server`: a
-//! real OIDC implementation on a real loopback socket that serves a discovery
-//! document, a JWKS endpoint, and RS256 ID tokens carrying the nonce, and that
-//! auto-grants consent in its authorize handler so no human and no login form is
-//! involved. Both servers run in this process, exactly as `authn_flow.rs` and
-//! `native_auth.rs` already serve connetto's own router in-process, and every
-//! request between them is real HTTP.
+//! Here `GenericOidcProvider` is pointed, unchanged, at the containerised mock
+//! provider: a real OIDC implementation on a real socket that serves discovery,
+//! JWKS, RS256 ID tokens, and a login form whose username becomes the subject.
+//! Both servers run in this process, and every request between them is real HTTP.
 //!
 //! What this deliberately does not cover is the user agent. An HTTP client walks
 //! the redirect chain instead of a browser, so origin and navigation semantics
@@ -39,22 +36,20 @@ use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
     AbuseConfig, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
-    GenericOidcProvider, InMemoryAuthStore, OidcProviderConfig, ProviderRegistry, RedirectPolicy,
-    RequestGuard, ThrottleConfig, TokenAuthority, auth_router,
+    GenericOidcProvider, InMemoryAuthStore, ProviderRegistry, RedirectPolicy, RequestGuard,
+    ThrottleConfig, TokenAuthority, auth_router,
 };
 // The same path `provider_oidc.rs` uses: `reqwest` is not a direct dependency of
 // this crate, it arrives through `openidconnect`, so the test client is built
 // from the very client type the provider is handed.
-use oauth2_test_server::{IssuerConfig, OAuthTestServer};
+use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::reqwest;
 use serde_json::json;
 
 /// The provider name the login request selects by.
-const PROVIDER: &str = "mock-idp";
+const PROVIDER: &str = MOCK_OAUTH_PROVIDER;
 
-/// The subject `oauth2-test-server` puts in every ID token it issues, from its
-/// own `IssuerConfig::default`. The identity connetto resolves is derived from
-/// it, so the test asserts against this rather than against a literal user id.
+/// The subject submitted to the provider login form.
 const IDP_SUBJECT: &str = "test-user-123";
 
 /// A client redirect the login endpoint accepts without registration, because
@@ -98,22 +93,19 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// connetto's auth endpoints on a real socket, in front of a real identity
-/// provider on another, with the provider's client registered against connetto's
-/// callback and the provider discovered over real HTTP.
+/// provider on another, with connetto configured as a client through discovery.
 struct Stack {
     connetto_base: String,
     idp_issuer: String,
     service: Arc<AuthService<InMemoryAuthStore>>,
     /// Held so the provider stays alive for the test's duration.
-    _idp: OAuthTestServer,
+    _idp: MockOauth,
 }
 
 impl Stack {
     async fn start() -> Self {
-        // connetto's listener is bound first, because the callback URL it will
-        // serve has to be registered with the provider as an exact redirect match
-        // before the provider is discovered, and the router cannot be built until
-        // the provider exists.
+        // connetto's listener is bound first because the provider redirects the
+        // user agent back to that callback.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind connetto's auth endpoints");
@@ -123,43 +115,13 @@ impl Stack {
         );
         let connetto_callback = format!("{connetto_base}/auth/callback");
 
-        // A real OIDC provider on its own loopback socket. Its host is pinned to
-        // the address it is actually reachable at: `oauth2-test-server` defaults
-        // to publishing `localhost` in its discovery document while binding
-        // 127.0.0.1, and `openidconnect` correctly refuses a document whose
-        // `issuer` does not equal the URL it was fetched from.
-        let idp = OAuthTestServer::start_with_config(IssuerConfig {
-            host: "127.0.0.1".into(),
-            port: 0,
-            ..IssuerConfig::default()
-        })
-        .await;
-        let idp_issuer = idp.base_url.to_string().trim_end_matches('/').to_owned();
-        let client = idp
-            .register_client(json!({
-                "redirect_uris": [connetto_callback.clone()],
-                "grant_types": ["authorization_code", "refresh_token"],
-                "response_types": ["code"],
-                "scope": "openid",
-            }))
-            .await;
-        assert!(
-            client.client_secret.is_some(),
-            "connetto is a confidential client, so the registration must issue a secret"
-        );
-
-        // Discovery is a real HTTP GET, and it is also what pins the issuer.
+        let idp = MockOauth::start().await;
+        let idp_issuer = idp.issuer().to_owned();
         let provider = GenericOidcProvider::discover(
             // No assurance bar: the mock issues no `amr` or `acr`, and asking
             // for assurance it cannot express would test the bar rather than
             // the spine. The bar itself is covered by `provider.rs`.
-            OidcProviderConfig::new(
-                PROVIDER,
-                client.client_id.clone(),
-                idp_issuer.clone(),
-                connetto_callback.clone(),
-            )
-            .with_client_secret(client.client_secret.clone()),
+            idp.oidc_config(PROVIDER, connetto_callback.clone()),
             reqwest::Client::new(),
         )
         .await
@@ -264,13 +226,14 @@ async fn the_oauth_spine_completes_against_a_real_identity_provider() {
         "the provider redirects back to connetto, never to the client"
     );
 
-    // Step three. The provider auto-grants consent and redirects back to
-    // connetto's callback with its own authorization code.
+    // Step three. The provider login form takes the username and redirects back
+    // to connetto's callback with its own authorization code.
     let authorized = agent
-        .get(&authorize_url)
+        .post(&authorize_url)
+        .form(&[("username", IDP_SUBJECT)])
         .send()
         .await
-        .expect("GET the provider's authorize endpoint");
+        .expect("POST the provider's authorize endpoint");
     let callback_url = location(&authorized);
     assert!(
         callback_url.starts_with(&connetto_callback),
@@ -308,15 +271,16 @@ async fn the_oauth_spine_completes_against_a_real_identity_provider() {
 
     // The client redeems that code with its PKCE verifier, which is the first
     // moment it holds a connetto token.
-    let tokens: serde_json::Value = agent
+    let token_response = agent
         .post(format!("{base}/auth/token"))
-        .json(&json!({ "code": connetto_code, "code_verifier": client_verifier }))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({ "code": connetto_code, "code_verifier": client_verifier }).to_string())
         .send()
         .await
-        .expect("POST /auth/token")
-        .json()
-        .await
-        .expect("a token response");
+        .expect("POST /auth/token");
+    let tokens: serde_json::Value =
+        serde_json::from_str(&token_response.text().await.expect("token response body"))
+            .expect("a token response");
     let access_token = tokens["access_token"]
         .as_str()
         .expect("an access token")
@@ -397,9 +361,9 @@ async fn a_provider_code_cannot_be_redeemed_against_another_logins_pending_state
         "and its own PKCE challenge, which is the guard that fires first"
     );
 
-    // The first login is walked to the point of holding a provider code.
     let authorized = agent
-        .get(&authorize_urls[0])
+        .post(&authorize_urls[0])
+        .form(&[("username", IDP_SUBJECT)])
         .send()
         .await
         .expect("authorize the first login");
@@ -529,7 +493,8 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
     let guess = |secret: &str| {
         agent
             .post(format!("{connetto_base}/auth/refresh"))
-            .json(&serde_json::json!({ "refresh_token": format!("{target}.{secret}") }))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({ "refresh_token": format!("{target}.{secret}") }).to_string())
             .send()
     };
 
@@ -562,9 +527,13 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
     // A different session is untouched by the first one's exhaustion.
     let other = agent
         .post(format!("{connetto_base}/auth/refresh"))
-        .json(&serde_json::json!({
-            "refresh_token": format!("{}.wrong", uuid::Uuid::new_v4())
-        }))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({
+                "refresh_token": format!("{}.wrong", uuid::Uuid::new_v4())
+            })
+            .to_string(),
+        )
         .send()
         .await
         .expect("POST /auth/refresh");

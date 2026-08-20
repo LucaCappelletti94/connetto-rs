@@ -13,8 +13,7 @@
 //! replica here is the same SQLite file a client would hold: every patch that
 //! arrives is applied to it in order, and the assertions read rows back out.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`
-//! and an `OpenFGA` server.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::time::Duration;
 
@@ -94,7 +93,6 @@ impl Replica {
 /// Read off the replica and not off the frame: what makes this a leak rather
 /// than a missing notification is that the row is still there afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_row_that_leaves_a_caller_s_reach_is_taken_off_their_replica() {
     let fixture = Fixture::acquire().await;
     let server = visibility_fixture(&fixture).await;
@@ -143,7 +141,6 @@ async fn a_row_that_leaves_a_caller_s_reach_is_taken_off_their_replica() {
 /// existed, what it was called and when it went, which is what principle 4 of
 /// `docs/architecture/08-authorization.md` forbids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn a_deleted_row_is_not_announced_to_a_caller_who_never_saw_it() {
     let fixture = Fixture::acquire().await;
     let server = visibility_fixture(&fixture).await;
@@ -189,7 +186,6 @@ async fn a_deleted_row_is_not_announced_to_a_caller_who_never_saw_it() {
 /// alice's reach. Row 52 is never hers, and is then deleted. Row 53 arrives last
 /// so a truncated replay cannot pass by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn catching_up_leaves_the_same_rows_as_staying_connected() {
     let fixture = Fixture::acquire().await;
     let server = visibility_fixture(&fixture).await;

@@ -7,9 +7,6 @@
 //! without OPFS persistence need no worker separation. The worker topology
 //! adds persistence and multi-tab sharing, not reactivity.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test page`
 
 #![cfg(target_arch = "wasm32")]
 

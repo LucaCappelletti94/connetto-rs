@@ -123,7 +123,6 @@ async fn forgetting_through_the_gap_makes_the_catchup_question_honest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_recreated_slot_resumes_past_what_was_delivered() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin();
@@ -222,7 +221,6 @@ async fn a_recreated_slot_resumes_past_what_was_delivered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin();

@@ -12,7 +12,7 @@
 //! none of them, so the database-wide reading refuses a deployment that is
 //! configured correctly.
 //!
-//! `#[ignore]` by default: it needs a running Postgres.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use connetto_server::{Artifact, PreflightError, preflight};
 use connetto_test_harness::Fixture;
@@ -32,7 +32,6 @@ struct Named {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn startup_refuses_a_replicated_table_that_cannot_report_the_old_row() {
     let fixture = Fixture::acquire().await;
     fixture
@@ -96,7 +95,6 @@ async fn startup_refuses_a_replicated_table_that_cannot_report_the_old_row() {
 /// check to the publication, and because the alternative was one line of subql's
 /// that would have been cheaper to adopt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_database_wide_audit_would_refuse_a_correct_deployment() {
     let fixture = Fixture::acquire().await;
     fixture

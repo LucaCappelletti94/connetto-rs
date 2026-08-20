@@ -114,7 +114,6 @@ async fn drain_to_barrier<T: Transport>(transport: &mut T, nonce: u64) -> Vec<St
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn snapshot_order_holds_when_the_credit_window_is_closed() {
     let fixture = Fixture::acquire().await;
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.

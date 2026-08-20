@@ -92,7 +92,7 @@ pub use reconnect::TokioSleeper;
 pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
-    encode_identity, replica_db_name,
+    encode_identity, is_reserved_record, replica_db_name,
 };
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.

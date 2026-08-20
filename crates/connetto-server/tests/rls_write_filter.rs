@@ -6,8 +6,7 @@
 //! insert naming another owner is refused by the policy's `WITH CHECK` and comes
 //! back as `MutationReject`, leaving Postgres unchanged.
 //!
-//! `#[ignore]` by default. It needs a running Postgres. Point `DATABASE_URL` at
-//! one and run with `--ignored` after explicit approval.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Like the read filter, the write must apply as a non-superuser role, since a
 //! superuser bypasses RLS. The test creates `app_writer` for the write target
@@ -217,7 +216,6 @@ async fn barrier<T: Transport>(transport: &mut T, nonce: u64) -> ControlMessage 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin().clone();
@@ -306,7 +304,6 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
 /// because a half-applied handoff would strand the row with nobody able to see
 /// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin().clone();
@@ -382,7 +379,6 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
 /// explain the difference in outcome, which is what makes this an assertion
 /// about the capability rather than about the policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() {
     const KEY: &str = "key:can-write-here";
 

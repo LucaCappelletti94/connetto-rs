@@ -17,8 +17,7 @@
 //! is one Postgres round trip per watcher per event, which is exactly what the
 //! counter suites assert is gone, so this run cannot also be that run.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`
-//! and an `OpenFGA` server.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{PolicyShape, fanout_parity_run};
@@ -30,7 +29,6 @@ const WATCHERS: u64 = 10;
 const EVENTS: u64 = 5;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn the_two_executors_never_disagree_about_a_row() {
     let fixture = Fixture::acquire().await;
 

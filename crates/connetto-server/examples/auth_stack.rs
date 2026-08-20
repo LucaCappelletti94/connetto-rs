@@ -1,28 +1,19 @@
-//! A single-origin authentication stack for browser tests and local loops.
+//! Authentication stack for browser tests and local loops.
 //!
 //! Phase E4.b needs a login a real browser can complete, and a wasm test cannot
 //! bind a listener, so the stack has to be an external process. This is it: one
-//! axum app, on one port, serving three things.
+//! axum app for connetto's own auth endpoints and landing route, plus one
+//! containerised OIDC provider.
 //!
-//! * A real OIDC provider, `oauth2-test-server`, whose authorize handler
-//!   auto-grants consent, so no human and no login form is involved.
-//! * connetto's own auth endpoints, `/auth/login`, `/auth/callback`,
-//!   `/auth/token`, `/auth/refresh`, and `/auth/logout`.
-//! * A landing route the client redirect points at, so the whole redirect chain
-//!   stays on this one origin and a browser test can read the delivered code out
-//!   of the final URL rather than navigating a tab away mid-test.
-//!
-//! One origin is the point. The OAuth dance itself needs no CORS, since every
-//! step is a navigation or a server-to-server call, but connetto's own
+//! Connetto and the browser test page may be on different origins. Connetto's
 //! `/auth/token`, `/auth/refresh`, and `/auth/logout` are `fetch` calls from the
-//! DB worker, and a browser test page is served from a port of its own. So
-//! connetto's routes carry a permissive [`CorsLayer`] here. That layer belongs to
-//! this dev stack and not to the library: `auth_router` returns a plain
-//! [`Router`], and a deployment that puts its app and its auth endpoints on
-//! different origins is the one that has to decide how to bridge them.
+//! DB worker, so connetto's routes carry a permissive [`CorsLayer`] here. That
+//! layer belongs to this dev stack and not to the library: `auth_router` returns
+//! a plain [`Router`]. An app that puts its UI and auth endpoints on different
+//! origins decides how to bridge them.
 //!
-//! It verifies nothing about identity, so it is a test fixture and never a
-//! deployment. Its session store is in memory and its signing key is ephemeral
+//! It verifies nothing about identity, so it is a test fixture. Its session
+//! store is in memory and its signing key is ephemeral
 //! unless `DATABASE_URL` and `CONNETTO_JWT_*_KEY_FILE` point it at the ones a
 //! sync server shares. Run it with:
 //!
@@ -39,15 +30,14 @@ use axum::routing::get;
 use connetto_core::SessionId;
 use connetto_server::{
     AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver,
-    GenericOidcProvider, InMemoryAuthStore, IssuedSession, OidcProviderConfig, ProviderRegistry,
-    RedirectPolicy, RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken,
-    TokenAuthority, auth_router, connetto_auth_tables,
+    GenericOidcProvider, InMemoryAuthStore, IssuedSession, ProviderRegistry, RedirectPolicy,
+    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, TokenAuthority,
+    auth_router, connetto_auth_tables,
 };
+use connetto_test_harness::MockOauth;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use oauth2_test_server::{AppState, IssuerConfig};
-use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
 /// The provider name a client names in its login request.
@@ -56,8 +46,8 @@ const PROVIDER: &str = "dev-idp";
 /// Where the stack listens unless `CONNETTO_AUTH_STACK_BIND` says otherwise. It is
 /// fixed rather than ephemeral because a browser test cannot be told a random port.
 const DEFAULT_BIND: &str = "127.0.0.1:18099";
-/// The path the client redirect points at. Serving it here keeps the redirect
-/// chain single-origin.
+/// The path the client redirect points at. Serving it here lets a browser test
+/// read the delivered code out of the final URL.
 const LANDING_PATH: &str = "/dev/landing";
 
 // The same default auth tables the reference binary uses, so a shared database
@@ -220,50 +210,14 @@ async fn main() -> Result<()> {
     let addr = listener.local_addr().context("reading the bound address")?;
     let base = format!("http://{addr}");
 
-    // The provider is configured to publish this very origin, because
-    // `openidconnect` refuses a discovery document whose `issuer` does not equal
-    // the URL it was fetched from, and because the provider's routes are about to
-    // be merged into this same app.
-    let idp = AppState::new(IssuerConfig {
-        scheme: "http".to_owned(),
-        host: addr.ip().to_string(),
-        port: addr.port(),
-        ..IssuerConfig::default()
-    });
-
     let callback = format!("{base}/auth/callback");
-    let client = idp
-        .register_client(json!({
-            "redirect_uris": [callback.clone()],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "scope": "openid",
-        }))
-        .await
-        .map_err(|err| anyhow::anyhow!("registering connetto as a client: {err:?}"))?;
-
-    // Built from endpoints rather than by discovery, because the endpoints live in
-    // the app that is not serving yet, and discovery would have nothing to talk
-    // to. Discovery itself is covered by `tests/oidc_spine.rs`.
-    let jwks = serde_json::from_value((*idp.jwks_json).clone())
-        .context("reading the provider's JWKS into a key set")?;
-    let provider = GenericOidcProvider::from_parts(
-        // No assurance bar: the provider issues no `amr` or `acr`, so one it
-        // cannot express would refuse every login. The bar itself is covered
-        // by `tests/provider.rs`.
-        OidcProviderConfig::new(
-            PROVIDER,
-            client.client_id.clone(),
-            base.clone(),
-            callback.clone(),
-        )
-        .with_client_secret(client.client_secret.clone()),
-        &format!("{base}/authorize"),
-        &format!("{base}/token"),
-        jwks,
+    let idp = MockOauth::start().await;
+    let provider = GenericOidcProvider::discover(
+        idp.oidc_config(PROVIDER, callback.clone()),
         openidconnect::reqwest::Client::new(),
     )
-    .map_err(|err| anyhow::anyhow!("building the provider: {err}"))?;
+    .await
+    .map_err(|err| anyhow::anyhow!("discovering the provider: {err}"))?;
 
     let config = AuthConfig::default();
     // The sync server verifies what this stack mints, so the two must agree on
@@ -273,13 +227,11 @@ async fn main() -> Result<()> {
     // set this falls back to an ephemeral key and an in-memory store, which
     // suits a login-only loop where nothing syncs.
     let service = build_service(load_authority(&config)?, &config).await?;
-
     let mut registry = ProviderRegistry::new();
+
     registry.register(Arc::new(provider));
 
-    // Permissive on purpose, and scoped to connetto's routes plus the landing:
-    // the provider's own router already carries its own CORS layer, and stacking
-    // two would emit duplicate headers that a browser rejects.
+    // Permissive on purpose, and scoped to connetto's routes plus the landing.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -291,13 +243,13 @@ async fn main() -> Result<()> {
         )
         .layer(cors);
 
-    let app = oauth2_test_server::router::build_router(idp).merge(connetto);
+    let app = connetto;
 
     tracing::info!(
         base = %base,
         provider = PROVIDER,
         redirect_uri = %format!("{base}{LANDING_PATH}"),
-        issuer = %base,
+        issuer = %idp.issuer(),
         "auth stack listening"
     );
     axum::serve(listener, app).await.context("serving")?;

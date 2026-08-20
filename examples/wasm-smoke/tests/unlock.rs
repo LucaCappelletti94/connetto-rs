@@ -6,9 +6,6 @@
 //! consumers. Each test controls a spawned DB worker via `worker.onmessage`
 //! and `worker.post_message`, so no simulated authenticator is needed.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test unlock`
 //!
 //! Test ordering matters: tests 1 and 2 require an empty credentials store,
 //! test 3 populates it, and test 4 relies on that state. wasm-bindgen runs
@@ -24,12 +21,21 @@ use std::rc::Rc;
 use connetto_core::{Custody, NoGate};
 use connetto_wasm_smoke::workers::{await_db_worker_ready, request_custody};
 use connetto_web::auth::{IdbKeyStore, LOCKED_MESSAGE};
+use indexed_db_futures::database::Database as IdbDatabase;
+use indexed_db_futures::prelude::*;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::MessageEvent;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+const KEY_STORE_DB: &str = "connetto-key-store";
+const STORE_KEK: &str = "kek";
+const STORE_WRAPPED: &str = "wrapped";
+const STORE_CREDENTIALS: &str = "credentials";
+const DEFAULT_AUTH_DB: &str = "connetto-auth.sqlite";
+const UNLOCK_AUTH_DB: &str = "connetto-unlock-auth.sqlite";
 
 /// Progress marker so a harness timeout shows how far each test reached.
 fn stage(message: &str) {
@@ -70,8 +76,8 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
     let wasm_url = glue_url
         .strip_suffix(".js")
         .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
-    // The blob broadcasts failures to connetto-debug before rethrowing, matching
-    // the pattern db-worker.js uses, so test listeners can detect boot errors.
+    // Broadcast failures to both channels: debug preserves the old assertion,
+    // hello lets readiness fail by name.
     let source = format!(
         "try {{\
          \n  const mod = await import(\"{g}\");\
@@ -79,6 +85,7 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
          \n  await mod.db_worker_unlock_boot();\
          \n}} catch (err) {{\
          \n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker FAILED: \" + err);\
+         \n  new BroadcastChannel(\"connetto-hello\").postMessage(\"failed:\" + err);\
          \n  throw err;\
          \n}}\n",
         g = glue_url,
@@ -151,14 +158,53 @@ async fn hkdf_key_from_bytes(seed: &[u8]) -> web_sys::CryptoKey {
         .unchecked_into::<web_sys::CryptoKey>()
 }
 
-// ─────────────────────────────────────────── tests ──────────────────────────
+async fn reset_key_store() {
+    drop(IdbKeyStore::open().await.expect("open the key store"));
+    let db = IdbDatabase::open(KEY_STORE_DB)
+        .await
+        .expect("reopen the key store");
+    let tx = db
+        .transaction([STORE_CREDENTIALS, STORE_KEK, STORE_WRAPPED])
+        .with_mode(indexed_db_futures::transaction::TransactionMode::Readwrite)
+        .build()
+        .expect("reset tx");
+    for store_name in [STORE_CREDENTIALS, STORE_KEK, STORE_WRAPPED] {
+        tx.object_store(store_name)
+            .expect("reset store")
+            .clear()
+            .expect("clear")
+            .await
+            .expect("clear await");
+    }
+    tx.commit().await.expect("reset commit");
+}
 
-/// Tests 1 and 2 require no enrolled credentials in IDB. Test 3 plants them.
-/// Test 4 uses what test 3 left. Source order is execution order.
+async fn reset_profile() {
+    reset_key_store().await;
+    let storage = connetto_web::storage::ReplicaStorage::install().await;
+    for db in [DEFAULT_AUTH_DB, UNLOCK_AUTH_DB] {
+        storage.delete_db(db).expect("clear auth database");
+    }
+}
+
+
+async fn plant_enrolled_credential(seed: u8, credential: u8) {
+    reset_profile().await;
+    let key_store = IdbKeyStore::open().await.expect("open key store");
+    let hkdf = hkdf_key_from_bytes(&[seed; 32]).await;
+    key_store
+        .adopt_derived(hkdf, &[credential; 16])
+        .await
+        .expect("adopt credential");
+}
+
+// Test cases are self-contained. `wasm-bindgen-test` does not promise source
+// order, and the key store is browser-profile state.
 
 #[wasm_bindgen_test]
 async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_from_the_tab() {
     stage("test 1: unsupported enrolment");
+    reset_profile().await;
     // Relay worker breadcrumbs from the debug channel.
     let _debug_relay = {
         let ch = web_sys::BroadcastChannel::new("connetto-debug").expect("debug channel");
@@ -198,7 +244,7 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
     }
 
     stage("test 1: waiting for worker ready");
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
 
     assert!(
         logins.get() >= 1,
@@ -213,13 +259,13 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
         "unsupported response leaves custody as unverified with no gate"
     );
 
-    drop(worker);
-    stage("test 1: done");
+    worker.terminate();
 }
 
 #[wasm_bindgen_test]
 async fn custody_without_the_unlock_flag_reads_as_offerable() {
     stage("test 2: custody offerable regression guard");
+    reset_profile().await;
     common::play_the_tab();
 
     // Spawn a worker with unlock=false (the default from spawn_db_worker).
@@ -227,7 +273,7 @@ async fn custody_without_the_unlock_flag_reads_as_offerable() {
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 2: waiting for worker ready");
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
 
     stage("test 2: reading custody from the worker");
     let custody = request_custody().await;
@@ -237,22 +283,14 @@ async fn custody_without_the_unlock_flag_reads_as_offerable() {
         "a consumer that does not enable unlock always sees offerable custody"
     );
 
-    drop(worker);
-    stage("test 2: done");
+    worker.terminate();
 }
 
 #[wasm_bindgen_test]
 async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
     stage("test 3: declined unlock");
 
-    // Plant an enrolled credential in IDB. After this call the credentials store
-    // is non-empty, so the spawned worker will send an unlock request.
-    let key_store = IdbKeyStore::open().await.expect("open key store");
-    let hkdf = hkdf_key_from_bytes(&[0xbbu8; 32]).await;
-    key_store
-        .adopt_derived(hkdf, &[0x01u8; 16])
-        .await
-        .expect("adopt credential");
+    plant_enrolled_credential(0xbb, 0x01).await;
     stage("test 3: credential enrolled in IDB");
 
     // Capture the OPFS pool state before the (failing) boot.
@@ -300,18 +338,16 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
         "a declined boot must not alter the OPFS pool"
     );
 
-    drop(worker);
+    worker.terminate();
     stage("test 3: done");
 }
 
 #[wasm_bindgen_test]
 async fn unlock_disabled_with_an_enrolled_credential_refuses_the_boot() {
     stage("test 4: unlock=false with enrolled credential");
-    // Credentials are present from test 3. The default spawn_db_worker uses
-    // unlock=false, so the boot must refuse rather than silently fall back.
-
+    plant_enrolled_credential(0xcc, 0x02).await;
     let failure_rx = wait_debug_for("FAILED");
-    let _worker =
+    let worker =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 4: waiting for boot failure");
@@ -320,6 +356,6 @@ async fn unlock_disabled_with_an_enrolled_credential_refuses_the_boot() {
         failure_msg.contains(LOCKED_MESSAGE),
         "boot with unlock=false and enrolled credential must fail, got: {failure_msg}"
     );
-
+    worker.terminate();
     stage("test 4: done");
 }

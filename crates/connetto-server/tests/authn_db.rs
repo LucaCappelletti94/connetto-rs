@@ -1,10 +1,8 @@
-//! Docker-gated database auth store test.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Exercises [`DbAuthStore`]: identity resolution through the resolver,
 //! session creation and liveness, rotating refresh with reuse detection, and
-//! revocation. `#[ignore]` by default because it needs a running Postgres.
-//! Point `DATABASE_URL` at one and run with `--ignored` after explicit approval.
-//!
+//! revocation.
 
 use std::time::SystemTime;
 
@@ -12,8 +10,8 @@ use connetto_server::{
     AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
     RetainedProviderToken, connetto_auth_tables,
 };
+use connetto_test_harness::Fixture;
 use diesel::sql_query;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
@@ -64,25 +62,17 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
-async fn pool() -> Pool<AsyncPgConnection> {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    Pool::builder().build(manager).await.expect("build pool")
-}
-
 // The two tests share one set of auth tables, so their `CREATE TABLE`s race on
 // `pg_type_typname_nsp_index` when run concurrently. Serialize them.
 static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn db_store_creates_resolves_rotates_and_revokes() {
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_auth_tables(&pool).await;
-    let store = build_store(&pool);
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
     let now = SystemTime::now();
 
     // Two logins for the same (issuer, subject) resolve to one deployment-owned
@@ -156,12 +146,11 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn db_store_retains_and_replaces_provider_tokens() {
     let _serial = PG_SERIAL.lock().await;
-    let pool = pool().await;
-    reset_auth_tables(&pool).await;
-    let store = build_store(&pool);
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
     let now = SystemTime::now();
     let issued = store
         .create_session(&identity("grace"), now)

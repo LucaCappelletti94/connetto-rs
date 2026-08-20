@@ -14,7 +14,7 @@
 //! if the filter leaked, the uncovered row would be the first live patch to
 //! arrive.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::time::Duration;
 
@@ -64,19 +64,16 @@ fn ids_in(patchset_zstd: &[u8]) -> Vec<i32> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
     let fixture = Fixture::acquire().await;
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes, note_shares CASCADE",
             "DROP TABLE IF EXISTS _connetto_mutations",
-            "DROP PUBLICATION IF EXISTS connetto_pub",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT)",
             "CREATE TABLE note_shares (note_id INT, viewer TEXT, PRIMARY KEY (note_id, viewer))",
-            "ALTER TABLE notes REPLICA IDENTITY FULL",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
             "ALTER TABLE note_shares ENABLE ROW LEVEL SECURITY",
             "CREATE POLICY notes_p ON notes USING ( \

@@ -21,8 +21,6 @@
 //! `ClientEvent`, a wire classifier) belong in the touched crate's own native
 //! tests, not this harness.
 //!
-//! Run with the demo stack up:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke`
 
 // Shared test support: each parity test binary uses a different subset of
 // these helpers, so unused ones are expected per binary.
@@ -285,7 +283,7 @@ impl ParityFixture {
         // This page wins the leader election and owns the DB worker that hosts
         // the relay hub the tab client speaks to.
         let membership = leader::join(&format!("connetto-parity-{base}"), &glue_url());
-        await_db_worker_ready().await;
+        await_db_worker_ready().await.expect("db worker ready");
         stage("db worker ready");
 
         // The direct client: a plain server session, the parity reference.

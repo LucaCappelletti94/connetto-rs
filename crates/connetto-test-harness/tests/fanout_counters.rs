@@ -19,9 +19,7 @@
 //! the row does not settle, divided by the batch cap. That case is asserted in
 //! `fanout_delegated.rs`, so neither half can quietly become the other.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with
-//! `wal_level=logical` and an `OpenFGA` server. Run under Docker with
-//! `DATABASE_URL` and `CONNETTO_TEST_FGA_URL` pointed at them and `-- --ignored`.
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{PolicyShape, fanout_run};
@@ -34,7 +32,6 @@ const LARGE: u64 = 100;
 const EVENTS: u64 = 5;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical and an OpenFGA server (Docker)"]
 async fn the_change_path_asks_the_service_nothing_whatever_the_audience() {
     let fixture = Fixture::acquire().await;
     let small = fanout_run(&fixture, SMALL, EVENTS, PolicyShape::Row).await;

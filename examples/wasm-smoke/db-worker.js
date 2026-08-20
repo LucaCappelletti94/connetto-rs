@@ -3,9 +3,10 @@
 // hub, hello channel intake). The parameter is read from import.meta.url,
 // not self.location: a harness may load this script through a wrapper
 // blob, and only the module URL keeps the query. Progress and failures go
-// to the connetto-debug broadcast channel, since a worker's console is not
-// always visible to the page.
+// to connetto-debug for captured logs and to connetto-hello for the page
+// readiness wait.
 const debug = new BroadcastChannel("connetto-debug");
+const hello = new BroadcastChannel("connetto-hello");
 
 try {
   const glue = new URL(import.meta.url).searchParams.get("glue");
@@ -19,5 +20,6 @@ try {
   debug.postMessage("db worker: serving");
 } catch (err) {
   debug.postMessage("db worker FAILED: " + err);
+  hello.postMessage("failed:" + err);
   throw err;
 }

@@ -1,8 +1,6 @@
 //! Shared harness for the logged-in startup suites.
 //!
-//! These suites boot the worker with logins on against the server's built-in
-//! auth endpoint, which the dev identity provider backs. See
-//! `authenticated_boot.rs` for the full stack commands.
+//! These suites boot the worker with logins on against the browser-stack auth endpoint.
 
 #![cfg(target_arch = "wasm32")]
 // A shared test module is compiled into every binary that includes it, and
@@ -14,14 +12,13 @@ use connetto_wasm_smoke::workers::{
     DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL,
 };
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, LoginMessage, REFRESH_RECORD, RefreshStore,
-    WorkerAuthConfig,
+    Acquired, BrowserAuthenticator, IdbKeyStore, LoginMessage, RefreshStore, WorkerAuthConfig,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{BroadcastChannel, MessageEvent, Response};
+use web_sys::{BroadcastChannel, MessageEvent, Request, RequestInit, Response};
 
 /// Where the login server listens by default.
 pub const AUTH_BASE: &str = "http://127.0.0.1:18099";
@@ -51,28 +48,64 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         .with_auth_db_name(REFRESH_DB)
 }
 
-/// Walk a login URL the way a navigating tab would, and return the code and state
-/// the redirect chain delivers.
-///
-/// `fetch` cannot read a `Location` header, since a manual-redirect response is
-/// opaque, so this follows the chain and reads the final URL. It works because the
-/// login server keeps every hop on one origin.
-pub async fn walk_the_login(login_url: &str) -> (String, String) {
-    // Fetch the login URL and follow redirects. Works from both a dedicated
-    // worker (WorkerGlobalScope) and the browser main thread (Window).
+async fn fetch_str(url: &str) -> Response {
     let global = js_sys::global();
     let promise = if let Ok(worker) = global.clone().dyn_into::<web_sys::WorkerGlobalScope>() {
-        worker.fetch_with_str(login_url)
+        worker.fetch_with_str(url)
     } else {
         web_sys::window()
             .expect("window or worker global required")
-            .fetch_with_str(login_url)
+            .fetch_with_str(url)
     };
-    let response: Response = JsFuture::from(promise)
+    JsFuture::from(promise)
         .await
-        .expect("the auth server must be running: see this file's suite headers")
+        .expect("the auth server must be running")
         .dyn_into()
-        .expect("a fetch resolves to a Response");
+        .expect("a fetch resolves to a Response")
+}
+
+async fn fetch_request(request: &Request) -> Response {
+    let global = js_sys::global();
+    let promise = if let Ok(worker) = global.clone().dyn_into::<web_sys::WorkerGlobalScope>() {
+        worker.fetch_with_request(request)
+    } else {
+        web_sys::window()
+            .expect("window or worker global required")
+            .fetch_with_request(request)
+    };
+    JsFuture::from(promise)
+        .await
+        .expect("submit the login form")
+        .dyn_into()
+        .expect("a fetch resolves to a Response")
+}
+
+/// Walk a login URL the way a navigating tab would, and return the code and state
+/// the redirect chain delivers.
+pub async fn walk_the_login(login_url: &str) -> (String, String) {
+    let response = fetch_str(login_url).await;
+    assert!(
+        response.ok(),
+        "the login form loaded at {} with status {}",
+        response.url(),
+        response.status()
+    );
+    let form_url = response.url();
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_body(&"username=startup".into());
+    let request = Request::new_with_str_and_init(&form_url, &init).expect("build form request");
+    request
+        .headers()
+        .set("content-type", "application/x-www-form-urlencoded")
+        .expect("set form content type");
+    let response = fetch_request(&request).await;
+    assert!(
+        response.ok(),
+        "the login chain ended at {} with status {}",
+        response.url(),
+        response.status()
+    );
     let final_url = response.url();
     let parsed = web_sys::Url::new(&final_url).expect("a parseable final url");
     let params = parsed.search_params();
@@ -167,7 +200,7 @@ pub async fn mint_session() -> (String, String) {
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");
     let store = RefreshStore::open(&storage.db_url(&db_name), &device).expect("open refresh store");
-    let authenticator = BrowserAuthenticator::new(auth_config(), REFRESH_RECORD);
+    let authenticator = BrowserAuthenticator::new(auth_config(), None);
     let pending = match authenticator
         .acquire::<String, _>(&store)
         .await

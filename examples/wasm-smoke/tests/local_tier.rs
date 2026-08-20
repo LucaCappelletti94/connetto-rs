@@ -11,9 +11,6 @@
 //! `.with_existing_tier` (reopen), which is the only way to create a
 //! durable tier that decrypts under the replica's derived key.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test local_tier`
 
 #![cfg(target_arch = "wasm32")]
 

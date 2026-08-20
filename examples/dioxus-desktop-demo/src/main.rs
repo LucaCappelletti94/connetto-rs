@@ -16,22 +16,24 @@
 //!   (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 //! - `CONNETTO_READER_URL`: conninfo for the non-owner Postgres role provisioned
 //!   by `roles.sql` (required).
-//! - `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and `CONNETTO_OIDC_*`: server auth
-//!   env from the dev IdP. Start the dev IdP with
-//!   `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source `target/dev-idp.env`
-//!   before starting the server.
+//! - `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the OIDC provider vars from
+//!   `target/dev-idp.env`: server auth env from the dev IdP. Start the dev
+//!   IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source
+//!   `target/dev-idp.env` before starting the server.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use connetto_client::auth::{
-    KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key,
+    KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key, remembered_account,
 };
 use connetto_client::replica::{Replica, replica_db_name};
-use connetto_client::teardown::{ForgetError, PurgeError, forget_device};
+use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning, forget_device};
 use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Grant, PolicyTables, SqlFunctions,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, IDENTITY_RECORD,
+    PolicyTables, SqlFunctions, decode_identity,
 };
+use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
@@ -57,13 +59,10 @@ const AUTH_SERVER: &str = "http://127.0.0.1:18081";
 const AUTH_PROVIDER: &str = "dev-idp";
 /// Prefix for per-identity replica file names (passed to `replica_db_name`).
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
-/// OS keyring service name for both the refresh token and per-replica keys.
-/// One service, one refresh-token entry ([`REFRESH_RECORD`]), and one key entry
-/// per replica name (derived from the identity).
+/// OS keyring service name for both refresh tokens and per-replica keys.
+/// One service, one refresh-token entry per account (keyed by the encoded user
+/// id), connetto's own reserved records, and one key entry per replica name.
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
-/// Keyring record holding the refresh token. A literal rather than an identity,
-/// because the token is what reveals the identity.
-const REFRESH_RECORD: &str = "refresh";
 
 diesel::table! {
     orders (id) {
@@ -156,6 +155,14 @@ struct AuthCtx {
     /// The replica name (from `replica_db_name`), used as both the keyring
     /// record name and the human-readable replica label.
     key_name: String,
+    /// Token store, used to enumerate stored accounts and to update the
+    /// last-used pointer when switching accounts.
+    token_store: Arc<KeyringStore>,
+    /// When the current session lapses if never refreshed again.
+    session_expires_at: std::time::SystemTime,
+    /// Encoded account key for the signed-in user, matching what
+    /// `RefreshTokenStore::accounts` returns for this identity.
+    current_account: String,
 }
 
 /// App data directory following XDG conventions on Linux.
@@ -188,6 +195,7 @@ fn restart() {
     std::process::exit(0)
 }
 
+
 /// Top-level sync boundary: build the runtime, drive `setup` to completion,
 /// then hand everything to the Dioxus event loop.
 ///
@@ -217,7 +225,7 @@ fn main() {
             dioxus::desktop::Config::new().with_window(
                 dioxus::desktop::WindowBuilder::new()
                     .with_title(title)
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 760.0)),
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 900.0)),
             ),
         )
         .with_context(client)
@@ -263,7 +271,7 @@ fn startup_failure_app() -> Element {
             style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
             h2 { "connetto demo cannot start" }
             p { style: "color: #a33;", {detail} }
-            p { "Check that CONNETTO_AUTH, CONNETTO_AUTH_BIND, and the CONNETTO_OIDC_* variables are set correctly, then relaunch." }
+            p { "Check that CONNETTO_AUTH, CONNETTO_AUTH_BIND, CONNETTO_OIDC_PROVIDERS, and per-provider vars are set, then relaunch." }
         }
     }
 }
@@ -360,18 +368,19 @@ async fn setup_authenticated(
 
     std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
 
-    // Credential store: one entry per app, one record per account. This demo
-    // signs one account in at a time, so the record is the literal below.
+    // Credential store: one entry per service, one record per account.
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
     // Key store: one entry per replica name (one per identity on this device).
     let key_store = Arc::new(KeyringKeyStore::new(KEYRING_SERVICE));
 
+    let account =
+        remembered_account(token_store.as_ref()).context("reading the remembered account")?;
     let authenticator = Arc::new(NativeAuthenticator::new(
         AUTH_SERVER,
         AUTH_PROVIDER,
         Arc::clone(&token_store)
             as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,
-        REFRESH_RECORD,
+        account,
     ));
 
     // Acquire the session. Silently refreshes from the stored refresh token
@@ -385,6 +394,11 @@ async fn setup_authenticated(
     // the name decides which file to open, so it must come first.
     let key_name = replica_db_name(REPLICA_PREFIX, &session.user_id)
         .map_err(|err| anyhow::anyhow!("naming the replica for this identity: {err}"))?;
+
+    // Save the session fields we need before the access token is moved below.
+    let session_expires_at = session.session_expires_at;
+    let current_account = connetto_client::encode_identity(&session.user_id)
+        .map_err(|err| anyhow::anyhow!("encoding current account key: {err}"))?;
 
     let db_path = data_dir().join(format!("{key_name}.sqlite"));
     let db_path_str = db_path
@@ -423,7 +437,11 @@ async fn setup_authenticated(
         .with_policy_tables(PolicyTables::from_translation(
             POLICY_TABLES.iter().copied(),
             POLICY_VIEWS.iter().copied(),
-        ));
+        ))
+        // A low threshold so the free-up-space button reclaims after a modest
+        // deletion, rather than only once the freelist is a quarter of the file.
+        // Trimming still runs only when the button is pressed.
+        .with_trim_threshold(5);
 
     let conn = if existing {
         // Resume: the replica already carries its schema and cursor.
@@ -461,8 +479,84 @@ async fn setup_authenticated(
         db_path,
         key_store,
         key_name,
+        token_store,
+        session_expires_at,
+        current_account,
     };
     Ok((conn, auth_ctx))
+}
+
+/// The replica's physical footprint: total pages and free pages a trim can reclaim.
+async fn replica_footprint(client: &ConnettoClient<Ws>) -> (i64, i64) {
+    client
+        .with_conn(|conn| {
+            let db = conn.conn();
+            let pages = db.page_count(None).unwrap_or(0);
+            let free = db.freelist_count(None).unwrap_or(0);
+            (pages, free)
+        })
+        .await
+}
+
+/// A short status word for one client event, or `None` to ignore it.
+///
+/// Covers mutation outcomes (feature 5), rate-limit signals (feature 3), and
+/// reconnect / close events.
+fn status_label(event: &ClientEvent) -> Option<String> {
+    match event {
+        ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
+        ClientEvent::Reconnected => Some("reconnected".to_owned()),
+        ClientEvent::MutationApplied { client_seq } => {
+            Some(format!("mutation {client_seq} applied"))
+        }
+        ClientEvent::MutationRejected { client_seq, .. } => {
+            Some(format!("mutation {client_seq} rejected"))
+        }
+        ClientEvent::MutationConflict {
+            client_seq,
+            server_row,
+            ..
+        } => Some(server_row.as_ref().map_or_else(
+            || format!("mutation {client_seq} conflicted, the server row is gone"),
+            |row| {
+                format!(
+                    "mutation {client_seq} conflicted, server holds {}",
+                    row.row_json
+                )
+            },
+        )),
+        // The server asked this client to back off before retrying a request.
+        // The client's reconnect policy uses a fixed backoff and does not read
+        // retry_after_ms, so the value here is informational only.
+        ClientEvent::RateLimited { retry_after_ms, .. } => Some(format!(
+            "rate limited: server asks {retry_after_ms}ms before retrying \
+             (client reconnects on its own fixed schedule)"
+        )),
+        // Connection-level throttle: the server closed the entire session because
+        // this client exceeded a connection-rate limit. Distinct from the
+        // per-request RateLimited above.
+        ClientEvent::ServerClosed {
+            reason: FatalErrorReason::RateLimited { retry_after_ms },
+        } => Some(format!(
+            "connection closed: rate limit exceeded (server suggests {retry_after_ms}ms wait)"
+        )),
+        ClientEvent::ServerClosed { reason } => {
+            Some(format!("server closed the connection: {reason:?}"))
+        }
+        ClientEvent::Closed => Some("connection closed".to_owned()),
+        _ => None,
+    }
+}
+
+/// State of the wipe-replica control, including the force-confirm step.
+#[derive(Clone, PartialEq)]
+enum WipeState {
+    /// Showing the wipe button.
+    Idle,
+    /// Wipe refused because unsynced writes exist: waiting for force confirm.
+    ConfirmForce { unsynced_count: usize },
+    /// Error from a failed wipe or account switch.
+    Error(String),
 }
 
 fn app() -> Element {
@@ -470,12 +564,87 @@ fn app() -> Element {
     let backend = use_context::<Backend>();
     let auth_ctx = use_context::<AuthCtx>();
 
+    // Live queries.
     let rows = use_live::<_, _, Order>(
         &client,
         orders::table.order((orders::created_at.asc(), orders::id.asc())),
     );
     let count = use_live(&client, orders::table.count());
 
+    // Features 3 and 5: status line updated by client events. The receiver is
+    // obtained before the hook so `client` is not moved into it.
+    let mut status: Signal<String> = use_signal(|| "connected".to_owned());
+    let event_rx = client.events();
+    use_hook(move || {
+        spawn(async move {
+            let mut rx = event_rx;
+            while let Ok(event) = rx.recv().await {
+                if let Some(label) = status_label(&event) {
+                    status.set(label);
+                }
+            }
+        })
+    });
+
+    // Feature 2: session expiry warning. Rechecked when rows change (live rows
+    // are a proxy for "something happened"). Only fires when unsynced writes
+    // exist AND the session is within 7 days of lapsing.
+    let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
+    {
+        let client = client.clone();
+        let session_expires_at = auth_ctx.session_expires_at;
+        use_effect(move || {
+            let _ = rows.value().read().len();
+            let client = client.clone();
+            spawn(async move {
+                let unsynced = client.with_conn(|c| c.unsynced()).await;
+                let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+                if let Some(w) = expiry_warning(
+                    std::time::SystemTime::now(),
+                    session_expires_at,
+                    lead,
+                    unsynced,
+                ) {
+                    let remaining = w
+                        .session_expires_at
+                        .duration_since(std::time::SystemTime::now())
+                        .unwrap_or_default();
+                    let days = remaining.as_secs() / 86400;
+                    expiry_warn.set(Some(format!(
+                        "Session expires in {days} day(s): {} unsynced write(s) at risk. \
+                         Stay connected to extend the deadline automatically.",
+                        w.unsynced.len()
+                    )));
+                } else {
+                    expiry_warn.set(None);
+                }
+            });
+        });
+    }
+
+    // Feature 4: replica page footprint, refreshed whenever rows change.
+    let mut footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
+    {
+        let client = client.clone();
+        use_effect(move || {
+            let _ = rows.value().read().len();
+            let client = client.clone();
+            spawn(async move {
+                footprint.set(replica_footprint(&client).await);
+            });
+        });
+    }
+
+    // Feature 6: state for the force-confirm wipe.
+    let mut wipe_state: Signal<WipeState> = use_signal(|| WipeState::Idle);
+    let mut add_picking: Signal<bool> = use_signal(|| false);
+
+    // Feature 1: stored accounts, read from the keyring once on mount.
+    let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
+    let current_account = auth_ctx.current_account.clone();
+    let token_store = Arc::clone(&auth_ctx.token_store);
+
+    // Derive display values from live queries before any closures move them.
     let display_rows: Vec<(Uuid, i64)> = rows
         .value()
         .read()
@@ -488,83 +657,269 @@ fn app() -> Element {
         .map_or_else(|| "pending".to_owned(), |v| v.to_string());
     let rows_error = rows.error().read().clone();
     let count_error = count.error().read().clone();
-    let pid = std::process::id();
 
+    let (pages, free) = *footprint.read();
+    let kb = pages * 4;
+    let pid = std::process::id();
+    let replica_label = auth_ctx.key_name.clone();
+
+    // Clones for closures; one purpose each so moves do not conflict.
     let insert_backend = backend.clone();
     let delete_backend = backend;
     let write_client = client.clone();
-    // A separate clone for the logout handler so the write closure above does
-    // not capture the only copy.
-    let logout_client = client.clone();
+    let tidy_client = client.clone();
+    let wipe_client = client.clone();
+    let force_client = client.clone();
+    let switch_client = client.clone();
+    let add_client = client.clone();
 
-    let mut logout_msg: Signal<Option<String>> = use_signal(|| None);
-
-    // Extract auth data for the logout closure and the replica label.
+    // Wipe auth data; cloned twice so the Idle and ConfirmForce arms each get
+    // their own (each arm's onclick is a separate move closure).
     let auth_data = (
         Arc::clone(&auth_ctx.authenticator),
         auth_ctx.db_path.clone(),
         Arc::clone(&auth_ctx.key_store),
         auth_ctx.key_name.clone(),
     );
-    let replica_label = auth_ctx.key_name.clone();
+    let auth_data_force = auth_data.clone();
+
+    let token_store_add = Arc::clone(&token_store);
+
+    // Pre-compute account rows so per-item clones are plain Rust, not macro magic.
+    let accounts_snap = accounts_list.read().clone();
+    let account_items: Vec<(String, String, bool)> = accounts_snap
+        .iter()
+        .map(|key| {
+            let display = decode_identity::<String>(key).unwrap_or_else(|_| key.clone());
+            let is_current = *key == current_account;
+            (key.clone(), display, is_current)
+        })
+        .collect();
 
     rsx! {
         div {
-            style: "font-family: sans-serif; padding: 16px; max-width: 680px;",
+            style: "font-family: sans-serif; padding: 16px; max-width: 760px;",
 
-            // Auth control strip.
+            // Status line: mutation outcomes, rate-limit notices, reconnect events.
+            p {
+                style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                "status: " {status}
+            }
+
+            // Session expiry warning (feature 2).
+            if let Some(warn) = expiry_warn.read().clone() {
+                p {
+                    style: "background: #fff3cd; border: 1px solid #f0ad4e; \
+                            border-radius: 4px; padding: 8px 12px; \
+                            color: #8a6d3b; margin-bottom: 12px; font-size: 0.9em;",
+                    {warn}
+                }
+            }
+
+            // Auth strip with wipe and force-confirm (features 6).
             div {
-                style: "background: #f0f4ff; border: 1px solid #c0c8e8; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px;",
+                style: "background: #f0f4ff; border: 1px solid #c0c8e8; \
+                        border-radius: 6px; padding: 10px 14px; margin-bottom: 16px;",
                 p {
                     style: "margin: 0 0 6px 0; font-size: 0.9em; color: #444;",
-                    "Mode: "
-                    strong { "Signed in (private encrypted replica)" }
+                    "Mode: " strong { "Signed in (private encrypted replica)" }
                 }
                 p {
                     style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
                     "Replica: {replica_label}"
                 }
-                button {
-                    onclick: move |_| {
-                        let (auth, path, ks, kn) = auth_data.clone();
-                        let cl = logout_client.clone();
-                        spawn(async move {
-                            let unsynced =
-                                cl.with_conn(|conn| conn.unsynced()).await;
-                            match forget_device(
-                                &auth,
-                                &path,
-                                ks.as_ref(),
-                                &kn,
-                                &unsynced,
-                                false,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    restart();
+                {match wipe_state.read().clone() {
+                    WipeState::Idle => rsx! {
+                        button {
+                            onclick: move |_| {
+                                let (auth, path, ks, kn) = auth_data.clone();
+                                let cl = wipe_client.clone();
+                                spawn(async move {
+                                    let unsynced = cl.with_conn(|c| c.unsynced()).await;
+                                    match forget_device(
+                                        &auth, &path, ks.as_ref(), &kn, &unsynced, false,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => restart(),
+                                        Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
+                                            wipe_state.set(WipeState::ConfirmForce {
+                                                unsynced_count: seqs.len(),
+                                            });
+                                        }
+                                        Err(err) => {
+                                            wipe_state.set(WipeState::Error(format!(
+                                                "logout error: {err}"
+                                            )));
+                                        }
+                                    }
+                                });
+                            },
+                            "Sign out (wipe local replica)"
+                        }
+                    },
+                    WipeState::ConfirmForce { unsynced_count } => rsx! {
+                        div {
+                            style: "background: #fff8e1; border: 1px solid #f0c040; \
+                                    border-radius: 6px; padding: 8px 12px; margin-top: 6px;",
+                            p {
+                                style: "margin: 0 0 6px 0;",
+                                "{unsynced_count} write(s) are not yet synced and will be permanently lost."
+                            }
+                            div {
+                                style: "display: flex; gap: 6px;",
+                                button {
+                                    onclick: move |_| {
+                                        let (auth, path, ks, kn) = auth_data_force.clone();
+                                        let cl = force_client.clone();
+                                        spawn(async move {
+                                            let unsynced = cl.with_conn(|c| c.unsynced()).await;
+                                            match forget_device(
+                                                &auth, &path, ks.as_ref(), &kn, &unsynced, true,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => restart(),
+                                                Err(err) => {
+                                                    wipe_state.set(WipeState::Error(format!(
+                                                        "logout error: {err}"
+                                                    )));
+                                                }
+                                            }
+                                        });
+                                    },
+                                    "Confirm: discard and wipe"
                                 }
-                                Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
-                                    logout_msg.set(Some(format!(
-                                        "Logout refused: {} write(s) not yet synced. \
-                                         Wait for sync to complete, then retry.",
-                                        seqs.len()
-                                    )));
-                                }
-                                Err(err) => {
-                                    logout_msg.set(Some(format!(
-                                        "Logout error: {err}"
-                                    )));
+                                button {
+                                    onclick: move |_| wipe_state.set(WipeState::Idle),
+                                    "Cancel"
                                 }
                             }
-                        });
+                        }
                     },
-                    "Sign out (wipe local replica)"
+                    WipeState::Error(msg) => rsx! {
+                        p {
+                            style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
+                            {msg}
+                        }
+                        button {
+                            onclick: move |_| wipe_state.set(WipeState::Idle),
+                            "Dismiss"
+                        }
+                    },
+                }}
+            }
+
+            // Account management pane (feature 1).
+            div {
+                style: "border: 1px solid #ccc; border-radius: 6px; \
+                        padding: 10px 14px; margin-bottom: 16px;",
+                h3 {
+                    style: "margin: 0 0 8px 0; font-size: 1em;",
+                    "Accounts"
                 }
-                if let Some(msg) = logout_msg.read().clone() {
-                    p {
-                        style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
-                        {msg}
+                for (acc_key, display, is_current) in account_items {
+                    div {
+                        key: "{acc_key}",
+                        style: "display: flex; align-items: center; gap: 8px; margin-bottom: 4px;",
+                        span { style: "flex: 1;", {display} }
+                        if is_current {
+                            span {
+                                style: "font-size: 0.8em; color: #555; font-style: italic;",
+                                "(current)"
+                            }
+                        } else {
+                            // Switch to another stored account: check for unsent
+                            // writes, update the last-used pointer, then restart
+                            // so the next boot silently refreshes as that user.
+                            {
+                                let ts = Arc::clone(&token_store);
+                                let cl = switch_client.clone();
+                                let key = acc_key.clone();
+                                rsx! {
+                                    button {
+                                        onclick: move |_| {
+                                            let ts = Arc::clone(&ts);
+                                            let cl = cl.clone();
+                                            let key = key.clone();
+                                            spawn(async move {
+                                                let unsynced =
+                                                    cl.with_conn(|c| c.unsynced()).await;
+                                                if !unsynced.is_empty() {
+                                                    wipe_state.set(WipeState::Error(format!(
+                                                        "Cannot switch: {} write(s) not yet synced.",
+                                                        unsynced.len()
+                                                    )));
+                                                    return;
+                                                }
+                                                // Update the last-used pointer so the next boot
+                                                // silently refreshes as the chosen account.
+                                                if let Err(err) =
+                                                    ts.store(IDENTITY_RECORD, &key)
+                                                {
+                                                    wipe_state.set(WipeState::Error(format!(
+                                                        "Cannot switch account: {err}"
+                                                    )));
+                                                    return;
+                                                }
+                                                restart();
+                                            });
+                                        },
+                                        "Switch"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Clears the last-used pointer so the next boot starts a fresh login.
+                if *add_picking.read() {
+                    div {
+                        style: "margin-top: 8px; background: #f5f5ff; \
+                                border: 1px solid #c8c8e8; border-radius: 6px; \
+                                padding: 10px 14px;",
+                        p {
+                            style: "margin: 0 0 8px 0; font-size: 0.9em;",
+                            "The app will restart and open a browser login page. \
+                             Come back after signing in to finish adding the account."
+                        }
+                        div {
+                            style: "display: flex; gap: 6px; flex-wrap: wrap;",
+                            button {
+                                onclick: move |_| {
+                                    let cl = add_client.clone();
+                                    let ts = Arc::clone(&token_store_add);
+                                    spawn(async move {
+                                        let unsynced = cl.with_conn(|c| c.unsynced()).await;
+                                        if !unsynced.is_empty() {
+                                            wipe_state.set(WipeState::Error(format!(
+                                                "Cannot add account: {} write(s) not yet synced.",
+                                                unsynced.len()
+                                            )));
+                                            return;
+                                        }
+                                        if let Err(err) = ts.clear(IDENTITY_RECORD) {
+                                            wipe_state.set(WipeState::Error(format!(
+                                                "Cannot clear identity pointer: {err}"
+                                            )));
+                                            return;
+                                        }
+                                        restart();
+                                    });
+                                },
+                                "Sign in"
+                            }
+                            button {
+                                onclick: move |_| add_picking.set(false),
+                                "Cancel"
+                            }
+                        }
+                    }
+                } else {
+                    button {
+                        style: "margin-top: 6px;",
+                        onclick: move |_| add_picking.set(true),
+                        "Add another account"
                     }
                 }
             }
@@ -621,10 +976,11 @@ fn app() -> Element {
             h2 { "local replica (live query)" }
             p {
                 style: "color: #666; font-size: 0.9em;",
-                "Local client writes upload to the server, apply to Postgres, and echo back through logical replication, so every window converges, count included."
+                "Local client writes upload to the server, apply to Postgres, and echo back \
+                 through logical replication, so every window converges, count included."
             }
             table {
-                style: "border-collapse: collapse; min-width: 320px;",
+                style: "border-collapse: collapse; min-width: 320px; margin-bottom: 20px;",
                 thead {
                     tr {
                         th { style: "border: 1px solid #999; padding: 4px 12px;", "id" }
@@ -638,6 +994,33 @@ fn app() -> Element {
                             td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{quantity}" }
                         }
                     }
+                }
+            }
+
+            // Retention pane (feature 4): page footprint and a trim button.
+            div {
+                style: "border: 1px solid #ccc; border-radius: 6px; padding: 10px 14px;",
+                h2 {
+                    style: "margin-top: 0; font-size: 1em;",
+                    "Retention"
+                }
+                p { "Replica: {pages} pages (~{kb} KB total, {free} free to reclaim)." }
+                p {
+                    style: "color: #666; font-size: 0.9em;",
+                    "Ending a subscription evicts rows no live query still covers, \
+                     and the trim pass returns those pages to the filesystem."
+                }
+                button {
+                    onclick: move |_| {
+                        let client = tidy_client.clone();
+                        spawn(async move {
+                            if let Err(err) = client.tidy().await {
+                                tracing::error!(error = %err, "tidy failed");
+                            }
+                            footprint.set(replica_footprint(&client).await);
+                        });
+                    },
+                    "Free up space"
                 }
             }
         }

@@ -14,7 +14,11 @@ publish = false
 workspace = true
 
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport", "test-support", "logging"] }
+connetto-core = { workspace = true, features = [
+  "native-transport",
+  "test-support",
+  "logging",
+] }
 # The harness exercises the real Postgres write and read paths, which
 # connetto-server now compiles unconditionally.
 connetto-server = { path = "../connetto-server" }
@@ -22,10 +26,10 @@ connetto-server = { path = "../connetto-server" }
 # parser used to build both. pg-streaming brings PgStreamingCdcSource and
 # PgStreamingConfig, executor-diesel-async-postgres brings PgAsyncDieselConnector.
 subql = { workspace = true, features = [
-    "pg-streaming",
-    "executor-diesel-async-postgres",
-    "visibility-openfga",
-    "membership-term",
+  "pg-streaming",
+  "executor-diesel-async-postgres",
+  "visibility-openfga",
+  "membership-term",
 ] }
 # The fan-out fixture serves through the executor the binary serves through, so
 # it needs the client that talks to the authorization service and the translator
@@ -34,15 +38,18 @@ openfga-client = { version = "0.6.1", default-features = false }
 rls2fga = { workspace = true }
 # Naming the caller mapping reverse translation rewrites the client's local
 # caller function with, mirroring the server binary's materializer wiring.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = [
+  "std",
+] }
+anyhow.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 # The admin and role pools that reset the fixture and back the write, snapshot,
 # and connector paths.
 diesel = { workspace = true, features = ["postgres_backend"] }
 diesel-async = { version = "0.7", default-features = false, features = [
-    "postgres",
-    "bb8",
+  "postgres",
+  "bb8",
 ] }
 # Building the mutation changeset a client uploads.
 sqlite-diff-rs = { version = "0.9.0", default-features = false }
@@ -50,6 +57,22 @@ sqlite-diff-rs = { version = "0.9.0", default-features = false }
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
 sqlparser = { version = "0.62", default-features = false }
+# The fixture owns the services it needs, so a test provisions nothing by hand.
+# `GenericImage` for both Postgres and OpenFGA rather than `testcontainers-modules`:
+# that crate pins testcontainers 0.27, and neither image is served better by a
+# module than by the command and readiness this fixture states outright.
+# `http_wait_plain` brings the HTTP readiness strategy OpenFGA needs, `watchdog`
+# stops a container when the test process takes a signal.
+testcontainers = { version = "0.28", features = [
+  "http_wait_plain",
+  "watchdog",
+] }
+axum = "0.8"
+openidconnect = { version = "4.0.1", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.

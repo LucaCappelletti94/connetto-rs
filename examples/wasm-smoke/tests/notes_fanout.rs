@@ -9,9 +9,6 @@
 //! hub's local snapshot leg, and a single mutation spanning both tiers is
 //! rejected by the hub and rolled back on the writing tab.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test notes_fanout`
 
 #![cfg(target_arch = "wasm32")]
 
@@ -195,7 +192,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
 
     // This page wins the leader election and owns the DB worker.
     let membership = leader::join(&format!("connetto-notes-leader-{base}"), &glue_url());
-    await_db_worker_ready().await;
+    await_db_worker_ready().await.expect("db worker ready");
     stage("db worker ready");
 
     let client_a = rosetta_uuid::Uuid::new_v4().to_string();

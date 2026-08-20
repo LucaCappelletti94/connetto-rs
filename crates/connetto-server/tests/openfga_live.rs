@@ -19,16 +19,7 @@
 //! adopted rather than rewritten, which is what keeps a restart from reloading
 //! every fact in the database.
 //!
-//! Run with a Postgres and an `OpenFGA` server:
-//!
-//! ```text
-//! docker run -d --rm --name r5b-pg -e POSTGRES_PASSWORD=postgres -p 55480:5432 \
-//!     postgres:16 -c wal_level=logical
-//! docker run -d --rm --name r5b-fga -p 55481:8081 openfga/openfga:v1.8.13 run
-//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55480/postgres \
-//! CONNETTO_TEST_FGA_URL=http://127.0.0.1:55481 \
-//!     cargo +stable test --release -p connetto-server --test openfga_live -- --ignored
-//! ```
+//! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::sync::Arc;
 
@@ -39,10 +30,10 @@ use connetto_server::openfga::{
     Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
 };
 use connetto_server::row_view::ValuesRow;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use connetto_test_harness::Fixture;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
+use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, RowData};
 use subql::backend::{Postgres, Value};
@@ -70,25 +61,6 @@ fn policies() -> String {
     POLICY_STATEMENTS.join(";\n") + ";"
 }
 
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
-
-fn service_url() -> String {
-    std::env::var("CONNETTO_TEST_FGA_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned())
-}
-
-async fn pool() -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url());
-    Pool::builder()
-        .max_size(4)
-        .build(manager)
-        .await
-        .expect("a Postgres pool")
-}
-
-/// Provision the table and its rows, dropping whatever a previous run left.
 async fn provision(pool: &Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("a connection");
     let mut statements = vec!["DROP TABLE IF EXISTS r5b_notes CASCADE", SCHEMA];
@@ -114,24 +86,6 @@ fn caller(user: &str) -> Arc<Principal> {
     Arc::new(principal)
 }
 
-async fn connect() -> (Channel, String) {
-    let endpoint = service_url();
-    let channel = Channel::from_shared(endpoint.clone())
-        .expect("a service endpoint")
-        .connect()
-        .await
-        .unwrap_or_else(|err| panic!("connecting to {endpoint}: {err}"));
-    let store = OpenFgaServiceClient::new(channel.clone())
-        .create_store(CreateStoreRequest {
-            name: format!("connetto-r5b-{}", uuid::Uuid::new_v4()),
-        })
-        .await
-        .expect("create a store")
-        .into_inner()
-        .id;
-    (channel, store)
-}
-
 /// One row as the change stream carries it, every column present, which is what
 /// `REPLICA IDENTITY FULL` gives an update.
 fn row_data(columns: &[(&str, &str)]) -> RowData {
@@ -143,11 +97,11 @@ fn row_data(columns: &[(&str, &str)]) -> RowData {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision(&pool).await;
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String>(SCHEMA, &policies(), "app.user_id")
         .expect("connetto's own policy shape translates");
@@ -222,11 +176,11 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn unchanged_rules_are_adopted_rather_than_rewritten() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision(&pool).await;
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
     let mut client = OpenFgaServiceClient::new(channel);
 
     let first = Translated::of::<String>(SCHEMA, &policies(), "app.user_id")
@@ -261,11 +215,11 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
 /// and the refusal is required to cost nothing, because nobody is granted and
 /// so no watcher is worth asking about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision(&pool).await;
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
 
     let policies = "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;";
     let translated =
@@ -330,11 +284,11 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
 /// calls with the removals first, so between them the row reaches nobody rather
 /// than everybody. This is the assertion that fix has to keep satisfying.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision(&pool).await;
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String>(SCHEMA, &policies(), "app.user_id")
         .expect("connetto's own policy shape translates");
@@ -456,13 +410,14 @@ async fn provision_cross(pool: &Pool<AsyncPgConnection>) {
 /// Translate the cross-table policy, put it and its facts on a fresh store, and
 /// compose the executor plus the upkeep that keeps it current.
 async fn cross_executor(
+    fixture: &Fixture,
     pool: &Pool<AsyncPgConnection>,
 ) -> (
     FgaAuth<String, String, Counted<Channel>>,
     Arc<dyn connetto_server::openfga::StoreUpkeep>,
     Arc<subql::visibility::shapes::Shapes<subql::ParserDB>>,
 ) {
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
     let schema = cross_schema();
     let translated =
         Translated::of::<String>(&schema, &CROSS_POLICY_STATEMENTS.join(";\n"), "app.user_id")
@@ -513,11 +468,11 @@ async fn cross_executor(
 /// `OPENFGA_CHECK_QUERY_CACHE_ENABLED` on is what would make the clause bite,
 /// and is what this measurement would then catch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision_cross(&pool).await;
-    let (auth, upkeep, shapes) = cross_executor(&pool).await;
+    let (auth, upkeep, shapes) = cross_executor(&fixture, &pool).await;
     let docs = catalog_helpers::table_id(shapes.catalog(), "r7_docs").expect("in the catalog");
     let row: [Value<Postgres>; 2] = [Value::Int(1), Value::Int(1)];
     let view = ValuesRow::new(docs, &row);
@@ -649,11 +604,11 @@ async fn provision_orders(pool: &Pool<AsyncPgConnection>) {
 /// write was refused. An allow for the typed key and a refusal for the bytes is
 /// the divergence the fix removes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres and OpenFGA (Docker); run after explicit approval"]
 async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
-    let pool = pool().await;
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
     provision_orders(&pool).await;
-    let (channel, store) = connect().await;
+    let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String>(ORDERS_SCHEMA, &orders_policies(), "app.user_id")
         .expect("connetto's own policy shape translates");

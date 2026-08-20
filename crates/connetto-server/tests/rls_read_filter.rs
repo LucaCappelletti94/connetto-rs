@@ -1,4 +1,4 @@
-//! Docker-gated Row-Level Security read-filter test.
+//! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Verifies that the row-level-security policy enforces a Postgres RLS policy
 //! keyed on `current_setting('app.user_id')`. The check reads the key off the
@@ -7,9 +7,6 @@
 //! visibility.
 //! Covers a single integer key, a composite key, a uuid key, and the loud
 //! failure raised for a key type the bind path does not cover yet.
-//!
-//! `#[ignore]` by default because it needs a running Postgres. Point
-//! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
 //!
 //! A superuser bypasses RLS entirely, so the check must connect as a
 //! non-superuser role. The test creates `app_reader` for that and runs the
@@ -20,10 +17,9 @@
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::{RlsAuth, RlsAuthError, ValuesRow};
+use connetto_test_harness::{Fixture, pool_for, with_user};
 use diesel::sql_query;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::bb8::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::RunQueryDsl;
 use std::sync::Arc;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{Verdict, VisibilityPolicy};
@@ -36,23 +32,6 @@ CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, body TEXT);\
 CREATE TABLE shares (doc_id INT, viewer TEXT, PRIMARY KEY (doc_id, viewer));\
 CREATE TABLE assets (id UUID PRIMARY KEY, owner TEXT);\
 CREATE TABLE events (occurred_at TIMESTAMP PRIMARY KEY, owner TEXT);";
-
-fn admin_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
-
-/// Rewrite a Postgres URL's user info, keeping host, port, and database.
-fn with_user(url: &str, user: &str, password: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    format!("{scheme}://{user}:{password}@{host}")
-}
-
-async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
-    Pool::builder().build(manager).await.expect("build pool")
-}
 
 /// Ask the policy about one row, as the change path does.
 ///
@@ -88,13 +67,17 @@ async fn visible(auth: &RlsAuth, user: &str, table: &str, key: &[Value<Postgres>
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn rls_read_filter_enforces_visibility_per_user() {
     let alice_asset = uuid::Uuid::from_u128(0x0A11_CE00);
     let bob_asset = uuid::Uuid::from_u128(0x00B0_B000);
 
-    let admin = pool_for(&admin_url()).await;
-    let mut conn = admin.get().await.expect("admin connection");
+    let fixture = Fixture::acquire().await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+
+    // DDL and role setup cannot be expressed in diesel's typed DSL.
+    // The INSERT statements seed data into tables that `docs` reuses with a
+    // different schema in the second test, so a shared typed table! would not
+    // cover both; raw SQL is used for those rows too.
     let setup: Vec<String> = vec![
         "DROP TABLE IF EXISTS docs, shares, assets, events CASCADE".to_owned(),
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -131,7 +114,7 @@ async fn rls_read_filter_enforces_visibility_per_user() {
     }
     drop(conn);
 
-    let reader = pool_for(&with_user(&admin_url(), "app_reader", "app_reader")).await;
+    let reader = pool_for(&with_user(fixture.admin_url(), "app_reader", "app_reader")).await;
     let auth = RlsAuth::from_ddl(reader, CATALOG_DDL).expect("build RlsAuth");
 
     // Single integer key: each user sees only their own row.
@@ -175,12 +158,15 @@ async fn rls_read_filter_enforces_visibility_per_user() {
 /// matters is the negative: with the default name the policy sees nothing,
 /// because connetto would be binding a setting nobody reads.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_policy_may_name_its_own_identity_setting() {
     const OURS: &str = "myapp.current_user";
 
-    let admin = pool_for(&admin_url()).await;
-    let mut conn = admin.get().await.expect("admin connection");
+    let fixture = Fixture::acquire().await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    // DDL, role setup, and INSERT are not expressible in diesel's typed DSL.
+    // The `docs` table here has a different schema than in the first test
+    // (no `body` column), so a shared typed table! definition would not cover
+    // both; raw SQL is used.
     for stmt in [
         // The role is this test's own to provision: depending on the other test
         // having run first is an ordering dependency, and it bit once already.
@@ -202,7 +188,7 @@ async fn a_policy_may_name_its_own_identity_setting() {
     }
     drop(conn);
 
-    let reader = pool_for(&with_user(&admin_url(), "app_reader", "app_reader")).await;
+    let reader = pool_for(&with_user(fixture.admin_url(), "app_reader", "app_reader")).await;
     let renamed = RlsAuth::from_ddl(reader.clone(), CATALOG_DDL)
         .expect("build RlsAuth")
         .with_user_setting(OURS);

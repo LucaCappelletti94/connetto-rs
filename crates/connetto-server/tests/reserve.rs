@@ -16,8 +16,7 @@
 //! sleep, which is the snapshot-transfer shape the reserve exists to survive.
 //! The identified caller reads `fast_rows`, which carries no such policy.
 //!
-//! `#[ignore]` by default. It needs a running Postgres. Point `DATABASE_URL` at
-//! one and run with `--ignored` after explicit approval.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -290,7 +289,6 @@ async fn wait_for_slow_reads(fixture: &Fixture, want: i64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn an_identified_caller_completes_under_anonymous_saturation() {
     let fixture = Fixture::acquire().await;
     let reader = setup(&fixture, 8.0).await;
@@ -411,7 +409,6 @@ async fn an_identified_caller_completes_under_anonymous_saturation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn anonymous_callers_reach_the_full_unreserved_share() {
     let fixture = Fixture::acquire().await;
     let reader = setup(&fixture, 4.0).await;

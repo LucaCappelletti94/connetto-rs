@@ -11,7 +11,7 @@
 //! delivered as an ordinary live patch, so the subscriber applied nothing, its
 //! cursor moved past the event, and its copy stayed populated for ever.
 //!
-//! `#[ignore]` by default: it needs a Postgres started with `wal_level=logical`.
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::time::Duration;
 
@@ -29,11 +29,9 @@ async fn provision(fixture: &Fixture) {
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS _connetto_mutations",
-            "DROP PUBLICATION IF EXISTS connetto_pub",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT)",
-            "ALTER TABLE notes REPLICA IDENTITY FULL",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
             "CREATE POLICY notes_p ON notes \
              USING (owner = current_setting('app.user_id', true))",
@@ -42,9 +40,6 @@ async fn provision(fixture: &Fixture) {
             "INSERT INTO notes (id, owner, body) VALUES (1, 'alice', 'one'), (2, 'alice', 'two')",
         ])
         .await;
-    // The handshake reads the durable mutation watermark, so the table has to
-    // exist before a client connects. Provisioned by the admin, as a deployment
-    // would: the restricted role cannot CREATE in schema public.
     connetto_test_harness::provision_watermark(fixture.admin()).await;
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
@@ -69,7 +64,6 @@ async fn spawn(fixture: &Fixture) -> connetto_test_harness::Server {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn truncating_a_table_replaces_the_subscription_naming_that_table() {
     let fixture = Fixture::acquire().await;
     provision(&fixture).await;
@@ -126,7 +120,6 @@ async fn truncating_a_table_replaces_the_subscription_naming_that_table() {
 /// past it. So the reconnecting client applied nothing and kept every row, which
 /// is the identical defect narrowed to offline clients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker)"]
 async fn a_client_offline_across_the_truncate_is_replaced_on_reconnect() {
     let fixture = Fixture::acquire().await;
     provision(&fixture).await;

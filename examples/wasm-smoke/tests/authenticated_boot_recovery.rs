@@ -9,7 +9,6 @@
 //! cleared key store or a wiped device leaves behind, and then boots. A startup
 //! missing the recovery would fail on the undecryptable store instead of logging in.
 //!
-//! Needs the stack up. See `authenticated_boot.rs` for the commands.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -17,11 +16,14 @@ mod common;
 
 use common::{REFRESH_DB, auth_config, play_the_tab, worker_config};
 use connetto_core::traits::RefreshTokenStore;
-use connetto_web::auth::{IdbKeyStore, REFRESH_RECORD, RefreshStore};
+use connetto_web::auth::{IdbKeyStore, RefreshStore, remembered_account};
 use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key, take_pending_wipes};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+/// Account key used to plant the stale credential: JSON form of a `String` id.
+const ACCOUNT: &str = "\"tester\"";
 
 /// A stored credential the device key no longer opens is discarded, not fatal.
 #[wasm_bindgen_test]
@@ -41,7 +43,7 @@ async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
     RefreshStore::open(&auth_db_url, &stale_device)
         .expect("open the refresh store")
         .store(
-            REFRESH_RECORD,
+            ACCOUNT,
             "a-refresh-token-the-device-key-can-no-longer-reach",
         )
         .expect("store a credential");
@@ -71,9 +73,12 @@ async fn a_refresh_store_that_does_not_decrypt_is_replaced_by_a_fresh_login() {
     // holds the credential from that login, so the next startup refreshes silently.
     let recovered =
         RefreshStore::open(&auth_db_url, &live_device).expect("the replacement store decrypts");
+    let account = remembered_account(&recovered)
+        .expect("read account")
+        .expect("the fresh login stored an account marker");
     assert!(
         recovered
-            .load(REFRESH_RECORD)
+            .load(&account)
             .expect("read the replacement store")
             .is_some(),
         "the fresh login left a credential behind"

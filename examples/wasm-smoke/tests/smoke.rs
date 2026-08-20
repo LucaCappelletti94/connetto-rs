@@ -9,9 +9,6 @@
 //! replication echo arriving back. This is also the full cdylib link proof
 //! for the dependency stack.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test smoke`
 
 #![cfg(target_arch = "wasm32")]
 

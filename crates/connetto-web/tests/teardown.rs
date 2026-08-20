@@ -14,9 +14,7 @@
 
 use connetto_client::cipher::ReplicaKey;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
-use connetto_web::auth::{
-    AuthError, IdbKeyStore, REFRESH_RECORD, RefreshStore, provision_replica_key,
-};
+use connetto_web::auth::{AuthError, IdbKeyStore, RefreshStore, provision_replica_key};
 use connetto_web::storage::{
     ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
     tier_db_name, wipe_replica,
@@ -34,6 +32,8 @@ const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 /// The refresh token the encrypted store round-trips, and the string that must
 /// not appear in the store's bytes at rest.
 const REFRESH_TOKEN: &str = "session-id.connetto-refresh-canary-3f80ba61";
+/// The account key used in store round-trip tests: JSON form of a `String` id.
+const ACCOUNT: &str = "\"tester\"";
 
 diesel::table! {
     /// Table with a marker string to verify encryption at rest
@@ -261,11 +261,9 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
     let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store
-            .store(REFRESH_RECORD, REFRESH_TOKEN)
-            .expect("save the token");
+        store.store(ACCOUNT, REFRESH_TOKEN).expect("save the token");
         assert_eq!(
-            store.load(REFRESH_RECORD).expect("load").as_deref(),
+            store.load(ACCOUNT).expect("load").as_deref(),
             Some(REFRESH_TOKEN),
             "the token round-trips through the encrypted store"
         );
@@ -292,7 +290,7 @@ async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reop
     );
     let store = RefreshStore::open(&url, &cached).expect("reopen the refresh store");
     assert_eq!(
-        store.load(REFRESH_RECORD).expect("load").as_deref(),
+        store.load(ACCOUNT).expect("load").as_deref(),
         Some(REFRESH_TOKEN),
         "the stored credential survives a cold reopen"
     );
@@ -315,9 +313,7 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
     let url = storage.db_url(name);
     {
         let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store
-            .store(REFRESH_RECORD, REFRESH_TOKEN)
-            .expect("save the token");
+        store.store(ACCOUNT, REFRESH_TOKEN).expect("save the token");
     }
 
     clear_device_key(&keys).await.expect("shred the device key");
@@ -337,7 +333,7 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
     storage.delete_db(name).expect("discard the store");
     let store = RefreshStore::open(&url, &reminted).expect("a fresh store opens");
     assert_eq!(
-        store.load(REFRESH_RECORD).expect("load"),
+        store.load(ACCOUNT).expect("load"),
         None,
         "the discarded credential is gone, so the next boot must log in"
     );

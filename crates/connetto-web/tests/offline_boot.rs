@@ -45,12 +45,14 @@ async fn the_worker_starts_with_no_server_reachable() {
 
     // Returns rather than propagating. Before this phase the connect failure
     // came straight back out of here and the worker never existed.
-    let identity = boot_db_worker::<String>(&config())
+    let booted = boot_db_worker::<String>(&config())
         .await
         .expect("the worker starts with no server reachable");
     assert_eq!(
-        identity, None,
+        booted.identity, None,
         "logins are off, so nobody was signed in, which is a separate axis from \
          whether a server answered"
     );
+    assert_eq!(booted.session_expires_at, None);
+    assert_eq!(booted.account, None);
 }

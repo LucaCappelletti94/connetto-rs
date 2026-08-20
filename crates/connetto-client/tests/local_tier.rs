@@ -10,6 +10,8 @@
 //! refused. The generation-time half of the contract (a `REFERENCES` crossing
 //! the tier boundary fails the template bake) is pinned against pg2sqlite
 //! directly.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
 
 #![allow(clippy::too_many_lines)]
 
@@ -220,7 +222,6 @@ async fn wait_broadcast_strict(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_write_is_outside_the_capture_session() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
@@ -263,7 +264,6 @@ async fn local_write_is_outside_the_capture_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_row_watch_registers_no_subscription_and_refreshes() {
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
@@ -308,7 +308,6 @@ async fn local_row_watch_registers_no_subscription_and_refreshes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_aggregate_recomputes_locally() {
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
@@ -355,7 +354,6 @@ async fn local_aggregate_recomputes_locally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn local_custom_aggregate_decodes_via_extension_seam() {
     // A custom aggregate (group_concat, absent from the built-in
     // AGGREGATE_FUNCTIONS) returning an application-defined SQL type
@@ -450,7 +448,6 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn mixed_tier_aggregate_is_refused_at_registration() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
@@ -475,7 +472,6 @@ async fn mixed_tier_aggregate_is_refused_at_registration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn mixed_row_query_subscribes_synced_tables_whole() {
     let fixture = Fixture::acquire().await;
     let (manager, seen, addr, server) = spawn_server(&fixture, 1).await;

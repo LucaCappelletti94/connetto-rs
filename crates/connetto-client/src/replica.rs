@@ -326,13 +326,34 @@ where
 /// never collide with this literal.
 pub const IDENTITY_RECORD: &str = "connetto-device-identity";
 
-/// Encode `user_id` for [`IDENTITY_RECORD`].
+/// The native credential store's index of the accounts it holds.
 ///
-/// The encoding is the id's own serde form, the same byte source
-/// [`replica_db_name`] hashes, so an account
-/// read back from the record names the replica it named when it was written.
-/// That is the property a start with no network depends on: nothing else on
-/// the device says who the stored credential belongs to.
+/// `keyring` 3.6.3 exposes no enumeration on any of its backends, verified in
+/// its own source, so the one store that cannot be asked what it holds is told.
+/// The browser needs no equivalent: its rows are enumerable, so asking them
+/// cannot disagree with what is stored.
+pub(crate) const ACCOUNTS_RECORD: &str = "connetto-account-index";
+
+/// Whether `name` is one of connetto's own credential-store records rather than
+/// an account.
+///
+/// The one definition of that set, because every store has to agree on it: a
+/// reserved record must never be offered as somebody to sign in as. Collision is
+/// impossible rather than merely unlikely, since an account key is a serialized
+/// id and neither literal is valid JSON.
+#[must_use]
+pub fn is_reserved_record(name: &str) -> bool {
+    name == IDENTITY_RECORD || name == ACCOUNTS_RECORD
+}
+
+/// Encode `user_id` for [`IDENTITY_RECORD`], and for the credential row itself.
+///
+/// One value serves both jobs, which is what makes an account list possible: the
+/// encoding is the id's own serde form, the same byte source [`replica_db_name`]
+/// hashes, so an account read back names the replica it named when it was
+/// written, and unlike the hash it reads back as the deployment's own id type.
+/// That is the property a start with no network depends on, since nothing else
+/// on the device says who a stored credential belongs to.
 ///
 /// # Errors
 ///

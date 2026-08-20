@@ -3,6 +3,8 @@
 //! whose rendered markup follows CDC. One hook serves both handle kinds: a
 //! row query renders its rows and a COUNT(*) aggregate renders its pushed
 //! value, in the same component.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -221,7 +223,6 @@ async fn render_until(vdom: &mut VirtualDom, pred: impl Fn(&str) -> bool) -> Str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn use_live_renders_and_follows_cdc() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
@@ -309,7 +310,6 @@ async fn use_live_renders_and_follows_cdc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn use_live_fn_follows_a_boxed_row_query() {
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");

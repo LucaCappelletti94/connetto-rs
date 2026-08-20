@@ -8,7 +8,7 @@
 //! an otherwise quiet machine:
 //!
 //! ```text
-//! CONNETTO_LOAD_RUN=1 DATABASE_URL=postgres://... \
+//! CONNETTO_LOAD_RUN=1 \
 //!   cargo test --release -p connetto-test-harness --test fanout_load \
 //!   -- --ignored --nocapture
 //! ```
@@ -42,7 +42,7 @@ const DELIVERY_SLACK: f64 = 1.10;
 const WRITER_MARGIN: u64 = 2;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and CONNETTO_LOAD_RUN"]
+#[ignore = "a baseline measurement: set CONNETTO_LOAD_RUN and run it explicitly"]
 async fn baseline_throughput_and_lock_wait() {
     if std::env::var_os("CONNETTO_LOAD_RUN").is_none() {
         println!("skipped: set CONNETTO_LOAD_RUN to take a baseline measurement");

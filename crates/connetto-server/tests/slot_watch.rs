@@ -20,7 +20,6 @@ use connetto_test_harness::Fixture;
 const SLOT: &str = "connetto_slot_watch";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn the_slot_reads_back_what_postgres_knows() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin();
@@ -113,7 +112,6 @@ async fn the_slot_reads_back_what_postgres_knows() {
 /// The scratch database is created and dropped here rather than assumed,
 /// because the property is only observable when two databases hold the name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_neighbouring_databases_slot_is_not_this_one() {
     let fixture = Fixture::acquire().await;
     let neighbour_db = "connetto_slot_watch_neighbour";

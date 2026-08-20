@@ -2,27 +2,24 @@
 //!
 //! Spawn the real `connetto-server` and `connetto-client` binaries as separate
 //! OS processes and drive a full sync loop over real Postgres logical
-//! replication. The suite starts a loopback identity provider in-process using
-//! `oauth2-test-server`, so every spawned server carries a real OIDC
-//! configuration and every spawned client carries a minted connetto access
-//! token. One test covers the read direction: each client receives the initial
-//! snapshot, then a live insert fans out to both, and after the walsender is
-//! terminated the server's reconnect loop resumes so a further insert still
-//! reaches both clients. The other covers the write direction: a client applies
+//! replication. The suite starts its own containerised OIDC provider, so every
+//! spawned server carries a real OIDC configuration and every spawned client
+//! carries a minted connetto access token. One test covers the read direction:
+//! each client receives the initial snapshot, then a live insert fans out to both,
+//! and after the walsender is terminated the reconnect loop still reaches both.
+//! The other covers the write direction: a client applies
 //! a local insert and pushes it, the server's write path lands it in Postgres,
 //! and it fans back out over CDC to a second client. This is the product spine
 //! end to end, unlike the in-process session tests.
 //!
-//! `#[ignore]` by default. It needs a Postgres started with `wal_level=logical`,
-//! both binaries built in the same profile as the test, and an `app_reader`
-//! non-superuser role that the fixture creates automatically. The in-process
-//! identity provider requires no external setup. Run it with:
+//! Needs Docker: the fixture starts its own Postgres, its own `OpenFGA`, and
+//! its own OIDC provider, and both binaries must be built in the same profile
+//! as the test. Run it with:
 //!
 //! ```text
 //! cargo build --release -p connetto-server --bin connetto-server
 //! cargo build --release -p connetto-client --bin connetto-client --all-features
-//! DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-//!   cargo test --release -p connetto-server --test e2e -- --ignored
+//! cargo test --release -p connetto-server --test e2e
 //! ```
 //!
 
@@ -40,9 +37,8 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
-use oauth2_test_server::{IssuerConfig, OAuthTestServer};
-use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
-use openfga_client::tonic::transport::Channel;
+use connetto_test_harness::{Fixture, MOCK_OAUTH_PROVIDER, MockOauth, PUBLICATION, SLOT};
+use keyring_core::Entry;
 use openidconnect::reqwest;
 use serde_json::json;
 
@@ -50,8 +46,6 @@ const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
-const SLOT: &str = "connetto_slot";
-const PUBLICATION: &str = "connetto_pub";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_SQLITE_DDL: &str =
@@ -89,11 +83,6 @@ diesel::table! {
 /// Serializes the Docker-gated tests. They reset the same Postgres and share one
 /// replication slot and publication name, so they must not run concurrently.
 static PG_SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
 
 fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_connetto-server"))
@@ -153,11 +142,16 @@ impl ReplicaDir {
 impl Drop for ReplicaDir {
     fn drop(&mut self) {
         for path in &self.replicas {
-            if let Ok(entry) = keyring::Entry::new(CLIENT_KEYRING_SERVICE, path) {
+            if let Ok(entry) = keyring_entry(path) {
                 let _ = entry.delete_credential();
             }
         }
     }
+}
+
+fn keyring_entry(name: &str) -> keyring_core::Result<Entry> {
+    keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
+    Entry::new(CLIENT_KEYRING_SERVICE, name)
 }
 
 /// Row count of the `orders` table in a client's local SQLite, or 0 while the
@@ -173,7 +167,7 @@ fn count_orders(db_path: &Path) -> i64 {
         return 0;
     }
     let path = db_path.to_string_lossy();
-    let Ok(entry) = keyring::Entry::new(CLIENT_KEYRING_SERVICE, &path) else {
+    let Ok(entry) = keyring_entry(&path) else {
         return 0;
     };
     let Ok(hex) = entry.get_password() else {
@@ -242,22 +236,9 @@ struct Authorization {
 }
 
 impl Authorization {
-    async fn provision(policies: &str) -> Self {
-        let endpoint = std::env::var("CONNETTO_TEST_FGA_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_owned());
-        let channel = Channel::from_shared(endpoint.clone())
-            .expect("a service endpoint")
-            .connect()
-            .await
-            .unwrap_or_else(|err| panic!("connecting to {endpoint}: {err}"));
-        let store = OpenFgaServiceClient::new(channel)
-            .create_store(CreateStoreRequest {
-                name: format!("connetto-e2e-{}", uuid::Uuid::new_v4()),
-            })
-            .await
-            .expect("create a store")
-            .into_inner()
-            .id;
+    async fn provision(fixture: &Fixture, policies: &str) -> Self {
+        let endpoint = fixture.fga_url().await.to_owned();
+        let (_channel, store) = fixture.fga_store().await;
         Self {
             policies: policies.to_owned(),
             endpoint,
@@ -366,42 +347,8 @@ async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
         .unwrap_or_else(|err| panic!("statement failed ({sql}): {err}"));
 }
 
-/// Drop the replication slot, terminating any active walsender first and
-/// retrying until the slot is gone. A prior test's server can still hold the
-/// slot for a moment after it is killed, and an active slot cannot be dropped.
-async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
-    for _ in 0..50 {
-        exec(
-            pool,
-            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
-             WHERE slot_name = 'connetto_slot' AND active_pid IS NOT NULL",
-        )
-        .await;
-        let mut conn = pool.get().await.expect("admin connection");
-        let dropped = sql_query(
-            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-             WHERE slot_name = 'connetto_slot'",
-        )
-        .execute(&mut *conn)
-        .await;
-        drop(conn);
-        if dropped.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    panic!("replication slot connetto_slot could not be dropped");
-}
-
-/// Reset the shared Postgres fixture to a clean slate: drop the slot, table, and
-/// publication, then recreate the table with `REPLICA IDENTITY FULL`, one seed
-/// row, the publication, and the slot. Also creates an `app_reader` non-superuser
-/// role (idempotent) and grants it the access the server needs. Grants die with
-/// DROP TABLE, so they are refreshed on each call. The seed lands before the slot
-/// exists, so it reaches clients via snapshot and only later writes arrive over
-/// replication.
-async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
-    drop_slot(pool).await;
+/// Reset the orders fixture, auth tables and reader role for one server run.
+async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
     // Stale per-session watermarks from a previous run would suppress replayed
     // mutations, so drop and recreate fresh. connetto emits no DDL and the
@@ -432,9 +379,7 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
          op connetto_auth_op NOT NULL, table_name TEXT, pk UUID)",
     )
     .await;
-    exec(pool, "DROP PUBLICATION IF EXISTS connetto_pub").await;
     exec(pool, PG_DDL).await;
-    exec(pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
     exec(
         pool,
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -453,14 +398,7 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>) {
     )
     .await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
-    exec(pool, "CREATE PUBLICATION connetto_pub FOR TABLE orders").await;
-    exec(
-        pool,
-        "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')",
-    )
-    .await;
-    // The server refuses to start without its reconnect log (R32).
-    connetto_test_harness::provision_oplog(pool).await;
+    fixture.start_replication(&["orders"]).await;
 }
 
 /// Rewrite a Postgres URL's user info, keeping host, port, and database. Used to
@@ -523,50 +461,29 @@ async fn wait_for_pg_count(
 }
 
 /// A loopback identity provider plus the env pairs the server binary needs to
-/// discover and use it. Holds the `OAuthTestServer` guard alive for the test.
+/// discover and use it. Holds the provider guard alive for the test.
 struct AuthStack {
-    _idp: OAuthTestServer,
-    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_` pairs.
+    _idp: MockOauth,
+    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_PROVIDERS` settings.
     env_pairs: Vec<(String, String)>,
     /// Base URL of the server binary's auth endpoints.
     auth_base: String,
 }
 
-/// Start an `oauth2-test-server` identity provider, register a client against
-/// the connetto auth callback bound at `auth_port`, and return the stack.
+/// Start the mock OAuth provider and configure connetto's auth callback at
+/// `auth_port`.
 async fn build_auth_stack(auth_port: u16) -> AuthStack {
     let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
-    let idp = OAuthTestServer::start_with_config(IssuerConfig {
-        host: "127.0.0.1".into(),
-        port: 0,
-        ..IssuerConfig::default()
-    })
-    .await;
-    let issuer = idp.base_url.to_string();
-    let issuer = issuer.trim_end_matches('/').to_owned();
-    let client = idp
-        .register_client(json!({
-            "redirect_uris": [callback],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "scope": "openid",
-        }))
-        .await;
-    let secret = client.client_secret.clone().unwrap_or_default();
+    let idp = MockOauth::start().await;
     let auth_base = format!("http://127.0.0.1:{auth_port}");
-    let env_pairs = vec![
+    let mut env_pairs = vec![
         ("CONNETTO_AUTH".to_owned(), "in-memory".to_owned()),
         (
             "CONNETTO_AUTH_BIND".to_owned(),
             format!("127.0.0.1:{auth_port}"),
         ),
-        ("CONNETTO_OIDC_PROVIDER".to_owned(), "generic".to_owned()),
-        ("CONNETTO_OIDC_NAME".to_owned(), "mock-idp".to_owned()),
-        ("CONNETTO_OIDC_ISSUER".to_owned(), issuer),
-        ("CONNETTO_OIDC_CLIENT_ID".to_owned(), client.client_id),
-        ("CONNETTO_OIDC_CLIENT_SECRET".to_owned(), secret),
-        ("CONNETTO_OIDC_REDIRECT_URL".to_owned(), callback),
     ];
+    env_pairs.extend(idp.env_pairs(MOCK_OAUTH_PROVIDER, &callback));
     AuthStack {
         _idp: idp,
         env_pairs,
@@ -575,12 +492,8 @@ async fn build_auth_stack(auth_port: u16) -> AuthStack {
 }
 
 /// Drive the login dance through the server binary's auth endpoints and return
-/// the minted `(access_token, user_id)` pair.
-///
-/// The identity provider auto-grants consent, so a plain GET to its authorize
-/// endpoint returns a redirect carrying the code. Without a client
-/// `redirect_uri` in the login request the callback responds with JSON.
-async fn mint_token(auth_base: &str) -> (String, String) {
+/// the callback JSON body.
+async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
     let agent = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -588,7 +501,7 @@ async fn mint_token(auth_base: &str) -> (String, String) {
 
     let login = agent
         .get(format!("{auth_base}/auth/login"))
-        .query(&[("provider", "mock-idp")])
+        .query(&[("provider", MOCK_OAUTH_PROVIDER)])
         .send()
         .await
         .expect("GET /auth/login");
@@ -606,10 +519,11 @@ async fn mint_token(auth_base: &str) -> (String, String) {
         .to_owned();
 
     let authorized = agent
-        .get(&authorize_url)
+        .post(&authorize_url)
+        .form(&[("username", subject)])
         .send()
         .await
-        .expect("GET idp authorize");
+        .expect("POST idp authorize");
     assert!(
         authorized.status().is_redirection(),
         "idp authorize must redirect, got {}",
@@ -623,12 +537,19 @@ async fn mint_token(auth_base: &str) -> (String, String) {
         .expect("utf-8 location")
         .to_owned();
 
-    let callback_resp = agent
+    let callback = agent
         .get(&callback_url)
         .send()
         .await
         .expect("GET /auth/callback");
-    let body: serde_json::Value = callback_resp.json().await.expect("callback JSON body");
+    let body = callback.text().await.expect("callback body");
+    serde_json::from_str(&body).expect("callback JSON body")
+}
+
+/// Drive the login dance through the server binary's auth endpoints and return
+/// the minted `(access_token, user_id)` pair.
+async fn mint_token(auth_base: &str) -> (String, String) {
+    let body = token_body(auth_base, "e2e-user").await;
     let access_token = body["access_token"]
         .as_str()
         .expect("access_token in callback JSON")
@@ -645,43 +566,7 @@ async fn mint_token(auth_base: &str) -> (String, String) {
 /// Only the audit test needs it, because logging out is the one producer
 /// reachable from outside the process.
 async fn mint_refresh_token(auth_base: &str) -> String {
-    let agent = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build token-mint HTTP client");
-    let login = agent
-        .get(format!("{auth_base}/auth/login"))
-        .query(&[("provider", "mock-idp")])
-        .send()
-        .await
-        .expect("GET /auth/login");
-    let authorize_url = login
-        .headers()
-        .get("location")
-        .expect("location on login redirect")
-        .to_str()
-        .expect("utf-8 location")
-        .to_owned();
-    let authorized = agent
-        .get(&authorize_url)
-        .send()
-        .await
-        .expect("GET idp authorize");
-    let callback_url = authorized
-        .headers()
-        .get("location")
-        .expect("location on authorize redirect")
-        .to_str()
-        .expect("utf-8 location")
-        .to_owned();
-    let body: serde_json::Value = agent
-        .get(&callback_url)
-        .send()
-        .await
-        .expect("GET /auth/callback")
-        .json()
-        .await
-        .expect("callback JSON body");
+    let body = token_body(auth_base, "e2e-user").await;
     body["refresh_token"]
         .as_str()
         .expect("refresh_token in callback JSON")
@@ -689,7 +574,6 @@ async fn mint_refresh_token(auth_base: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_two_clients_snapshot_live_and_reconnect() {
     assert!(
         client_bin().exists(),
@@ -700,11 +584,12 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
 
     let _serial = PG_SERIAL.lock().await;
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let port = free_port();
     let auth_port = free_port();
@@ -720,7 +605,7 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
         .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let authorization = Authorization::provision(NO_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
@@ -790,7 +675,6 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_client_write_lands_in_pg_and_fans_out() {
     assert!(
         client_bin().exists(),
@@ -801,11 +685,12 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
 
     let _serial = PG_SERIAL.lock().await;
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let port = free_port();
     let auth_port = free_port();
@@ -821,7 +706,7 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
         .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let authorization = Authorization::provision(NO_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
@@ -884,7 +769,6 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     assert!(
         client_bin().exists(),
@@ -893,7 +777,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         client_bin().display()
     );
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let admin = Pool::builder().build(manager).await.expect("build pool");
 
@@ -907,38 +792,28 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // Clean slate, then a non-superuser writer role, the table with an RLS
-    // policy keyed on `app.user_id`, grants, the publication, and the slot. The
-    // admin role is superuser and bypasses RLS, so it is used only for setup and
-    // for reading the result back. The server applies writes as `app_writer`
-    // (via `CONNETTO_READER_URL`), which is subject to the policy.
-    drop_slot(&admin).await;
+    // The server applies writes as `app_writer`, which is subject to the policy.
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
         "DROP TABLE IF EXISTS _connetto_mutations",
-        "DROP PUBLICATION IF EXISTS connetto_pub",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
          THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
         "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT)",
-        "ALTER TABLE owned REPLICA IDENTITY FULL",
         "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
-        // The exactly-once watermark table is created by the test, as a
-        // deployment would: connetto emits no DDL, the restricted writer role
-        // cannot CREATE in schema public on Postgres 15+ (and must not need
-        // to), and the writer only needs DML on it. Keyed on session_id alone (R2).
+        // The test creates the exactly-once watermark table. connetto emits no
+        // DDL, the restricted writer role cannot CREATE in schema public on
+        // Postgres 15+ and the writer only needs DML on it. Keyed on session_id
+        // alone (R2).
         "CREATE TABLE _connetto_mutations \
          (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
         "GRANT USAGE ON SCHEMA public TO app_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",
         "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
-        "CREATE PUBLICATION connetto_pub FOR TABLE owned",
-        "SELECT pg_create_logical_replication_slot('connetto_slot', 'pgoutput')",
     ] {
         exec(&admin, stmt).await;
     }
-    // The server refuses to start without its reconnect log (R32).
-    connetto_test_harness::provision_oplog(&admin).await;
+    fixture.start_replication(&["owned"]).await;
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 
@@ -947,7 +822,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let ws = format!("ws://127.0.0.1:{port}/");
     let auth_bind = format!("127.0.0.1:{auth_port}");
 
-    let authorization = Authorization::provision(OWNED_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, OWNED_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
@@ -1033,7 +908,6 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 /// not visible from a test that spawns the server binary, so that count is
 /// proven in `fanout_counters.rs`.
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_unrestricted_table_delivers_without_policy() {
     assert!(
         client_bin().exists(),
@@ -1044,11 +918,12 @@ async fn e2e_unrestricted_table_delivers_without_policy() {
 
     let _serial = PG_SERIAL.lock().await;
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let port = free_port();
     let auth_port = free_port();
@@ -1064,7 +939,7 @@ async fn e2e_unrestricted_table_delivers_without_policy() {
         .collect();
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let authorization = Authorization::provision(NO_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     let _server = spawn_server_cfg(
         &url,
         &bind,
@@ -1136,13 +1011,13 @@ async fn run_server_exit_output(
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_without_a_reader_role() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     // Auth must be configured so the server reaches the reader-role check.
     // The server exits before binding auth endpoints, so auth_port is a placeholder.
@@ -1167,13 +1042,13 @@ async fn e2e_startup_refuses_without_a_reader_role() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let output = run_server_exit_output(
@@ -1181,7 +1056,13 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
         Some(&reader_url),
         &[
             ("CONNETTO_AUTH", "in-memory"),
-            ("CONNETTO_OIDC_PROVIDER", "frobnicate"),
+            ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+            ("CONNETTO_OIDC_MYPROVIDER_KIND", "frobnicate"),
+            ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+                "http://127.0.0.1/callback",
+            ),
         ],
     )
     .await;
@@ -1207,13 +1088,13 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
 /// the early return for no logins, so the setting was accepted and silently
 /// did nothing, which is the failure this pins.
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_audit_without_auth() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let output =
@@ -1232,13 +1113,13 @@ async fn e2e_startup_refuses_audit_without_auth() {
 /// An unrecognised recording mode refuses startup, matching every other mode
 /// setting the binary reads.
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let output = run_server_exit_output(
@@ -1259,13 +1140,13 @@ async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let output = run_server_exit_output(
@@ -1273,7 +1154,13 @@ async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
         Some(&reader_url),
         &[
             ("CONNETTO_AUTH", "in-memory"),
-            ("CONNETTO_OIDC_PROVIDER", "Google"),
+            ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+            ("CONNETTO_OIDC_MYPROVIDER_KIND", "Google"),
+            ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+                "http://127.0.0.1/callback",
+            ),
         ],
     )
     .await;
@@ -1289,13 +1176,13 @@ async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_startup_refuses_without_an_auth_store() {
     let _serial = PG_SERIAL.lock().await;
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     // A reader URL is provided but CONNETTO_AUTH is deliberately absent.
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1318,7 +1205,6 @@ async fn e2e_startup_refuses_without_an_auth_store() {
 /// and the identity without the writing site naming either, and an event that
 /// belongs to no session carries no stand-in for one.
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     assert!(
         client_bin().exists(),
@@ -1328,10 +1214,11 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     );
     let _serial = PG_SERIAL.lock().await;
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let port = free_port();
     let auth_port = free_port();
@@ -1354,7 +1241,7 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     for (key, value) in &auth_stack.env_pairs {
         command.env(key, value);
     }
-    let authorization = Authorization::provision(NO_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     for (key, value) in authorization.env_pairs() {
         command.env(key, value);
     }
@@ -1433,14 +1320,14 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
 /// that exercises the switch, the startup shape check, the ready-made writer,
 /// and the table together, through a process nobody handed a collector to.
 #[tokio::test]
-#[ignore = "requires a running Postgres with wal_level=logical (Docker) and both binaries built"]
 async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let _serial = PG_SERIAL.lock().await;
 
-    let url = database_url();
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool).await;
+    reset_fixture(&pool, &fixture).await;
 
     let port = free_port();
     let auth_port = free_port();
@@ -1465,7 +1352,7 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     for (key, value) in &auth_stack.env_pairs {
         command.env(key, value);
     }
-    let authorization = Authorization::provision(NO_POLICIES).await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     for (key, value) in authorization.env_pairs() {
         command.env(key, value);
     }
@@ -1488,7 +1375,8 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let agent = reqwest::Client::new();
     let logout = agent
         .post(format!("{}/auth/logout", auth_stack.auth_base))
-        .json(&json!({ "refresh_token": refresh_token }))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({ "refresh_token": refresh_token }).to_string())
         .send()
         .await
         .expect("POST /auth/logout");

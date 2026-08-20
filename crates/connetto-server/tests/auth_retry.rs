@@ -108,7 +108,6 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 /// After the fix: the error propagates as `Err(AuthUnavailable)`, the ingest
 /// loop retries, and `DeliveryPaused` is sent to all live sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
     let fixture = Fixture::acquire().await;
     let manager = SessionManager::new(
@@ -189,7 +188,6 @@ async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
 /// and broadcasts `DeliveryPaused` to every live session on the first error.
 /// After the auth service recovers it broadcasts `DeliveryResumed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn ingest_emits_auth_retry_events_and_broadcasts_pause_resume() {
     use std::sync::atomic::{AtomicU32, Ordering};
 

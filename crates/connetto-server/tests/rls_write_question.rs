@@ -1,5 +1,7 @@
-//! Docker-gated: the row-level-security policy answers the write question the
-//! minting path asks (R50).
+//! Needs Docker: the fixture starts its own Postgres.
+//!
+//! The row-level-security policy answers the write question the minting path
+//! asks (R50).
 //!
 //! A share must not hand on a verb the sharer does not hold itself, and the
 //! minting path is the one caller that asks with no database write behind it, so
@@ -12,9 +14,6 @@
 //! writes one separately, and a locking read cannot speak for that, so the
 //! answerer refuses instead of borrowing the update verb's answer.
 //!
-//! `#[ignore]` by default because it needs a running Postgres. Point
-//! `DATABASE_URL` at one and run with `--ignored` after explicit approval.
-//!
 //! A superuser and a table owner bypass row-level security, so the pool
 //! connects as `app_minter`, which the fixture grants the same verbs a
 //! deployment's `roles.sql` grants its reader role.
@@ -26,8 +25,8 @@ use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::{
     AuthConfig, CapabilityIssuer, PgSnapshotSource, RlsAuth, ShareError, ShareLevel, TokenAuthority,
 };
+use connetto_test_harness::{Fixture, pool_for, with_user};
 use diesel::sql_query;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use subql::backend::{Postgres as PgValues, Value};
@@ -38,22 +37,6 @@ use subql::visibility::WriteOp;
 const CATALOG_DDL: &str = "\
 CREATE TABLE journals (id INT PRIMARY KEY, owner TEXT, body TEXT);\
 CREATE TABLE ledgers (id INT PRIMARY KEY, owner TEXT, body TEXT);";
-
-fn admin_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned())
-}
-
-fn with_user(url: &str, user: &str, password: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    format!("{scheme}://{user}:{password}@{host}")
-}
-
-async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
-    Pool::builder().build(manager).await.expect("build pool")
-}
 
 fn caller(identity: &str) -> Principal {
     let mut principal: Principal = Principal::unidentified(SessionId::from_token_hash(identity));
@@ -70,9 +53,11 @@ fn caller(identity: &str) -> Principal {
 /// answer the wrong question: everybody may read it, only the owner may change
 /// or delete it. `ledgers` writes one rule for every command, which is what
 /// connetto's own translation generates and what a locking read answers exactly.
-async fn setup() -> Pool<AsyncPgConnection> {
-    let admin = pool_for(&admin_url()).await;
-    let mut conn = admin.get().await.expect("admin connection");
+async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    // DDL, role setup, policy, and grant statements cannot be expressed in
+    // diesel's typed DSL. INSERT seeds data into ephemeral test tables whose
+    // typed schema would only be defined when this setup moves to the fixture.
     for statement in [
         "DROP TABLE IF EXISTS journals, ledgers CASCADE",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_minter') \
@@ -102,7 +87,7 @@ async fn setup() -> Pool<AsyncPgConnection> {
             .expect("setup statement");
     }
     drop(conn);
-    pool_for(&with_user(&admin_url(), "app_minter", "app_minter")).await
+    pool_for(&with_user(fixture.admin_url(), "app_minter", "app_minter")).await
 }
 
 type Issuer = CapabilityIssuer<RlsAuth, PgSnapshotSource, String>;
@@ -118,9 +103,9 @@ fn issuer(pool: &Pool<AsyncPgConnection>) -> Issuer {
 
 /// A caller who may read a row but not change it may not certify a change.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_reader_may_not_mint_a_change_it_cannot_perform() {
-    let pool = setup().await;
+    let fixture = Fixture::acquire().await;
+    let pool = setup(&fixture).await;
     let issuer = issuer(&pool);
     let row = [Value::<PgValues>::Int(1)];
 
@@ -166,9 +151,9 @@ async fn a_reader_may_not_mint_a_change_it_cannot_perform() {
 /// A delete rule written for its own command cannot be answered by a locking
 /// read, so the answerer refuses rather than guessing, for the owner too.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn a_command_specific_delete_rule_is_refused_rather_than_guessed() {
-    let pool = setup().await;
+    let fixture = Fixture::acquire().await;
+    let pool = setup(&fixture).await;
     let issuer = issuer(&pool);
     let row = [Value::<PgValues>::Int(1)];
 
@@ -195,9 +180,9 @@ async fn a_command_specific_delete_rule_is_refused_rather_than_guessed() {
 /// One rule covering every command is what connetto's own translation writes,
 /// and there the delete verb is answered from the database.
 #[tokio::test]
-#[ignore = "requires a running Postgres (Docker); run after explicit approval"]
 async fn one_rule_for_every_command_answers_the_delete_verb() {
-    let pool = setup().await;
+    let fixture = Fixture::acquire().await;
+    let pool = setup(&fixture).await;
     let issuer = issuer(&pool);
     let row = [Value::<PgValues>::Int(1)];
 

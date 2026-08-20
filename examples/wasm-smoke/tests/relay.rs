@@ -11,9 +11,6 @@
 //! must land in Postgres (an independent observer sees it) and the echo must
 //! flow back down to the tab.
 //!
-//! **Needs the stack up.** See `authenticated_boot.rs` for the commands.
-//! Run this suite with:
-//! `wasm-pack test --headless --chrome examples/wasm-smoke --test relay`
 
 #![cfg(target_arch = "wasm32")]
 
