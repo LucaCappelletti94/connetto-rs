@@ -171,6 +171,24 @@ Both hooks compose with connetto's release contract: dropping the `LiveHandle` r
 
 **`connetto-yew`** (`crates/connetto-yew/src/lib.rs`): Yew's `spawn_local` is detached, unlike a Dioxus scope task, so unmounting the component does not cancel it. The hook wraps the driver future in `Abortable` and returns an effect cleanup that calls `abort()`, which drops the handle at the task's next await point and releases the subscription.
 
+## SQLite hardening (R18, built 2026-08-18)
+
+**Built.** Every replica connection is hardened in one place, `harden::harden_replica_connection` in `crates/connetto-client/src/harden.rs`, called from `open_inner` right after the cipher unlock and the journal mode. Native and browser reach it through the same open, so the two agree on every value by construction. What it sets: defensive mode on, trusted schema off, four of SQLite's recommended limits (at most 8 function arguments, at most 10 nested triggers, at most 25,000 instructions per compiled statement, no sorter threads), and the attach lockdown described below. The full table with a reason per value is in the plan's R18 section.
+
+**The rest of SQLite's recommended limit table is deliberately not applied.** Those numbers are written for a process that runs nothing but untrusted SQL, and this connection also runs the application's own diesel queries. Measured against the full set, a four-row batch insert, an eleven-key `IN` lookup, a twelve-term filter chain, a 60-character `LIKE` pattern and a 1.5 MB value are all refused. connetto's own suite passes with them on, because connetto's internal statements are small, so a suite-only measurement would have hidden every one of those refusals.
+
+**The attach posture is default-closed with audited windows.** At rest the connection can attach nothing: creation off, write off, and the attached-database ceiling equal to what is already attached (read back from `PRAGMA database_list`, so it cannot drift). Each connetto-owned attach calls `harden::attach_in_window`, which opens exactly the permits that site needs, attaches, and seals the connection again. The sites are the local tier (`attach_tier`, write only for an existing tier so a missing file fails rather than appearing, create and write for a first boot), the relay's hub meta database (create and write, since a device's first run creates it), and the relay's snapshot scratch database (write only, since `:memory:` needs no creation permit). Both attach enables are attach-time settings, so sealing leaves everything already attached readable and writable, which is what keeps the tier usable at rest.
+
+**What this does not promise.** It is a configuration pass, not enforcement, and three limits of it matter.
+
+SQL that reaches the connection still reads `main`. Application code holds `conn()`, so nothing here isolates the replica from the application, and nothing here narrows what a query may select. The row-level-security story is the server's and the replica's views, not this.
+
+The limits bound resource abuse rather than preventing it. A statement under 25,000 instructions can still be slow, a value under a gigabyte can still exhaust the device, and none of the four values that are set will stop a query written to be expensive.
+
+The attach lockdown gates connetto's own seams, not a compromised process. Anything holding the connection can raise the same knobs it lowered, and anything holding the process can open its own connection to the file. What the lockdown buys is that an attach appearing anywhere other than the three audited sites fails, so a new attach has to be written deliberately rather than arriving through a formatted SQL string.
+
+One consequence reaches the application: trusted schema off means a function the application registers through `SqlFunctions` and a schema object calls (a column `DEFAULT`, a view, a trigger, a `CHECK`, a generated column, an expression index) must carry `SqliteFunctionBehavior::INNOCUOUS`. Without it SQLite refuses the call as "unsafe use of f()" when the schema object runs, which is later than registration and therefore worth knowing in advance. connetto's own caller function already carries the flag.
+
 ---
 
 ## Open Questions

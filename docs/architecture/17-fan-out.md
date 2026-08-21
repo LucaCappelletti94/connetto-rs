@@ -16,7 +16,7 @@ The evidence lives in `08-authorization.md` under "The per-client floor" and is 
 
 ## The measurement this design targets
 
-**Built (R0 part B), measured 2026-08-07.** Postgres 16 in Docker, release build, ten-second windows, `connetto_test_harness::fanout::fanout_load`.
+**Built (R0 part B), measured 2026-08-07, against the pre-R5b executor.** Postgres 16 in Docker, release build, ten-second windows, `connetto_test_harness::fanout::fanout_load`.
 
 | | 10 subscribers | 100 subscribers |
 |---|---|---|
@@ -26,13 +26,29 @@ The evidence lives in `08-authorization.md` under "The per-client floor" and is 
 | materializer lock wait | 0 ns | 0 ns |
 | payload bytes copied per subscriber per event | ~39 | ~39 |
 
-Three readings, and the design rests on these rather than on arithmetic.
+Three readings were taken from that table, and one of them has since been overtaken by the phase it was measuring.
 
-**The ceiling is one quantity**, the rate at which sequential visibility round trips complete, roughly 590 microseconds each. Deliveries per second are identical across a tenfold change in subscriber count, which is what identifies the round trip as the whole ceiling rather than one contributor to it.
+**The materializer mutex is free, not merely cheap.** Only the change-ingest task takes it while delivery runs, so the `3 + K` acquisitions per event cannot contend. This is structural, not a lucky reading, and it still holds.
 
-**The materializer mutex is free, not merely cheap.** Only the change-ingest task takes it while delivery runs, so the `3 + K` acquisitions per event cannot contend. This is structural, not a lucky reading.
+**The ceiling was one quantity**, the rate at which sequential visibility round trips complete, roughly 590 microseconds each. Deliveries per second identical across a tenfold change in subscriber count is what identified the round trip as the whole ceiling rather than one contributor to it. **R5b removed it**, so this reading is history rather than a live constraint.
 
-**Copy elimination buys nothing measurable at this row size.** Thirty-nine bytes per subscriber per event on a two-column row. The case for the frame split and the shared payload is that both scale with patch size, not that either shows up in these numbers.
+**Copy elimination buys nothing measurable at the narrow row**, thirty-nine bytes per subscriber per event on two columns. The case for the frame split and the shared payload was always that both scale with patch size, and the reading below is that measurement.
+
+### Remeasured 2026-08-16, after R5b
+
+**Built (R14 step zero), on an idle machine, same rig with a row-width arm added.** The wide arm writes 8,192 characters of high-entropy filler per row, which compresses to 5,451 bytes per patch against the narrow row's 55.
+
+| | 10 subscribers | 100 subscribers |
+|---|---|---|
+| events per second, 55-byte patch | 399.3 | 380.5 |
+| events per second, 5,451-byte patch | 387.7 | 366.7 |
+| deliveries per second, 55-byte patch | 3,993 | 38,050 |
+| materializer lock wait | 0 ns | 0 ns |
+| authorization round trips | 0 | 0 |
+
+**The per-client floor is now what this chapter is up against, and nothing above it dominates.** Deliveries per second scale with subscriber count instead of staying flat, so no single sequential quantity is the ceiling any more. All per-subscriber work together is 1.38 microseconds at the narrow row and 1.65 at the wide one, read off the slope between the two subscriber counts, against a per-event floor of 2.5 ms. Patch size moves it in the direction this chapter predicted, by 0.27 microseconds across 5,396 extra bytes, which is one memcpy at 20 GB/s.
+
+**So the shared payload is a prerequisite here rather than a win of its own, and R14 was dropped on this reading.** The copy table below is where it earns its place, taking three copies per subscriber to one and then to none. `plans/master-implementation-plan.md` records the verdict, the numbers and the five readings that would reopen it, one of which is memory rather than throughput: a session's pending queue is uncapped, so queued patches hold a full copy per subscriber where shared bytes would hold one.
 
 ---
 
@@ -135,7 +151,7 @@ Sending the header and the body as separate WebSocket continuation fragments wou
 
 ## Payload ownership
 
-**Decided (R14): the compressed payload is held by shared reference, as `Arc<[u8]>`, with no new dependency.** R14 step 3 owns this, and R16 part A already corrected that step's speculation about needing an upstream change: `subql`'s `pgoutput_patchset` returns an owned `Vec<u8>` (verified in `src/emit.rs` at the pinned revision), so wrapping it costs nothing and changes no `subql` signature. The type flows through `MatchedPatch`, the bulk message variants, and the `Transport` trait.
+**Decided (R16 part B): the compressed payload is held by shared reference, as `Arc<[u8]>`, with no new dependency.** R14 step 3 owned this until R14 was dropped on 2026-08-16, and the phase that builds the frame split inherits it, because the copy table above is where the shared payload stops being one copy fewer and starts being the thing that makes a frame shareable at all. R16 part A already corrected the original speculation about needing an upstream change: `subql`'s `pgoutput_patchset` returns an owned `Vec<u8>` (verified in `src/emit.rs` at the pinned revision), so wrapping it costs nothing and changes no `subql` signature. The type flows through `MatchedPatch`, the bulk message variants, and the `Transport` trait.
 
 **`Arc<[u8]>` is precedent here rather than a new convention.** `ClientEvent::LivePatch` in `crates/connetto-client/src/lib.rs` already carries `patchset_zstd: Arc<[u8]>`, for exactly this reason, so a relay can forward without re-encoding.
 
@@ -185,7 +201,7 @@ A retained registration produces a `MatchedPatch` on every matching event, disca
 
 ## The materializer lock
 
-**Decided (R16 part B): hoisting the per-subscriber cursor advance out of the fan-out loop is worth nothing, and is not carried as a live improvement.** R0 measured zero lock wait at both subscriber counts. That is structural: only the change-ingest task takes the lock while delivery runs, so the `3 + K` acquisitions per event cannot contend. R14 step 1 is known in advance to buy nothing and survives only as a guard against a hoist introducing contention where there was none.
+**Decided (R16 part B): hoisting the per-subscriber cursor advance out of the fan-out loop is worth nothing, and is not carried as a live improvement.** R0 measured zero lock wait at both subscriber counts, and the 2026-08-16 remeasurement reads zero again after R5b. That is structural: only the change-ingest task takes the lock while delivery runs, so the `3 + K` acquisitions per event cannot contend. R14 owned the hoist as a guard against introducing contention where there was none, and **R14 was dropped on 2026-08-16**, so no phase carries it.
 
 **One case the measurement does not cover, stated so it is not read as more than it is.** `catch_up_row` takes the lock from a session task rather than from the ingest task, three times per replayed record. R0's fixture measures a steady-state dispatch window after routes have settled, with no client catching up, so a catchup storm concurrent with live dispatch is the one shape where the lock could contend and no number exists for it. The stored patch removes one of the three takes, which is a reason to prefer it and not a reason to claim a measurement.
 
@@ -203,7 +219,7 @@ Part A established that nothing on the delivery side needs an upstream change, a
 | Header type mirroring the bulk variants without the payload | `messages/bulk.rs` | **Decided (R16 part B)** |
 | Four decoders keep their shape, `decode_bulk` splits internally | `transport.rs`, and `lib.rs`, `broadcast.rs`, `port.rs` in `connetto-web` | **Decided (R16 part B)** |
 | Length-prefixed pair takes the same split, wire round-trip test rewritten | `codec.rs`, `connetto-core/tests/wire.rs` | **Decided (R16 part B)** |
-| Payload as `Arc<[u8]>` through `MatchedPatch`, the bulk variants and `Transport` | `materializer.rs`, `connetto-core` | **Decided (R14)** |
+| Payload as `Arc<[u8]>` through `MatchedPatch`, the bulk variants and `Transport` | `materializer.rs`, `connetto-core` | **Decided (R16 part B)**, inherited from the dropped R14 |
 | `Transport` gains a send taking an already-framed shared buffer | `traits.rs` in `connetto-core`, every transport impl | **Decided (R16 part B)** |
 | Server handle derived from `predicate_hash`, returned on the subscribe reply, carried in the header | `materializer.rs`, `session.rs`, `messages` | **Decided (R16 part B)** |
 | One frame built per handle per event, cloned per socket | `session.rs` | **Decided (R16 part B)** |

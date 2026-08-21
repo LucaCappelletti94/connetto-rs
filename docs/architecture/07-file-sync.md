@@ -2,9 +2,9 @@
 
 **Status**: draft
 
-> **Scope notice: connetto does not build file sync, and this chapter is not a plan to.** The index records the decision at Q7.1 to Q7.8: file sync is outside connetto's scope and belongs to a separate stack, `https://github.com/LucaCappelletti94/file-system`. What remains connetto's is how it **integrates** such a stack, for which `FileStore` in `crates/connetto-core/src/traits.rs` is an unimplemented seam, and that is phase R24, which is exploratory and may conclude the seam is wrong.
+> **Scope notice: `connetto-core` does not build file sync, and this chapter is not the design.** R24 concluded on 2026-08-21: the boundary decided at Q7.1 to Q7.8 lives at the crate level rather than the repo level, so the file-handling code is built in this repository as file crates that depend on connetto and never the reverse, designed against the joint review at `https://github.com/LucaCappelletti94/file-system-review` (an earlier reference here named a `file-system` repository that does not exist). The design itself is the ten positions recorded in the plan's R24 section, executed by phases R64 to R69, and `FileStore` in `crates/connetto-core/src/traits.rs` is deleted by R66 in favour of a signer seam.
 >
-> This chapter is retained as a record of the design thinking that produced that decision, including the chunking, hashing and content-channel questions the separate stack has to answer. **Read it as history and as input to R24, not as intent.** An earlier version of this notice said file sync was "deferred to a future phase of connetto", which contradicted the index.
+> This chapter is retained as the record of the thinking that led there. **Read it as history, not as the contract.** Where it disagrees with the R24 positions, the positions are right: notably the file identity is plain `blake3(file)` rather than a hash of chunk hashes, display rides a short-lived signed URL rather than downloaded content, and local content sync happens only for pinned, locally processed, or not-yet-uploaded files. An earlier version of this notice said file sync was "deferred to a future phase of connetto", which contradicted the index.
 
 ---
 

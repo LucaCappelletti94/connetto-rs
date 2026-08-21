@@ -33,7 +33,7 @@ Authentication answers "who is this caller." Its output is a `Principal` carryin
 3. **Authentication gates sync, never local reads.** The local replica is readable and writable offline with no valid credential. Only the server connection requires authentication.
 4. **Token expiry while offline is a designed state, not an error.** The app keeps working locally, and re-authentication resumes sync.
 5. **Asymmetric algorithms only, with issuer and audience pinned.** The `none` algorithm is rejected, and a symmetric algorithm verified with a public key is rejected. Issuer and audience are always checked.
-6. **The verification seam is pluggable and mirrors the authorization one.** A trait with a real implementation and a permissive stand-in, so tests and local loops need no live identity provider.
+6. **The verification seam is pluggable and mirrors the authorization one.** A trait with a real implementation behind it and a test double that refuses whatever it was not told to accept, so tests and local loops need no live identity provider. **Corrected (R9, 2026-08-16):** this used to read "a permissive stand-in", which neither seam has now.
 
 ---
 
@@ -148,9 +148,9 @@ OIDC standardizes assurance signaling. A deployment can require step-up authenti
 
 ## Server verification seam
 
-Two seams, both mirroring the authorization pattern of a trait plus a permissive stand-in.
+Two seams, both mirroring the authorization pattern of a trait with a real implementation behind it. **Corrected (R9, 2026-08-16):** this used to read "a trait plus a permissive stand-in", and no seam has one now.
 
-At the login callback, the `IdentityProvider` registry verifies the provider token and the mapper resolves the identity. **Built (R1).** `PermissiveProvider` is deleted. The replacements are the `oauth2-test-server` fixture and the `dev_idp` example. An unrecognised `CONNETTO_OIDC_PROVIDER`, including an unset or miscapitalised one, is a startup error rather than a fall-through to a permissive default, because the old fall-through meant a capitalised provider name yielded a deployment that minted real signed tokens in which every user was the same dev identity.
+At the login callback, the `IdentityProvider` registry verifies the provider token and the mapper resolves the identity. **Built (R1).** `PermissiveProvider` is deleted. The replacements are the `oauth2-test-server` fixture and the `dev_idp` example. An unrecognised `CONNETTO_OIDC_<NAME>_KIND`, including an unset or miscapitalised one, is a startup error rather than a fall-through to a permissive default, because the old fall-through meant a capitalised kind name yielded a deployment that minted real signed tokens in which every user was the same dev identity.
 
 At the handshake, the seam used to turn one access token into an `AuthContext`. **Built (R3).** It is now `HandshakeAuthority`: it checks each grant on its own and the accepted subjects fold into a `Principal`, which may carry no identity at all. It is held as a runtime trait-object field on the server rather than as a generic type parameter, because checking fires once per connection and is off any hot path, so static dispatch buys nothing, and a trait object keeps the server's public type signature stable no matter how a deployment configures identity.
 
@@ -316,12 +316,12 @@ See `open-questions.md` section 11, where Q11.1 through Q11.4 are resolved: cons
 - **Decided (R3).** A grant that fails to resolve does not end the connection. The reply says nothing about the failure, not the reason and not which grant it was.
 - **Decided (R8).** An identity carries a user id and nothing else. `AuthContext.tenant_id`, `.roles`, and `.claims` are deleted because nothing ever read them.
 - **Built (R3).** A caller with no identity gets an in-memory local copy, always, with no opt-in, and the device-private database beside it is in memory too, enforced in the type.
-- **Built (R1).** `PermissiveProvider` is deleted, and an unrecognised or unset `CONNETTO_OIDC_PROVIDER` refuses startup.
+- **Built (R1).** `PermissiveProvider` is deleted, and an unrecognised or unset `CONNETTO_OIDC_<NAME>_KIND` refuses startup.
 
 ---
 
 ## Notes
 
-- The verifier seam mirrors the authorization seam deliberately, so authentication and authorization share one pluggability idiom (a trait, a real implementation, a permissive stand-in) even though authentication is resolved once per connection and authorization fires per row.
+- The verifier seam mirrors the authorization seam deliberately, so authentication and authorization share one pluggability idiom (a trait with a real implementation behind it) even though authentication is resolved once per connection and authorization fires per row. **Corrected (R9, 2026-08-16):** the idiom used to be written here as "a trait, a real implementation, a permissive stand-in", and the authorization half no longer has a permissive stand-in. Its test double is `RosterAuth` (`crates/connetto-test-harness/src/roster.rs`), which is told which callers it grants and refuses everybody else, so a test installing it still fails if the authorization path stops asking.
 - The two store variants are not only a storage-location choice, they are the single-server-ephemeral versus durable-and-mesh-capable choice, and the deterministic-mapping versus account-linking choice. A single-provider or simple deployment uses the in-memory store and deterministic mapping. The moment one human may hold several logins, or the deployment needs durability or a mesh, the database store is required, which is why both ship.
 - Putting connetto on the OAuth-client side is what makes the browser story simple. Every hard part (secrets, provider verification, token minting, JWKS handling) lives on the backend where it is trivial, and the frontend holds only a credential connetto can revoke by deleting a row.

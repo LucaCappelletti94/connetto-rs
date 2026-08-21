@@ -29,7 +29,7 @@ Each entry links back to its source file where context lives.
 
 **Q1.2** ~~Which pieces are in-scope for a first prototype versus later iterations?~~
 
-**Decision: all pieces (A to L) are in scope for v1, except file sync (J).** The core transport, subscriptions, mutation path, CDC push, reconnect, schema distribution, authorization, aggregate queries, and WASM adapters all need to work together, and none can be deferred without breaking the whole. File sync (J) is handled by a separate stack. The integration point with connetto is a future design concern.
+**Decision: all pieces (A to L) are in scope for v1, except file sync (J).** The core transport, subscriptions, mutation path, CDC push, reconnect, schema distribution, authorization, aggregate queries, and WASM adapters all need to work together, and none can be deferred without breaking the whole. File sync (J) is handled by file crates in this repository that depend on connetto and never the reverse (amended 2026-08-21, when R24 concluded: the boundary is the crate, not the repo). The integration design is recorded in the plan's R24 positions and built by phases R64 to R69.
 
 **Q1.3** ~~Is `SharedWorker` a requirement for multi-tab browser support, or is tab-per-worker acceptable initially?~~
 
@@ -267,7 +267,7 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 
 **Q7.1 to Q7.8** ~~All file sync questions.~~
 
-**Decision: file sync is permanently outside connetto's scope.** It belongs to a separate stack (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are for that stack to answer. See https://github.com/LucaCappelletti94/file-system-review for notes and research.
+**Decision: file sync is permanently outside `connetto-core`'s scope.** Amended 2026-08-21 when R24 concluded: the boundary is the crate rather than a separate repository, so the file crates live in this repo beside the demos (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are answered by the R24 positions in the master plan and the phases R64 to R69 derived from them, except the file-tree conflict question (X2), which stays open for the file crates. See https://github.com/LucaCappelletti94/file-system-review for the research this was designed against.
 
 ---
 
