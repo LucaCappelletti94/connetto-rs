@@ -167,11 +167,15 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         FullResyncReason::TableTruncated {
             table: "orders".to_owned(),
         },
+        // SessionManager::restart_or_refuse, when a page of an initial read
+        // failed part way through and the read starts again (R58).
+        FullResyncReason::SnapshotInterrupted,
     ];
     for reason in &reasons {
         match reason {
             FullResyncReason::CursorOutsideRetention
             | FullResyncReason::AuthorizationChange
+            | FullResyncReason::SnapshotInterrupted
             | FullResyncReason::TableTruncated { .. } => {}
         }
     }

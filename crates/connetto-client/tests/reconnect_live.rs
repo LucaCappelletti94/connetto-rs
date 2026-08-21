@@ -20,8 +20,8 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    LoopbackTransport, Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, Snapshot, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -42,12 +42,26 @@ impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -61,9 +75,14 @@ impl SnapshotSource for SeedSnapshot {
         let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
             .insert(insert)
             .build();
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset,
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

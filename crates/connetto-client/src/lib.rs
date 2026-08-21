@@ -3041,9 +3041,9 @@ where
         // catalog and a subscription names it as its query spelled it.
         let emptied = match reason {
             FullResyncReason::TableTruncated { table } => Some(table.to_lowercase()),
-            FullResyncReason::CursorOutsideRetention | FullResyncReason::AuthorizationChange => {
-                None
-            }
+            FullResyncReason::CursorOutsideRetention
+            | FullResyncReason::AuthorizationChange
+            | FullResyncReason::SnapshotInterrupted => None,
         };
         self.delete_uncovered(
             &resyncing.tables,

@@ -23,8 +23,8 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot,
-    SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -113,18 +113,37 @@ impl SnapshotSource for RecordingSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
         &self,
         select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         if let Ok(mut seen) = self.seen.lock() {
             seen.push(select_sql.to_owned());
         }
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: PatchSet::<SimpleTable, String, Vec<u8>>::new().build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

@@ -34,8 +34,9 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    AbuseConfig, LoopbackTransport, Materializer, RequestGuard, SessionConfig, SessionManager,
-    Snapshot, SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    AbuseConfig, LoopbackTransport, Materializer, PageSpec, RequestGuard, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -54,12 +55,26 @@ impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -70,11 +85,16 @@ impl SnapshotSource for SeedSnapshot {
             .expect("set quantity")
             .set(3, Value::Text("seed".to_owned()))
             .expect("set status");
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: PatchSet::<SimpleTable, String, Vec<u8>>::new()
                 .insert(insert)
                 .build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -82,7 +102,7 @@ impl SnapshotSource for SeedSnapshot {
 type Manager = Arc<SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>>;
 
 /// Build a manager whose only unusual setting is the throttle.
-fn manager(fixture: &Fixture, throttle: ThrottleConfig) -> Manager {
+fn manager(fixture: &Fixture, throttle: &ThrottleConfig) -> Manager {
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     SessionManager::new(
         materializer,
@@ -92,7 +112,7 @@ fn manager(fixture: &Fixture, throttle: ThrottleConfig) -> Manager {
         Arc::new(TestGrantChecker),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::new(throttle, AbuseConfig::default())),
+        Arc::new(RequestGuard::new(*throttle, AbuseConfig::default())),
         SessionConfig::default(),
     )
 }
@@ -167,7 +187,7 @@ fn subscription_limits(identified: u32, anonymous: u32) -> ThrottleConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_over_limit_subscription_is_refused_and_the_session_survives() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture, subscription_limits(2, 2));
+    let manager = manager(&fixture, &subscription_limits(2, 2));
     let (mut client, server, _) = connect(&manager, "greedy", &["user:greedy"], None).await;
 
     for nth in 0..2 {
@@ -205,7 +225,7 @@ async fn an_over_limit_subscription_is_refused_and_the_session_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_two_tiers_are_different_allowances() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture, subscription_limits(3, 1));
+    let manager = manager(&fixture, &subscription_limits(3, 1));
 
     // No grant, so nothing resolves an identity and the caller is anonymous.
     let (mut visitor, visitor_server, _) = connect(&manager, "visitor", &[], None).await;
@@ -244,7 +264,7 @@ async fn the_two_tiers_are_different_allowances() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_anonymous_limit_holds_across_a_reconnection() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture, subscription_limits(2, 2));
+    let manager = manager(&fixture, &subscription_limits(2, 2));
 
     let (mut first, first_server, resume) = connect(&manager, "loop", &[], None).await;
     for nth in 0..2 {
@@ -270,7 +290,7 @@ async fn the_anonymous_limit_holds_across_a_reconnection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rate_refusal_and_a_schema_refusal_stay_distinguishable() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture, subscription_limits(2, 2));
+    let manager = manager(&fixture, &subscription_limits(2, 2));
     let (mut client, server, _) = connect(&manager, "prober", &["user:prober"], None).await;
 
     // R38 keeps every schema refusal byte-identical so a caller cannot learn
@@ -313,7 +333,7 @@ async fn too_many_connections_on_one_handle_are_closed() {
     let throttle = ThrottleConfig::new()
         .with_identified(TierLimits::identified().with_connections(2, WINDOW))
         .with_anonymous(TierLimits::anonymous().with_connections(2, WINDOW));
-    let manager = manager(&fixture, throttle);
+    let manager = manager(&fixture, &throttle);
 
     let (client, server, resume) = connect(&manager, "flapper", &["user:flapper"], None).await;
     drop(client);
@@ -367,7 +387,7 @@ async fn an_anonymous_caller_cannot_reconnect_past_its_connection_limit() {
     let fixture = Fixture::acquire().await;
     let manager = manager(
         &fixture,
-        ThrottleConfig::new().with_anonymous(TierLimits::anonymous().with_connections(2, WINDOW)),
+        &ThrottleConfig::new().with_anonymous(TierLimits::anonymous().with_connections(2, WINDOW)),
     );
 
     let (client, server, resume) = connect(&manager, "visitor", &[], None).await;

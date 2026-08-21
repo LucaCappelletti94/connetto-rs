@@ -62,17 +62,69 @@ use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
-use crate::throttle::Tier;
+use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 
-/// Initial rows for a subscription, produced by a [`SnapshotSource`].
-pub struct Snapshot {
-    /// Raw (uncompressed) insert-patchset bytes for the initial rows.
+/// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
+pub struct SnapshotPage {
+    /// Raw (uncompressed) insert-patchset bytes for this page's rows.
     pub patchset: Vec<u8>,
-    /// Cursor at which the snapshot was read. Live updates strictly greater
+    /// Cursor at which this page was read. Live updates strictly greater
     /// than this apply on top on the client.
     pub cursor: Cursor,
+    /// Where the next page resumes, or [`None`] when nothing follows this
+    /// page.
+    pub next: Option<PageKey>,
+    /// Whether the read had more rows than this page's allowance.
+    ///
+    /// Filled with no resume point is a read that cannot be paged, and the
+    /// caller must refuse it. Reporting it separately is what keeps the seam
+    /// unable to answer a truncation as though it were complete.
+    pub filled: bool,
+    /// The largest single row this page carries, in bytes, which the caller
+    /// judges against its tier's ceiling.
+    pub widest_row: u64,
+    /// How many rows this page carries.
+    pub rows: u32,
+    /// What this page's rows measure, summed over their column values.
+    ///
+    /// Measured rather than predicted, so the caller can size the next page
+    /// from what this one actually cost. The planner's own width counts a
+    /// value stored out of line as its pointer, so a prediction alone is not
+    /// enough to bound a page.
+    pub bytes: u64,
+}
+
+/// The primary key of the last row a page delivered, in key order.
+///
+/// Opaque to the session, which hands it back to the source that produced it.
+/// Keyset rather than an offset because offset paging costs O(offset) per
+/// page, measured under R58 decision 6.
+pub struct PageKey {
+    /// The key columns' values, in key order.
+    pub values: Vec<PgValue<Postgres>>,
+}
+
+/// What one page of a read may carry, and where it starts.
+pub struct PageSpec {
+    /// Resume past this key, or start at the beginning of the read.
+    pub after: Option<PageKey>,
+    /// How many rows this page may carry.
+    pub max_rows: u32,
+    /// The wall-clock ceiling on this page's read.
+    pub timeout: Duration,
+}
+
+/// What the backend predicts one read will produce.
+///
+/// Both numbers come from one round trip, which is what makes deriving a row
+/// cap from a byte budget free (R58 decision 3).
+pub struct SnapshotEstimate {
+    /// Rows the planner expects the read to return.
+    pub rows: f64,
+    /// Average row width in bytes the planner expects.
+    pub width: u32,
 }
 
 /// The caller's own membership rows for a term at registration, read by a
@@ -118,6 +170,44 @@ enum SubscribeRefusal {
     /// The snapshot source cannot run a seed read.
     #[error("this snapshot source cannot seed a membership term")]
     Unseedable,
+    /// The table's predicted average row is already above the ceiling one
+    /// delivered row may reach, so no page of it can be served (R58).
+    #[error(
+        "the read was refused before it ran: the table's average row is {width} bytes, the ceiling on one row is {ceiling}"
+    )]
+    TableTooWide {
+        /// The planner's predicted average row width.
+        width: u32,
+        /// The tier's ceiling on one row.
+        ceiling: u64,
+    },
+    /// One row of the read is above the ceiling. The three numbers together
+    /// say whether the ceiling is set too low or the schema stores
+    /// file-shaped data (R58 decision 7).
+    #[error(
+        "a row of {bytes} bytes is above the {ceiling} byte ceiling, on a table averaging {average} bytes a row"
+    )]
+    WideRow {
+        /// The offending row's size.
+        bytes: u64,
+        /// The tier's ceiling on one row.
+        ceiling: u64,
+        /// The table's predicted average row width, for comparison.
+        average: u32,
+    },
+    /// The read filled its page and cannot be paged, because the
+    /// subscription's projection carries no primary key to resume from.
+    #[error("the read filled its page of {cap} rows and its projection carries no primary key")]
+    Unpageable {
+        /// The page's row cap.
+        cap: u32,
+    },
+    /// A page after the first failed, and the replacement read failed too.
+    #[error("a paged read failed part way through and could not be restarted: {0}")]
+    Interrupted(String),
+    /// The estimate the page size is derived from could not be read.
+    #[error("the read estimate failed: {0}")]
+    Estimate(String),
 }
 
 /// The server-chosen label of the membership subscription over `member_table`
@@ -128,34 +218,65 @@ fn membership_label(member_table: &str) -> String {
     format!("connetto-membership:{member_table}")
 }
 
-/// Produces a subscription's initial snapshot for a given identity.
+/// Produces a subscription's initial rows for a given identity, one page at a
+/// time.
 ///
-/// Phase 4 implements it over the re-exec `Connector`: run the subscription's
-/// `SELECT` against Postgres at a snapshot LSN and encode the rows into an
+/// Implemented over Postgres by
+/// [`PgSnapshotSource`](crate::PgSnapshotSource): run the subscription's
+/// `SELECT` against the backend at a snapshot LSN and encode the rows into an
 /// insert-patchset with `sqlite-diff-rs`. No SQLite lives on the backend. The
 /// `caller` lets the implementation run the read under the requesting
-/// principal's Row-Level Security so the snapshot already excludes rows it
-/// cannot see.
+/// principal's Row-Level Security so the rows already exclude what it cannot
+/// see.
+///
+/// A read arrives in pages because a legitimately large read is the product,
+/// not an abuse: the first sync of a new device and a resync the server itself
+/// demands are both the whole working set (R58 decision 6). The session paces
+/// the pages with the delivery credits it already has.
 #[allow(async_fn_in_trait)]
 pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// Snapshot-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Produce the initial snapshot for `select_sql`, authorized as `caller`.
+    /// What the backend predicts `select_sql` will produce, as `caller`.
+    ///
+    /// Asked before the read is spent: the predicted width sizes the page, and
+    /// a predicted average row already above the ceiling on one row is refused
+    /// without reading anything.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backend read or a plan that does not parse.
+    async fn estimate(
+        &self,
+        select_sql: &str,
+        binds: &[BindValue],
+        caller: &Principal<Id, Key>,
+    ) -> Result<SnapshotEstimate, Self::Error>;
+
+    /// Produce one page of the initial rows for `select_sql`, authorized as
+    /// `caller`.
     ///
     /// `select_sql` is the Postgres translation of the subscription query,
     /// never the client dialect, with `$N` placeholders paired to `binds` in
     /// order.
     ///
+    /// A page that fills its allowance reports where the next one resumes. A
+    /// read that fills its allowance and cannot be resumed must fail rather
+    /// than return its first rows: a truncation the caller cannot tell from a
+    /// complete answer is the one outcome this seam may never produce.
+    ///
     /// # Errors
     ///
-    /// Implementation-defined: a backend read or encoding failure.
-    async fn snapshot(
+    /// Implementation-defined: a backend read or encoding failure, a row above
+    /// the ceiling, or a read that filled a page it cannot resume.
+    async fn snapshot_page(
         &self,
         select_sql: &str,
         binds: &[BindValue],
         caller: &Principal<Id, Key>,
-    ) -> Result<Snapshot, Self::Error>;
+        page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error>;
 
     /// Read the caller's own membership rows for a term at registration:
     /// `seed_sql` run as `caller` under the same binding the snapshot uses,
@@ -600,6 +721,169 @@ impl Deliverable {
 struct RowSub {
     reg: RowRegistration,
     sub: Subscribe,
+    /// Bytes the first delivery carried, once it completed. The reference the
+    /// growth warning is measured against (R58 decision 8).
+    first_delivery: Option<u64>,
+    /// Bytes delivered for this subscription over its whole life.
+    delivered: u64,
+    /// Whether the growth line has already been logged, so it fires once.
+    warned: bool,
+}
+
+/// How far past its first delivery a standing request may grow before the
+/// developer hears about it (R58 decision 8).
+///
+/// The live set stays the application's to bound, so this is a line in the log
+/// and never a refusal.
+const GROWTH_WARN_FACTOR: u64 = 100;
+
+/// Log a refused read by name and produce the error the refusal path answers
+/// with.
+///
+/// Every cause reaches the wire as the one fixed `SUBSCRIPTION_REFUSED`
+/// detail (R38), so the cause exists for the structured log alone. A running
+/// application cannot adapt to a read limit, by design: it is something a
+/// developer meets in the log during development.
+fn refuse_read(sub_id: &str, cause: &SubscribeRefusal) -> SessionError {
+    tracing::warn!(sub_id = %sub_id, cause = %cause, "read refused");
+    SessionError::Snapshot(cause.to_string())
+}
+
+/// How many rows a page of a table averaging `width` bytes a row may carry
+/// under a `budget` byte page.
+///
+/// An average, so a table whose row widths vary wildly still produces a page
+/// well off the budget, and the planner approximates the width of a value
+/// stored out of line. Never zero rows: a page cannot be smaller than one row,
+/// which is why the ceiling on one row exists beside the budget.
+fn page_rows(budget: u64, width: u32) -> u32 {
+    let rows = budget / u64::from(width).max(1);
+    u32::try_from(rows).unwrap_or(u32::MAX).max(1)
+}
+
+/// Count what one subscription has delivered, and say once when a standing
+/// request has grown far past what its first delivery was allowed.
+///
+/// The live set stays the application's to bound (R58 decision 8): an
+/// application that does not want a table on a device asks a narrower
+/// question. This is so the developer hears it from connetto rather than from
+/// a complaint about a slow device. `budget` floors the comparison, so a tiny
+/// first delivery does not warn on its second frame.
+fn note_delivered<Id, Key>(
+    state: &mut SessionState<Id, Key>,
+    label: &str,
+    bytes: u64,
+    budget: u64,
+) {
+    let Some(row) = state.subs.get_mut(label) else {
+        return;
+    };
+    row.delivered = row.delivered.saturating_add(bytes);
+    if row.warned {
+        return;
+    }
+    let Some(first) = row.first_delivery else {
+        return;
+    };
+    if row.delivered > first.max(budget).saturating_mul(GROWTH_WARN_FACTOR) {
+        row.warned = true;
+        tracing::warn!(
+            sub_id = %label,
+            delivered = row.delivered,
+            first_delivery = first,
+            "a standing subscription has delivered far more than its first delivery, so its live set keeps growing"
+        );
+    }
+}
+
+/// Decide whether a page may be delivered, refusing by name when it may not.
+///
+/// Two refusals, both of them policy the tier owns rather than mechanics the
+/// read owns: a row above the ceiling, logged with the three numbers that say
+/// whether the ceiling is set too low or the schema stores file-shaped data,
+/// and a read that filled a page it cannot resume, which must never be
+/// answered with its first rows.
+fn admit_page(
+    sub_id: &str,
+    page: &SnapshotPage,
+    max_rows: u32,
+    average: u32,
+    limits: ReadLimits,
+) -> Result<(), SessionError> {
+    if page.widest_row > limits.row_ceiling {
+        return Err(refuse_read(
+            sub_id,
+            &SubscribeRefusal::WideRow {
+                bytes: page.widest_row,
+                ceiling: limits.row_ceiling,
+                average,
+            },
+        ));
+    }
+    if page.filled && page.next.is_none() {
+        return Err(refuse_read(
+            sub_id,
+            &SubscribeRefusal::Unpageable { cap: max_rows },
+        ));
+    }
+    Ok(())
+}
+
+/// What starting or restarting one read needs.
+///
+/// A bundle rather than five parameters, because a restart passes the same
+/// five back and a positional list of them invites getting one wrong.
+struct ReadStart {
+    /// The request, so a restart re-reads the same set.
+    sub: Subscribe,
+    /// The engine ids and the translated query.
+    reg: RowRegistration,
+    /// The caller's tier, which the read limits come from.
+    tier: Tier,
+    /// The reader-pool share the delivery holds (R39).
+    permit: Option<ReaderPermit>,
+    /// Whether this read is itself the one restart a failed page gets.
+    restarted: bool,
+}
+
+/// One initial read still arriving in pages.
+///
+/// Held by the session rather than by the read, because the pages are paced by
+/// the client's delivery credits and the only path that can read an
+/// acknowledgement is the same one a read would block (R33). So a page is
+/// taken when an acknowledgement arrives and the producer waits here in
+/// between.
+struct PagedRead {
+    /// The client's own label for the subscription.
+    label: String,
+    /// The request, so a restart can re-read the same set.
+    sub: Subscribe,
+    /// The engine ids and the translated query the pages are read from.
+    reg: RowRegistration,
+    /// Where the next page resumes.
+    after: PageKey,
+    /// How many rows a page of this read may carry, derived from the tier's
+    /// byte budget and the table's predicted average row width.
+    max_rows: u32,
+    /// The tier's read limits, carried so every page of one read is judged by
+    /// the limits the read started under.
+    limits: ReadLimits,
+    /// The table's predicted average row width, kept for the log line a
+    /// refused row produces.
+    average_width: u32,
+    /// The cursor the completing `SnapshotEnd` carries: the first page's, never
+    /// a later one's, because resuming from the earliest position can only
+    /// re-deliver changes the client already has.
+    cursor: Cursor,
+    /// Bytes this delivery has carried so far.
+    delivered: u64,
+    /// Whether this delivery is itself the one restart a failed page gets.
+    restarted: bool,
+    /// The caller's tier, so a restart is judged by the same limits.
+    tier: Tier,
+    /// The reader-pool share held for the whole delivery (R39), released when
+    /// the last page lands and carried across a restart.
+    permit: Option<ReaderPermit>,
 }
 
 /// Mutable per-session state carried through the run loop.
@@ -610,6 +894,10 @@ struct SessionState<Id, Key> {
     /// so the server can re-read the same set without asking the client again
     /// (R7).
     subs: HashMap<String, RowSub>,
+    /// Reads still arriving in pages, oldest first, so several large
+    /// subscriptions take turns rather than one finishing before the next
+    /// starts.
+    paging: VecDeque<PagedRead>,
     agg_subs: HashMap<String, u64>,
     /// Delta aggregate subscriptions by client label: consumer id and engine
     /// subscription id, both needed to tear the subscription down.
@@ -1546,27 +1834,11 @@ where
         let Some(sql) = narrowed_sql(&route.pg_sql, &term_move.column, &term_move.value) else {
             return false;
         };
-        let mut attempt: u32 = 0;
-        let snapshot = loop {
-            match self
-                .snapshot_source
-                .snapshot(&sql, &route.binds, &route.principal)
-                .await
-            {
-                Ok(snapshot) => break snapshot,
-                Err(err) => {
-                    attempt = attempt.saturating_add(1);
-                    if attempt >= Self::MOVE_ATTEMPTS {
-                        tracing::warn!(
-                            sub_id = %route.label,
-                            error = %err,
-                            "a move-in read kept failing, replacing the subscription"
-                        );
-                        return false;
-                    }
-                    tokio::time::sleep(self.auth_retry.backoff(attempt)).await;
-                }
-            }
+        let Some(snapshot) = self
+            .move_page(&self.snapshot_source, &sql, &route.binds, route)
+            .await
+        else {
+            return false;
         };
         let has_rows = matches!(
             ParsedDiffSet::parse(&snapshot.patchset),
@@ -1581,6 +1853,60 @@ where
             return false;
         };
         self.send_move(route, cursor, payload).await
+    }
+
+    /// Read one page of a move's narrowed query as `route`'s caller, retrying a
+    /// failing read the way the ingest loop retries an unreachable
+    /// authorization service.
+    ///
+    /// [`None`] when the move cannot be served this way, which the callers turn
+    /// into a replacement of the whole subscription. A move wider than one page
+    /// is one of those cases: it is neither truncated nor assembled whole, and
+    /// the replacement is read in pages (R58).
+    async fn move_page(
+        &self,
+        source: &Snap,
+        sql: &str,
+        binds: &[BindValue],
+        route: &Route<Id, Key>,
+    ) -> Option<SnapshotPage> {
+        let limits = self.guard.read_limits(Tier::of(&route.principal));
+        // The same page budget the subscription's own read uses, so a move
+        // cannot deliver more at once than a snapshot may.
+        let estimate = source.estimate(sql, binds, &route.principal).await.ok()?;
+        let mut attempt: u32 = 0;
+        loop {
+            let spec = PageSpec {
+                after: None,
+                max_rows: page_rows(limits.page_bytes, estimate.width),
+                timeout: limits.timeout,
+            };
+            match source
+                .snapshot_page(sql, binds, &route.principal, &spec)
+                .await
+            {
+                Ok(page) if page.filled => {
+                    tracing::warn!(
+                        sub_id = %route.label,
+                        "a move read filled its page, replacing the subscription"
+                    );
+                    return None;
+                }
+                Ok(page) => return Some(page),
+                Err(err) => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt >= Self::MOVE_ATTEMPTS {
+                        tracing::warn!(
+                            sub_id = %route.label,
+                            error = %err,
+                            "a move read kept failing, replacing the subscription"
+                        );
+                        return None;
+                    }
+                    tokio::time::sleep(self.auth_retry.backoff(attempt)).await;
+                }
+            }
+        }
     }
 
     /// Withdraw what a value leaving the set no longer shows: the rows under
@@ -1626,23 +1952,8 @@ where
         let Some(sql) = narrowed_sql(&base, &term_move.column, &term_move.value) else {
             return false;
         };
-        let mut attempt: u32 = 0;
-        let snapshot = loop {
-            match source.snapshot(&sql, &[], &route.principal).await {
-                Ok(snapshot) => break snapshot,
-                Err(err) => {
-                    attempt = attempt.saturating_add(1);
-                    if attempt >= Self::MOVE_ATTEMPTS {
-                        tracing::warn!(
-                            sub_id = %route.label,
-                            error = %err,
-                            "a move-out read kept failing, replacing the subscription"
-                        );
-                        return false;
-                    }
-                    tokio::time::sleep(self.auth_retry.backoff(attempt)).await;
-                }
-            }
+        let Some(snapshot) = self.move_page(source, &sql, &[], route).await else {
+            return false;
         };
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
             return false;
@@ -2485,6 +2796,7 @@ where
             credits: self.config.initial_credits,
             pending: VecDeque::new(),
             subs: HashMap::new(),
+            paging: VecDeque::new(),
             agg_subs: HashMap::new(),
             delta_agg_subs: HashMap::new(),
             outbound: outbound_tx,
@@ -2498,8 +2810,13 @@ where
 
         while !state.closing {
             // One task, two arms. The transport arm awaits a whole subscribe,
-            // snapshot included, so the outbound arm cannot interleave a live
-            // patch into it and a client never sees one before SnapshotEnd.
+            // including its first page of rows, so the outbound arm cannot
+            // interleave a live patch into that. A read still arriving in
+            // pages is the one exception, deliberately: its later pages are
+            // taken when the client acknowledges, so a live patch may land
+            // between two pages. That is safe in one direction only and the
+            // direction is the right one, because a page is read after every
+            // frame already sent (R58 decision 9).
             // Moving either arm onto its own task breaks that silently.
             tokio::select! {
                 incoming = transport.recv() => {
@@ -2520,43 +2837,8 @@ where
                 }
                 outbound = outbound_rx.recv() => {
                     let Some(outbound) = outbound else { break };
-                    match outbound {
-                        Outbound::Live(patch) => {
-                            enqueue_and_flush(
-                                &mut transport,
-                                &mut state.credits,
-                                &mut state.pending,
-                                Deliverable::Rows(BulkMessage::LivePatch(patch)),
-                            )
-                            .await
-                            .map_err(transport_err)?;
-                        }
-                        Outbound::Aggregate(update) => {
-                            transport
-                                .send_control(ControlMessage::AggregateUpdate(update))
-                                .await
-                                .map_err(transport_err)?;
-                        }
-                        Outbound::Fatal(fatal) => {
-                            let _ = transport
-                                .send_control(ControlMessage::FatalError(fatal))
-                                .await;
-                            break;
-                        }
-                        Outbound::Drop => break,
-                        Outbound::Control(msg) => {
-                            // Non-fatal control frame: send immediately, ignore
-                            // a closed transport (the session may have moved on).
-                            let _ = transport.send_control(msg).await;
-                        }
-                        Outbound::Resnapshot { sub_id, reason } => {
-                            // In this arm rather than a task of its own, so the
-                            // select cannot interleave it into a subscribe, and
-                            // the notice with its replacement is one ordered
-                            // pair on the task that holds the transport (R7).
-                            self.resnapshot_row(&mut transport, &mut state, &sub_id, &reason)
-                                .await?;
-                        }
+                    if !self.handle_outbound(&mut transport, outbound, &mut state).await? {
+                        break;
                     }
                 }
             }
@@ -2570,6 +2852,65 @@ where
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
         Ok(())
+    }
+
+    /// Deliver one item the dispatch side produced for this session, answering
+    /// whether the session goes on.
+    ///
+    /// It runs on the same task as the transport arm, not one of its own, so
+    /// the select cannot interleave a live patch into a subscribe and the
+    /// resnapshot notice travels with its replacement as one ordered pair (R7).
+    async fn handle_outbound<T: Transport>(
+        &self,
+        transport: &mut T,
+        outbound: Outbound,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<bool, SessionError> {
+        match outbound {
+            Outbound::Live(patch) => {
+                let budget = self
+                    .guard
+                    .read_limits(Tier::of(&state.principal))
+                    .page_bytes;
+                note_delivered(
+                    state,
+                    &patch.sub_id,
+                    patch.patchset_zstd.len() as u64,
+                    budget,
+                );
+                enqueue_and_flush(
+                    transport,
+                    &mut state.credits,
+                    &mut state.pending,
+                    Deliverable::Rows(BulkMessage::LivePatch(patch)),
+                )
+                .await
+                .map_err(transport_err)?;
+            }
+            Outbound::Aggregate(update) => {
+                transport
+                    .send_control(ControlMessage::AggregateUpdate(update))
+                    .await
+                    .map_err(transport_err)?;
+            }
+            Outbound::Fatal(fatal) => {
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(fatal))
+                    .await;
+                return Ok(false);
+            }
+            Outbound::Drop => return Ok(false),
+            // Non-fatal control frame: send immediately, ignore a closed
+            // transport (the session may have moved on).
+            Outbound::Control(msg) => {
+                let _ = transport.send_control(msg).await;
+            }
+            Outbound::Resnapshot { sub_id, reason } => {
+                self.resnapshot_row(transport, state, &sub_id, &reason)
+                    .await?;
+            }
+        }
+        Ok(true)
     }
 
     /// Drop every route and registration this connection held.
@@ -2650,7 +2991,12 @@ where
                 state.credits = state.credits.saturating_add(ack.credits);
                 flush(transport, &mut state.credits, &mut state.pending)
                     .await
-                    .map_err(transport_err)
+                    .map_err(transport_err)?;
+                // The acknowledgement is what paces a read still arriving in
+                // pages: one page per acknowledgement, so the server holds one
+                // page at a time and a client that stops reading stops the
+                // producer (R58 decision 9).
+                self.pump_page(transport, state).await
             }
             ControlMessage::Handshake(_) => {
                 let _ = transport
@@ -3082,7 +3428,7 @@ where
         // once for the operation however many checkouts it makes. Aggregates
         // bootstrap through the re-execution connector on the owner pool and
         // take none.
-        let Some(_reader_permit) = self
+        let Some(reader_permit) = self
             .subscribe_reader_permit(transport, tier, &sub.sub_id, reg.sub_id)
             .await?
         else {
@@ -3112,7 +3458,10 @@ where
             }
         }
         let members = std::sync::Arc::clone(&reg.member_tables);
-        match self.subscribe_row(transport, sub, state, reg).await {
+        match self
+            .subscribe_row(transport, sub, state, reg, tier, Some(reader_permit))
+            .await
+        {
             // A snapshot failure is scoped to this one subscription: the
             // registration is rolled back and the session (with every sibling
             // subscription) stays alive. Transport and oplog failures stay
@@ -3165,6 +3514,8 @@ where
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: RowRegistration,
+        tier: Tier,
+        permit: Option<ReaderPermit>,
     ) -> Result<(), SessionError> {
         let mut resync = None;
         if state.resume_lsn != 0 {
@@ -3179,7 +3530,19 @@ where
                 }
             }
         }
-        self.snapshot_row(transport, sub, state, &reg, resync).await
+        self.snapshot_row(
+            transport,
+            state,
+            ReadStart {
+                sub,
+                reg,
+                tier,
+                permit,
+                restarted: false,
+            },
+            resync,
+        )
+        .await
     }
 
     /// Open the membership subscription a term needs, on the client's behalf
@@ -3254,7 +3617,7 @@ where
                 "a membership subscription registered as something other than rows".to_owned(),
             ));
         };
-        let Some(_reader_permit) = self
+        let Some(reader_permit) = self
             .subscribe_reader_permit(transport, tier, &label, sub_id)
             .await?
         else {
@@ -3266,7 +3629,8 @@ where
             pg_sql,
             member_tables: std::sync::Arc::from(Vec::new()),
         };
-        self.subscribe_row(transport, hidden, state, reg).await
+        self.subscribe_row(transport, hidden, state, reg, tier, Some(reader_permit))
+            .await
     }
 
     /// Install the live route and record the subscription, so `dispatch_event`
@@ -3300,11 +3664,22 @@ where
             },
         )
         .await;
+        // A resnapshot re-records the same subscription, so the delivery
+        // counters carry over rather than resetting: what a standing request
+        // has cost over its life does not restart because it was replaced.
+        let carried = state
+            .subs
+            .get(&sub.sub_id)
+            .map(|row| (row.first_delivery, row.delivered, row.warned));
+        let (first_delivery, delivered, warned) = carried.unwrap_or((None, 0, false));
         state.subs.insert(
             sub.sub_id.clone(),
             RowSub {
                 reg: reg.clone(),
                 sub: sub.clone(),
+                first_delivery,
+                delivered,
+                warned,
             },
         );
     }
@@ -3335,7 +3710,18 @@ where
             };
             let (sub, reg) = (row.sub.clone(), row.reg.clone());
             match self
-                .snapshot_row(transport, sub, state, &reg, Some(reason.clone()))
+                .snapshot_row(
+                    transport,
+                    state,
+                    ReadStart {
+                        sub,
+                        reg,
+                        tier: Tier::of(&state.principal),
+                        permit: None,
+                        restarted: false,
+                    },
+                    Some(reason.clone()),
+                )
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -3355,21 +3741,25 @@ where
         }
     }
 
-    /// Snapshot a row subscription: route first, then read, then resync
-    /// notice, begin, patch, end.
+    /// Snapshot a row subscription: route first, then the estimate, then the
+    /// first page, then the resync notice, begin, rows, and either the end or
+    /// a continuation that later pages arrive on.
     ///
-    /// The patch and the end share one queue, so the end cannot overtake the
+    /// The rows and the end share one queue, so the end cannot overtake the
     /// rows it completes however far behind the client has fallen. Only the
-    /// patch spends a credit.
+    /// rows spend a credit.
     ///
-    /// Live delivery runs throughout the snapshot, so a change committed while
-    /// it is in flight reaches the client as a patch queued behind
-    /// `SnapshotEnd`. Such a patch may repeat a row the snapshot already
-    /// carries, which is harmless: patches arrive in commit order, so the last
-    /// one applied for a row is that row's current value. Filtering the
-    /// overlap by LSN was considered and rejected, see `04-subscriptions.md`.
+    /// Live delivery runs throughout, so a change committed while the read is
+    /// in flight reaches the client as a patch of its own. Such a patch may
+    /// repeat a row a page already carried, which is harmless: patches arrive
+    /// in commit order, so the last one applied for a row is that row's
+    /// current value. A paged read takes that one step further, since a later
+    /// page is read after every frame already sent and so can never carry a
+    /// value older than one the client has applied (R58 decision 9).
+    /// Filtering the overlap by LSN was considered and rejected, see
+    /// `04-subscriptions.md`.
     ///
-    /// No frame goes out until the read succeeds. A `SnapshotBegin` or a
+    /// No frame goes out until the first page succeeds. A `SnapshotBegin` or a
     /// `FullResyncRequired` ahead of a failing read would mark the refusal as
     /// one that passed registration, and a refusal must not vary by cause.
     /// The resync notice is also what makes the client discard the rows it
@@ -3377,17 +3767,57 @@ where
     async fn snapshot_row<T: Transport>(
         &self,
         transport: &mut T,
-        sub: Subscribe,
         state: &mut SessionState<Id, Key>,
-        reg: &RowRegistration,
+        start: ReadStart,
         resync: Option<FullResyncReason>,
     ) -> Result<(), SessionError> {
-        self.attach_row_route(&sub, state, reg).await;
-        let snapshot = self
+        let ReadStart {
+            sub,
+            reg,
+            tier,
+            permit,
+            restarted,
+        } = start;
+        self.attach_row_route(&sub, state, &reg).await;
+        // Any read still arriving in pages for this label is abandoned: this
+        // call is its replacement.
+        state.paging.retain(|read| read.label != sub.sub_id);
+        let limits = self.guard.read_limits(tier);
+        let estimate = self
             .snapshot_source
-            .snapshot(&reg.pg_sql, &sub.spec.binds, &state.principal)
+            .estimate(&reg.pg_sql, &sub.spec.binds, &state.principal)
+            .await
+            .map_err(|err| {
+                refuse_read(&sub.sub_id, &SubscribeRefusal::Estimate(err.to_string()))
+            })?;
+        // The cheap refusal the estimate pays for: a table whose typical row
+        // is already above the ceiling has no servable page, and nothing has
+        // been read to find out (R58 decision 10).
+        if u64::from(estimate.width) > limits.row_ceiling {
+            return Err(refuse_read(
+                &sub.sub_id,
+                &SubscribeRefusal::TableTooWide {
+                    width: estimate.width,
+                    ceiling: limits.row_ceiling,
+                },
+            ));
+        }
+        let max_rows = page_rows(limits.page_bytes, estimate.width);
+        let page = self
+            .snapshot_source
+            .snapshot_page(
+                &reg.pg_sql,
+                &sub.spec.binds,
+                &state.principal,
+                &PageSpec {
+                    after: None,
+                    max_rows,
+                    timeout: limits.timeout,
+                },
+            )
             .await
             .map_err(|err| SessionError::Snapshot(err.to_string()))?;
+        admit_page(&sub.sub_id, &page, max_rows, estimate.width, limits)?;
         if let Some(reason) = resync {
             transport
                 .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
@@ -3404,35 +3834,277 @@ where
             }))
             .await
             .map_err(transport_err)?;
-        let payload = compress(&snapshot.patchset)?;
+        let delivered = self
+            .send_page(transport, state, &sub.sub_id, page.patchset)
+            .await?;
+        match page.next {
+            // More to come. The producer waits in `state.paging` and the next
+            // page is taken when the client acknowledges this one, because the
+            // only path that can read that acknowledgement is the one a
+            // waiting read would block (R33).
+            Some(after) => {
+                state.paging.push_back(PagedRead {
+                    label: sub.sub_id.clone(),
+                    sub,
+                    reg,
+                    after,
+                    max_rows,
+                    limits,
+                    average_width: estimate.width,
+                    cursor: page.cursor,
+                    delivered,
+                    tier,
+                    restarted,
+                    permit,
+                });
+                Ok(())
+            }
+            None => {
+                self.complete_snapshot(transport, state, sub.sub_id, page.cursor, delivered)
+                    .await
+            }
+        }
+    }
+
+    /// Deliver one page's rows, returning what the frame carried.
+    ///
+    /// Compression happens here rather than in the source, so the source
+    /// answers in rows and the wire's own encoding stays on this side.
+    async fn send_page<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        label: &str,
+        patchset: Vec<u8>,
+    ) -> Result<u64, SessionError> {
+        let payload = compress(&patchset)?;
+        let bytes = payload.len() as u64;
         enqueue_and_flush(
             transport,
             &mut state.credits,
             &mut state.pending,
             Deliverable::Rows(BulkMessage::SnapshotPatch(SnapshotPatch::new(
-                sub.sub_id.clone(),
+                label.to_owned(),
                 payload,
             ))),
         )
         .await
         .map_err(transport_err)?;
-        // Queued rather than sent, so it cannot overtake the rows it completes
-        // when the credit window is shut. It costs no credit: it waits its
-        // turn, it is not rationed. Sending it here instead would tell the
-        // client to record a resume position for rows still in `pending`
-        // (R33).
+        Ok(bytes)
+    }
+
+    /// Close a delivery: queue its `SnapshotEnd` and record what it carried as
+    /// the reference the growth warning is measured against.
+    ///
+    /// The end is queued rather than sent, so it cannot overtake the rows it
+    /// completes when the credit window is shut. It costs no credit: it waits
+    /// its turn, it is not rationed. Sending it here instead would tell the
+    /// client to record a resume position for rows still in `pending` (R33).
+    async fn complete_snapshot<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        label: String,
+        cursor: Cursor,
+        delivered: u64,
+    ) -> Result<(), SessionError> {
+        if let Some(row) = state.subs.get_mut(&label) {
+            row.delivered = row.delivered.saturating_add(delivered);
+            if row.first_delivery.is_none() {
+                row.first_delivery = Some(delivered);
+            }
+        }
         enqueue_and_flush(
             transport,
             &mut state.credits,
             &mut state.pending,
             Deliverable::SnapshotComplete(SnapshotEnd {
-                sub_id: sub.sub_id,
-                cursor: snapshot.cursor,
+                sub_id: label,
+                cursor,
             }),
         )
         .await
-        .map_err(transport_err)?;
-        Ok(())
+        .map_err(transport_err)
+    }
+
+    /// Take the next page of the read that has waited longest, if the client
+    /// has room for it.
+    ///
+    /// One page per call, called when an acknowledgement arrives, so the
+    /// credit window paces the backend reads as well as the wire and the
+    /// server holds one page at a time (R58 decision 9). Nothing is read while
+    /// a frame is still queued, so a client that has fallen behind stops the
+    /// producer rather than filling the queue behind it.
+    async fn pump_page<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        if state.credits == 0 || !state.pending.is_empty() {
+            return Ok(());
+        }
+        let Some(read) = state.paging.pop_front() else {
+            return Ok(());
+        };
+        // An unsubscribe may have landed since the last page, and then there
+        // is nothing left to deliver to.
+        if !state.subs.contains_key(&read.label) {
+            return Ok(());
+        }
+        let PagedRead {
+            label,
+            sub,
+            reg,
+            after,
+            max_rows,
+            limits,
+            average_width,
+            cursor,
+            delivered,
+            restarted,
+            tier,
+            permit,
+        } = read;
+        let outcome = self
+            .snapshot_source
+            .snapshot_page(
+                &reg.pg_sql,
+                &sub.spec.binds,
+                &state.principal,
+                &PageSpec {
+                    after: Some(after),
+                    max_rows,
+                    timeout: limits.timeout,
+                },
+            )
+            .await;
+        let page = match outcome {
+            Ok(page) => page,
+            Err(err) => {
+                return self
+                    .restart_or_refuse(
+                        transport,
+                        state,
+                        ReadStart {
+                            sub,
+                            reg,
+                            tier,
+                            permit,
+                            restarted,
+                        },
+                        &err.to_string(),
+                    )
+                    .await;
+            }
+        };
+        // A page above the ceiling is not a transient failure and a restart
+        // would meet the same row, so this one ends the subscription.
+        if admit_page(&label, &page, max_rows, average_width, limits).is_err() {
+            return self.refuse_subscription(transport, state, &label).await;
+        }
+        // Size the next page from what this one measured rather than from the
+        // prediction, which cannot see the true size of a value stored out of
+        // line (R58).
+        let measured = match page.rows {
+            0 => average_width,
+            rows => u32::try_from(page.bytes / u64::from(rows)).unwrap_or(u32::MAX),
+        };
+        let max_rows = page_rows(limits.page_bytes, measured);
+        let carried = delivered.saturating_add(
+            self.send_page(transport, state, &label, page.patchset)
+                .await?,
+        );
+        match page.next {
+            Some(after) => {
+                state.paging.push_back(PagedRead {
+                    label,
+                    sub,
+                    reg,
+                    after,
+                    max_rows,
+                    limits,
+                    average_width: measured,
+                    cursor,
+                    delivered: carried,
+                    restarted,
+                    tier,
+                    permit,
+                });
+                Ok(())
+            }
+            None => {
+                self.complete_snapshot(transport, state, label, cursor, carried)
+                    .await
+            }
+        }
+    }
+
+    /// A page after the first failed. Read the whole subscription again once,
+    /// and refuse it if that fails too (R58 decision 11).
+    ///
+    /// The replacement's own first page is read before the notice goes out, so
+    /// nothing is discarded on a promise. A refusal leaves the pages already
+    /// applied on the client covered by no subscription, which R29's retention
+    /// pass evicts, so no partial set survives.
+    async fn restart_or_refuse<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        start: ReadStart,
+        detail: &str,
+    ) -> Result<(), SessionError> {
+        let label = start.sub.sub_id.clone();
+        if start.restarted {
+            let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail.to_owned()));
+            return self.refuse_subscription(transport, state, &label).await;
+        }
+        tracing::warn!(
+            sub_id = %label,
+            error = %detail,
+            "a page failed part way through a read, replacing the subscription"
+        );
+        let start = ReadStart {
+            restarted: true,
+            ..start
+        };
+        match self
+            .snapshot_row(
+                transport,
+                state,
+                start,
+                Some(FullResyncReason::SnapshotInterrupted),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(SessionError::Snapshot(detail)) => {
+                let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail));
+                self.refuse_subscription(transport, state, &label).await
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Give up on one subscription: tear the registration down and answer with
+    /// the one fixed phrase (R38).
+    async fn refuse_subscription<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        label: &str,
+    ) -> Result<(), SessionError> {
+        state.paging.retain(|read| read.label != label);
+        if let Some(row) = state.subs.remove(label) {
+            self.remove_route(row.reg.consumer_id).await;
+            self.materializer.lock().await.unregister(row.reg.sub_id);
+        }
+        transport
+            .send_control(ControlMessage::NonFatalError(NonFatalError {
+                related_to: Some(label.to_owned()),
+                detail: SUBSCRIPTION_REFUSED.to_owned(),
+            }))
+            .await
+            .map_err(transport_err)
     }
 
     /// Catch a resuming row subscription up from the oplog.
@@ -3795,5 +4467,29 @@ async fn flush<T: Transport>(
                     .await?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_rows;
+
+    /// A page's rows come from a byte budget divided by the width Postgres
+    /// predicts, so a table of wide rows pages smaller under the same budget.
+    #[test]
+    fn a_page_is_sized_from_the_budget_and_the_width() {
+        assert_eq!(page_rows(8192, 64), 128);
+        assert!(
+            page_rows(8192, 4096) < page_rows(8192, 64),
+            "wide rows page smaller under one budget"
+        );
+    }
+
+    /// A page cannot be smaller than one row, which is why a ceiling on one row
+    /// exists beside the budget, and an unpredicted width caps on rows alone.
+    #[test]
+    fn a_page_always_carries_at_least_one_row() {
+        assert_eq!(page_rows(8192, 100_000), 1);
+        assert_eq!(page_rows(8192, 0), 8192);
     }
 }

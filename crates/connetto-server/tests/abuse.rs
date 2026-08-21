@@ -40,9 +40,10 @@ use connetto_server::audit::{AUTH_OP_TYPE, AuthOp, pg_audit_hook};
 use connetto_server::ban::Instant;
 use connetto_server::{
     AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
-    EnforcementPolicy, LoopbackTransport, Materializer, NewBan, PersonLimits, RequestGuard,
-    SessionConfig, SessionManager, Snapshot, SnapshotSource, ThrottleConfig, TierLimits,
-    connetto_audit_table, connetto_ban_table, loopback, pg_ban_store, pg_write_target,
+    EnforcementPolicy, LoopbackTransport, Materializer, NewBan, PageSpec, PersonLimits,
+    RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    ThrottleConfig, TierLimits, connetto_audit_table, connetto_ban_table, loopback, pg_ban_store,
+    pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoWatermark, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
@@ -86,20 +87,39 @@ impl SnapshotSource for KeyedSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         auth: &Principal,
-    ) -> Result<Snapshot, Self::Error> {
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let withdrawn = auth
             .capabilities()
             .iter()
             .any(|subject| subject.key() == REVOKED_KEY);
         if withdrawn {
-            return Ok(Snapshot {
+            return Ok(SnapshotPage {
                 patchset: Vec::new(),
                 cursor: Cursor::new(Vec::new()),
+                next: None,
+                filled: false,
+                widest_row: 0,
+                rows: 0,
+                bytes: 0,
             });
         }
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
@@ -112,11 +132,16 @@ impl SnapshotSource for KeyedSnapshot {
             .expect("set quantity")
             .set(3, Value::Text("seed".to_owned()))
             .expect("set status");
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: PatchSet::<SimpleTable, String, Vec<u8>>::new()
                 .insert(insert)
                 .build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -235,18 +260,18 @@ fn guard(
     abuse: AbuseConfig,
     policy: Option<Arc<dyn EnforcementPolicy<String>>>,
 ) -> Arc<RequestGuard<String>> {
-    throttled_guard(fixture, ThrottleConfig::default(), abuse, policy)
+    throttled_guard(fixture, &ThrottleConfig::default(), abuse, policy)
 }
 
 /// The same, with the request limits tightened too, for a test whose subject is
 /// what happens when a rate limit trips.
 fn throttled_guard(
     fixture: &Fixture,
-    throttle: ThrottleConfig,
+    throttle: &ThrottleConfig,
     abuse: AbuseConfig,
     policy: Option<Arc<dyn EnforcementPolicy<String>>>,
 ) -> Arc<RequestGuard<String>> {
-    let mut built = RequestGuard::new(throttle, abuse)
+    let mut built = RequestGuard::new(*throttle, abuse)
         .with_bans(pg_ban_store::<ConnettoBans>(fixture.admin().clone()));
     if let Some(policy) = policy {
         built = built.with_enforcement(policy);
@@ -971,7 +996,7 @@ async fn a_tripped_credential_limit_still_counts_its_refusals() {
         .expect("valid thresholds");
     let guard = throttled_guard(
         &fixture,
-        ThrottleConfig::new()
+        &ThrottleConfig::new()
             .with_anonymous(TierLimits::anonymous().with_credential_refusals(2, WINDOW)),
         abuse,
         None,

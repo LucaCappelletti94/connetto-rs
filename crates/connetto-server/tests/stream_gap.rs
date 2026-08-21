@@ -27,9 +27,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, Oplog, OplogConfig, PgOplog,
-    RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, catchup_decision,
-    loopback, pg_write_target, slot,
+    CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, Oplog, OplogConfig, PageSpec,
+    PgOplog, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, catchup_decision, loopback, pg_write_target, slot,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -71,15 +71,34 @@ impl SnapshotSource for NoSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
-        Ok(Snapshot {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        Ok(SnapshotPage {
             patchset: Vec::new(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

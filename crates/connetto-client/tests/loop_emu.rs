@@ -26,9 +26,9 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PgOplog, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog, RequestGuard,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -53,9 +53,15 @@ fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
 }
 
+/// Internal helper struct to hold snapshot data for test doubles.
+struct SnapshotData {
+    patchset: Vec<u8>,
+    cursor: Cursor,
+}
+
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
-fn seed_snapshot() -> Snapshot {
+fn seed_snapshot() -> SnapshotData {
     let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(1))
@@ -69,7 +75,7 @@ fn seed_snapshot() -> Snapshot {
     let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build();
-    Snapshot {
+    SnapshotData {
         patchset,
         cursor: Cursor::new(Vec::new()),
     }
@@ -83,13 +89,36 @@ impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
-        Ok(seed_snapshot())
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        let snapshot = seed_snapshot();
+        Ok(SnapshotPage {
+            patchset: snapshot.patchset,
+            cursor: snapshot.cursor,
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
+        })
     }
 }
 
@@ -108,15 +137,35 @@ impl SnapshotSource for CursoredSeed {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
-        Ok(Snapshot {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        let snapshot = seed_snapshot();
+        Ok(SnapshotPage {
+            patchset: snapshot.patchset,
             cursor: Cursor::new(SEED_CURSOR.to_be_bytes().to_vec()),
-            ..seed_snapshot()
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -133,16 +182,39 @@ impl SnapshotSource for RecordingSeed {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
         &self,
         select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         if let Ok(mut seen) = self.seen.lock() {
             seen.push(select_sql.to_owned());
         }
-        Ok(seed_snapshot())
+        let snapshot = seed_snapshot();
+        Ok(SnapshotPage {
+            patchset: snapshot.patchset,
+            cursor: snapshot.cursor,
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
+        })
     }
 }
 
@@ -248,12 +320,26 @@ impl SnapshotSource for GadgetSeed {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
             let table = SimpleTable::new("gadgets", &["id", "active", "label"], &[0]);
@@ -266,9 +352,14 @@ impl SnapshotSource for GadgetSeed {
                 .expect("set label");
             patchset = patchset.insert(insert);
         }
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: patchset.build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -286,12 +377,26 @@ struct GatedSnapshot {
 impl SnapshotSource for GatedSnapshot {
     type Error = std::convert::Infallible;
 
-    async fn snapshot(
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         self.entered.notify_one();
         self.release.notified().await;
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
@@ -308,9 +413,14 @@ impl SnapshotSource for GatedSnapshot {
                 .expect("set status");
             patchset = patchset.insert(insert);
         }
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: patchset.build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -3800,12 +3910,26 @@ impl SnapshotSource for StatusSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -3816,11 +3940,16 @@ impl SnapshotSource for StatusSnapshot {
             .expect("set quantity")
             .set(3, Value::Text(self.status.to_owned()))
             .expect("set status");
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: PatchSet::<SimpleTable, String, Vec<u8>>::new()
                 .insert(insert)
                 .build(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

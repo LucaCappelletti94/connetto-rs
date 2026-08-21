@@ -30,7 +30,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_server::{
     AbuseConfig, LoopbackTransport, Materializer, PgSnapshotSource, ReaderReserve, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, loopback,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
     pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID, with_user};
@@ -143,13 +143,23 @@ type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermar
 /// pool under test.
 fn manager(reader: &Pool<AsyncPgConnection>) -> Manager {
     let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
-    let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-        .with_reader_gate(
-            ReaderReserve::new()
-                .with_total(TOTAL)
-                .with_reserved(RESERVED)
-                .gate(),
-        );
+    // The read limits are raised for one reason only: this fixture's policy
+    // sleeps for seconds per row on purpose, to hold a pooled connection, and
+    // R58's per-tier time limit would otherwise stop the very read whose
+    // occupancy is the subject here.
+    let unhurried = |tier: TierLimits| tier.with_read_timeout(Duration::from_secs(120));
+    let guard = RequestGuard::new(
+        ThrottleConfig::default()
+            .with_identified(unhurried(TierLimits::identified()))
+            .with_anonymous(unhurried(TierLimits::anonymous())),
+        AbuseConfig::default(),
+    )
+    .with_reader_gate(
+        ReaderReserve::new()
+            .with_total(TOTAL)
+            .with_reserved(RESERVED)
+            .gate(),
+    );
     SessionManager::new(
         Materializer::with_write_catalog(
             PG_DDL,

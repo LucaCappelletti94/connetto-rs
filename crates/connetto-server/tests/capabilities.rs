@@ -183,13 +183,22 @@ async fn visible_on_change_path(auth: &RlsAuth, caller: &Principal) -> Vec<i32> 
 /// Which papers a fresh snapshot delivers, read back off a replica the
 /// patchset was applied to, so the assertion is on rows a client would hold.
 async fn visible_in_snapshot(source: &PgSnapshotSource, caller: &Principal) -> Vec<i32> {
-    let snapshot = source
-        .snapshot("SELECT * FROM papers", &[], caller)
+    let page = source
+        .snapshot_page(
+            "SELECT * FROM papers",
+            &[],
+            caller,
+            &connetto_server::PageSpec {
+                after: None,
+                max_rows: 1024,
+                timeout: std::time::Duration::from_secs(30),
+            },
+        )
         .await
         .expect("snapshot");
     let mut replica = SqliteConnection::establish(":memory:").expect("open replica");
     diesel::RunQueryDsl::execute(sql_query(REPLICA_DDL), &mut replica).expect("replica ddl");
-    let compressed = zstd::encode_all(snapshot.patchset.as_slice(), 3).expect("compress");
+    let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
     Materializer::new(CATALOG_DDL)
         .expect("applier")
         .apply_diffset(&compressed, &mut replica)

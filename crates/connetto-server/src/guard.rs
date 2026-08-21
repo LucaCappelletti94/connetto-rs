@@ -163,8 +163,8 @@ where
     pub fn new(throttle: ThrottleConfig, abuse: AbuseConfig) -> Self {
         Self {
             key_cap: throttle.key_cap(),
-            auth: AuthThrottle::new(throttle),
-            handles: HandleThrottle::new(throttle),
+            auth: AuthThrottle::new(&throttle),
+            handles: HandleThrottle::new(&throttle),
             owners: Mutex::new(HashMap::new()),
             person_retain: abuse.person_retain(),
             abuse,
@@ -211,6 +211,12 @@ where
             Some(gate) => gate.acquire(tier).await,
             None => Ok(ReaderPermit::none()),
         }
+    }
+
+    /// What one read of `tier` may cost: the page budget, the ceiling on one
+    /// row and the time one page's read may take (R58).
+    pub(crate) const fn read_limits(&self, tier: Tier) -> crate::throttle::ReadLimits {
+        self.handles.read(tier)
     }
 
     /// Attach the audit sink, once, so an impose and a lift reach `auth_events`.

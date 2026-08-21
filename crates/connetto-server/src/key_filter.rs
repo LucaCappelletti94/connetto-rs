@@ -46,7 +46,15 @@ enum KeyBind {
     Uuid(uuid::Uuid),
 }
 
-/// `"col" = $1 AND "col2" = $2` over a table's primary key, plus its values.
+/// One row's key columns, in key order, with the value each binds.
+type CollectedKey = (Vec<String>, Vec<KeyBind>);
+
+/// A predicate over a table's primary key, plus the values it binds.
+///
+/// Two shapes, both key-shaped and both answered by the primary-key index:
+/// [`build`](Self::build) renders `"col" = $1 AND "col2" = $2` to name one
+/// row, and [`after`](Self::after) renders `("col", "col2") > ($1, $2)` to
+/// resume a snapshot page past the last row it delivered (R58).
 pub(crate) struct KeyFilter {
     predicate: String,
     binds: Vec<KeyBind>,
@@ -63,8 +71,75 @@ impl KeyFilter {
         catalog: &DB,
         table_id: TableId,
         table: &str,
-        mut value_at: F,
+        value_at: F,
     ) -> Result<Option<Self>, KeyError>
+    where
+        DB: DatabaseLike,
+        F: FnMut(usize, ColumnId) -> Result<Value<Postgres>, ValueError>,
+    {
+        let Some((columns, binds)) = Self::collect(catalog, table_id, table, value_at)? else {
+            return Ok(None);
+        };
+        let mut predicate = String::new();
+        for (position, name) in columns.iter().enumerate() {
+            if position > 0 {
+                predicate.push_str(" AND ");
+            }
+            let _ = write!(predicate, "{} = ${}", quote_ident(name), position + 1);
+        }
+        Ok(Some(Self { predicate, binds }))
+    }
+
+    /// The keyset predicate resuming past one row: a row-value comparison
+    /// over the whole primary key, with placeholders starting at `first` so
+    /// the subscription's own binds keep the numbers they were translated
+    /// with.
+    ///
+    /// A row-value comparison is lexicographic, which is the order a
+    /// composite key's own index is in, so a page resumes at one index
+    /// descent whatever the key's arity.
+    ///
+    /// [`None`] on the same terms as [`build`](Self::build).
+    pub(crate) fn after<DB, F>(
+        catalog: &DB,
+        table_id: TableId,
+        table: &str,
+        first: usize,
+        value_at: F,
+    ) -> Result<Option<Self>, KeyError>
+    where
+        DB: DatabaseLike,
+        F: FnMut(usize, ColumnId) -> Result<Value<Postgres>, ValueError>,
+    {
+        let Some((columns, binds)) = Self::collect(catalog, table_id, table, value_at)? else {
+            return Ok(None);
+        };
+        let names = columns
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let places = (first..first + columns.len())
+            .map(|place| format!("${place}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(Self {
+            predicate: format!("({names}) > ({places})"),
+            binds,
+        }))
+    }
+
+    /// Read every key cell of the row through `value_at`, in key order.
+    ///
+    /// [`None`] where no row can be named at all: a table with no primary
+    /// key, a key cell carrying no value, or a key column the catalog cannot
+    /// name.
+    fn collect<DB, F>(
+        catalog: &DB,
+        table_id: TableId,
+        table: &str,
+        mut value_at: F,
+    ) -> Result<Option<CollectedKey>, KeyError>
     where
         DB: DatabaseLike,
         F: FnMut(usize, ColumnId) -> Result<Value<Postgres>, ValueError>,
@@ -74,7 +149,7 @@ impl KeyFilter {
             return Ok(None);
         }
         let mut binds = Vec::with_capacity(columns.len());
-        let mut predicate = String::new();
+        let mut names = Vec::with_capacity(columns.len());
         for (position, column) in columns.into_iter().enumerate() {
             let bind = match value_at(position, column)? {
                 Value::Bool(value) => KeyBind::Bool(value),
@@ -94,13 +169,10 @@ impl KeyFilter {
             let Some(name) = catalog_helpers::column_name(catalog, table_id, column) else {
                 return Ok(None);
             };
-            if position > 0 {
-                predicate.push_str(" AND ");
-            }
-            let _ = write!(predicate, "{} = ${}", quote_ident(&name), position + 1);
+            names.push(name);
             binds.push(bind);
         }
-        Ok(Some(Self { predicate, binds }))
+        Ok(Some((names, binds)))
     }
 
     /// The rendered `WHERE` body, with `$n` placeholders in bind order.

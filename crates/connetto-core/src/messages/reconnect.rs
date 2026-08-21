@@ -34,6 +34,10 @@ pub enum FullResyncReason {
         /// whole of this one rather than sparing what siblings still claim.
         table: String,
     },
+    /// An initial read arriving in pages failed part way through, so what the
+    /// client holds is part of a set (R58). The replacement is read afresh
+    /// before this notice goes out, so nothing is discarded on a promise.
+    SnapshotInterrupted,
 }
 
 /// Server tells the client "throw away local state for this subscription and

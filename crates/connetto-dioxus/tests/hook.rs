@@ -16,8 +16,8 @@ use connetto_core::{
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    WebSocketTransport, pg_write_target,
+    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -60,15 +60,34 @@ impl SnapshotSource for EmptySnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
-        Ok(Snapshot {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        Ok(SnapshotPage {
             patchset: Vec::new(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -82,12 +101,26 @@ impl SnapshotSource for SeedOneOrder {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _caller: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -97,9 +130,14 @@ impl SnapshotSource for SeedOneOrder {
         let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
             .insert(insert)
             .build();
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset,
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

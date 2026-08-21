@@ -18,8 +18,8 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession};
 use connetto_server::{
-    Materializer, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource, loopback,
-    pg_write_target,
+    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 
@@ -36,16 +36,35 @@ impl SnapshotSource for CapturingSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         caller: &Principal,
-    ) -> Result<Snapshot, Self::Error> {
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
         *self.seen.lock().expect("capture lock") = caller.identity().cloned();
-        Ok(Snapshot {
+        Ok(SnapshotPage {
             patchset: Vec::new(),
             cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }

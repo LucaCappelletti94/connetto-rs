@@ -88,11 +88,11 @@ pub use preflight::{Artifact, PreflightError};
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
-    NoConnector, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError, SessionManager,
-    Snapshot, SnapshotSource,
+    NoConnector, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
-pub use throttle::{Limit, ThrottleConfig, Tier, TierLimits};
+pub use throttle::{Limit, ReadLimits, ThrottleConfig, Tier, TierLimits};
 pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};

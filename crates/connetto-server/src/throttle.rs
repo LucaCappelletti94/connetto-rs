@@ -28,6 +28,8 @@ const MINUTE: Duration = Duration::from_secs(60);
 /// Five minutes, the window the credential-guessing defaults use, longer
 /// because guessing is patient and a legitimate refresh is rare.
 const FIVE_MINUTES: Duration = Duration::from_secs(300);
+/// One mebibyte, the unit the read budgets are written in.
+const MIB: u64 = 1024 * 1024;
 
 /// How many of something a caller may ask for, over how long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,26 @@ pub struct TierLimits {
     subscriptions: Limit,
     connections: Limit,
     credential_refusals: Limit,
+    read: ReadLimits,
+}
+
+/// What one read of this tier may cost, as opposed to how many reads it may
+/// ask for (R58).
+///
+/// Three numbers because they bound three different things. `page_bytes`
+/// shapes a page and is a pacing target, derived per table from the width
+/// Postgres predicts. `row_ceiling` is the one that actually bounds memory,
+/// since a page cannot be smaller than one row. `timeout` bounds the work
+/// Postgres does, which a row cap cannot: an `ORDER BY` on an unindexed
+/// column reads the whole table to return a capped page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadLimits {
+    /// Byte budget one delivered page aims at.
+    pub page_bytes: u64,
+    /// Size above which a single row is refused rather than delivered.
+    pub row_ceiling: u64,
+    /// Wall-clock ceiling on one page's read.
+    pub timeout: Duration,
 }
 
 impl TierLimits {
@@ -100,6 +122,11 @@ impl TierLimits {
             subscriptions: Limit::new(120, MINUTE),
             connections: Limit::new(30, MINUTE),
             credential_refusals: Limit::new(30, MINUTE),
+            read: ReadLimits {
+                page_bytes: 8 * MIB,
+                row_ceiling: 32 * MIB,
+                timeout: Duration::from_secs(30),
+            },
         }
     }
 
@@ -110,6 +137,11 @@ impl TierLimits {
             subscriptions: Limit::new(30, MINUTE),
             connections: Limit::new(15, MINUTE),
             credential_refusals: Limit::new(10, MINUTE),
+            read: ReadLimits {
+                page_bytes: MIB,
+                row_ceiling: 8 * MIB,
+                timeout: Duration::from_secs(5),
+            },
         }
     }
 
@@ -132,6 +164,27 @@ impl TierLimits {
     #[must_use]
     pub const fn with_credential_refusals(mut self, max: u32, window: Duration) -> Self {
         self.credential_refusals = Limit::new(max, window);
+        self
+    }
+
+    /// The byte budget one delivered page of this tier's reads aims at.
+    #[must_use]
+    pub const fn with_page_bytes(mut self, bytes: u64) -> Self {
+        self.read.page_bytes = bytes;
+        self
+    }
+
+    /// The size above which one row is refused rather than delivered.
+    #[must_use]
+    pub const fn with_row_ceiling(mut self, bytes: u64) -> Self {
+        self.read.row_ceiling = bytes;
+        self
+    }
+
+    /// The wall-clock ceiling on one page's read.
+    #[must_use]
+    pub const fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read.timeout = timeout;
         self
     }
 }
@@ -502,10 +555,10 @@ pub(crate) struct HandleThrottle {
 
 impl HandleThrottle {
     /// Build the counters for `config`.
-    pub(crate) fn new(config: ThrottleConfig) -> Self {
+    pub(crate) fn new(config: &ThrottleConfig) -> Self {
         Self {
             retain: config.handle_retain(),
-            config,
+            config: *config,
             subscriptions: Counters::new(),
             connections: Counters::new(),
             credential_refusals: Counters::new(),
@@ -545,6 +598,12 @@ impl HandleThrottle {
             Instant::now(),
         )
     }
+
+    /// What one read of this tier may cost. Counted against nothing: these
+    /// bound one read's size and duration rather than a rate (R58).
+    pub(crate) const fn read(&self, tier: Tier) -> ReadLimits {
+        self.config.tier(tier).read
+    }
 }
 
 /// The counters the token endpoints are metered against.
@@ -571,10 +630,10 @@ pub(crate) struct AuthThrottle {
 
 impl AuthThrottle {
     /// Build the counters for `config`.
-    pub(crate) fn new(config: ThrottleConfig) -> Self {
+    pub(crate) fn new(config: &ThrottleConfig) -> Self {
         Self {
             retain: config.auth_retain(),
-            config,
+            config: *config,
             per_session: Counters::new(),
             per_account: Counters::new(),
         }
@@ -663,7 +722,7 @@ mod tests {
     fn a_capped_map_evicts_the_flood_and_keeps_the_caller_it_is_limiting() {
         const CAP: usize = 4;
         let throttle = HandleThrottle::new(
-            ThrottleConfig::new()
+            &ThrottleConfig::new()
                 .with_anonymous(TierLimits::anonymous().with_subscriptions(2, MINUTE))
                 .with_max_tracked(CAP),
         );
@@ -715,7 +774,7 @@ mod tests {
         // The credential windows stay long, which is the point: the connection
         // counters must not inherit their retention.
         let throttle = HandleThrottle::new(
-            ThrottleConfig::new()
+            &ThrottleConfig::new()
                 .with_anonymous(short_tier(TierLimits::anonymous()))
                 .with_identified(short_tier(TierLimits::identified()))
                 .with_refresh_failures_per_session(5, FIVE_MINUTES)
@@ -745,7 +804,7 @@ mod tests {
     fn a_window_admits_its_limit_then_refuses() {
         let config = ThrottleConfig::new()
             .with_anonymous(TierLimits::anonymous().with_subscriptions(2, MINUTE));
-        let throttle = HandleThrottle::new(config);
+        let throttle = HandleThrottle::new(&config);
         let key = handle();
 
         assert!(throttle.subscription(key, Tier::Anonymous).is_none());
@@ -764,7 +823,7 @@ mod tests {
         let config = ThrottleConfig::new()
             .with_anonymous(TierLimits::anonymous().with_subscriptions(1, MINUTE))
             .with_identified(TierLimits::identified().with_subscriptions(3, MINUTE));
-        let throttle = HandleThrottle::new(config);
+        let throttle = HandleThrottle::new(&config);
         let signed_in = handle();
         let visitor = handle();
 
@@ -781,7 +840,7 @@ mod tests {
     fn one_handles_limit_does_not_spend_anothers() {
         let config = ThrottleConfig::new()
             .with_anonymous(TierLimits::anonymous().with_subscriptions(1, MINUTE));
-        let throttle = HandleThrottle::new(config);
+        let throttle = HandleThrottle::new(&config);
         let first = handle();
         let second = handle();
 
@@ -812,7 +871,7 @@ mod tests {
         let config = ThrottleConfig::new()
             .with_refresh_failures_per_session(10, MINUTE)
             .with_refresh_failures_per_account(2, MINUTE);
-        let throttle = AuthThrottle::new(config);
+        let throttle = AuthThrottle::new(&config);
         let (first, second) = (handle(), handle());
 
         assert!(throttle.refresh_failed(first, Some("alice")).is_none());
@@ -828,7 +887,7 @@ mod tests {
         let config = ThrottleConfig::new()
             .with_refresh_failures_per_session(1, MINUTE)
             .with_refresh_failures_per_account(1, MINUTE);
-        let throttle = AuthThrottle::new(config);
+        let throttle = AuthThrottle::new(&config);
         let guessed = handle();
 
         assert!(throttle.refresh_failed(guessed, None).is_none());

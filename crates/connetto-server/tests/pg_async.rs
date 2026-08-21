@@ -16,9 +16,9 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PgOplog,
-    PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, Snapshot, SnapshotSource,
-    loopback, pg_write_target,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PageSpec, PgOplog,
+    PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -182,18 +182,23 @@ async fn async_pg_snapshot_reads_rows() {
     }
 
     let source = PgSnapshotSource::from_ddl(pool, ORDERS_PG_DDL).expect("build source");
-    let snapshot = source
-        .snapshot(
+    let page = source
+        .snapshot_page(
             "SELECT * FROM orders WHERE quantity > 0",
             &[],
             &connetto_core::Principal::<String, String>::unidentified(
                 connetto_core::SessionId::from_token_hash("test-user"),
             ),
+            &PageSpec {
+                after: None,
+                max_rows: 1024,
+                timeout: std::time::Duration::from_secs(30),
+            },
         )
         .await
         .expect("produce snapshot");
     assert!(
-        !snapshot.cursor.as_bytes().is_empty(),
+        !page.cursor.as_bytes().is_empty(),
         "a real read carries an LSN cursor"
     );
 
@@ -202,7 +207,7 @@ async fn async_pg_snapshot_reads_rows() {
     diesel::RunQueryDsl::execute(sql_query(ORDERS_SQLITE_DDL), &mut replica)
         .expect("create replica");
     let applier = Materializer::new(ORDERS_PG_DDL).expect("build applier");
-    let compressed = zstd::encode_all(snapshot.patchset.as_slice(), 3).expect("compress");
+    let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
     applier
         .apply_diffset(&compressed, &mut replica)
         .expect("apply snapshot");
@@ -267,19 +272,24 @@ async fn async_pg_snapshot_uuid_is_blob16() {
     }
 
     let source = PgSnapshotSource::from_ddl(pool, THINGS_PG_DDL).expect("build source");
-    let snapshot = source
-        .snapshot(
+    let page = source
+        .snapshot_page(
             "SELECT * FROM things",
             &[],
             &connetto_core::Principal::<String, String>::unidentified(
                 connetto_core::SessionId::from_token_hash("test-user"),
             ),
+            &PageSpec {
+                after: None,
+                max_rows: 1024,
+                timeout: std::time::Duration::from_secs(30),
+            },
         )
         .await
         .expect("produce snapshot");
 
     let ParsedDiffSet::Patchset(diff) =
-        ParsedDiffSet::parse(snapshot.patchset.as_slice()).expect("parse patchset")
+        ParsedDiffSet::parse(page.patchset.as_slice()).expect("parse patchset")
     else {
         panic!("snapshot is not a patchset");
     };
@@ -305,15 +315,34 @@ impl SnapshotSource for NoSnapshot {
     type Error = std::convert::Infallible;
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn snapshot(
+    async fn estimate(
         &self,
         _select_sql: &str,
         _binds: &[connetto_core::messages::BindValue],
         _auth: &connetto_core::Principal,
-    ) -> Result<Snapshot, Self::Error> {
-        Ok(Snapshot {
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &connetto_core::Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        Ok(SnapshotPage {
             patchset: Vec::new(),
             cursor: connetto_core::Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
         })
     }
 }
@@ -798,13 +827,18 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
 
     // Snapshot with the translated SQL plus the same binds, on real Postgres.
     let source = PgSnapshotSource::from_ddl(pool, TRANSLATED_PG_DDL).expect("build source");
-    let snapshot = source
-        .snapshot(
+    let page = source
+        .snapshot_page(
             &reg.pg_sql,
             &binds,
             &connetto_core::Principal::<String, String>::unidentified(
                 connetto_core::SessionId::from_token_hash("test-user"),
             ),
+            &PageSpec {
+                after: None,
+                max_rows: 1024,
+                timeout: std::time::Duration::from_secs(30),
+            },
         )
         .await
         .expect("snapshot the translated query");
@@ -815,7 +849,7 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
     diesel::RunQueryDsl::execute(sql_query(TRANSLATED_SQLITE_DDL), &mut replica)
         .expect("create replica");
     let applier = Materializer::new(TRANSLATED_PG_DDL).expect("build applier");
-    let compressed = zstd::encode_all(snapshot.patchset.as_slice(), 3).expect("compress");
+    let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
     applier
         .apply_diffset(&compressed, &mut replica)
         .expect("apply snapshot");
