@@ -30,13 +30,21 @@ rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
 # Structured logging (R12): this demo emits through `tracing` and installs the
 # developer-console destination in `main`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# `Blob`, `Url` and the anchor element are the export download affordance: a
+# page can only offer a file by clicking a synthetic link at an object URL.
 web-sys = { version = "0.3", features = [
+    "Blob",
     "BroadcastChannel",
+    "Document",
+    "Element",
     "History",
+    "HtmlAnchorElement",
+    "HtmlElement",
     "HtmlInputElement",
     "Location",
     "MessageEvent",
     "Storage",
+    "Url",
     "Window",
     "console",
 ] }

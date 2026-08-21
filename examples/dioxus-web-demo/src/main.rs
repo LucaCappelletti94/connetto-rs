@@ -96,6 +96,8 @@ const AUTH_PROVIDER: &str = "dev-idp";
 const AUTH_CALLBACK_PATH: &str = "/auth/callback";
 /// Channel the page uses to respond to the worker's provider query at each boot.
 const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
+/// File name the export download is offered under.
+const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
 
 diesel::table! {
     orders (id) {
@@ -261,6 +263,26 @@ fn worker_origin() -> String {
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default()
+}
+
+/// Offer `bytes` to the user as a file download named `name`.
+///
+/// A `Blob` at an object URL plus a synthetic anchor click, which is the only
+/// way a page can hand over a file the user decides where to keep. The URL is
+/// revoked immediately: the click has already taken its own reference.
+fn download_bytes(name: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    let parts = js_sys::Array::new();
+    parts.push(&js_sys::Uint8Array::from(bytes));
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| JsValue::from_str("no document"))?;
+    let anchor: web_sys::HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
+    anchor.set_href(&url);
+    anchor.set_download(name);
+    anchor.click();
+    web_sys::Url::revoke_object_url(&url)
 }
 
 // -----------------------------------------------------------------------------
@@ -1205,6 +1227,9 @@ fn Dashboard() -> Element {
 
     let mut note_text = use_signal(String::new);
 
+    // R26: the last export's outcome, so a failed one is not silent.
+    let mut export_status: Signal<Option<String>> = use_signal(|| None);
+
     // R15 retention readout: the tab mirror's page footprint, refreshed on
     // mount and whenever the covered rows move.
     let mut footprint = use_signal(|| (0_i64, 0_i64));
@@ -1359,6 +1384,34 @@ fn Dashboard() -> Element {
                         },
                         "Free up space"
                     }
+                }
+            }
+            div { class: "pane",
+                h2 { "your data " span { class: "badge local", "R26" } }
+                p { "A zip of plain SQLite databases, one per tier, readable with any SQLite tool." }
+                p { "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }
+                div { class: "row",
+                    button {
+                        onclick: move |_| {
+                            spawn(async move {
+                                let message = match workers::request_export().await {
+                                    Ok(bytes) => {
+                                        let len = bytes.len();
+                                        match download_bytes(EXPORT_FILE_NAME, &bytes) {
+                                            Ok(()) => format!("{len} bytes offered as {EXPORT_FILE_NAME}"),
+                                            Err(err) => format!("download refused: {err:?}"),
+                                        }
+                                    }
+                                    Err(err) => format!("export failed: {err}"),
+                                };
+                                export_status.set(Some(message));
+                            });
+                        },
+                        "Export local data"
+                    }
+                }
+                if let Some(message) = export_status.read().clone() {
+                    p { style: "font-family:monospace;font-size:0.85em;color:#555;", {message} }
                 }
             }
         }

@@ -122,6 +122,9 @@ pub enum ClientError {
     /// Zstd compression or decompression failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
+    /// Writing the local data export failed.
+    #[error("export error: {0}")]
+    Export(String),
     /// The server advertised a schema version this client build does not match
     /// (either a different version or none at all), so this build is stale and
     /// the app must reload. connetto never migrates schemas at runtime.
@@ -1084,6 +1087,411 @@ fn is_internal_table(name: &str) -> bool {
     sqlite_own || name.starts_with("_connetto")
 }
 
+const EXPORT_FORMAT: &str = "connetto-local-data";
+const EXPORT_VERSION: u32 = 1;
+const EXPORT_MANIFEST: &str = "manifest.json";
+const EXPORT_SYNCED_DB: &str = "synced.sqlite";
+const EXPORT_DEVICE_PRIVATE_DB: &str = "device-private.sqlite";
+/// The schema an export's empty twins live under while the row patchset is
+/// taken. Its own name because the relay attaches a `blank` of its own to this
+/// same connection, and two attachments cannot share one name.
+const EXPORT_BLANK_SCHEMA: &str = "connetto_export_blank";
+
+#[derive(serde::Serialize)]
+struct ExportManifest {
+    format: &'static str,
+    version: u32,
+    databases: Vec<ExportDatabase>,
+}
+
+#[derive(serde::Serialize)]
+struct ExportDatabase {
+    tier: &'static str,
+    path: &'static str,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ExportSchemaRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    tbl_name: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    sql: Option<String>,
+}
+
+/// One exported table: the name it has on the replica, the name it gets in the
+/// archive (they differ for a policy-split table), and its stored DDL.
+struct ExportTable {
+    physical: String,
+    logical: String,
+    ddl: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ExportKeyRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    key_columns: i64,
+}
+
+fn zip_error(error: impl core::fmt::Display) -> ClientError {
+    ClientError::Export(format!("writing the zip archive: {error}"))
+}
+
+fn export_manifest(include_device_private: bool) -> Result<Vec<u8>, ClientError> {
+    let mut databases = vec![ExportDatabase {
+        tier: "synced",
+        path: EXPORT_SYNCED_DB,
+    }];
+    if include_device_private {
+        databases.push(ExportDatabase {
+            tier: "device_private",
+            path: EXPORT_DEVICE_PRIVATE_DB,
+        });
+    }
+    serde_json::to_vec_pretty(&ExportManifest {
+        format: EXPORT_FORMAT,
+        version: EXPORT_VERSION,
+        databases,
+    })
+    .map_err(|err| ClientError::Export(format!("encoding the manifest: {err}")))
+}
+
+fn write_export_archive(
+    synced: &[u8],
+    device_private: Option<&[u8]>,
+) -> Result<Vec<u8>, ClientError> {
+    let manifest = export_manifest(device_private.is_some())?;
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file(EXPORT_MANIFEST, options)
+        .map_err(zip_error)?;
+    std::io::Write::write_all(&mut archive, &manifest).map_err(zip_error)?;
+    archive
+        .start_file(EXPORT_SYNCED_DB, options)
+        .map_err(zip_error)?;
+    std::io::Write::write_all(&mut archive, synced).map_err(zip_error)?;
+    if let Some(device_private) = device_private {
+        archive
+            .start_file(EXPORT_DEVICE_PRIVATE_DB, options)
+            .map_err(zip_error)?;
+        std::io::Write::write_all(&mut archive, device_private).map_err(zip_error)?;
+    }
+    archive
+        .finish()
+        .map(std::io::Cursor::into_inner)
+        .map_err(zip_error)
+}
+
+/// Build one archive database from one schema of `source`.
+///
+/// Rows travel as a session patchset rather than as generated SQL or a second
+/// connection onto an attached scratch database. The patchset carries every
+/// storage class verbatim, and the target is the `main` of its own connection,
+/// which is the only database `sqlite3_serialize` can reach and the only
+/// topology the browser's SQLite build offers (one connection per database).
+fn export_sqlite_schema(
+    source: &mut SqliteConnection,
+    source_schema: &str,
+    policy_tables: &PolicyTables,
+    include: Option<&HashSet<String>>,
+    hidden: &HashSet<String>,
+) -> Result<Vec<u8>, ClientError> {
+    let rows = export_schema_rows(source, source_schema)?;
+    let mut tables = Vec::new();
+    for row in rows.iter().filter(|row| row.kind == "table") {
+        if !export_table_allowed(&row.name, include, hidden) {
+            continue;
+        }
+        let Some(ddl) = row.sql.as_ref() else {
+            continue;
+        };
+        // A table with no primary key cannot be attached to a session, so its
+        // rows would be absent from the patchset. Refusing beats handing over an
+        // archive whose tables are all present and one of them empty.
+        if key_columns(source, source_schema, &row.name)? == 0 {
+            return Err(ClientError::Export(format!(
+                "table {} has no primary key, so its rows cannot be exported",
+                row.name
+            )));
+        }
+        tables.push(ExportTable {
+            physical: row.name.clone(),
+            logical: policy_tables
+                .logical(&row.name)
+                .map_or_else(|| row.name.clone(), ToOwned::to_owned),
+            ddl: ddl.clone(),
+        });
+    }
+    let mut target = SqliteConnection::establish(":memory:")
+        .map_err(|err| ClientError::Export(format!("opening the export database: {err}")))?;
+    for table in &tables {
+        target.batch_execute(&rename_create_table(
+            &table.ddl,
+            &quote_ident(&table.logical),
+        )?)?;
+    }
+    export_rows(source, source_schema, &tables, &mut target)?;
+    // After the rows: filling an unindexed table and indexing it once is
+    // cheaper than maintaining the index per row.
+    for row in rows.iter().filter(|row| row.kind == "index") {
+        let Some(ddl) = row.sql.as_ref() else {
+            continue;
+        };
+        let Some(table) = tables
+            .iter()
+            .find(|table| table.physical.eq_ignore_ascii_case(&row.tbl_name))
+        else {
+            continue;
+        };
+        target.batch_execute(&rename_index_table(ddl, &table.logical)?)?;
+    }
+    Ok(target.serialize_database_to_buffer().as_slice().to_vec())
+}
+
+/// Move every row of `tables` into `target`, under the archive's names.
+///
+/// The patchset is taken by diffing each table against an empty twin, which is
+/// what the relay does to build a tab's snapshot. The twins need a database of
+/// their own attached to `source`, so the attach window is opened and sealed
+/// again around the whole batch.
+fn export_rows(
+    source: &mut SqliteConnection,
+    source_schema: &str,
+    tables: &[ExportTable],
+    target: &mut SqliteConnection,
+) -> Result<(), ClientError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    // An in-memory database needs no creation permit, only the write one: the
+    // twins are created inside it.
+    harden::attach_in_window(
+        source,
+        ":memory:",
+        EXPORT_BLANK_SCHEMA,
+        harden::AttachPermits::Write,
+    )?;
+    let patchset = export_patchset(source, source_schema, tables);
+    let detached = source
+        .batch_execute(&format!(
+            "DETACH DATABASE {}",
+            quote_ident(EXPORT_BLANK_SCHEMA)
+        ))
+        .map_err(ClientError::from)
+        .and_then(|()| harden::seal_attaches(source).map_err(ClientError::from));
+    let patchset = patchset?;
+    detached?;
+    if patchset.is_empty() {
+        return Ok(());
+    }
+    let renamed = rename_diffset(patchset, |physical| {
+        tables
+            .iter()
+            .find(|table| table.physical == physical && table.physical != table.logical)
+            .map(|table| table.logical.clone())
+    })?;
+    target
+        .apply_patchset(&renamed, |_| ConflictAction::Abort)
+        .map_err(|err| ClientError::Export(format!("filling the export database: {err}")))
+}
+
+/// The patchset holding every row of `tables`, taken against empty twins in
+/// the already-attached blank schema.
+fn export_patchset(
+    source: &mut SqliteConnection,
+    source_schema: &str,
+    tables: &[ExportTable],
+) -> Result<Vec<u8>, ClientError> {
+    for table in tables {
+        let twin = rename_create_table(
+            &table.ddl,
+            &format!(
+                "{}.{}",
+                quote_ident(EXPORT_BLANK_SCHEMA),
+                quote_ident(&table.physical)
+            ),
+        )?;
+        source.batch_execute(&twin)?;
+    }
+    let mut session = source
+        .create_session_on(source_schema)
+        .map_err(|err| ClientError::Export(format!("opening the export session: {err}")))?;
+    for table in tables {
+        session
+            .attach_by_name(&table.physical)
+            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.physical)))?;
+        session
+            .diff(EXPORT_BLANK_SCHEMA, &table.physical)
+            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.physical)))?;
+    }
+    session
+        .patchset()
+        .map_err(|err| ClientError::Export(format!("encoding the exported rows: {err}")))
+}
+
+/// How many columns make up `table`'s primary key, zero for a rowid table
+/// that declared none.
+fn key_columns(
+    source: &mut SqliteConnection,
+    source_schema: &str,
+    table: &str,
+) -> Result<i64, ClientError> {
+    let rows: Vec<ExportKeyRow> = diesel::sql_query(format!(
+        "SELECT count(*) AS key_columns FROM {}.pragma_table_info(?) WHERE pk > 0",
+        quote_ident(source_schema)
+    ))
+    .bind::<diesel::sql_types::Text, _>(table)
+    .load(source)?;
+    Ok(rows.first().map_or(0, |row| row.key_columns))
+}
+
+fn export_schema_rows(
+    db: &mut SqliteConnection,
+    source_schema: &str,
+) -> Result<Vec<ExportSchemaRow>, ClientError> {
+    diesel::sql_query(format!(
+        "SELECT type AS kind, name, tbl_name, sql FROM {}.sqlite_schema \
+         WHERE sql IS NOT NULL \
+         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
+        quote_ident(source_schema)
+    ))
+    .load(db)
+    .map_err(ClientError::from)
+}
+
+fn export_table_allowed(
+    name: &str,
+    include: Option<&HashSet<String>>,
+    hidden: &HashSet<String>,
+) -> bool {
+    let lower = name.to_lowercase();
+    !is_internal_table(name)
+        && !hidden.contains(&lower)
+        && include.is_none_or(|tables| tables.contains(&lower))
+}
+
+/// Rewrite a stored `CREATE TABLE` statement to name `target`, which is an
+/// already-quoted path: a bare name for the archive database, or a qualified
+/// one for a twin in the blank schema. Column definitions travel verbatim, so
+/// types, defaults and constraints survive.
+fn rename_create_table(sql: &str, target: &str) -> Result<String, ClientError> {
+    let mut pos = after_keyword(sql, "CREATE TABLE")
+        .ok_or_else(|| ClientError::Export(format!("unsupported table DDL: {sql}")))?;
+    pos = skip_ws(sql, pos);
+    if starts_ci(&sql[pos..], "IF NOT EXISTS") {
+        pos += "IF NOT EXISTS".len();
+        pos = skip_ws(sql, pos);
+    }
+    let range = object_path_range(sql, pos)
+        .ok_or_else(|| ClientError::Export(format!("unsupported table DDL: {sql}")))?;
+    Ok(replace_range(sql, range, target))
+}
+
+/// Rewrite a stored `CREATE INDEX` statement to index `table` instead. The
+/// index keeps its own name: the archive database holds one schema, and the
+/// names in it were already unique in the schema they came from.
+fn rename_index_table(sql: &str, table: &str) -> Result<String, ClientError> {
+    let Some(on) = find_ascii_ci(sql, " ON ") else {
+        return Err(ClientError::Export(format!("unsupported index DDL: {sql}")));
+    };
+    let pos = skip_ws(sql, on + " ON ".len());
+    let range = object_path_range(sql, pos)
+        .ok_or_else(|| ClientError::Export(format!("unsupported index DDL: {sql}")))?;
+    Ok(replace_range(sql, range, &quote_ident(table)))
+}
+
+fn replace_range(sql: &str, range: std::ops::Range<usize>, replacement: &str) -> String {
+    let mut renamed = String::with_capacity(sql.len() + replacement.len());
+    renamed.push_str(&sql[..range.start]);
+    renamed.push_str(replacement);
+    renamed.push_str(&sql[range.end..]);
+    renamed
+}
+
+fn after_keyword(sql: &str, keyword: &str) -> Option<usize> {
+    let start = skip_ws(sql, 0);
+    starts_ci(&sql[start..], keyword).then_some(start + keyword.len())
+}
+
+fn starts_ci(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn skip_ws(value: &str, pos: usize) -> usize {
+    value[pos..]
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(pos + offset))
+        .unwrap_or(value.len())
+}
+
+fn object_path_range(sql: &str, pos: usize) -> Option<std::ops::Range<usize>> {
+    let start = pos;
+    let first = identifier_end(sql, pos)?;
+    let after_first = skip_ws(sql, first);
+    if sql.as_bytes().get(after_first) != Some(&b'.') {
+        return Some(start..first);
+    }
+    let second_start = skip_ws(sql, after_first + 1);
+    let second = identifier_end(sql, second_start)?;
+    Some(start..second)
+}
+
+fn identifier_end(sql: &str, pos: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    match *bytes.get(pos)? {
+        b'"' | b'\'' | b'`' => quoted_identifier_end(bytes, pos, bytes[pos]),
+        b'[' => bracket_identifier_end(bytes, pos),
+        _ => unquoted_identifier_end(sql, pos),
+    }
+}
+
+fn quoted_identifier_end(bytes: &[u8], pos: usize, quote: u8) -> Option<usize> {
+    let mut i = pos + 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+            } else {
+                return Some(i + 1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn bracket_identifier_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    bytes[pos + 1..]
+        .iter()
+        .position(|byte| *byte == b']')
+        .map(|offset| pos + 1 + offset + 1)
+}
+
+fn unquoted_identifier_end(sql: &str, pos: usize) -> Option<usize> {
+    sql[pos..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (ch.is_whitespace() || ch == '(' || ch == '.').then_some(pos + offset)
+        })
+        .filter(|end| *end > pos)
+        .or(Some(sql.len()))
+}
+
 /// `s` without `prefix`, matched case-insensitively, or `None`. Byte-indexed
 /// through `get` so a multibyte character at the boundary cannot panic.
 fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1930,6 +2338,33 @@ where
     #[must_use]
     pub const fn local_tables(&self) -> &HashSet<String> {
         &self.local_tables
+    }
+
+    /// Return a zip archive with plain SQLite copies of the local data tiers.
+    ///
+    /// The archive contains `manifest.json`, `synced.sqlite`, and
+    /// `device-private.sqlite` when a local tier is attached. Authentication
+    /// state, sync cursors and pending transport state are not exported.
+    pub fn export_local_data(&mut self) -> Result<Vec<u8>, ClientError> {
+        let synced = export_sqlite_schema(
+            &mut self.db,
+            "main",
+            &self.config.policy_tables,
+            None,
+            &self.hidden_tables,
+        )?;
+        let device_private = if self.local_tables.is_empty() {
+            None
+        } else {
+            Some(export_sqlite_schema(
+                &mut self.db,
+                LOCAL_SCHEMA,
+                &PolicyTables::default(),
+                Some(&self.local_tables),
+                &HashSet::new(),
+            )?)
+        };
+        write_export_archive(&synced, device_private.as_deref())
     }
 
     /// How the key protecting this replica is held.

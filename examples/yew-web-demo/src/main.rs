@@ -87,6 +87,8 @@ const DEMO_IDENTITY_CHANNEL: &str = "connetto-demo-identity";
 const AUTH_PROVIDER: &str = "dev-idp";
 /// Channel the page uses to respond to the worker's provider query at each boot.
 const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
+/// File name the export download is offered under.
+const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
 
 diesel::table! {
     orders (id) {
@@ -368,6 +370,26 @@ fn worker_origin() -> String {
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default()
+}
+
+/// Offer `bytes` to the user as a file download named `name`.
+///
+/// A `Blob` at an object URL plus a synthetic anchor click, which is the only
+/// way a page can hand over a file the user decides where to keep. The URL is
+/// revoked immediately: the click has already taken its own reference.
+fn download_bytes(name: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    let parts = js_sys::Array::new();
+    parts.push(&js_sys::Uint8Array::from(bytes));
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| JsValue::from_str("no document"))?;
+    let anchor: web_sys::HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
+    anchor.set_href(&url);
+    anchor.set_download(name);
+    anchor.click();
+    web_sys::Url::revoke_object_url(&url)
 }
 
 /// The served URL of this app's wasm-bindgen glue module, recovered from the
@@ -1204,6 +1226,29 @@ fn dashboard(props: &DashboardProps) -> Html {
         })
     };
 
+    // R26: the export runs in the DB worker, which holds the durable replica
+    // and the device-private tier. A tab mirror is in memory and partial.
+    let export_status = use_state(|| Option::<String>::None);
+    let export = {
+        let export_status = export_status.clone();
+        Callback::from(move |_| {
+            let export_status = export_status.clone();
+            spawn_local(async move {
+                let message = match workers::request_export().await {
+                    Ok(bytes) => {
+                        let len = bytes.len();
+                        match download_bytes(EXPORT_FILE_NAME, &bytes) {
+                            Ok(()) => format!("{len} bytes offered as {EXPORT_FILE_NAME}"),
+                            Err(err) => format!("download refused: {err:?}"),
+                        }
+                    }
+                    Err(err) => format!("export failed: {err}"),
+                };
+                export_status.set(Some(message));
+            });
+        })
+    };
+
     let orders_error = orders.error().map(|err| {
         html! { <p style="color:#b00;">{ format!("orders error: {err}") }</p> }
     });
@@ -1268,6 +1313,17 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <div class="row">
                     <button onclick={tidy}>{ "Free up space" }</button>
                 </div>
+            </div>
+            <div class="pane">
+                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <p>{ "A zip of plain SQLite databases, one per tier, readable with any SQLite tool." }</p>
+                <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
+                <div class="row">
+                    <button onclick={export}>{ "Export local data" }</button>
+                </div>
+                if let Some(message) = (*export_status).clone() {
+                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                }
             </div>
         </div>
     }

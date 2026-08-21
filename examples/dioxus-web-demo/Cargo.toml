@@ -27,7 +27,20 @@ wasm-bindgen-futures = "0.4"
 # maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
 # browser CSPRNG through getrandom's wasm_js backend.
 rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
-web-sys = { version = "0.3", features = ["BroadcastChannel", "MessageEvent", "Window", "console"] }
+# `Blob`, `Url` and the anchor element are the export download affordance: a
+# page can only offer a file by clicking a synthetic link at an object URL.
+web-sys = { version = "0.3", features = [
+  "Blob",
+  "BroadcastChannel",
+  "Document",
+  "Element",
+  "HtmlAnchorElement",
+  "HtmlElement",
+  "MessageEvent",
+  "Url",
+  "Window",
+  "console",
+] }
 # Structured logging (R12): this demo emits through `tracing` and installs the
 # developer-console destination in `main`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }

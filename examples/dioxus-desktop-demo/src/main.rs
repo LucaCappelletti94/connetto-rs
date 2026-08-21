@@ -180,6 +180,22 @@ fn data_dir() -> PathBuf {
     .join("connetto-dioxus-demo")
 }
 
+/// Where an export lands. One fixed name per profile, so exporting twice
+/// replaces the copy rather than accumulating them.
+fn export_path() -> PathBuf {
+    data_dir().join("connetto-local-data.zip")
+}
+
+/// Write an export archive beside the replica, reporting what the user can go
+/// and open. The bytes are handed over whole rather than streamed: they are
+/// already in memory, and the archive is the whole point of the call.
+fn write_export(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = export_path();
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
 /// Restart the current binary and exit this process, so a sign-out takes
 /// effect immediately. A clean exit is performed if the binary path cannot be
 /// resolved: the user relaunches manually.
@@ -638,6 +654,9 @@ fn app() -> Element {
     // Feature 6: state for the force-confirm wipe.
     let mut wipe_state: Signal<WipeState> = use_signal(|| WipeState::Idle);
     let mut add_picking: Signal<bool> = use_signal(|| false);
+    // Feature 7: the last export's outcome, shown so the user knows where the
+    // archive went without the app opening a file manager.
+    let mut export_status: Signal<Option<String>> = use_signal(|| None);
 
     // Feature 1: stored accounts, read from the keyring once on mount.
     let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
@@ -672,6 +691,7 @@ fn app() -> Element {
     let force_client = client.clone();
     let switch_client = client.clone();
     let add_client = client.clone();
+    let export_client = client.clone();
 
     // Wipe auth data; cloned twice so the Idle and ConfirmForce arms each get
     // their own (each arm's onclick is a separate move closure).
@@ -1021,6 +1041,53 @@ fn app() -> Element {
                         });
                     },
                     "Free up space"
+                }
+            }
+
+            // Export pane (feature 7): a readable copy of the local data.
+            div {
+                style: "border: 1px solid #ccc; border-radius: 6px; \
+                        padding: 10px 14px; margin-top: 16px;",
+                h2 {
+                    style: "margin-top: 0; font-size: 1em;",
+                    "Your data"
+                }
+                p {
+                    style: "color: #666; font-size: 0.9em;",
+                    "The export is a zip of plain SQLite databases, one per local \
+                     tier, readable with any SQLite tool. This demo names no \
+                     device-private tier, so the archive holds the synced replica \
+                     alone."
+                }
+                button {
+                    onclick: move |_| {
+                        let client = export_client.clone();
+                        spawn(async move {
+                            let message = match client
+                                .with_conn(connetto_client::ConnettoConnection::export_local_data)
+                                .await
+                            {
+                                Ok(bytes) => match write_export(&bytes) {
+                                    Ok(path) => format!(
+                                        "Wrote {} bytes to {}",
+                                        bytes.len(),
+                                        path.display()
+                                    ),
+                                    Err(err) => format!("could not write the export: {err}"),
+                                },
+                                Err(err) => format!("export failed: {err}"),
+                            };
+                            export_status.set(Some(message));
+                        });
+                    },
+                    "Export local data"
+                }
+                if let Some(message) = export_status.read().clone() {
+                    p {
+                        style: "font-family: monospace; font-size: 0.85em; \
+                                color: #555; margin: 8px 0 0 0;",
+                        {message}
+                    }
                 }
             }
         }

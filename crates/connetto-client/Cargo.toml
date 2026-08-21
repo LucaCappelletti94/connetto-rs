@@ -20,14 +20,14 @@ default = ["native-transport"]
 # ConnettoClient::start and the client binary. Wasm builds leave this off,
 # inject their own transport, and drive the pump with spawn_local.
 native-transport = [
-    "connetto-core/env",
-    "connetto-core/logging",
-    "connetto-core/native-transport",
-    "tokio/rt",
-    "tokio/rt-multi-thread",
-    "tokio/net",
-    "tokio/time",
-    "tokio/io-util",
+  "connetto-core/env",
+  "connetto-core/logging",
+  "connetto-core/native-transport",
+  "tokio/rt",
+  "tokio/rt-multi-thread",
+  "tokio/net",
+  "tokio/time",
+  "tokio/io-util",
 ]
 # Aggregate decode support for the Postgres-only diesel SQL types `Uuid` and
 # `Timestamptz`. Their diesel markers live behind diesel's postgres_backend
@@ -39,14 +39,14 @@ postgres-types = ["diesel/postgres_backend"]
 # and the HTTP calls to connetto-server's login, token, and refresh endpoints.
 # Native only, never wasm (the browser worker owns token custody there).
 native-auth = [
-    "native-transport",
-    "dep:reqwest",
-    "dep:keyring-core",
-    "dep:apple-native-keyring-store",
-    "dep:linux-keyutils-keyring-store",
-    "dep:windows-native-keyring-store",
-    "dep:open",
-    "dep:getrandom",
+  "native-transport",
+  "dep:reqwest",
+  "dep:keyring-core",
+  "dep:apple-native-keyring-store",
+  "dep:linux-keyutils-keyring-store",
+  "dep:windows-native-keyring-store",
+  "dep:open",
+  "dep:getrandom",
 ]
 
 [[bin]]
@@ -61,8 +61,8 @@ connetto-core.workspace = true
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
 diesel = { workspace = true, features = [
-    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
-    "returning_clauses_for_sqlite_3_35",
+  "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+  "returning_clauses_for_sqlite_3_35",
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
@@ -72,7 +72,9 @@ zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
-sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.62", default-features = false, features = [
+  "visitor",
+] }
 # Rendering typed diesel queries to placeholder SQL plus bind values through
 # subql's diesel-typed API, the same machinery the engine's typed registration
 # uses server-side.
@@ -81,25 +83,36 @@ subql = { workspace = true, features = ["diesel-typed-sqlite"] }
 # LiveValue.
 serde.workspace = true
 serde_json = "1"
+# Local data export archives, written stored so wasm needs no compressor.
+zip = { version = "4.6.1", default-features = false }
 # The replica file an identity owns is named from a SHA-256 over the id's own
 # serde encoding, so identity never reaches the filename through `Display`.
 sha2 = "0.10"
 # The library core needs only the runtime-agnostic pieces, which compile on
 # wasm32. The runtime, net, and time features arrive with native-transport.
-tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+tokio = { version = "1", default-features = false, features = [
+  "sync",
+  "macros",
+] }
 thiserror.workspace = true
 # Binary error handling (connetto-client bin).
 anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
 # destination, and the binary installs `connetto_core::logging`.
-tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing = { version = "0.1", default-features = false, features = [
+  "std",
+  "attributes",
+] }
 # Native OAuth acquisition (feature native-auth), all native-only and optional.
 # reqwest posts to connetto-server's token and refresh endpoints. keyring-core
 # stores refresh tokens in the platform store. open launches the system browser.
 # The unconditional base64 below plus the unconditional sha2 above compute the
 # PKCE S256 challenge. getrandom mints the PKCE verifier, the CSRF state, and
 # the per-replica encryption key, the last of which stays on the device.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+], optional = true }
 keyring-core = { version = "1.0.0", optional = true }
 open = { version = "5.4", optional = true }
 # Reading the base64url payload of a grant the client already holds, so a share
@@ -127,7 +140,9 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled-sqlcipher"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-apple-native-keyring-store = { version = "1.0.2", features = ["keychain"], optional = true }
+apple-native-keyring-store = { version = "1.0.2", features = [
+  "keychain",
+], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
@@ -140,7 +155,9 @@ windows-native-keyring-store = { version = "1.1.0", optional = true }
 # Declared with no code using it: the feature is the dependency, and putting it
 # here means every downstream wasm workspace inherits it without repeating it.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-sqlite-wasm-rs = { version = "0.5", default-features = false, features = ["sqlite3mc"] }
+sqlite-wasm-rs = { version = "0.5", default-features = false, features = [
+  "sqlite3mc",
+] }
 
 [dev-dependencies]
 # The shared fake transport the suites here drive `connect` and `resume` with.
@@ -153,7 +170,10 @@ connetto-server = { path = "../connetto-server" }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The write-path loop tests read the server's Postgres target back through a
 # typed diesel-async query, so the async DSL must be nameable directly.
-diesel-async = { version = "0.7", default-features = false, features = ["postgres", "bb8"] }
+diesel-async = { version = "0.7", default-features = false, features = [
+  "postgres",
+  "bb8",
+] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
 # Building a NaiveDateTime the emulator connector returns as a re-executed
@@ -166,7 +186,9 @@ serde_json = "1"
 # Postgres schema at test time and reads the logical to physical table map
 # through `translation_manifest`. Rev pinned to the reference-closed FK
 # validation merge (PR #46).
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = [
+  "std",
+] }
 # The watch_fn boxed-row test drives a live query whose row type carries a
 # strongly typed `rosetta_uuid::Uuid` primary key (stored as a SQLite BLOB) and
 # a `bool` column, the same key strategy the demos use, rather than raw bytes.
@@ -178,7 +200,10 @@ rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite", "serde"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false }
 # GenericOidcProvider::discover takes an openidconnect::reqwest::Client.
-openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+openidconnect = { version = "4.0.1", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
 # The two native-auth tests mint a deterministic v5 id for their resolver and a
 # PKCE token of their own. Test-only since R47: the client's own PKCE token now
 # comes from the platform RNG through `getrandom`.

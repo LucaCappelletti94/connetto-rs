@@ -104,7 +104,7 @@ fn open_window(conn: &mut SqliteConnection, permits: AttachPermits) -> QueryResu
 /// The two enables are attach-time settings, so sealing leaves the databases
 /// already attached readable and writable. That is what keeps the local tier
 /// usable at rest.
-fn seal_attaches(conn: &mut SqliteConnection) -> QueryResult<()> {
+pub(crate) fn seal_attaches(conn: &mut SqliteConnection) -> QueryResult<()> {
     conn.set_attach_create_enabled(false)?;
     conn.set_attach_write_enabled(false)?;
     let live = attached_count(conn)?;

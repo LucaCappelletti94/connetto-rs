@@ -53,6 +53,10 @@ pub const HELLO_CHANNEL: &str = "connetto-hello";
 /// The web lock the DB worker holds for its whole life. Tab transports
 /// watch it for dead-worker detection.
 pub const DB_ALIVE_LOCK: &str = "connetto-db-alive";
+/// The channel a tab asks for a local-data export on. Its own channel rather
+/// than the hello channel because the reply carries an archive, and the hello
+/// channel is a string protocol every tab already listens to.
+pub const EXPORT_CHANNEL: &str = "connetto-export";
 /// Storage-pool slots [`boot_db_worker`] reserves: the four databases it opens
 /// (the replica, the device-private database beside it, the refresh store and
 /// the hub's own state) and a rollback journal for each, which the pool counts
@@ -1089,6 +1093,9 @@ where
             hub.clone(),
         )?;
     }
+    // Export service. Unconditional, unlike logout: a run with no logins still
+    // holds data the user may want a copy of.
+    serve_export_requests(hub.clone())?;
 
     // The hello channel intake: answer readiness asks and attach a wire
     // transport per tab announcement, acking each attachment.
@@ -1198,6 +1205,174 @@ pub fn serve_logout_requests(
     // The listener lives for the worker's whole life, like the hello intake.
     listener.forget();
     Ok(())
+}
+
+/// Serve [`EXPORT_CHANNEL`] for this worker's life, answering a tab's request
+/// for an archive of the local tiers.
+///
+/// [`boot_db_worker`] calls this itself, so an application built on it needs
+/// nothing here. Call it directly when assembling a worker by hand.
+///
+/// The reply carries bytes, so it is a structured-clone object rather than the
+/// JSON strings the other channels use: base64 through a string would inflate
+/// every archive by a third to say the same thing.
+///
+/// # Errors
+///
+/// The `BroadcastChannel` error when the channel cannot be opened.
+pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue> {
+    let channel = BroadcastChannel::new(EXPORT_CHANNEL)
+        .map_err(|err| JsValue::from_str(&format!("export channel: {err:?}")))?;
+    let listener = {
+        let channel = channel.clone();
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            // Only the request is a string. This worker's own replies are
+            // objects, and a BroadcastChannel never echoes to its sender
+            // anyway, so a second worker's reply is what this skips.
+            if event.data().as_string().as_deref() != Some(EXPORT_REQUEST) {
+                return;
+            }
+            let channel = channel.clone();
+            let hub = hub.clone();
+            spawn_local(async move {
+                let reply = match hub.export_local_data().await {
+                    Ok(bytes) => export_reply_ok(&bytes),
+                    Err(err) => export_reply_failed(&err.to_string()),
+                };
+                match reply {
+                    Ok(reply) => {
+                        let _ = channel.post_message(&reply);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = ?err, "db worker: building an export reply failed");
+                    }
+                }
+            });
+        })
+    };
+    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+    // The listener lives for the worker's whole life, like the hello intake.
+    listener.forget();
+    Ok(())
+}
+
+/// The one string a tab posts on [`EXPORT_CHANNEL`].
+const EXPORT_REQUEST: &str = "export?";
+/// `kind` of a reply carrying an archive.
+const EXPORT_REPLY_OK: &str = "export";
+/// `kind` of a reply carrying a failure.
+const EXPORT_REPLY_FAILED: &str = "export-failed";
+
+/// Build the success reply: `{ kind: "export", bytes: Uint8Array }`.
+fn export_reply_ok(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let reply = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(EXPORT_REPLY_OK),
+    )?;
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("bytes"),
+        &js_sys::Uint8Array::from(bytes),
+    )?;
+    Ok(reply.into())
+}
+
+/// Build the failure reply: `{ kind: "export-failed", error: String }`.
+fn export_reply_failed(error: &str) -> Result<JsValue, JsValue> {
+    let reply = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(EXPORT_REPLY_FAILED),
+    )?;
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("error"),
+        &JsValue::from_str(error),
+    )?;
+    Ok(reply.into())
+}
+
+/// One export reply: the archive, or the reason there is none.
+type ExportReply = Result<Vec<u8>, String>;
+
+/// Where the channel listener leaves the reply for the awaiting caller.
+type ExportSlot = Rc<RefCell<Option<ExportReply>>>;
+
+/// How long [`request_export`] waits for a worker to answer before giving up.
+/// Generous, because the wait covers reading the whole replica, and the only
+/// thing it catches is a worker that is not there.
+const EXPORT_TIMEOUT_MS: i32 = 30_000;
+/// Poll step while waiting for the export reply.
+const EXPORT_POLL_MS: i32 = 25;
+
+/// Page side: ask the DB worker for a zip archive of this device's local data,
+/// the synced replica and the device-private tier as plain SQLite databases.
+///
+/// Call after [`await_db_worker_ready`]. The request is posted once and not
+/// repeated, unlike [`request_custody`]: an export reads the whole replica, so
+/// a repeated ask would run it again rather than hurry the first one along.
+///
+/// A tab cannot export its own mirror instead. That mirror is in memory and
+/// holds only what its subscriptions cover, so it is neither the durable copy
+/// nor the whole one.
+///
+/// # Errors
+///
+/// [`ExportRefused::Gone`](crate::relay::ExportRefused::Gone) when no worker
+/// answered in time, [`ExportRefused::Failed`](crate::relay::ExportRefused::Failed)
+/// when one answered without an archive.
+pub async fn request_export() -> Result<Vec<u8>, crate::relay::ExportRefused> {
+    let channel = BroadcastChannel::new(EXPORT_CHANNEL).map_err(|err| {
+        crate::relay::ExportRefused::Failed(format!("export channel: {err:?}"))
+    })?;
+    let result: ExportSlot = Rc::new(RefCell::new(None));
+    let on_message = {
+        let result = Rc::clone(&result);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if let Some(reply) = decode_export_reply(&event.data()) {
+                result.borrow_mut().get_or_insert(reply);
+            }
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    let posted = channel.post_message(&JsValue::from_str(EXPORT_REQUEST));
+    let mut waited = 0;
+    while posted.is_ok() && result.borrow().is_none() && waited < EXPORT_TIMEOUT_MS {
+        sleep_ms(EXPORT_POLL_MS).await;
+        waited += EXPORT_POLL_MS;
+    }
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    match result.borrow_mut().take() {
+        Some(Ok(bytes)) => Ok(bytes),
+        Some(Err(err)) => Err(crate::relay::ExportRefused::Failed(err)),
+        None => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
+    }
+}
+
+/// Read one [`EXPORT_CHANNEL`] message as a reply, or `None` when it is not one
+fn decode_export_reply(data: &JsValue) -> Option<ExportReply> {
+    let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
+        .ok()?
+        .as_string()?;
+    match kind.as_str() {
+        EXPORT_REPLY_OK => {
+            let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
+            Some(Ok(js_sys::Uint8Array::new(&bytes).to_vec()))
+        }
+        EXPORT_REPLY_FAILED => {
+            let error = js_sys::Reflect::get(data, &JsValue::from_str("error"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .unwrap_or_else(|| "the worker gave no reason".to_owned());
+            Some(Err(error))
+        }
+        _ => None,
+    }
 }
 
 /// The queued mutation seqs, or `None` when the hub core cannot answer.

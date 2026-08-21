@@ -147,6 +147,9 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 wasm-bindgen-futures = "0.4"
 # The shared fake transport the account-switch suite drives a real connection with.
 connetto-core = { path = "../connetto-core", features = ["test-support"] }
+# Reading the export archive back in the export suite, which must open it as a
+# plain zip rather than trusting the bytes the worker handed over.
+zip = { version = "4.6.1", default-features = false }
 
 # Standalone workspace: a wasm-only platform crate consumed by path from the
 # smoke tests and the dioxus-web demo, never entering the root headless gate.

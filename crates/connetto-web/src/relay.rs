@@ -129,6 +129,18 @@ pub enum RelayError {
 #[error("the relay hub core has ended")]
 pub struct HubGone;
 
+/// Why an export request came back without an archive.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportRefused {
+    /// Nobody answered: the hub core has ended, or from a page's side of the
+    /// channel, no DB worker is listening.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// Somebody answered, and no archive came of it.
+    #[error("export: {0}")]
+    Failed(String),
+}
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -156,6 +168,9 @@ enum HubEvent {
     /// Report the worker's queued, unacknowledged mutations. The core owns the
     /// connection, so a caller outside it can only ask and be answered.
     Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
+    /// Export the worker's local tiers as an archive. Same reason as
+    /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
+    Export(futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>),
 }
 
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
@@ -589,6 +604,28 @@ impl RelayHub {
             .map_err(|_| HubGone)?;
         answer.await.map_err(|_| HubGone)
     }
+
+    /// A zip archive of the worker's local data: the synced replica and the
+    /// device-private tier beside it, as plain SQLite databases.
+    ///
+    /// The worker connection is the only durable copy in this topology. A tab
+    /// mirror holds whatever its subscriptions cover, in memory, so exporting
+    /// one would hand the user a subset that disappears on reload.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportRefused::Gone`] when the core has ended, so no answer will come.
+    /// [`ExportRefused::Failed`] when the core answered and the export failed.
+    pub async fn export_local_data(&self) -> Result<Vec<u8>, ExportRefused> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events
+            .send(HubEvent::Export(reply))
+            .map_err(|_| HubGone)?;
+        answer
+            .await
+            .map_err(|_| HubGone)?
+            .map_err(|err| ExportRefused::Failed(err.to_string()))
+    }
 }
 
 /// The per-tab I/O task: owns the transport, feeds inbound frames to the
@@ -707,6 +744,12 @@ where
                 // core's problem.
                 Some(HubEvent::Unsynced(reply)) => {
                     let _ = reply.send(worker.unsynced());
+                }
+                // Runs on the core because it reads the connection, and it
+                // holds the core for its duration: a tab frame arriving
+                // mid-export waits rather than writing into the copy.
+                Some(HubEvent::Export(reply)) => {
+                    let _ = reply.send(worker.export_local_data());
                 }
                 // Removing the state drops the tab's sender, and the shovel
                 // answers the closed channel by closing the transport.
