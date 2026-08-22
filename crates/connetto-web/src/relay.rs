@@ -181,7 +181,10 @@ enum HubEvent {
     Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
-    Export(ExportScope, futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>),
+    Export(
+        ExportScope,
+        futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>,
+    ),
     /// Import an archive: device-private rows and queued writes. Same reason.
     Import(
         Vec<u8>,

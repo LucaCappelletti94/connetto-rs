@@ -11,12 +11,12 @@
 use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
 use connetto_web::RelayHub;
-use diesel::connection::SimpleConnection;
 use connetto_web::locks;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use connetto_web::workers::{
     DB_ALIVE_LOCK, request_export, request_import, serve_export_requests, serve_import_requests,
 };
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
 use std::io::{Cursor, Read};
@@ -66,9 +66,13 @@ async fn a_file_lands_in_the_worker_tier() {
     let src_tier = tier_db_name(SRC);
     let dst_tier = tier_db_name(DST);
     storage.delete_db(SRC).expect("clear earlier src replica");
-    storage.delete_db(&src_tier).expect("clear earlier src tier");
+    storage
+        .delete_db(&src_tier)
+        .expect("clear earlier src tier");
     storage.delete_db(DST).expect("clear earlier dst replica");
-    storage.delete_db(&dst_tier).expect("clear earlier dst tier");
+    storage
+        .delete_db(&dst_tier)
+        .expect("clear earlier dst tier");
     // Four slots: one replica + one tier per connection, two connections in
     // sequence (src is dropped before dst opens), so four slots at most.
     storage.reserve(4).await.expect("room in the pool");
@@ -76,10 +80,12 @@ async fn a_file_lands_in_the_worker_tier() {
     // Build source archive: a replica with a known device-private row.
     let archive_bytes = {
         let src_url = storage.db_url(SRC);
-        let src_replica =
-            Replica::encrypted_file(&src_url, Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])))
-                .expect("resolved src key")
-                .with_tier(&src_tier, TIER_DDL);
+        let src_replica = Replica::encrypted_file(
+            &src_url,
+            Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])),
+        )
+        .expect("resolved src key")
+        .with_tier(&src_tier, TIER_DDL);
         let mut src = ConnettoConnection::connect(
             FakeTransport::accepting_but_silent(),
             &src_replica,
@@ -102,10 +108,12 @@ async fn a_file_lands_in_the_worker_tier() {
 
     // Open the destination worker with an empty tier and no source data.
     let dst_url = storage.db_url(DST);
-    let dst_replica =
-        Replica::encrypted_file(&dst_url, Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])))
-            .expect("resolved dst key")
-            .with_tier(&dst_tier, TIER_DDL);
+    let dst_replica = Replica::encrypted_file(
+        &dst_url,
+        Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])),
+    )
+    .expect("resolved dst key")
+    .with_tier(&dst_tier, TIER_DDL);
     let mut worker = ConnettoConnection::connect(
         FakeTransport::accepting_but_silent(),
         &dst_replica,

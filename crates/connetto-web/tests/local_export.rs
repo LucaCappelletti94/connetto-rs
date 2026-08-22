@@ -10,10 +10,10 @@
 
 use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
-use diesel::connection::SimpleConnection;
 use connetto_web::RelayHub;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use connetto_web::workers::{request_export, serve_export_requests};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
 use std::io::{Cursor, Read};
@@ -58,7 +58,9 @@ fn config() -> ClientConfig {
 async fn a_tab_receives_both_tiers_as_patchsets() {
     let storage = ReplicaStorage::install().await;
     let tier = tier_db_name(REPLICA);
-    storage.delete_db(REPLICA).expect("clear an earlier replica");
+    storage
+        .delete_db(REPLICA)
+        .expect("clear an earlier replica");
     storage.delete_db(&tier).expect("clear an earlier tier");
     storage.reserve(4).await.expect("room in the pool");
     let replica_url = storage.db_url(REPLICA);
@@ -103,8 +105,7 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
 
     // Verify the manifest describes the new format.
     let manifest: serde_json::Value =
-        serde_json::from_slice(&entry_raw(&mut archive, "manifest.json"))
-            .expect("manifest json");
+        serde_json::from_slice(&entry_raw(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
     assert_eq!(manifest["version"], 2, "R56 version");
     assert_eq!(
@@ -120,19 +121,30 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
     let synced_zstd = entry_raw(&mut archive, "synced.patchset");
     let private_zstd = entry_raw(&mut archive, "device-private.patchset");
     assert!(!synced_zstd.is_empty(), "the synced patchset is not empty");
-    assert!(!private_zstd.is_empty(), "the device-private patchset is not empty");
+    assert!(
+        !private_zstd.is_empty(),
+        "the device-private patchset is not empty"
+    );
 
     let synced_patch = zstd::decode_all(synced_zstd.as_slice()).expect("decompress synced");
     let private_patch = zstd::decode_all(private_zstd.as_slice()).expect("decompress private");
-    assert!(!synced_patch.is_empty(), "synced patchset decompresses to real bytes");
-    assert!(!private_patch.is_empty(), "private patchset decompresses to real bytes");
+    assert!(
+        !synced_patch.is_empty(),
+        "synced patchset decompresses to real bytes"
+    );
+    assert!(
+        !private_patch.is_empty(),
+        "private patchset decompresses to real bytes"
+    );
 
     // Apply each patchset to a fresh in-memory connection and read the rows.
     // This is the definitive proof: the wasm SQLite build has silently returned
     // empty results before, so the byte check above and these queries are both
     // required.
     let mut synced_conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
-    synced_conn.batch_execute(REPLICA_DDL).expect("synced schema");
+    synced_conn
+        .batch_execute(REPLICA_DDL)
+        .expect("synced schema");
     synced_conn
         .apply_patchset(&synced_patch, |_| ConflictAction::Abort)
         .expect("apply synced patchset");

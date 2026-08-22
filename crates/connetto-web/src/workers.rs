@@ -437,7 +437,9 @@ pub async fn await_db_worker_ready() -> Result<(), JsValue> {
                 let detail = detail.clone();
                 channel.set_onmessage(None);
                 channel.close();
-                return Err(JsValue::from_str(&format!("db worker boot failed: {detail}")));
+                return Err(JsValue::from_str(&format!(
+                    "db worker boot failed: {detail}"
+                )));
             }
             Ready::Waiting => {}
         }
@@ -1435,12 +1437,9 @@ const POLL_MS: i32 = 25;
 /// answered in time,
 /// [`ExportRefused::Failed`](crate::relay::ExportRefused::Failed) when one
 /// answered without an archive.
-pub async fn request_export(
-    scope: ExportScope,
-) -> Result<Vec<u8>, crate::relay::ExportRefused> {
-    let channel = BroadcastChannel::new(EXPORT_CHANNEL).map_err(|err| {
-        crate::relay::ExportRefused::Failed(format!("export channel: {err:?}"))
-    })?;
+pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay::ExportRefused> {
+    let channel = BroadcastChannel::new(EXPORT_CHANNEL)
+        .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
     let result: ExportSlot = Rc::new(RefCell::new(None));
     let on_message = {
         let result = Rc::clone(&result);
@@ -1493,9 +1492,8 @@ pub async fn request_export(
 pub async fn request_import(
     file: File,
 ) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
-    let channel = BroadcastChannel::new(IMPORT_CHANNEL).map_err(|err| {
-        crate::relay::ImportRefused::Failed(format!("import channel: {err:?}"))
-    })?;
+    let channel = BroadcastChannel::new(IMPORT_CHANNEL)
+        .map_err(|err| crate::relay::ImportRefused::Failed(format!("import channel: {err:?}")))?;
     let result: ImportSlot = Rc::new(RefCell::new(None));
     let on_message = {
         let result = Rc::clone(&result);
@@ -1507,7 +1505,8 @@ pub async fn request_import(
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let posted = channel.post_message(file.as_ref());
-    while posted.is_ok() && result.borrow().is_none()
+    while posted.is_ok()
+        && result.borrow().is_none()
         && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
     {
         sleep_ms(POLL_MS).await;
@@ -1547,8 +1546,16 @@ fn build_export_request(scope: ExportScope) -> JsValue {
         ExportScope::Everything => "everything",
         ExportScope::Unsynced => "unsynced",
     };
-    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("export?"));
-    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("scope"), &JsValue::from_str(scope_str));
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("export?"),
+    );
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("scope"),
+        &JsValue::from_str(scope_str),
+    );
     obj.into()
 }
 

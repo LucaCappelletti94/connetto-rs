@@ -33,7 +33,8 @@ use std::rc::Rc;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::teardown::expiry_warning;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, ExportScope, PolicyTables, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, ExportScope, PolicyTables,
+    Replica,
 };
 use connetto_core::custody::Custody;
 use connetto_web::auth::WorkerAuthConfig;

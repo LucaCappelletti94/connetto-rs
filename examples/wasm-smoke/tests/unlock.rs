@@ -187,7 +187,6 @@ async fn reset_profile() {
     }
 }
 
-
 async fn plant_enrolled_credential(seed: u8, credential: u8) {
     reset_profile().await;
     let key_store = IdbKeyStore::open().await.expect("open key store");

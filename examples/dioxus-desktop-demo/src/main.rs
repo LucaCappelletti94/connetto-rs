@@ -211,7 +211,6 @@ fn restart() {
     std::process::exit(0)
 }
 
-
 /// Top-level sync boundary: build the runtime, drive `setup` to completion,
 /// then hand everything to the Dioxus event loop.
 ///
