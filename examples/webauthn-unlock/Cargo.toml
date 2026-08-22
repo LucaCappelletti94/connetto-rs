@@ -41,8 +41,11 @@ web-sys = { version = "=0.3.103", features = [
     "console",
 ] }
 
-# Native driver test dependencies.
-[dev-dependencies]
+# Native driver test dependencies. Gated, because the driver is a native test
+# and `tokio`'s net feature drags in `mio`, whose own `compile_error!` refuses
+# wasm: an ungated block makes `--all-targets --target wasm32-unknown-unknown`
+# fail before it reaches any code here.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 axum = "0.8"

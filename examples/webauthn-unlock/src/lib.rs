@@ -41,21 +41,23 @@ mod inner {
 
     // ── tab-side thread-locals ────────────────────────────────────────────
 
+    /// The message handler the result channel keeps alive.
+    type ResultHandler = Closure<dyn Fn(web_sys::MessageEvent)>;
+
     thread_local! {
         static WORKER: std::cell::RefCell<Option<web_sys::Worker>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
         static GLUE_URL: std::cell::RefCell<String> =
-            std::cell::RefCell::new(String::new());
+            const { std::cell::RefCell::new(String::new()) };
         // Closures and the channel must stay alive until page unload so JS can
         // call them. Storing in thread-locals means Drop runs normally; no
         // mem::forget or Closure::forget is needed.
-        static RESULT_HANDLER: std::cell::RefCell<
-            Option<Closure<dyn Fn(web_sys::MessageEvent)>>,
-        > = std::cell::RefCell::new(None);
+        static RESULT_HANDLER: std::cell::RefCell<Option<ResultHandler>> =
+            const { std::cell::RefCell::new(None) };
         static RESULT_CHANNEL: std::cell::RefCell<Option<web_sys::BroadcastChannel>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
         static RESTART_HANDLER: std::cell::RefCell<Option<Closure<dyn Fn()>>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
 
     // ── JS-error conversion ───────────────────────────────────────────────
@@ -68,8 +70,8 @@ mod inner {
 
     fn spawn_worker(glue_url: &str) -> Result<web_sys::Worker> {
         let url = format!("/db-worker.js?glue={glue_url}");
-        let mut opts = web_sys::WorkerOptions::new();
-        opts.type_(web_sys::WorkerType::Module);
+        let opts = web_sys::WorkerOptions::new();
+        opts.set_type(web_sys::WorkerType::Module);
         web_sys::Worker::new_with_options(&url, &opts).map_err(|e| js_err("Worker::new", e))
     }
 
@@ -108,12 +110,11 @@ mod inner {
                 &JsValue::from_str("__step_result"),
                 &JsValue::from_str(&msg),
             );
-            if let Some(win) = web_sys::window() {
-                if let Some(doc) = win.document() {
-                    if let Some(el) = doc.get_element_by_id(RESULT_EL) {
-                        el.set_text_content(Some(&msg));
-                    }
-                }
+            if let Some(win) = web_sys::window()
+                && let Some(doc) = win.document()
+                && let Some(el) = doc.get_element_by_id(RESULT_EL)
+            {
+                el.set_text_content(Some(&msg));
             }
             web_sys::console::log_1(&JsValue::from_str(&format!("harness: {msg}")));
         }) as Box<dyn Fn(web_sys::MessageEvent)>);

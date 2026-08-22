@@ -470,7 +470,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
     // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
     // import and `main` boots the tier, so no separate bootstrap is needed.
     let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Glue);
-    workers::await_db_worker_ready().await;
+    workers::await_db_worker_ready().await?;
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
@@ -1427,30 +1427,30 @@ fn Dashboard() -> Element {
                                 .document().expect("document")
                                 .get_element_by_id("import-file-input").expect("import input")
                                 .unchecked_into();
-                            if let Some(files) = input.files() {
-                                if let Some(file) = files.get(0) {
-                                    spawn(async move {
-                                        let message = match workers::request_import(file).await {
-                                            Ok((outcome, clashes)) => {
-                                                let mut msg = format!(
-                                                    "{} row(s) restored, {} kept, \
-                                                     {} write(s) restored",
-                                                    outcome.rows_restored,
-                                                    outcome.rows_kept,
-                                                    outcome.writes_restored
-                                                );
-                                                if clashes > 0 {
-                                                    msg.push_str(&format!(
-                                                        " ({clashes} clash(es) resolved to file)"
-                                                    ));
-                                                }
-                                                msg
+                            if let Some(files) = input.files()
+                                && let Some(file) = files.get(0)
+                            {
+                                spawn(async move {
+                                    let message = match workers::request_import(file).await {
+                                        Ok((outcome, clashes)) => {
+                                            let mut msg = format!(
+                                                "{} row(s) restored, {} kept, \
+                                                 {} write(s) restored",
+                                                outcome.rows_restored,
+                                                outcome.rows_kept,
+                                                outcome.writes_restored
+                                            );
+                                            if clashes > 0 {
+                                                msg.push_str(&format!(
+                                                    " ({clashes} clash(es) resolved to file)"
+                                                ));
                                             }
-                                            Err(err) => format!("refused: {err}"),
-                                        };
-                                        import_status.set(Some(message));
-                                    });
-                                }
+                                            msg
+                                        }
+                                        Err(err) => format!("refused: {err}"),
+                                    };
+                                    import_status.set(Some(message));
+                                });
                             }
                         }
                     }
