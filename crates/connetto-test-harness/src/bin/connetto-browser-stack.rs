@@ -310,8 +310,15 @@ async fn run_verified_topology(services: &Services) -> Result<()> {
 }
 
 async fn run_default_browser_suites(services: &Services) -> Result<()> {
+    // A suite that never reports leaves the runner waiting, so the children
+    // carry their own deadline unless the caller already set one.
+    let mut envs = services.envs.clone();
+    if std::env::var_os("WASM_BINDGEN_TEST_TIMEOUT").is_none() {
+        envs.push(("WASM_BINDGEN_TEST_TIMEOUT".to_owned(), "60".to_owned()));
+    }
+
     let web_args = strings(&["test", "--headless", "--chrome", "crates/connetto-web"]);
-    run_process(OsStr::new("wasm-pack"), &web_args, &services.envs).await?;
+    run_browser_suite(&web_args, &envs).await?;
 
     for test in wasm_smoke_tests()? {
         let args = vec![
@@ -322,7 +329,7 @@ async fn run_default_browser_suites(services: &Services) -> Result<()> {
             OsString::from("--test"),
             test,
         ];
-        run_process(OsStr::new("wasm-pack"), &args, &services.envs).await?;
+        run_browser_suite(&args, &envs).await?;
     }
     Ok(())
 }
@@ -355,6 +362,87 @@ async fn run_process(program: &OsStr, args: &[OsString], envs: &[(String, String
         .await
         .with_context(|| format!("starting {display}"))?;
     require_success(&display, status)
+}
+
+/// What the headless runner prints when it loses a suite's report, kills
+/// chromedriver and fails through no fault of the suite. R46 documented it as
+/// an upstream defect (`docs/upstream-wasm-bindgen-headless-hang.md`), and it
+/// is why a browser suite is retried once rather than failing the whole run.
+const HEADLESS_HANG: &str = "Failed to detect test as having been run";
+
+/// One child run: how it exited, and whether its output carried the hang.
+struct BrowserRun {
+    status: std::process::ExitStatus,
+    hung: bool,
+}
+
+/// Run one browser suite, retrying once when the headless runner lost the
+/// report. Any other failure is reported as it happened, so a real one is
+/// never retried into looking intermittent.
+async fn run_browser_suite(args: &[OsString], envs: &[(String, String)]) -> Result<()> {
+    let program = OsStr::new("wasm-pack");
+    let display = display_command(program, args);
+    let first = run_watching(program, args, envs).await?;
+    if first.status.success() {
+        return Ok(());
+    }
+    if !first.hung {
+        return Err(anyhow!("{display} exited with {}", first.status));
+    }
+    eprintln!("{display} lost its report to the headless runner, retrying once");
+    let second = run_watching(program, args, envs).await?;
+    require_success(&display, second.status)
+}
+
+/// Spawn a child, echo its output as it arrives, and report whether the hang
+/// signature appeared. Output is echoed rather than swallowed so a long suite
+/// still reports progress.
+async fn run_watching(
+    program: &OsStr,
+    args: &[OsString],
+    envs: &[(String, String)],
+) -> Result<BrowserRun> {
+    let display = display_command(program, args);
+    eprintln!("running {display}");
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(envs.iter().cloned())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {display}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{display} gave no stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("{display} gave no stderr"))?;
+    let out = tokio::spawn(echo_watching(stdout));
+    let err = tokio::spawn(echo_watching(stderr));
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("waiting for {display}"))?;
+    let hung = out.await.context("reading stdout")?? || err.await.context("reading stderr")??;
+    Ok(BrowserRun { status, hung })
+}
+
+/// Echo every line to stderr, answering whether any carried the hang.
+async fn echo_watching<R>(reader: R) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut hung = false;
+    while let Some(line) = lines.next_line().await.context("reading child output")? {
+        hung |= line.contains(HEADLESS_HANG);
+        eprintln!("{line}");
+    }
+    Ok(hung)
 }
 
 fn require_success(display: &str, status: std::process::ExitStatus) -> Result<()> {
@@ -523,4 +611,26 @@ fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEADLESS_HANG, echo_watching};
+
+    /// The retry exists for one signature, so the reader has to recognise it
+    /// among ordinary output and nothing else. A false positive would retry a
+    /// real failure and make it look intermittent.
+    #[tokio::test]
+    async fn the_reader_recognises_only_the_hang() {
+        let hung = format!("Loading Wasm module...\n{HEADLESS_HANG}\ndriver status: signal: 9\n");
+        assert!(
+            echo_watching(hung.as_bytes()).await.expect("read"),
+            "the runner's own words are what the retry keys on"
+        );
+        let failed = "running 1 test\ntest a_real_one ... FAILED\ntest result: FAILED.\n";
+        assert!(
+            !echo_watching(failed.as_bytes()).await.expect("read"),
+            "an ordinary failure is reported, never retried"
+        );
+    }
 }
