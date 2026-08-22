@@ -503,7 +503,11 @@ mod pg {
     ///
     /// One round trip yields both, which is what makes deriving a row cap from
     /// a byte budget free (R58 decision 3). A plan missing either number reads
-    /// as zero, so a page falls back to one row rather than to no limit.
+    /// as zero, and a zero width sizes the first page from the budget alone
+    /// (`page_rows` divides by `width.max(1)`), which the physical width below
+    /// and then the first page's own measurement correct. Postgres always
+    /// reports a width, so this is the shape of the fallback rather than a
+    /// path anything takes.
     fn plan_estimate(plan: &str) -> Result<SnapshotEstimate, SnapshotError> {
         let parsed: serde_json::Value = serde_json::from_str(plan)
             .map_err(|err| SnapshotError::Backend(format!("the plan did not parse: {err}")))?;
