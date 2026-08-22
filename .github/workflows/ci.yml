@@ -20,9 +20,30 @@ env:
 
 jobs:
   format:
-    name: Format
+    name: Format ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every workspace, because a check that runs at the root alone leaves
+        # each standalone one to drift: six files were unformatted when this
+        # matrix replaced the single root run.
+        include:
+          - name: root
+            cwd: .
+          - name: connetto-web
+            cwd: crates/connetto-web
+          - name: wasm-smoke
+            cwd: examples/wasm-smoke
+          - name: dioxus-web-demo
+            cwd: examples/dioxus-web-demo
+          - name: yew-web-demo
+            cwd: examples/yew-web-demo
+          - name: webauthn-unlock
+            cwd: examples/webauthn-unlock
+          - name: dioxus-desktop-demo
+            cwd: examples/dioxus-desktop-demo
     steps:
       - uses: actions/checkout@v7
 
@@ -44,6 +65,7 @@ jobs:
             --component rustfmt
 
       - name: Check formatting
+        working-directory: ${{ matrix.cwd }}
         run: cargo +stable fmt --all -- --check
 
   lint:
@@ -140,6 +162,21 @@ jobs:
           - name: connetto-web wasm
             cwd: crates/connetto-web
             target: --target wasm32-unknown-unknown
+          - name: wasm-smoke wasm
+            cwd: examples/wasm-smoke
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-web-demo wasm
+            cwd: examples/dioxus-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: yew-web-demo wasm
+            cwd: examples/yew-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: webauthn-unlock wasm
+            cwd: examples/webauthn-unlock
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-desktop-demo native
+            cwd: examples/dioxus-desktop-demo
+            target: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -163,6 +200,22 @@ jobs:
       - name: Add wasm target
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain nightly
+
+      - name: Install desktop dependencies
+        if: matrix.cwd == 'examples/dioxus-desktop-demo'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            lld
 
       - name: Run nightly clippy
         working-directory: ${{ matrix.cwd }}
@@ -188,6 +241,21 @@ jobs:
           - name: connetto-web wasm
             cwd: crates/connetto-web
             target: --target wasm32-unknown-unknown
+          - name: wasm-smoke wasm
+            cwd: examples/wasm-smoke
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-web-demo wasm
+            cwd: examples/dioxus-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: yew-web-demo wasm
+            cwd: examples/yew-web-demo
+            target: --target wasm32-unknown-unknown
+          - name: webauthn-unlock wasm
+            cwd: examples/webauthn-unlock
+            target: --target wasm32-unknown-unknown
+          - name: dioxus-desktop-demo native
+            cwd: examples/dioxus-desktop-demo
+            target: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -208,6 +276,22 @@ jobs:
       - name: Add wasm target
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install desktop dependencies
+        if: matrix.cwd == 'examples/dioxus-desktop-demo'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            lld
 
       - name: Check docs
         working-directory: ${{ matrix.cwd }}
@@ -375,3 +459,13 @@ jobs:
           cargo +stable run \
             -p connetto-test-harness \
             --bin connetto-browser-stack
+
+      # The R23 passkey gate's end-to-end driver. It lives in a workspace the
+      # root excludes, so no other job can reach it, and it needs the wasm
+      # package on disk before it can drive a browser at it.
+      - name: Build the passkey demo package
+        run: wasm-pack build examples/webauthn-unlock --target web
+
+      - name: Run the passkey gate driver
+        working-directory: examples/webauthn-unlock
+        run: cargo +stable test --release --test webauthn_unlock
