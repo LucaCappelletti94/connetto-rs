@@ -2083,9 +2083,13 @@ mod membership_term_tests {
         let mat = materializer(Some(mapping()));
         assert!(
             mat.membership_terms("SELECT * FROM docs WHERE project_id > 5")
-                .is_empty()
+                .is_empty(),
+            "a comparison against a literal is not a membership subquery"
         );
         let joined = "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm JOIN docs d ON d.project_id = pm.project_id WHERE pm.user_id = current_setting('app.user_id', true))";
-        assert!(mat.membership_terms(joined).is_empty());
+        assert!(
+            mat.membership_terms(joined).is_empty(),
+            "a subquery joining a second table is outside the canonical shape"
+        );
     }
 }

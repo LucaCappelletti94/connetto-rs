@@ -556,7 +556,10 @@ mod tests {
         assert_eq!(texts, 1, "the sibling still needs the text");
 
         forget(&mut db, "wire-1").expect("forget");
-        assert!(listed(&mut db).is_empty());
+        assert!(
+            listed(&mut db).is_empty(),
+            "forgetting the last sibling leaves no declared subscription"
+        );
         let texts: i64 = query_text::table
             .count()
             .get_result(&mut db)
@@ -665,7 +668,10 @@ mod tests {
         );
 
         unpin(&mut db, "offline-pack").expect("unpin");
-        assert!(pins(&mut db).expect("pins").is_empty());
+        assert!(
+            pins(&mut db).expect("pins").is_empty(),
+            "unpinning removes the pin itself"
+        );
         assert_eq!(
             expired(&mut db).expect("expired"),
             vec!["wire-0".to_owned()],

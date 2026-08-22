@@ -350,9 +350,21 @@ mod tests {
     #[test]
     fn an_unrelated_fact_reaches_nothing() {
         let reach = reach(CROSS_TABLE);
-        assert!(reach.tables_for("teams:1", "can_delete").is_empty());
-        assert!(reach.tables_for("nothing:1", "member").is_empty());
-        assert!(reach.tables_for("malformed", "member").is_empty());
+        assert_eq!(
+            reach.tables_for("teams:1", "can_delete"),
+            Vec::<String>::new(),
+            "no read answer depends on can_delete"
+        );
+        assert_eq!(
+            reach.tables_for("nothing:1", "member"),
+            Vec::<String>::new(),
+            "nothing is not a type any rule names"
+        );
+        assert_eq!(
+            reach.tables_for("malformed", "member"),
+            Vec::<String>::new(),
+            "an object id with no type prefix names nothing"
+        );
     }
 
     /// Parent inheritance, which is the same indirection one hop further out:
@@ -424,6 +436,10 @@ mod tests {
             "the rules deny every row of this table, so no fact about it changes \
              what any subscriber receives"
         );
-        assert!(reach.tables_for("docs:1", "no_access").is_empty());
+        assert_eq!(
+            reach.tables_for("docs:1", "no_access"),
+            Vec::<String>::new(),
+            "and neither does a relation the rules never mention"
+        );
     }
 }

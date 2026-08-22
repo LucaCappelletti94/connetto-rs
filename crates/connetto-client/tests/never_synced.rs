@@ -305,7 +305,10 @@ async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
         .watch::<_, Draft>(drafts::table.order(drafts::id))
         .await
         .expect("watch");
-    assert!(query.rows().is_empty());
+    assert!(
+        query.rows().is_empty(),
+        "nothing has been written to the tier yet"
+    );
 
     // Wait until the pump has run a full step and reported where it stands, so
     // the write below lands on a settled pump rather than racing its first
@@ -574,7 +577,10 @@ async fn a_pin_survives_a_restart_with_no_server() {
     );
 
     conn.unpin_subscription("offline-pack").expect("unpin");
-    assert!(conn.pins().expect("pins").is_empty());
+    assert!(
+        conn.pins().expect("pins").is_empty(),
+        "unpinning removes the pin from the replica, restart or not"
+    );
 }
 
 /// A subscription past its grace is not re-declared on the next connection,

@@ -177,7 +177,10 @@ async fn presenting_nothing_arrives_with_neither_identity_nor_capability() {
         arrival.caller.identity().is_none(),
         "nobody presented a login, so nobody is signed in"
     );
-    assert!(arrival.caller.capabilities().is_empty());
+    assert!(
+        arrival.caller.capabilities().is_empty(),
+        "and presented no key either"
+    );
     assert!(
         arrival.session_token.parse::<SessionId>().is_ok(),
         "a run with no identity still has a handle: {}",
@@ -194,7 +197,10 @@ async fn presenting_a_login_arrives_with_an_identity_and_no_capability() {
         arrival.caller.identity().expect("signed in").user_id,
         "alice"
     );
-    assert!(arrival.caller.capabilities().is_empty());
+    assert!(
+        arrival.caller.capabilities().is_empty(),
+        "a login is not a capability"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
