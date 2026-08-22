@@ -1482,7 +1482,8 @@ pub async fn request_export(
 ///
 /// Absence of the DB worker is detected through the liveness lock it holds for
 /// its whole life ([`DB_ALIVE_LOCK`]). When the lock is released before a reply
-/// arrives, this function returns [`ImportRefused::Gone`].
+/// arrives, this function returns
+/// [`ImportRefused::Gone`](crate::relay::ImportRefused::Gone).
 ///
 /// # Errors
 ///
@@ -1572,6 +1573,26 @@ fn decode_export_reply(data: &JsValue) -> Option<ExportReply> {
     }
 }
 
+/// One count carried as a JS number, or `None` when the value is not a whole
+/// number a count can be.
+///
+/// A JS number is an `f64`, and the counts the worker sends are `usize`
+/// values that fit `u32` on every wasm target, so anything outside that is a
+/// reply this build did not write.
+fn count_from_js(value: &JsValue) -> Option<usize> {
+    let number = value.as_f64()?;
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number > f64::from(u32::MAX)
+    {
+        return None;
+    }
+    // reason: std offers no fallible conversion from f64, and the guard above
+    // proves this one is a whole number inside u32, so neither cast lint can
+    // fire here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let count = number as u32;
+    usize::try_from(count).ok()
+}
+
 /// Read one [`IMPORT_CHANNEL`] message as an import reply, or `None`.
 fn decode_import_reply(data: &JsValue) -> Option<ImportReply> {
     let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
@@ -1581,8 +1602,7 @@ fn decode_import_reply(data: &JsValue) -> Option<ImportReply> {
         IMPORT_REPLY_OK => {
             let get_count = |key: &str| -> Option<usize> {
                 let v = js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?;
-                // JS number from u32 fits in usize on every wasm target (32-bit).
-                usize::try_from(v.as_f64()? as u32).ok()
+                count_from_js(&v)
             };
             let outcome = ImportOutcome {
                 rows_restored: get_count("rows_restored")?,
