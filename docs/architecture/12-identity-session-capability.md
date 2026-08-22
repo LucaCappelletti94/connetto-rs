@@ -12,7 +12,7 @@ Every normative statement in this chapter and in the chapters it governs carries
 |---|---|
 | **Built** | In the tree and exercised by a test. |
 | **Built, defective** | In the tree and wrong. The defect is named and the phase that fixes it is cited. |
-| **Decided (RN)** | Settled by a decision, not built. `RN` is the phase in `plans/identity-session-capability-refactor.md`. |
+| **Decided (RN)** | Settled by a decision, not built. `RN` is the phase in `plans/master-implementation-plan.md`, the one normative record of phases (corrected 2026-08-21: this cell used to name a process artifact that is never committed). |
 
 The markers exist because this repository already shipped a design that was documented in its first commit, never built, and looked authoritative for the life of the project. `session_token` is that design. A doc with no status marker is how that happened.
 
@@ -300,7 +300,7 @@ Nothing in this chapter's scope is an open decision, and the one measurement tha
 
 ### Outside this chapter, and recorded so nobody rediscovers them
 
-Both are in `plans/identity-session-capability-refactor.md` with their evidence.
+Both are in `plans/master-implementation-plan.md` with their evidence (corrected 2026-08-21, this line used to name a process artifact that is never committed).
 
 **Owner-less synced data duplicated per identity is now decided**, in "Public tables may be shared across identities" above. In short: an attached store holding public tables, demand-driven, controlled by a bool on the client configuration that defaults to on, with the access-pattern leak disclosed by a signal rather than by documentation. The full-table-only rule was considered and rejected as infeasible. Note this remains a different question from the never-syncing attached database above, which does not sync at all.
 

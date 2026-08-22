@@ -6,7 +6,7 @@
 |---|---|
 | **Built** | In the tree and exercised by a test. |
 | **Built, defective** | In the tree and wrong. The defect and its fixing phase are named. |
-| **Decided (RN)** | Settled, not built. `RN` is the phase in `plans/identity-session-capability-refactor.md`. |
+| **Decided (RN)** | Settled, not built. `RN` is the phase in `plans/master-implementation-plan.md`, the one normative record of phases (corrected 2026-08-21: this cell used to name a process artifact that is never committed). |
 
 ---
 
