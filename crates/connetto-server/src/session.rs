@@ -497,6 +497,15 @@ pub enum SessionError {
     /// The snapshot source failed.
     #[error("snapshot error: {0}")]
     Snapshot(String),
+    /// The read was refused on policy rather than failing: a row or a table
+    /// above the tier's ceiling, or a read that filled a page it cannot
+    /// resume (R58).
+    ///
+    /// Separate from [`Snapshot`](Self::Snapshot) because a failed read is
+    /// worth retrying and a refused one is not: retrying a refusal replaces
+    /// nothing, for ever, one log line at a time.
+    #[error("read refused: {0}")]
+    ReadRefused(String),
     /// The oplog backing store failed.
     #[error("oplog error: {0}")]
     Oplog(String),
@@ -746,7 +755,7 @@ const GROWTH_WARN_FACTOR: u64 = 100;
 /// developer meets in the log during development.
 fn refuse_read(sub_id: &str, cause: &SubscribeRefusal) -> SessionError {
     tracing::warn!(sub_id = %sub_id, cause = %cause, "read refused");
-    SessionError::Snapshot(cause.to_string())
+    SessionError::ReadRefused(cause.to_string())
 }
 
 /// How many rows a page of a table averaging `width` bytes a row may carry
@@ -3466,7 +3475,7 @@ where
             // registration is rolled back and the session (with every sibling
             // subscription) stays alive. Transport and oplog failures stay
             // fatal.
-            Err(SessionError::Snapshot(detail)) => {
+            Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                 tracing::warn!(sub_id = %sub_label, error = %detail, "snapshot failed");
                 state.subs.remove(&sub_label);
                 self.remove_route(consumer_id).await;
@@ -3735,6 +3744,18 @@ where
                         "replacing a subscription failed, retrying"
                     );
                     tokio::time::sleep(backoff).await;
+                }
+                // A refusal is not an outage, so retrying it would replace
+                // nothing for ever. The subscription ends instead, and the
+                // rows it held are covered by nothing, which R29's retention
+                // pass evicts on the client.
+                Err(SessionError::ReadRefused(detail)) => {
+                    tracing::warn!(
+                        sub_id = %sub_label,
+                        error = %detail,
+                        "replacing a subscription was refused, ending it"
+                    );
+                    return self.refuse_subscription(transport, state, sub_label).await;
                 }
                 Err(other) => return Err(other),
             }
@@ -4077,7 +4098,7 @@ where
             .await
         {
             Ok(()) => Ok(()),
-            Err(SessionError::Snapshot(detail)) => {
+            Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                 let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail));
                 self.refuse_subscription(transport, state, &label).await
             }

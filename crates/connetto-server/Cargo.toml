@@ -66,6 +66,10 @@ parking_lot = "0.12"
 # Async Postgres write path: the diesel-async apply and re-exec connector over a
 # bb8-pooled AsyncPgConnection. tokio-postgres backed, no libpq.
 diesel-async = { version = "0.7", default-features = false, features = ["postgres", "bb8"] }
+# Walking a result set row by row, so a page reads its column names once
+# instead of once per row (R58 review). diesel-async's own row stream is the
+# only place those names are available without deserializing per row.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Canonical primary-key codec: serialize the pk as Vec<subql Value<Postgres>>.
 rmp-serde.workspace = true
 # Binary error handling (connetto-server bin).

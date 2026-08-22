@@ -413,3 +413,44 @@ mod logging {
         BUFFER.clone()
     }
 }
+
+/// A subscription the server has to replace, over a table this tier refuses,
+/// ends rather than retrying a refusal for ever.
+///
+/// Replacing a subscription retries a failed read, because until the
+/// replacement lands the client is holding rows it may no longer see. A refusal
+/// is not an outage: retrying it would replace nothing, for ever, one log line
+/// at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
+    let logs = logging::install_once();
+    let fixture = Fixture::acquire().await;
+    fill(&fixture, 40, 64).await;
+    let serving = manager(
+        &fixture,
+        limits(8 * 1024, 32 * 1024, Duration::from_secs(30)),
+    );
+
+    let mut client = connect(&serving);
+    client.handshake_with("replaced", "user:replaced").await;
+    client.subscribe("all", "SELECT * FROM things").await;
+    let pages = drain_pages(&mut client, "all").await;
+    assert!(!pages.is_empty(), "the first read is served");
+
+    // A ceiling under the table's own rows, so a read here can only be
+    // refused.
+    let refusing = manager(&fixture, limits(8 * 1024, 1, Duration::from_secs(30)));
+    let mut narrowed = connect(&refusing);
+    narrowed.handshake_with("narrowed", "user:narrowed").await;
+    narrowed.subscribe("all", "SELECT * FROM things").await;
+
+    let ControlMessage::NonFatalError(refusal) = narrowed.next_control().await else {
+        panic!("the read is refused");
+    };
+    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+    // One refusal line, and no retry line: a refusal is not retried.
+    let retried = logs.lines().into_iter().any(|line| {
+        line["message"] == "replacing a subscription failed, retrying" && line["sub_id"] == "all"
+    });
+    assert!(!retried, "a refused read is never retried");
+}

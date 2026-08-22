@@ -207,7 +207,7 @@ mod pg {
     use diesel::{ExpressionMethods, QueryDsl, QueryableByName, sql_query};
     use diesel_async::pooled_connection::bb8::Pool;
     use diesel_async::scoped_futures::ScopedFutureExt;
-    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
     use sqlite_diff_rs::PatchsetOp;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
@@ -383,30 +383,77 @@ mod pg {
         }
     }
 
-    /// One backend result row read in Postgres binary: the result column names
-    /// and the raw wire bytes per column, `None` for a SQL NULL.
+    /// One backend result set read in Postgres binary: the column names once,
+    /// and the raw wire bytes per row, `None` for a SQL NULL.
     ///
     /// The read is dynamic (the subscription's projection is not known at
-    /// compile time), so this walks the diesel [`Row`] API by ordinal rather
-    /// than deriving a typed row. `field.value()` hands back the exact bytes
+    /// compile time), so it walks the diesel [`Row`] API by ordinal rather than
+    /// deriving a typed row. `field.value()` hands back the exact bytes
     /// tokio-postgres received in binary format, which is what
     /// [`subql::emit::pgbinary_patchset`] decodes.
-    struct BinaryRow {
+    ///
+    /// The names live beside the rows rather than inside each one. Every row of
+    /// one result carries the same names, so deserializing them per row
+    /// allocated a copy per row and read only the first set (R58 review): a
+    /// page of a million narrow rows paid a million allocations to say the same
+    /// five words.
+    #[derive(Default)]
+    struct BinaryRows {
         names: Vec<String>,
-        cells: Vec<Option<Vec<u8>>>,
+        rows: Vec<Vec<Option<Vec<u8>>>>,
     }
 
-    impl QueryableByName<diesel::pg::Pg> for BinaryRow {
-        fn build<'a>(row: &impl NamedRow<'a, diesel::pg::Pg>) -> diesel::deserialize::Result<Self> {
-            let arity = row.field_count();
-            let mut names = Vec::with_capacity(arity);
-            let mut cells = Vec::with_capacity(arity);
-            for ordinal in 0..arity {
-                let field = Row::get(row, ordinal).ok_or(diesel::result::UnexpectedEndOfRow)?;
-                names.push(field.field_name().unwrap_or_default().to_owned());
-                cells.push(field.value().map(|value| value.as_bytes().to_vec()));
+    impl BinaryRows {
+        /// Read every row of `query` as raw Postgres binary.
+        ///
+        /// Uses diesel-async's own row stream rather than a deserialized row
+        /// type, because the column names are on the row and a deserialized
+        /// type has nowhere to put them once.
+        async fn load(
+            conn: &mut AsyncPgConnection,
+            query: Boxed<'_>,
+        ) -> Result<Self, diesel::result::Error> {
+            use futures_util::StreamExt as _;
+
+            let mut stream = Box::pin(AsyncConnectionCore::load(conn, query).await?);
+            let mut read = Self::default();
+            while let Some(row) = stream.next().await {
+                let row = row?;
+                let arity = Row::field_count(&row);
+                if read.names.is_empty() {
+                    read.names = (0..arity)
+                        .map(|ordinal| {
+                            Row::get(&row, ordinal)
+                                .and_then(|field| field.field_name().map(ToOwned::to_owned))
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                }
+                let mut cells = Vec::with_capacity(arity);
+                for ordinal in 0..arity {
+                    let field = Row::get(&row, ordinal).ok_or(
+                        diesel::result::Error::DeserializationError(Box::new(
+                            diesel::result::UnexpectedEndOfRow,
+                        )),
+                    )?;
+                    cells.push(field.value().map(|value| value.as_bytes().to_vec()));
+                }
+                read.rows.push(cells);
             }
-            Ok(Self { names, cells })
+            Ok(read)
+        }
+
+        /// The column names as the encoder wants them.
+        fn column_names(&self) -> Vec<&str> {
+            self.names.iter().map(String::as_str).collect()
+        }
+
+        /// The rows as the encoder wants them.
+        fn cells(&self) -> Vec<Vec<Option<&[u8]>>> {
+            self.rows
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.as_deref()).collect())
+                .collect()
         }
     }
 
@@ -541,29 +588,32 @@ mod pg {
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let rows = conn
-                .transaction::<Vec<BinaryRow>, diesel::result::Error, _>(|c| {
+            let read = conn
+                .transaction::<BinaryRows, diesel::result::Error, _>(|c| {
                     async move {
                         sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
                         binding.apply(c).await?;
-                        query.load(c).await
+                        BinaryRows::load(c, query).await
                     }
                     .scope_boxed()
                 })
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let Some(row) = rows.as_slice().first() else {
+            let cells = read.cells();
+            let Some(row) = cells.into_iter().next() else {
                 return Ok(None);
             };
             // Lower through the same encoder the snapshot uses, so a value read
             // here and the same value delivered to a client are one value. The
             // builder's ops are the encoder's own, so nothing is serialized and
             // parsed back to reach them.
-            let names: Vec<&str> = row.names.iter().map(String::as_str).collect();
-            let cells: Vec<Option<&[u8]>> = row.cells.iter().map(|c| c.as_deref()).collect();
-            let built =
-                subql::emit::pgbinary_patchset_builder(&self.catalog, table, &names, &[cells])
-                    .map_err(|err| SnapshotError::Encode(err.to_string()))?;
+            let built = subql::emit::pgbinary_patchset_builder(
+                &self.catalog,
+                table,
+                &read.column_names(),
+                &[row],
+            )
+            .map_err(|err| SnapshotError::Encode(err.to_string()))?;
             let Some(PatchsetOp::Insert { values, .. }) = built.iter().next() else {
                 return Err(SnapshotError::Encode(
                     "the row encoder produced no insert".into(),
@@ -607,6 +657,13 @@ mod pg {
             // what is stored out of line, so the wider of the two is used, and
             // a table whose row count is unknown reads as one row wide, which
             // errs towards a small page.
+            //
+            // The name is bare, because the catalog knows tables by their bare
+            // name, so `regclass` resolves it through the reading role's own
+            // search path, and a deployment whose tables sit outside that path
+            // resolves nothing. So this read is an improvement to the estimate
+            // rather than a condition of serving: it runs on its own and its
+            // failure costs the physical half, never the subscription.
             let physical = sql_query(
                 "SELECT CASE WHEN c.reltuples > 0 \
                  THEN (pg_table_size(c.oid) / c.reltuples)::bigint \
@@ -614,29 +671,47 @@ mod pg {
                  FROM pg_class c WHERE c.oid = $1::regclass",
             )
             .into_boxed::<diesel::pg::Pg>()
-            .bind::<Text, _>(table);
+            .bind::<Text, _>(table.clone());
             let mut conn = self
                 .pool
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let (plan, physical) = conn
-                .transaction::<(PlanRow, WidthRow), diesel::result::Error, _>(|c| {
+            let plan = conn
+                .transaction::<PlanRow, diesel::result::Error, _>(|c| {
                     async move {
                         sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
                         binding.apply(c).await?;
-                        let plan: PlanRow = query.get_result(c).await?;
-                        let physical: WidthRow = physical.get_result(c).await?;
-                        Ok((plan, physical))
+                        query.get_result(c).await
                     }
                     .scope_boxed()
                 })
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let physical = conn
+                .transaction::<WidthRow, diesel::result::Error, _>(|c| {
+                    async move {
+                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                        physical.get_result(c).await
+                    }
+                    .scope_boxed()
+                })
+                .await;
             let mut estimate = plan_estimate(&plan.plan)?;
-            estimate.width = estimate
-                .width
-                .max(u32::try_from(physical.bytes.max(0)).unwrap_or(u32::MAX));
+            match physical {
+                Ok(physical) => {
+                    estimate.width = estimate
+                        .width
+                        .max(u32::try_from(physical.bytes.max(0)).unwrap_or(u32::MAX));
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        table = %table,
+                        error = %err,
+                        "the table's physical size is unreadable, so the page is sized from the planner's width alone and then from what the first page measures"
+                    );
+                }
+            }
             Ok(estimate)
         }
 
@@ -667,8 +742,8 @@ mod pg {
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let (rows, lsn) = conn
-                .transaction::<(Vec<BinaryRow>, String), diesel::result::Error, _>(|c| {
+            let (read, lsn) = conn
+                .transaction::<(BinaryRows, String), diesel::result::Error, _>(|c| {
                     async move {
                         // Pin one MVCC snapshot so this page's rows and its LSN
                         // agree. Successive pages are separate moments by
@@ -688,11 +763,11 @@ mod pg {
                         // Establish the requesting caller's RLS context so the
                         // read returns only rows it may see.
                         binding.apply(c).await?;
-                        let rows: Vec<BinaryRow> = query.load(c).await?;
+                        let read = BinaryRows::load(c, query).await?;
                         let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
                             .get_result(c)
                             .await?;
-                        Ok((rows, lsn.lsn))
+                        Ok((read, lsn.lsn))
                     }
                     .scope_boxed()
                 })
@@ -702,32 +777,26 @@ mod pg {
             // A page that filled is reported as filled whether or not it can
             // resume, so the caller refuses a read it cannot page rather than
             // taking these rows for a complete answer.
-            let filled = rows.len() > max_rows as usize;
-            let rows = &rows[..rows.len().min(max_rows as usize)];
+            let filled = read.rows.len() > max_rows as usize;
+            let rows = &read.rows[..read.rows.len().min(max_rows as usize)];
             let sizes = rows.iter().map(|row| {
-                row.cells
-                    .iter()
+                row.iter()
                     .map(|cell| cell.as_ref().map_or(0, |value| value.len() as u64))
                     .sum::<u64>()
             });
             let (widest_row, bytes) = sizes.fold((0, 0), |(widest, total): (u64, u64), size| {
                 (widest.max(size), total.saturating_add(size))
             });
-            // Column names come from the first row; a zero-row page has none,
-            // and the encoder returns an empty patchset for that, which is
-            // correct (nothing to insert).
-            let column_names: Vec<&str> = rows
-                .first()
-                .map(|r| r.names.iter().map(String::as_str).collect())
-                .unwrap_or_default();
+            // A zero-row page carries no names either, and the encoder returns
+            // an empty patchset for that, which is correct (nothing to insert).
             let row_cells: Vec<Vec<Option<&[u8]>>> = rows
                 .iter()
-                .map(|r| r.cells.iter().map(|c| c.as_deref()).collect())
+                .map(|row| row.iter().map(|cell| cell.as_deref()).collect())
                 .collect();
             let built = subql::emit::pgbinary_patchset_builder(
                 &self.catalog,
                 &table,
-                &column_names,
+                &read.column_names(),
                 &row_cells,
             )
             .map_err(|err| SnapshotError::Encode(err.to_string()))?;
@@ -780,8 +849,8 @@ mod pg {
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let (rows, published) = conn
-                .transaction::<(Vec<BinaryRow>, Option<bool>), diesel::result::Error, _>(|c| {
+            let (read, published) = conn
+                .transaction::<(BinaryRows, Option<bool>), diesel::result::Error, _>(|c| {
                     async move {
                         sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
                         // The caller's own binding, so the seed and the
@@ -792,7 +861,9 @@ mod pg {
                         // the query text and the table it reads come from the
                         // deployment's runtime DDL, so no `table!` schema can
                         // name them at compile time.
-                        let rows: Vec<BinaryRow> = sql_query(seed).load(c).await?;
+                        let read =
+                            BinaryRows::load(c, sql_query(seed).into_boxed::<diesel::pg::Pg>())
+                                .await?;
                         // The publication probe is typed against preflight's
                         // modelled catalog view, in the same transaction as
                         // the seed so the two answers name one moment.
@@ -810,7 +881,7 @@ mod pg {
                             }
                             None => None,
                         };
-                        Ok((rows, published))
+                        Ok((read, published))
                     }
                     .scope_boxed()
                 })
@@ -819,15 +890,8 @@ mod pg {
             // Lower through the same encoder the snapshot uses, so a seed
             // value and the same value delivered on the change path are one
             // value, and the term lookup keyed by it matches.
-            let column_names: Vec<&str> = rows
-                .as_slice()
-                .first()
-                .map(|row| row.names.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            let cells: Vec<Vec<Option<&[u8]>>> = rows
-                .iter()
-                .map(|row| row.cells.iter().map(|cell| cell.as_deref()).collect())
-                .collect();
+            let column_names = read.column_names();
+            let cells = read.cells();
             let mut decoded = Vec::with_capacity(cells.len());
             if !cells.is_empty() {
                 let member_table_id = catalog_helpers::table_id(&self.catalog, member_table);

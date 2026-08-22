@@ -693,6 +693,7 @@ dependencies = [
  "connetto-test-harness",
  "diesel",
  "diesel-async",
+ "futures-util",
  "http-body-util",
  "jsonwebtoken",
  "keyring-core",
