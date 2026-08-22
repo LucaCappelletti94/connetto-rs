@@ -209,6 +209,27 @@ pub enum ClientError {
         /// The disagreeing names, each said as which side is missing it.
         unmapped: Vec<String>,
     },
+    /// A table connetto cannot record changes to, so writes to it would be
+    /// lost without a word.
+    ///
+    /// SQLite records nothing for a table whose only key is the implicit
+    /// `rowid`, and two mechanisms depend on that record: the capture session
+    /// bound to `main`, so a synced table is never uploaded, and the session
+    /// diff the browser relay serves a tab from, so a table of either
+    /// database is never read by a sibling tab. `CREATE TABLE prefs (name
+    /// TEXT, value TEXT)` is a keyed table by SQL's standards, so this
+    /// requirement is connetto's own and the refusal names the fix.
+    ///
+    /// A table listed in [`ClientConfig::with_unrecorded_tables`] that does
+    /// declare a key is refused here too: the list and the schema then say
+    /// opposite things, and the table would sync while the application
+    /// believed it did not.
+    #[error("connetto cannot record changes to some tables: {}", .tables.join(", "))]
+    WritesNotRecorded {
+        /// One sentence per table, naming which database holds it and what to
+        /// change.
+        tables: Vec<String>,
+    },
 }
 
 /// Why a sign-in switch was refused.
@@ -531,6 +552,12 @@ pub struct ClientConfig {
     /// same build that produced the DDL. Empty by default, which is right for
     /// a schema with no policies and renames nothing.
     policy_tables: PolicyTables,
+    /// Tables whose missing primary key is intentional, so connetto records
+    /// nothing for them and the application accepted that. Empty by default,
+    /// and every other unkeyed table is refused
+    /// ([`ClientError::WritesNotRecorded`]). Lowercased, since SQLite table
+    /// names are ASCII-case-insensitive.
+    unrecorded_tables: HashSet<String>,
     /// What a translated policy means by the caller: the SQLite function name
     /// the deployment mapped `current_setting` onto, and the value it returns.
     ///
@@ -566,6 +593,7 @@ impl ClientConfig {
             schema_version: None,
             sql_functions: SqlFunctions::default(),
             policy_tables: PolicyTables::default(),
+            unrecorded_tables: HashSet::new(),
             caller: None,
             trim_threshold: DEFAULT_TRIM_THRESHOLD,
             trim_budget: DEFAULT_TRIM_BUDGET,
@@ -619,6 +647,33 @@ impl ClientConfig {
     #[must_use]
     pub fn with_policy_tables(mut self, policy_tables: PolicyTables) -> Self {
         self.policy_tables = policy_tables;
+        self
+    }
+
+    /// Tables whose missing primary key is intentional, accepting that
+    /// connetto records nothing for them.
+    ///
+    /// A settings singleton, a rebuilt cache or a log ordered by `rowid` has no
+    /// natural key, and naming one here is how an application says so. Every
+    /// unkeyed table not named is refused when the replica opens, or at the
+    /// next write when the application created it later, and so is a name here
+    /// that does declare a key, since the two would then disagree
+    /// ([`ClientError::WritesNotRecorded`]).
+    ///
+    /// An unrecorded table stays readable and writable locally on native,
+    /// where a live query re-reads it after SQLite's update hook reports the
+    /// write. In a browser it does not: the worker holds the database and a tab
+    /// reads through the relay, which builds a tab's copy as a session diff,
+    /// so a tab sees an unrecorded table as empty.
+    #[must_use]
+    pub fn with_unrecorded_tables(
+        mut self,
+        tables: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.unrecorded_tables = tables
+            .into_iter()
+            .map(|table| table.into().to_lowercase())
+            .collect();
         self
     }
 
@@ -1103,7 +1158,7 @@ fn is_internal_table(name: &str) -> bool {
 const EXPORT_BLANK_SCHEMA: &str = "connetto_export_blank";
 
 #[derive(diesel::QueryableByName)]
-struct ExportSchemaRow {
+struct SchemaDdlRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -1138,8 +1193,9 @@ fn export_rows(
     source_schema: &str,
     include: Option<&HashSet<String>>,
     hidden: &HashSet<String>,
+    accepted: &HashSet<String>,
 ) -> Result<Vec<u8>, ClientError> {
-    let rows = export_schema_rows(source, source_schema)?;
+    let rows = schema_ddl_rows(source, source_schema)?;
     let mut tables = Vec::new();
     for row in &rows {
         if !export_table_allowed(&row.name, include, hidden) {
@@ -1149,9 +1205,14 @@ fn export_rows(
             continue;
         };
         // A table with no primary key cannot be attached to a session, so its
-        // rows would be absent from the record. Refusing beats handing over an
-        // archive whose tables are all present and one of them empty.
+        // rows would be absent from the record. One the application declared
+        // unrecorded is skipped, which is what the declaration means, and any
+        // other is refused: that beats handing over an archive whose tables
+        // are all present and one of them empty.
         if key_columns(source, source_schema, &row.name)? == 0 {
+            if accepted.contains(&row.name.to_lowercase()) {
+                continue;
+            }
             return Err(ClientError::Export(format!(
                 "table {} has no primary key, so its rows cannot be exported",
                 row.name
@@ -1237,10 +1298,10 @@ fn key_columns(
 }
 
 /// The tables of one schema, in creation order, each with the DDL SQLite kept.
-fn export_schema_rows(
+fn schema_ddl_rows(
     db: &mut SqliteConnection,
     source_schema: &str,
-) -> Result<Vec<ExportSchemaRow>, ClientError> {
+) -> Result<Vec<SchemaDdlRow>, ClientError> {
     diesel::sql_query(format!(
         "SELECT name, sql FROM {}.sqlite_schema \
          WHERE type = 'table' AND sql IS NOT NULL ORDER BY rowid",
@@ -1248,6 +1309,74 @@ fn export_schema_rows(
     ))
     .load(db)
     .map_err(ClientError::from)
+}
+
+/// What a refusal calls the database holding the table, since a refused write
+/// over a device-private table never travelled anywhere.
+fn schema_label(schema: &str) -> &'static str {
+    if schema == LOCAL_SCHEMA {
+        "device-private"
+    } else {
+        "synced"
+    }
+}
+
+/// Refuse the tables of `schema` whose changes connetto cannot record.
+///
+/// SQLite records nothing for a table whose only key is the implicit `rowid`,
+/// so a write to one is never uploaded and never reaches a sibling browser
+/// tab, and nothing else notices. `accepted` names the tables whose missing
+/// key the application declared intentional, and a name in it that does
+/// declare a key is refused for the opposite reason (R62).
+fn check_recorded_tables(
+    db: &mut SqliteConnection,
+    schema: &str,
+    accepted: &HashSet<String>,
+) -> Result<(), ClientError> {
+    let where_it_is = schema_label(schema);
+    let mut tables = Vec::new();
+    for row in schema_ddl_rows(db, schema)? {
+        if is_internal_table(&row.name) {
+            continue;
+        }
+        let keyed = key_columns(db, schema, &row.name)? > 0;
+        match (keyed, accepted.contains(&row.name.to_lowercase())) {
+            (false, false) => tables.push(format!(
+                "{} in the {where_it_is} database declares no primary key, so SQLite records \
+                 nothing for it and writes to it are lost: declare one (a single-row table wants \
+                 id INTEGER PRIMARY KEY CHECK (id = 1)), or accept the loss with \
+                 ClientConfig::with_unrecorded_tables",
+                row.name
+            )),
+            (true, true) => tables.push(format!(
+                "{} in the {where_it_is} database declares a primary key and is named in \
+                 ClientConfig::with_unrecorded_tables, so the two disagree: drop the name to sync \
+                 it, or drop the key to keep it local",
+                row.name
+            )),
+            _ => {}
+        }
+    }
+    if tables.is_empty() {
+        return Ok(());
+    }
+    tables.sort();
+    Err(ClientError::WritesNotRecorded { tables })
+}
+
+#[derive(diesel::QueryableByName)]
+struct SchemaCookie {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    schema_version: i64,
+}
+
+/// SQLite's schema cookie for one database, which changes on any DDL. One
+/// integer read, so the write path can tell whether the key check has anything
+/// new to look at.
+fn schema_cookie(db: &mut SqliteConnection, schema: &str) -> Result<i64, ClientError> {
+    let rows: Vec<SchemaCookie> =
+        diesel::sql_query(format!("PRAGMA {}.schema_version", quote_ident(schema))).load(db)?;
+    Ok(rows.first().map_or(0, |row| row.schema_version))
 }
 
 pub(crate) fn export_table_allowed(
@@ -1727,6 +1856,11 @@ pub struct ConnettoConnection<T: Transport> {
     /// in-memory replica has no durable key, so `custody()` overrides the
     /// configured level to `Ephemeral` whenever this is false.
     durable: bool,
+    /// The schema cookie of `main` at its last key check, and of the tier when
+    /// one is attached. The write path re-checks a schema only when its cookie
+    /// moved, which is one integer read per schema (R62 decisions 1 and 4).
+    main_schema: i64,
+    tier_schema: Option<i64>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -1878,6 +2012,10 @@ where
         // After the schema exists, whether this open created it or a previous
         // run did: the views are what the map has to agree with.
         check_policy_tables(&mut db, &config.policy_tables)?;
+        // Beside it, and for the same reason: SQLite records nothing for a
+        // table whose only key is the implicit rowid, so a write to one
+        // uploads nothing and reports success (R62).
+        check_recorded_tables(&mut db, "main", &config.unrecorded_tables)?;
         db.batch_execute(META_DDL)?;
         db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
         // Once per open, before anything can re-claim: a watch the previous run
@@ -1908,6 +2046,9 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
 
+        // Read after every statement this open applies, so the first write
+        // re-checks only what the application changed since.
+        let main_schema = schema_cookie(&mut db, "main")?;
         let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
         let mut conn = Self {
             wire: None,
@@ -1931,6 +2072,8 @@ where
             // constructor that carries none, and `encrypted_file` refuses
             // without one.
             durable: replica.key().is_some(),
+            main_schema,
+            tier_schema: None,
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -1951,7 +2094,7 @@ where
     /// in the same key store behind the same wrap.
     fn attach_tier(&mut self, tier: &Tier<'_>) -> Result<(), ClientError> {
         match tier {
-            Tier::None => Ok(()),
+            Tier::None => return Ok(()),
             Tier::Existing { path } => {
                 // Write allowed so the tier stays writable, creation refused so
                 // a missing tier file fails instead of starting an empty one.
@@ -1961,8 +2104,6 @@ where
                     LOCAL_SCHEMA,
                     harden::AttachPermits::Write,
                 )?;
-                self.local_tables = local_tier_tables(&mut self.db)?;
-                Ok(())
             }
             Tier::Create { path, ddl } => {
                 harden::attach_in_window(
@@ -1978,10 +2119,15 @@ where
                         self.db.batch_execute(&qualify_create_table(statement)?)?;
                     }
                 }
-                self.local_tables = local_tier_tables(&mut self.db)?;
-                Ok(())
             }
         }
+        self.local_tables = local_tier_tables(&mut self.db)?;
+        // The tier needs keys as much as the replica does: a browser tab reads
+        // a tier table through a session diff the relay takes, so an unkeyed
+        // one delivers nothing to a sibling tab (R62).
+        check_recorded_tables(&mut self.db, LOCAL_SCHEMA, &self.config.unrecorded_tables)?;
+        self.tier_schema = Some(schema_cookie(&mut self.db, LOCAL_SCHEMA)?);
+        Ok(())
     }
 
     /// Attach a source of fresh access tokens, consulted on every
@@ -2255,8 +2401,10 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Export`] when a table has no declared primary key, since
-    /// SQLite records no changes for one and its rows would be silently absent.
+    /// [`ClientError::Export`] when a table has no declared primary key and
+    /// was not named in [`ClientConfig::with_unrecorded_tables`], since SQLite
+    /// records no changes for one and its rows would be silently absent. A
+    /// named one is skipped, which is what the declaration means.
     pub fn export_local_data(&mut self, scope: ExportScope) -> Result<Vec<u8>, ClientError> {
         let synced_rows = match scope {
             ExportScope::Everything => Some(export_rows(
@@ -2264,6 +2412,7 @@ where
                 "main",
                 None,
                 &self.hidden_tables,
+                &self.config.unrecorded_tables,
             )?),
             ExportScope::Unsynced => None,
         };
@@ -2275,6 +2424,7 @@ where
                 LOCAL_SCHEMA,
                 Some(&self.local_tables),
                 &HashSet::new(),
+                &self.config.unrecorded_tables,
             )?)
         };
         archive::write(&archive::Archive {
@@ -2388,6 +2538,7 @@ where
                 LOCAL_SCHEMA,
                 Some(&self.local_tables),
                 &HashSet::new(),
+                &self.config.unrecorded_tables,
             )?;
             archive::index_rows(&current, &local_columns)?
         };
@@ -2833,6 +2984,30 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
+    /// Re-run the key check for a schema whose DDL moved since the last look.
+    ///
+    /// The capture session covers tables created after it exists, so a table
+    /// the application creates mid-run would otherwise lose every write to it
+    /// until the next restart. The gate is one integer read per schema, and
+    /// the tier is read too even though nothing there uploads, because a tier
+    /// table nobody records is invisible to every sibling browser tab (R62
+    /// decisions 1 and 4).
+    fn recheck_changed_schemas(&mut self) -> Result<(), ClientError> {
+        let main = schema_cookie(&mut self.db, "main")?;
+        if main != self.main_schema {
+            check_recorded_tables(&mut self.db, "main", &self.config.unrecorded_tables)?;
+            self.main_schema = main;
+        }
+        if let Some(seen) = self.tier_schema {
+            let tier = schema_cookie(&mut self.db, LOCAL_SCHEMA)?;
+            if tier != seen {
+                check_recorded_tables(&mut self.db, LOCAL_SCHEMA, &self.config.unrecorded_tables)?;
+                self.tier_schema = Some(tier);
+            }
+        }
+        Ok(())
+    }
+
     /// Upload local writes captured since the last push as one mutation.
     ///
     /// Returns the assigned `client_seq`, or `None` when there was nothing to
@@ -2844,8 +3019,11 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] on a session, compression, or transport failure.
+    /// [`ClientError`] on a session, compression, or transport failure, and
+    /// [`ClientError::WritesNotRecorded`] when the application created a table
+    /// connetto cannot record changes to since the last write.
     pub async fn push(&mut self) -> Result<Option<u64>, ClientError> {
+        self.recheck_changed_schemas()?;
         let changeset = self
             .session
             .changeset()
@@ -3801,7 +3979,7 @@ mod tests {
                      INSERT INTO ghosts (id, body) VALUES (1, 'boo');",
                 )
                 .expect("scratch schema");
-            export_rows(&mut other, "main", None, &HashSet::new()).expect("record")
+            export_rows(&mut other, "main", None, &HashSet::new(), &HashSet::new()).expect("record")
         };
         let bytes = archive::write(&archive::Archive {
             scope: ExportScope::Unsynced,

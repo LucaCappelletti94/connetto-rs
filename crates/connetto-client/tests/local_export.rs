@@ -267,16 +267,25 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
     );
 }
 
+/// The export's own refusal, which R62 left in place as the backstop.
+///
+/// Its only route is now a table created after open, since a schema carrying
+/// an unkeyed table no longer opens at all.
 #[test]
 fn table_without_primary_key_is_refused_by_name() {
     let replica = Replica::in_memory();
     let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
         &replica,
-        "CREATE TABLE nokey (name TEXT NOT NULL);",
+        "CREATE TABLE keyed (id INTEGER PRIMARY KEY);",
         &ClientConfig::new("nopk-test".to_owned()),
         None,
     )
     .expect("open replica");
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE nokey (name TEXT NOT NULL)",
+    )
+    .expect("create it mid-run");
     let err = conn
         .export_local_data(ExportScope::Everything)
         .expect_err("must refuse a table without a primary key");
