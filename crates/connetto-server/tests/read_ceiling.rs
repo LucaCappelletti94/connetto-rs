@@ -25,7 +25,8 @@ use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
-                      CREATE TABLE narrow (id INT PRIMARY KEY, n INT);";
+                      CREATE TABLE narrow (id INT PRIMARY KEY, n INT); \
+                      CREATE TABLE counts (id INT PRIMARY KEY, n INT);";
 
 /// The manager these tests serve: the real Postgres read, a policy the initial
 /// read never consults, and no re-execution connector.
@@ -453,4 +454,194 @@ async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
         line["message"] == "replacing a subscription failed, retrying" && line["sub_id"] == "all"
     });
     assert!(!retried, "a refused read is never retried");
+}
+
+/// The aggregate half of the same ceiling (R81).
+///
+/// An aggregate never snapshots, so none of the machinery above touches it: its
+/// seed and every re-execution triggered by a change run their own query
+/// through the connector. The seed spends the subscribing caller's tier, and a
+/// triggered read spends the server's shorter bound, because a trigger is
+/// awaited on the loop that fans every patch to every client.
+mod aggregates {
+    use super::{PG_DDL, logging};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use connetto_core::messages::{ControlMessage, SUBSCRIPTION_REFUSED};
+    use connetto_core::test_support::TestGrantChecker;
+    use connetto_server::{
+        AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard, SessionConfig,
+        SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    };
+    use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+    use subql::{CdcSource, PgSqliteEmuSource};
+
+    /// A manager whose aggregates read through connetto's own connector.
+    type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+
+    /// One in-process client on its own session, as the row tests do it, over
+    /// the manager type that carries a connector.
+    fn connect_to(manager: &Arc<Manager>) -> Client {
+        let (server_end, client_end) = loopback();
+        let session = Arc::clone(manager);
+        tokio::spawn(async move {
+            let _ = session.serve(server_end).await;
+        });
+        Client::new(client_end)
+    }
+    /// A guard whose tier reads may take `seed` and whose triggered
+    /// re-executions may take `triggered`.
+    fn guard(seed: Duration, triggered: Duration) -> Arc<RequestGuard<String>> {
+        Arc::new(RequestGuard::new(
+            ThrottleConfig::default()
+                .with_identified(TierLimits::identified().with_read_timeout(seed))
+                .with_reexec_timeout(triggered),
+            AbuseConfig::default(),
+        ))
+    }
+
+    fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> {
+        SessionManager::with_connector(
+            Materializer::new(PG_DDL).expect("build materializer"),
+            PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source"),
+            // An aggregate result is global, so the policy never sees it.
+            RosterAuth::granting_nobody(),
+            Arc::new(TestGrantChecker),
+            PgReadConnector::new(fixture.admin().clone()),
+            pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+                .expect("build write target"),
+            guard,
+            SessionConfig::default(),
+        )
+    }
+
+    /// Enough rows that `MIN(n)` on an unindexed column cannot finish inside a
+    /// millisecond, since the plan has to read every one of them.
+    async fn fill_counts(fixture: &Fixture, rows: u32) {
+        fixture.exec("DROP TABLE IF EXISTS counts CASCADE").await;
+        fixture
+            .exec("CREATE TABLE counts (id INT PRIMARY KEY, n INT)")
+            .await;
+        fixture
+            .exec(&format!(
+                "INSERT INTO counts (id, n) SELECT g, g FROM generate_series(1, {rows}) AS g"
+            ))
+            .await;
+        fixture.exec("ANALYZE counts").await;
+    }
+
+    /// Remove the row holding the current extreme, which is what makes subql
+    /// re-execute rather than fold: the answer is no longer derivable from the
+    /// value it holds.
+    async fn retire_the_extreme(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>) {
+        for sql in [
+            "INSERT INTO counts (id, n) VALUES (1, 1)",
+            "DELETE FROM counts WHERE id = 1",
+        ] {
+            source.execute_sql(sql).expect("execute dml");
+            while let Some(event) = source.next_event().await.expect("poll source") {
+                manager.dispatch_event(&event).await.expect("dispatch");
+            }
+        }
+    }
+
+    /// A seed the caller's own tier cannot afford is refused, like any read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_past_the_callers_own_limit_is_refused() {
+        let fixture = Fixture::acquire().await;
+        fill_counts(&fixture, 200_000).await;
+        let manager = manager(
+            &fixture,
+            guard(Duration::from_millis(1), Duration::from_secs(30)),
+        );
+
+        let mut client = connect_to(&manager);
+        client.handshake_with("seeder", "user:seeder").await;
+        client
+            .subscribe("cheapest", "SELECT MIN(n) FROM counts")
+            .await;
+
+        let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+            panic!("a seed past its limit must be refused");
+        };
+        assert_eq!(refusal.related_to.as_deref(), Some("cheapest"));
+        assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+    }
+
+    /// A triggered re-execution is bounded by the server's number, not the
+    /// caller's, and exceeding it ends the subscription.
+    ///
+    /// The tier here is generous enough to seed, so the only thing that can stop
+    /// the read the change triggers is the shorter shared bound. What the client
+    /// then gets is one refusal carrying the same fixed phrase every other
+    /// refusal carries, and the log carries the cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_triggered_read_past_the_shared_bound_ends_the_subscription() {
+        let logs = logging::install_once();
+        let fixture = Fixture::acquire().await;
+        fill_counts(&fixture, 200_000).await;
+        let manager = manager(
+            &fixture,
+            guard(Duration::from_secs(30), Duration::from_millis(1)),
+        );
+
+        let mut client = connect_to(&manager);
+        client.handshake_with("watcher", "user:watcher").await;
+        client
+            .subscribe("cheapest", "SELECT MIN(n) FROM counts")
+            .await;
+        let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
+            panic!(
+                "the seed is served under the caller's own tier: {:?}",
+                logs.lines()
+            );
+        };
+        assert_eq!(seeded.result_json, "1");
+
+        let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+        retire_the_extreme(&mut source, &manager).await;
+
+        let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+            panic!("a triggered read past the shared bound must be refused");
+        };
+        assert_eq!(refusal.related_to.as_deref(), Some("cheapest"));
+        assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+        let named = logs.lines().into_iter().any(|line| {
+            line["message"] == "an aggregate re-execution was refused, ending the subscription"
+                && line["sub_id"] == "cheapest"
+        });
+        assert!(named, "the log names the subscription it ended");
+    }
+
+    /// The same trigger under a bound it fits delivers a value, which is what
+    /// makes the test above about the limit rather than about the trigger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_triggered_read_inside_the_bound_is_delivered() {
+        let fixture = Fixture::acquire().await;
+        fill_counts(&fixture, 200_000).await;
+        let manager = manager(
+            &fixture,
+            guard(Duration::from_secs(30), Duration::from_secs(30)),
+        );
+
+        let mut client = connect_to(&manager);
+        client.handshake_with("patient", "user:patient").await;
+        client
+            .subscribe("cheapest", "SELECT MIN(n) FROM counts")
+            .await;
+        let ControlMessage::AggregateUpdate(_) = client.next_control().await else {
+            panic!("expected the seed");
+        };
+
+        let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+        retire_the_extreme(&mut source, &manager).await;
+
+        // Postgres still holds every row, so the re-execution answers the same
+        // extreme. The assertion is that it answered at all.
+        let ControlMessage::AggregateUpdate(again) = client.next_control().await else {
+            panic!("a triggered read inside the bound is delivered");
+        };
+        assert_eq!(again.result_json, "1");
+    }
 }

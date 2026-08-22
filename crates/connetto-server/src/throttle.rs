@@ -199,6 +199,7 @@ pub struct ThrottleConfig {
     anonymous: TierLimits,
     refresh_failures_per_session: Limit,
     refresh_failures_per_account: Limit,
+    reexec_timeout: Duration,
     max_tracked: usize,
 }
 
@@ -208,6 +209,15 @@ pub struct ThrottleConfig {
 /// enough that reaching it costs tens of megabytes rather than the process.
 const DEFAULT_MAX_TRACKED: usize = 100_000;
 
+/// How long a re-execution triggered by a change may read for.
+///
+/// Server-wide rather than per tier, and shorter than the identified tier's
+/// own read timeout, because a triggered read is awaited on the loop that fans
+/// every patch to every client: what it delays is the change stream, not the
+/// caller who subscribed (R81 decision 2). Matches the anonymous tier's five
+/// seconds, which is the shortest number already in this file.
+const DEFAULT_REEXEC_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Default for ThrottleConfig {
     fn default() -> Self {
         Self {
@@ -215,6 +225,7 @@ impl Default for ThrottleConfig {
             anonymous: TierLimits::anonymous(),
             refresh_failures_per_session: Limit::new(10, FIVE_MINUTES),
             refresh_failures_per_account: Limit::new(30, FIVE_MINUTES),
+            reexec_timeout: DEFAULT_REEXEC_TIMEOUT,
             max_tracked: DEFAULT_MAX_TRACKED,
         }
     }
@@ -257,6 +268,22 @@ impl ThrottleConfig {
     pub const fn with_refresh_failures_per_account(mut self, max: u32, window: Duration) -> Self {
         self.refresh_failures_per_account = Limit::new(max, window);
         self
+    }
+
+    /// How long one re-execution triggered by a change may read for.
+    ///
+    /// Raise it for a deployment whose aggregates legitimately read longer than
+    /// the default, knowing that live delivery waits for each one.
+    #[must_use]
+    pub const fn with_reexec_timeout(mut self, timeout: Duration) -> Self {
+        self.reexec_timeout = timeout;
+        self
+    }
+
+    /// The budget a triggered re-execution reads under.
+    #[must_use]
+    pub const fn reexec_timeout(&self) -> Duration {
+        self.reexec_timeout
     }
 
     /// How many distinct keys one signal tracks before the least recently
@@ -603,6 +630,12 @@ impl HandleThrottle {
     /// bound one read's size and duration rather than a rate (R58).
     pub(crate) const fn read(&self, tier: Tier) -> ReadLimits {
         self.config.tier(tier).read
+    }
+
+    /// The budget a re-execution triggered by a change reads under, which is
+    /// the server's rather than any caller's (R81 decision 2).
+    pub(crate) const fn reexec_timeout(&self) -> Duration {
+        self.config.reexec_timeout()
     }
 }
 

@@ -60,6 +60,7 @@ use crate::materializer::{
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::reexec::{ReadBudget, TimedOutRead};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
@@ -236,7 +237,11 @@ fn membership_label(member_table: &str) -> String {
 #[allow(async_fn_in_trait)]
 pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// Snapshot-source error.
-    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
+    ///
+    /// [`TimedOutRead`] because the session has to tell a read that ran out of
+    /// time from one that failed: the first is policy and ends the
+    /// subscription, the second is an outage and is retried (R81 decision 3).
+    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static + TimedOutRead;
 
     /// What the backend predicts `select_sql` will produce, as `caller`.
     ///
@@ -939,7 +944,7 @@ pub struct NoConnector;
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for NoConnector {
-    type AuthContext = ();
+    type AuthContext = ReadBudget;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -948,7 +953,7 @@ impl AsyncConnector for NoConnector {
         &self,
         _sql: &str,
         _kind: ScalarKind,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -962,7 +967,7 @@ impl AsyncConnector for NoConnector {
     fn execute_rows(
         &self,
         _sql: &str,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
     > + Send {
@@ -988,7 +993,9 @@ pub struct SessionManager<
 > where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+        + Send
+        + Sync,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
@@ -1096,8 +1103,10 @@ impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
-    C::Error: core::fmt::Display,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+        + Send
+        + Sync,
+    C::Error: core::fmt::Display + TimedOutRead,
     W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with a re-execution connector and a default in-memory
@@ -1132,8 +1141,10 @@ impl<Snap, Auth, C, O, W> SessionManager<Snap, Auth, W, C, O>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
-    C::Error: core::fmt::Display,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+        + Send
+        + Sync,
+    C::Error: core::fmt::Display + TimedOutRead,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = String>,
 {
@@ -1185,8 +1196,10 @@ where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     Auth::Error: core::fmt::Display,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
-    C::Error: core::fmt::Display,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+        + Send
+        + Sync,
+    C::Error: core::fmt::Display + TimedOutRead,
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
@@ -1639,15 +1652,28 @@ where
                 .await;
         }
 
+        let budget = self.guard.reexec_budget();
         for trigger in dispatched.triggers {
-            let Ok((value, _lsn)) = self
+            let value = match self
                 .connector
-                .execute_scalar(&trigger.sql, trigger.kind, &())
+                .execute_scalar(&trigger.sql, trigger.kind, &budget)
                 .await
-            else {
-                // Re-execution failure: bounded retry and SyncFailure surfacing
-                // land in Phase 6. Skip for now.
-                continue;
+            {
+                Ok((value, _lsn)) => value,
+                Err(err) if err.timed_out() => {
+                    // A timeout is policy rather than an outage, so retrying it
+                    // replaces nothing: every later change would meet the same
+                    // read. The subscription ends instead, and the client is
+                    // told no more than any other refusal tells it (R81
+                    // decision 3).
+                    self.refuse_aggregate(trigger.query_id, &err).await;
+                    continue;
+                }
+                Err(_) => {
+                    // Re-execution failure: bounded retry and SyncFailure surfacing
+                    // land in Phase 6. Skip for now.
+                    continue;
+                }
             };
             let result_json = value_to_json(&value);
             {
@@ -2319,6 +2345,40 @@ where
             is_full_result: true,
         };
         let _ = route.tx.send(Outbound::Aggregate(update));
+    }
+
+    /// End one aggregate subscription because its read was refused, telling the
+    /// client only what every refusal tells it.
+    ///
+    /// The wire carries R38's one fixed phrase and the log carries the cause, so
+    /// a caller cannot tell an unusably heavy query from any other refusal while
+    /// the developer reads the reason. Called from the dispatch loop, which
+    /// holds no transport of its own, so the frame travels the route's channel
+    /// the same way an aggregate value does.
+    ///
+    /// The session's own `agg_subs` entry is left in place: a later unsubscribe
+    /// naming it removes nothing and reports nothing, which is what an already
+    /// ended subscription should do.
+    async fn refuse_aggregate<E: core::fmt::Display>(&self, query_id: u64, cause: &E) {
+        let route = { self.agg_routes.lock().await.remove(&query_id) };
+        self.materializer
+            .lock()
+            .await
+            .unregister_aggregate(query_id);
+        let Some(route) = route else { return };
+        tracing::warn!(
+            sub_id = %route.label,
+            cause = %cause,
+            "an aggregate re-execution was refused, ending the subscription"
+        );
+        let _ = route
+            .tx
+            .send(Outbound::Control(ControlMessage::NonFatalError(
+                NonFatalError {
+                    related_to: Some(route.label),
+                    detail: SUBSCRIPTION_REFUSED.to_owned(),
+                },
+            )));
     }
 
     /// Send a folded delta aggregate value to the session owning `consumer_id`,
@@ -3837,7 +3897,13 @@ where
                 },
             )
             .await
-            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
+            .map_err(|err| {
+                if err.timed_out() {
+                    SessionError::ReadRefused(err.to_string())
+                } else {
+                    SessionError::Snapshot(err.to_string())
+                }
+            })?;
         admit_page(&sub.sub_id, &page, max_rows, estimate.width, limits)?;
         if let Some(reason) = resync {
             transport
@@ -4317,6 +4383,10 @@ where
 
     /// Bootstrap a captured aggregate through the connector, deliver its initial
     /// value, and route future updates.
+    ///
+    /// The seed runs in the subscribing caller's own path, so it spends that
+    /// caller's tier budget: a slow seed delays the caller who asked for it and
+    /// nobody else (R81 decision 2).
     async fn subscribe_aggregate<T: Transport>(
         &self,
         transport: &mut T,
@@ -4324,9 +4394,10 @@ where
         state: &mut SessionState<Id, Key>,
         capture: crate::materializer::AggregateCapture,
     ) -> Result<(), SessionError> {
+        let budget = ReadBudget::new(self.guard.read_limits(Tier::of(&state.principal)).timeout);
         let value = match self
             .connector
-            .execute_scalar(&capture.sql, capture.kind, &())
+            .execute_scalar(&capture.sql, capture.kind, &budget)
             .await
         {
             Ok((value, _lsn)) => value,
@@ -4391,9 +4462,10 @@ where
             .lock()
             .await
             .expect_aggregate(capture.consumer_id);
+        let budget = ReadBudget::new(self.guard.read_limits(Tier::of(&state.principal)).timeout);
         let row = match self
             .connector
-            .execute_scalar_row(&capture.bootstrap.sql, &capture.bootstrap.kinds, &())
+            .execute_scalar_row(&capture.bootstrap.sql, &capture.bootstrap.kinds, &budget)
             .await
         {
             Ok((row, _lsn)) => row,

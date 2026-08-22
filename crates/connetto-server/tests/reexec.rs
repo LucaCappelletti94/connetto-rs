@@ -15,8 +15,8 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    Materializer, PageSpec, ReadBudget, RequestGuard, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarKind, Value as PgValue};
@@ -40,7 +40,7 @@ impl QueuedConnector {
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for QueuedConnector {
-    type AuthContext = ();
+    type AuthContext = ReadBudget;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -49,7 +49,7 @@ impl AsyncConnector for QueuedConnector {
         &self,
         _sql: &str,
         _kind: ScalarKind,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -63,7 +63,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_rows(
         &self,
         _sql: &str,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
     > + Send {

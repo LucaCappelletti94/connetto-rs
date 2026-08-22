@@ -44,6 +44,14 @@ pub enum SnapshotError {
     /// The backend read failed.
     #[error("backend read failed: {0}")]
     Backend(String),
+    /// Postgres cancelled the read at the tier's time limit.
+    ///
+    /// Separate from [`Backend`](Self::Backend) because a read that ran out of
+    /// time is a refusal rather than an outage: the replacement path retries a
+    /// failure and would meet the same limit every time, so it has to end the
+    /// subscription instead (R81 decision 3, applied to the row path R58 built).
+    #[error("the read ran past its {0:?} limit")]
+    TimedOut(core::time::Duration),
 }
 
 /// Extract the single table a `SELECT` reads from, as its bare catalog name.
@@ -732,11 +740,10 @@ mod pg {
             } = plan;
             let max_rows = page.max_rows.max(1);
             let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
-            // Milliseconds, and never zero: Postgres reads zero as no limit
-            // at all, which is the opposite of a tight budget.
-            let timeout_ms = u64::try_from(page.timeout.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1);
+            // Both ends of this number are traps, so one helper owns them: zero
+            // reads as no limit at all, and the setting's own range is a signed
+            // 32-bit integer (R81).
+            let timeout_ms = crate::reexec::statement_timeout_ms(page.timeout);
             let mut conn = self
                 .pool
                 .get()
@@ -772,7 +779,13 @@ mod pg {
                     .scope_boxed()
                 })
                 .await
-                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+                .map_err(|err| {
+                    if crate::reexec::is_statement_timeout(&err) {
+                        SnapshotError::TimedOut(page.timeout)
+                    } else {
+                        SnapshotError::Backend(err.to_string())
+                    }
+                })?;
 
             // A page that filled is reported as filled whether or not it can
             // resume, so the caller refuses a read it cannot page rather than

@@ -5,7 +5,7 @@
 //! binary runs. The write direction goes through [`pg_write_target`] under an RLS role,
 //! the read direction through [`PgSnapshotSource`] and a real
 //! [`PgStreamingCdcSource`] over a live replication slot and publication, and
-//! aggregate re-execution through [`PgAsyncDieselConnector`]. It mirrors the
+//! aggregate re-execution through [`PgReadConnector`]. It mirrors the
 //! wiring in `crates/connetto-server/src/bin/connetto-server.rs` main.
 //!
 //! Every test starts its own Postgres, and its own authorization service if it
@@ -36,9 +36,9 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::openfga::{Counted, FgaAuth};
 use connetto_server::{
-    LoopbackTransport, Materializer, OidcProviderConfig, PgSnapshotSource, ReconnectPolicy,
-    RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    loopback, pg_write_target,
+    LoopbackTransport, Materializer, OidcProviderConfig, PgReadConnector, PgSnapshotSource,
+    ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -51,7 +51,6 @@ use rls2fga::translator::Translator;
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
-use subql::reexec::PgAsyncDieselConnector;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
@@ -733,7 +732,7 @@ fn unreachable_service() -> HarnessAuthError {
 /// The concrete manager type the harness serves: real snapshot, the harness auth
 /// policy, and the async re-execution connector.
 type HarnessManager =
-    SessionManager<PgSnapshotSource, HarnessAuth, ConnettoWatermark, PgAsyncDieselConnector>;
+    SessionManager<PgSnapshotSource, HarnessAuth, ConnettoWatermark, PgReadConnector>;
 
 /// How to wire a harness server.
 pub struct ServerConfig {
@@ -921,7 +920,7 @@ pub fn spawn_server(
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
-    let connector = PgAsyncDieselConnector::new(connector_pool);
+    let connector = PgReadConnector::new(connector_pool);
     // The manager requires a handshake authority with no default (R2). The
     // harness is test-only, so it installs the `test-support` stand-in that
     // reads the subject out of the grant string, which is what

@@ -35,6 +35,7 @@ pub mod parity;
 pub mod pk;
 pub mod preflight;
 pub mod reach;
+pub mod reexec;
 pub mod reserve;
 pub mod row_view;
 pub mod session;
@@ -85,6 +86,7 @@ pub use oplog::{
 };
 pub use oplog::{PgOplog, PgOplogError};
 pub use preflight::{Artifact, PreflightError};
+pub use reexec::{PgReadConnector, ReadBudget, ReadError, TimedOutRead};
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{

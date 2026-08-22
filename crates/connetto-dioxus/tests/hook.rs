@@ -16,8 +16,8 @@ use connetto_core::{
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
+    Materializer, PageSpec, ReadBudget, RequestGuard, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -149,7 +149,7 @@ struct SeedRows {
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for SeedRows {
-    type AuthContext = ();
+    type AuthContext = ReadBudget;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -158,7 +158,7 @@ impl AsyncConnector for SeedRows {
         &self,
         _sql: &str,
         _kind: ScalarKind,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -168,7 +168,7 @@ impl AsyncConnector for SeedRows {
     fn execute_rows(
         &self,
         _sql: &str,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
     > + Send {
@@ -179,7 +179,7 @@ impl AsyncConnector for SeedRows {
         &self,
         _sql: &str,
         _kinds: &[ScalarKind],
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {

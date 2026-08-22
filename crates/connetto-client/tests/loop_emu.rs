@@ -26,9 +26,9 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, WebSocketTransport, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog, ReadBudget,
+    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -1516,7 +1516,7 @@ impl QueuedConnector {
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for QueuedConnector {
-    type AuthContext = ();
+    type AuthContext = ReadBudget;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -1525,7 +1525,7 @@ impl AsyncConnector for QueuedConnector {
         &self,
         _sql: &str,
         _kind: ScalarKind,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -1539,7 +1539,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_rows(
         &self,
         _sql: &str,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
     > + Send {
@@ -1554,7 +1554,7 @@ impl AsyncConnector for QueuedConnector {
         &self,
         _sql: &str,
         _kinds: &[ScalarKind],
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {
@@ -1741,8 +1741,10 @@ async fn drain_events<S, C, O>(
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ()> + Send + Sync,
-    C::Error: core::fmt::Display,
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+        + Send
+        + Sync,
+    C::Error: core::fmt::Display + connetto_server::TimedOutRead,
     O: Oplog,
 {
     while let Some(event) = source.next_event().await.expect("poll event") {
@@ -1911,7 +1913,7 @@ struct GatedSeed {
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for GatedSeed {
-    type AuthContext = ();
+    type AuthContext = ReadBudget;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -1920,7 +1922,7 @@ impl AsyncConnector for GatedSeed {
         &self,
         _sql: &str,
         _kind: ScalarKind,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -1930,7 +1932,7 @@ impl AsyncConnector for GatedSeed {
     fn execute_rows(
         &self,
         _sql: &str,
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
     > + Send {
@@ -1941,7 +1943,7 @@ impl AsyncConnector for GatedSeed {
         &self,
         _sql: &str,
         _kinds: &[ScalarKind],
-        _auth: &(),
+        _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {

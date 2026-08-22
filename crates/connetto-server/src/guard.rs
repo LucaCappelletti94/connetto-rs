@@ -219,6 +219,13 @@ where
         self.handles.read(tier)
     }
 
+    /// The budget one re-execution triggered by a change reads under: shorter
+    /// than any tier's, because the read is awaited on the dispatch loop and
+    /// delays every client rather than the one that subscribed (R81).
+    pub(crate) const fn reexec_budget(&self) -> crate::reexec::ReadBudget {
+        crate::reexec::ReadBudget::new(self.handles.reexec_timeout())
+    }
+
     /// Attach the audit sink, once, so an impose and a lift reach `auth_events`.
     ///
     /// A second call is ignored, matching the sink on

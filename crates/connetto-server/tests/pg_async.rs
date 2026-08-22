@@ -17,8 +17,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PageSpec, PgOplog,
-    PgSnapshotSource, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, loopback, pg_write_target,
+    PgReadConnector, PgSnapshotSource, RequestGuard, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -27,7 +27,6 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
-use subql::reexec::PgAsyncDieselConnector;
 use subql::{CdcSource, PgSqliteEmuSource};
 
 diesel::table! {
@@ -373,7 +372,7 @@ async fn async_pg_reexec_bootstraps_min() {
             .expect("seed rows");
     }
 
-    let connector = PgAsyncDieselConnector::new(pool.clone());
+    let connector = PgReadConnector::new(pool.clone());
     let materializer = Materializer::new(AGGS_PG_DDL).expect("build materializer");
     let target =
         pg_write_target::<ConnettoWatermark>(pool, AGGS_PG_DDL).expect("build write target");
@@ -695,7 +694,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
             .expect("seed rows");
     }
 
-    let connector = PgAsyncDieselConnector::new(pool.clone());
+    let connector = PgReadConnector::new(pool.clone());
     let materializer =
         Materializer::new("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
             .expect("build materializer");

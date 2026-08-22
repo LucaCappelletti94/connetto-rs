@@ -79,10 +79,10 @@ use connetto_server::reach::GrantReach;
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, OplogConfig, PgOplog, PgSnapshotSource, ProviderRegistry, ReaderGate,
-    ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome, RequestGuard,
-    ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig, SessionError,
-    SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
+    OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, ProviderRegistry,
+    ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
+    RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig,
+    SessionError, SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
     connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
     is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
@@ -97,7 +97,6 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::reexec::PgAsyncDieselConnector;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -574,13 +573,8 @@ fn caller_mapping() -> Option<SessionVariableMapping> {
 }
 
 /// The concrete manager this binary serves.
-type ServerManager = SessionManager<
-    PgSnapshotSource,
-    ServerAuth,
-    ConnettoWatermark,
-    PgAsyncDieselConnector,
-    PgOplog,
->;
+type ServerManager =
+    SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgReadConnector, PgOplog>;
 
 /// R27 decision 6: move-out withdrawals are read on `DATABASE_URL`'s pool,
 /// because the policy that made those rows visible to the caller is exactly
@@ -635,7 +629,7 @@ async fn main() -> Result<()> {
     let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
     let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     let oplog = prepare_change_log(&pool, &slot, &publication, &oplog_table).await?;
-    let connector = PgAsyncDieselConnector::new(pool.clone());
+    let connector = PgReadConnector::new(pool.clone());
 
     let (reader_pool_size, reader_gate) = reader_split()?;
 
@@ -944,13 +938,7 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
 /// shutdown signal arrives.
 async fn run(
     manager: &Arc<
-        SessionManager<
-            PgSnapshotSource,
-            ServerAuth,
-            ConnettoWatermark,
-            PgAsyncDieselConnector,
-            PgOplog,
-        >,
+        SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgReadConnector, PgOplog>,
     >,
     pool: &Pool<AsyncPgConnection>,
     database_url: &str,
