@@ -1421,6 +1421,16 @@ where
         self.close_all(FatalErrorReason::ServerShuttingDown).await
     }
 
+    /// How many connections the registry holds right now.
+    ///
+    /// The handshake ack is written by `run_handshake` and the connection is
+    /// registered afterwards by `run_session`, so a client holding its ack is
+    /// not necessarily counted here yet. A caller that needs both to be true
+    /// waits for this to reach the number it expects.
+    pub async fn live_connections(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     /// Reconcile the change feed's resume position against what the log holds,
     /// declaring a resync epoch when the feed skipped a stretch.
     ///

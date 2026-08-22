@@ -52,6 +52,22 @@ async fn serve(fixture: &Fixture) -> Server {
     )
 }
 
+/// Wait until the registry holds `expected` connections.
+///
+/// The handshake ack is written before the connection is registered, so a
+/// test holding an ack cannot yet ask the registry about it. Without this the
+/// two assertions below fail about two runs in five.
+async fn await_registered(server: &Server, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.manager().live_connections().await < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{expected} connection(s) should have registered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// One insert of `id`, as a client uploads it.
 fn note(id: i64, body: &str) -> Vec<u8> {
     insert_changeset(
@@ -78,6 +94,7 @@ async fn revocation_closes_an_idle_connection() {
     let mut client = server.connect();
     let ack = client.handshake_with("conn-label", "user:alice").await;
     let handle = SessionId::from_str(&ack.session_token).expect("the ack carries the handle");
+    await_registered(&server, 1).await;
 
     assert!(
         server
@@ -107,6 +124,8 @@ async fn shutdown_closes_every_live_connection() {
     alice.handshake_with("alice-device", "user:alice").await;
     let mut bob = server.connect();
     bob.handshake_with("bob-device", "user:bob").await;
+
+    await_registered(&server, 2).await;
 
     assert_eq!(
         server.manager().shutdown().await,
