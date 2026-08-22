@@ -1,32 +1,26 @@
-//! R26 through the relay: a tab asks, the DB worker exports.
+//! R26/R56 through the relay: a tab asks, the DB worker exports.
 //!
-//! The worker connection is the only durable copy in this topology, so the
-//! archive has to come from the hub rather than from the asking tab's own
-//! in-memory mirror. This drives the real channel protocol: a real
-//! [`RelayHub`] over a real encrypted OPFS replica with a device-private tier
-//! beside it, the export service installed on it, and the page-side request
-//! function asking for the bytes.
-//!
-//! Runs in a dedicated worker for the sahpool VFS, and reads the reply back as
-//! a plain zip of plain SQLite databases, which is the promise the format
-//! makes. Asserting the bytes rather than the call's success is the point: the
-//! export attaches a scratch database through a URI, and whether the browser's
-//! SQLite build honours one is not something to assume.
+//! The archive format changed in R56: entries are SQLite change records
+//! (patchsets), not plain databases. Each patchset is decompressed and
+//! applied to a fresh in-memory connection, and the rows are read back.
+//! The bytes are checked before the rows: the wasm SQLite build has
+//! silently returned empty results before.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica, ReplicaKey};
+use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
+use diesel::connection::SimpleConnection;
 use connetto_web::RelayHub;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use connetto_web::workers::{request_export, serve_export_requests};
 use diesel::prelude::*;
+use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
 use std::io::{Cursor, Read};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 const REPLICA_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
@@ -53,20 +47,15 @@ diesel::table! {
     }
 }
 
-#[derive(diesel::QueryableByName)]
-struct NameRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-}
-
 fn config() -> ClientConfig {
     ClientConfig::new("r26-export").with_login(Some(connetto_client::Grant::new("user:tester")))
 }
 
-/// The archive a tab receives holds both tiers as readable SQLite, with the
-/// rows this device wrote and none of connetto's own bookkeeping.
+/// The archive a tab receives carries both tiers as patchsets. Applying each
+/// patchset to a fresh in-memory connection reads back the rows this device
+/// wrote.
 #[wasm_bindgen_test]
-async fn a_tab_receives_both_tiers_as_plain_sqlite() {
+async fn a_tab_receives_both_tiers_as_patchsets() {
     let storage = ReplicaStorage::install().await;
     let tier = tier_db_name(REPLICA);
     storage.delete_db(REPLICA).expect("clear an earlier replica");
@@ -99,7 +88,7 @@ async fn a_tab_receives_both_tiers_as_plain_sqlite() {
         .execute(worker.conn())
         .expect("write a device-private row");
 
-    // The hub takes the connection, so from here the archive is only reachable
+    // The hub takes the connection, so from here the data is only reachable
     // by asking the core, which is exactly what the export service does.
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
     wasm_bindgen_futures::spawn_local(async move {
@@ -107,70 +96,73 @@ async fn a_tab_receives_both_tiers_as_plain_sqlite() {
     });
     serve_export_requests(hub).expect("install the export service");
 
-    let bytes = request_export().await.expect("the worker answers");
+    let bytes = request_export(ExportScope::Everything)
+        .await
+        .expect("the worker answers");
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("a plain zip");
+
+    // Verify the manifest describes the new format.
     let manifest: serde_json::Value =
-        serde_json::from_slice(&entry(&mut archive, "manifest.json")).expect("manifest json");
+        serde_json::from_slice(&entry_raw(&mut archive, "manifest.json"))
+            .expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
-    assert_eq!(manifest["databases"][0]["tier"], "synced");
+    assert_eq!(manifest["version"], 2, "R56 version");
     assert_eq!(
-        manifest["databases"][1]["tier"], "device_private",
-        "the tier this device could otherwise lose is in the archive"
+        manifest["entries"][0]["path"], "synced.patchset",
+        "synced rows travel as a patchset"
+    );
+    assert_eq!(
+        manifest["entries"][1]["path"], "device-private.patchset",
+        "device-private rows travel as a patchset"
     );
 
-    let synced = entry(&mut archive, "synced.sqlite");
-    let private = entry(&mut archive, "device-private.sqlite");
-    assert!(
-        synced.starts_with(SQLITE_MAGIC) && private.starts_with(SQLITE_MAGIC),
-        "each entry is a database any SQLite tool opens, not an encrypted page image"
-    );
+    // Read both patchsets (stored zstd-compressed inside the zip entry).
+    let synced_zstd = entry_raw(&mut archive, "synced.patchset");
+    let private_zstd = entry_raw(&mut archive, "device-private.patchset");
+    assert!(!synced_zstd.is_empty(), "the synced patchset is not empty");
+    assert!(!private_zstd.is_empty(), "the device-private patchset is not empty");
 
-    let mut synced = opened(&synced);
+    let synced_patch = zstd::decode_all(synced_zstd.as_slice()).expect("decompress synced");
+    let private_patch = zstd::decode_all(private_zstd.as_slice()).expect("decompress private");
+    assert!(!synced_patch.is_empty(), "synced patchset decompresses to real bytes");
+    assert!(!private_patch.is_empty(), "private patchset decompresses to real bytes");
+
+    // Apply each patchset to a fresh in-memory connection and read the rows.
+    // This is the definitive proof: the wasm SQLite build has silently returned
+    // empty results before, so the byte check above and these queries are both
+    // required.
+    let mut synced_conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
+    synced_conn.batch_execute(REPLICA_DDL).expect("synced schema");
+    synced_conn
+        .apply_patchset(&synced_patch, |_| ConflictAction::Abort)
+        .expect("apply synced patchset");
     assert_eq!(
         items::table
             .select(items::label)
-            .load::<Option<String>>(&mut synced)
-            .expect("read the exported synced rows"),
+            .load::<Option<String>>(&mut synced_conn)
+            .expect("read synced rows"),
         vec![Some("synced".to_owned())]
     );
-    let mut private = opened(&private);
+
+    let mut private_conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
+    private_conn.batch_execute(TIER_DDL).expect("tier schema");
+    private_conn
+        .apply_patchset(&private_patch, |_| ConflictAction::Abort)
+        .expect("apply private patchset");
     assert_eq!(
         drafts::table
             .select(drafts::body)
-            .load::<Option<String>>(&mut private)
-            .expect("read the exported device-private rows"),
+            .load::<Option<String>>(&mut private_conn)
+            .expect("read private rows"),
         vec![Some("device-private".to_owned())]
     );
-    // The hub keys a durable write counter per tab inside the tier. It is
-    // connetto's bookkeeping, not the user's data, so it stays behind.
-    assert!(
-        !objects(&mut private).iter().any(|name| name.starts_with('_')),
-        "connetto's own tables are not part of a user's export"
-    );
 }
 
-/// One archive entry, read whole.
-fn entry(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
-    let mut entry = archive.by_name(name).expect("the entry is present");
+/// One archive entry as raw bytes. Data entries are zstd-compressed; the
+/// manifest is plain JSON. The caller decides which is which.
+fn entry_raw(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
+    let mut e = archive.by_name(name).expect("the entry is present");
     let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).expect("read the entry");
+    e.read_to_end(&mut bytes).expect("read the entry");
     bytes
-}
-
-/// An exported database, opened read-only from its bytes.
-fn opened(bytes: &[u8]) -> diesel::SqliteConnection {
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
-    conn.deserialize_readonly_database_from_buffer(bytes)
-        .expect("the bytes are a database");
-    conn
-}
-
-/// Every schema object name in an exported database.
-fn objects(conn: &mut diesel::SqliteConnection) -> Vec<String> {
-    diesel::sql_query("SELECT name FROM sqlite_schema")
-        .load::<NameRow>(conn)
-        .expect("read the schema")
-        .into_iter()
-        .map(|row| row.name)
-        .collect()
 }

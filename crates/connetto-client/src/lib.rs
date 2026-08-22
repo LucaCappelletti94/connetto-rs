@@ -61,6 +61,7 @@ use sqlite_diff_rs::{
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
 pub mod cipher;
@@ -76,6 +77,9 @@ mod subscriptions;
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
+pub use archive::{
+    Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome, ImportPlan, Keep,
+};
 #[cfg(feature = "native-auth")]
 pub use auth::{
     AcquiredSession, BrowserOpener, KeyringKeyStore, KeyringStore, MemoryKeyStore,
@@ -125,6 +129,12 @@ pub enum ClientError {
     /// Writing the local data export failed.
     #[error("export error: {0}")]
     Export(String),
+    /// Reading or applying a local data archive failed, or the archive was
+    /// refused: a schema, an account or a queue this replica cannot take. Every
+    /// refusal says which by name, because an import that fails has to tell the
+    /// person something they can act on.
+    #[error("import error: {0}")]
+    Import(String),
     /// The server advertised a schema version this client build does not match
     /// (either a different version or none at all), so this build is stale and
     /// the app must reload. connetto never migrates schemas at runtime.
@@ -1087,123 +1097,51 @@ fn is_internal_table(name: &str) -> bool {
     sqlite_own || name.starts_with("_connetto")
 }
 
-const EXPORT_FORMAT: &str = "connetto-local-data";
-const EXPORT_VERSION: u32 = 1;
-const EXPORT_MANIFEST: &str = "manifest.json";
-const EXPORT_SYNCED_DB: &str = "synced.sqlite";
-const EXPORT_DEVICE_PRIVATE_DB: &str = "device-private.sqlite";
 /// The schema an export's empty twins live under while the row patchset is
 /// taken. Its own name because the relay attaches a `blank` of its own to this
 /// same connection, and two attachments cannot share one name.
 const EXPORT_BLANK_SCHEMA: &str = "connetto_export_blank";
 
-#[derive(serde::Serialize)]
-struct ExportManifest {
-    format: &'static str,
-    version: u32,
-    databases: Vec<ExportDatabase>,
-}
-
-#[derive(serde::Serialize)]
-struct ExportDatabase {
-    tier: &'static str,
-    path: &'static str,
-}
-
 #[derive(diesel::QueryableByName)]
 struct ExportSchemaRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
-    kind: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    tbl_name: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     sql: Option<String>,
 }
 
-/// One exported table: the name it has on the replica, the name it gets in the
-/// archive (they differ for a policy-split table), and its stored DDL.
+/// One exported table: its name on the replica and its stored DDL, which the
+/// empty twin the rows are diffed against is built from.
+///
+/// Names travel verbatim, backing name and all: both ends of an archive run
+/// the same build, which the schema fingerprint enforces, so renaming a
+/// policy-split table to its logical name would only be a step to undo on the
+/// way back in (R56 decision 10).
 struct ExportTable {
-    physical: String,
-    logical: String,
+    name: String,
     ddl: String,
 }
-
 #[derive(diesel::QueryableByName)]
 struct ExportKeyRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     key_columns: i64,
 }
 
-fn zip_error(error: impl core::fmt::Display) -> ClientError {
-    ClientError::Export(format!("writing the zip archive: {error}"))
-}
-
-fn export_manifest(include_device_private: bool) -> Result<Vec<u8>, ClientError> {
-    let mut databases = vec![ExportDatabase {
-        tier: "synced",
-        path: EXPORT_SYNCED_DB,
-    }];
-    if include_device_private {
-        databases.push(ExportDatabase {
-            tier: "device_private",
-            path: EXPORT_DEVICE_PRIVATE_DB,
-        });
-    }
-    serde_json::to_vec_pretty(&ExportManifest {
-        format: EXPORT_FORMAT,
-        version: EXPORT_VERSION,
-        databases,
-    })
-    .map_err(|err| ClientError::Export(format!("encoding the manifest: {err}")))
-}
-
-fn write_export_archive(
-    synced: &[u8],
-    device_private: Option<&[u8]>,
-) -> Result<Vec<u8>, ClientError> {
-    let manifest = export_manifest(device_private.is_some())?;
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    archive
-        .start_file(EXPORT_MANIFEST, options)
-        .map_err(zip_error)?;
-    std::io::Write::write_all(&mut archive, &manifest).map_err(zip_error)?;
-    archive
-        .start_file(EXPORT_SYNCED_DB, options)
-        .map_err(zip_error)?;
-    std::io::Write::write_all(&mut archive, synced).map_err(zip_error)?;
-    if let Some(device_private) = device_private {
-        archive
-            .start_file(EXPORT_DEVICE_PRIVATE_DB, options)
-            .map_err(zip_error)?;
-        std::io::Write::write_all(&mut archive, device_private).map_err(zip_error)?;
-    }
-    archive
-        .finish()
-        .map(std::io::Cursor::into_inner)
-        .map_err(zip_error)
-}
-
-/// Build one archive database from one schema of `source`.
+/// Every row of one schema, as the change record an import applies.
 ///
-/// Rows travel as a session patchset rather than as generated SQL or a second
-/// connection onto an attached scratch database. The patchset carries every
-/// storage class verbatim, and the target is the `main` of its own connection,
-/// which is the only database `sqlite3_serialize` can reach and the only
-/// topology the browser's SQLite build offers (one connection per database).
-fn export_sqlite_schema(
+/// The rows are diffed against empty twins, which is what the relay does to
+/// build a tab's snapshot, and the record travels as it comes out: `R26`
+/// replayed it into a second database and serialized that, which is the half
+/// `R56` decision 10 deleted.
+fn export_rows(
     source: &mut SqliteConnection,
     source_schema: &str,
-    policy_tables: &PolicyTables,
     include: Option<&HashSet<String>>,
     hidden: &HashSet<String>,
 ) -> Result<Vec<u8>, ClientError> {
     let rows = export_schema_rows(source, source_schema)?;
     let mut tables = Vec::new();
-    for row in rows.iter().filter(|row| row.kind == "table") {
+    for row in &rows {
         if !export_table_allowed(&row.name, include, hidden) {
             continue;
         }
@@ -1211,7 +1149,7 @@ fn export_sqlite_schema(
             continue;
         };
         // A table with no primary key cannot be attached to a session, so its
-        // rows would be absent from the patchset. Refusing beats handing over an
+        // rows would be absent from the record. Refusing beats handing over an
         // archive whose tables are all present and one of them empty.
         if key_columns(source, source_schema, &row.name)? == 0 {
             return Err(ClientError::Export(format!(
@@ -1220,53 +1158,12 @@ fn export_sqlite_schema(
             )));
         }
         tables.push(ExportTable {
-            physical: row.name.clone(),
-            logical: policy_tables
-                .logical(&row.name)
-                .map_or_else(|| row.name.clone(), ToOwned::to_owned),
+            name: row.name.clone(),
             ddl: ddl.clone(),
         });
     }
-    let mut target = SqliteConnection::establish(":memory:")
-        .map_err(|err| ClientError::Export(format!("opening the export database: {err}")))?;
-    for table in &tables {
-        target.batch_execute(&rename_create_table(
-            &table.ddl,
-            &quote_ident(&table.logical),
-        )?)?;
-    }
-    export_rows(source, source_schema, &tables, &mut target)?;
-    // After the rows: filling an unindexed table and indexing it once is
-    // cheaper than maintaining the index per row.
-    for row in rows.iter().filter(|row| row.kind == "index") {
-        let Some(ddl) = row.sql.as_ref() else {
-            continue;
-        };
-        let Some(table) = tables
-            .iter()
-            .find(|table| table.physical.eq_ignore_ascii_case(&row.tbl_name))
-        else {
-            continue;
-        };
-        target.batch_execute(&rename_index_table(ddl, &table.logical)?)?;
-    }
-    Ok(target.serialize_database_to_buffer().as_slice().to_vec())
-}
-
-/// Move every row of `tables` into `target`, under the archive's names.
-///
-/// The patchset is taken by diffing each table against an empty twin, which is
-/// what the relay does to build a tab's snapshot. The twins need a database of
-/// their own attached to `source`, so the attach window is opened and sealed
-/// again around the whole batch.
-fn export_rows(
-    source: &mut SqliteConnection,
-    source_schema: &str,
-    tables: &[ExportTable],
-    target: &mut SqliteConnection,
-) -> Result<(), ClientError> {
     if tables.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // An in-memory database needs no creation permit, only the write one: the
     // twins are created inside it.
@@ -1276,7 +1173,7 @@ fn export_rows(
         EXPORT_BLANK_SCHEMA,
         harden::AttachPermits::Write,
     )?;
-    let patchset = export_patchset(source, source_schema, tables);
+    let patchset = export_patchset(source, source_schema, &tables);
     let detached = source
         .batch_execute(&format!(
             "DETACH DATABASE {}",
@@ -1286,18 +1183,7 @@ fn export_rows(
         .and_then(|()| harden::seal_attaches(source).map_err(ClientError::from));
     let patchset = patchset?;
     detached?;
-    if patchset.is_empty() {
-        return Ok(());
-    }
-    let renamed = rename_diffset(patchset, |physical| {
-        tables
-            .iter()
-            .find(|table| table.physical == physical && table.physical != table.logical)
-            .map(|table| table.logical.clone())
-    })?;
-    target
-        .apply_patchset(&renamed, |_| ConflictAction::Abort)
-        .map_err(|err| ClientError::Export(format!("filling the export database: {err}")))
+    Ok(patchset)
 }
 
 /// The patchset holding every row of `tables`, taken against empty twins in
@@ -1313,7 +1199,7 @@ fn export_patchset(
             &format!(
                 "{}.{}",
                 quote_ident(EXPORT_BLANK_SCHEMA),
-                quote_ident(&table.physical)
+                quote_ident(&table.name)
             ),
         )?;
         source.batch_execute(&twin)?;
@@ -1323,11 +1209,11 @@ fn export_patchset(
         .map_err(|err| ClientError::Export(format!("opening the export session: {err}")))?;
     for table in tables {
         session
-            .attach_by_name(&table.physical)
-            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.physical)))?;
+            .attach_by_name(&table.name)
+            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.name)))?;
         session
-            .diff(EXPORT_BLANK_SCHEMA, &table.physical)
-            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.physical)))?;
+            .diff(EXPORT_BLANK_SCHEMA, &table.name)
+            .map_err(|err| ClientError::Export(format!("reading {}: {err}", table.name)))?;
     }
     session
         .patchset()
@@ -1350,21 +1236,21 @@ fn key_columns(
     Ok(rows.first().map_or(0, |row| row.key_columns))
 }
 
+/// The tables of one schema, in creation order, each with the DDL SQLite kept.
 fn export_schema_rows(
     db: &mut SqliteConnection,
     source_schema: &str,
 ) -> Result<Vec<ExportSchemaRow>, ClientError> {
     diesel::sql_query(format!(
-        "SELECT type AS kind, name, tbl_name, sql FROM {}.sqlite_schema \
-         WHERE sql IS NOT NULL \
-         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
+        "SELECT name, sql FROM {}.sqlite_schema \
+         WHERE type = 'table' AND sql IS NOT NULL ORDER BY rowid",
         quote_ident(source_schema)
     ))
     .load(db)
     .map_err(ClientError::from)
 }
 
-fn export_table_allowed(
+pub(crate) fn export_table_allowed(
     name: &str,
     include: Option<&HashSet<String>>,
     hidden: &HashSet<String>,
@@ -1373,6 +1259,33 @@ fn export_table_allowed(
     !is_internal_table(name)
         && !hidden.contains(&lower)
         && include.is_none_or(|tables| tables.contains(&lower))
+}
+
+/// Refuse a restored write naming a table this build does not have.
+///
+/// SQLite skips a table absent from the target rather than reporting it, so
+/// without this a queued write would be restored, replayed, and quietly apply
+/// nothing (R56 decision 6).
+fn pending_tables(
+    changeset: &[u8],
+    known: &HashMap<String, Vec<String>>,
+) -> Result<(), ClientError> {
+    let parsed = ParsedDiffSet::parse(changeset)
+        .map_err(|err| ClientError::Import(format!("a restored write does not parse: {err}")))?;
+    let named: Vec<String> = match &parsed {
+        ParsedDiffSet::Changeset(set) => {
+            set.iter().map(|op| op.table().name().to_owned()).collect()
+        }
+        ParsedDiffSet::Patchset(set) => set.iter().map(|op| op.table().name().to_owned()).collect(),
+    };
+    for table in named {
+        if !known.contains_key(&table.to_lowercase()) {
+            return Err(ClientError::Import(format!(
+                "a queued write names table {table}, which this build does not have"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite a stored `CREATE TABLE` statement to name `target`, which is an
@@ -1392,19 +1305,6 @@ fn rename_create_table(sql: &str, target: &str) -> Result<String, ClientError> {
     Ok(replace_range(sql, range, target))
 }
 
-/// Rewrite a stored `CREATE INDEX` statement to index `table` instead. The
-/// index keeps its own name: the archive database holds one schema, and the
-/// names in it were already unique in the schema they came from.
-fn rename_index_table(sql: &str, table: &str) -> Result<String, ClientError> {
-    let Some(on) = find_ascii_ci(sql, " ON ") else {
-        return Err(ClientError::Export(format!("unsupported index DDL: {sql}")));
-    };
-    let pos = skip_ws(sql, on + " ON ".len());
-    let range = object_path_range(sql, pos)
-        .ok_or_else(|| ClientError::Export(format!("unsupported index DDL: {sql}")))?;
-    Ok(replace_range(sql, range, &quote_ident(table)))
-}
-
 fn replace_range(sql: &str, range: std::ops::Range<usize>, replacement: &str) -> String {
     let mut renamed = String::with_capacity(sql.len() + replacement.len());
     renamed.push_str(&sql[..range.start]);
@@ -1422,13 +1322,6 @@ fn starts_ci(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-}
-
-fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn skip_ws(value: &str, pos: usize) -> usize {
@@ -2340,31 +2233,265 @@ where
         &self.local_tables
     }
 
-    /// Return a zip archive with plain SQLite copies of the local data tiers.
+    /// Write an archive of this device's local data, which
+    /// [`import_local_data`](Self::import_local_data) reads back.
     ///
-    /// The archive contains `manifest.json`, `synced.sqlite`, and
-    /// `device-private.sqlite` when a local tier is attached. Authentication
-    /// state, sync cursors and pending transport state are not exported.
-    pub fn export_local_data(&mut self) -> Result<Vec<u8>, ClientError> {
-        let synced = export_sqlite_schema(
-            &mut self.db,
-            "main",
-            &self.config.policy_tables,
-            None,
-            &self.hidden_tables,
-        )?;
-        let device_private = if self.local_tables.is_empty() {
+    /// `scope` decides how much travels: [`ExportScope::Everything`] carries
+    /// the synced replica and the device-private tier, and
+    /// [`ExportScope::Unsynced`] carries only what an import restores, which is
+    /// the device-private tier and the writes that never reached the server.
+    /// Authentication state and sync cursors are never exported.
+    ///
+    /// Every entry is a SQLite change record, connetto's own binary format
+    /// rather than a database, so the file is read back by connetto and not by
+    /// an ordinary SQLite tool. Handing a person a readable copy of their data
+    /// is a different job with a different scope, which only the application
+    /// knows.
+    ///
+    /// **The archive is not encrypted.** It holds every row this device can
+    /// read, in the clear, so it is a bearer document: whoever holds the file
+    /// holds the data. That is deliberate, and it is why this is the only place
+    /// that says so. Put it somewhere you would put the data itself.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Export`] when a table has no declared primary key, since
+    /// SQLite records no changes for one and its rows would be silently absent.
+    pub fn export_local_data(&mut self, scope: ExportScope) -> Result<Vec<u8>, ClientError> {
+        let synced_rows = match scope {
+            ExportScope::Everything => Some(export_rows(
+                &mut self.db,
+                "main",
+                None,
+                &self.hidden_tables,
+            )?),
+            ExportScope::Unsynced => None,
+        };
+        let local_rows = if self.local_tables.is_empty() {
             None
         } else {
-            Some(export_sqlite_schema(
+            Some(export_rows(
                 &mut self.db,
                 LOCAL_SCHEMA,
-                &PolicyTables::default(),
                 Some(&self.local_tables),
                 &HashSet::new(),
             )?)
         };
-        write_export_archive(&synced, device_private.as_deref())
+        archive::write(&archive::Archive {
+            scope,
+            fingerprint: self.schema_fingerprint()?,
+            account: self.account(),
+            synced_rows,
+            local_rows,
+            pending: self.pending.values().cloned().collect(),
+        })
+    }
+
+    /// The fingerprint of the schema this replica runs, over both tiers.
+    fn schema_fingerprint(&mut self) -> Result<String, ClientError> {
+        let local = if self.local_tables.is_empty() {
+            None
+        } else {
+            Some(self.local_tables.clone())
+        };
+        let schemas: Vec<(&str, Option<&HashSet<String>>)> = match &local {
+            Some(tables) => vec![("main", None), (LOCAL_SCHEMA, Some(tables))],
+            None => vec![("main", None)],
+        };
+        archive::fingerprint(&mut self.db, &schemas, &self.hidden_tables)
+    }
+
+    /// The account this replica is signed in as, as the deployment's own policy
+    /// names it, or [`None`] when the deployment names no caller.
+    ///
+    /// The caller value is the one thing on the device that says whose rows
+    /// these are: it is what the server binds as the row-level-security
+    /// identity, so an archive and the replica it is imported into agree on it
+    /// or the import refuses. A deployment with no policy has no such value and
+    /// also nothing owning its rows, so the check has nothing to protect there.
+    fn account(&self) -> Option<String> {
+        self.config
+            .caller
+            .as_ref()
+            .map(|(_, identity)| identity.clone())
+    }
+
+    /// Read an archive, check it against this replica, and report what
+    /// applying it would overwrite. Nothing is written.
+    ///
+    /// Only what the server does not have is ever restored: the device-private
+    /// tier and the writes that never reached it. The cache of rows the server
+    /// already holds is skipped even when the archive carries it, because the
+    /// server sends those again and writing them back would have them deleted
+    /// without warning at the next refresh.
+    ///
+    /// Answer the plan's collisions with [`ImportChoices`] and hand both to
+    /// [`apply_import`](Self::apply_import). The file wins by default, and
+    /// never silently: the clashes are in the plan before anything is
+    /// overwritten.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Import`] naming the refusal: an archive of another
+    /// format or version, one made under a different schema, one belonging to
+    /// another account, a queue longer than this build holds, or a table this
+    /// build does not have.
+    pub fn import_local_data(&mut self, bytes: &[u8]) -> Result<ImportPlan, ClientError> {
+        let archive = archive::read(bytes)?;
+        let fingerprint = self.schema_fingerprint()?;
+        if archive.fingerprint != fingerprint {
+            return Err(ClientError::Import(
+                "the archive was made under a different schema than this build runs, so it cannot be restored here"
+                    .to_owned(),
+            ));
+        }
+        if archive.account != self.account() {
+            return Err(ClientError::Import(
+                "the archive belongs to another account, and an import only ever restores into the account that made it"
+                    .to_owned(),
+            ));
+        }
+        // Refused rather than trimmed: the queue evicts its oldest record when
+        // full, and giving up a write inside the feature whose purpose is not
+        // losing writes is the one thing an import must never do (R56).
+        let queued = self.pending.len().saturating_add(archive.pending.len());
+        if queued > PENDING_CAP {
+            return Err(ClientError::Import(format!(
+                "the archive carries {} queued writes and this replica already holds {}, which is past the {PENDING_CAP} it can hold",
+                archive.pending.len(),
+                self.pending.len()
+            )));
+        }
+        let local_columns = archive::schema_columns(
+            &mut self.db,
+            LOCAL_SCHEMA,
+            Some(&self.local_tables),
+            &HashSet::new(),
+        )?;
+        let main_columns =
+            archive::schema_columns(&mut self.db, "main", None, &self.hidden_tables)?;
+        // The queue's tables are checked here too, on the same terms: a
+        // changeset naming a table the target lacks is skipped by SQLite in
+        // silence.
+        for changeset in &archive.pending {
+            pending_tables(changeset, &main_columns)?;
+        }
+        let incoming = match &archive.local_rows {
+            Some(rows) => archive::read_rows(rows, &local_columns)?,
+            None => Vec::new(),
+        };
+        let held = if self.local_tables.is_empty() {
+            archive::index_rows(&[], &local_columns)?
+        } else {
+            let current = export_rows(
+                &mut self.db,
+                LOCAL_SCHEMA,
+                Some(&self.local_tables),
+                &HashSet::new(),
+            )?;
+            archive::index_rows(&current, &local_columns)?
+        };
+        let mut rows = Vec::with_capacity(incoming.len());
+        let mut collisions = Vec::new();
+        for row in incoming {
+            let collision = match held.get(&(row.table.clone(), row.key.clone())) {
+                Some(mine) if *mine != row.values => {
+                    collisions.push(archive::Collision {
+                        table: row.table.clone(),
+                        key: row.key.clone(),
+                        columns: row.columns.clone(),
+                        mine: mine.clone(),
+                        theirs: row.values.clone(),
+                    });
+                    Some(collisions.len() - 1)
+                }
+                _ => None,
+            };
+            rows.push(archive::PlannedRow {
+                table: row.table,
+                columns: row.columns,
+                key_columns: row.key_columns,
+                values: row.values,
+                collision,
+            });
+        }
+        Ok(ImportPlan {
+            archive,
+            rows,
+            collisions,
+        })
+    }
+
+    /// Apply a plan, honouring `choices` for every clash it reported.
+    ///
+    /// The device-private rows land in this build's schema, and each restored
+    /// write is applied locally **and** put back in the queue, which is the
+    /// pair an offline write already produces, so the replica ends where it
+    /// would have been had those writes been made here. The next connection
+    /// replays them through the ordinary path.
+    ///
+    /// The restored writes are numbered above this replica's own. A number
+    /// means something only inside one durable session handle and an archive
+    /// arrives under a different one, so the file's numbers would collide here
+    /// and say nothing to the server.
+    ///
+    /// The whole apply is one transaction, so an import is all or nothing.
+    /// SQLite rolls back a single failed apply on its own, measured in
+    /// `tests/apply_behaviour.rs`, but an import is a sequence of them and a
+    /// half-restored replica is exactly what this phase exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Import`] when a row or a queued write cannot be applied,
+    /// and [`ClientError::Db`] on a local database failure.
+    pub fn apply_import(
+        &mut self,
+        plan: &ImportPlan,
+        choices: &ImportChoices,
+    ) -> Result<ImportOutcome, ClientError> {
+        let mut outcome = ImportOutcome::default();
+        let mut restored: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut next_seq = self.next_seq;
+        {
+            // Suspended for the whole apply, so restoring a write does not
+            // capture a second write of the same rows.
+            let _suspended = SuspendedCapture::new(&mut self.session);
+            self.db.transaction::<(), ClientError, _>(|db| {
+                for row in &plan.rows {
+                    if choices.answer(row.collision) == Keep::Mine {
+                        outcome.rows_kept += 1;
+                        continue;
+                    }
+                    archive::write_row(
+                        db,
+                        LOCAL_SCHEMA,
+                        &row.table,
+                        &row.columns,
+                        &row.key_columns,
+                        &row.values,
+                    )?;
+                    outcome.rows_restored += 1;
+                }
+                for changeset in &plan.archive.pending {
+                    // A row this changeset updates or deletes that the replica
+                    // never held is omitted rather than failing: the cache is
+                    // not imported, so it may not be here, and the server
+                    // settles the write when it goes up.
+                    db.apply_changeset(changeset, |_| ConflictAction::Omit)
+                        .map_err(|err| {
+                            ClientError::Import(format!("applying a restored write: {err}"))
+                        })?;
+                    persist_pending(db, next_seq, changeset)?;
+                    restored.push((next_seq, changeset.clone()));
+                    next_seq += 1;
+                    outcome.writes_restored += 1;
+                }
+                Ok(())
+            })?;
+        }
+        self.next_seq = next_seq;
+        self.pending.extend(restored);
+        Ok(outcome)
     }
 
     /// How the key protecting this replica is held.
@@ -3628,5 +3755,136 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
         conn.set_custody(Custody::Verified);
         assert_eq!(conn.custody(), Custody::Verified);
+    }
+
+    /// A device with a device-private tier, for the two refusals an honest
+    /// export of the same build cannot produce.
+    fn tiered_connection(dir: &tempfile::TempDir) -> ConnettoConnection<FakeTransport> {
+        let replica_path = dir.path().join("replica.db");
+        let tier_path = dir.path().join("tier.db");
+        let replica = Replica::encrypted_file(
+            replica_path.to_str().expect("path is utf-8"),
+            Some(ReplicaKey::from_bytes([0x11; ReplicaKey::LEN])),
+        )
+        .expect("replica")
+        .with_tier(
+            tier_path.to_str().expect("path is utf-8"),
+            "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)",
+        );
+        ConnettoConnection::<FakeTransport>::open(
+            &replica,
+            DDL,
+            &ClientConfig::new("refusal-test"),
+            None,
+        )
+        .expect("open replica")
+    }
+
+    /// An archive naming a table this build does not have is refused.
+    ///
+    /// It cannot arrive from an honest export of the same build, because the
+    /// schema fingerprint would differ first, so the archive is built here.
+    /// The check stays because the file is not authenticated and SQLite skips
+    /// an absent table in silence rather than reporting it.
+    #[test]
+    fn an_archive_naming_an_unknown_table_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut conn = tiered_connection(&dir);
+        let fingerprint = conn.schema_fingerprint().expect("fingerprint");
+        let rows = {
+            // A record naming a table that exists nowhere, built the way the
+            // export builds one.
+            let mut other = SqliteConnection::establish(":memory:").expect("scratch");
+            other
+                .batch_execute(
+                    "CREATE TABLE ghosts (id INTEGER PRIMARY KEY, body TEXT);
+                     INSERT INTO ghosts (id, body) VALUES (1, 'boo');",
+                )
+                .expect("scratch schema");
+            export_rows(&mut other, "main", None, &HashSet::new()).expect("record")
+        };
+        let bytes = archive::write(&archive::Archive {
+            scope: ExportScope::Unsynced,
+            fingerprint,
+            account: None,
+            synced_rows: None,
+            local_rows: Some(rows),
+            pending: Vec::new(),
+        })
+        .expect("write archive");
+        match conn.import_local_data(&bytes) {
+            Err(ClientError::Import(message)) => {
+                assert!(
+                    message.contains("ghosts"),
+                    "the refusal names it: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {}", other.is_ok()),
+        }
+    }
+
+    /// The cap bounds the queue after the import, not the archive alone: a
+    /// replica already holding writes of its own has that much less room, and
+    /// the eviction that would otherwise take the difference is silent.
+    #[test]
+    fn a_queue_that_does_not_fit_beside_the_replicas_own_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut conn = tiered_connection(&dir);
+        let fingerprint = conn.schema_fingerprint().expect("fingerprint");
+        // The replica is already at its cap, so one more write does not fit.
+        for seq in 0..PENDING_CAP as u64 {
+            conn.pending.insert(seq, Vec::new());
+        }
+        let bytes = archive::write(&archive::Archive {
+            scope: ExportScope::Unsynced,
+            fingerprint,
+            account: None,
+            synced_rows: None,
+            local_rows: None,
+            pending: vec![Vec::new()],
+        })
+        .expect("write archive");
+        match conn.import_local_data(&bytes) {
+            Err(ClientError::Import(message)) => {
+                assert!(
+                    message.contains("already holds 256"),
+                    "the refusal names what is already queued: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {}", other.is_ok()),
+        }
+    }
+
+    /// A queue longer than the replica holds is refused whole rather than
+    /// trimmed, because the queue evicts its oldest record when full and an
+    /// import may never give up a write.
+    ///
+    /// Also unreachable from an honest export, for the same reason from the
+    /// other side: the source's own queue is capped at `PENDING_CAP`.
+    #[test]
+    fn an_oversized_queue_is_refused_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut conn = tiered_connection(&dir);
+        let fingerprint = conn.schema_fingerprint().expect("fingerprint");
+        // The records themselves are never reached: the count is checked
+        // first, which is the point.
+        let bytes = archive::write(&archive::Archive {
+            scope: ExportScope::Unsynced,
+            fingerprint,
+            account: None,
+            synced_rows: None,
+            local_rows: None,
+            pending: vec![Vec::new(); PENDING_CAP + 1],
+        })
+        .expect("write archive");
+        match conn.import_local_data(&bytes) {
+            Err(ClientError::Import(message)) => {
+                assert!(
+                    message.contains("queued writes") && message.contains("256"),
+                    "the refusal names the cap: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {}", other.is_ok()),
+        }
     }
 }

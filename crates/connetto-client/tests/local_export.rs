@@ -1,8 +1,8 @@
 //! Local data export contract tests.
 
-use connetto_client::{ClientConfig, ConnettoConnection, PolicyTables, Replica};
-use diesel::connection::SimpleConnection;
+use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, PolicyTables, Replica};
 use diesel::prelude::*;
+use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
@@ -13,49 +13,54 @@ CREATE INDEX items_label_idx ON items(label);
 ";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT;";
 
-#[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
-struct ItemRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    id: i32,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    label: String,
-    #[diesel(sql_type = diesel::sql_types::Binary)]
-    payload: Vec<u8>,
+diesel::table! {
+    /// Synced test table for items.
+    items (id) {
+        /// Item identifier, the primary key.
+        id -> Integer,
+        /// Label text, may contain NUL bytes.
+        label -> Text,
+        /// Binary payload.
+        payload -> Binary,
+    }
 }
 
-#[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
-struct DraftRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    id: i32,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    body: String,
+diesel::table! {
+    /// Device-private test table for drafts.
+    drafts (id) {
+        /// Draft identifier, the primary key.
+        id -> Integer,
+        /// Draft body text, may contain NUL bytes.
+        body -> Text,
+    }
 }
 
-#[derive(diesel::QueryableByName)]
-struct NameRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-}
-
-#[derive(diesel::QueryableByName)]
-struct SchemaKindRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    kind: String,
+diesel::table! {
+    /// Physical backing table for the policy-split orders table.
+    orders_rls (id) {
+        /// Order identifier, the primary key.
+        id -> Integer,
+        /// Owner identity column, used by the row-level-security view.
+        owner_id -> Text,
+        /// Binary order payload.
+        payload -> Binary,
+    }
 }
 
 #[test]
-fn local_export_is_a_plain_zip_with_synced_and_device_private_databases() {
+#[allow(clippy::too_many_lines)]
+fn archive_carries_manifest_and_compressed_patchset_entries() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let replica_path = dir.path().join("replica.sqlite");
     let tier_path = dir.path().join("tier.sqlite");
-    let replica_path = replica_path.to_str().expect("utf-8 path").to_owned();
-    let tier_path = tier_path.to_str().expect("utf-8 path").to_owned();
+    let replica_path_str = replica_path.to_str().expect("utf-8 path").to_owned();
+    let tier_path_str = tier_path.to_str().expect("utf-8 path").to_owned();
     let replica = Replica::encrypted_file(
-        &replica_path,
+        &replica_path_str,
         Some(connetto_core::test_support::replica_key()),
     )
     .expect("replica key")
-    .with_tier(&tier_path, TIER_DDL);
+    .with_tier(&tier_path_str, TIER_DDL);
     let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
         &replica,
         SYNCED_DDL,
@@ -64,100 +69,230 @@ fn local_export_is_a_plain_zip_with_synced_and_device_private_databases() {
     )
     .expect("open replica");
 
-    conn.conn()
-        .batch_execute(
-            "CREATE INDEX connetto_local.drafts_body_idx ON drafts(body);
-             INSERT INTO items (id, label, payload) VALUES (1, 'alpha', X'0001ff');
-             INSERT INTO drafts (id, body) VALUES (7, 'draft');",
-        )
-        .expect("seed local rows");
-    diesel::sql_query("INSERT INTO items (id, label, payload) VALUES (?, ?, ?)")
-        .bind::<diesel::sql_types::Integer, _>(2)
-        .bind::<diesel::sql_types::Text, _>("nul\0text")
-        .bind::<diesel::sql_types::Binary, _>(vec![2, 3])
+    diesel::insert_into(items::table)
+        .values(&[
+            (
+                items::id.eq(1),
+                items::label.eq("alpha"),
+                items::payload.eq(vec![0u8, 1, 255]),
+            ),
+            (
+                items::id.eq(2),
+                items::label.eq("nul\0text"),
+                items::payload.eq(vec![2u8, 3]),
+            ),
+        ])
         .execute(conn.conn())
-        .expect("seed text with nul");
-    diesel::sql_query("INSERT INTO drafts (id, body) VALUES (?, ?)")
-        .bind::<diesel::sql_types::Integer, _>(8)
-        .bind::<diesel::sql_types::Text, _>("draft\0body")
+        .expect("seed items");
+    diesel::insert_into(drafts::table)
+        .values(&[
+            (drafts::id.eq(7), drafts::body.eq("draft")),
+            (drafts::id.eq(8), drafts::body.eq("draft\0body")),
+        ])
         .execute(conn.conn())
-        .expect("seed private text with nul");
+        .expect("seed drafts");
 
-    let bytes = conn.export_local_data().expect("export local data");
+    let bytes = conn
+        .export_local_data(ExportScope::Everything)
+        .expect("export local data");
+
+    // Encrypted replica files are not readable as plain SQLite.
     assert!(
         !std::fs::read(&replica_path)
-            .expect("read encrypted replica")
+            .expect("read replica file")
             .starts_with(SQLITE_MAGIC)
     );
     assert!(
         !std::fs::read(&tier_path)
-            .expect("read encrypted tier")
+            .expect("read tier file")
             .starts_with(SQLITE_MAGIC)
     );
 
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open export archive");
-    let manifest = zip_entry(&mut archive, "manifest.json");
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest).expect("manifest json");
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+
+    // Manifest carries format, version 2, scope, schema fingerprint, and account.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&zip_entry(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
-    assert_eq!(manifest["version"], 1);
-    assert_eq!(manifest["databases"][0]["tier"], "synced");
-    assert_eq!(manifest["databases"][1]["tier"], "device_private");
-
-    let synced = zip_entry(&mut archive, "synced.sqlite");
-    let device_private = zip_entry(&mut archive, "device-private.sqlite");
-    assert!(synced.starts_with(SQLITE_MAGIC));
-    assert!(device_private.starts_with(SQLITE_MAGIC));
-
-    let mut synced = open_exported(&synced);
-    let items = diesel::sql_query("SELECT id, label, payload FROM items ORDER BY id")
-        .load::<ItemRow>(&mut synced)
-        .expect("read exported synced rows");
-    assert_eq!(
-        items,
-        vec![
-            ItemRow {
-                id: 1,
-                label: "alpha".to_owned(),
-                payload: vec![0, 1, 255],
-            },
-            ItemRow {
-                id: 2,
-                label: "nul\0text".to_owned(),
-                payload: vec![2, 3],
-            },
-        ]
+    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["scope"], "everything");
+    assert!(
+        manifest["schema_fingerprint"].is_string(),
+        "schema_fingerprint must be a string"
     );
-    assert!(index_names(&mut synced, "items").contains(&"items_label_idx".to_owned()));
-    assert!(internal_names(&mut synced).is_empty());
-
-    let mut device_private = open_exported(&device_private);
-    let drafts = diesel::sql_query("SELECT id, body FROM drafts ORDER BY id")
-        .load::<DraftRow>(&mut device_private)
-        .expect("read exported device-private rows");
-    assert_eq!(
-        drafts,
-        vec![
-            DraftRow {
-                id: 7,
-                body: "draft".to_owned(),
-            },
-            DraftRow {
-                id: 8,
-                body: "draft\0body".to_owned(),
-            },
-        ]
+    assert!(
+        manifest.get("account").is_some(),
+        "account must be present in the manifest"
     );
-    assert!(index_names(&mut device_private, "drafts").contains(&"drafts_body_idx".to_owned()));
-    assert!(internal_names(&mut device_private).is_empty());
+
+    // Entries are not SQLite databases: the magic must be absent.
+    let synced_raw = zip_entry(&mut archive, "synced.patchset");
+    let device_raw = zip_entry(&mut archive, "device-private.patchset");
+    assert!(
+        !synced_raw.starts_with(SQLITE_MAGIC),
+        "synced.patchset must not be a SQLite database"
+    );
+    assert!(
+        !device_raw.starts_with(SQLITE_MAGIC),
+        "device-private.patchset must not be a SQLite database"
+    );
+
+    // Entries are zstd-compressed and parse as patchsets.
+    let synced_bytes = zstd::decode_all(synced_raw.as_slice()).expect("decompress synced");
+    let device_bytes = zstd::decode_all(device_raw.as_slice()).expect("decompress device-private");
+    let synced = ParsedDiffSet::parse(&synced_bytes).expect("parse synced patchset");
+    let device = ParsedDiffSet::parse(&device_bytes).expect("parse device-private patchset");
+    assert!(synced.is_patchset(), "synced must be a patchset");
+    assert!(device.is_patchset(), "device-private must be a patchset");
+
+    // No connetto-internal or sqlite-internal tables appear in the patchsets.
+    for schema in synced.table_schemas() {
+        let name = schema.name();
+        assert!(
+            !name.starts_with("_connetto"),
+            "internal table {name} must not appear in synced patchset"
+        );
+        assert!(
+            !name.to_ascii_lowercase().starts_with("sqlite"),
+            "sqlite table {name} must not appear in synced patchset"
+        );
+    }
+    for schema in device.table_schemas() {
+        let name = schema.name();
+        assert!(
+            !name.starts_with("_connetto"),
+            "internal table {name} must not appear in device-private patchset"
+        );
+        assert!(
+            !name.to_ascii_lowercase().starts_with("sqlite"),
+            "sqlite table {name} must not appear in device-private patchset"
+        );
+    }
+
+    // Binary values and text holding NUL survive in the patchset records.
+    let item_rows: Vec<_> = patchset_inserts(&synced)
+        .into_iter()
+        .filter(|(t, _)| t == "items")
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        item_rows
+            .iter()
+            .any(|row| row.contains(&Value::Blob(vec![0u8, 1, 255]))),
+        "binary blob must survive in the synced patchset"
+    );
+    assert!(
+        item_rows
+            .iter()
+            .any(|row| row.contains(&Value::Text("nul\0text".to_owned()))),
+        "text with NUL must survive in the synced patchset"
+    );
+
+    let draft_rows: Vec<_> = patchset_inserts(&device)
+        .into_iter()
+        .filter(|(t, _)| t == "drafts")
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        draft_rows
+            .iter()
+            .any(|row| row.contains(&Value::Text("draft\0body".to_owned()))),
+        "text with NUL must survive in the device-private patchset"
+    );
 }
 
 #[test]
-fn local_export_materializes_split_policy_tables_under_logical_names() {
+fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
+    let replica = Replica::in_memory().with_tier(TIER_DDL);
+    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
+        &replica,
+        SYNCED_DDL,
+        &ClientConfig::new("scope-test".to_owned()),
+        None,
+    )
+    .expect("open replica");
+
+    diesel::insert_into(items::table)
+        .values((
+            items::id.eq(1),
+            items::label.eq("row"),
+            items::payload.eq(vec![1u8]),
+        ))
+        .execute(conn.conn())
+        .expect("seed synced row");
+    diesel::insert_into(drafts::table)
+        .values((drafts::id.eq(1), drafts::body.eq("draft")))
+        .execute(conn.conn())
+        .expect("seed private row");
+
+    // ExportScope::Everything carries both tiers.
+    let bytes_all = conn
+        .export_local_data(ExportScope::Everything)
+        .expect("export everything");
+    let mut arch_all = ZipArchive::new(Cursor::new(bytes_all)).expect("open zip");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&zip_entry(&mut arch_all, "manifest.json"))
+            .expect("manifest")["scope"],
+        "everything"
+    );
+    assert!(
+        arch_all.by_name("synced.patchset").is_ok(),
+        "synced.patchset must be present under everything"
+    );
+    assert!(
+        arch_all.by_name("device-private.patchset").is_ok(),
+        "device-private.patchset must be present under everything"
+    );
+
+    // ExportScope::Unsynced omits the synced replica but keeps the private tier.
+    let bytes_unsynced = conn
+        .export_local_data(ExportScope::Unsynced)
+        .expect("export unsynced");
+    let mut arch_unsynced = ZipArchive::new(Cursor::new(bytes_unsynced)).expect("open zip");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&zip_entry(
+            &mut arch_unsynced,
+            "manifest.json"
+        ))
+        .expect("manifest")["scope"],
+        "unsynced"
+    );
+    assert!(
+        arch_unsynced.by_name("synced.patchset").is_err(),
+        "synced.patchset must be absent under unsynced"
+    );
+    assert!(
+        arch_unsynced.by_name("device-private.patchset").is_ok(),
+        "device-private.patchset must be present under unsynced"
+    );
+}
+
+#[test]
+fn table_without_primary_key_is_refused_by_name() {
+    let replica = Replica::in_memory();
+    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
+        &replica,
+        "CREATE TABLE nokey (name TEXT NOT NULL);",
+        &ClientConfig::new("nopk-test".to_owned()),
+        None,
+    )
+    .expect("open replica");
+    let err = conn
+        .export_local_data(ExportScope::Everything)
+        .expect_err("must refuse a table without a primary key");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("nokey"),
+        "error must name the refused table: {msg}"
+    );
+}
+
+#[test]
+fn policy_split_table_rows_travel_in_the_synced_patchset() {
     let ddl = "
 CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL, payload BLOB NOT NULL) STRICT;
 CREATE VIEW orders AS SELECT id, owner_id, payload FROM orders_rls WHERE owner_id = connetto_user();
 CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
-INSERT INTO orders_rls (id, owner_id, payload) VALUES (1, 'alice', X'aabb');
 ";
     let config = ClientConfig::new("export-rls".to_owned())
         .with_sql_functions(connetto_client::SqlFunctions::default())
@@ -172,26 +307,52 @@ INSERT INTO orders_rls (id, owner_id, payload) VALUES (1, 'alice', X'aabb');
     )
     .expect("open split replica");
 
-    let bytes = conn.export_local_data().expect("export local data");
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open export archive");
-    let synced = zip_entry(&mut archive, "synced.sqlite");
-    let mut synced = open_exported(&synced);
+    diesel::insert_into(orders_rls::table)
+        .values((
+            orders_rls::id.eq(1),
+            orders_rls::owner_id.eq("alice"),
+            orders_rls::payload.eq(vec![0xaau8, 0xbb]),
+        ))
+        .execute(conn.conn())
+        .expect("seed order row");
 
-    let objects = object_names(&mut synced);
-    assert!(objects.contains(&"orders".to_owned()));
-    assert!(!objects.contains(&"orders_rls".to_owned()));
-    assert_eq!(object_kind(&mut synced, "orders"), "table");
-    assert!(index_names(&mut synced, "orders").contains(&"orders_rls_owner_idx".to_owned()));
-    let rows = diesel::sql_query("SELECT id, owner_id AS label, payload FROM orders ORDER BY id")
-        .load::<ItemRow>(&mut synced)
-        .expect("read exported logical table");
-    assert_eq!(
-        rows,
-        vec![ItemRow {
-            id: 1,
-            label: "alice".to_owned(),
-            payload: vec![170, 187],
-        }]
+    let bytes = conn
+        .export_local_data(ExportScope::Everything)
+        .expect("export local data");
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+    let raw = zip_entry(&mut archive, "synced.patchset");
+    let decompressed = zstd::decode_all(raw.as_slice()).expect("decompress synced");
+    let patchset = ParsedDiffSet::parse(&decompressed).expect("parse patchset");
+
+    // Rows travel under the physical backing name, not the view name.
+    let names = patchset_table_names(&patchset);
+    assert!(
+        names.contains(&"orders_rls".to_owned()),
+        "physical backing table orders_rls must appear in the synced patchset"
+    );
+    assert!(
+        !names.contains(&"orders".to_owned()),
+        "view orders must not appear as a table in the synced patchset"
+    );
+
+    let rows: Vec<_> = patchset_inserts(&patchset)
+        .into_iter()
+        .filter(|(t, _)| t == "orders_rls")
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "orders_rls must have rows in the patchset"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains(&Value::Text("alice".to_owned()))),
+        "owner_id must survive in the patchset row"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains(&Value::Blob(vec![0xaau8, 0xbb]))),
+        "payload must survive in the patchset row"
     );
 }
 
@@ -202,48 +363,25 @@ fn zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
     bytes
 }
 
-fn open_exported(bytes: &[u8]) -> diesel::SqliteConnection {
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
-    conn.deserialize_readonly_database_from_buffer(bytes)
-        .expect("deserialize sqlite");
-    conn
-}
-
-fn index_names(conn: &mut diesel::SqliteConnection, table: &str) -> Vec<String> {
-    diesel::sql_query(format!("SELECT name FROM pragma_index_list('{table}')"))
-        .load::<NameRow>(conn)
-        .expect("read index list")
+fn patchset_table_names(patchset: &ParsedDiffSet) -> Vec<String> {
+    patchset
+        .table_schemas()
         .into_iter()
-        .map(|row| row.name)
+        .map(|s| s.name().clone())
         .collect()
 }
 
-fn internal_names(conn: &mut diesel::SqliteConnection) -> Vec<String> {
-    diesel::sql_query("SELECT name FROM sqlite_schema WHERE name GLOB '_connetto*'")
-        .load::<NameRow>(conn)
-        .expect("read internal names")
-        .into_iter()
-        .map(|row| row.name)
-        .collect()
-}
+/// One insert a record carries: the table it names and its row values.
+type Insert = (String, Vec<Value<String, Vec<u8>>>);
 
-fn object_names(conn: &mut diesel::SqliteConnection) -> Vec<String> {
-    diesel::sql_query("SELECT name FROM sqlite_schema")
-        .load::<NameRow>(conn)
-        .expect("read object names")
-        .into_iter()
-        .map(|row| row.name)
-        .collect()
-}
-
-fn object_kind(conn: &mut diesel::SqliteConnection, name: &str) -> String {
-    diesel::sql_query(format!(
-        "SELECT type AS kind FROM sqlite_schema WHERE name = '{name}'"
-    ))
-    .load::<SchemaKindRow>(conn)
-    .expect("read object kind")
-    .into_iter()
-    .next()
-    .expect("object exists")
-    .kind
+fn patchset_inserts(patchset: &ParsedDiffSet) -> Vec<Insert> {
+    let mut ops = Vec::new();
+    if let ParsedDiffSet::Patchset(ds) = patchset {
+        for op in ds.iter() {
+            if let PatchsetOp::Insert { table, values, .. } = op {
+                ops.push((table.name().clone(), values.to_vec()));
+            }
+        }
+    }
+    ops
 }

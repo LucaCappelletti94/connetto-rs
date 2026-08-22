@@ -62,8 +62,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
-    AffectedRow, ClientError, ClientEvent, ConnettoConnection, PolicyTables,
-    subscription_is_aggregate, subscription_tables,
+    AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
+    ImportOutcome, PolicyTables, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
@@ -141,6 +141,17 @@ pub enum ExportRefused {
     Failed(String),
 }
 
+/// Why an import request came back without an outcome.
+#[derive(Debug, thiserror::Error)]
+pub enum ImportRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the import was refused or failed.
+    #[error("import: {0}")]
+    Failed(String),
+}
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -170,7 +181,12 @@ enum HubEvent {
     Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
-    Export(futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>),
+    Export(ExportScope, futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>),
+    /// Import an archive: device-private rows and queued writes. Same reason.
+    Import(
+        Vec<u8>,
+        futures_channel::oneshot::Sender<Result<(ImportOutcome, usize), ClientError>>,
+    ),
 }
 
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
@@ -605,26 +621,47 @@ impl RelayHub {
         answer.await.map_err(|_| HubGone)
     }
 
-    /// A zip archive of the worker's local data: the synced replica and the
-    /// device-private tier beside it, as plain SQLite databases.
+    /// A zip archive of the worker's local data, scoped as requested.
     ///
-    /// The worker connection is the only durable copy in this topology. A tab
-    /// mirror holds whatever its subscriptions cover, in memory, so exporting
-    /// one would hand the user a subset that disappears on reload.
+    /// The worker connection is the only durable copy in this topology.
     ///
     /// # Errors
     ///
-    /// [`ExportRefused::Gone`] when the core has ended, so no answer will come.
+    /// [`ExportRefused::Gone`] when the core has ended.
     /// [`ExportRefused::Failed`] when the core answered and the export failed.
-    pub async fn export_local_data(&self) -> Result<Vec<u8>, ExportRefused> {
+    pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ExportRefused> {
         let (reply, answer) = futures_channel::oneshot::channel();
         self.events
-            .send(HubEvent::Export(reply))
+            .send(HubEvent::Export(scope, reply))
             .map_err(|_| HubGone)?;
         answer
             .await
             .map_err(|_| HubGone)?
             .map_err(|err| ExportRefused::Failed(err.to_string()))
+    }
+
+    /// Apply an archive to the worker connection: device-private rows and
+    /// queued writes. Every clash resolves in the file's favour.
+    ///
+    /// Returns the outcome and the number of rows where the file won over a
+    /// locally held version.
+    ///
+    /// # Errors
+    ///
+    /// [`ImportRefused::Gone`] when the core has ended.
+    /// [`ImportRefused::Failed`] when the plan or apply step is refused.
+    pub async fn import_local_data(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<(ImportOutcome, usize), ImportRefused> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events
+            .send(HubEvent::Import(bytes, reply))
+            .map_err(|_| HubGone)?;
+        answer
+            .await
+            .map_err(|_| HubGone)?
+            .map_err(|err| ImportRefused::Failed(err.to_string()))
     }
 }
 
@@ -748,8 +785,16 @@ where
                 // Runs on the core because it reads the connection, and it
                 // holds the core for its duration: a tab frame arriving
                 // mid-export waits rather than writing into the copy.
-                Some(HubEvent::Export(reply)) => {
-                    let _ = reply.send(worker.export_local_data());
+                Some(HubEvent::Export(scope, reply)) => {
+                    let _ = reply.send(worker.export_local_data(scope));
+                }
+                Some(HubEvent::Import(bytes, reply)) => {
+                    let result = worker.import_local_data(&bytes).and_then(|plan| {
+                        let collisions = plan.collisions().len();
+                        let choices = ImportChoices::keeping_the_file();
+                        worker.apply_import(&plan, &choices).map(|o| (o, collisions))
+                    });
+                    let _ = reply.send(result);
                 }
                 // Removing the state drops the tab's sender, and the shovel
                 // answers the closed channel by closing the transport.

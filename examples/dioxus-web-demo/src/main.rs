@@ -34,8 +34,8 @@ use std::{
 };
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Custody, NoGate, PolicyTables,
-    Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Custody, ExportScope, NoGate,
+    PolicyTables, Replica,
     teardown::{ExpiryWarning, expiry_warning},
 };
 use connetto_core::messages::FatalErrorReason;
@@ -1229,6 +1229,7 @@ fn Dashboard() -> Element {
 
     // R26: the last export's outcome, so a failed one is not silent.
     let mut export_status: Signal<Option<String>> = use_signal(|| None);
+    let mut import_status: Signal<Option<String>> = use_signal(|| None);
 
     // R15 retention readout: the tab mirror's page footprint, refreshed on
     // mount and whenever the covered rows move.
@@ -1388,13 +1389,15 @@ fn Dashboard() -> Element {
             }
             div { class: "pane",
                 h2 { "your data " span { class: "badge local", "R26" } }
-                p { "A zip of plain SQLite databases, one per tier, readable with any SQLite tool." }
+                p { "Save a zip archive of this device's local data. The archive is not \
+                     encrypted and holds every row the device can read: whoever holds \
+                     the file holds the data." }
                 p { "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }
                 div { class: "row",
                     button {
                         onclick: move |_| {
                             spawn(async move {
-                                let message = match workers::request_export().await {
+                                let message = match workers::request_export(ExportScope::Everything).await {
                                     Ok(bytes) => {
                                         let len = bytes.len();
                                         match download_bytes(EXPORT_FILE_NAME, &bytes) {
@@ -1411,6 +1414,48 @@ fn Dashboard() -> Element {
                     }
                 }
                 if let Some(message) = export_status.read().clone() {
+                    p { style: "font-family:monospace;font-size:0.85em;color:#555;", {message} }
+                }
+                div { class: "row",
+                    input {
+                        id: "import-file-input",
+                        r#type: "file",
+                        accept: ".zip",
+                        onchange: move |_| {
+                            let window = web_sys::window().expect("window");
+                            let input: web_sys::HtmlInputElement = window
+                                .document().expect("document")
+                                .get_element_by_id("import-file-input").expect("import input")
+                                .unchecked_into();
+                            if let Some(files) = input.files() {
+                                if let Some(file) = files.get(0) {
+                                    spawn(async move {
+                                        let message = match workers::request_import(file).await {
+                                            Ok((outcome, clashes)) => {
+                                                let mut msg = format!(
+                                                    "{} row(s) restored, {} kept, \
+                                                     {} write(s) restored",
+                                                    outcome.rows_restored,
+                                                    outcome.rows_kept,
+                                                    outcome.writes_restored
+                                                );
+                                                if clashes > 0 {
+                                                    msg.push_str(&format!(
+                                                        " ({clashes} clash(es) resolved to file)"
+                                                    ));
+                                                }
+                                                msg
+                                            }
+                                            Err(err) => format!("refused: {err}"),
+                                        };
+                                        import_status.set(Some(message));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(message) = import_status.read().clone() {
                     p { style: "font-family:monospace;font-size:0.85em;color:#555;", {message} }
                 }
             }

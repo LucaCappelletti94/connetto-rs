@@ -83,7 +83,10 @@ subql = { workspace = true, features = ["diesel-typed-sqlite"] }
 # LiveValue.
 serde.workspace = true
 serde_json = "1"
-# Local data export archives, written stored so wasm needs no compressor.
+# Local data archives. Entries are compressed with the `zstd` below, which is
+# unconditional on every target including wasm, so the zip itself only frames
+# them. An earlier comment here claimed wasm had no compressor, which was never
+# true: the whole wire protocol compresses with zstd there.
 zip = { version = "4.6.1", default-features = false }
 # The replica file an identity owns is named from a SHA-256 over the id's own
 # serde encoding, so identity never reaches the filename through `Display`.

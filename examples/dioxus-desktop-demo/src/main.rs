@@ -30,8 +30,8 @@ use connetto_client::auth::{
 use connetto_client::replica::{Replica, replica_db_name};
 use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning, forget_device};
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, IDENTITY_RECORD,
-    PolicyTables, SqlFunctions, decode_identity,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, ExportScope, Grant,
+    IDENTITY_RECORD, ImportChoices, PolicyTables, SqlFunctions, decode_identity,
 };
 use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
@@ -657,6 +657,7 @@ fn app() -> Element {
     // Feature 7: the last export's outcome, shown so the user knows where the
     // archive went without the app opening a file manager.
     let mut export_status: Signal<Option<String>> = use_signal(|| None);
+    let mut import_status: Signal<Option<String>> = use_signal(|| None);
 
     // Feature 1: stored accounts, read from the keyring once on mount.
     let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
@@ -692,6 +693,7 @@ fn app() -> Element {
     let switch_client = client.clone();
     let add_client = client.clone();
     let export_client = client.clone();
+    let import_client = client.clone();
 
     // Wipe auth data; cloned twice so the Idle and ConfirmForce arms each get
     // their own (each arm's onclick is a separate move closure).
@@ -1054,17 +1056,16 @@ fn app() -> Element {
                 }
                 p {
                     style: "color: #666; font-size: 0.9em;",
-                    "The export is a zip of plain SQLite databases, one per local \
-                     tier, readable with any SQLite tool. This demo names no \
-                     device-private tier, so the archive holds the synced replica \
-                     alone."
+                    "Save a zip archive of this device's local data. The archive is \
+                     not encrypted and holds every row the device can read: whoever \
+                     holds the file holds the data."
                 }
                 button {
                     onclick: move |_| {
                         let client = export_client.clone();
                         spawn(async move {
                             let message = match client
-                                .with_conn(connetto_client::ConnettoConnection::export_local_data)
+                                .with_conn(|c| c.export_local_data(ExportScope::Everything))
                                 .await
                             {
                                 Ok(bytes) => match write_export(&bytes) {
@@ -1083,6 +1084,75 @@ fn app() -> Element {
                     "Export local data"
                 }
                 if let Some(message) = export_status.read().clone() {
+                    p {
+                        style: "font-family: monospace; font-size: 0.85em; \
+                                color: #555; margin: 8px 0 0 0;",
+                        {message}
+                    }
+                }
+            }
+
+            // Import pane (R56): restore local data from an archive.
+            div {
+                style: "border: 1px solid #ccc; border-radius: 6px; \
+                        padding: 10px 14px; margin-top: 16px;",
+                h2 {
+                    style: "margin-top: 0; font-size: 1em;",
+                    "Restore from file"
+                }
+                p {
+                    style: "color: #666; font-size: 0.9em;",
+                    "Pick an archive from this account. The file's version wins every clash."
+                }
+                button {
+                    onclick: move |_| {
+                        let client = import_client.clone();
+                        spawn(async move {
+                            let Some(file) = rfd::AsyncFileDialog::new()
+                                .add_filter("archive", &["zip"])
+                                .pick_file()
+                                .await
+                            else {
+                                return;
+                            };
+                            let bytes = file.read().await;
+                            let message =
+                                match client.with_conn(move |c| c.import_local_data(&bytes)).await
+                                {
+                                    Err(err) => format!("refused: {err}"),
+                                    Ok(plan) => {
+                                        let clash_count = plan.collisions().len();
+                                        let choices = ImportChoices::keeping_the_file();
+                                        match client
+                                            .with_conn(move |c| c.apply_import(&plan, &choices))
+                                            .await
+                                        {
+                                            Ok(outcome) => {
+                                                let mut msg = format!(
+                                                    "{} row(s) restored, {} kept, \
+                                                     {} write(s) restored",
+                                                    outcome.rows_restored,
+                                                    outcome.rows_kept,
+                                                    outcome.writes_restored
+                                                );
+                                                if clash_count > 0 {
+                                                    msg.push_str(&format!(
+                                                        " ({clash_count} clash(es) \
+                                                         resolved to the file)"
+                                                    ));
+                                                }
+                                                msg
+                                            }
+                                            Err(err) => format!("apply failed: {err}"),
+                                        }
+                                    }
+                                };
+                            import_status.set(Some(message));
+                        });
+                    },
+                    "Import from file"
+                }
+                if let Some(message) = import_status.read().clone() {
                     p {
                         style: "font-family: monospace; font-size: 0.85em; \
                                 color: #555; margin: 8px 0 0 0;",

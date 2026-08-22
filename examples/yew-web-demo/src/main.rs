@@ -32,7 +32,7 @@ use std::rc::Rc;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::teardown::expiry_warning;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, PolicyTables, Replica,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, ExportScope, PolicyTables, Replica,
 };
 use connetto_core::custody::Custody;
 use connetto_web::auth::WorkerAuthConfig;
@@ -43,7 +43,7 @@ use diesel::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BroadcastChannel, HtmlInputElement, MessageEvent};
+use web_sys::{BroadcastChannel, Event, HtmlInputElement, MessageEvent};
 
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 use yew::prelude::*;
@@ -1229,12 +1229,44 @@ fn dashboard(props: &DashboardProps) -> Html {
     // R26: the export runs in the DB worker, which holds the durable replica
     // and the device-private tier. A tab mirror is in memory and partial.
     let export_status = use_state(|| Option::<String>::None);
+    let import_status = use_state(|| Option::<String>::None);
+    let import_cb = {
+        let import_status = import_status.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Some(files) = input.files() {
+                if let Some(file) = files.get(0) {
+                    let import_status = import_status.clone();
+                    spawn_local(async move {
+                        let message = match workers::request_import(file).await {
+                            Ok((outcome, clashes)) => {
+                                let mut msg = format!(
+                                    "{} row(s) restored, {} kept, {} write(s) restored",
+                                    outcome.rows_restored,
+                                    outcome.rows_kept,
+                                    outcome.writes_restored
+                                );
+                                if clashes > 0 {
+                                    msg.push_str(&format!(
+                                        " ({clashes} clash(es) resolved to file)"
+                                    ));
+                                }
+                                msg
+                            }
+                            Err(err) => format!("refused: {err}"),
+                        };
+                        import_status.set(Some(message));
+                    });
+                }
+            }
+        })
+    };
     let export = {
         let export_status = export_status.clone();
         Callback::from(move |_| {
             let export_status = export_status.clone();
             spawn_local(async move {
-                let message = match workers::request_export().await {
+                let message = match workers::request_export(ExportScope::Everything).await {
                     Ok(bytes) => {
                         let len = bytes.len();
                         match download_bytes(EXPORT_FILE_NAME, &bytes) {
@@ -1316,12 +1348,20 @@ fn dashboard(props: &DashboardProps) -> Html {
             </div>
             <div class="pane">
                 <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
-                <p>{ "A zip of plain SQLite databases, one per tier, readable with any SQLite tool." }</p>
+                <p>{ "Save a zip archive of this device's local data. The archive is not \
+                      encrypted and holds every row the device can read: whoever holds \
+                      the file holds the data." }</p>
                 <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
                 <div class="row">
                     <button onclick={export}>{ "Export local data" }</button>
                 </div>
                 if let Some(message) = (*export_status).clone() {
+                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                }
+                <div class="row">
+                    <input type="file" accept=".zip" onchange={import_cb} />
+                </div>
+                if let Some(message) = (*import_status).clone() {
                     <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
                 }
             </div>
