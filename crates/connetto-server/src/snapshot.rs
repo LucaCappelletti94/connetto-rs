@@ -855,6 +855,7 @@ mod pg {
             &self,
             seed_sql: &str,
             member_table: &str,
+            member_key: &str,
             caller: &Principal<Id, Key>,
         ) -> Result<Option<TermSeedRead>, SnapshotError> {
             let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
@@ -906,12 +907,27 @@ mod pg {
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             // Lower through the same encoder the snapshot uses, so a seed
             // value and the same value delivered on the change path are one
-            // value, and the term lookup keyed by it matches.
+            // value, and the term lookup keyed by it matches. The encoder
+            // writes each cell at its catalog ordinal and leaves every column
+            // the seed did not project absent, so the projected column is
+            // found by name and never by result position.
             let column_names = read.column_names();
             let cells = read.cells();
-            let mut decoded = Vec::with_capacity(cells.len());
+            let mut values = Vec::with_capacity(cells.len());
             if !cells.is_empty() {
-                let member_table_id = catalog_helpers::table_id(&self.catalog, member_table);
+                let member_table_id = catalog_helpers::table_id(&self.catalog, member_table)
+                    .ok_or_else(|| {
+                        SnapshotError::Encode(format!(
+                            "the membership table {member_table} is not in the catalog"
+                        ))
+                    })?;
+                let key_ordinal =
+                    catalog_helpers::column_id(&self.catalog, member_table_id, member_key)
+                        .ok_or_else(|| {
+                            SnapshotError::Encode(format!(
+                                "the seed projects {member_key}, which {member_table} does not have"
+                            ))
+                        })? as usize;
                 let built = subql::emit::pgbinary_patchset_builder(
                     &self.catalog,
                     member_table,
@@ -920,25 +936,20 @@ mod pg {
                 )
                 .map_err(|err| SnapshotError::Encode(err.to_string()))?;
                 for op in built.iter() {
-                    let PatchsetOp::Insert { values, .. } = op else {
+                    let PatchsetOp::Insert { values: cells, .. } = op else {
                         return Err(SnapshotError::Encode(
                             "the seed encoder produced something other than an insert".into(),
                         ));
                     };
-                    let row = match member_table_id {
-                        Some(table_id) => crate::pk::row_from_wire(&self.catalog, table_id, values),
-                        None => values
-                            .iter()
-                            .map(|value| crate::pk::from_wire(value, None))
-                            .collect(),
-                    };
-                    decoded.push(row);
+                    let row = crate::pk::row_from_wire(&self.catalog, member_table_id, cells);
+                    values.push(row.get(key_ordinal).cloned().ok_or_else(|| {
+                        SnapshotError::Encode(format!(
+                            "the decoded membership row has no column at {member_key}'s ordinal"
+                        ))
+                    })?);
                 }
             }
-            Ok(Some(TermSeedRead {
-                rows: decoded,
-                published,
-            }))
+            Ok(Some(TermSeedRead { values, published }))
         }
     }
 }

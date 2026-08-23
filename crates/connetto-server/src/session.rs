@@ -37,7 +37,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, Sessio
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
-use subql::backend::{CdcEvent, Postgres, ScalarKind, Value as PgValue};
+use subql::backend::{CdcEvent, Postgres, ScalarKindOf, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
@@ -131,9 +131,15 @@ pub struct SnapshotEstimate {
 /// The caller's own membership rows for a term at registration, read by a
 /// [`SnapshotSource`] that can run the seed under the caller's own binding.
 pub struct TermSeedRead {
-    /// Full membership rows in catalog column order, decoded the same way the
-    /// snapshot decodes, so the seed and the snapshot agree by construction.
-    pub rows: Vec<Vec<PgValue<Postgres>>>,
+    /// The value each membership row admits, taken from the column subql's
+    /// seed projects and decoded the same way the snapshot decodes, so the
+    /// seed and the snapshot agree by construction.
+    ///
+    /// Which cell that is belongs to the source rather than to the caller: the
+    /// seed's one projected column is lowered through the table's full catalog
+    /// shape, so its position is the column's catalog ordinal and nothing the
+    /// result order can be read for.
+    pub values: Vec<PgValue<Postgres>>,
     /// Whether the membership table is carried by the publication this source
     /// was configured with, or `None` when it has none to check against.
     pub published: Option<bool>,
@@ -287,6 +293,9 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// `seed_sql` run as `caller` under the same binding the snapshot uses,
     /// plus whether `member_table` is carried by the configured publication.
     ///
+    /// `member_key` names the column the seed projects, which the source
+    /// resolves against its own catalog to pick each row's admitted value.
+    ///
     /// The default cannot seed and returns `Ok(None)`, which refuses the
     /// registration: a term served without its seed admits nobody in silence,
     /// and a membership table outside the publication never narrows.
@@ -298,9 +307,10 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
         &self,
         seed_sql: &str,
         member_table: &str,
+        member_key: &str,
         caller: &Principal<Id, Key>,
     ) -> Result<Option<TermSeedRead>, Self::Error> {
-        let _ = (seed_sql, member_table, caller);
+        let _ = (seed_sql, member_table, member_key, caller);
         Ok(None)
     }
 }
@@ -952,7 +962,7 @@ impl AsyncConnector for NoConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKind,
+        _kind: ScalarKindOf<Postgres>,
         _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
@@ -3350,7 +3360,14 @@ where
     ) -> Result<(SqliteRegistration, std::sync::Arc<[(String, String)]>), SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
-        let terms = materializer.membership_terms(&pg_sql);
+        // Describing asks the plain compiler, which refuses shapes the
+        // re-execution wrapper goes on to accept (a `MAX` aggregate, say), so
+        // a refusal here is not one: registration below is the authority and
+        // re-raises anything genuinely refused, term problems included, since
+        // subql describes and registers through one compile path.
+        let terms = materializer
+            .describe_terms(consumer_id, &pg_sql, &sub.spec.binds)
+            .unwrap_or_default();
         let seed = match terms.as_slice() {
             [] => None,
             [first, rest @ ..] => {
@@ -3371,7 +3388,12 @@ where
                 for term in &terms {
                     let read = self
                         .snapshot_source
-                        .term_seed(&term.seed_sql, &term.member_table, &state.principal)
+                        .term_seed(
+                            &term.seed_sql,
+                            &term.member_table,
+                            &term.member_key,
+                            &state.principal,
+                        )
                         .await
                         .map_err(|err| SubscribeRefusal::Seed(err.to_string()))?
                         .ok_or(SubscribeRefusal::Unseedable)?;
@@ -3383,11 +3405,9 @@ where
                         None => return Err(SubscribeRefusal::NoPublication),
                     }
                     let values: Vec<PgValue<Postgres>> = read
-                        .rows
-                        .iter()
-                        .filter_map(|row| row.get(term.member_key_ordinal))
+                        .values
+                        .into_iter()
                         .filter(|value| !matches!(value, PgValue::Missing | PgValue::Null))
-                        .cloned()
                         .collect();
                     term_values.push((term.column.clone(), values));
                 }
@@ -3653,11 +3673,13 @@ where
         // The caller's own rows only (decision 12): a membership table
         // typically carries no policy of its own, so an unfiltered read would
         // snapshot every tenant's membership rows to every client. The
-        // identity rides as a bind rather than as the caller function,
-        // because a filter naming the caller directly is itself a term to
-        // subql and would ask for a seed of its own, while a bound literal is
-        // an ordinary predicate. The requirement, never the spelling, is what
-        // decision 12 fixed.
+        // identity rides as a bind rather than as the caller function.
+        //
+        // R63 decision 2 set out to retire this spelling, because subql
+        // `6b0ce94` serves a caller comparison as a self-seeding term. It is
+        // blocked upstream instead: such a term needs a subscriber built at
+        // the compared column's kind, and no public API answers that kind
+        // (`upstream/subql-caller-term-subscriber-kind-not-answerable.md`).
         let query = format!(
             "SELECT * FROM {} WHERE {} = ?",
             connetto_core::quote_ident(member_table),

@@ -44,20 +44,20 @@ use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
     TableSchema, Value,
 };
-use sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
-use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue};
+use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, ScalarKindOf, Value as PgValue};
 use subql::emit::{
     WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
 };
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
 use subql::{
-    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, ColumnId, DatabaseLike,
-    DefaultIds, OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId,
-    SubscriptionRequest, TableId, TableLike, catalog_helpers,
+    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, DatabaseLike, DefaultIds,
+    OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId,
+    TableLike, catalog_helpers,
 };
 
 use crate::oplog::ChangeRecord;
@@ -341,7 +341,7 @@ pub struct AggregateCapture {
     /// SQL to run for the initial value and on each re-execution.
     pub sql: String,
     /// Decode hint for the scalar result.
-    pub kind: ScalarKind,
+    pub kind: ScalarKindOf<Postgres>,
 }
 
 /// A captured delta aggregate awaiting its bootstrap seed.
@@ -408,7 +408,7 @@ pub struct PendingReExec {
     /// SQL to run.
     pub sql: String,
     /// Decode hint for the scalar result.
-    pub kind: ScalarKind,
+    pub kind: ScalarKindOf<Postgres>,
     /// Resume cursor for the event that triggered it.
     pub cursor: Vec<u8>,
 }
@@ -416,7 +416,7 @@ pub struct PendingReExec {
 /// Bootstrap metadata retained per captured query.
 struct ReExecMeta {
     sql: String,
-    kind: ScalarKind,
+    kind: ScalarKindOf<Postgres>,
 }
 
 /// Hosts one `subql` engine over a Postgres-flavored catalog on the pgoutput
@@ -604,37 +604,6 @@ fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
         .collect()
 }
 
-/// One membership term extracted from a translated subscription, in the
-/// canonical single-link shape connetto can seed: the subscribed table's
-/// `column` compared with `IN (SELECT member_key FROM member_table WHERE
-/// member_subject = current_setting(...))`. subql classifies the term itself
-/// at registration, so this extraction only recognises what it will seed,
-/// never judges what is servable: a shape it does not recognise registers
-/// unseeded and subql refuses it for want of a subscriber.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MembershipTerm {
-    /// The subscribed table's compared column, which keys the seed's values.
-    pub column: String,
-    /// The membership table the subquery reads.
-    pub member_table: String,
-    /// The membership column naming the subscriber, which the hidden
-    /// membership subscription filters by on the client's behalf (R27
-    /// decision 12).
-    pub member_subject: String,
-    /// Catalog ordinal of the subquery's projected column in `member_table`,
-    /// which is where each seed row carries the admitted value.
-    pub member_key_ordinal: usize,
-    /// The scalar kind of the column naming the subscriber. A subscriber
-    /// supplied at another kind admits nobody in silence, so the identity is
-    /// built at this kind or the term is refused.
-    pub subject_kind: ScalarKind,
-    /// The seed read, `SELECT * FROM <from> WHERE <the subquery's own
-    /// filter>`, run as the caller so the seed and the snapshot agree by
-    /// construction, and full-row so it decodes through the same binary path
-    /// `read_row` uses.
-    pub seed_sql: String,
-}
-
 /// What a term registration is seeded with: the subscriber it filters for and
 /// the values each compared column currently admits, read from the membership
 /// table as the caller.
@@ -652,90 +621,13 @@ pub struct TermSeed {
 /// in silence. `None` refuses the term instead: an identity that cannot be
 /// read at the column's kind cannot be a member.
 #[must_use]
-pub fn typed_subscriber(identity: &str, kind: ScalarKind) -> Option<PgValue<Postgres>> {
+pub fn typed_subscriber(identity: &str, kind: ScalarKindOf<Postgres>) -> Option<PgValue<Postgres>> {
     match kind {
         ScalarKind::String => Some(PgValue::String(identity.to_owned())),
         ScalarKind::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
         ScalarKind::Int => identity.parse().ok().map(PgValue::Int),
         _ => None,
     }
-}
-
-/// Flatten a `WHERE` clause into its top-level `AND` conjuncts.
-fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_conjuncts(left, out);
-            collect_conjuncts(right, out);
-        }
-        Expr::Nested(inner) => collect_conjuncts(inner, out),
-        other => out.push(other),
-    }
-}
-
-/// The bare column name an expression names, or `None` when it is not a plain
-/// (possibly qualified) identifier.
-fn ident_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.clone()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
-        Expr::Nested(inner) => ident_name(inner),
-        _ => None,
-    }
-}
-
-/// The column compared against the caller in one conjunct, or `None`.
-///
-/// Either operand order is accepted. Which setting names the caller is
-/// subql's judgement, made by the translator it was built with, so any
-/// `current_setting` call is recognised here: a term naming a foreign setting
-/// is refused at registration by the classifier and its seed is never read.
-fn subject_of(conjunct: &Expr) -> Option<String> {
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = conjunct
-    else {
-        return None;
-    };
-    match (is_caller_call(left), is_caller_call(right)) {
-        (true, false) => ident_name(right),
-        (false, true) => ident_name(left),
-        _ => None,
-    }
-}
-
-/// Whether the expression is a `current_setting(...)` call, seen through any
-/// nesting or cast the translation wrapped around it.
-fn is_caller_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function(function) => function
-            .name
-            .0
-            .last()
-            .and_then(|part| part.as_ident())
-            .is_some_and(|ident| ident.value.eq_ignore_ascii_case("current_setting")),
-        Expr::Nested(inner) => is_caller_call(inner),
-        Expr::Cast { expr, .. } => is_caller_call(expr),
-        _ => false,
-    }
-}
-
-/// The catalog ordinal of `column` in `table_id`, matched case-insensitively
-/// because translated SQL quotes identifiers as the DDL wrote them.
-fn column_ordinal<DB: DatabaseLike>(db: &DB, table_id: TableId, column: &str) -> Option<usize> {
-    let arity = catalog_helpers::table_arity(db, table_id)?;
-    (0..arity).find(|ordinal| {
-        ColumnId::try_from(*ordinal)
-            .ok()
-            .and_then(|id| catalog_helpers::column_name(db, table_id, id))
-            .is_some_and(|name| name.eq_ignore_ascii_case(column))
-    })
 }
 
 /// Resolve subql's narrowing ids to catalog names, so the session builds the
@@ -837,6 +729,9 @@ fn value_literal(value: &PgValue<Postgres>) -> Option<Expr> {
         | PgValue::Float(_)
         | PgValue::Json(_)
         | PgValue::Jsonb(_) => return None,
+        // Postgres teaches subql no custom scalars, so the variant's payload
+        // is uninhabited and this arm exists only to be total.
+        PgValue::Custom(never) => match *never {},
     };
     Some(Expr::Value(literal.into()))
 }
@@ -1568,94 +1463,31 @@ where
             .await?)
     }
 
-    /// The membership terms `pg_sql` names that connetto knows how to seed.
+    /// What each membership term this subscription names needs seeded, as
+    /// subql itself describes it.
     ///
-    /// Empty for a filter naming none, and for shapes outside the canonical
-    /// single-link form: those register unseeded, and subql refuses a term
-    /// without a subscriber, so an unrecognised term is refused rather than
-    /// served half-way.
-    pub fn membership_terms(&self, pg_sql: &str) -> Vec<MembershipTerm> {
-        let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, pg_sql) else {
-            return Vec::new();
-        };
-        let [Statement::Query(query)] = statements.as_slice() else {
-            return Vec::new();
-        };
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return Vec::new();
-        };
-        let Some(selection) = &select.selection else {
-            return Vec::new();
-        };
-        let mut conjuncts = Vec::new();
-        collect_conjuncts(selection, &mut conjuncts);
-        conjuncts
-            .into_iter()
-            .filter_map(|conjunct| self.term_of(conjunct))
-            .collect()
-    }
-
-    /// The canonical term one conjunct names, resolved against the catalog.
-    fn term_of(&self, conjunct: &Expr) -> Option<MembershipTerm> {
-        let Expr::InSubquery {
-            expr,
-            subquery,
-            negated: false,
-        } = conjunct
-        else {
-            return None;
-        };
-        let column = ident_name(expr)?;
-        let SetExpr::Select(inner) = subquery.body.as_ref() else {
-            return None;
-        };
-        let [projection] = inner.projection.as_slice() else {
-            return None;
-        };
-        let (SelectItem::UnnamedExpr(key_expr) | SelectItem::ExprWithAlias { expr: key_expr, .. }) =
-            projection
-        else {
-            return None;
-        };
-        let member_key = ident_name(key_expr)?;
-        let [from] = inner.from.as_slice() else {
-            return None;
-        };
-        if !from.joins.is_empty() {
-            return None;
-        }
-        let TableFactor::Table { name, .. } = &from.relation else {
-            return None;
-        };
-        let member_table = name
-            .0
-            .last()
-            .and_then(|part| part.as_ident())
-            .map(|ident| ident.value.clone())?;
-        let filter = inner.selection.as_ref()?;
-        let mut inner_conjuncts = Vec::new();
-        collect_conjuncts(filter, &mut inner_conjuncts);
-        let member_subject = inner_conjuncts
-            .iter()
-            .find_map(|conjunct| subject_of(conjunct))?;
-        let db = self.catalog();
-        let table_id = catalog_helpers::table_id(db, &member_table)?;
-        let member_key_ordinal = column_ordinal(db, table_id, &member_key)?;
-        let subject_ordinal = column_ordinal(db, table_id, &member_subject)?;
-        let subject_kind = catalog_helpers::column_scalar_kind(
-            db,
-            table_id,
-            ColumnId::try_from(subject_ordinal).ok()?,
-        )?;
-        let seed_sql = format!("SELECT * FROM {from} WHERE {filter}");
-        Some(MembershipTerm {
-            column,
-            member_table,
-            member_subject,
-            member_key_ordinal,
-            subject_kind,
-            seed_sql,
-        })
+    /// Empty for a filter naming none, which is every filter until one is
+    /// written. subql compiles the filter here through the same path
+    /// `register` uses, so a term described is a term `register` accepts, and
+    /// the seed query answered is the subquery's own text rather than SQL
+    /// rebuilt from resolved names (R63).
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Register`] for whatever `register` would answer
+    /// short of the seed itself: a filter outside subql's shape, an aggregate
+    /// over row-level security, or a relationship it cannot serve.
+    pub fn describe_terms(
+        &self,
+        consumer_id: u64,
+        pg_sql: &str,
+        binds: &[BindValue],
+    ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
+        let request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        self.engine
+            .inner()
+            .describe_terms(&request)
+            .map_err(MaterializerError::Register)
     }
 
     /// Register a pre-translated Postgres `SELECT`, optionally seeded with the
@@ -1705,6 +1537,8 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
         PgValue::Time(t) => serde_json::Value::String(t.to_string()),
         PgValue::Decimal(d) => serde_json::Value::String(d.to_string()),
         PgValue::Json(j) | PgValue::Jsonb(j) => j.clone(),
+        // Uninhabited for this backend, as above.
+        PgValue::Custom(never) => match *never {},
     };
     json.to_string()
 }
@@ -2002,17 +1836,19 @@ mod membership_term_tests {
             pg_sql.contains("current_setting"),
             "the mapping must rewrite the caller, got {pg_sql}"
         );
-        let terms = mat.membership_terms(&pg_sql);
+        let terms = mat
+            .describe_terms(1, &pg_sql, &[])
+            .expect("the canonical shape describes");
         let [term] = terms.as_slice() else {
-            panic!("one canonical term extracts, got {terms:?}");
+            panic!("one canonical term describes, got {terms:?}");
         };
         assert_eq!(term.column, "project_id");
         assert_eq!(term.member_table, "project_members");
-        assert_eq!(term.member_key_ordinal, 0);
+        assert_eq!(term.member_key, "project_id");
         assert_eq!(term.subject_kind, ScalarKind::String);
         assert_eq!(term.member_subject, "user_id");
         assert!(
-            term.seed_sql.starts_with("SELECT * FROM project_members"),
+            term.seed_sql.contains("project_members"),
             "the seed reads the membership table, got {}",
             term.seed_sql
         );
@@ -2077,19 +1913,24 @@ mod membership_term_tests {
         );
     }
 
-    // Shapes outside the canonical single link seed nothing, deliberately.
+    // Shapes outside the single-link form seed nothing. subql answers them
+    // itself now, so this pins what it answers rather than what connetto's
+    // own walk used to recognise (R63).
     #[test]
-    fn a_non_canonical_shape_extracts_no_term() {
+    fn a_non_canonical_shape_describes_no_term() {
         let mat = materializer(Some(mapping()));
         assert!(
-            mat.membership_terms("SELECT * FROM docs WHERE project_id > 5")
+            mat.describe_terms(1, "SELECT * FROM docs WHERE project_id > 5", &[])
+                .expect("a literal comparison is an ordinary predicate")
                 .is_empty(),
             "a comparison against a literal is not a membership subquery"
         );
         let joined = "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm JOIN docs d ON d.project_id = pm.project_id WHERE pm.user_id = current_setting('app.user_id', true))";
+        let described = mat.describe_terms(1, joined, &[]);
         assert!(
-            mat.membership_terms(joined).is_empty(),
-            "a subquery joining a second table is outside the canonical shape"
+            matches!(described, Err(MaterializerError::Register(_))),
+            "a subquery joining a second table is outside the shape subql compiles, \
+             so it is refused rather than described, got {described:?}"
         );
     }
 }
