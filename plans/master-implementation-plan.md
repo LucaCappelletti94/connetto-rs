@@ -1,6 +1,6 @@
 # Master implementation plan: identity, session, capability, and the change path
 
-This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. The identity half is built: R1, R0, R2, R8, R12, R3, R16 (both parts), R4, R5a, R35, R13, R38 and R19 are done, and the change path is what remains.
+This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Both halves are built: the identity phases and the whole change path (R5b, R6, R7, R9, R27, R48, R49, R50) are done, as are export, multi-account, retention, the browser unlock gate and CI. What remains committed is the pair running next in parallel (R56 import and R58 read ceiling with paging), the platform gates (R51, R52, and R53 blocked on hardware), the follow-ups (R57, R60, R63), the six file-handling phases R24's design derived (R64 to R69), and the parked R11, R21, R31 and R61. (This paragraph was frozen at the 2026-08-06 state until 2026-08-21.)
 
 ## How to read this
 
@@ -13,6 +13,8 @@ This programme closes a security defect in how connetto decides who a caller is,
 **Citations name a file and a symbol, not a line number.** Line numbers rot silently and several in this repository already had. Where a symbol does not exist, a line range is given and should be read as a hint rather than a fact.
 
 **Every phase has the same shape:** Status, Purpose, Blocked on, Steps, Done when, and where the ordering or the necessity is counterintuitive, Why. A phase is done when its Done when clause is demonstrated, never when it merely compiles.
+
+**Two status words are load-bearing.** **DONE** means the Done when clause was demonstrated. **BUILT** means every step landed and was proven except a named remainder outside the phase's own work, such as a run the environment blocks, and the section names that remainder. Defined 2026-08-21, when five phases were found using BUILT undefined.
 
 **The last section holds exploratory phases.** Those are not committed work, each may conclude it should not be built, and deleting one after its investigation changes nothing else. Every phase before that section is committed.
 
@@ -28,7 +30,7 @@ The reasoning that mandated the reset is kept for the record: the tree was a ren
 
 ## The gate
 
-There is no CI and no task runner in this repository, so the gate is manual and must be run in full. Five workspaces, each with its own lockfile: the root, `crates/connetto-web`, and the three demos plus `examples/wasm-smoke`.
+The gate is manual and CI now also runs it: `.github/workflows/ci.yml` has run it on pull requests since R55 (2026-08-20), and it must still pass in full locally before any push. There is still no task runner. Seven workspaces, each with its own lockfile: the root, `crates/connetto-web`, the three demos, `examples/wasm-smoke` and `examples/webauthn-unlock`. (Corrected 2026-08-21: this said no CI and five workspaces, both stale, the count having missed `webauthn-unlock` and miscounted the rest.)
 
 Root workspace:
 
@@ -65,7 +67,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | 6 | ~~R12 part B, the refused-grant line~~ **DONE** | Rode with R3, the phase that created the silence it covers. It could not be proven earlier, because a refused credential was announced on the wire until then |
 | 7 | ~~R4~~ **DONE** | Needed R3, which is what makes a checked grant resolve to a subject that is not a person |
 | done | ~~R13~~ **DONE** | The `auth_events` contract and its four producers. Landed 2026-08-06 |
-| done | ~~R22~~ **DELETED** | The compile-time query set. Deleted 2026-08-05: a curated set of permitted queries is refused on principle, since authorization is row-level security, OpenFGA and roles. Its leak moved to R19, its cost concern to R19, its compilation requirement to R27 |
+| done | ~~R22~~ **DELETED** | The compile-time query set. Deleted 2026-08-05: a curated set of permitted queries is refused on principle, since authorization is row-level security, OpenFGA and roles. Its leak moved to R19 and from there to R38 when that split out, its cost concern to R19, its compilation requirement to R27 |
 | done | ~~R38~~ **DONE** | The refusal leak. Landed 2026-08-06: one fixed refusal text on server and relay, `SnapshotBegin` deferred behind the read, causes to the log |
 | done | ~~R19~~ **DONE** | Throttling. Landed 2026-08-06: subscriptions, connections and credential refusals metered per durable handle and per tier, refresh failures per session and per account, all limits chain-built |
 | done | ~~R36~~ **DONE** | Landed 2026-08-06: four refusal signals tallied per person over a day and per connection within one socket, bans in a deployment-owned table with a nullable expiry, and the application asked what a crossing costs |
@@ -83,7 +85,7 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R7~~ **DONE** | Landed 2026-08-16. Four decisions had to be taken before any code because grounding measured the plan's own narrowing to be unbuildable: a membership fact hangs on the membership's type, not on the guarded table, so the rules have to be walked. `GrantReach` does that walk at startup, the upkeep reports what moved, and each affected session replaces its own subscription. Split out R49 |
 | done | ~~R9~~ **DONE** | Landed 2026-08-16. Six decisions rather than four: measuring per code path rather than per file found that **ten of the twenty-two fixtures ask the policy nothing at all**, so those install a roster granting nobody, and that the stand-in needs an entry for the caller with no name, which two fixtures need to keep proving that Postgres refuses an anonymous write. Split out R50 |
 | done | ~~R27~~ **DONE** | Landed 2026-08-18. The term serves end to end: seeded registration under one materializer-lock hold, incremental move-in and move-out driven by subql's narrowings with `FullResyncRequired` asserted absent both ways, the R7 resend yielding to the term on its own membership tables, the move-out delete gated on the event's own grant moves after the proof demonstrated the never-held-key disclosure, and the server-opened hidden membership subscription announced with `MembershipOpened`, counted against R19, torn down with its last term. Proof: `crates/connetto-test-harness/tests/membership_term.rs`, both directions plus the intersection fixture |
-| done | R28 part A | **DONE 2026-08-03.** The route now precedes the snapshot read. Its step 2, the client-side discard rule, was dropped after measuring that it loses data, and the overlap is re-applied instead |
+| done | ~~R28 part A~~ **DONE** | Landed 2026-08-03. The route now precedes the snapshot read. Its step 2, the client-side discard rule, was dropped after measuring that it loses data, and the overlap is re-applied instead |
 | done | ~~R28 part B~~ **DONE** | Landed 2026-08-09. The ordering question dissolved, and part A's own defect turned out to sit in the same two functions on a window part A never tested: a change dispatched while a delta aggregate reads its seed was folded into nothing and lost for good. Demonstrated, then fixed by buffering deltas from the moment the seed is requested |
 | done | ~~R33~~ **DONE** | Landed 2026-08-09. The reasoning held: a backlogged client was told its snapshot was complete over an empty replica and recorded the resume position that frame carries. Demonstrated at both halves, then fixed by giving the completion frame a place in the delivery queue that costs no credit. The browser relay had copied the shape and was fixed with it |
 | done | ~~R29~~ **DONE** | The coverage question R15 asks. Landed 2026-08-08: the resync delete spares what siblings still want, watches gain a grace and pins are the durable form. Its window-exit half became R44 and its write surface moved to R15 |
@@ -91,25 +93,60 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R45~~ **DONE** | Landed 2026-08-09. The five defects the 2026-08-08 reconciliation found: the launch anchor for a watch the app died holding, connetto's bookkeeping out of the changed-tables signal, an expired share key no longer presented, one `quote_ident` in `connetto-core`, and the snapshot row read off the builder |
 | done | ~~R46~~ **DONE** | Concluded 2026-08-09 as an upstream finding: the wasm-bindgen test runner's WebDriver requests carry no timeout, so a stalled chromedriver command wedges the invocation forever, before the first test or after the last. Demonstrated by fault injection; 21 instrumented full runs after the reboot found no organic wedge |
 | done | ~~R47~~ **DONE** | Landed 2026-08-09. All eight items from the 2026-08-08 sweep consolidated, none left alone: one percent-encoder and one program-environment reader in `connetto-core`, one generic wasm frame pump replacing the two named transports, one generalized broadcast request-reply, one PKCE token convention with the browser crate moved to `getrandom` 0.3, one login tail, one keyring helper, one loopback host predicate with the first unit tests either caller has had, and the three minors |
-| any | R23 | Blocked on a measurement, not on code. `docs/webauthn-prf-probe-spec.md` specifies it, and a negative on its central question reshapes the phase |
-| any | R26 | Blocked on nothing. Carries a portability obligation and the durability story for device-private data |
+| done | ~~R23~~ **DONE** | Completed 2026-08-20. The browser gate, custody property, chapter 14 and the `wasm-smoke` unlock proof are all green. Native Apple split to R51, native Android to R52, Windows to R53 |
+| any | R51 | Native Apple gate, split out of R23 on 2026-08-19. Mechanism measured (probe N1 to N3): `apple-native-keyring-store` `RequireUserPresence` suffices and nothing needs contributing upstream. Needs the provisioned-app packaging, and its first step verifies the iOS native leg (probe I5) on the phone. Demoted from next 2026-08-21 when `R56` and `R58` were promoted |
+| any | R52 | Native Android gate, split out of R23 on 2026-08-19. Mechanism measured (probe A6): the Keystore user-authentication flag gates, but stock `keyring::Entry` hardcodes it off, so the key is built by hand, and the read-past-refusal prompt belongs to the application shell |
+| blocked | R53 | Windows gate, split out of R23 on 2026-08-19. Blocked on hardware: no reliable Windows machine exists at this time. First step is the probe's Windows leg (W1 to W3), whose W2 answer (whether a Hello-held key signs deterministically) decides whether a native gate exists there at all |
+| done | ~~R26~~ **DONE** | Completed 2026-08-21. A zip of `manifest.json`, `synced.sqlite` and optional `device-private.sqlite`, reached in a browser through the DB worker because the durable copy is the worker's. Rows travel as a session patchset: the first attempt read a shared-cache scratch database through a second connection, which the wasm SQLite build silently answered with an empty database. All three demos offer it. Its two leftover items, entry compression and the plaintext-exposure statement, travel to `R56` with the format change, and its key-requirement decision became `R62` |
+| done | ~~R56~~ **DONE** | Completed 2026-08-21, the other half of `R26`. It restores the device-only tier and the writes that never reached the server, leaves the server's own copy alone, and rewrote the archive on change records throughout, deleting `R26`'s conversion half. Twelve decisions: nine designed, then three the steps had left open settled before any code (the format contradiction, a selectable scope, and stacking the restored writes above the receiving replica's own numbers). It carried `R26`'s compression and plaintext-statement items |
 | any | R21 | Blocked on nothing. Removes a compatibility risk that surfaces on user devices rather than in tests |
-| any | R20 | **DONE 2026-08-08.** A defect, blocked on nothing. Offline operation is a project objective and boot violated it |
+| done | ~~R20~~ **DONE** | Landed 2026-08-08. A defect, blocked on nothing. Offline operation is a project objective and boot violated it |
 | done | ~~R34~~ **DONE** | The mint asks the write question. Landed 2026-08-09: a share names the verbs it certifies, and the reply reports them |
 | done | ~~R35~~ **DONE** | Three deadline columns, a browser tab's identity, and the demo schema. Landed 2026-08-05 |
 | done | ~~R41~~ **DONE** | One seam for the two secret stores. Landed 2026-08-07: one trait per secret in `connetto-core`, both name-addressed, the browser key store renamed off the collision |
 | done | ~~R17~~ **DONE** | The local tier's name and key scope. Landed 2026-08-07: the tier is named from the replica's own file name, and the delete-my-data path destroys it too |
-| any | R42 | Several accounts signed in at once, split out of R17 on 2026-08-07. The cold-boot decision was taken 2026-08-08 and is recorded in the phase, so it lands whenever it is wanted |
+| done | ~~R42~~ **DONE** | Several accounts signed in at once. Landed 2026-08-19 as BUILT, completed 2026-08-22 when a fresh `connetto-browser-stack` run discharged the environment remainder: a switch replaces the DB worker, the worker asks the tab which account after the gate, connetto keeps its own account index because `keyring` cannot enumerate, and an unusable default falls to a login. Found and fixed two defects in R23 on the way |
+| done | ~~R54~~ **DONE** | Every demo carries every application-visible feature. Landed 2026-08-19 as BUILT, completed 2026-08-22 when the named unrun binary ran green against a fresh stack. Closed three library holes: the browser boot withheld the session deadline and the account key, a second account was unreachable through any application path, and `WebAuthn` refusing an IP-address origin was misclassified as a fault |
+| any | R57 | The demo feature gaps the `R26` audit found. `R54`'s follow-through: seven items verified against source on 2026-08-21, two of which are demos asserting a capability the library has |
+| done | ~~R58~~ **DONE** | Completed 2026-08-21. A per-read page cap wrapped onto the query and a per-tier time limit bound connetto and the wire, keyset paging serves a legitimately large read in parts with the client's own acknowledgements pacing them, and every refusal stays behind `R38`'s one fixed phrase with the cause in the log. Measured, not assumed: the wrap is flattened and a keyset predicate reaches the index while offset paging costs O(offset) per page, and the planner reports a value held out of line as its pointer, so a page is sized from the table's physical bytes and then from what the previous page measured |
+| done | ~~R59~~ **ABSORBED** | Folded into `R58` on 2026-08-21. Written as its sibling, and decision 6 showed paging is what makes a ceiling a policy rather than a crash guard, so it is one phase. The section survives as a pointer recording where each of its five questions was answered, and nothing is left open there (corrected 2026-08-21, when this row still claimed two were open) |
+| any | R60 | A "latest N" subscription syncs the whole table forever and disables its cleanup. Defect demonstrated 2026-08-22 (`retention.rs`, 23 rows held for a 3-row request, `tidy` removes none) and all four questions decided the same day: windowed subscriptions in subql (upstream request written, `docs/upstream-subql-windowed-subscriptions.md`, sending needs its own instruction), the eviction claim becomes the delivered window, the residual pass runs by default on a threshold with the application able to supplant it (superseding R15 D4), and the measure is a cheap applied-rows counter with a crossing event. Also owns the raw-unsubscribe stranding the demonstration exposed |
+| done | ~~R62~~ **DONE** | Completed 2026-08-22. A table keyed only by the implicit rowid was silently never captured: never uploaded if synced, never seen by sibling tabs if device-only. The refusal now runs at open over the replica and the device-private tier, and again before a write travels when either database's `PRAGMA schema_version` moved, and `ClientConfig::with_unrecorded_tables` accepts the tables whose missing key is intentional, restricted to unkeyed ones so the exemption needs no promise held by convention anywhere else. The gap was demonstrated first: a write to an unkeyed table produced no mutation at all |
+| any | R63 | The `R27` rewire: the three subql findings its step 5 surfaced merged upstream 2026-08-19, so the pin moves and connetto swaps its `Materializer::membership_terms` workaround for subql's term planning and seeding APIs, deleting the workaround. A cleanup `R27`'s own section names, split out 2026-08-21 so it is owned |
+| done | ~~R55~~ **DONE** | Containerised test services and CI landed 2026-08-20. Tests that need services provision them through `testcontainers`, the browser stack runner gates `verified_topology.rs`, `connetto-web` and all 21 `wasm-smoke` binaries, and `.github/workflows/ci.yml` runs the hand gate on pull requests. Widened 2026-08-22 after gating `R62` found four jobs covering less than they appeared to: formatting, docs and the nightly lint each ran on a fraction of the workspaces, and `R23`'s passkey driver ran nowhere at all |
+| any | R61 | The portability download, fully designed 2026-08-22: the application registers the person-scope query list, connetto runs it under that identity and produces one zip (plain SQLite rows, reassembled `files/`, a provenance manifest naming the queries). Erasure stays a documented recipe, no function, because connetto cannot verify the list's completeness. Deadline is the first real deployment, the `R31` class, and the file half needs `R65` |
 | done | ~~R43~~ **DONE** | The browser held two handles on one tier file. Found while grounding R17 on 2026-08-07 and landed the same day: the client's attachment is the only handle, the relay serves through it, and a tab write is replayed under the old conflict rule |
 | done | ~~R18~~ **DONE** | The SQLite hardening surface is configured on the one open path both targets share: defensive mode, trusted schema off, four limits, and a default-closed attach posture with audited windows. Landed 2026-08-18. Most of SQLite's recommended limit table is deliberately stock, because the application's queries share this connection |
 | any | R11 | Off the critical path and blocked on nothing, so it lands whenever it is wanted |
-| done | ~~R15~~ **BUILT** | Landed 2026-08-19. Local eviction of rows no live subscription covers, incremental trimming gated on the freelist ratio, the `auto_vacuum = INCREMENTAL` create path, and the typed write-and-keep surface. Decision D4: the callable free-up-space pass trims regardless of eviction, and only eviction waits on the transport. Proven by `crates/connetto-client/tests/retention.rs` and a browser demo |
+| done | ~~R15~~ **DONE** | Landed 2026-08-19. Local eviction of rows no live subscription covers, incremental trimming gated on the freelist ratio, the `auto_vacuum = INCREMENTAL` create path, and the typed write-and-keep surface. Decision D4: the callable free-up-space pass trims regardless of eviction, and only eviction waits on the transport. Proven by `crates/connetto-client/tests/retention.rs` and a browser demo |
 | any | R31 | Application schema majors: the drain gate, the resync boundary, and the local-tier migration trait. Deadline is the first deployment intending to survive a schema change |
 | done | ~~R32~~ **DONE** | Landed 2026-08-09. The reconnect log is durable and a server that cannot prove a client current now resyncs it (a defect found and demonstrated while grounding, folded in as step 0). Startup refuses a missing slot, publication or log table naming which. The slot's retained log, remaining headroom and reservation status are logged on a cadence. And a feed that resumes past what it delivered trims the log to the resume point and closes every connection, detected by comparing positions because nothing reports an invalidation |
-| done | ~~R40~~ **BUILT** | Replica policy enforcement wired into sync. Landed 2026-08-15. The rename is on the client at both sync boundaries, the map is a build artifact the client is refused without, and the demo's table carries a real policy. Its browser evidence waits on a finding whose attribution is still open between connetto, subql and rls2fga (`upstream/policy-bearing-table-refuses-an-owned-write.md`), written up and not worked around. **Corrected 2026-08-18:** this row called it an upstream pg2sqlite defect, which described the first finding, resolved on 2026-08-15 |
-| last | R24 | Exploratory. How connetto integrates a file-sync stack it does not own |
-| last | R25 | Exploratory, and not now. Device-to-device sync with no server |
-| last | R30 | Exploratory. Revisit grouped aggregates from the recorded research |
+| done | ~~R40~~ **DONE** | Replica policy enforcement wired into sync. Landed 2026-08-15, completed 2026-08-19. The rename is on the client at both sync boundaries, the map a build artifact the client is refused without, and the demo table carries a real policy. The completing session type-directed the pk codec (a blob-shaped UUID key lifts to `Value::Uuid`), taught the relay hub to read and apply split tables through the worker's map, separated the tests' same-user logins, and all twenty browser binaries pass |
+| any | R64 | The file core, first of the six phases R24's design derived on 2026-08-21. Off the critical path, and its tests run under wasm from the start |
+| any | R65 | The file server: storage backends, upload protocol, ticket serving, GC, byte metering. Needs R64 |
+| any | R66 | The connetto seam: `FileStore` deleted, the ticket message pair and signer seam. Independent, may run beside R64 |
+| any | R67 | The native file client. Needs R64, R65 and R66 |
+| any | R68 | The browser file client, its archive step coordinated with R56's format. Needs R64, R65 and R66 |
+| any | R69 | Every demo carries the photo entry end to end, R54's rule applied to files. Needs R67 and R68 |
+| any | R70 | The deployment backup and restore story, minted 2026-08-21 by the full review: no chapter states what a deployment backs up or what a restore to an earlier point does to cursors, watermarks and the slot |
+| any | R71 | Linux replica-key custody survives a reboot, minted 2026-08-21: today a reboot loses the session-keyring key and destroys the device tier |
+| any | R72 | Clock discipline, X6 given an owner 2026-08-21: monotonic versus wall time decided per timer, suspend and resume stated |
+| done | ~~R81~~ **DONE** | Completed 2026-08-22, the day the second review minted it. The aggregate seed and every triggered re-execution read with no time bound, on the owner pool the change stream shares, so connetto took its own connector (the value is per tier, which subql does not model) and bounds each read inside it. Three decisions recorded, one R58 defect fixed on the way (a timed-out replacement page retried for ever) and one upstream finding written |
+| any | R74 | Device identity: enrolment, key custody, certificates. First of the seven peer-sync phases R25's design derived on 2026-08-22 |
+| any | R75 | The per-device applied frontier, the one exactly-once domain for every write path. Needs R74, touches the R2 watermark contract |
+| any | R76 | The peer link: discovery and mutual TLS on the LAN, native targets. Needs R74 |
+| any | R77 | The exchange: signed changesets, cursors, the acked frontier, retractions, the provisional tier. Needs R75 and R76 |
+| any | R78 | Courier recovery, deployment-opt-in. Needs R75 and R77 |
+| any | R79 | Media over the peer link: chunk pull, thumbnail prefetch, opt-in replication. Needs R77 and the file phases R64 to R67 |
+| any | R80 | Peer sync in every demo, plus the iOS hotspot field test. Needs R77, R78 and R79 |
+| any | R82 | Server delivery of grouped and re-executed results. Needs the upstream subql phases U0 to U5 of `docs/upstream-subql-grouped-and-reexecution-tiers.md`. Derived from R30 on 2026-08-22 |
+| any | R83 | The client resting table for server-computed results, scalars included. Needs nothing. Derived from R30 |
+| any | R84 | Typed keyed and row-shaped live handles. Needs R82 and R83. Derived from R30 |
+| any | R85 | Per-viewer re-execution on RLS tables. Needs upstream U6 and R82. Derived from R30 |
+| done | ~~R24~~ **DONE** | Concluded 2026-08-21 as a design: ten positions recorded in its section, `FileStore`'s deletion justified, and R64 to R69 derived as committed work |
+| done | ~~R25~~ **DONE** | Concluded 2026-08-22 as a design: every area decided, reviewed in full and amended in place, `docs/research-device-to-device-sync.md` and chapter 19 carry it, and the maintainer ordered the derivation its own rule reserved, yielding R74 to R80 |
+| done | ~~R30~~ **DONE** | Concluded 2026-08-22 as a design: the tier model (fold, hybrid, re-execution catch-all) recorded in its section with six decisions, Q5.7's status split updated, one upstream defect written (`upstream/subql-group-by-having-silently-dropped.md`), and the maintainer ordered the derivation the same day, yielding R82 to R85 and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md` |
+| last | R73 | Exploratory, X7 given an owner 2026-08-21, reframed 2026-08-22 with the maintainer: the hard parts are existing Postgres features (streaming replication, PG 17 failover slots, synchronous commit), so the phase is a Docker-gated failover verification, a deployment recipe, and the chapter 11 correction that scopes multi-master out |
 
 ## Status and blockers
 
@@ -146,8 +183,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R34 a write-level share | **DONE** (2026-08-09) | nothing, R5a put the write question on the same seam | no |
 | R50 the policy answers a write it never asks | **DONE** (2026-08-18) | nothing | no, discharged |
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
-| R23 user-verified unlock of local secrets | NOT STARTED | a measurement, see `docs/webauthn-prf-probe-spec.md` | no |
-| R26 local data export | NOT STARTED | nothing | no |
+| R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
+| R51 native Apple gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
+| R52 native Android gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
+| R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
+| R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
 | R28 part B, the aggregate subscribe paths | **DONE** (2026-08-09) | nothing | no |
@@ -161,21 +201,53 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
-| R42 several accounts signed in at once | NOT STARTED | nothing. The cold-boot rule was decided 2026-08-08 and is recorded in the phase | no |
+| R42 several accounts signed in at once | **DONE** (2026-08-22) | nothing. The three OS-keyring integration tests were called unrunnable here and are not: they pass under `keyctl session`, which is what CI itself uses (corrected 2026-08-22) | no |
+| R54 every demo carries every feature | **DONE** (2026-08-22) | nothing. The yew and desktop demo hand-drives fold into R57's human pass | no |
+| R55 containerised test services and CI | **DONE** (2026-08-20) | nothing. `plans/containerised-test-services-and-ci.md` records all decisions and proofs, and the section here records the four coverage gaps closed 2026-08-22 | no |
+| R56 local data import | **DONE** (2026-08-21) | nothing. Twelve decisions recorded, two findings folded into `R19` and `R26`, and `R26`'s compression and plaintext-statement items landed with it | no |
+| R57 the demo feature gaps the export audit found | NOT STARTED | nothing | no |
+| R58 a subscription's cost and a large read's ceiling | **DONE** (2026-08-21) | nothing. Fifteen decisions recorded, `R59` absorbed by decision 6, `R60` split out, and the build's own findings written into the section | no. Question 4 established the work is connetto's, with `pg2sqlite` and `subql` untouched |
+| ~~R59 a subscription has no ceiling and no way to page~~ | **ABSORBED** into R58 (2026-08-21) | n/a | no |
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
-| R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no, discharged |
+| R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
+| R60 a limited request syncs the whole table and blocks its cleanup | IN PROGRESS, designed | the upstream subql windowed-subscription feature landing, then the pin move. Steps 4 and 5 (unsubscribe stranding, residual-pass policy) are buildable now | landed nothing yet: **yes, subql** (request written, unsent) |
 | R11 shared public store | NOT STARTED | nothing | no |
-| R15 replica retention and trimming | **BUILT** (2026-08-19) | **nothing.** The pin carries all nine APIs the phase uses (`wal_checkpoint`, `WalCheckpointMode`, `auto_vacuum` and its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum`, `vacuum_into`) | merged and pinned |
+| R61 the portability download | NOT STARTED, fully designed (2026-08-22) | wanting it: the deadline is the first real deployment. The file half needs `R65` | no |
+| R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
+| R63 rewire the membership term onto subql's own APIs | NOT STARTED | nothing. Needs the subql pin bump to a revision carrying the three merged findings | landed 2026-08-19 |
+| R15 replica retention and trimming | **DONE** (2026-08-19) | **nothing.** The pin carries all nine APIs the phase uses (`wal_checkpoint`, `WalCheckpointMode`, `auto_vacuum` and its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum`, `vacuum_into`) | merged and pinned |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
 | R32 replication slot lifecycle | **DONE** (2026-08-09) | nothing | no |
-| R40 replica policy enforcement wired into sync | **BUILT** (2026-08-15), browser evidence partial | **not R40's, and it is the change path rather than the replica**: `upstream/policy-bearing-table-refuses-an-owned-write.md`. A policy-bearing table refuses a client's write of a row the caller owns, while reads work. Thirteen of twenty browser binaries pass, seven wait on a server echo that never comes. The first blocker, a pg2sqlite trigger destroying column defaults, was written up and upstream fixed it the same day (pin `5bf6dd9` to `e02e7b9`) | landed |
-| R24 file-sync integration | NOT STARTED, exploratory | nothing | reads a separate stack |
-| R25 device-to-device sync | NOT STARTED, exploratory | nothing | no |
-| R30 grouped aggregates revisited | NOT STARTED, exploratory | nothing | no |
+| R40 replica policy enforcement wired into sync | **DONE** (2026-08-19) | nothing. The pk codec is type-directed, the relay hub reads and applies split tables through the worker's map, and all twenty browser binaries pass | landed |
+| R24 file-sync integration | **DONE** (2026-08-21, as a design) | nothing. Ten positions recorded, R64 to R69 derived | no |
+| R64 file core | NOT STARTED | nothing | no |
+| R65 file server | NOT STARTED | R64 | no |
+| R81 aggregate read time bound | **DONE** (2026-08-22) | nothing | no. Confirmed: the upstream request assigns read ceilings to the caller, and this phase makes true a sentence it already states |
+| R66 file seam in connetto | NOT STARTED | nothing | no |
+| R67 native file client | NOT STARTED | R64, R65 and R66 | no |
+| R68 browser file client | NOT STARTED | R64, R65 and R66. The archive step coordinates with R56's format | no |
+| R69 files in every demo | NOT STARTED | R67 and R68 | no |
+| R70 backup and restore story | NOT STARTED | nothing | no |
+| R71 Linux key custody survives reboot | NOT STARTED | nothing for grounding. One custody decision to take with the maintainer at execution | no |
+| R72 clock discipline (X6) | NOT STARTED | nothing | no |
+| R74 device identity and certificates | NOT STARTED | nothing | no |
+| R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
+| R76 the peer link | NOT STARTED | R74 | no |
+| R77 the peer exchange and provisional tier | NOT STARTED | R75 and R76. The retraction's reason rides on R57 step 8's fix | no |
+| R78 courier recovery | NOT STARTED | R75 and R77 | no |
+| R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
+| R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
+| R25 device-to-device sync | **DONE** (2026-08-22, as a design) | nothing. R74 to R80 derived on the maintainer's instruction, chapter 19 written. The iOS hotspot zero-coverage field test travels to R80 | no |
+| R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | yes: the GROUP BY/HAVING refusal defect, written and unsent |
+| R82 grouped and re-executed delivery | NOT STARTED | upstream subql phases U0 to U5 | yes: `docs/upstream-subql-grouped-and-reexecution-tiers.md`, unsent |
+| R83 client resting table | NOT STARTED | nothing | no |
+| R84 keyed and row-shaped handles | NOT STARTED | R82 and R83 | no |
+| R85 per-viewer RLS re-execution | NOT STARTED | upstream U6 and R82 | yes: U6 of the same request |
+| R73 failover verification (X7, reframed) | NOT STARTED, exploratory | nothing | no |
 
 ## Dependency graph
 
-A rendering of the dependencies in the table above, for reading rather than for deciding. **The graph carries dependencies only and says nothing about status. Decided with the maintainer 2026-08-08**, after the graph's done-highlighting was found missing R20, R29 and R44 and its node set missing R34 and R39: status lived in three hand-maintained places and drifted within days, so finishing a phase now updates the two tables and never this diagram. If an edge disagrees with the table, the table is right.
+A rendering of the dependencies in the table above, for reading rather than for deciding. **The graph carries dependencies only and says nothing about status. Decided with the maintainer 2026-08-08**, after the graph's done-highlighting was found missing R20, R29 and R44 and its node set missing R34 and R39: status lived in three hand-maintained places and drifted within days, so finishing a phase now updates the two tables and never this diagram. If an edge disagrees with the table, the table is right. Amended 2026-08-21: the node set had stopped growing (R48 to R61 were missing while R55 alone was added), so the missing phases are backfilled and the standing rule is that a new phase adds its node and edges, while status still never touches the diagram.
 
 ```mermaid
 graph TD
@@ -223,7 +295,7 @@ graph TD
   R31[R31 application schema majors]
   R32[R32 replication slot lifecycle]
   R12A -.->|lag line only| R32
-  U3[upstream diesel: wal_checkpoint merged,<br/>fork pin not yet rebased] --> R15[R15 replica retention and trimming]
+  U3[upstream diesel: wal_checkpoint merged,<br/>fork rebased and pinned 2026-08-18] --> R15[R15 replica retention and trimming]
   R23[R23 user-verified unlock of local secrets]
   P[probe: webauthn-prf-probe-spec] --> R23
   R26[R26 local data export]
@@ -238,10 +310,63 @@ graph TD
   R47[R47 one helper per job]
   R40[R40 replica policy wired into sync]
   U2b -.->|pin moves when it lands| R40
-  R24[R24 file-sync integration, exploratory]
-  R25[R25 device-to-device sync, exploratory]
-  R30[R30 grouped aggregates revisited, exploratory]
+  R24[R24 file-sync integration]
+  R25[R25 device-to-device sync]
+  R30[R30 grouped aggregates, DONE as a design]
+  R24 --> R64[R64 file core]
+  R64 --> R65[R65 file server]
+  R66[R66 file seam in connetto]
+  R64 --> R67[R67 native file client]
+  R65 --> R67
+  R66 --> R67
+  R64 --> R68[R68 browser file client]
+  R65 --> R68
+  R66 --> R68
+  R56 -.->|archive format| R68
+  R67 --> R69[R69 files in every demo]
+  R68 --> R69
+  R70[R70 backup and restore story]
+  R65 -.->|content backup split| R70
+  R71[R71 Linux key custody survives reboot]
+  R72[R72 clock discipline]
+  R73[R73 the mesh question, exploratory]
+  R58 -.->|the bound it extends| R81[R81 aggregate read time bound]
+  R30 --> R82[R82 grouped and re-executed delivery]
+  R30 --> R83[R83 client resting table]
+  R82 --> R84[R84 keyed and row-shaped handles]
+  R83 --> R84
+  R82 --> R85[R85 per-viewer RLS re-execution]
+  R81 -.->|bounds every tier read| R82
+  R25 --> R74[R74 device identity and certificates]
+  R74 --> R75[R75 per-device applied frontier]
+  R74 --> R76[R76 the peer link]
+  R75 --> R77[R77 exchange and provisional tier]
+  R76 --> R77
+  R57 -.->|reason surface| R77
+  R75 --> R78[R78 courier recovery]
+  R77 --> R78
+  R77 --> R79[R79 media over the peer link]
+  R67 --> R79
+  R77 --> R80[R80 peer sync in every demo]
+  R78 --> R80
+  R79 --> R80
+  R55[R55 containerised test services and CI]
   R2 -.->|registry only| R8
+  R48[R48 a truncate empties the client's copy]
+  R49[R49 a withdrawn cross-table grant] -->|held-key sub-case only| R7
+  R50[R50 the policy answers a write it never asks]
+  P --> R51[R51 native Apple gate]
+  P --> R52[R52 native Android gate]
+  P --> R53[R53 Windows gate]
+  R26 --> R56[R56 local data import]
+  R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
+  R58[R58 read ceiling and keyset paging]
+  R60[R60 a limited request syncs the whole table]
+  R26 --> R61[R61 the portability download]
+  R65 -.->|the files/ half| R61
+  R62[R62 refuse an undeclared primary key]
+  U5[upstream subql:<br/>term planning and seeding, landed] --> R63[R63 membership-term rewire]
+  R27 --> R63
 ```
 
 ## Upstream dependencies
@@ -259,7 +384,7 @@ graph TD
 
 **Delivering R5b raised three more against the same two projects, all filed and all fixed within a day**, which is why the pin moved four times during one phase. A difference whose tuple key states both sides, a table the database leaves open, and a statement the model refuses: rls2fga learned to report the last two, and subql learned to read all three. R5b's own section carries each one with its reproduction.
 
-**The one upstream item still open is not a blocker.** `diesel-rs/diesel#5150` added `SqliteConnection::wal_checkpoint` and merged on 2026-08-14, so all five of the SQLite maintenance proposals are upstream. It is **merged but not yet reachable**: this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch, pinned at `ac4cdfc3`, which does not carry it. R15 needs the fork rebased on upstream `main` and the pin moved, which is a lock change rather than a request, and the precedent is the 2026-08-07 rebase recorded under R29.
+**The last open item closed on 2026-08-18.** `diesel-rs/diesel#5150` added `SqliteConnection::wal_checkpoint` and merged on 2026-08-14, completing all five of the SQLite maintenance proposals. It was merged but unreachable for four days, because this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch and the pin at `ac4cdfc3` did not carry it. The fork was rebased and every workspace lock moved to `705e4340` on 2026-08-18, R15 consumed all nine APIs from it, and the opening sentence of this section is true without exceptions. (Corrected 2026-08-21: this paragraph still described the rebase as pending after R15 had recorded it done.)
 
 ---
 
@@ -2140,7 +2265,7 @@ One handle exists per tier file at any moment in the browser, native still attac
 
 ## R42: several accounts stay signed in at once
 
-**Status.** NOT STARTED. The one undecided input was settled with the maintainer on 2026-08-08, so nothing blocks it.
+**Status.** **DONE** (2026-08-22, BUILT 2026-08-19). All four decisions were taken with the maintainer and are recorded below, everything landed, and the environment remainder was discharged on 2026-08-22: a fresh `connetto-browser-stack` run from current source (exit 0, twelve minutes, every suite zero failed) put a matching-schema server on 7777, so all 21 `wasm-smoke` binaries ran, `election.rs` and `failover.rs` proved the `spawn_worker` replacement path, and `browser_auth`'s `two_real_logins_leave_two_accounts_signed_in_at_once` demonstrated the Done-when's first clause against two real providers. **The last remainder is discharged too, and it was never an environment condition. Corrected 2026-08-22 while gating `R62`:** the three OS-keyring integration tests were recorded here as unrunnable behind a locked `login` collection, and they pass under `keyctl session`, which starts a fresh kernel session keyring and is exactly what CI's own `rust-tests` job does. Run here: `the_keyring_key_store_keeps_two_accounts_apart`, `the_keyring_refresh_store_keeps_two_accounts_apart` and `the_keyring_refresh_store_lists_every_account_it_holds`, all green, so this phase has no unrun test on any machine that runs the suite the way CI does.
 
 **Blocked on nothing.** Split out of R17 on 2026-08-07, where it had been step 2. It was blocked on a decision rather than on a phase, and that decision is now taken and recorded below.
 
@@ -2164,9 +2289,68 @@ A person with a work account and a personal one should flip between them instant
 
 **The smaller question riding with it falls out mechanically.** The pre-login literal (`connetto_web::auth::REFRESH_RECORD`, and the desktop demo's own `"refresh"`) dies with this phase: every store call names the account it is about, taken from the login response, the switch target, or the boot default read from the marker. Native follows the same rule, since R41 made both stores account-addressed and `IDENTITY_RECORD` lives in `connetto-client`, shared by both targets.
 
+### Grounded against the tree, 2026-08-19
+
+Five facts checked at source before any code, because three of them outrun the text above.
+
+1. **Nothing can enumerate the accounts today, and on the desktop nothing could.** `RefreshTokenStore` (`crates/connetto-core/src/traits.rs:159`) has `load`, `store` and `clear`, all account-addressed, and none enumerates. The browser can answer a list from SQL over `connetto_refresh`. The desktop cannot answer it at all: `keyring` 3.6.3 exposes no search, list or enumerate on any of its three native backends, verified in its own source, and no version ever did, the capability living in a separate single-author crate (`keyring-search`). So "connetto exposes the list of stored account names" was unreachable as written. Decision 3 closes it.
+2. **The account key is forced, not chosen.** `encode_identity` (`crates/connetto-client/src/replica.rs:342`) is `serde_json::to_string`, so it round-trips through `decode_identity`, while `replica_db_name` (`:294`) is a truncated SHA-256 and cannot. The encoded identity is therefore the only value on the device that names an account and reads back as the deployment's own id type, and the last-used marker already holds exactly it.
+3. **There is no switch entry point anywhere.** `boot_db_worker` (`crates/connetto-web/src/workers.rs:534`) opens one replica, provisions one key, connects once, and holds the relay hub and the alive lock for the worker's whole life. Decision 1 settles what a switch is.
+4. **The gate is ahead of the store.** The unlock ceremony runs at `workers.rs:593-625`, before `open_refresh_store`, so the account list exists only after a user-verification prompt. This is the constraint R23 flagged for this phase to record, and decision 2 records it as the boot order.
+5. **A runtime account has no field to arrive in.** `DbWorkerConfig` carries `&'static str` throughout, and `boot_db_worker` is generic over the id while the config is not, so naming an account through the config would make the config generic. Decision 2 avoids needing to.
+
+### Four decisions, taken with the maintainer 2026-08-19
+
+**Decision 1, a switch replaces the whole DB worker.** The tab terminates the worker and spawns a fresh one, which boots against the new account exactly as a cold start does. This reuses the replacement path that already exists and is tested: `workers.rs:20` and the demo's own comment (`examples/dioxus-web-demo/src/main.rs:368`) both state that a tab's factory finds a replacement worker through the same ready handshake, which is what leader failover already does. No invariant is added. **Accepted cost: one user-verification prompt per switch**, because R23 decision 7 makes the gate one prompt per worker boot, and a switch takes about as long as a page load rather than being instant. **Rejected: swapping the replica and the connection inside a live worker**, which would be instant and free of a second prompt, but breaks the assumption that a worker opens one file and holds it for its life, an assumption the pending-wipe path leans on directly (`workers.rs:1057-1059`, the replica is destroyed only at the next startup because OPFS cannot delete a live file), and would carry the hub, the alive lock and the tab ports through a mid-life reopen. **Rejected: one worker per signed-in account**, which decrypts and holds open every account's data whether or not anyone is looking at it and contradicts this phase's own rejection of resuming every stored account at once.
+
+**Decision 2, the worker asks the tab which account, during boot and after the gate.** The request rides the private `MessagePort` R23 already built for the ceremony, so no new channel and no new config genericity: the worker posts the account list, the tab answers with one, and the boot continues with it. Enabled by its own flag, the shape `unlock` already has, and off by default so an application with no picker keeps the last-used default and never waits. This is also the only order that costs one gesture rather than two, which is what R23's note about prompting first and choosing second anticipated. **Accepted cost: an application that turns the flag on and never answers hangs its own boot**, which is the documented failure mode of the `unlock` flag already (`workers.rs:261-264`) rather than a new one. **Rejected: booting the last-used account and publishing the list afterwards**, which never blocks but opens, keys and syncs an account nobody asked for and then throws it away, and, because decision 1 makes a switch a fresh worker, costs a second prompt on every boot where the wanted account is not the last-used one. **Rejected: the application names the account at spawn and keeps its own list**, already rejected above as a second bookkeeping of the same fact.
+
+**Decision 3, connetto maintains its own account index, and the credential-store trait grows a list.** Each target answers it the best way it honestly can: the browser reads `connetto_refresh`, which cannot drift because it is the same rows the credentials live in, and the desktop reads one extra record connetto writes beside the sign-ins holding the account names. **Accepted cost: the desktop index can go stale** if an entry is removed from the keychain out of band, so a listed account may have no usable credential, which decision 4 answers by falling through to a login. One extra small write per sign-in. **Rejected: making the list browser-only and narrowing the Done when**, which is cheaper and matches this phase's "only the browser needs changing", but leaves the two targets offering different features and forces a desktop picker into the second bookkeeping this phase rejected for the browser. **Rejected: depending on `keyring-search`**, a single-author crate whose job is reading the machine's credential store, on a security-relevant path, and which does nothing for the browser anyway.
+
+**Decision 4, an unusable default asks for a login rather than choosing somebody else.** When the marker names an account whose credential is gone or refused, the boot falls through to interactive login with nobody preselected. This is what the code already does with no credential at all (`crates/connetto-web/src/auth.rs:1202-1215` falls to `Acquired::NeedLogin`), so it needs no new behaviour, and it is what keeps the device from ever coming up as a person nobody picked. **Rejected: falling back to another stored account**, which avoids a login while a working credential sits on the device, but silently opens one identity's data when the user expected another's and needs an arbitrary order among stored accounts to decide which. **Rejected: refusing the boot with its own error**, which helps only an application with a picker, and an application with a picker never reaches this path because decision 2 has it choose before the account is used.
+
+### Steps
+
+1. **The account key becomes the encoded identity, and the pre-login literal dies.** `REFRESH_RECORD` and the desktop demo's `"refresh"` go. `BrowserAuthenticator` and `NativeAuthenticator` hold an optional account: absent means nothing is stored to refresh from, which is the first-boot path, so the silent attempt is skipped rather than made against a literal. Every store call names an account, from the login response, the switch target, or the marker.
+2. **`RefreshTokenStore` grows an enumeration**, answered from `connetto_refresh` in the browser and from a new index record in `connetto-client` beside `IDENTITY_RECORD` on the desktop. The reserved record names are excluded from what it returns, since the marker and the index live in the same key namespace as the accounts.
+3. **Boot order in `boot_db_worker`**: gate, open the store, read the list, then either ask the tab (flag on) or read the marker (flag off), then acquire, then name the replica. The marker is written on a switch as well as on a token acquisition.
+4. **The switch entry point**, page side: terminate the worker, spawn a fresh one, let the existing ready handshake reattach every tab. The worker writes the marker to the switch target before it goes, since it is the only context that can reach the OPFS-backed store.
+5. **Logout names one account.** `logout_locally` (`workers.rs:1088`) passes the active account rather than a literal, so signing one account out leaves the others signed in and the marker falls to decision 4 on the next boot.
+6. **Chapter 12 line 236 changes and must not be missed.** It states that replica file names permit confirmation but not enumeration. After this phase the credential store does permit enumeration of accounts, to anyone past the gate. Chapter 14's store table and chapter 12's threat-model section both record the new position, including that the gate is what stands in front of the list.
+
+### What execution changed, and two defects it uncovered in R23
+
+**Step 4 needed no marker write, and step 3's last clause is therefore void.** A switch sets a pending target on the page that owns the worker, replaces the worker, and the replacement's account question is answered with that target. The marker then follows for free, because the acquisition writes it, so a later cold boot lands on the account that was switched to without anything writing it twice. The target is consumed by the one answer it was set for, which is what stops a switch from being sticky: without that, an application's chooser would be dead code after the first switch.
+
+**A page with no worker can still ask for a switch.** `Membership::switch_account` acts directly when this page is the leader and broadcasts otherwise, because a `BroadcastChannel` never delivers to its own sender. Only a page holding leadership records the target: a target held anywhere else would either go unused or be answered by a page promoted long afterwards, which is a switch resurrecting itself.
+
+**Defect found in R23, fixed here: the gate was unreachable under the leader topology.** `serve_unlock` takes the `Worker` handle, and a page reaches the topology through `leader::join`, which never exposed one. Nothing outside `examples/webauthn-unlock`, which spawns its own worker, could install the tab side at all, so neither demo could ever have unlocked a gated profile. `join` now installs it on every worker it spawns, replacements included. The handler is inert unless the worker asks something, so a consumer with no gate pays nothing. This had to be fixed here regardless, since a switch spawns a worker that must be able to ask.
+
+**Defect found in R23, fixed here: a logout on an enrolled profile silently kept the credential.** `logout_locally` opened a second `IdbKeyStore`, and the derived key-encryption key lives on the instance (`crates/connetto-web/src/auth.rs`, the `derived` field), so on an enrolled profile the fresh store was locked, `device_key` returned `Locked`, and the revoke path logged a warning and cleared nothing while the tab was told it had logged out. It now uses the worker's own unlocked store through a new `unlock::worker_key_store`, falling back to opening one only when no gate was ever installed.
+
+**One decision refined at implementation.** Decision 2 accepted that an application turning the account question on and never answering hangs its own boot. As built it cannot: a tab with no chooser registered answers with the default, so only a chooser whose own future never resolves can hang. The stated cost is therefore smaller than accepted, not larger.
+
+**The native index arithmetic is a pair of pure functions**, `indexed_with` and `indexed_without`, rather than logic inlined in `store` and `clear`, which both duplicated the "did anything change" test. That is what makes the index provable on a machine with no usable OS keyring, which is the machine this landed on.
+
+### Proven
+
+**Native, 311 tests, no failures.** The account list is proven by one caller for every implementation, `connetto_core::test_support::every_stored_account_is_listed`, run against the in-memory store, the OS keyring store, the browser's `SQLite` store and the deferred store. Its load-bearing assertion is that a reserved record written into the same key namespace never appears in the list, because the marker is written on every single token acquisition and offering it would put a credential nobody owns in front of a user. Three unit tests in `crates/connetto-client/src/auth.rs` cover the native index, mutation-checked: dropping the reserved guard fails `the_account_index_refuses_connettos_own_records`.
+
+**Browser, 52 tests over eleven binaries, no failures.** `crates/connetto-web/tests/account_boot.rs` is new: the marker addresses the row it names rather than merely naming a person, the later sign-in wins the marker while the earlier account stays signed in and both are offered, a marker whose credential is gone asks for a login and disturbs nothing, and a first run names no account. `unlock::tests::a_switch_target_answers_once_and_then_the_chooser_does` pins the switch precedence and its single use, mutation-checked: making the target survive its answer fails it.
+
+**Decision 4's rejected alternative is excluded against a real auth stack.** `a_marker_whose_credential_is_gone_never_signs_the_other_account_in` in `examples/wasm-smoke/tests/browser_auth.rs` logs in for real, points the marker at an account with no credential, and asserts the boot asks for a login while the other account's token does not rotate. Mutation-checked by implementing the rejected fallback, which fails it with "the boot signed in as ...". **The offline sibling cannot carry this**, and says so in its own comment: with no server the fallback's refresh fails too and both designs reach the same answer.
+
+**What is not proven, so nobody reads silence as a pass.** The worker replacement itself, meaning a real switch end to end, and the account question over the private port. Both need a booted DB worker from `examples/wasm-smoke`, and every binary there is refused before reaching any of this phase's code: the sync server on the hardcoded port 7777 advertises schema `44430ebd24e8` while a wasm-smoke client is built for `d55c5b624df3`. That is the same environment blocker R23 recorded, it belongs to whoever is running that server, and the suite compiles. The replacement path itself is `spawn_worker`, the one `run_election` uses, which `election.rs` and `failover.rs` already prove converges every tab. Also unrun: the three OS-keyring integration tests, including R41's two pre-existing ones, which fail identically on this machine with "No matching entry found in secure storage" because the session has no usable keyring.
+
+**Discharged 2026-08-22.** The stale port-7777 process was gone, `cargo +stable run -p connetto-test-harness --bin connetto-browser-stack` provisioned and ran everything from current source, exit 0, every suite zero failed, so the two blocked runs above are now proven. The three OS-keyring tests stay unrun here: `org.freedesktop.secrets` reports the `login` collection locked, the same wedge the 2026-08-17 record describes.
+
+### Proof
+
+Two accounts' credentials coexist in one browser profile, a switch to the second needs no interactive login, a cold boot with nobody naming an account lands on the last-used one, and an application that answers the account request lands on the one it named. Asserted in `crates/connetto-web/tests/` beside the two-account properties `account_switch.rs` already carries, plus the stale-marker fallback of decision 4 and a native test that the index enumerates what was stored and forgets what was cleared.
+
 ### Done when
 
-Two accounts are signed in on one browser at once, a switch between them needs no login, a cold boot resumes the last-used account by default, and an application can list the stored accounts and name one at boot instead.
+Two accounts are signed in on one browser at once, a switch between them needs no login, a cold boot resumes the last-used account by default, and an application can list the stored accounts on either target and name one at boot instead. No store call names a literal any more.
 
 ### Why it is not part of R17
 
@@ -2191,7 +2375,7 @@ The **cost concern also belongs to R19** and needs no query set: a new subscript
 
 The **advance knowledge of the query set belongs to R27**, which is the only thing that ever needed it. A membership term naming a relationship must be compiled into relationship checks for the change path, and `docs/architecture/04-subscriptions.md` records that this compilation needs the query set known ahead of time. If R27 needs it, R27 derives it automatically from what the application already wrote, and designs it against a concrete use rather than in the abstract.
 
-**Consequences to carry.** R19 no longer has a prerequisite here and can start whenever. R27's dependency on R22 is void and must be restated as a requirement R27 satisfies for itself, in this plan and in `04-subscriptions.md`, which names R22 twice. Step 8 loses one of its two entries, leaving R13.
+**Consequences to carry.** R19 no longer has a prerequisite here and can start whenever. R27's dependency on R22 is void and must be restated as a requirement R27 satisfies for itself, in this plan and in `04-subscriptions.md`, which names R22 twice. Step 8 loses one of its two entries, leaving R13. **Corrected 2026-08-21: both halves are done.** `04-subscriptions.md` no longer names R22 anywhere, and R27 (DONE) carried its own compilation requirement, so nothing remains to restate.
 
 ## R38: a refusal stops disclosing what exists
 
@@ -2246,7 +2430,7 @@ No refusal on any path tells a caller whether what it named exists.
 
 ### Purpose
 
-**There is no rate limiting anywhere.** A search for `rate_limit`, `throttl` and `governor` across `crates/` returns nothing, and the endpoints in `auth_router` count no attempts. This was recorded as phase E7 of an earlier series and never carried into this plan, so it has been unowned rather than deferred.
+**There is no rate limiting anywhere.** A search for `rate_limit`, `throttl` and `governor` across `crates/` returns nothing, and the endpoints in `auth_router` count no attempts. This was recorded as phase E7 of an earlier series and never carried into this plan, so it has been unowned rather than deferred. **(Superseded by this phase's own build, 2026-08-06: `crates/connetto-server/src/throttle.rs` now meters and refuses, and this paragraph survives as the grounding that motivated it. Marked 2026-08-21 after a review read it as current.)**
 
 One thing already in the codebase is easy to mistake for throttling and is not: `SessionConfig::initial_credits` in `crates/connetto-server/src/session.rs` is delivery flow control, bounding how much undelivered data a session accumulates. It does not bound what a caller may ask for.
 
@@ -2295,6 +2479,8 @@ A caller exceeding the subscription-creation limit is refused rather than served
 
 **Two more findings, both working as decided, recorded because they change what R36 can lean on.** Credential refusals do not accumulate across connections for a caller that never presents a resume token, since a handshake without one mints a fresh handle, so that counter reads one per connection for precisely the attacker R36 means to ban. Step 5 accepts discardable handles explicitly, so this is not a defect here, but **R36 must not build its failed-credential signal on this counter without a second key.** And nothing honours `retry_after_ms` on a close: `ReconnectPolicy` is a fixed 200ms to 5s doubling that never reads the reason, so a client told to wait a minute retries every five seconds. The value reaches the application through `ClientEvent::ServerClosed`, so decision 1's typed signal is delivered, but the "an honest client backs off" half of its justification needs the client loop to read it.
 
+**A third finding, added 2026-08-21 while `R56` was being designed: writes are metered by nothing.** This phase chose three signals, subscriptions, connections and credential refusals, and a write is not among them. A mutation instead takes `R39`'s reader-share permit, so when the unreserved share is full it is deferred with `RateLimited` and stays pending on the client to replay. That bounds what the server spends and does not count what the caller did, and `R36`'s tally counts credential signals only, so a caller who keeps the unreserved share saturated is absorbed on every burst and noticed on none. **Left open deliberately rather than fixed.** A write limit needs a threshold, a threshold without a measurement refuses somebody's legitimate bulk work on its first day, and this repository already has the habit of pricing a thing before tuning it. Whoever picks that number should know that `R39`'s reserved share for identified callers is the mitigation already in place, and that a determined flooder paces itself under any count-based limit anyway.
+
 ### Done when
 
 Subscription creation, connection rate and the auth endpoints are all metered, the two tiers are distinguishable in a test, and the anonymous key survives reconnection.
@@ -2303,9 +2489,9 @@ Subscription creation, connection rate and the auth endpoints are all metered, t
 
 ## R23: user-verified unlock of locally stored secrets
 
-**Status.** NOT STARTED
+**Status.** DONE 2026-08-20. Everything in the steps below landed, and R55's browser-stack run discharged the delayed `wasm-smoke` unlock proof.
 
-**Blocked on a measurement, not on code.** `docs/webauthn-prf-probe-spec.md` specifies a probe to be built and run separately. Two decisions inside this phase wait on its report, and a negative result on its central question would reshape the phase rather than merely delay it. **Confirmed by the 2026-08-08 reconciliation: nothing in this phase is decidable ahead of the probe report**, so its next action is executing step 1 as written, not a discussion, and no future session should reopen the phase looking for one.
+**Probe done and four decisions taken, 2026-08-19.** The report lives in the `webauth-spike` sibling repo (`report/results.json`, sixteen rows). Q5 stability passed on every row that ran, synced Google Password Manager passkeys carry the extension on both measured platforms (so step 8's no-gate decision stands), iCloud Keychain is confirmed directly on Safari and iOS, Q13 is proven in the strongest cross-browser form (the stolen-profile claim is makeable), the worker topology is exactly as step 3 assumed, and the whole product flow drives through typed `web-sys` 0.3.103. The decisions, each recorded with costs in `docs/prompt-r23-user-verified-unlock.md`: **(1) Windows is out of this phase entirely** and moves to R53, since no reliable Windows machine exists and its decisive W2 question is unmeasured. **(2) Enrolment requests `residentKey: "preferred"` uniformly**, because Android delivers the extension only for discoverable credentials (its non-discoverable platform credential returned nothing despite the browser advertising the capability), with the recorded caveat that the measured passing row used `required`, so the manual Android proof confirms `preferred` lands on the passkey path. **(3) The restart-lockout risk (Q12) is accepted**: wipe-and-resync is the recovery, no passphrase fallback and no retained stored key. **(4) The phase splits so each surface lands alone**: R23 keeps the browser gate, the custody property and chapter 14 (steps 2, 3, 7, 9), native Apple moves to R51 (step 4, with step 5 discharged by the probe: `RequireUserPresence` matches the raw flags on all three points, nothing to contribute), native Android moves to R52 (work the probe surfaced: a WebView app's only gate is the native Keystore), and Windows moves to R53 (step 6).
 
 **Renamed and rescoped.** It was "derive the browser replica key from a passkey". That undersized it in three ways: it covered one of the two secrets, it was browser-only, and its step 1 conflated "is the extension supported" with "is the mechanism it replaces actually weak", so it could never deliver what its own step 5 promised.
 
@@ -2315,21 +2501,43 @@ Locally stored secrets are readable by anyone holding the device or the browser 
 
 The target is the behaviour a banking application has: open it, present a finger, and the local data is readable. The server verifies nothing and is not involved, which is what distinguishes this from a login mechanism. `11-authentication.md` records that distinction and rejects the login variant as bad practice.
 
+**Six further decisions taken 2026-08-19, decisions 5 to 10.** Grounding the phase against the tree before writing code turned up five points the prompt did not settle, each a contradiction with the source rather than a preference. All five are now closed and the reasoning is here so the next reader does not re-derive it.
+
+**Decision 5, the first run signs in before it enrols.** The gate is needed before the login on every boot, including the first: `boot_db_worker` opens the key store, then `acquire_session` mints or reads the device key and hands it to `RefreshStore::open`, and once the wrapping key stops being stored that record cannot be touched before a ceremony completes. A first run has no credential and nobody signed in, so the original step 2 wording (the user entity is the signed-in identity) could not hold as written. Resolved by ordering a first run as login, refresh token held in memory only, enrolment, then create the store and write the token. Accepted cost: one extra first-run path, and a user who leaves between signing in and enrolling signs in again. **Amended by decision 10:** this decision's original benefit was stated as the passkey carrying the account the user just signed in as, and that half is withdrawn. The ordering is kept for the reason that turned out to be load-bearing, which is that a profile that enrols never writes a stored key at all, so no snapshot of it can hold one.
+
+**Decision 6, a failed unlock refuses the boot.** Chapter 14 said a user who declines lands on a stored key with no user verification (`docs/architecture/14-at-rest-encryption.md:118`) while the same chapter deletes the `kek` store (`:100`), so post-enrolment there is no rung to land on. WebAuthn also returns the same `NotAllowedError` for a dismissal and for a credential that is gone, deliberately, so no code can tell them apart. Resolved by refusing the boot with an error distinct from every other boot failure, leaving everything on disk intact, and letting the application offer the ceremony again. Recovery from a genuine lockout stays the user's explicit choice through the existing `connetto_web::storage::mark_wipe_pending` and boot-drain path. Rejected: falling back to a memory-only session, which hides device-private tables and silently discards whatever is typed in it. Rejected as actively dangerous: wiping automatically, because one accidental dismissal is indistinguishable from a lockout and would destroy unpushed writes with no way back. Note for R23's own text: decision 3's phrase "the existing purge-and-recover path" names `purge_replica`, which is `#[cfg(feature = "native-transport")]` (`crates/connetto-client/src/teardown.rs:99`) and has no browser mirror. The browser mechanism is `wipe_replica` plus `mark_wipe_pending`.
+
+**Decision 7, one prompt per worker boot, derived rather than chosen.** Not asked, because chapter 14 already decided the page keeps no reference to the key (`:104`) and the platform closes off the alternative. `PublicKeyCredential` is `Exposed=Window`, so a worker can never call the ceremony, and the key must therefore arrive from a tab. It crosses on the private `MessagePort` the tab already owns from spawning its own worker, never on a `BroadcastChannel`, because a non-extractable key object on a shared channel hands any same-origin script the ability to unwrap the replica key, which is the invariant `crates/connetto-web/src/auth.rs:13-14` states for the login channel. A promoted leader spawns a fresh worker (`examples/wasm-smoke/tests/election.rs:1-4`) and so prompts again. Measured platform facts behind this: Safari has required a user gesture for an assertion since Safari 14 and grants one gesture-free call per navigation, restored after each success and spent on a failure (WebKit changesets r287957 and 257940@main), while Chrome and Firefox do not gate a plain `get()`, which the passing web-platform-test `webauthn/getcredential-prf.https.html` demonstrates by calling it with no gesture. So a first attempt may be automatic everywhere and a retry after a dismissal needs a real click on Safari, which makes the unlock a function a tab calls rather than something connetto initiates.
+
+**Decision 8, custody has two shapes, each true about what it describes.** A read-only accessor on whichever connection owns the durable replica, which covers the worker and every native connection, plus a browser-only asynchronous request a tab makes to the worker. A tab's own connection deliberately does not answer: tabs hold their own `ConnettoConnection` over `MessageTransport<BroadcastChannel>` against `Replica::in_memory()` (`crates/connetto-web/src/workers.rs:893`, `examples/wasm-smoke/tests/page.rs:55-67`), so the honest answer about a tab's mirror is always no durable key, which would read as a warning about the real data. Rejected: carrying it in the handshake so one accessor works everywhere, which widens the shared client-server protocol with a field the server has nothing to do with and puts a browser-only concept into `connetto-core`. Rejected: returning it once from startup, which goes stale exactly in the case the reason-carrying design exists for, a user who enrols later.
+
+**Decision 9, the automated proof lands in this phase.** The proof as written was not reachable: all twenty browser binaries run under `wasm-pack test --headless --chrome`, so `wasm-bindgen-test-runner` owns the WebDriver session and nothing in the repo drives WebDriver itself, while virtual authenticators install only over WebDriver or the DevTools protocol. Verified before deciding: ChromeDriver's `POST /session/{id}/webauthn/authenticator` accepts `extensions: ["prf"]`, mapped to the CDP `hasPrf` option in `chrome/test/chromedriver/webauthn_commands.cc`, backed by `VirtualCtap2Device::Config::prf_support` in `device/fido/virtual_ctap2_device.h`, default-enabled from Chrome 116, requiring `protocol: "ctap2_1"`. Presence is auto-simulated, so no synthetic gesture is needed. Virtual credentials do not persist across sessions and no hmac-secret can be injected, which is why the negative case is produced by deleting the simulated authenticator mid-session rather than by copying a profile directory. That is a stronger model of the same property: identical stored data, no credential. The harness needs no database or login stack, because what is under test is the key store rather than syncing. Rejected: deferring it to its own phase, which would leave the phase's headline claim resting on the probe report between landings while the ceremony wiring is the code most likely to break silently.
+
+**Decision 10, the credential names the device, not a person. Taken 2026-08-19 after R23 landed, while weighing R42.** Surfaced by grounding R42 (several accounts signed in at once) against what R23 had just built. R23 is structurally ready for several accounts and this was verified rather than assumed: nothing per-identity enters the derivation (`AT_REST_PRF_INPUT` and `AT_REST_KEK_LABEL` are fixed literals), records are keyed per replica as `{name}#{holder}`, and a second account's boot takes the unlock path and skips enrolment because `was_enrolled` reads the profile-wide `credentials` store, so it needs no second ceremony. What was wrong was one display string. The credential's `user.name` and `user.displayName` carried the enroling account, so a person with a work and a personal account would see one of them standing for both, permanently, because WebAuthn has no rename and `adopt_derived` refuses a second enrolment. Resolved by naming the user entity for the device and the origin (`"this device"` and `"local data on <host>"`), which also removed the identity from the enrol request entirely, so the worker no longer hands the tab a label. Neither string names connetto, which is a library an embedder's users should never be shown. Rejected: keeping the account label, which reads best for the single-account case and misleads exactly the work-plus-personal user R42 exists for. Rejected as unavailable rather than unwanted: relabelling on a switch, since the only way to change a passkey's label is to mint another one, which would derive a different key and orphan everything the first wraps. This costs nothing now because at `0.0.0` nobody has enrolled, and it would cost every enrolled user later.
+
+**A constraint R42 must record, found the same way.** R42's cold-boot rule reads the last-used marker and exposes the stored account list out of the refresh store, and that store opens under a key-store record, so after R23 both are behind the gate. An application wanting an account picker must therefore prompt first and choose second. That is the better order anyway, one gesture to unlock the device and then a choice of who, but R42's text says nothing about when the list becomes available and should.
+
 ### Steps
 
-1. **Run the probe and record the report.** `docs/webauthn-prf-probe-spec.md` lists thirteen browser questions and two native ones, with the consequence of each answer. A negative on its Q5, stability of the derived value, ends this approach outright.
-2. **Browser: derive the key-encryption key from the passkey** with one fixed input, through HKDF with a per-purpose label, replacing the stored non-extractable key. Re-key the `wrapped` store to (replica name, credential id) while writing a single row.
-3. **Browser: move the assertion into a tab and hand the key to the worker.** `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, so this is forced by the interface. State what the main thread may retain, since key material now transits it.
-4. **Native Apple: gate the keychain items** with biometry-any combined with device passcode. Biometry-any because biometry-current-set invalidates on a fingerprint change, and the passcode combination gives a fallback without a second stored copy.
-5. **Add access control to the Apple store crate upstream, and use it.** Decided rather than open: version 4 of that library split into a core plus per-platform store crates, so the capability lands in the Apple store alone and no cross-platform interface has to express something three platforms lack. The project is active with outside contributions merging within days, and no such request exists yet. Confirm the flags behave as expected via the probe's native leg before proposing anything. Reaching around the library was the alternative and is rejected, since the capability belongs where every other user of it can have it.
-6. **Windows, pending its own measurement.** Credential Manager has no user-verification attribute, so the gate cannot be a flag on existing storage. Hello is reachable through the `windows` crate's `Security_Credentials` features, but its consent check is worth nothing against an attacker holding the files, and its platform-held key signs rather than encrypts. Whether a key can be seeded from it depends on the signature being deterministic, which the probe's W2 measures. A negative puts Windows with the unsupported surfaces.
-7. **Expose which custody applies to the open replica**, as a property of the connection alongside the existing `ClientEvent` stream rather than as a new channel. Three levels, derived from a user-verified credential, stored without verification, and no durable key at all, each carrying a reason so an application can explain why rather than only what. The reason must separate a platform that cannot support the gate from a user who declined it, because only the second can be offered again, and enrolling later re-wraps the replica key under the derived one. This exists so an interface can warn plainly when protection is absent, since a user cannot infer it from their browser. Reporting a level connetto does not provide would be worse than reporting nothing, so it must be derived from what actually happened at unlock rather than from a capability guess made earlier.
-8. **Confirm the unsupported population**, from the probe's matrix. Structurally it is about 2.3% of tracked usage and the decision is already taken, no gate and the chapter says so. That decision stands only if a synced software passkey satisfies the extension. If it does not, the unsupported case becomes the common one and the fallback reopens with a passphrase as the serious candidate.
-9. **Update `14-at-rest-encryption.md`** to replace the pending markers with what the report established, including whether the stolen-profile claim can finally be made.
+1. ~~Run the probe and record the report.~~ Done 2026-08-19. Sixteen rows in `webauth-spike` at `report/results.json`.
+2. **Browser: derive the key-encryption key from the passkey** with one fixed input, through HKDF with a per-purpose label, replacing the stored non-extractable key. Re-key the `wrapped` store to (replica name, credential id) while writing a single row. A `credentials` store holding enrolled credential ids in the clear is added. The key-store database version bumps and its upgrade drops the old records, so a development profile written before this phase starts clean instead of carrying ones nothing can unwrap. **Correction to chapter 14 line 100, found while grounding this step: the `kek` store does not disappear.** It is the ungated rung, and chapter 14 requires that rung in two other places, at line 118 for a user who declines and at line 124 for a platform that cannot. So the stored key exists exactly while nobody has enrolled, and enrolling re-wraps every record under the derived key and destroys the stored one. The honest limitation this leaves, stated in chapter 14 rather than smoothed over: a profile snapshot taken before enrolment holds the stored key and therefore the replica key, which enrolment re-wraps but does not re-key, and no delete of an `IndexedDB` record erases the bytes underneath. That is why decision 5 keeps the first run's refresh token in memory until enrolment resolves, so a profile that enrols never wrote a stored key at all and only a profile that declined ever has one.
+3. **Browser: enrolment and assertion in a tab, the key to the worker over the tab's private port.** `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, so a worker cannot call it. The raw bytes exist in the tab only long enough for `importKey`, what crosses is the non-extractable `CryptoKey`, and the tab keeps no reference. Per decision 7 the unlock is a function a tab calls, so an application can retry it from a click.
+4. **Boot ordering, per decision 5 and decision 6.** A first run signs in, holds the refresh token in memory, enrols, then creates the refresh store and writes the token. A later boot asserts before anything opens. A failed or declined unlock refuses the boot with its own error and destroys nothing.
+5. **Expose which custody applies to the open replica**, per decision 8. Three levels, derived from a user-verified credential, stored without verification, and no durable key at all, each carrying a reason so an application can explain why rather than only what. The reason separates a platform that cannot support the gate from a user who declined it, because only the second can be offered again, and enrolling later re-wraps the replica key under the derived one. Native surfaces report stored without verification until R51 and R52 land, native Windows and Linux are platform-cannot, and a WebView-hosted application is platform-cannot on the browser route because it has no WebAuthn at all. Reporting a level connetto does not provide would be worse than reporting nothing, so it is derived from what actually happened at unlock rather than from a capability guess made earlier.
+6. **The ChromeDriver harness**, per decision 9. Its own standalone workspace: a page, a static file server, and a WebDriver client over HTTP. It enrols against a simulated authenticator carrying the extension, derives, writes, restarts the worker, opens again, then deletes the authenticator and proves the replica will not open.
+7. **Update `14-at-rest-encryption.md`** to replace the pending markers with what the report established, make the stolen-profile claim with Q13 as its evidence, name the ungated surfaces, and point native gating at R51 and R52.
+8. ~~Confirm the unsupported population.~~ Discharged by the probe: synced Google Password Manager passkeys carry the extension on both measured platforms, so the no-gate decision for the roughly 2.3 percent tail stands and the passphrase fallback stays closed.
+9. ~~Native Apple, the upstream contribution, and Windows.~~ Split out on 2026-08-19 to R51, R52 and R53. Nothing needs contributing upstream after all, since `apple-native-keyring-store` 1.0.1 already measures equivalent.
 
 ### Proof
 
-A replica written under a derived key opens after user verification and fails without it. **Copying the browser profile to a fresh browser and failing to open the replica** is the property this phase exists to buy and the one the current design cannot demonstrate. On Apple, an item survives a fingerprint-set change and still prompts.
+A replica written under a derived key opens after user verification and fails without it, asserted on every run by the harness of decision 9. **Deleting the simulated authenticator while the stored data stays put, and failing to open the replica**, is the property this phase exists to buy and the one the current design cannot demonstrate. Q13 of the probe is the evidence that the credential lives outside any browser profile, measured as byte-identical output from two browsers with separate profiles on one machine, so the harness proves connetto's half and the report proves the platform's. The wasm-smoke suite additionally covers what needs no authenticator: that no wrapping key is ever written to storage, that a stored record is inert without the derived key, that a boot with no key refuses, and the three custody levels including a decline that stays re-offerable.
+
+**Run 2026-08-19, what passed.** `examples/webauthn-unlock`, one test `passkey_gate_enrol_use_and_lock`, green in 62 seconds against real headless Chrome 151 with a simulated authenticator carrying the extension: enrol, derive, write a record, restart the worker, re-derive the same key and read it back, then delete the authenticator and fail to open. The `connetto-web` browser suite was green at 33 tests over 7 binaries, including 13 key-store tests of which 7 were new. Native was green at 307 tests. The formatter, `clippy -D warnings` on all four workspaces including the wasm target, and rustdoc `-D warnings` were all clean.
+
+**Run 2026-08-20, delayed proof discharged by R55.** `cargo +stable run -p connetto-test-harness --bin connetto-browser-stack` passed, including `examples/wasm-smoke --test unlock`, the `crates/connetto-web` browser suite and all 21 `wasm-smoke` binaries, with the stack started by the runner rather than by hand.
+
+**Three defects the run found, all fixed, worth recording because each is the silent-loss class this project keeps meeting.** A locked key store returned `Ok(None)` from `load` rather than refusing, which a boot would have read as "no key was ever cached" and answered by minting a fresh one, stranding the replica. A ceremony that threw anything other than a dismissal was reported to the worker as `unsupported`, which downgraded custody on a bug and blamed the platform, so the protocol now carries a distinct failure that fails the boot with the detail. And the ceremony ran with no timeout, so an unlock that cannot succeed hung rather than refusing: it is now bounded at 60 seconds, which is what makes the locked outcome observable at all.
 
 ### Done when
 
@@ -2341,36 +2549,697 @@ Multiple wrapped copies per replica. Every copy would live in the same store and
 
 ---
 
+## R54: every demo carries every application-visible feature
+
+**Status.** **DONE** (2026-08-22, BUILT 2026-08-19), opened on the maintainer's instruction that all demos hold all major features. Audited first, because "any feature we previously failed to add" cannot be acted on before it is named. The audit found two library holes and running the result found a third, all three closed. Completed when the one named unrun binary, `two_real_logins_leave_two_accounts_signed_in_at_once`, ran green on 2026-08-22 against a fresh stack serving both providers. The yew and desktop demo hand-drives fold into `R57`'s human pass, which drives every demo by design.
+
+### Purpose
+
+A demo is how an embedding author learns what connetto offers, and it is the only place several capabilities are exercised outside a test. A capability no demo drives is one nobody has held in their hands, which is where the two defects R42 found in R23 came from: the gate was unreachable under the leader topology precisely because no demo ever installed it.
+
+### The audit, 2026-08-19
+
+Established by direct search across `examples/*/src`, not by reading summaries. Counts are call sites. The three demos are `dioxus-desktop-demo`, `dioxus-web-demo` and `yew-web-demo`; `wasm-smoke` and `webauthn-unlock` are test harnesses and are not in scope.
+
+| Capability | desktop | dioxus web | yew web |
+| --- | --- | --- | --- |
+| Passkey gate, `with_unlock` | not applicable, R51 and R52 not started | **absent** | **absent** |
+| Custody level shown, `request_custody` | **absent** | **absent** | **absent** |
+| Account picker, `with_pick_account` and `serve_account_choice` | **absent** | **absent** | **absent** |
+| Account switch, `switch_account` | **absent** | **absent** | **absent** |
+| Last-used resume, `remembered_account` | present | **absent** | **absent** |
+| Session expiry warning, `expiry_warning` | **absent** | **absent** | **absent** |
+| Retention and trimming | **absent** | present | **absent** |
+| Mutation outcome shown | **absent** | present | present |
+| Reconnect policy, `with_reconnect` | **absent** | present | present |
+| Over-limit signal, `RateLimited` | **absent** | **absent** | **absent** |
+| Forget device | present | not applicable, browser has no combined primitive | not applicable |
+
+**`expiry_warning` has zero call sites anywhere in the repository**, tests included. So does `request_custody`. Both are public, both were built for an application to call, and neither has ever been driven.
+
+### Two library holes the audit exposed, which block the demo work
+
+**Hole 1, the browser boot withholds two values the application needs.** `boot_db_worker` returns `Option<Id>` alone. The session deadline is in hand (`BrowserSession::session_expires_at`, `crates/connetto-web/src/auth.rs:453`) and so is the account key, and neither reaches the page, so no browser application can warn before a session lapses or name the account it is signed in as. R20's own argument for returning the identity applies unchanged to both: without it the only way to learn the value is a second acquisition, which rotates the refresh token twice per boot.
+
+**Hole 2, R42's Done when is unreachable through any application path, and the demo work is what exposed it.** The phase claims two accounts signed in at once. The store carries it and that is proven, but a tab can only answer the account question with a stored account or with "take the default", so there is no way to say "sign in as somebody new". Adding a second account therefore requires signing the first one out, which deletes exactly the credential that would have made it the second account. **The mechanism is forced rather than chosen**: the answer needs a third case, so `TabAnswer::Account` carries a three-way choice (a named account, the last-used default, or nobody) and the page reaches it through an explicit `Membership::add_account`. Nobody means an interactive login with every stored credential left alone.
+
+### Steps
+
+1. **Close hole 1.** `boot_db_worker` returns the identity, the session deadline and the active account key together. Clean cutover across every call site, three demos and four test binaries.
+2. **Close hole 2.** The three-way account choice, `Membership::add_account`, and the boot path honouring it.
+3. **All three demos: multi-account.** Pick at boot from the stored accounts, switch without a login, add another account, and show which one is active. Native switches by rebuilding the connection under the unsynced guard `end_run_for_sign_in` already applies, which also has no call site today.
+4. **All three demos: the session expiry warning**, through `expiry_warning` and the deadline step 1 delivers.
+5. **All three demos: the over-limit signal**, so a caller told to slow down says so rather than looking merely disconnected.
+6. **Both web demos: the passkey gate**, `with_unlock(true)` plus the custody level through `request_custody`, and an offer to enrol later for a profile that declined.
+7. **Parity fills.** The yew demo gains the retention pane the dioxus web demo has. The desktop demo gains retention, the mutation outcome display, a reconnect policy, and the force override on a refused wipe.
+8. **A fourth hole, and the demo half of step 3 could not be honoured without it.** The mock provider cannot be asked which person to sign in as: `oauth2-test-server` 0.2.3 auto-grants consent as one fixed subject and ignores `login_hint`, so one instance is one person forever, and every login resolves the same account. That is why the two-account claim had no runtime evidence. Two instances on two ports give two genuinely distinct people, because connetto derives the user id as a UUID v5 over `{issuer}|{subject}`, so a distinct issuer is as distinct as a distinct subject. **And that exposed a real product limit**: the reference binary registered exactly one provider from its environment, even though `ProviderRegistry` was built to hold several, so no deployment could offer both a corporate login and Google. The environment now reads `CONNETTO_OIDC_PROVIDERS`, a comma-separated list of provider names, with each provider's own settings under `CONNETTO_OIDC_<NAME>_*` where the prefix is the name upper-cased with everything outside `A-Z0-9` turned into an underscore. The name is the key rather than an invented slot, because the name already has to be unique: it is what a login request selects on. Two names that collide into one prefix refuse startup by name rather than resolving by precedence. The singular variables are gone, which at version 0.0.0 is simply the new spelling.
+
+### What execution changed, and a third defect running it found
+
+**A third library defect, and only running a demo could have found it.** `WebAuthn` refuses an origin whose host is not a registrable domain, so a demo served from `http://127.0.0.1:9912` throws `SecurityError: This is an invalid domain` on every ceremony. R23 classified anything that is not a dismissal as a fault, which fails the boot, so turning the gate on broke the demo outright with "the enrolment ceremony failed". An invalid origin is a permanent property of where the application is served, exactly like a browsing context with no `WebAuthn` at all, and no retry can change it. `answer` in `crates/connetto-web/src/unlock.rs` now reports a `SecurityError` as unsupported, which keeps the boot alive and puts the operator's real fix, a hostname, in the custody reason. The same origin reached as `localhost` works, because `localhost` is a valid relying-party id.
+
+**The reboot must not wait for readiness, and must not reload.** Both web demos first shipped "wait for the worker to be ready, then reload the page", which deadlocks on the one path that matters: adding an account needs an interactive login, the login needs the page to render its prompt, and readiness only comes after the login, so the reload never runs. A reload would also have been wrong on its own, because the pending choice lives in a page thread-local and a reload discards it. What works is the opposite: clear the page's identity immediately, reload nothing, and let the worker's own post-boot broadcast repopulate it. The banner hides the login prompt while an identity is held, so a stale identity hid the very control the worker was waiting for.
+
+**Native switching is restart-based and says so.** The desktop demo has no worker to replace, and swapping a live `ConnettoConnection` and its transport inside the running app would mean restructuring startup around a runtime-swappable slot. It instead checks for unsent writes, points the last-used marker at the chosen account, and asks for a restart. Adding an account clears the marker, so the next start addresses no stored credential and logs somebody new in while every other credential survives.
+
+**`enrol_gate` was added for the same reason `join` installs the tab handler.** `unlock::enrol` needs the `Worker`, which a page never sees, so an application could read that the gate was on offer and have no way to accept. `Membership::enrol_gate` runs the ceremony on the page that owns the worker and answers `false` on a follower, because only the leader holds the private port the derived key travels on.
+
+### Proven
+
+**The dioxus web demo was driven in a real headless Chrome against the running stack**, with a virtual authenticator carrying the `prf` extension, served from `localhost` so the relying-party id is valid. Observed on screen: `status: connected` against the sync server, `Signed in as: 1e854bb5-... (account: "1e854bb5-...")` which is the identity and the account key hole 1 now delivers, **`gate: verified by passkey`**, which is R23's gate reported in a demo for the first time and the first call site `request_custody` has ever had, the retention pane reading 16 pages with 0 reclaimable, and the account controls. Clicking "Add another account" replaced the worker, drew the login prompt, completed a real login against the dev provider, and came back connected with the gate still verified. The deadlock above was found exactly here, fixed, and the flow re-driven.
+
+**The two-provider chain is verified end to end, which closes the boundary the first pass had to report.** Two mock instances on two ports resolve two genuinely different people: through the test stack, `dev-idp` gives `8ae8a993-d9ad-513d-9a83-57953bcef132` and `dev-idp-2` gives `1ff9fca6-d0d7-5ae2-be02-ce4eb31d912f`, both full logins driven to a token exchange. Through the demo path, `dev_idp` stands up both, writes both providers' settings to `target/dev-idp.env`, and the reference binary reads them and logs `identity providers registered providers=["dev-idp", "dev-idp-2"]`, which is the new environment contract and real discovery against both issuers working. A made-up client id does not work and was checked: the mock refuses an unregistered client at the authorize hop with `error=invalid_client`, which is why the recipe sources the file rather than inventing credentials.
+
+**What remains unrun, so nobody reads silence as a pass.** `two_real_logins_leave_two_accounts_signed_in_at_once` in `examples/wasm-smoke/tests/browser_auth.rs` compiles and has not been run: it needs the auth stack on port 18099, and the process holding that port is a build from before this phase, so it serves no `dev-idp-2`. Restarting it belongs to whoever started it. The yew demo compiles and is unrun, its delta from the dioxus one being framework glue over the same library calls. The desktop demo compiles and cannot run here, because this session has no usable OS keyring. The over-limit line needs a tripped server limit to appear, and the expiry line correctly stays hidden while a session is nowhere near lapsing.
+
+**Discharged 2026-08-22.** Port 18099 was free, the `connetto-browser-stack` run provisioned a fresh auth stack serving both providers, and `two_real_logins_leave_two_accounts_signed_in_at_once` ran and passed. The yew and desktop demo hand-drives travel to `R57`'s human pass, and the desktop demo additionally waits on an unlocked OS keyring on this machine.
+
+**One demo wart, recorded rather than hidden.** Changing which dev person to sign in as costs two clicks of the same button: the worker has already built a login URL for the other provider, so the first click replaces the worker and the second completes the login. The demo now says so on screen. A real application has one button here and the provider decides which account, which is what the upstream change would restore.
+
+**The upstream gap is written up and the fix is prepared, not sent.** `upstream/oauth2-test-server-login-hint.md` carries the finding, a reproduction against the crate's own binary with its verbatim wrong output, and the expected behaviour phrased as a test assertion. `upstream/oauth2-test-server-login-hint.patch` is a two-line diff generated against the 0.2.3 source, and it is verified rather than proposed: applied to a copy, built with `--all-features`, and driven through register, authorize and token, it yields `alice@example.com` and `bob@example.com` for those hints while a request with no hint still yields `test-user-123`. Both files are git-excluded. Sending it needs its own instruction.
+
+### Done when
+
+Every capability in the audit table reads present or not applicable for every demo, with not applicable carrying its reason, the four holes are closed so the table can say present at all, and a person clicking through a demo can hold two accounts and flip between them.
+
+### What this audit missed
+
+Seven further gaps surfaced on 2026-08-21 while `R26` was wired into the demos, two of them demos asserting a capability the library has. They are `R57`, not amendments here: this phase's Done-when refers to the table it audited, and reopening a closed phase to absorb later findings is how a plan stops being readable.
+
+---
+
+## R55: containerised test services, and the CI that runs them
+
+**Status.** DONE. The working document records the decisions and proof.
+
+The phase moved service-backed tests onto `testcontainers`, replaced the hand-started browser stack with `connetto-browser-stack`, and added `.github/workflows/ci.yml` as the pull request gate. Stale browser test recipes are gone from source doc comments, and `docs/devstack-local.md` was deleted.
+
+### Done when
+
+Done: a clean checkout with Docker available runs the Rust and browser gates without environment variables or hand-started containers, and pull requests have the same gate in GitHub Actions.
+
+### What the gate did not check, found and closed 2026-08-22
+
+Found while gating `R62` by mirroring `ci.yml` job for job instead of running the hand gate. Every one of these is a job believing it covered the repository when it covered part of it, which is the worst kind of green.
+
+- **Formatting ran at the root workspace only.** `crates/connetto-web` and all five examples are separate workspaces, so `cargo +stable fmt --all -- --check` at the root never saw them, and six files had drifted: `connetto-web/src/relay.rs`, `connetto-web/src/workers.rs`, `connetto-web/tests/local_export.rs`, `connetto-web/tests/local_import.rs`, `wasm-smoke/tests/unlock.rs` and `dioxus-desktop-demo/src/main.rs`. The job is now a seven-entry matrix and the six files are formatted.
+- **Docs ran on two of seven workspaces**, root and `connetto-web`. That is exactly where the broken `[db_worker_boot]` link in `yew-web-demo` survived: nothing ever ran rustdoc there. Now seven, with the desktop demo's apt dependencies added to the job that needs them.
+- **The nightly lint ran on the same two.** Now seven. It keeps `continue-on-error: true`, so it reports rather than blocks, which is also the correction to the note in `R62`'s section.
+- **`R23`'s end-to-end passkey driver ran nowhere.** `examples/webauthn-unlock` is in the root workspace's `exclude` list, so the `rust-tests` job cannot reach it, and the browser runner never knew about it. `passkey_gate_enrol_use_and_lock` drives a real ceremony through chromedriver and had been dead weight since it was written. The browser job now builds the package with `wasm-pack build examples/webauthn-unlock --target web` and runs it, verified locally first (61 seconds, green) rather than wired in on hope.
+
+**Two facts about the gate that the hand recipe does not carry, both learned the hard way.** CI runs its suite as `keyctl session -- cargo +stable test --release --all-features`, and that fresh kernel keyring session is what makes `e2e` and `secret_stores` pass, which a bare `cargo test` on a workstation reports as broken. And CI installs a floating `nightly` while the hand gate pins `nightly-2026-08-05`, so a lint added upstream after that date appears only in CI.
+
+---
+
+## R51: native Apple gate for stored secrets
+
+**Status.** NOT STARTED. Split out of R23 on 2026-08-19 so each surface lands alone.
+
+Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store` 1.0.1 `protected::Store` with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). Nothing needs contributing upstream. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
+
+### Steps
+
+1. Verify the iOS native leg first (probe I5 on the iPhone): the access-control flags and their prompting are not guaranteed to match between macOS and iOS, and Face ID may change the fallback behaviour.
+2. Wire the gated store behind the seam, report through R23's custody surface, extend chapter 14.
+
+### Proof
+
+The probe app remains the platform evidence for prompting behaviour, since provisioning is not available to `cargo test`. connetto's wiring is proven by the store refusing ungated reads where gated, plus custody tests.
+
+---
+
+## R52: native Android gate for stored secrets
+
+**Status.** NOT STARTED. Split out of R23 on 2026-08-19.
+
+Gate both items through a hand-built Keystore key with `set_user_authentication_required(true)` (probe A6: the flag gates correctly, an ungated read is refused by the Keystore). Stock `keyring::Entry` in `android-keyring` 0.2.0 hardcodes the flag off, so the key is built by hand, and the crate is a single-author dependency that would hold the key to every local replica, which this phase weighs explicitly (use, wrap, vendor, or contribute). The read-past-refusal prompt (`BiometricPrompt` plus `CryptoObject`) belongs to the application shell, and the demo carries a minimal one. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
+
+### Proof
+
+On the physical device, per the probe's A4 rule that the emulator on hand is not evidence for this platform.
+
+---
+
+## R53: Windows gate for stored secrets
+
+**Status.** BLOCKED on hardware. Split out of R23 on 2026-08-19: no reliable Windows machine exists at this time.
+
+First step is the probe's Windows leg (`webauth-spike/native/windows`, questions W1 to W3). W2 is decisive: whether a `KeyCredentialManager` key signs the same challenge byte-identically across invocations and across a reboot. Deterministic means a native gate can be seeded from the signature exactly as the browser extension's output seeds one. Not deterministic puts native Windows with the unsupported surfaces, which chapter 14 and the custody reason already name pending this measurement (R23 does that). W1 (`UserConsentVerifier`) is recorded as insufficient by construction: a consent check our own code performs is worth nothing against an attacker holding the files, and it is noted only so nobody later mistakes it for protection.
+
+---
+
 ## R26: local data export
 
-**Status.** NOT STARTED
+**Status.** **DONE (2026-08-21), and its format is superseded the same day.** `ConnettoConnection::export_local_data` writes a zip of plain SQLite databases on both targets, `RelayHub::export_local_data` plus `workers::request_export` reach it from a browser tab, and all three demos offer it. The discussion that opened `R56` then separated two use cases this phase had conflated, and the format decision below records the outcome: the device-to-device export becomes changesets and belongs to `R56`, while plain SQLite written from application-supplied queries becomes a portability export and belongs to `R61`. **So what is built works and is the wrong shape for the case it now serves**, and the conversion half of it is expected to be deleted rather than extended. Its two decided leftovers, entry compression and the plaintext-exposure statement, moved to `R56` on 2026-08-21 so they land once on the final format, and the key-requirement refusal became `R62`.
 
 **Blocked on nothing.** Independent of everything in R23.
 
 ### Purpose
 
-Nothing in the architecture addresses exporting a user's data, and the obligation is not optional for a product handling personal data. It also carries the durability story for the device-private tier, which is the only data connetto can genuinely lose: the local-only tier is "device-private, never synced" by definition, so losing the device loses it, and no key mechanism can change that without making the tier not device-private.
+Nothing in the architecture addresses a user taking a readable copy of the data this device already holds. It also carries the durability story for the device-private tier, which is the only data connetto can genuinely lose: the local-only tier is "device-private, never synced" by definition, so losing the device loses it, and no key mechanism can change that without making the tier not device-private.
 
-That makes export the honest answer to durability rather than a recovery credential. It puts the user in control, needs no enrolment flow and no additional cryptography, and it has to exist regardless.
+That makes export the honest answer to local durability rather than a recovery credential. It puts the user in control, needs no enrolment flow and no additional cryptography, and it has to exist regardless.
 
 ### Steps
 
-1. **Export both tiers**, synced and device-private, since a portability request covers everything held about the person and the two tiers are one database from the user's point of view.
+1. **Export both local tiers**, synced and device-private, since they are one database from the user's point of view and both already live on the device.
 2. **Choose and document an interchange format.** A raw encrypted file is not an export. This is the phase's real design question.
-3. **Cover the server side**, since data held server-side is equally in scope for portability and the client alone cannot satisfy the obligation.
+
+**Decision 2026-08-20.** The export format is a zip archive containing a manifest and plain SQLite databases for the synced replica and the device-private tier. This keeps table shapes, SQL types, indexes and binary values readable with standard SQLite tools, without depending on connetto.
+3. **Exclude generic server-side export.** connetto cannot know which visible server rows are the person's data, and exporting every visible row would leak the application's ownership model into a blind library default.
 4. **State what export does not include**, so the boundary is explicit rather than assumed.
+
+**Result 2026-08-20.** The export is implemented on the client. The public method documentation names the archive entries and the excluded authentication, sync cursor and pending transport state.
+
+**Correction 2026-08-21.** The first implementation copied rows into a scratch database attached under a `file:...?mode=memory&cache=shared` URI and read the bytes back through a second connection onto that URI. That passes natively and produces an **empty archive** in a browser, because the wasm SQLite build gives one connection per database and the second connection opened a different, empty database. Diagnosed by asserting on the exported bytes rather than on the call's success: the entry carried the SQLite magic, no table name and no row value. Rows now travel as a session patchset, taken by diffing each table against an empty twin in an attached blank schema, exactly as the relay builds a tab snapshot, and the archive database is the `main` of its own connection, which is the only database `sqlite3_serialize` reaches. One mechanism on both targets, no second handle, and every storage class carried verbatim. A table with no primary key cannot be attached to a session, so the export refuses it by name rather than handing over a schema with no rows.
+
+**Browser reach 2026-08-21.** A tab cannot export its own mirror: that mirror is in memory and holds only what its subscriptions cover. The durable copy is the DB worker's, so the archive is fetched from it. `HubEvent::Export` reaches the connection through the hub core, `workers::serve_export_requests` answers a tab on `EXPORT_CHANNEL`, and the reply is a structured-clone `Uint8Array` rather than base64 in JSON, which would inflate every archive by a third to say the same thing.
+
+**The archive is not final, found 2026-08-21 while opening `R56`.** Step 4 said what the export leaves out, and one of those exclusions turns out to be load-bearing rather than incidental: the queue of writes made offline. Those writes are applied to the replica and their changesets sit in `_connetto_pending`, which `is_internal_table` keeps out of the archive, so the rows travel with nothing marking them unsent and nothing that could send them. The maintainer named restoring exactly those writes as almost the whole point of export and import together. The format change belongs to `R56`, with the import that needs it, and this phase stays done on its own terms.
+
+**The archive is uncompressed for a reason that is not true, and the exposure was never weighed. Both decided 2026-08-21, and both moved to `R56` with the format change the same day, so they land once on the final format.** The manifest entry in `crates/connetto-client/Cargo.toml` reads "written stored so wasm needs no compressor", which is false: `zstd` is an unconditional dependency of the same crate and the whole wire protocol compresses with it on wasm. **Decided: compress the entries, and correct the comment to say what is actually true.** Separately, nobody weighed what the file is. It holds every row the device can read, in the clear, so it is a bearer document, and the maintainer's own reference to "the encrypted sqlite data" is evidence the default surprises. **Decided: leave it unencrypted and state the exposure where the person chooses to export**, in the method documentation and in each demo's affordance, so the choice stays theirs and becomes an informed one. Rejected: encrypting under a passphrase, which would break this phase's central promise that any SQLite tool opens it and would make the file the raw encrypted blob `R26` step 2 rejected as not being an export, while putting connetto in the business of prompting for a passphrase, which it does nowhere else. Also rejected: leaving it uncompressed, which is defensible on inspectability grounds and would have meant recording that nobody minded the size. **The accepted cost is that a warning is weaker than a mechanism**, and an application author has to repeat it in their own interface.
+
+**connetto requires a declared primary key wherever it records changes, and says so nowhere. Found 2026-08-21 while auditing this phase's own refusals, and it reaches well past export.** The capture session is installed with `attach_all()`, and SQLite records nothing for a table whose only key is the implicit `rowid`, so writes to such a table are silently never captured: never uploaded if the table is synced, never seen by sibling tabs if it is device-only. Nothing detects this. The export's refusal, added by this phase, is currently the only place in connetto that notices.
+
+**Why an application would write such a table, since the first reading was that nobody sensible would.** Four reasons, none of them careless. In SQLite `CREATE TABLE prefs (name TEXT, value TEXT)` **is** a keyed table, keyed by `rowid`, which SQLite guarantees, so the stricter requirement is connetto's rather than SQL's and the developer followed ordinary practice. A singleton settings table has no natural key, because there is one row and nothing to identify. An append-only log is ordered by `rowid` already, so declaring a key reads as noise. And `UNIQUE(a, b)` means the same thing as `PRIMARY KEY(a, b)` to a reader while satisfying only the second.
+
+**Decided 2026-08-21: refuse when the schema is applied, everywhere, with a message that names the fix**, since the developer did nothing wrong by SQL's standards and a refusal that only complains would be unfair. The export keeps its own refusal as a backstop. Rejected: refusing only for the synced tier and warning for the device-only one, which would tolerate silent loss in the one tier that has no server copy. Also rejected: giving the singleton a supported shape connetto generates DDL for, which would put connetto in the business of authoring application tables. **Owned by `R62` as of 2026-08-21**, split out because the refusal guards every schema apply rather than only export.
+
+**A correction inside this decision, because the precedent cited for it was wrong.** `_connetto_meta` was offered as connetto's own answer to the key requirement. It is not: its doc states both internal tables are "written only under capture suspension, so they never ride a mutation upload", so connetto deliberately does not record changes to them. Its `id INTEGER PRIMARY KEY CHECK (id = 1)` exists because `persist_cursor` upserts with `ON CONFLICT (id)`, which needs a uniqueness constraint to conflict on, and because the check states the one-row invariant in the database rather than trusting call sites, a contrast `R17` already recorded against the browser refresh store's three hardcoded call sites. The shape is still the right thing to recommend, since a declared key does satisfy the recorder, but the refusal message must not claim connetto adopted it for that reason.
+
+**The format decision was reopened on 2026-08-21 and the answer is that there are two exports, not one.** The maintainer separated two concerns this phase had conflated. **(1) Moving data between devices of the same service**, the bricked-radio case, rare and eventually answered properly by `R25`. Both ends run connetto and hold the same schema, which `R56` decision 4 enforces by refusing a mismatched fingerprint, so third-party readability buys nothing. **Decided: this export carries changesets**, the format connetto already moves rows in everywhere else, which makes import symmetric and removes the schema replay, the DDL renaming and the serialize step along with the class of bug that produced an empty archive. **(2) Handing a person all their data**, which is a different product. A device export cannot serve it even in principle, because the replica only ever held what its subscriptions covered, so rows the person may read but never subscribed to were never present. **Decided: that export is plain SQLite, written from queries the application supplies**, connetto running them under the authenticated identity. So plain SQLite was the right format all along, for the other use case.
+
+**The incoherence this corrected, recorded because it is instructive.** The original decision justified plain SQLite as "readable with standard SQLite tools, without depending on connetto", while step 3 of the same phase excluded portability as out of scope. Readability only pays when the application or connetto is gone, which is case (2), so the format was chosen to serve the case the phase had disowned, and a conversion step was built to honour it. Two facts settled the correction: a changeset is SQLite's own documented format and the stock shell at 3.51.1 can write one (`.session ... changeset FILE`) but has no subcommand to apply or dump one, and the format is positional with the table name and column count but no column names, so it is reconstructible with the schema and inert without it.
+
+**Three smaller things decided alone during the build and reviewed 2026-08-21 at the maintainer's request.** **The export filename.** The desktop demo wrote one fixed name beside the replica, so a second export destroyed the first. **Decided: timestamp it and keep every export**, and more generally, **a default name connetto provides carries the context that identifies it**, which for this file means when it was taken and, given `R56` decision 5 ties an archive to one account, whose it is. **The browser wait.** `workers::request_export` polled a shared slot every twenty-five milliseconds and gave up after thirty seconds, both numbers invented, where the sibling `request_logout` awaits a channel and wakes exactly when the answer arrives. Worse, a thirty-second cap makes a legitimately large export indistinguishable from a worker that will never answer. **Decided: await the reply as logout does, and detect an absent worker from the liveness lock it holds for its whole life**, which tab transports already watch, so no arbitrary number survives, a slow export waits as long as it takes and a dead worker fails at once. **The priority of `R60`.** Marked `next` unilaterally and confirmed by the maintainer: it is a defect whose first step needs no decision. Superseded later on 2026-08-21: the maintainer promoted `R56` and `R58` to next, and `R60` dropped to any.
+
+**Erasure, and what connetto already contributes.** The maintainer's reading is correct and matches decisions already taken: documents, images and photos are outside connetto entirely (Q1.2, file sync belongs to a separate stack), and the scope of a person's data is the application's to define. Two of the three parts are nonetheless already built. The local copy is covered by `teardown`'s `purge_replica`, `wipe_replica` and `forget_device`, with `R17` making the device-private tier die with the replica. And the server side propagates unaided: an application deleting a person's rows in Postgres produces ordinary change events, and `R44`'s departure machinery removes them from every device that held them, with no API and nothing new. What is missing is only the scope, which is the same thing the download needs, so both halves want the one input only the application can give.
 
 ### Proof
 
-A user exports, and the result is readable without connetto and contains both tiers.
+`cargo +stable test --release -p connetto-client --test local_export` proves that a user export is readable without connetto, contains both tiers, preserves binary and `NUL` text values, excludes connetto internal tables, and turns policy backing tables into logical tables.
+
+`wasm-pack test --headless --chrome --test local_export` in `crates/connetto-web` proves the same archive reaches a tab through the real channel protocol over a real encrypted OPFS replica with a device-private tier beside it, and that the hub's own per-tab watermark table stays out of it.
 
 ### Done when
 
-A documented export exists covering both tiers and the server side, and the durability position for device-private data points at it.
+Done 2026-08-21. A documented export exists covering the synced replica and the device-private tier, the durability position for device-private data points at it, and every demo offers it: the desktop demo writes the archive beside its replica, and both web demos download it from the DB worker.
 
 ### Out of scope
 
-Import, and device-to-device transfer. The latter is `R25`, exploratory and explicitly not now, and is expected to follow local wireless transport rather than an export file.
+Import, device-to-device transfer, and generic server-side export. Import is `R56`, which supersedes this exclusion, is designed as of 2026-08-21, and owns the archive format change this phase's exclusions turned out to need. Device-to-device transfer is `R25`, designed 2026-08-22 and building as `R74` to `R80` over local wireless transport rather than an export file (corrected 2026-08-22, this line said exploratory and explicitly not now). Server-side export needs an application-specific contract rather than a library guess, and is `R61`, designed 2026-08-22.
+
+---
+
+## R56: local data import
+
+**Status.** **DONE (2026-08-21).** Nine questions answered with the maintainer, then three more the steps had left open settled before any code (decisions 10 to 12), then built. The archive is now change records throughout and `R26`'s conversion half is deleted, the export takes a scope, and an import checks, reports and applies in one transaction. Proven by `crates/connetto-client/tests/local_import.rs` (a replica exported, destroyed and restored, with an offline delete among the queued writes, a clash reported with both versions and answered both ways, and the schema and account refusals by name), the crate's own tests for the two refusals no honest export can produce, `crates/connetto-client/tests/apply_behaviour.rs` for step 7's two measurements, `crates/connetto-client/tests/local_export.rs` for the format, and `crates/connetto-web/tests/local_import.rs` for the browser crossing. All three demos offer it, and `R26`'s two leftovers landed with it: the entries are compressed and the false manifest comment is corrected.
+
+**This phase changes `R26`'s archive format.** `R26` is done and its archive is not final: it does not carry the queue of writes made offline, which decision 1 puts at the centre of the feature. The format change belongs here, with the import that needs it.
+
+**Blocked on nothing.** `R26` shipped the archive and the browser channel this phase inverts, and question 4's answer keeps this phase independent of `R31`.
+
+### Purpose
+
+`R26` gave a user a readable copy of what their device holds. It gave them no way to put one back. That leaves the device-private tier in a strange position: the export is the phase's stated answer to local durability, and an answer a user cannot act on is not one. A copy nobody can restore is a souvenir.
+
+### What already exists, so the discussion starts informed
+
+Grounded in the tree at `af79260`, not recalled:
+
+- The archive is `manifest.json` plus one plain SQLite database per tier, with policy-split tables written under their **logical** names (`crates/connetto-client/src/lib.rs`, `export_sqlite_schema`). An import has to invert that through `PolicyTables`, because the replica stores a split table under the backing name behind a view.
+- The manifest carries `format`, `version` and the tier list. It does **not** carry the application schema version, the identity, or anything about the server the rows came from.
+- Rows leave through a session patchset and the archive is built from the source's own stored DDL. The reverse direction has an existing primitive: `SqliteSessionExt::apply_patchset` with a `ConflictAction`, which is how server patches already land.
+- A device-private write is outside the capture session and can never upload (`crates/connetto-web/tests/local_tier_one_handle.rs`). A synced write goes through capture, `push`, and the server's authorization and conflict check.
+- The synced tier is a server cache by decision: `R23` decision 3 settled that wipe-and-resync is the recovery for a lost gate, precisely because only the device-private tier is unrecoverable.
+- connetto never migrates schemas at runtime, and a client whose build does not match the server's advertised version is stale by construction (`ClientError::SchemaOutdated`).
+- In a browser the durable replica belongs to the DB worker, not the asking tab. `R26` carries bytes worker to tab over `EXPORT_CHANNEL`. This phase needs the same crossing in reverse, and a tab-supplied `File` is the only place an archive can enter.
+- **A write made offline has not reached the server, and the archive does not carry the queue that would send it.** An offline write applies to the replica and records its changeset in `_connetto_pending` (`META_DDL`), which `attach` replays on the next connection. `is_internal_table` excludes every `_connetto` table from the export, so the archive holds the row values the write produced with nothing marking them unsent, and none of the changesets. This was found while answering question 1 on 2026-08-21 and is the reason `R26`'s format is not final.
+
+### Open questions the discussion must settle
+
+Each of these changes what the phase is, not how it is spelled, so none may be answered by whoever implements it.
+
+**Question 1 was asked with the wrong shape, and the answer corrects it.** It offered two kinds of data, a cache of the server's rows and data that never syncs. There are three. The third is a write the user made while offline, which lives in the synced tier's tables and yet is as unrecoverable as device-only data, because the server has never seen it.
+
+1. **Which data can be imported at all?** **Decided 2026-08-21: data the server does not have.** That is the device-only tier plus any write made offline that never reached the server, and the maintainer names the second half as almost the whole point of the feature. The cache of rows the server already holds is not imported, because the server sends it again anyway and writing it back locally would have it deleted without warning at the next refresh. Rejected: importing the cache as plain local rows, which is the obvious choice and the one that loses data quietly, and importing the cache as fresh writes, which needs a connection and makes every import partial.
+2. **How does an offline write travel in the archive, and what does it become on import?** **Decided 2026-08-21: the archive gains an entry holding the pending changesets, and an import puts them back into `_connetto_pending` so the next `attach` replays them.** That reuses the path a restart already takes, so an offline insert, update or delete all travel, and each changeset keeps the old row image the server's conflict check needs. The cost accepted: that one entry is connetto's own binary format and is the only part of the archive a person cannot open with an ordinary SQLite tool, which is a narrower promise than "every entry is plain SQLite" and is worth stating in the manifest. Rejected: carrying only row values with a list of which were unsent, which cannot express an offline delete at all and leaves the server's conflict check blind because there is no prior image to compare against.
+3. **What happens when an imported item already exists on the device?** **Decided 2026-08-21: the file wins, but never silently.** An import first reports the collisions it found and only then applies, so the application has a chance to put the choice in front of the person before anything is overwritten. A silent overwrite was rejected for the reason it is tempting: a recovery feature that destroys newer work without showing it first is the worst place in the product to put data loss. Refusing the whole file was rejected as too blunt for a common case, and skipping the clashing items was rejected because a skipped item is a piece of the very data the import exists to recover. **This is the shape the logout protocol already has**, and the precedent is worth following rather than reinventing: `LogoutMessage::Unsynced` asks what would be lost, `Logout { force }` acts, and `Refused { seqs }` names what stopped it. **Open sub-point, question 3b:** whether the application confirms once for the whole file or decides per item.
+3b. **How fine-grained is that choice?** **Decided 2026-08-21: one decision per clashing item, with both versions in hand, plus a blanket rule for people who do not want to answer twice.** connetto surfaces each clash with the version on the device and the version in the file, and the application answers for that item. It also ships a default presentation of the pair, comparing them column by column so an application gets something showable without writing a differ, and an application that wants its own is free to ignore it. On top of that sits a blanket choice, keep mine or keep the file's, so a person facing hundreds of clashes is not asked hundreds of questions. **Constraint carried over from `R26`:** the comparison hands over typed values and never a text rendering of them, because rendering values as text is exactly the mistake `R26` made and had to undo, and a blob or a string holding a `NUL` cannot survive it. A rendering may sit on top as a convenience, and it says "binary, 1.2 kB" rather than pretending. The per-item shape is also the cheaper half of the work: applying a changeset already routes every conflict through a `ConflictAction` callback, so the offline-write half of the import needs no new mechanism at all, and only the device-only half does.
+4. **How is an archive from an older application schema handled?** **Decided 2026-08-21: refuse it, and offer nothing more.** The archive gains a fingerprint of the schema it was made under and an import refuses anything that does not match this build. The maintainer's reason is the deciding one: an archive can come from any earlier version, so supporting conversion means owning the paths from all of them, and that complexity is not worth carrying for a recovery feature. This also matches what `R31` already decided for the half that matters most here, that writes which never reached the server are not rescued across a version boundary and the deployment keeps the old major up until they drain. Recorded for a later reader so this reads as the scope choice it is rather than a technical wall: `R31`'s local-tier conversion trait chains one step per boundary, so a converting import was available in principle and was declined. Rejected: routing the device-only half through that trait, which would have blocked this phase behind `R31` and would have had to explain a half-restore to the person.
+5. **How is an archive from a different account handled?** **Decided 2026-08-21: refuse it. An import only ever restores into the account that made it.** The deciding argument is futility rather than security, and it came from the maintainer: an offline write into a policy-bearing table carries the writer's own owner value, so on another person's device the local view filters it out and on the server `WITH CHECK` refuses it. Allowing the import would offer to save edits it cannot save. The archive therefore records the account it was made under and an import refuses anything else. Two things were considered and rejected. Allowing the device-only half across accounts, which would work, because that tier has no policy at all and nothing owns it: rejected as a split behaviour whose only use is handing one person's private data to another, which the same-account rule does not need to serve. And warning rather than refusing: rejected because there is nothing useful on the other side of the warning.
+
+   Two corrections to the analysis that produced this answer, kept because both were wrong in chat first. The archive is **not** encrypted: `R26` made every entry plain SQLite deliberately, and the encrypted thing is the replica on disk. And nothing here was ever an impersonation risk, because the session identity is always the importer's own and no archive can set it, so a replayed write is recorded as the importer's action or refused, never attributed to whoever made the file.
+6. **How much of the archive is trusted?** **Decided 2026-08-21, with one half forced and the other narrowed.** Forced by decision 4: because a file whose schema fingerprint does not match this build is refused, the archive's own DDL is redundant by construction, so rows are read into the schema this build already has and nothing in the file is ever executed. Narrowed after the maintainer asked whether inspecting the changeset duplicates what SQLite already does, which it partly does. **Not** re-validated: the format, since the apply reports a malformed changeset itself. **Checked before applying:** the table set, because a table present in the record and absent from the target is skipped by the session extension rather than reported, which is the same silent-loss shape `R40` and `R26` were both bitten by and which must be confirmed against the pinned version rather than taken on trust, and the record count, because `PENDING_CAP` is connetto's invariant and nothing in SQLite knows it exists. `ParsedDiffSet::parse` already serves `affected_rows` and `count_ops`, so this is an existing primitive rather than new machinery.
+7. **Where does the file enter, in the browser?** **Decided 2026-08-21: the page hands the worker the picked file itself and the worker reads it.** Nothing is held twice, so the ceiling on an importable archive is the database being written into rather than what survives a message. The cost accepted is that this is not the export's mechanism run backwards, so the two directions use different shapes and the handle surviving the trip is a browser behaviour to confirm rather than assume. Rejected: copying the bytes through a message, which would be one mechanism for both directions and would fail on a large file by running out of memory rather than by saying no, and staging the file in browser storage, which would need a pool slot, a name, and cleanup of every abandoned import.
+8. **What bounds the volume an import can push at the server?** Raised by the maintainer 2026-08-21, and the grounding splits it in two.
+
+   **Import grants no abuse capability that did not already exist.** A hostile client fabricates and sends mutations directly. Nothing on the import path lets it send a frame it could not already send, or send frames faster. So the flood worry is about the server's write limits in general and is not this phase's to answer.
+
+   **What the server actually has, checked rather than assumed.** `throttle.rs` limits three things: subscriptions, connections and credential refusals. There is no per-identity write limit. A mutation instead takes `R39`'s reader-share permit, and when the unreserved share is full it is deferred with `RateLimited` and stays pending on the client to replay, which absorbs a burst rather than counting it against the caller. `R36`'s abuse tally counts credential signals, not write volume. So a persistent flooder is absorbed on every burst and noticed on none, and whether that is a gap or the intended design is question 8b.
+
+   **The part that is this phase's, and it is a data-loss bug waiting to be written.** `PENDING_CAP` is 256 and the queue **evicts its oldest record** when full, whose own comment says that gives up its replay. Restoring a queue larger than that would silently drop the oldest writes, inside the one feature whose purpose is not losing them. **Constraint, not a question: an import refuses a queue it cannot hold whole, and never evicts to make room.** Whether the cap should also rise is a measurement, not a guess, and belongs with whoever measures it.
+8b. **Is the missing write limit a gap, and does it become work now?** **Decided 2026-08-21: recorded as a finding beside the limits that do exist, not fixed here.** It is written into `R19`'s section as a third finding, because that is the phase that chose the three signals and left writes out. The reason for waiting rather than acting is that a write limit needs a number, and a number without a measurement refuses somebody's legitimate bulk work on its first day, which is precisely the bulk this feature generates. Rejected: opening a phase now, which would pick that threshold blind, and declaring it not a gap, which would be defensible on capacity grounds and would still leave a paced flooder invisible by design.
+9. **Do the restored offline writes appear before the device is online again?** Raised by nobody and produced by decisions 1 and 2 sitting next to each other, which is why it was written down rather than left to be discovered mid-build. **Decided 2026-08-21: yes, an import applies the queue's own rows locally as well as restoring the queue.** The maintainer's check is the argument: this is already what an offline write does, which applies to the replica and records its changeset in `_connetto_pending`, both. So an import produces the same pair and afterwards the replica holds exactly the state it would have held had those writes been made on this device. **That gives the offline half of the phase its whole contract in one line: put the replica into the state it would have been in.** No new state, no new invariant, and no new machinery for a later refusal either, because `invert_changeset` already rolls a rejected mutation back and applies here unchanged. This does not reopen decision 1: only the rows the unsent writes are about come back, never the server's copy of anything else. Rejected: waiting for the server to echo the rows, which would make an import do nothing observable on an offline device, and would leave a write the server later refuses never having appeared at all, with a rejection event as the only evidence it existed.
+
+### Three points the steps left open, settled with the maintainer on 2026-08-21 before any code
+
+10. **Which archive shape does this phase build?** Step 1 and `R26`'s own format note disagreed: step 1 grows the existing zip of plain SQLite databases and keeps the promise that every entry opens in an ordinary SQLite tool, while `R26`'s note, written later the same day, says this export carries changesets and the conversion half of what is built is expected to be deleted. **Decided: changesets throughout, and the conversion is deleted.** Grounded in the code before asking: `export_sqlite_schema` already builds the rows as a session patchset and only then replays it into a fresh `:memory:` database under renamed DDL, replays the indexes and serializes the page image, so writing the patchset itself removes that whole second half along with `rename_create_table`, `rename_index_table` and the `sqlite3_serialize` step, and makes import the exact inverse of export. The cost accepted is that no entry opens in an ordinary SQLite tool, so the manifest's readability promise goes: it only ever paid when connetto was absent, which is the case this phase disowned and `R61` owns. Rejected: keeping the plain databases and adding one binary entry, which keeps two mechanisms and asks import to read rows out of a database and reshape them. Also rejected: carrying both, which puts every row in the file twice and lets two representations of one row disagree.
+11. **Does the file still carry the cache of server rows the import ignores?** **Decided: yes by default, and the application may ask for the narrow file instead.** The maintainer's question was whether both could be offered, and they can: the export takes a scope, and the two values are everything the device holds (the default, so the file keeps being a copy of the device) and only what an import restores, which is the device-only tier plus the unsent writes. The narrow one exists because it is as small as the thing it is for. Both travel in the same format, and the manifest names which entries are present, so an import reads either.
+12. **How do the file's write numbers meet the numbers on the device importing it?** **Decided: stack the file's writes above this replica's highest, per the maintainer.** The grounding is what settles it: a write's number means something only inside one durable session handle, because the server's duplicate check is keyed on `(session_id, client_seq)` alone and deliberately not on the account (`write_target.rs`, `session.rs`). A replacement device signs in under a new handle, so the server has no record to compare the file's numbers against and keeping them buys nothing, while keeping them can collide on the device itself, since `_connetto_pending` is keyed by that number too and a file carrying 7 would overwrite a pending 7. **The residual is not caused by the numbering and is recorded rather than fixed:** a write the dead device had delivered but never saw acknowledged is sent again under the new handle whatever number it carries, because the new handle's watermark is empty. The write path's own conflict check catches it, since a resent insert meets the primary key, a resent update's old image no longer matches and a resent delete finds no row, so it surfaces to the application as a rejection or a conflict and rolls back locally. Rejected: refusing an import whenever a number collides, which protects nothing the server was going to check. Also rejected for scope: moving the wire to a `uuidv7` mutation id, which would fix the resend class properly and turns the watermark from a highest-applied number into set membership, reopening the watermark schema contract.
+
+### Steps
+
+1. **Rewrite the archive on the change-record format, which is a format change to `R26` and deletes its conversion half** (decision 10). Each tier's rows travel as the session patchset the export already builds, written straight into the archive instead of being replayed into a fresh database, and the unsent writes travel as their own changesets (decision 2). The manifest carries a raised version, the schema fingerprint an import checks (decision 4), the account it was made under (decision 5), the scope the export was asked for (decision 11), and a statement that every entry is connetto's own binary format.
+1b. **Give the export a scope** (decision 11): everything the device holds, which is the default and keeps the file a copy of the device, or only what an import restores, which is the device-only tier and the unsent writes. One format either way, and the manifest names what is present.
+2. **Refuse before anything is applied, always by name.** A schema fingerprint that does not match this build, an account that does not match the one signed in, a queue larger than `PENDING_CAP` can hold whole, and a changeset naming a table this build does not have. The last two are the checks SQLite will not make for us (decisions 6 and 8).
+3. **Restore the device-only tier.** Rows into this build's schema, never the archive's DDL. Each collision is offered to the application with both versions in typed form, with a column-by-column comparison provided as a convenience and a blanket keep-mine or keep-the-file's on top (decisions 3, 3b and 6).
+4. **Restore the offline writes so the replica ends where it would have been.** Apply the queue's own rows locally and put the changesets back in `_connetto_pending`, which is the pair an offline write already produces. The next `attach` replays them through the existing path, and a later refusal rolls back through `invert_changeset` unchanged (decisions 2 and 9).
+5. **Carry the file to the worker in a browser.** The page passes the picked file itself and the worker reads it, so the archive is never held twice and the size ceiling is the database's rather than a message's (decision 7).
+6. **Offer it in all three demos**, beside the export affordances `R26` added, since a capability no demo drives is one nobody has held.
+7. **Confirm the two behaviours this design leans on rather than asserting them.** Whether the session extension skips a table absent from the target instead of reporting it, and whether a failed apply leaves nothing behind. Both were stated from documentation and memory during the discussion and neither was measured.
+8. **Carry `R26`'s two leftovers on the new format.** Compress the archive entries, correct the manifest comment in `crates/connetto-client/Cargo.toml` that falsely claims wasm has no compressor (`zstd` is unconditional there), and state the plaintext exposure where the person chooses to export, in the method documentation and each demo's affordance. Both decided under `R26` on 2026-08-21 and moved here the same day.
+
+### Proof
+
+A replica exported, destroyed and restored onto a fresh one of the same account and build ends in the state it would have been in: the device-only rows present, the unsent writes visible locally and queued, and an offline **delete** among them, since that is the case the rejected design could not express. Each refusal is proven by name: a mismatched schema, a mismatched account, an oversized queue, an unknown table. A collision is proven to reach the application with both versions and to honour the answer it gives. In the browser the file crosses from a page to the worker and both halves come back, mirroring `R26`'s own browser test. One import is driven by hand in a demo. The archive's entries are compressed, and the export affordances state the plaintext exposure.
+
+### What the build found, 2026-08-21
+
+**Two of step 2's four refusals cannot be produced by an honest export of this build, and both stay.** The schema fingerprint covers the table set, so an archive naming a table the target lacks is refused as a differing schema before the table check is reached. And the source's own queue is capped at `PENDING_CAP`, evicting its oldest record past it, so an archive can never carry more writes than a replica holds. Both checks are still right, because the archive is not authenticated and a hand-edited or later-built file can carry either shape, and SQLite skips a table absent from the target in silence rather than reporting it. They are proven in the crate's own tests, where an archive can be built directly, rather than end to end where they are unreachable.
+
+**The device-private tier is outside the capture session, which is what makes decision 1's split exact.** Seeding the tier queues nothing, so its rows travel as rows and the queue holds writes to synced tables only. Nothing had to enforce that: the capture session binds `main`, so a device-only write is physically incapable of becoming a queued mutation, which `R23`'s own test already pins.
+
+**A restored write applies with conflicts omitted, and that follows from decision 1 rather than softening it.** The cache is not imported, so an update or a delete of a row this replica never held applies to nothing. That is the same `NotFound` becomes `Omit` rule the server-delete path already uses, and the write itself is back in the queue, so the server settles it on the next connection. In the ordinary case the rows are there anyway, because the write that created them is in the same queue and replays first.
+
+**The account is the caller identity, because it is the only value on the device that names one.** A login grant is an opaque token the client cannot read (it reads `exp` and nothing else), and the replica's filename is a hash that does not read back. The caller value from `with_caller` is what the server binds as the row-level-security identity, so both ends of an archive compare the same thing. A deployment that names no caller has no such value and also no policy owning its rows, so the check has nothing to protect there, which is stated on the method rather than left as a gap.
+
+**Step 7's two behaviours, measured in `crates/connetto-client/tests/apply_behaviour.rs`.** A record naming a table the target does not have applies as a **success** and writes nothing, so the apply can never report a missing table and the import's own table check is load-bearing exactly as decision 6 said. And a failed apply leaves **nothing** behind, so the assumption the design leaned on holds: SQLite rolls its own apply back. That is per apply rather than per import, so the import wraps its whole sequence in one transaction anyway, which the same file pins from the other side. **What cannot be provoked through the public API:** a mid-import failure, because both ends share a schema by construction, so nothing the file carries can violate a constraint the source did not already satisfy. The transaction is there for the disk-error case rather than for a case a test can stage.
+
+### What the review found, 2026-08-21
+
+A full read of the phase's own diff, after it was declared done, found two defects in it and one avoidable cost. All three are fixed and pinned, and they are written here because each was the kind of thing a green suite hides.
+
+**The queue cap was checked against the archive alone, which would have evicted writes in silence.** The check read `archive.pending.len() > PENDING_CAP`, so an import of a hundred writes into a replica already holding two hundred of its own left three hundred records, and the cap is enforced at push time by dropping the oldest. That is exactly the loss decision 8 forbids, arriving through the feature meant to prevent it. **Fixed:** the cap bounds the queue after the import, and the refusal names both counts. Pinned by `a_queue_that_does_not_fit_beside_the_replicas_own_is_refused`.
+
+**A restored row was written with `INSERT OR REPLACE`, which deletes the row it replaces.** With foreign keys enforced, that takes any `ON DELETE CASCADE` children with it, so restoring one clashing row could destroy rows nobody was asked about. **Fixed:** the write is an upsert (`ON CONFLICT (key) DO UPDATE`), with a `DO NOTHING` arm for a table whose every column is in the key. Pinned by `restoring_a_clashing_row_updates_it_rather_than_replacing_it`. **Narrowed while testing:** the delete-trigger half of the same hazard is unreachable, because the device-private tier accepts `CREATE TABLE` only and refuses trigger DDL, so the cascade was the live half.
+
+**The largest entry in the file was decompressed to be discarded.** An import never restores the server's own copy, and the read decompressed `synced.patchset` anyway. **Fixed:** reading returns an `Incoming` that names whether that entry is present rather than carrying it, so an `Everything` archive of a large replica costs nothing on the import path.
+
+### Done when
+
+A person whose device died can restore the export onto its replacement and find both the data that never syncs and the work they did offline, with every refusal named and nothing skipped silently.
+
+**One defect this phase's commit left, found and fixed 2026-08-22 while gating `R62`.** `eb933d4` read the worker's import reply counts with `usize::try_from(v.as_f64()? as u32)`, an unchecked cast that CI's own `Lint (connetto-web wasm)` job refuses on both stable and nightly (`cast_possible_truncation` and `cast_sign_loss`), so the next push would have gone red on committed code rather than on anything new. Replaced by `count_from_js`, which refuses a value that is not finite, is negative, has a fractional part, or exceeds `u32::MAX`, so a malformed reply is now read as malformed instead of becoming a wrong count. Verified with CI's exact invocation on stable, nightly and the pinned `nightly-2026-08-05`, and with `local_import`, `local_export` and `key_requirement` in headless Chrome.
+
+---
+
+## R57: the demo feature gaps the export audit found
+
+**Status.** NOT STARTED. Every item below was verified against source on 2026-08-21 while wiring `R26` into the demos, and each names its evidence.
+
+**Blocked on nothing.** `R54` claimed every demo carries every application-visible feature. It was true for what it audited and these are what it missed, so this is `R54`'s follow-through rather than a new idea.
+
+### Purpose
+
+A capability no demo drives is one nobody has held. That is the lesson `R42` and `R54` already paid for: auditing the demos against the public API found five library defects a green test suite had hidden. Two of the gaps below are worse than an absence, because a demo actively asserts the feature does not exist.
+
+### Steps
+
+1. **Live aggregate subscriptions in both web demos.** `examples/dioxus-web-demo/src/main.rs` computes its counts from the live rows and carries a comment stating that "the relay hub does not serve aggregate subscriptions". That is false: the hub multiplexes a private upstream subscription per tab aggregate and demuxes the server's pushes back (`crates/connetto-web/src/relay.rs`, `agg_routes`), and `examples/wasm-smoke/tests/parity.rs::aggregate_is_relay_transparent` proves a `COUNT(*)` resolves identically through the relay and on a direct socket. `examples/dioxus-desktop-demo/src/main.rs` already drives one through `use_live(&client, orders::table.count())`. Both web demos should drive a real aggregate, and the false comment must go rather than be softened.
+2. **The passkey gate cannot be turned on in the yew demo.** `examples/yew-web-demo/src/main.rs` reads custody through `workers::request_custody()` and displays it, but never calls `Membership::enrol_gate`, so a user of that demo can never enrol. `examples/dioxus-web-demo/src/main.rs` offers the button whenever custody is `Unverified(NoGate::Offerable)` and renders all five custody states, where the yew demo prints one line through `Display`.
+3. **`ClientEvent::SyncStatus` is surfaced by no demo.** Its own documentation calls it the only thing that carries connection state, so that an application reading the stream always knows whether what it is showing is current. All three demos fall through `_ => None` in their `status_label`. For a library whose first objective is offline operation, no demo shows online or offline.
+4. **`ClientEvent::NonFatal` is surfaced by no demo.** A subscription the server refuses leaves the session alive and says why, and every demo drops it. The live-query hooks' `error()` is the hook's own failure, not this event, so nothing else covers it.
+5. **`ClientEvent::FullResync` is surfaced by no demo.** A subscription whose rows were replaced wholesale is invisible, which is the one event that explains why a list a user was looking at changed under them.
+6. **Both web demos discard `await_db_worker_ready()`'s result.** `examples/dioxus-web-demo/src/main.rs` and `examples/yew-web-demo/src/main.rs` call it bare. The worker reports boot failures on that channel precisely so a stale or absent stack fails by name instead of spinning, and the compiler warns on every build of both demos.
+7. **The desktop demo has no device-private tier.** It never calls `Replica::with_tier`, so the tier that `R26`'s durability story is about is absent from the native demo and its archive can only ever hold the synced replica. The demo's own export pane says so today, which is honest and is not a substitute.
+8. **A refused write says why to no application (folded in 2026-08-21 from the full review).** The client drops `MutationRejectReason` (`crates/connetto-client/src/lib.rs`, recorded in R40's section as not R40's to fix), so an application cannot tell a denial from a cannot-determine, which is exactly the distinction R5b added `Indeterminate` for. Surface the reason on the client event and have at least one demo display it. This also discharges the prerequisite the R25 design placed on its retraction log, which carries this reason.
+
+### Proof
+
+Each item is demonstrated in the demo it names, by a human running it: an aggregate that tracks a write, a gate that enrols, a status line that goes offline and back, a refused subscription that says why, a resync that announces itself, a boot against a stale stack that names the failure, an archive from the desktop demo carrying two databases, and a refused write whose reason reaches the screen.
+
+### Done when
+
+Every item above is driven by the demo it names, and no demo comment claims a capability does not exist that the library provides.
+
+### Out of scope
+
+Making the demos runnable in CI, which `R55` settled: they need a browser, a served bundle and a full stack, and their value is a human clicking them.
+
+---
+
+## R58: a subscription's cost is metered as one, and a large read has no ceiling
+
+**Status.** **DONE (2026-08-21).** Designed and built the same day: all eight questions answered with three more raised and answered, `R59` absorbed by decision 6, then four points the steps left open settled with the maintainer before any code (decisions 9 to 12 below) and the build's own findings recorded under them. The Done-when is demonstrated by `crates/connetto-server/tests/read_ceiling.rs`, six tests over a real Postgres: a read larger than the budget arrives complete in keyset pages, the same budget pages smaller over wider rows, a row above the ceiling is refused with the three numbers in the log, a table already wider than the ceiling is refused before a row is read, a read whose plan needs a sort is stopped by the time limit, and two different causes refuse in byte-identical frames.
+
+**Blocked on nothing.** Question 4 established the work sits in connetto, with `pg2sqlite` and `subql` untouched, and Q4.2 stands.
+
+### Purpose
+
+Everything that meters a caller counts events of equal weight, and the events are not of equal weight. A subscription over one row and a subscription over ten million draw the same allowance, and a five-megabyte patch and a fifty-five-byte patch each spend one delivery credit. So the cheapest way to cost the server a great deal is to ask politely and stay inside every limit. And a large read is not an abuse to be refused: it is what a local-first client asks for on its first run, which is why decision 6 made paging part of this phase rather than a separate one.
+
+### What already exists, so the discussion starts informed
+
+Grounded in the tree and the chapters, not recalled:
+
+- `02-protocol.md` states the gap in its own words: credits "bound how much undelivered data a session accumulates. They do not bound what a caller may ask for", and each subscription "costs a full snapshot of the subscribed shape". So this is a known asymmetry rather than an oversight, and `R19` chose count-based signals with it in view.
+- Three signals are metered, in `crates/connetto-server/src/throttle.rs`: subscription creations, connections, and refused grants, each per window and tiered by whether the handshake resolved an identity. All three count occurrences.
+- Delivery credits are per frame. `INITIAL_CREDITS` is 64 on both the server and the relay hub, and only a bulk frame spends one, so a frame's size does not enter into it.
+- Admission is a separate mechanism and also does not price: `16-server-capacity.md` bounds what the server holds in flight at once, and `R39` reserves a share of the reader pool for identified callers.
+- Writes are metered by nothing at all, which is `R19`'s third recorded finding.
+- `open-questions.md` Q4.2 decided that connetto imposes no subscription limits of its own and that registry limits belong to `subql`. **A decision recorded in a chapter outranks this plan**, so any pricing that lives in connetto reopens Q4.2 deliberately and says so.
+- Aggregate re-execution is the one place cost is already acknowledged: `05-aggregate-queries.md` says re-execution "is more expensive but always correct" and Q5.5 put the debounce and the concurrency cap in `subql` and the materializer.
+- **A snapshot is built whole before anything is sent, and costs one credit.** `PgSnapshotSource::snapshot` collects every row into a `Vec<BinaryRow>` whose cells own copies of the Postgres wire bytes, encodes that set whole into one patchset, and compresses it whole, with more than one full copy live at once. `snapshot_row` then sends the entire compressed patchset as a single `SnapshotPatch`, so a 64-credit window means 64 snapshots of any size whatever. `SnapshotSource::snapshot` returns one `Snapshot` value, so nothing here can be incremental without changing that trait.
+- **A live patch carries exactly one row change.** `Materializer` builds every live payload with `pgoutput_patchset_builder(db, std::slice::from_ref(event))`, a single-element slice, so a transaction touching a million rows becomes a million small frames rather than one large one. Credits therefore already bound the live path. The unbounded frame was only ever the snapshot, which decision 6 pages.
+- **The row cap bounds count, not bytes.** Nothing in SQL can limit a read by size, so a page of a thousand rows each holding a ten-megabyte value is a bounded page and an unbounded amount of memory. This is the one gap decision 1 leaves and it is question 3's remaining substance.
+- **The server never estimates.** No `EXPLAIN` and no count probe exists on this path, so today it learns a subscription's size only by having built it. `FANOUT_PAYLOAD_BYTES` counts fan-out copies and nothing counts snapshot rows or bytes.
+- **Query shape is already bounded, and it does not help.** A subscription is a `WHERE` clause over a single table (Q4.1) and joins are excluded by an `R27` decision that calls the single-table boundary a decision rather than a limitation to be lifted. `subql` accepts a fixed operator set and refuses the rest, and `R27`'s membership term is the one relational escape, bounded to thirteen compilable patterns. So a query cannot be complex, and complexity was never the cost: `SELECT * FROM orders WHERE true` is the simplest expressible query and the most expensive one available.
+
+### Open questions the discussion must settle
+
+1. **What is the unit of cost, and what backs it up?** **Decided 2026-08-21: ask Postgres what it expects before running, and cap the read at the query itself so a wrong estimate cannot hurt.** The translated `SELECT` is wrapped and given a row limit one above the caller's allowance, so if row n+1 comes back the subscription is refused and Postgres stopped producing at n+1. Memory is then bounded **by construction** rather than by an estimate being right, and the estimate's job becomes refusing the obvious cases cheaply before a query is spent at all. **Constraint, and it is the trap this project keeps meeting: a capped read that comes back full must be REFUSED, never delivered as its first n rows.** A truncation a client cannot tell from a complete answer is the silent-loss shape `R26` and `R40` were both bitten by. Rejected: the maintainer's own first answer, an estimate plus a count of what was delivered, because neither half bounds the read that is actually running, so the underestimated query is still built, encoded and compressed whole and the count only refuses the caller's next request. Also rejected for now: serving the read in parts and charging bytes as they go, which is the most complete answer and needs the read interface and the wire meaning of a credit to change together.
+
+   **This is what splits the two phases cleanly.** With the cap in place, `R58` bounds cost and `R59` gives a legitimately large read somewhere to go. Without it they would have been the same work.
+
+   **Two mechanism details to get right rather than discover.** A client query may already carry its own `LIMIT` from pagination, so the cap wraps rather than appends. And the wrap goes inside the existing read-only repeatable-read transaction the snapshot already takes, so the cursor it reports stays consistent.
+
+   **Measured 2026-08-21 rather than assumed, on Postgres 16 with two million rows, because the maintainer asked whether the engine optimizes the wrap away.** It does. A plain filtered query is flattened outright, `Limit` directly over `Seq Scan`, eleven rows actual, one buffer read, 0.023 ms. A client query carrying its own `LIMIT 5` is **not** flattened, two `Limit` nodes survive, and it makes no difference: the scan stopped at five rows, the inner limit is preserved exactly and both terminate early. **That retires the pagination risk this decision recorded**, so the wrap needs no special case for a query that already pages.
+
+   **What the cap does not bound, and this is the finding.** With `ORDER BY` on an unindexed column inside, the plan becomes `Limit` over `Gather Merge` over `Sort` over `Parallel Seq Scan`, and the scan reports 666,667 rows per worker across three workers. Postgres read all two million rows and sorted them, 461 ms, to return eleven. The cap turned into a top-N heapsort, which bounds Postgres's memory to 27 kB per worker and bounds its work not at all. So decision 1 holds exactly as far as it was stated: **connetto's memory and the wire are bounded by construction, and Postgres's work is not.** Two consequences. The estimate half of this decision carries more weight than it was credited with, being the only part that can refuse a query that is expensive but small. And a statement timeout, dismissed under question 4 as bounding time rather than rows, covers precisely the dimension the cap leaves open, so the two are complementary rather than alternatives. That pairing is question 1b.
+
+1b. **Does a time bound sit alongside the row cap?** **Decided 2026-08-21: yes, set by connetto on the snapshot's own transaction, per caller tier.** The snapshot already runs in its own read-only repeatable-read transaction, so a statement timeout scoped to it bounds the dimension the row cap leaves open without touching deployment configuration. Both dimensions are then covered: rows by construction, time by refusal. **Where the knobs live, per the maintainer:** the same place the existing per-tier allowances live, `TierLimits` in `crates/connetto-server/src/throttle.rs`, which already carries `identified()` and `anonymous()` defaults with `const fn with_subscriptions`, `with_connections` and `with_credential_refusals` overrides, held by `RequestGuard`. So the row cap and the time bound are two more knobs on an existing tiered struct rather than a new configuration surface, and `Tier::of(&state.principal)` is already called at the mutation permit site so the tier is in hand where the snapshot runs. **Costs accepted:** a timeout is wall-clock, so it refuses differently on a loaded machine than an idle one and a legitimate large read fails intermittently rather than predictably, and it abandons the read after the work is spent, protecting the next caller rather than this one. Rejected: leaving it to the operator on the reading role, which cannot vary by tier and gives connetto a database error it cannot distinguish from any other, so the refusal would be vague where the row cap's is exact. Also rejected: relying on the planner estimate for time, which rests on the estimate being right and the row cap exists precisely because it is not trusted.
+2. ~~**Is cost charged before or after the work?**~~ **Answered by decision 1: before, by the estimate, with the cap as the backstop that makes being wrong survivable.**
+3. ~~**Does a credit become a unit of size?**~~ **Decided 2026-08-21: no. The allowance becomes a byte budget and the row cap is derived from it per table.** Two findings narrowed this first. A live patch carries one row, so credits already pace that path, and paging bounds the snapshot path, so the reason a credit meant nothing is gone and its wire meaning stays a frame. What survived was that a row count is not a size, and the answer is to express the allowance in bytes and derive the per-table row cap from the average row width Postgres already tracks. **The derivation is free, which is the neat part:** the estimate query decision 1 already runs returns a predicted width alongside the predicted rows, so one round trip yields both, and a table of wide rows gets a small page while a narrow one gets a large page, both landing near the same size. **Imprecision to state rather than discover:** it is an average, so a table whose row widths vary wildly still produces a page well off the budget, and the planner approximates the width of a value stored out of line, so a column of large text or bytes can be undercounted. Rejected: leaving rows as the only cap and expecting an operator to lower it, because the operator who needs to is exactly the one who has not thought about it and one wide column is enough to make a sensible cap dangerous. Also rejected: making a credit mean bytes, which prices delivery honestly and changes the wire, the relay hub and every client's accounting to answer fairness rather than the memory question actually on the table. **Considered and available later rather than rejected:** cutting an assembled page into several delivery frames at a byte budget, which would bound what is delivered even when the derivation overshoots, and which pairs with this decision rather than competing with it.
+4. ~~**Where does the ceiling live mechanically?**~~ **Decided 2026-08-21: connetto, as a textual subquery wrap.** Two corrections came first. The earlier framing said decision 1 reopened `open-questions.md` Q4.2 by itself, and that was too strong: Q4.2's subject is subscription **count** and registry memory, answered by giving caps and eviction to `subql`, while decision 1's cap is the result size of one read. The chapter decision stands untouched. And the earlier phrasing said "the upstream engine", which conflated three crates. Named: `pg2sqlite` performs the dialect translation, through `ReverseTranslator::reverse_translate` called from `Materializer::translate_subscription_sql`. `subql` only registers the finished Postgres string, via `SubscriptionRequest::new(consumer_id, pg_sql)`, and never authors it. `sqlparser` is the AST library connetto already uses for its own two rewriting passes, `narrowed_sql` and `membership_terms`. So the cap belongs in connetto, which produces the SQL and runs the snapshot itself, and it is applied by wrapping rather than rewriting: the translation already refuses anything but a single statement, so an inner query is safe to wrap without understanding it, and the measurement under decision 1 shows the wrap costs nothing. Rejected: an AST rewrite through `sqlparser`, consistent with the two existing passes but obliged to reason about a limit and offset the client may already have written, where being wrong is a silent wrong answer rather than a compile error. Also rejected: emitting the cap from `pg2sqlite`, a general dialect translator shared with the schema pipeline that knows nothing of callers, tiers or allowances, which would push a connetto concept upstream and onto somebody else's release.
+5. ~~**What does a caller see when it cannot afford what it asked for?**~~ **Decided 2026-08-21: nothing new. The fixed phrase stands and the cause goes to the structured log.** The maintainer's reason is the deciding one: this is information for the developer building against connetto, not for the person using their application, and the server log is the developer's channel because a deployment runs its own connetto-server. So `SUBSCRIPTION_REFUSED` is unchanged, `R38`'s invariant keeps having no exceptions, and whoever adds the next refusal needs no judgement about which side of a line it falls on. Rejected: naming the cause, and naming a single cost class, both of which were arguable on disclosure grounds, since the read runs as the caller under row-level security so another person's rows are absent rather than refused and a tripped cap reveals only data the caller was already entitled to. That argument was sound and lost to the invariant. **Consequence to state rather than rediscover:** a running application cannot adapt to the cap, because the wire never tells it the shape of its request was the problem. The cap is therefore something a developer meets during development, in the log, which puts the burden of communicating it on the documentation and the demos rather than on the protocol. Nobody should later "improve" this by adding a detail.
+6. ~~**Is this a limit or a scheduler?**~~ **Reframed and decided 2026-08-21: neither. The cap is a real ceiling, paging is how a large read is served, and this phase absorbs `R59`.**
+
+   **The maintainer's example is what reframed it.** Asked where a large read legitimately happens, the answer is that it is the product: connetto is a local-first engine and a subscription is how a device says keep these rows. The initial sync on a new device is the whole working set by definition. A server-demanded resync takes the identical read, through the same `snapshot_row`, and **the client neither asked for it nor can shrink it**, so a cap that refuses there leaves a client unable to recover. An offline-first app whose working set is a whole table, and a shared reference table every client holds, are both ordinary. So refusing large reads refuses the main job, and the earlier claim that the cap cleanly split this phase from `R59` was wrong in the other direction: paging is a **prerequisite** for the cap to be a policy rather than a crash guard.
+
+   **Paging must be automatic, per the maintainer: the application asks for what it wants and connetto serves it in parts, spread over time, with no client-side paging logic.**
+
+   **Measured 2026-08-21, Postgres 16, two million rows, because the maintainer asked whether the wrap stays optimized across successive pages.** It does, and the shape of paging is decided by the numbers. Offset paging through the wrap costs O(offset) per page: the first page took 0.371 ms producing 1,000 rows, the thousandth took **703 ms** producing 1,001,000 rows, and the last took 570 ms producing all two million, so paging the table by offset produces roughly two billion rows to deliver two million. Keyset paging is flat: `WHERE t.id > 1999000` on the outer wrap took **0.377 ms** producing exactly 1,000 rows, and the plan shows the predicate pushed down into `Index Cond: (id > 1999000)` with the subquery flattened away. **So paging is keyset, never offset.**
+
+   **Keyset is available by construction and transparent here.** Every subscribed table has a primary key already, because the changeset machinery requires one, so the ordering key always exists. And delivery order does not matter in connetto: the client reads its local replica with its own queries, so a client's own `ORDER BY` applies locally to the assembled set, which `04-subscriptions.md` already implies by treating pagination inside the query as a snapshot-shaping device rather than an ordering promise.
+
+   **Two things fall out.** Spreading the load over time needs no new mechanism: with a large read served as pages, the existing delivery-credit window becomes the pacing device it was designed to be. And question 3 gets easier rather than harder, because every page is bounded.
+
+   Rejected: a crash guard set far above any legitimate working set, which prices nothing and leaves the fairness problem that opened this phase untouched. Also rejected: a ceiling exempting reads the client did not choose, which would leave the resync path uncapped, and a mass resync after a cursor loss is the worst load the server ever sees. Also rejected: scheduling in the sense the protocol chapter refuses, since a size cap leaves nothing to wait for and `RateLimited` is reserved by `error.rs` for a refusal that is "not a refusal of what was named". **A correction on the way: an earlier claim here that the write path already schedules was wrong.** `mutation_reader_permit` returns `Ok(None)` and the mutation "stays pending on the client and replays on reconnect", so the server holds nothing and both paths refuse.
+
+7. **What happens to a single row larger than the whole budget?** Carried from `R59` and sharpened by decision 3, since a page cannot be smaller than one row. **Decided 2026-08-21: deliver it over budget, up to a separate hard ceiling above which the subscription is refused.** Two numbers rather than one: the byte budget that shapes pages, which stays a pacing target because the derivation is an average anyway, and a hard maximum for a single row that is the thing actually bounding memory. Ordinary wide rows are served and the pathological one is refused. The cost accepted is a second knob and a band between the two numbers where behaviour is tolerated rather than paced or refused. Rejected: delivering any row at any size, which permits exactly the single enormous allocation the budget exists to prevent, and refusing on the budget alone, which makes a table with one wide row unsubscribable in whole.
+
+   **What the log says, per the maintainer's framing.** A tripped ceiling means one of two things: the ceiling is set too low, or the schema is pathological. connetto can tell them apart from numbers already in hand, because the estimate gives the table's predicted average width and the offending row's size is known when it is read. A row near the table average means the schema is uniformly wide and the ceiling is wrong. A row far above it means one outlier. So the log carries the ceiling, this row and the table average, and whoever reads it knows which case they are in without connetto judging.
+
+   **And one of those two cases is already somebody else's.** A schema storing a document or an image inline is putting file-sync-shaped data in a sync row, and `open-questions.md` Q1.2 settled that "file sync is permanently outside connetto's scope. It belongs to a separate stack." So refusing there is connetto declining a use case it documented as out of scope rather than failing at its own.
+8. ~~**Is the live set bounded once the snapshot is paged?**~~ **Decided 2026-08-21, carried from `R59`: it is the application's choice, and connetto warns the developer when a standing request keeps growing.** The maintainer accepted the recommended option and called the example query itself a poor one, which is the point: an application that does not want a year of orders on a device asks a narrower question in the first place, so the cap bounds the first delivery and the application bounds the lifetime by deciding what to ask for. On top of that, connetto logs once a standing request has delivered far more over its life than its first delivery was allowed, so the developer hears it from connetto rather than from a complaint about a slow device. The cost accepted is a counter per standing request and a threshold to choose for when the line fires. Rejected: holding the line by dropping the oldest rows to make room, because rows a person was looking at would vanish from their device unexplained, possibly while offline, which is data loss caused by a limit, and it contradicts the position already recorded in `04-subscriptions.md`.
+
+### Four points the steps left open, settled with the maintainer on 2026-08-21 before any code
+
+Each was found by grounding the steps against the tree, and each changes what the phase builds rather than how it is spelled. All four recommendations were accepted.
+
+9. **How are pages produced and paced?** The run loop has one arm that serves a whole subscribe and also reads the client's credit acknowledgements (`session.rs`, the two-armed `select!`), so a paged read cannot wait for credits where it runs today, which `R33` already recorded as a deadlock rather than a delay. **Decided: the read is resumed from the acknowledgement.** The session holds a page producer per standing read, each page is its own short read-only transaction resumed by primary key, and the reported cursor is the first page's, so the server holds one page at a time and the resume position can only ask for changes it already has. **The cost accepted, and it is a promise moving:** the `select!` comment claims a client never sees a live patch before `SnapshotEnd`, and between pages it now can. That is safe in one direction only, and the direction is the right one: a page is read after every frame already sent, so a page can never carry a value older than one the client has applied, and a row arriving twice is what `snapshot_row`'s own documentation already calls harmless. Rejected: holding one transaction open across the whole delivery, which keeps the single frozen moment and lets a slow client pin a reader connection and block vacuum for as long as it takes to drain, starving every other caller through the mechanism this phase exists to protect. Also rejected: building every page up front and queueing them, which changes no invariant and still holds the whole read in memory, only chopped up.
+10. **What may the estimate refuse, once paging makes a large read legitimate?** Step 2 says to refuse the obvious cases before spending the read, and decision 6 says a large read is the product. **Decided: the estimate sizes the page, and refuses one case only, a predicted average row width already above the per-row hard ceiling.** That is the pathological schema decision 7 refuses, caught for the price of a prediction that was being made anyway, before a single row is read. Everything else is left to the per-row ceiling and the statement timeout. Rejected: refusing on predicted total size, which is the obvious reading of step 2's words and refuses the first sync of a new device and the server's own demanded resync, both of which decision 6 says must be served. Also rejected: sizing only, which is the same behaviour minus one cheap refusal.
+11. **What happens when a read fails part way through a paged delivery?** New with paging: a statement timeout or a lost backend connection can arrive after the client has applied several pages. **Decided: tell the client the subscription needs replacing and start over, once.** The replacement is read before the notice goes out, so the existing invariant holds that nothing is discarded on a promise, and a second failure refuses the subscription with the one fixed phrase. A refused subscription's leftover rows are covered by nothing and become evictable through `R29`'s retention pass, so the partial state does not survive. Rejected: refusing immediately as a failed snapshot does today, which leaves applied pages in the replica with nothing to complete them and no way for the client to tell a partial set from a whole one. Also rejected: closing the session, which takes every sibling subscription down with one bad read.
+12. **What are the three numbers?** **Decided: for a signed-in caller an 8 MiB page budget, a 32 MiB ceiling on one row and 30 seconds on a read, and for a caller with no identity 1 MiB, 8 MiB and 5 seconds.** A page at that size fits the compressor and the wire, an ordinary wide row is still served, and the time limit is loose enough that an honest first sync finishes on a loaded machine. The credit window remains the real bound on a session's footprint. Rejected: a quarter of those numbers, which costs a hostile caller less and makes an honest read fail intermittently on a loaded machine, the worst failure to debug. Also rejected: four times them, which turns the ceiling back into the crash guard decision 6 refused.
+
+**Three smaller things derived from the above rather than asked, recorded so they are not rediscovered.** A subscription whose projection does not expose the primary key cannot be paged, because the wrap can only reference the columns the inner query returns, so it stays a single capped read and is refused when it comes back full, which is step 1 unchanged. The growth warning of step 8 fires at one hundred times the greater of the first delivery's byte total and the tier's page budget, once per standing request, the floor being there so a tiny first delivery does not warn on its second page. And the cursor a paged snapshot completes with is the first page's, never the last, because resuming from the earliest position can only re-deliver changes the client already has.
+
+### What the build found, 2026-08-21
+
+**The planner's own width is unusable on its own, and this reshaped the estimate.** Decision 3 recorded that "the planner approximates the width of a value stored out of line", which understates it: measured on Postgres 16, a table of four-kilobyte rows predicted **22 bytes a row**, because `Plan Width` counts a value held out of line as the pointer to it. Sizing a page from that alone asks for a thousand times the budget, which is the memory the phase exists to bound. Two further measurements: the same prediction reads 36 bytes for a table holding one two-hundred-kilobyte row, and `ANALYZE` does not help, because the statistic is of the stored datum. **So the estimate takes the wider of two numbers, the planner's prediction and the table's own physical size over its row count** (`pg_table_size` over `reltuples`, which counts what is held out of line), and a table whose row count is unknown reads as one row wide, which errs towards a small page. **And the page after the first is sized from what the previous one measured**, which needs no estimate at all and is exact. The ceiling on one row is measured on the bytes as they arrive, never on a prediction, which is what makes it the number that actually bounds memory.
+
+**A move's read is paged by refusing to page it.** `R7`'s move-in and move-out reads go through the same seam and would truncate under a page cap, so each takes one page and a move too wide for one replaces the whole subscription instead, which is then read in pages by the ordinary path. Rejected: assembling a move's pages whole, which reintroduces the unbounded build this phase removes, and delivering a move in parts, which would need the move frames to carry a completion signal the wire does not have.
+
+**Two functions were split rather than suppressed.** The run loop's outbound arm became `handle_outbound`, and the two move reads now share one `move_page`, both because this phase's additions pushed them past the line-count lint. The split is the honest fix and the deduplication was overdue: the two move reads had identical retry loops.
+
+**The time limit is felt by a policy that is slow per row, which one suite proved by failing.** `tests/reserve.rs` holds a pooled connection on purpose with a policy that sleeps eight seconds per row, and the anonymous tier's five-second limit stopped exactly that read. The fixture now raises its own read timeout and says why, and the default stands: a deployment whose row-level security calls something slow per row meets this limit, and the log names the timeout. That is the intended behaviour rather than a surprise, and it is written here because the first person to meet it will read it as a regression.
+
+### What the review found, 2026-08-21
+
+A full read of the phase's diff after it landed, plus a read of the paths it did not test itself. One fix, two findings left open because each needs a decision rather than a mechanism.
+
+**Fixed: the physical-width read could refuse every subscription of a deployment whose tables sit outside the reading role's search path.** The estimate resolves the table through `$1::regclass` on a bare name, because the catalog knows tables by bare name, so a table in a schema the reader does not search resolves to nothing and the whole estimate failed, which refused the read. It now runs on its own and its failure costs the physical half alone: the page is sized from the planner's width and then corrected from what the first page measures. The old shape would have looked like the phase breaking every subscription on such a deployment.
+
+**Decided by the maintainer and fixed: a refused replacement ends the subscription, a failed one still retries.** `resnapshot_row` looped on every read error with growing backoff, which was right when every such error was transient. Two of this phase's refusals are not: a table whose typical row is above the ceiling, and a read whose plan needs a sort past the time limit. A grant move (`R7`) or a truncate (`R48`) on such a subscription retried a refusal for ever, one log line per attempt. The two are now separate: `SessionError::ReadRefused` carries a refusal and `SessionError::Snapshot` a failure, so the replacement path retries the second and ends the subscription on the first, with the one fixed phrase on the wire. The rows it held are then covered by nothing and `R29`'s retention pass evicts them on the client. Rejected: capping the retries, which still retries a refusal that cannot change and adds a number to choose. Also rejected: keeping the rows and stopping, which would leave a device showing data the person lost access to, reopening the leak `R7` closed. Pinned by `a_refused_replacement_ends_the_subscription_instead_of_retrying`.
+
+**Decided by the maintainer and fixed: a page reads its column names once.** The deserialized row type kept a `Vec<String>` of the result's column names **per row**, so a page of a million narrow rows allocated a million copies of the same names and read only the first set, which made real memory per page a multiple of the byte budget on exactly the tables that produce the biggest pages. The read now walks diesel-async's own row stream and keeps one name list beside the rows, which is also why the names could not simply be shared before: a deserialized row type has nowhere to put them once. One dependency added for it, `futures-util`, already in the lockfile. Rejected: lowering the default budget to absorb the overhead, which guesses at a ratio that varies with a table's column count and makes small pages for everyone.
+
+### Steps
+
+1. **Wrap the translated `SELECT`** with a row cap one above the allowance, textually, inside the snapshot's existing transaction (decisions 1 and 4). A capped read that comes back full is refused, never truncated.
+2. **Ask Postgres for its estimate first**, taking the predicted rows and the predicted width from one round trip (decisions 1 and 3), and refuse the obvious cases before spending the read.
+3. **Derive the row cap from a byte budget** per table using that width, and add the byte budget, the row-level hard ceiling and the statement timeout to `TierLimits` beside the allowances already there (decisions 1b, 3 and 7).
+4. **Set the statement timeout on the snapshot transaction**, per tier (decision 1b).
+5. **Serve a large read as keyset pages by primary key, automatically**, never by offset, with the existing delivery-credit window pacing them (decision 6). The application writes no paging logic and the client re-sorts locally, so delivery order carries no promise.
+6. **Refuse a single row above the hard ceiling**, logging the ceiling, the row's size and the table's average width so the reader can tell a ceiling set too low from a schema storing file-shaped data (decision 7).
+7. **Keep every refusal behind the one fixed phrase**, adding a variant to the private `SubscribeRefusal` enum so the cause reaches the structured log and nothing reaches the wire (decision 5).
+8. **Count what a standing request has delivered over its life** and log once it far exceeds what its first delivery was allowed, so a request that keeps growing reaches the developer rather than a complaint about a slow device (decision 8).
+
+### Proof
+
+A subscription over a table larger than the allowance is served completely, in keyset pages, with the credit window pacing them and no page held whole beyond its budget. The same subscription against a table of wide rows produces smaller pages for the same byte budget. A single row above the hard ceiling is refused, and the log names the ceiling, the row and the table average. A read whose plan needs a sort is refused by the timeout rather than running to completion. Every refusal reaches the wire as the one fixed phrase, asserted rather than assumed. And the measurement under decision 6 is pinned by a test: offset paging is never used, because its cost grows with position.
+
+### Done when
+
+A client can subscribe to more than it is allowed to receive at once and still receive all of it, in parts, without the server holding any part whole beyond its budget, and a request the server will not serve is refused rather than truncated.
+
+### Why this is not `R14`
+
+`R14` priced the dispatch loop's per-subscriber cost and closed on a measurement: 1.38 microseconds per subscriber, and the order-of-magnitude collapse gone. That is what one delivery costs the server. This phase is about what one **request** costs it, which nothing has ever measured or bounded.
+
+---
+
+## R59: a subscription has no ceiling and no way to page
+
+**Status.** **ABSORBED INTO `R58` (2026-08-21).** The identifier stays, because a phase name is never reissued and the chapters reference these by name, so this section is a pointer rather than a phase.
+
+**Why it merged.** It was written as `R58`'s sibling on the reasoning that a ceiling can exist without a price and a price without a ceiling. `R58`'s decision 6 established the opposite: because the initial sync, a server-demanded resync and an offline-first working set are all legitimately large, a ceiling that refuses them refuses the product, so paging is what makes the ceiling a policy rather than a crash guard. One phase, not two.
+
+**The grounding it collected, unchanged and still true.** Pagination works for the snapshot because `LIMIT` and `OFFSET` ride inside the query text. The live set is explicitly not enforced, per `04-subscriptions.md`: it "applies to the initial snapshot only. As rows are inserted or deleted, the live result set may grow beyond the original window without the server enforcing it." `R29` already strips pagination when computing what retention must keep, so eviction holds a superset. Nothing bounds an unpaginated subscription. And there is no continuation today, because a second page is a second subscription that re-snapshots and shares nothing, not even a cursor.
+
+**Its five questions, and what became of each.** Question 1, ceiling or paging or both, is answered by `R58` decision 6: both, with paging as the mechanism and automatic rather than something the application writes. Question 4, what a cursor means across pages, is answered by the measurement under decision 6: keyset by primary key, never offset, and the key always exists because the changeset machinery requires one. Question 5, whose ceiling, is answered by `R58` decision 4: connetto's, with Q4.2 untouched because it governs subscription counts rather than the size of one read. Question 2, refused or truncated, became `R58`'s decision 7: served over budget up to a hard per-row ceiling, refused above it, never truncated. Question 3, whether the live set is enforced, became `R58`'s decision 8: the application's choice, with connetto warning the developer when a standing request keeps growing. **Nothing is left open here.**
+
+---
+
+## R60: a "latest N" subscription syncs the whole table forever and disables its cleanup
+
+**Status.** IN PROGRESS. Step 1 DONE (2026-08-22), the defect demonstrated and sized. Questions 1 and 2 DECIDED with the maintainer the same day: **windowed subscriptions in subql**, the server keeps the top-k window per audience, emits an ordinary patchset delete for a displaced row, and refills an underfull window through the connector re-execution the scalar `MIN` and `MAX` fallback already uses, which dissolves question 2 because the client's copy then IS the window and the eviction claim becomes the delivered window rather than the table. The upstream request is written, extremely clear per the maintainer's instruction: `docs/upstream-subql-windowed-subscriptions.md`, with bounded state, per-audience windows under visibility, tie-breaking, registration refusals (`OFFSET`, multi-column `ORDER BY`, `LIMIT` without `ORDER BY`) and nine acceptance assertions. Sending it upstream needs its own instruction. This reopens the `04-subscriptions.md` live-set-may-grow position, reopened by the maintainer in person. Questions 3 and 4 remain open below. Raised 2026-08-21 while closing `R58`.
+
+**Blocked on nothing to demonstrate the defect.** The design half is blocked on the discussion in this section. Independent of `R58`, which bounds what one request may fetch, where this is about what happens to what was already fetched.
+
+### Purpose
+
+`SELECT * FROM entries ORDER BY created_at DESC LIMIT 10` is one of the most ordinary queries an application writes, and connetto turns it into something nobody asked for. The server matches each changed row against the request's filter, and there is no filter, so every insert into that table is delivered for as long as the subscription lives. Then the device's cleanup pass reads the same absent filter as a claim on the whole table and refuses to evict anything from it. So a request for ten rows means receive all of them forever and switch off the one mechanism that would reclaim the space.
+
+Around that sits the smaller question it was raised for: the cleanup pass only runs when the application calls it, nothing measures what has accumulated, and nothing tells the application it is overdue.
+
+### What already exists, so the discussion starts informed
+
+- **A drifting window IS writable, and it is the ordinary case.** `SELECT * FROM entries ORDER BY created_at DESC LIMIT 10` has no function and no `WHERE` clause, and `04-subscriptions.md` says ordering and pagination ride inside the query. **An earlier note here claimed such a filter could not be written, which was wrong and conflated two different things.** What `subql/src/compiler/parser.rs` refuses is a function call inside a **predicate**, `WHERE created_at > now() - interval '1 hour'`, whose refusal message names "complex expressions, aggregates, or functions". Ordering and limiting are not predicates and are not refused.
+- **And a query with no `WHERE` clause makes its table permanently un-evictable, which is the finding.** `coverage_of` takes the coverage predicate from `select.selection`, which is `None` for a query that filters nothing. `Coverage.predicate` documents `None` as covering the whole table, and `delete_uncovered` acts on it by inserting the table into `untouchable`, commented "A survivor with no predicate wants the whole table, so nothing there may go." Combined with the server matching every changed row against an absent filter, a request for ten rows means: receive every row of this table for as long as the subscription lives, and switch eviction off for that table while it does. `04-subscriptions.md` records the growth half, that the live set "may grow beyond the original window without the server enforcing it". It does not record that eviction cannot then reclaim it. **This reads as a defect rather than a design question, and it makes this phase larger rather than smaller.**
+- **Eviction exists and works.** `ConnettoConnection::tidy` collects every surviving subscription's predicate through `live::coverage_of`, then `delete_uncovered` deletes rows in scope matching none of them, sparing the keys of pending writes. `R15`, proven by `crates/connetto-client/tests/retention.rs`, and exposed in all three demos as a free-up-space button.
+- **The coverage predicates are re-evaluated as SQL at the moment the pass runs**, so a filter naming a fixed moment keeps its rows covered until the application asks again with a new one, and a query that filters nothing keeps its whole table covered forever. Binds are inlined by `coverage_of` before parsing, so a parameter is frozen at the value it was given.
+- **Eviction is gated on connectivity by decision.** `tidy` evicts only when connected, because a row discarded offline cannot be re-fetched, and trims regardless (`R15` decision D4).
+- **The server never reports a departure caused by time.** Removal is computed from a changed row's two versions (`R6`'s two-check form, `R44`'s departure), and time passing produces no version, so nothing on the change path can notice. The client's local pass is the only mechanism, by construction rather than by omission.
+- **The analogue on the permissions side is already refused.** `R49`'s D4 refuses a policy comparing against the clock at boot, because it is a request-scoped question connetto does not ask per check.
+
+### Open questions the discussion must settle
+
+1. ~~**What should a limited request mean on the change path?**~~ **DECIDED 2026-08-22: connetto (through subql) keeps the window.** The maintainer reframed it as subql's problem and was right: the engine maintains k keys plus a boundary per audience, an entering insert also emits the displaced row's delete, and an underfull window refills through the connector re-execution that scalar `MIN`/`MAX` already use, so a top-k window is their k-row generalization. Rejected: serving it as written with documentation (the demonstrated defect kept), and refusing the query at registration (the most ordinary query an application writes, with no alternative spelling since time predicates are refused).
+2. ~~**Should a query with no filter mark its table un-evictable?**~~ **DISSOLVED by decision 1.** With departures maintaining the window, the client's rows for such a subscription are exactly the window, and its eviction claim becomes its delivered window rather than the whole table, which is the connetto-side change this phase makes when the pin moves.
+3. ~~**Who decides when the cleanup pass runs?**~~ **DECIDED 2026-08-22: both, the maintainer's shape.** connetto ships a default automatic residual pass, threshold-driven by question 4's measure and honouring the existing safety gates (eviction only while connected), and the application can supplant it, taking manual control and calling `tidy` itself, the R11 default-on-with-opt-out pattern. **This supersedes R15 D4's callable-only rule by the maintainer's decision**, and D4's reasoning survives inside the default policy: the pass still never runs while disconnected, and an application that wants full control of the moment takes it. Scope stated for the reader: subscription-lapse cleanup was always automatic and stays so, this question was only about the residual pass (time-drifted rows under surviving subscriptions, physical trimming).
+4. ~~**Should the accumulation be measurable, and does the application need telling?**~~ **DECIDED 2026-08-22: a cheap proxy, load-bearing for decision 3.** Rows applied per table since the last pass (O(1) on the apply path) plus the freelist ratio the trim gate already computes, queryable at any time, with a typed event on threshold crossing in the `expiry_warning` pattern: connetto supplies the signal, the consumer (the default policy or a manual application) decides. Rejected: the exact uncovered count, whose measurement costs what the pass itself costs, defeating a threshold trigger. The inexactness costs at most a cheap pass that reclaims little and self-corrects as the counter resets.
+
+### Steps
+
+1. **Demonstrate the defect before designing anything.** A subscription of the form `SELECT * FROM t ORDER BY c DESC LIMIT n`, then rows inserted past `n`, asserting what the client actually holds and that `tidy` removes none of it. This needs no decision and it establishes the size of the problem.
+
+   **Demonstrated 2026-08-22**, `a_latest_n_subscription_accumulates_everything_and_tidy_removes_nothing` in `crates/connetto-client/tests/retention.rs`, green over the loopback transport: a `LIMIT 3` subscription's snapshot honours the limit (three rows), twenty later inserts are all delivered and all held (23 rows for a 3-row request), and `tidy` while connected removes none of them. The control is the rotation pattern: replacing the subscription with a real one-row filter lets the same pass evict 22 of 23, so it was the absent filter alone holding them. **The demonstration also sharpened the defect:** the first control attempt (plain unsubscribe, then `tidy`) evicted nothing either, because a table no surviving subscription names leaves the eviction scope entirely, so even dropping the latest-N subscription never reclaims what it accumulated until some other subscription names that table.
+
+   **A refinement the maintainer supplied and the code confirms, correcting the note above:** connetto has two lapse paths. The live-query teardown (`crates/connetto-client/src/live.rs`, grace expiry) calls `evict_subscription_rows` before unsubscribing, and that pass scopes to the departed subscription's own coverage, so a lapsed filterless subscription IS swept over its full table there, exactly as the maintainer said. The raw `ConnettoConnection::unsubscribe` API is the path that never evicts: it forgets the record first (deliberately, so an offline cancellation is not replayed), sends the frame, and calls no pass, after which the departed rows are invisible to the end pass (record gone) and to `tidy` (table out of scope). **So raw-unsubscribing the last subscription naming a table strands its rows permanently, for any query shape, not only the limited one.** An adjacent defect this phase owns: `unsubscribe` gains the eviction the live teardown already has, ordered evict-then-forget as `live.rs` orders it.
+2. **File and land the upstream feature** (`docs/upstream-subql-windowed-subscriptions.md`), then move the pin.
+3. **The connetto side once the pin moves:** the eviction claim of a windowed subscription becomes its delivered window (departures make the two identical), proven by flipping the step 1 demonstration's assertions.
+4. **Fix the raw-unsubscribe stranding:** `unsubscribe` evicts before it forgets, the order `live.rs` already uses, proven by the step 1 control rewritten to use the raw API.
+5. **The residual-pass policy per decisions 3 and 4:** the applied-rows counter and its threshold event, the default automatic pass it drives, and the configuration through which an application supplants it, superseding R15 D4 in `15-replica-retention.md`'s record when the maintainer names the doc.
+6. **Amend the two superseded chapter records when the maintainer names the docs:** `04-subscriptions.md`'s position that the live set may grow without server enforcement and that strict top-N is managed locally (superseded by decision 1), and `15-replica-retention.md`'s D4 callable-only rule (superseded by decision 3).
+
+### Proof
+
+Step 1's demonstration flips its assertions when steps 2 and 3 land: the same twenty inserts leave three rows held, and the displaced rows arrive as deletes. Step 4's proof is the rewritten control. Step 5's proof: the counter crosses, the event fires, the default pass runs and resets it, and a supplanting application sees the event and the default pass stays silent.
+
+### Done when
+
+A `LIMIT n` subscription holds n rows on the device at rest, a displaced row leaves as an ordinary delete, an underfull window refills without client machinery, raw unsubscribe reclaims like the live teardown does, the residual pass runs by default on the threshold and yields to an application that supplants it, and the accumulation measure is queryable with its crossing event delivered.
+
+---
+
+## R61: the portability download, whose scope only the application knows
+
+**Status.** NOT STARTED, fully designed 2026-08-22. Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data. All three open questions were settled with the maintainer on 2026-08-22, and its build waits on the same deadline class as `R31`: the first real deployment. The file half needs `R65`.
+
+**Blocked on nothing technically.** Blocked on wanting it: nothing in the tree needs it and no deployment exists to be obliged by it.
+
+### Purpose
+
+A deployment has to be able to hand a person all their data and to erase it. `R26`'s device export cannot serve that, and not because of its format: the replica only ever held what its subscriptions covered, so rows the person may read but never subscribed to were never on the device at all. And connetto cannot define the scope, because only the application knows which rows are that person's, which is what `R26` step 3 already decided when it excluded a generic server-side export as a blind library default.
+
+### The shape agreed 2026-08-21
+
+The application registers the queries that name a person's data. connetto authenticates the caller, runs them under that identity so the deployment's own row-level security applies, and writes the results out as plain SQLite. The application owns the scope, connetto owns the plumbing and the identity. **Plain SQLite is right here for the reason it was wrong for `R56`:** this audience is a person or a regulator, so readable with any tool is the promise that matters.
+
+### What connetto already contributes to erasure, so this phase does not rebuild it
+
+- **The local copy.** `teardown` gives `purge_replica`, `wipe_replica` and `forget_device`, and `R17` made the device-private tier die with the replica.
+- **Propagation, unaided.** An application deleting a person's rows in Postgres produces ordinary change events, and `R44`'s departure machinery removes them from every device that held them. No API, nothing new, and it is the part an application would otherwise build by hand.
+- **Files, corrected 2026-08-22.** This bullet used to say documents and photos are outside connetto by decision, which `R24`'s conclusion superseded: the file programme (chapter 18, `R64` to `R69`) is connetto's own, the person's file bytes live in the deployment's chunk store, and their erasure also needs nothing new, because deleting the metadata rows drops the chunk reference counts and chapter 18's sweep reclaims the bytes.
+
+So the only missing piece is the scope, and it is the same missing piece for both halves: the query list.
+
+### The three questions, all settled 2026-08-22
+
+1. ~~**Does connetto build this at all, and now?**~~ **Dissolved as a scheduling attribute, not a design question:** the phase is fully defined here, sits at `any`, and its natural deadline is the first real deployment, the `R31` class. Deleting the phase was considered and rejected, the obligation is structural.
+2. ~~**Does erasure get a surface of its own?**~~ **DECIDED: no function, document the recipe.** Delete the person's rows with ordinary SQL, sync's departures remove every device's copies, the chunk GC reclaims their file bytes, and the person's own device is wiped by the existing teardown APIs. Rejected: an `erase person` convenience over the registered query list, because connetto cannot verify the list's completeness, and an erasure of an incomplete list fails silently while the function's name claims success, a compliance trap wearing a convenience. A download of an incomplete list is visibly incomplete, which is why the same list is acceptable for the download half.
+3. ~~**What does the file promise?**~~ **DECIDED: one zip, three plain parts.** The rows as a plain SQLite file, a `files/` directory holding each referenced file reassembled from the chunk store under a human-usable name, and a provenance manifest naming whose data it is, when it was generated, by which deployment, and the query list that produced it, which is what makes coverage inspectable in a dispute rather than implied. No format version: nothing ever machine-reads the archive back, and versioning a terminal artifact is ceremony. The earlier rows-only "plain SQLite" wording predates the file programme and is superseded by this shape, the `R26` zip precedent with plain contents because the audience is a person, not a re-importer.
+
+### Steps
+
+1. **The registration surface:** the application registers the person-scope query list on the server configuration, chain-built like every other setting.
+2. **The runner:** authenticate the caller, run the list under that identity through the reader role so row-level security bounds every result, with the statement time limits `R58` established applying to these reads too.
+3. **Rows out:** write the results into a fresh plain SQLite file whose schema comes from the same `pg2sqlite` translation the client build already uses.
+4. **Files out (needs `R65`):** for each file-metadata row in the results, reassemble the content from the chunk store into `files/`, named from the metadata with the file id disambiguating collisions, hash-verified against the row's `blake3` identity.
+5. **The manifest and the zip:** provenance as decided in question 3, zipped by a server-side writer (the `R26` archive is the format precedent only, its writer is client code this phase does not share), returned to the application, which owns delivery, since the channel a deployment hands a person their data over is not connetto's.
+6. **Document the erasure recipe** per question 2, in the chapter the maintainer names when it is time.
+
+### Proof
+
+A fixture deployment with rows and files for two identities yields, for one of them, an archive whose SQLite opens in an ordinary tool holding exactly the rows that identity may read, whose `files/` contents match their metadata hashes, and whose manifest names the queries, while nothing of the second identity appears anywhere in it.
+
+### Done when
+
+The archive of the proof is produced by one library call from the registered list, the erasure recipe is documented, and a row or file invisible to the identity provably never leaves the server.
+
+---
+
+## R62: refuse a table with no declared primary key, everywhere changes are recorded
+
+**Status.** **DONE (2026-08-22).** Split out of `R26` on 2026-08-21, where the finding and the first decision are recorded in full. Three more questions were answered with the maintainer on 2026-08-22 before any code, and a fourth in execution, all recorded below with their costs and the options rejected. What landed is in the closing record at the end of this section.
+
+**Blocked on nothing.**
+
+### Purpose
+
+The capture session is installed with `attach_all()`, and SQLite records nothing for a table whose only key is the implicit `rowid`, so writes to such a table are silently never captured: never uploaded if the table is synced, never seen by sibling tabs if it is device-only. Nothing detects it, and by SQLite's own rules the developer did nothing wrong, since `CREATE TABLE prefs (name TEXT, value TEXT)` is a legal keyed table. `R26`'s export refusal is currently the only place in connetto that notices, which leaves the loss silent everywhere else.
+
+### What grounding established, 2026-08-22
+
+Read from the tree, because two of the three answers turn on it:
+
+- **`attach_all()` covers tables created later**, so a table the application creates mid-run is captured too, provided it declares a key. The window for a keyless table is therefore unbounded rather than closed at the next open.
+- **Nothing connetto or the translation authors is caught by its own check.** `_connetto_meta`, `_connetto_pending`, `_connetto_query`, `_connetto_subscription` and `_connetto_bind` all declare keys, and pg2sqlite's generated audit table is `id INTEGER PRIMARY KEY AUTOINCREMENT`. So the check needs no exclusion list for connetto's own tables.
+- **The device-private tier needs keys too, for a reason worth stating**: `serve_snapshot` (`crates/connetto-web/src/relay.rs`) serves a tier table to a browser tab through `snapshot_patchset(LOCAL_SCHEMA, ..)`, which is a session diff, so an unkeyed tier table delivers nothing to a sibling tab. This is why the tier is not itself the escape hatch.
+- **A commit hook cannot host the check.** SQLite forbids querying the connection that invoked the hook, so converting an offending `CREATE TABLE` into a rollback at commit time is not available, although `CommitDecision::Rollback` exists and connetto already installs a commit hook.
+- **Eviction cannot reach an unsubscribed table.** `tidy` builds `delete_uncovered`'s scope only from declared subscriptions' coverage, so a private table nobody subscribes to is never in scope and its rows cannot be deleted.
+
+### Open questions the discussion settled
+
+1. ~~**When does the refusal fire, given the application holds a live handle and can create a table at any moment?**~~ **DECIDED 2026-08-22: at startup over the live schema, and again before a write is sent when the schema has changed.** The startup check covers the DDL this open applied, a database a previous run created, and the attached tier. The write path re-runs it only when `PRAGMA schema_version` differs from the last look, which is one integer read, so the application is never told a write travelled when the table it wrote to cannot be recorded. Rejected: startup only, which narrows the silent loss to mid-run tables rather than removing it. Rejected: refusing the `CREATE TABLE` statement through a hook, which would make connetto parse SQL for a dialect the database already understands, at a moment when the table does not exist yet to be inspected.
+2. ~~**May a table opt out of the key requirement at all?**~~ **DECIDED 2026-08-22: yes, an application-declared list.** An absolute refusal forces a key onto tables that have no natural one and were never meant to be recorded (a settings singleton, a rebuilt cache, an append-only log already ordered by rowid), and `R26`'s own finding records those four reasons as sound rather than careless. Rejected: no exemption, whose only remaining home for such a table is a database file outside connetto, losing the local conveniences over data the application keeps beside its own.
+3. ~~**What may the list name?**~~ **DECIDED 2026-08-22: only tables with no declared key, and a listed table that declares one is refused, naming the contradiction.** The list means "I accept this table is not recorded". **This is what keeps the phase clean**, and the reason is mechanical rather than stylistic: for an unkeyed table, "ignored by everything that leaves the device" is already true by the database's own behaviour, so the list is consulted in exactly two places (the startup check, and the export's refusal becoming a skip) and nothing else has to remember it. Upload capture, tab snapshots, the fingerprint and eviction all follow structurally, per the grounding above. Rejected: a general exclusion that may also name keyed tables, which would need the changeset filtered, the tab snapshot filtered, the export filtered, the fingerprint filtered and eviction fenced, five promises held by convention that every future table-walking feature (`R61`, `R64` to `R69`, `R74` to `R80`) must remember, whose failure mode is a private table leaking into an archive or a peer exchange, silently, inside the escape hatch of the phase that exists to remove silent failure. It also duplicates the device-private tier, which is the structural way to say the same thing, and it carries a second-order trap: a listed table that later declares a key would become silently unsynced while the application believed otherwise, which the chosen refusal turns into a loud contradiction instead.
+4. ~~**Does the write-path re-check cover the device-private tier as well as the synced database, given a tier write never uploads?**~~ **DECIDED 2026-08-22, both, and the question was raised in execution because decision 1's wording and its reason point different ways.** The wording ties the re-check to a write that travels, and nothing in the tier travels, so a literal reading checks `main` alone and leaves a tier table created after startup silently unreadable from every sibling tab until the next restart. That is the same unbounded window decision 1 rejected on the synced side, over the one tier with no copy on the server, so the requirement wins over the mechanism: the re-check reads `PRAGMA main.schema_version` and `PRAGMA connetto_local.schema_version`, two integers rather than one, and refuses a write over either. **Accepted cost: a write can be refused because of a table that never uploads, so the refusal names which database the table is in and says nothing was sent.** Rejected: `main` only, which is the literal plan and keeps the hole. Rejected: checking the tier where a tab reads it, in the relay's snapshot path, which reports the mistake far from where it was made and tells a native application nothing.
+
+**One consequence to state in the documentation, because it differs by target.** An ignored table stays locally usable on native, since the changed-tables signal comes from SQLite's update hook and never consulted keys or the session. In a browser it does not: the worker holds the database and a tab reads through subscriptions the relay serves by session diff, so a tab cannot read an ignored table through connetto at all. Same declaration, two behaviours, so it is written down once rather than discovered.
+
+### Steps
+
+1. **The check.** A helper listing the tables of one live schema that declare no key, reusing the export's existing `key_columns` (`crates/connetto-client/src/lib.rs`), which already counts `pragma_table_info` rows with `pk > 0`. Refuse with a message naming the table, the fix, and the `id INTEGER PRIMARY KEY CHECK (id = 1)` shape recommended for a singleton.
+2. **Run it at startup for every schema connetto holds**: `main` after the DDL is applied (beside `check_policy_tables`, which is the precedent for a refusal at open) and the tier after it is attached, on both the create and the existing path.
+3. **Run it again on the write path when a schema changed**, gated on `PRAGMA schema_version` read for both `main` and the tier, per decisions 1 and 4.
+4. **The list**, declared through `ClientConfig` beside `with_policy_tables`, naming tables whose missing key is intentional. A listed table that declares a key is itself refused (decision 3), and a listed name that matches nothing is harmless: a typo leaves the real table refused, which is loud.
+5. **The export skips a listed table** instead of refusing it, and `R26`'s refusal stays for every other unkeyed table, unchanged.
+6. **Say so in the documentation**, since the requirement is connetto's rather than SQL's and today it is written nowhere, including the browser consequence above.
+7. **The server needs nothing, and the section says why**: a Postgres table that records changes is already refused at startup without `REPLICA IDENTITY FULL` (`R6`), so "everywhere changes are recorded" is discharged on that side rather than extended.
+
+### Proof
+
+Applying a schema containing a rowid-only table is refused on both targets, naming the table and the fix, proven by a test that first demonstrates the silent capture gap against the unfixed code. A `UNIQUE(a, b)` table without a primary key is refused too, since it satisfies a reader but not the recorder. A table created after open is caught at the next write rather than at the next restart. An unkeyed tier table is refused on both the create and the existing path. A listed table opens, and a listed table that declares a key is refused naming the contradiction. The export skips a listed table and still refuses an unlisted unkeyed one.
+
+### Done when
+
+No path that records changes can be handed a table whose writes it would silently drop, except one the application named and accepted, and every refusal message tells the developer what to declare.
+
+### What landed, 2026-08-22
+
+**The gap was demonstrated before anything was built**, which is the phase's own proof rule: a write to `prefs (name TEXT, value TEXT)` on an unfixed client produced no mutation at all (`push` returned `None`) while a keyed table beside it uploaded, and that test now carries the acceptance and reads as the consented behaviour (`a_write_to_an_accepted_table_is_captured_by_nothing`).
+
+**Where it lives.** `check_recorded_tables` in `crates/connetto-client/src/lib.rs` walks one schema's tables through the existing `key_columns`, skips connetto's own by `is_internal_table`, and returns `ClientError::WritesNotRecorded` carrying one sentence per table: the name, whether the synced or the device-private database holds it, and the fix. It runs in `open_inner` beside `check_policy_tables`, at the end of `attach_tier` for both the create and the existing path, and from `recheck_changed_schemas` at the top of `push`, which compares `PRAGMA main.schema_version` and `PRAGMA connetto_local.schema_version` against the values recorded at the last check. `ClientConfig::with_unrecorded_tables` holds the acceptance, lowercased, and `export_rows` skips an accepted table instead of refusing it, leaving `R26`'s refusal for every other unkeyed one.
+
+**Two deviations, both small.** `export_schema_rows` became `schema_ddl_rows` (with `ExportSchemaRow` becoming `SchemaDdlRow`), because the check walks the same catalogue and the old name said export. And `R26`'s own `table_without_primary_key_is_refused_by_name` now creates its unkeyed table after open, since a schema carrying one no longer opens at all, so that is the export refusal's only remaining route.
+
+**Proof.** `crates/connetto-client/tests/key_requirement.rs`, 11 tests covering every Proof item natively, plus `crates/connetto-web/tests/key_requirement.rs`, 4 tests in a dedicated worker over real OPFS covering the worker's own replica, both tier paths, and a tier table created mid-run caught at the next write. The whole `connetto-client` suite, every `connetto-server` and `connetto-test-harness` target, all 14 `connetto-web` browser suites and every example workspace check were run.
+
+**The server needed nothing, confirmed rather than assumed.** `preflight::Artifact::PreviousImages` still refuses at startup any published table without `REPLICA IDENTITY FULL`, which records nothing at all for a table with no primary key, so that half was already closed (documented in `docs/architecture/08-authorization.md`).
+
+**Documented** in `docs/architecture/13-client-connection.md`, the chapter the maintainer named, beside the hardening pass that is the other thing connetto demands of the connection it opens. It states the rule, the acceptance and its restriction, and the consequence that differs by target: an accepted table stays locally usable on native, since the changed-tables signal is SQLite's update hook, and is invisible to a browser tab, since a tab reads through the relay's session diff.
+
+**What the review pass changed, 2026-08-22.** Two claims written in prose were wrong about the mechanism and are corrected: the doc on `ClientError::WritesNotRecorded` said the capture session covers the device-private tier, which it does not, since `create_session` binds to `main` and a tier write is structurally incapable of uploading. The tier needs keys for the relay's session diff instead, and the chapter says so the same way now. The second was arithmetic on the escape hatch: the list has two consumers rather than two call sites, because the import's clash comparison shares the export's row reader.
+
+**One hazard the review found and the suite now defends.** `ANALYZE` creates `sqlite_stat1`, which declares no primary key and moves the schema cookie, so the write path meets it. It is skipped as SQLite's own by `is_internal_table`, whose rule is that a name longer than six characters beginning with `sqlite` is not the application's, and without that a replica that was ever analysed could not write again (`sqlites_own_statistics_table_is_not_the_applications`).
+
+**Two things left alone deliberately, both recorded so a later reader does not take them for oversights.** A virtual table (`CREATE VIRTUAL TABLE`, an FTS index) reports no primary key through `pragma_table_info` and is therefore refused, which is honest since a session cannot record one either, and is what the export already did before this phase. No decision here covers virtual tables, so this states the behaviour rather than choosing it. And the schema fingerprint still hashes an accepted table's DDL: both ends of an archive run the same build, so it stays symmetric, and nothing had to learn the list.
+
+### Seven pre-existing CI breaks, found and fixed 2026-08-22 while gating this phase
+
+None of these belong to `R62`. They were found by mirroring `.github/workflows/ci.yml` job for job rather than running the hand gate, on the first push since CI landed (`main` was ten commits ahead of `origin/main`). Five of the seven would have failed that push outright, one would have failed a job that reports without blocking, and one was a flake that fails about two runs in five.
+
+**The hand gate and CI disagree about two things, which is why they were invisible.** CI's `rust-tests` job runs `keyctl session -- cargo +stable test --release --all-features`, and under that fresh kernel keyring session the whole suite passes, `e2e` and `secret_stores` included. Earlier reports in this session called those two environmentally broken, which was wrong: they need the keyring session CI gives them. And CI's `nightly-lint` job installs a floating `nightly`, while the hand gate pins `nightly-2026-08-05`, so a lint added after that date shows only in CI. **Corrected after this list was first written:** that job carries `continue-on-error: true`, so item 1 below reports rather than blocks a push, and calling it red overstated it.
+
+1. **`clippy::assert_is_empty`, new in today's nightly, 12 sites.** `crates/connetto-server/src/reach.rs` (4), `src/materializer.rs` (2), `tests/grants.rs` (2), `crates/connetto-client/src/subscriptions.rs` (2), `tests/never_synced.rs` (2). The lint fires only on a bare `assert!(x.is_empty())`, never on one carrying a message, so each now says why the value must be empty, which is the house style anyway.
+2. **`examples/webauthn-unlock` could not lint or compile for wasm at all.** Its `[dev-dependencies]` were ungated, so `--all-targets --target wasm32-unknown-unknown`, which is exactly what CI runs, pulled `mio` and hit its own `compile_error!`. Gated behind `cfg(not(target_arch = "wasm32"))`, which then exposed five real lints in the crate's own source (a deprecated `WorkerOptions::type_`, three `thread_local` initialisers that can be `const`, a complex type wanting a name, and two nested `if let`s), all fixed.
+3. **Both web demos ignored a `Result`.** `workers::await_db_worker_ready()` gained one in `5f8d3c1` and neither call site was updated, so `unused_must_use` failed their lint jobs. Both now propagate it, which is also the honest behaviour: a boot that cannot reach its worker should not carry on. A `collapsible_if` in each demo's import handler (from `eb933d4`) went with it.
+4. **Two broken intra-doc links.** `[ImportRefused::Gone]` in `crates/connetto-web/src/workers.rs` needed its path, and the `yew-web-demo` module doc named `db_worker_boot`, a symbol that does not exist: its worker path is `main` finding no `Window`. Both docs jobs were failing on `-D warnings`.
+5. **A flaky test, 2 failures in 5 runs at clean HEAD.** `session_handle.rs` asserted on the connection registry immediately after a handshake ack, but `run_handshake` writes the ack and `run_session` registers the connection afterwards, so a client holding its ack is not yet counted. Two tests raced on it. `SessionManager::live_connections` was added as a read-only count, the two tests wait for it, and the file's helper says why. 8 of 8 runs green afterwards. The server's own behaviour is unchanged and remains as documented at `session.rs:1417`.
+6. **The browser job could lose a whole run to an upstream hang.** `wasm-smoke --test unlock` failed inside `connetto-browser-stack` with "Failed to detect test as having been run" and a killed chromedriver, which is `R46`'s documented upstream defect (`docs/upstream-wasm-bindgen-headless-hang.md`), while the same suite passes 4 of 4 when run under the stack on its own. The runner now gives each browser suite a `WASM_BINDGEN_TEST_TIMEOUT` unless the caller set one, watches each child's output, and retries a suite **only** when that exact signature appears, so a real failure is still reported the first time. A unit test pins the discrimination.
+7. **A cast that CI refuses**, already recorded under `R56`: `usize::try_from(v.as_f64()? as u32)` in the worker's import reply, replaced by a guarded `count_from_js`.
+
+**A method note worth keeping.** An early attribution here was sloppy and had to be redone: `unlock` was declared pre-existing after failing identically at clean HEAD, but both runs had been made without the stack, so both were failing on a missing auth server rather than on the defect under investigation. The rerun under the real stack is what showed the suite is healthy and the runner is not.
+
+### The review round the fixes earned, 2026-08-22
+
+Run at the maintainer's instruction after the seven above, to find more of the same. Five read-only agents took a defect class each: timing races between a client-visible event and server state, assertions that cannot fail, unchecked conversions and dropped failures at trust boundaries, tests nothing executes, and prose describing a mechanism the code no longer has.
+
+**They returned twenty candidates and none survived verification**, which is worth recording as a result rather than as an absence. Three of the misreads are instructive: the "unchecked cast on wire data" was the guarded `count_from_js` written an hour earlier, the "post-message races" in `workers.rs` are polling loops with deadlines, and the "broken intra-doc links" pass `rustdoc -D warnings`. The weak-assertion candidates were assertions read out of their role, `expect_dropped` asserting only that the socket ended because a silent drop is the entire contract for a banned caller. **The standing lesson: a scout's finding is a candidate, and the verification is the work.**
+
+**Everything real came from a different question**, what CI believes it checks versus what it checks, and it is recorded in `R55`'s section, which owns the workflow. One code-adjacent finding stayed here: `snapshot.rs` claimed a plan with no width falls back to one row, while `page_rows` divides by `width.max(1)` and sizes the page from the whole budget. Two corrections stand behind it (the physical width is a `max` over the planner's, and later pages are sized from what the first measured) and Postgres always reports a width, so the sentence was the defect and now says what the code does.
+
+### Landed as
+
+Nine commits, source and tests only, no Markdown and no plan, in the order they were made: `a8969c8` the key requirement itself, `ab68ddb` the guarded import-reply counts, `7fdb604` the assertion messages, `0e3fb16` the registry wait and the count it needs, `f44e197` the browser-suite retry, `0213cad` the example workspaces linting for wasm, `72e1b5c` the six formatted files, `c5955e1` the snapshot sentence, and `2bf8987` the widened CI matrices with the passkey driver.
+
+---
+
+## R63: rewire the membership term onto subql's own APIs
+
+**Status.** NOT STARTED. Split out of `R27`'s follow-up note on 2026-08-21 so the cleanup is owned rather than waiting on an unscheduled pin bump.
+
+**Blocked on nothing.** The three subql findings `R27` step 5 surfaced (`upstream/subql-term-plan-not-queryable-before-registration.md`, `upstream/subql-term-values-doc-recommends-snapshot-seeding.md`, `upstream/subql-direct-caller-comparison-refused-as-unsupported.md`) merged upstream on 2026-08-19.
+
+### Purpose
+
+`R27` serves the membership term end to end through a connetto-side workaround, `Materializer::membership_terms`, built because subql could not yet plan or seed a term at the time. Upstream now can, so the workaround is duplicated machinery that must track subql's behaviour by hand.
+
+### Steps
+
+1. **Bump the subql pin** to a revision carrying the three merged findings.
+2. **Rewire term planning and seeding onto subql's APIs**, deleting the `Materializer::membership_terms` workaround and everything only it used, per the clean-cutover rule.
+
+### Proof
+
+`crates/connetto-test-harness/tests/membership_term.rs` stays green in both directions plus the intersection fixture, with the workaround gone, and the gate runs in full since a pin move touches every workspace.
+
+### Done when
+
+Term planning and seeding go through subql's own APIs, the workaround is deleted, and `R27`'s follow-up note points here.
 
 ---
 
@@ -2379,6 +3248,8 @@ Import, and device-to-device transfer. The latter is `R25`, exploratory and expl
 **Status.** **DONE (2026-08-18).** All six steps landed and are proven against real Postgres and OpenFGA. Decisions 8 to 15 below record what execution added, and the closing record at the end of this section names what ran and the two environmental exclusions. The blocker history: fixed upstream 2026-08-17 (pg2sqlite `f71e709` and `50fd4f7`, merged as `22b60bf`), so `upstream/pg2sqlite-reverse-session-variable-mapping.md` stays discharged.
 
 **Unblocked, R6 landed 2026-08-16. The subql half is built**, landed as `0dac842` and `fcf7d83`, which recognise a bounded membership subquery, key its subscriber lookup, and serve it by narrowing which subscribers a changed row admits. Researched and decided in `docs/architecture/04-subscriptions.md`, sequenced rather than urgent.
+
+**Follow-up unblocked 2026-08-19.** The three subql findings R27 step 5 surfaced are merged upstream (`upstream/subql-term-plan-not-queryable-before-registration.md`, `upstream/subql-term-values-doc-recommends-snapshot-seeding.md`, `upstream/subql-direct-caller-comparison-refused-as-unsupported.md`), so connetto can now switch off its own `Materializer::membership_terms` workaround onto subql's term planning and seeding APIs. This is a cleanup rather than a completion, since R27 already serves the term end to end through the workaround. It needs a subql pin bump to the revision carrying the three, then the rewire. Owned by `R63` as of 2026-08-21.
 
 **It used to be blocked on R22 as well, and that dependency is void since R22 was deleted on 2026-08-05.** The underlying requirement is unchanged and is now R27's own: the evaluation question is settled as one filter compiled to two executors, and compiling a subscription filter needs the query set known ahead of time. What is refused is the mechanism R22 proposed, a curated set somebody maintains. R27 derives what it needs automatically from the queries the application already wrote, designed against this concrete use rather than in the abstract, which is the only reason the requirement exists at all.
 
@@ -2954,7 +3825,7 @@ Public rows are stored once per device rather than once per identity, the switch
 
 ## R15: replica retention, eviction and trimming
 
-**Status.** **BUILT** (2026-08-19). All six steps and decisions D1 to D4 landed, proven by `crates/connetto-client/tests/retention.rs` and a browser demo of the free-up-space affordance.
+**Status.** **DONE** (2026-08-19, relabelled from BUILT on 2026-08-21 under the definitions in How to read this, since nothing named remains). All six steps and decisions D1 to D4 landed, proven by `crates/connetto-client/tests/retention.rs` and a browser demo of the free-up-space affordance.
 
 **Nothing gates this phase any more, as of 2026-08-18.** The locks moved to the fork's `future` branch at `705e4340`, and that checkout carries all nine APIs the steps below use: `wal_checkpoint` with `WalCheckpointMode`, `auto_vacuum` with its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum` and `vacuum_into`, each read in the pinned sources rather than inferred from a merged pull request. The paragraphs below are the history of that blocker and are kept for the lesson in the second one, not as a live gate. **Step 1's pin move is therefore already done, and what remains of it is deleting the step.**
 
@@ -3079,7 +3950,7 @@ A replication slot retains WAL without limit by default (`max_slot_wal_keep_size
 
 **Step 1's own proof, run against a live binary rather than asserted.** Four boots against a bare database: a missing slot names the replication slot (including the cross-database case above), a missing publication names the publication, a missing oplog table names the table, and with all three present the server starts.
 
-**Blast radius, all updated.** Two `e2e.rs` fixtures, the harness, `11-authentication.md`'s reference SQL, `docs/devstack-local.md`, and the recipe headers of `authenticated_boot.rs` and `verified_topology.rs`. The live browser stack's Postgres was provisioned with the new table and the full 20-binary run is green.
+**Blast radius, all updated.** Two `e2e.rs` fixtures, the harness, `11-authentication.md`'s reference SQL, the since-retired dev stack recipe, and the recipe headers of `authenticated_boot.rs` and `verified_topology.rs`. The live browser stack's Postgres was provisioned with the new table and the full 20-binary run is green.
 
 **One thing changed that was not planned.** `loop_emu.rs`'s `SQLITE_DDL` gained `IF NOT EXISTS`, because `connect` replays the caller's DDL on every open and the restart tests reopen one replica across two server runs. Every other test starts from a fresh temp file, so nothing else notices.
 
@@ -3462,7 +4333,7 @@ All five proofs pass, the Parked entry for the expired key is retired, and R29 s
 
 **One finding that is not this phase's, recorded so it is not lost.** The two aggregate-bootstrap tests in `pg_async.rs` fail against a bare `postgres:16` with `expected control frame, got None`, because nothing in that file creates `_connetto_mutations` and the handshake's watermark read then ends the session before the ack. Not a regression (they pass once the table exists) and not a defect in the product, but the failure names neither the missing table nor the watermark, which costs a reader the same detour twice.
 
-**A second gated test with a hidden prerequisite, found while re-verifying.** `verified_topology.rs` is the one native test that opens a real handshake against a running server, so it is worth running for step 3, but it needs the `dev_idp` stack its header names and not the browser dev stack of `docs/devstack-local.md`. Pointed at the latter it fails with `404 Not Found` on the login chain, because that stack leaves `CONNETTO_OIDC_NAME` unset and the provider registers as `oidc` rather than `dev-idp`, and overriding only the name then hangs instead, because that stack's `CONNETTO_OIDC_REDIRECT_URL` goes to the browser landing page so the chain never returns to the test's loopback listener. Against its own stack (`dev_idp` on 18098, a second `connetto-server` on 7778 and 18082) it passes. It cannot be affected by step 3 in any case: it sets `capabilities: Vec::new()` and presents only the login grant, which the filter never touches.
+**A second gated test with a hidden prerequisite, found while re-verifying.** R55 retired this path: `verified_topology.rs` now runs through `connetto-browser-stack`, which supplies the server binary and service environment. The test still matters because it opens a real handshake against a running server, sets `capabilities: Vec::new()`, and presents only the login grant, which the step 3 filter never touches.
 
 ---
 
@@ -3596,19 +4467,520 @@ One definition exists per job for steps 1 through 7, step 8's three items are di
 
 ---
 
+## R64: the file core
+
+**Status.** NOT STARTED. First of the six phases R24's design derived on 2026-08-21. Chapter `18-file-handling.md` (written 2026-08-22) is the normative record of the decisions, and R24's ten recorded positions carry their reasoning and rejected alternatives, normative wherever these six sections and the chapter are silent.
+
+**Blocked on nothing.**
+
+### Purpose
+
+The platform-neutral library everything else consumes: file identity, chunking, manifests, the store trait, and the encrypting store. No connetto dependency, and its tests run under wasm from the first commit, because R26 and R40 both paid for browser surprises found last.
+
+### Steps
+
+1. A new root-workspace crate. File identity is plain `blake3(file)`, computed in the same streaming pass as FastCDC chunking (decided 2026-08-21: chunking-independent, so re-tuning chunk sizes never re-identifies a file, and bao verified streaming stays a free upgrade since the hash already is a tree root). Chunking parameters are a per-mime-class table shipped as data, and a file at or under the max chunk size skips CDC.
+2. The manifest format: ordered per-chunk `(blake3, length)` pairs, transport and dedup metadata only, lengths present because they map a byte range to chunks.
+3. Per-chunk zstd compression (level 3) between chunking and encryption, with a per-mime skip table beside the chunking table and a compression flag in the chunk header, the Borg and Kopia order (added by the 2026-08-21 review: omitting it roughly doubles FASTA storage, and the driving use case is text-heavy scientific data).
+4. `ChunkStore` (`write_chunk`, `read_chunk`, `has_chunk` by content hash) with the in-memory implementation.
+5. The encrypting decorator: XChaCha20-Poly1305 per chunk (amended from AES-GCM by the 2026-08-21 review: the 192-bit random nonce removes the 2^32-chunks-per-key bound and the AES-NI assumption on mobile cores), a random 24-byte nonce stored with the ciphertext, the chunk's plaintext hash as associated data, and the key derived by HKDF with a purpose label so custody stays with R41's `ReplicaKeyStore`.
+6. The wasm test rig, in this phase and not later.
+
+### Done when
+
+Chunk, encrypt, store, read, decrypt, reassemble round-trips under property tests (identity stable across chunking parameters, a tampered chunk refused at decrypt), green natively and under wasm.
+
+---
+
+## R65: the file server
+
+**Status.** NOT STARTED.
+
+**Blocked on** R64.
+
+### Purpose
+
+Durable chunk storage, the upload protocol, and ticket-gated serving. Content bytes never enter Postgres, per R24 position 4: this deployment runs `wal_level = logical`, so `BYTEA` content would be WAL-logged and pinned by the R32 slot.
+
+### Steps
+
+1. `ChunkStore` backends: a filesystem directory and an S3-compatible object store.
+2. Manifests and refcounts in Postgres through typed diesel, plus the reconciling mark-sweep whose grace window is the upload ticket TTL.
+3. Upload, all on the content channel under a websocket-minted write ticket carrying the authorized byte ceiling (channel precision from the 2026-08-21 review): intent, needed-hashes scoped to the caller's own visibility domain (the existence-oracle rule), chunk PUTs, and a commit that verifies each chunk hash and the `blake3` identity, then writes `content_state` on the metadata row so CDC announces availability.
+4. The `content_state` grant (added by the 2026-08-21 review): the metadata table gains a deployment-provisioned column-scoped UPDATE policy or a `SECURITY DEFINER` setter for the file server's role, because R1 forbids superuser and BYPASSRLS and RLS otherwise blocks a non-owner UPDATE, and `preflight.rs` verifies the grant at startup.
+5. Serving: `GET` with `Range` mapped through the manifest, a strong `ETag` equal to the content hash, immutable caching, and tickets with the session-long TTL decided 2026-08-21 (cross-session cache misses accepted over cookies or a service worker).
+6. Byte metering per identity per window in both directions, enforced against the ticket's ceiling rather than a second counter (the mint charged the budget, per the review), and refusals answering 404 whether the file is absent or forbidden.
+
+### Done when
+
+A crashed upload never serves and its orphans are collected, ranged download is proven against both backends, and a bulk flood is refused by the meter in a test.
+
+---
+
+## R66: the connetto seam
+
+**Status.** NOT STARTED.
+
+**Blocked on nothing**, and may run in parallel with R64.
+
+### Purpose
+
+Everything connetto itself changes, deliberately small, per R24 positions 6 and 9.
+
+### Steps
+
+1. Delete `FileStore` from `connetto-core`.
+2. The wire message pair: ticket request (file id, verb, and for the write verb the declared byte size) and grant. Free per the bump doctrine.
+3. The signer seam trait in `connetto-core`, implemented by the file crates, wired on the server config the way `WriteTarget` is. Per the review, this is the ONLY trait `connetto-core` gains: the two-verb authorization answer stays internal to `connetto-server`'s session loop, having no external consumer.
+4. The session loop answers visibility from the metadata row through the existing machinery before calling the signer, and charges the byte budget once, at the mint, with the file server enforcing the ticket's ceiling.
+5. ~~The ticket-versus-capability distinction written where chapter 12's amendment will draw from.~~ Closed by the review: chapter 12 gained "A content ticket is not a capability" and was committed 2026-08-21 (`826e041`) before this phase began.
+
+### Done when
+
+A session obtains a ticket for a visible file and is refused, R38-shaped, for an invisible one, proven with a test signer, and `FileStore` no longer exists.
+
+---
+
+## R67: the native file client
+
+**Status.** NOT STARTED.
+
+**Blocked on** R64, R65 and R66.
+
+### Steps
+
+1. Manifests and the outbox in the device-private tier, committed in the same transaction as the entry row, so a crash orphans a chunk file but never a row.
+2. The `std::fs` encrypted chunk store.
+3. The outbox walk on reconnect, intent through commit, and the boot integrity pass over unsent manifests.
+4. The resolver (signed URL online, local bytes for unsent or pinned content, and an extension point for further local sources, which R25's design already names: peer-fetched cache chunks and present-peer pull) and the pin surface.
+
+### Done when
+
+The offline photo case runs end to end natively: entry and bytes written offline, both arrive after reconnect, and a second client sees `content_state` flip and fetches by ranged `GET`.
+
+---
+
+## R68: the browser file client
+
+**Status.** NOT STARTED.
+
+**Blocked on** R64, R65 and R66. Its archive step coordinates with R56's format.
+
+### Steps
+
+1. The encrypted OPFS chunk store owned by the worker. R26's lesson applies: never a second connection or handle onto worker-owned storage.
+2. The resolver's browser half: blob URLs from local bytes for unsent and pinned content, plain signed URLs otherwise.
+3. The R26/R56 archive gains unsent chunk files by manifest walk, so a device move carries a pending photo.
+
+### Done when
+
+The offline photo case runs in headless Chrome end to end, and an export taken offline restores on import with the photo still pending, which then uploads.
+
+---
+
+## R69: files in every demo
+
+**Status.** NOT STARTED.
+
+**Blocked on** R67 and R68.
+
+### Steps
+
+1. Every demo carries the photo entry flow: pick, offline write, upload, display through a signed URL, placeholder while `content_state` is pending.
+2. The dev stack provisions the content host beside the server, and the gate section plus R55's CI gain the new build legs.
+
+### Done when
+
+All demos exercise the flow per R54's rule, and `wasm-smoke` carries a binary proving it in CI.
+
+---
+
+## R70: the deployment backup and restore story
+
+**Status.** NOT STARTED. Minted 2026-08-21 by the full review, which found the hazard recorded nowhere as anyone's.
+
+**Blocked on nothing.**
+
+### Purpose
+
+No chapter states what a deployment must back up or what a restore does. A database backup carries the rows, the `_connetto` tables and the oplog, but the replication slot is not backed up by any method and must be recreated, and a restore to an earlier point rewinds the oplog and the exactly-once watermark underneath clients whose cursors and pending queues are ahead of it. R32 detects a feed resuming past what it delivered and forces a resync, which covers part of this, and nothing has established what the watermark rewind does to a replayed pending queue. R24 position 4 already flags the content half: once R65 exists, a database backup no longer covers file bytes, and the deployment docs must say so.
+
+### Steps
+
+1. Enumerate every deployment-owned artifact with its backup requirement and recreation procedure: the application tables, the `_connetto` tables, the oplog, the slot and publication, the reconnect log, the OpenFGA store, and later the chunk store.
+2. Establish restore semantics against a server restored to an earlier point, by demonstration: what R32's resume-past-delivery detection already catches, what a rewound watermark does to a client replaying its pending queue, and decide the intended behavior with the maintainer where the demonstration shows a choice.
+3. Write the story into the architecture, in the chapter the maintainer names when it is time.
+4. Add cheap startup detection where the demonstration shows it is possible, through the existing `preflight.rs` pattern.
+
+### Done when
+
+The story is written, and a Docker-gated test drives a client against a server restored to an earlier point and shows the decided behavior rather than silent divergence.
+
+---
+
+## R71: Linux replica-key custody survives a reboot
+
+**Status.** NOT STARTED. Minted 2026-08-21: the 14-at-rest-encryption chapter records the behavior, the review found nobody owning it, and the same day's crypto discussion named it the one real safety failure the encryption has caused.
+
+**Blocked on** one custody decision to take with the maintainer at execution, because every candidate has a named cost: the Secret Service (gnome-keyring or KWallet) survives reboots but carries the lock hazard that has already wedged this repository's own test runs, the kernel persistent keyring does not survive a reboot either and is out, and a wrapped file under XDG needs its wrap source named or it is plaintext-equivalent.
+
+### Purpose
+
+On Linux the replica key lives in the kernel session keyring, which does not survive a reboot, so a rebooted device reports `ClientError::ReplicaKeyMissing`, synced tables recover by re-syncing, and device-local tables are destroyed. For a field device that is data loss caused by the encryption itself.
+
+### Steps
+
+1. Take the custody decision with the maintainer, grounded in what each backend actually guarantees on a headless and a desktop Linux.
+2. Implement it in `KeyringKeyStore`'s Linux arm, leaving the other platforms untouched.
+3. Prove it: a reboot-equivalent test (drop the session keyring, reopen) shows the replica and the tier reopening without a re-mint.
+4. Amend chapter 14's Linux row when the maintainer names the doc.
+
+### Done when
+
+A fresh Linux session reopens the replica and the device tier without re-minting, proven by test, and the chapter states the new custody.
+
+---
+
+## R72: clock discipline
+
+**Status.** NOT STARTED. X6 given an owner 2026-08-21 by the full review.
+
+**Blocked on nothing.**
+
+### Purpose
+
+Grace countdowns (R29), the session staleness bound (chapter 11), cache TTLs, and, once R25 builds, certificate validation all assume a sane running clock, and nothing states monotonic versus wall time per timer or what suspend and resume does. A device waking after a week fires every grace expiry at once while reconnect races catch-up, under the offline eviction pause, which is X6's own example.
+
+### Steps
+
+1. Inventory every timer and deadline in the tree with its current clock source, cited per symbol.
+2. Decide monotonic versus wall time per timer with the maintainer, and state the suspend-and-resume behavior for each.
+3. Fix the code where it disagrees with the decided rule, and write the rule into the chapters the maintainer names.
+4. Close X6 in `open-questions.md` with a pointer.
+
+### Done when
+
+X6 is closed with a per-timer rule recorded, and the code matches the rule everywhere the inventory found a disagreement.
+
+---
+
+## R74: device identity, enrolment, and certificates
+
+**Status.** NOT STARTED. First of the seven peer-sync phases R25's design derived on 2026-08-22 at the maintainer's instruction. R25's section and chapter 19 are normative wherever these seven are silent.
+
+**Blocked on nothing.**
+
+### Purpose
+
+Nothing today lets two devices authenticate each other offline: clients hold only server-signed credentials. This phase gives a device a durable identity the server vouches for: an Ed25519 keypair whose private key lives beside R41's stores on the same custody backend behind the R23 gate, as its own record type rather than inside `ReplicaKeyStore`, and an X.509 certificate the deployment's CA signs binding the public key to the account.
+
+### Steps
+
+1. The device keypair (`ed25519-dalek`) and its custody record type, one per account on the device per R42's model.
+2. The deployment CA keypair as provisioned material, verified at startup through the `preflight.rs` pattern, with the CA certificate handed to devices at enrolment for offline peer verification.
+3. Enrolment over the websocket: the device sends its public key while authenticated, the server records the enrolment and returns an `rcgen`-signed certificate (note rcgen 0.14's API break against 0.13 examples) plus the CA certificate. Automatic, no human step.
+4. Lifetime is application-requested under a server ceiling, refused if over, the R4 `capability_ttl` pattern, with renewal auto-run on any connectivity past half-life. Lifetime IS the offline revocation lag, stated in the docs rather than hidden.
+5. Server-side enrolment revocation (a reported-lost device), the surface R78's courier refusals and the ban machinery consult.
+6. No offline enrolment and no sub-issuance, recorded as refusals with their reasoning.
+
+### Done when
+
+A device enrols while online, holds key and certificates across restarts behind the existing gate, renews past half-life, is refused a lifetime over the ceiling, and a revoked enrolment stops verifying, all proven by tests including one browser-independent native run.
+
+---
+
+## R75: the per-device applied frontier
+
+**Status.** NOT STARTED.
+
+**Blocked on** R74. Touches the R2 watermark contract and the R56 import.
+
+### Purpose
+
+The 2026-08-21 review found exactly-once splitting into three unreconciled domains (session watermark, courier, archive restore), and the maintainer decided one domain: every write carries its durable identity, (author device key, sequence), and the server keeps one applied frontier per device key that the normal path, the courier path and an archive restore all consult. The session watermark becomes a cache of the frontier rather than a second truth.
+
+### Steps
+
+1. The pending queue's sequence becomes the wire-visible half of the write identity, and `_connetto_pending` refuses at `PENDING_CAP` instead of evicting its oldest, because an evicted entry would leave provisional copies on peers that can never be confirmed or retracted (the R56-recorded hazard, now load-bearing).
+2. Mutations carry (device key, sequence), the server records the per-device frontier in the deployment-owned watermark table (schema change, free at 0.0.0), and `reconcile_pending` reconciles against the frontier so a couriered write is never re-applied on the author's next reconnect.
+3. A (key, sequence) collision is first-seen-wins, audited through R13's contract, the second refused: the Secure Scuttlebutt fork rule.
+4. Archive import retires the archived device's enrolment and mints a fresh key, with restored entries carrying their original (key, sequence) as provenance so the frontier dedups the logical writes across the restore. This amends the R56-landed import path.
+
+### Done when
+
+A write applied through any path is refused by every other path, proven three ways: a replay after a simulated courier application, a restore-then-reupload, and a forged second changeset at an applied (key, sequence), each drawing the refusal and the audit record.
+
+---
+
+## R76: the peer link
+
+**Status.** NOT STARTED.
+
+**Blocked on** R74.
+
+### Purpose
+
+The LAN data plane R25 decided: discovery by gateway-probe first (a hotspot host IS the gateway) with mDNS as the general case, then mutual TLS over plain TCP between certified devices, native targets only.
+
+### Steps
+
+1. Discovery: gateway-probe plus `mdns-sd` under service type `_connetto-peer._tcp.local`, the TXT record carrying protocol version and certificate fingerprint only, discovery treated as fully public with authentication only at the handshake.
+2. The link: `rustls` mutual TLS on TCP, both sides verifying against the deployment CA, refusing expired certificates.
+3. Platform notes made real: Android `LocalOnlyHotspot` guidance, `MulticastLock` for mDNS reception, iOS local-network permission, and the mixed-fleet rule that the Android device hosts.
+4. The BLE advertise-only beacon ("join my hotspot") is recorded as the later bootstrap and explicitly not built here.
+
+### Done when
+
+Two native processes with valid certificates discover each other on one network and hold an authenticated link, a device with an expired or foreign certificate is refused, proven by tests on loopback plus one real two-machine or two-process LAN demonstration.
+
+---
+
+## R77: the exchange and the provisional tier
+
+**Status.** NOT STARTED.
+
+**Blocked on** R75 and R76. The retraction's reason rides on R57 step 8's fix of the dropped `MutationRejectReason`.
+
+### Purpose
+
+The peer exchange itself, with every rule the review fixed: per-author-device cursors, the acked frontier against the uncovered-row leak, signed retractions, and the provisional tier with its explicit conflict rule and its own eviction spare clause.
+
+### Steps
+
+1. The exchange: mTLS session, mutual offer of queue bounds plus acked frontier plus retraction log, request from cursor plus one, signed changesets streamed in order, cursor advanced in the same transaction as the apply.
+2. Peer applies suspend capture exactly as `apply_patch` does, or a peer's write re-uploads as the receiver's own.
+3. The conflict rule: the receiver's own unsent write is never displaced (own authorship wins locally), any other collision applies last-writer-locally with the displaced author recorded, `server_wins` stays reserved for server patches.
+4. Offline authorization: the translated-RLS evaluation with the author's identity bound through a rebindable evaluator (its own connection or hook, since `register_caller` binds one identity per connection), failing closed on OpenFGA-derived and locally unanswerable rights, with the partial-replica false-deny and bounded false-allow limits stated in the docs.
+5. `_connetto_provisional` in the device tier: provenance per (table, pk), a spare clause feeding `delete_uncovered` beside `pending_spare`, server-sourced writes clearing provenance, typed provenance reads and applied/confirmed/retracted-with-cause events.
+6. The acked frontier marks at-or-below provisional rows adjudicated, handing them to ordinary coverage, and a signed retraction removes the copy and surfaces its `MutationRejectReason`.
+
+### Done when
+
+Two devices of different accounts exchange offline and reconcile online with nothing lost and nothing double-applied: an offline exchange applies policy-passing writes provisionally, a reconnect confirms covered rows, adjudicates uncovered ones by the frontier, rolls back a refused write on both devices with its reason surfaced, and eviction spares provisional rows throughout, proven end to end in the harness.
+
+---
+
+## R78: courier recovery
+
+**Status.** NOT STARTED.
+
+**Blocked on** R75 and R77.
+
+### Purpose
+
+Field survivability: a lost device's work is recoverable from the camp. The server accepts author-signed changesets from any certified bearer, deduplicated by the same frontier every path consults. The maintainer's impersonation concern is met by cryptographic confinement and rides as five constraints, none optional.
+
+### Steps
+
+1. The server courier path, **deployment-opt-in, default off**: verify the author's signature against its enrolment, apply under the author's identity, refuse sequence gaps, dedup by the frontier.
+2. The five constraints: a distinct R13 `auth_events` record per couriered application naming courier and author, per-courier metering under R19's machinery, refusal of revoked enrolments, author notification on next login, and acceptance governed by the account's and enrolment's standing at apply time since signatures carry no trusted timestamp.
+3. The client side: offering another author's held changesets for courier upload, explicit, never automatic.
+
+### Done when
+
+A device's writes reach the server through a different account's session with exactly-once held against the author's own later replay, a malicious courier can neither forge nor reorder (gap refusal proven), a revoked enrolment is refused, and every couriered application is audited, all Docker-gated.
+
+---
+
+## R79: media over the peer link
+
+**Status.** NOT STARTED.
+
+**Blocked on** R77, and on R64 to R67 for the chunk machinery.
+
+### Purpose
+
+Sample photos in camp: metadata rows travel in the exchange already, so this phase adds content. Pull-on-demand by chunk hash over the established link, the author's device answering after evaluating the requester against translated policy fail-closed, hash-verified, re-encrypted under the receiver's key into the never-exported cache class.
+
+### Steps
+
+1. The chunk-request frames on the peer link and the author-side policy gate.
+2. Receiver verification against the signed row's hashes, re-encryption, cache-class storage, orphan sweep after retraction.
+3. Thumbnail prefetch (ordinary derived files behind `thumb_hash`, instant at their size), and the resolver's peer source slotting into R67's extension point.
+4. Opt-in replication: the application marks content for push to present peers, the survivability half of R78.
+
+### Done when
+
+A photo authored offline on one device displays on a peer in camp (thumbnail immediately, full image on tap), a policy-refused requester gets nothing, a retraction sweeps the cached chunks, and replicated content survives the author device's loss end to end with R78, proven in the harness.
+
+---
+
+## R80: peer sync in every demo
+
+**Status.** NOT STARTED.
+
+**Blocked on** R77, R78 and R79.
+
+### Steps
+
+1. Every native-capable demo carries the camp flow per R54's rule: discover, exchange, provisional display with provenance, retraction display, courier offer.
+2. The iOS hotspot zero-coverage field test, the one physical verification the design left open, recorded with its result.
+3. The gate section and CI gain whatever new legs the peer crates added.
+
+### Done when
+
+A person with two devices on one hotspot exercises the whole flow through a demo, and the field test's answer is recorded in chapter 19.
+
+---
+
+## R81: the aggregate read has no time bound
+
+**Status.** **DONE** (2026-08-22). Minted the same day by the second full review, three questions answered with the maintainer before any code (recorded below with their costs and the options rejected), then built. connetto owns its re-execution connector, a seed spends its caller's tier and a triggered read the server's shorter bound, and a timed-out read ends its subscription with R38's one phrase on the wire and the cause in the log. Proven Docker-gated in `crates/connetto-server/tests/read_ceiling.rs::aggregates`, three tests: a seed past the caller's own limit refused, a triggered read past the shared bound ending the subscription with the log naming it, and the same trigger inside the bound delivering a value. The build also fixed a defect in R58's landing and produced one upstream finding, both recorded below.
+
+**Blocked on nothing.** Confirmed against the upstream request: read ceilings are the caller's, so nothing here waits on subql.
+
+### Purpose
+
+R58 bounded row snapshot reads with a per-tier `SET LOCAL statement_timeout` (`crates/connetto-server/src/snapshot.rs:760`), and the aggregate paths never got it: an aggregate registration's seed and every re-execution run a full query through the materializer's connector with no time limit, so an aggregate over an unindexed table is the same unbounded read R58 closed for rows.
+
+**Two claims in this section as first written were wrong, and both make the case stronger.** The read is not metered "by the reader permit (R39)": R39 reserves a share of the *reader* pool, and the connector is built on the **owner** pool (`bin/connetto-server.rs:636-638`, `CONNETTO_OWNER_POOL_SIZE`, default 10), which also serves the ingest loop, the oplog, the ban store and the audit hook, so an unbounded aggregate read competes for ten privileged connections with the change stream itself. And Q5.5 was attributed backwards: it gave subql in-batch coalescing only, and put cross-batch debounce, the concurrency cap and retry above the engine, in connetto's materializer and its connector. So the whole surface is connetto's, which is what makes this phase buildable alone.
+
+### Open questions the discussion settled
+
+1. ~~**Where does the limit get applied, given the read happens inside a connector connetto does not own?**~~ **DECIDED 2026-08-22: connetto writes its own connector.** connetto implements subql's `AsyncConnector` and stops using `subql::reexec::PgAsyncDieselConnector`, the convenience implementation upstream ships for callers wanting no ceilings. The seam is already generic (`C = NoConnector` by default), the value only exists here (`ReadLimits.timeout` per `Tier::of(&principal)`, a concept subql does not model), connetto owns the pool the read runs on, and `docs/upstream-subql-grouped-and-reexecution-tiers.md` already assigns read ceilings to the caller's connector under U5 and U6, whose closing section states as fact that connetto's connector applies them. This phase makes that sentence true. Rejected: asking subql for the knob, which contradicts a division of labour recorded upstream the same morning and would forward a number subql cannot compute. Rejected: setting it on the pool at acquisition, which cannot vary per caller and would bound the ingest loop, the audit writes and the ban lookups with the same number. **Cost accepted:** connetto carries database plumbing upstream also has, and R82's later tiers must route through this connector to inherit the bound.
+2. ~~**Whose limit bounds a triggered re-execution?**~~ **DECIDED 2026-08-22: a separate, tighter server-wide bound, distinct from the caller tiers.** Two numbers because there are two harms. The seed runs in the subscribing caller's own path and keeps that caller's tier limit. A trigger is serviced inside `dispatch_with_grants` (`session.rs:1643-1650`), awaited inline on the loop that fans every patch to every client, so what it delays is the change stream rather than its owner. The tier is knowable (each captured query gets a fresh id and records exactly one consumer, `subql/src/reexec/engine.rs:281`), and it is deliberately not the number used. Rejected: reusing the owner's tier, which lets one signed-in caller freeze live delivery for everybody for a full 30 seconds. Rejected: hardcoding the anonymous 5 seconds, which leaves a deployment with a genuinely slow aggregate no way to raise it. **Cost accepted:** a fourth configurable number, and a signed-in caller's aggregate stoppable by a bound shorter than its tier promises.
+3. ~~**What does a timed-out re-execution do mid-life, where there is no request to refuse?**~~ **DECIDED 2026-08-22: the timeout is a refusal, so it ends that aggregate subscription.** This reuses the split R58 built: a failure is transient and retried, a refusal is policy and retrying it replaces nothing for ever. The client learns nothing beyond R38's one fixed phrase, per the maintainer: an unusably heavy subscription is the developer's to see in the log, not the caller's to be told about. The machinery exists, `refuse_subscription` (`session.rs:4111`) sends `NonFatalError { related_to, detail: SUBSCRIPTION_REFUSED }` and unregisters, and `Outbound::Control` carries the same frame from the ingest loop, which holds no transport. Every other connector failure keeps today's skip, untouched. Rejected: a non-fatal notice that keeps the subscription alive, which floods a busy table with one message per change while the displayed value stays stale for ever. Rejected: keeping the silent skip, which is the defect R57 step 8 is opened against for refused writes.
+
+**A finding this discussion produced, deliberately not folded in.** `session.rs:1648` defers re-execution retry and failure surfacing to a "Phase 6" that no phase in this plan owns, and Q5.5 places it here rather than upstream. Every non-timeout connector failure is still silently skipped. Naming it is this phase's whole contribution to it.
+
+**The edge R30 asked this phase to state.** R81 bounds one read, and Q5.5's debounce and concurrency bound how many reads happen. The re-execution tier R82 to R85 build multiplies reads (per group for a hybrid re-query, per viewer on an RLS table), so every read that tier issues arrives already bounded by the connector this phase creates, which is why the connector is the right home rather than any one call site.
+
+### Steps
+
+1. **Add a connetto-owned `AsyncConnector`** over the owner pool, replacing `PgAsyncDieselConnector` at its one construction site, with `SET LOCAL statement_timeout` set inside each transaction it opens (after the existing `SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ`, before the query subql rendered), across `execute_scalar`, `execute_scalar_row` and `execute_rows`.
+2. **Two numbers on `ReadLimits`**: the seed takes the caller's tier, and a triggered re-execution takes the new server-wide bound (decision 2).
+3. **A timed-out read ends its aggregate subscription** through the existing refusal path, with the cause and the numbers in the log and R38's fixed phrase on the wire (decision 3).
+4. **Prove it in the `read_ceiling.rs` pattern**: a seeded aggregate whose plan needs a sort over an unindexed two-million-row table is stopped by the tier's limit, a triggered re-execution is stopped by the shorter bound and ends its subscription, and the fixed phrase is what reaches the client. Docker-gated.
+5. **Correct the upstream request's closing section** if it still overstates what connetto does when this lands.
+
+### What the build found and where it deviated, 2026-08-22
+
+**Deviation, step 2: one number on `ThrottleConfig`, not two on `ReadLimits`.** `ReadLimits` is reached per tier through `RequestGuard::read_limits(Tier::of(&principal))`, and decision 2's whole point is that a triggered read has no caller tier, so a field for it inside a per-tier struct would invite a deployment setting it twice and reading it once. It landed as `ThrottleConfig::with_reexec_timeout` with a five-second default (the shortest number already in `throttle.rs`), reached through `RequestGuard::reexec_budget`. The two seeds keep taking `read_limits(tier).timeout`, which is what decision 2 asked for.
+
+**Deviation, step 1: `execute_rows` returns a refusal rather than a bounded read.** The trait's third method has no producer at the pinned revision (subql's own connector returns `RowsUnsupported`, and row capture is upstream U4 and U5), so there is no read there to bound. It returns `ReadError::RowsUnbuilt` naming R82, whose rows need the catalog wire types the snapshot path reads rather than a scalar decode. Implementing an untested decode for a tier that does not exist would have been the speculative option.
+
+**Fixed, a defect in `R58`'s own landing.** R58's review answered "tell a refusal from a failure" and the answer was applied to the ceiling refusals but never to the time limit: a timed-out page came back as `SnapshotError::Backend`, which `resnapshot_row` retries with growing backoff for ever, so a grant move (R7) or a truncate (R48) over a table whose read cannot finish in time would have retried a refusal one log line at a time. `SnapshotError` gained `TimedOut`, `SnapshotSource::Error` now requires `TimedOutRead`, and the first page's error maps to `SessionError::ReadRefused` when it timed out. This is the same decision 3, applied to the path that already had the machinery.
+
+**Upstream finding, written and not worked around.** subql's shipped `PgAsyncDieselConnector` cannot decode an aggregate over any integer narrower than `bigint`: `ScalarKind` names no width and the decode reads `Nullable<BigInt>`, so `MIN(int_column)` fails with "Received less than 8 bytes while decoding an i64". Found because connetto's new connector mirrored that decode faithfully and failed the first proof run, then confirmed against upstream's own artifact directly (`bigint` returns `Ok(Int(7))`, `int` fails) rather than inferred. Written to `upstream/subql-diesel-connector-cannot-decode-a-narrow-integer.md`. connetto's own connector casts inside the read (`SELECT CAST(v AS BIGINT) AS v FROM (<sql>) AS agg_read(v)`, which Postgres flattens), which is its own decode being correct rather than a workaround, since decision 1 made the connector connetto's.
+
+**Step 5 needed nothing.** The upstream request's closing sentence says connetto's connector "already applies per-tier statement timeouts and row ceilings on its side", and as of this phase it does.
+
+### What the review of this phase's own diff found, 2026-08-22
+
+Three defects, all in the new connector, all fixed and two of them pinned by unit tests in `crates/connetto-server/src/reexec.rs`.
+
+1. **A spent budget bought an unbounded read.** `statement_timeout = 0` is Postgres for no limit at all, so a zero or sub-millisecond budget produced exactly the unbounded read this phase exists to remove. The row path R58 built already carried a `.max(1)` for this reason and the new connector did not. One helper, `statement_timeout_ms`, now owns the floor and both paths call it.
+2. **A generous budget failed every read.** The setting is a signed 32-bit integer, so a budget past about 24 days is outside its range and Postgres refuses the `SET` itself. Clamped rather than refused, because such a limit is a deployment asking for none.
+3. **A multi-component seed could spend its budget several times over.** `statement_timeout` bounds one statement, and a delta aggregate's seed is one statement per component (three for variance), so a 30-second budget bounded a three-component seed at 90 seconds. Each component after the first now gets what is left of the read's budget, and a budget already spent asks for a millisecond so the refusal still arrives as Postgres's own and is classified the one way.
+
+### Done when
+
+No aggregate path reads without the tier's time bound, proven against a real Postgres.
+
+---
+
+## R82: server delivery of grouped and re-executed results
+
+**Status.** NOT STARTED. Derived 2026-08-22 from R30's tier model on the maintainer's instruction, together with R83 to R85 and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md`.
+
+**Blocked on the upstream subql phases U0 to U5** in that request (the `GROUP BY`/`HAVING` refusal, the re-execution captures, and the grouped fold family with budget and demotion).
+
+### Purpose
+
+Once subql produces per-group deltas, demotion notices, and captured-query full results, connetto's server must deliver them. Today all four `AggregateUpdate` construction sites in `crates/connetto-server/src/session.rs` hardcode `group_key: None, is_full_result: true`, which is correct for the scalar family and nothing else.
+
+### Steps
+
+1. Construct `AggregateUpdate` from subql's grouped output: per-group deltas carry `group_key: Some(bytes), is_full_result: false`, re-executed full results carry `is_full_result: true`, scalars stay as they are. The bytes stay opaque end to end.
+2. Surface the group budget as server configuration (default 1024, the R30 decision) wherever connetto constructs the engine, and put demotion notices into logs and metrics. Demotion is never a client-visible error.
+3. R81's time bound and R58's row ceiling apply to every read the re-execution tier issues through connetto's connector, including per-group targeted re-queries. One event fanning out to many reads is bounded per read by R81 and in count by the recorded Q5.5 scheduling split.
+
+### Done when
+
+A grouped subscription delivers per-group deltas over the wire with the key populated, a demoted subscription keeps answering with full results and leaves a log line, and the loopback tests assert both.
+
+---
+
+## R83: the client resting table for server-computed results
+
+**Status.** NOT STARTED. Derived 2026-08-22 from R30 (decision 6).
+
+**Blocked on nothing.** The scalar half needs no upstream work: scalars already arrive.
+
+### Purpose
+
+R30 decided every server-computed result rests in the Q5.7 table `_connetto_aggregates (sub_id TEXT, group_key BLOB, result_json TEXT, PRIMARY KEY (sub_id, group_key))`, scalars included, so an offline restart shows the last synced value and the `LiveValue` freeze becomes ordinary staleness. The table is connetto-owned client storage in the replica's `main` file (it is bookkeeping, not application schema, and must survive restarts).
+
+### Steps
+
+1. Create the table alongside connetto's other client bookkeeping tables.
+2. On every `AggregateUpdate`, upsert by `(sub_id, group_key)` with an empty key for scalars, replacing all rows for the `sub_id` when `is_full_result` is set and the update is a whole-result push (re-executed row sets key by position within the replacement).
+3. Change the scalar bootstrap to read through the table: `LiveValue` initializes from the stored row when one exists, so the value survives an offline restart, and the server's next push overwrites it.
+4. Amend chapter 05 and chapter 13 from "not yet built" to delivered when this lands.
+
+### Done when
+
+A client restarted offline shows the last synced scalar value instead of `None`, proven by a test that kills the connection, restarts the client against the same replica file, and reads the value before any reconnect.
+
+---
+
+## R84: typed keyed and row-shaped live handles
+
+**Status.** NOT STARTED. Derived 2026-08-22 from R30.
+
+**Blocked on R82 and R83.**
+
+### Purpose
+
+`watch_value` serves a single scalar. Grouped results are a keyed map and re-executed results are row sets, and both need typed client handles with the same compile-time dispatch story the existing `Watchable` path has.
+
+### Steps
+
+1. A keyed handle for grouped results: decoded per-group values keyed by the opaque `group_key`, upserting on deltas, replacing on full results, reading through the R83 table on startup.
+2. A row-shaped handle for re-executed results (joins, DISTINCT, expression projections), decoding `result_json` rows into the application's type, full-replacement semantics only.
+3. Extend `query.live(&client)` dispatch and the `use_live` hooks so a grouped query resolves to the keyed handle at compile time where diesel's markers allow, with the SQL-text path as the fallback for shapes diesel cannot mark.
+
+### Done when
+
+A grouped subscription renders as a live map that updates one entry per delta, offline restart included, exercised in at least one demo.
+
+---
+
+## R85: per-viewer re-execution on RLS tables
+
+**Status.** NOT STARTED. Derived 2026-08-22 from R30 (decision 5, which amended chapter 05's global-only restriction for the re-execution tier).
+
+**Blocked on upstream U6 and on R82.**
+
+### Purpose
+
+A re-executed query is not shared state, so the server can run it under the asking viewer's identity and serve per-viewer statistics over rows the client does not hold. Results key by query and viewer: one viewer's identical subscriptions share an execution, different viewers never share.
+
+### Steps
+
+1. connetto's connector executes captured RLS-table queries inside a transaction that sets the viewer's identity (`SET LOCAL app.user_id`, the same shape the write path and the RLS read tests already use), under R81's time bound.
+2. Key the server-side captured state and the delivery routing by query and viewer, and pass the viewer's auth context through subql's `Connector::AuthContext` seam.
+3. Docker-gated proof: two viewers subscribing the same aggregate over an RLS table each receive their own value, a change to one viewer's rows re-executes for both but changes only the affected viewer's result, and the refusal still fires for the shared fold family.
+
+### Done when
+
+The Docker-gated test above is green, and chapter 05's amended decision text matches the delivered behavior.
+
+---
+
 # Exploratory phases
 
-**Neither of these is committed work.** They exist so the ideas are not lost, they are last on purpose, and each is allowed to conclude that it should not be built. A phase in this section may be deleted after its investigation without anything else changing, which is not true of any phase above.
+**Nothing in this section is committed work.** These exist so the ideas are not lost, they are last on purpose, and each is allowed to conclude that it should not be built. A phase in this section may be deleted after its investigation without anything else changing, which is not true of any phase above.
 
 ## R24: how connetto integrates a file-sync stack
 
-**Status.** NOT STARTED, exploratory.
+**Status.** **DONE** (2026-08-21). Concluded as a design: the ten positions below are the deliverable, `FileStore`'s deletion is justified, and R64 to R69 carry the build as committed phases. Since 2026-08-22 the decisions also live in `docs/architecture/18-file-handling.md`, the committed normative record, with this section keeping the reasoning and the rejected alternatives.
 
 **Blocked on nothing, and deliberately last.** Nothing above depends on it.
 
 ### Purpose
 
-**connetto does not build file sync**, and that is recorded: `docs/architecture/open-questions.md` puts file sync permanently outside its scope and names a separate stack, `https://github.com/LucaCappelletti94/file-system`. What is not decided is how connetto **integrates** such a stack, and there is already a seam pointing at it: `FileStore` in `crates/connetto-core/src/traits.rs` declares `write_chunk`, `read_chunk` and `has_chunk` over content hashes, and **nothing implements it**.
+**connetto does not build file sync**, and that is recorded: `docs/architecture/open-questions.md` puts file sync permanently outside its scope and names a separate stack. Corrected 2026-08-21 with the maintainer: the stack reference is `https://github.com/LucaCappelletti94/file-system-review`, the joint state-of-the-art review, and the `file-system` URL this section and chapter 07 carried returns 404. The review is the surface to design against until code exists. What is not decided is how connetto **integrates** such a stack, and there is already a seam pointing at it: `FileStore` in `crates/connetto-core/src/traits.rs` declares `write_chunk`, `read_chunk` and `has_chunk` over content hashes, and **nothing implements it**.
 
 So the question is not whether to build file sync. It is whether that seam is the right shape for a stack connetto does not own, and what the split of responsibility is when file metadata travels as ordinary synced rows while content does not.
 
@@ -3621,19 +4993,42 @@ So the question is not whether to build file sync. It is whether that seam is th
 3. Decide what travels on connetto's wire. Metadata as ordinary rows is the obvious answer and the one chapter 07 assumes, so verify it rather than inherit it.
 4. **Say what the authorization story is**, because a content-addressed chunk store has no rows for row-level security to gate, so whatever guards file content is a different mechanism from everything in R5b.
 
+### The ten positions from the 2026-08-21 design discussion, this phase's deliverable
+
+Taken with the maintainer, in order, each superseding whatever the review or the earlier turns assumed. Two late details were settled the same day and live in R64 and R65: file identity is plain `blake3(file)` with chunk hashes as transport metadata only, and tickets carry a session-long TTL, accepting cross-session cache misses. Two clauses below were superseded by later positions: position 6's "mint still open" fell to position 9, and position 10's F-names became R64 to R69. **Amended by the 2026-08-21 full review** (three passes: adversarial against the code, state-of-the-art cross-check, the author's own): position 3's cipher became XChaCha20-Poly1305 and gained zstd compression, position 5 gained the RLS grant it silently lacked, position 6 lost a trait with no consumer, and position 9's upload sentence was made channel-precise. Each amendment is marked in place.
+
+1. **Placement, decided by the maintainer: the file-handling code lives in this repository and is exercised by the demos.** Not a separate repo. The Q7 "separate stack" decision keeps its meaning at the crate boundary rather than the repo boundary: `connetto-core` still does not build file sync, the file crates depend on connetto and not the reverse, and the demos carry the feature end to end per R54's rule.
+2. **Display is not sync: a three-tier download model.** The common case renders a short-lived signed URL and never touches client chunk storage (server assembles from chunks, HTTP `Range`, `ETag` is the content hash, immutable caching). Local content sync happens only for pinned files, locally processed inputs (`noodles`, `mzdata` in wasm), and content this device authored but has not uploaded. A file reference row is an intent: metadata can arrive before content is fetchable, readers show a placeholder, and offline authorship makes this unavoidable rather than a bug.
+3. **Client storage: one encrypted chunk store outside SQLite, manifests in the device tier.** Chunk files in OPFS (browser) or plain files (native), each zstd-compressed (level 3, per-mime skip table, compression flag in the chunk header, the Borg and Kopia order: dedup hash over plaintext, then compress, then encrypt, amended by review since FASTA halves under zstd) and then XChaCha20-Poly1305 encrypted with a random 24-byte nonce (amended by review from AES-GCM: the 192-bit nonce removes the 2^32-chunks-per-key bound and the AES-NI assumption on mobile cores), the chunk's plaintext hash as AEAD associated data, and the key derived by HKDF with a purpose label from the same custody `ReplicaKeyStore` serves, so the R23 gate and crypto-shred-on-wipe cover content too. The device tier carries only manifests (ordered chunk hash and length pairs, upload state) and the outbox, committed in the same transaction as the entry row, so a crash orphans a chunk file (collectable) but never commits a dangling row. Unsent chunk files travel in the R26/R56 archive by manifest walk. Rejected: all chunks as tier blobs (encryption for free but bulk data through an encrypted B-tree and bloated exports), all chunks in plain OPFS (loses encryption, export, and transactionality), and a provenance split routing unsent content into SQLite (an unsent 2 GB dataset is still bulk).
+4. **Server storage: never Postgres `BYTEA`.** Beyond ordinary TOAST costs, this deployment runs `wal_level = logical`, so content bytes would be fully WAL-logged and pinned by the R32 replication slot, letting one bulk upload eat the retention headroom that keeps offline devices resumable. Chunks go to a filesystem directory or an S3-compatible object store behind the same `ChunkStore` trait, manifests and refcounts stay in Postgres, GC is refcount plus a reconciling mark-sweep with a grace window tied to the upload token TTL, and the deployment docs must say a database backup no longer covers content.
+5. **The availability signal rides the metadata row.** After the two-phase upload commits, the file-stack server writes a `content_state` column on the row under its own role, and CDC delivers it to every subscribed device with the row's own policy gating who learns it. A convention, deliberately not a trait. **Amended by review: the write needs a grant nothing had provided.** The file server's role is not the row's owner, R1 forbids superuser and BYPASSRLS, so RLS blocks the UPDATE as first written. R65 provisions a column-scoped UPDATE policy or a `SECURITY DEFINER` setter for that role and `preflight.rs` verifies it at startup.
+6. **Trait ownership.** The file crates own `ChunkStore` (`write_chunk`, `read_chunk`, `has_chunk` by hash, platform impls: OPFS, `std::fs`, object store) and `ManifestStore`, plus the app-facing content resolver (file id to signed URL, local blob, or unsent bytes, with an extension point for further local sources, which R25's design already names) and pin policy. `connetto-core` deletes `FileStore` and gains only the signer seam trait the file crates implement. **Amended by review: the "two-verb authorization answer" this position used to add to `connetto-core` has no consumer** (visibility is answered inside `connetto-server`'s session loop, the file server verifies tickets and never asks connetto, and R25's peer checks run client-side on translated policy), so it is not a core trait. Key custody reuses R41's backend, with the peer device key as its own record type per R25's review.
+7. **Abuse surface.** The content channel meters bytes per identity per window in both directions, because R19 recorded that connetto meters occurrences and has no write-volume limit, and file upload is the first genuinely bulk write path. Refusals answer 404 whether the file is absent or forbidden, R38's principle on HTTP. Dedup negotiation ("which hashes do you need") is scoped to the caller's own visibility domain to close the existence oracle, while storage dedups globally and silently. No convergent encryption.
+8. **Crate layout, decided by the maintainer: library crates in the existing workspaces.** The platform-neutral core (chunking, manifests, chunk crypto, `ChunkStore`) and the server half join the root workspace under `crates/`, the browser adapter joins the `connetto-web` workspace, and the demos consume them by path. Rejected: per-demo copies (the DDL near-copy precedent is tens of lines behind a loud refusal, not a protocol) and a dedicated eighth workspace (another lockfile and CI leg for isolation nobody asked for). Consequence: the gate section and R55's CI grow the new build legs, and `blake3` and `fastcdc` enter the root lockfile where the indexmap-edge hazard lives.
+9. **The mint, decided by the maintainer: the file crates sign, connetto invokes the signer through a wired seam.** A content URL is a transport ticket carrying an already-made decision from the websocket to HTTP, not an R4 capability, which must never carry its own permission. Connetto answers visibility with its own machinery and calls a deployment-wired signer (the `WriteTarget` pattern), and the signer, key, token format and verifying HTTP endpoint all live in one file crate. Revocation lag equals the ticket TTL, and chapter 12 carries the distinction (committed `826e041`). **Channel precision, amended by review since the first wording drove R65 and R66 apart:** what rides the websocket is the ticket request (file id, verb, and for the write verb the declared byte size), where the byte budget is charged once. The whole upload negotiation (intent, needed-hashes, chunk PUTs, commit) is HTTP under that ticket, and the file server enforces the ticket's byte ceiling rather than keeping a second counter. Rejected: connetto signing (token vocabulary and key sharing leak into `connetto-core`) and per-fetch policy checks (an authorization round trip on the hot serving path).
+10. **Phases and order, decided by the maintainer: bottom-up with the browser proven from day one.** F-core (chunking, manifest and root-hash format, `ChunkStore`, in-memory and encrypting impls, property tests, no connetto dependency), F-server (fs and object-store backends, upload protocol, ticket verification, `Range` serving, GC sweep, byte metering), F-seam (connetto's part: delete `FileStore`, wire message pair, signer seam, visibility answer in the session loop, `content_state` convention), F-native (device-tier manifests and outbox, resolver, pins, `std::fs` store), F-browser (OPFS store in the worker, blob URLs, export-archive extension touching R56's format), F-demos (the photo entry end to end everywhere, per R54). Every platform-neutral crate runs its tests under wasm from F-core onward, because R26 and R40 both paid for browser surprises found last. Rejected: plain bottom-up (browser risk lands after the formats freeze) and a vertical slice (protocol churn and throwaway work).
+
 ### Proof
 
-A written position on the seam, with the separate stack's real surface cited rather than assumed.
+A written position on the seam, with the separate stack's real surface cited rather than assumed. **Met by the position list above.**
 
 ### Done when
 
-Either a justified seam or a justified deletion of `FileStore`, decided against the separate stack's real surface rather than against an assumption about it.
+Either a justified seam or a justified deletion of `FileStore`, decided against the separate stack's real surface rather than against an assumption about it. **Met 2026-08-21: deletion justified (position 6), the replacement seam decided (position 9), and the committed phases derived (R64 to R69).**
 
 ---
 
 ## R40: replica policy enforcement wired into sync
 
-**Status.** BUILT (2026-08-15). Every step is implemented and proven on the production path. One proof, the browser suite's local-write half, waits on an upstream defect that is not this phase's, `upstream/policy-bearing-table-refuses-an-owned-write.md`, with thirteen of twenty browser binaries passing and seven waiting on a server echo of a local write. **Corrected 2026-08-18.** This line named `docs/upstream-pg2sqlite-instead-of-insert-drops-defaults.md`, which that document has recorded as resolved upstream since 2026-08-15 (fixed by `8bad566` and `e36ec44`, merged as `e02e7b9`, the pin moved from `5bf6dd9` in all five lockfiles, and `opfs` and `notes_fanout` went green on the bump alone). The section body below already named the live finding, so the staleness was in this line alone.
+**Status.** **DONE** (2026-08-19, first landed 2026-08-15). Every step is implemented and proven on the production path and all twenty browser binaries pass. Until 2026-08-21 this line still opened BUILT with thirteen of twenty passing, superseded by its own later paragraphs, so the history it carried moves here: the local-write half was first believed blocked on `upstream/policy-bearing-table-refuses-an-owned-write.md`. **Corrected 2026-08-18.** This line named `docs/upstream-pg2sqlite-instead-of-insert-drops-defaults.md`, which that document has recorded as resolved upstream since 2026-08-15 (fixed by `8bad566` and `e36ec44`, merged as `e02e7b9`, the pin moved from `5bf6dd9` in all five lockfiles, and `opfs` and `notes_fanout` went green on the bump alone). The section body below already named the live finding, so the staleness was in this line alone.
+
+**Corrected 2026-08-19: the remaining block is local, not upstream.** The seven waiting browser binaries fail on `crates/connetto-server/src/pk.rs::from_wire`, which maps a blob-shaped UUID primary key to `Value::Bytes` while the read path lifts it to `Value::Uuid` from the catalog, so `pk::encode` disagrees across the two paths and the owned-write identity comparison misses. `upstream/policy-bearing-table-refuses-an-owned-write.md` is therefore wrong or stale, not an upstream defect. The fix is local and unblocked: make the key codec type-directed through `catalog_helpers::column_scalar_kind` (public subql API, already called at `materializer.rs:1637`) and lift a UUID column's blob with `uuid::Uuid::from_bytes`, verified to produce the granting record. The completing session is driven by `docs/prompt-r40-completion.md`, which also records two findings: `wire_and_read_paths_agree` omits the UUID case where the paths diverge, and subql's `records_from_row_view` returns `Ok([])` on a refused value spelling against its own doc.
+
+**Landed and proven 2026-08-19.** The codec is type-directed. `pk::from_wire` takes the column's scalar kind and `pk::row_from_wire` resolves it per cell from the catalog, so a UUID column's uploaded blob lifts to `Value::Uuid` before it reaches any `RowView`. Every wire-to-value caller was migrated: the changeset and patchset write plans, the update old and new images, the move-out visibility check, the single-row capability read, and the membership-term seed. Proven four ways. `pk.rs`'s `wire_and_read_paths_agree` now covers the UUID case. A new Docker-gated `openfga_live` test drives the real `FgaAuth::may_write` for an owned UUID insert and shows the typed key allowed and the raw-bytes key refused. The `smoke` browser binary passes its full sync loop. And every owned browser write now lands in Postgres. `upstream/policy-bearing-table-refuses-an-owned-write.md` is corrected to the local cause, and the latent subql gap it uncovered is filed as `docs/upstream-subql-record-refusal-reads-as-no-grant.md`.
+
+**Corrected later on 2026-08-19: the six split into two different blockers, and the first single-cause guess was wrong.** `page` was the same-user session supersession: its observer and writer shared one sign-in, the writer's connection evicted the observer's, and giving the writer its own sign-in of the same user fixed it. The other five (`relay`, `topology`, `election`, `failover`, `parity`) hung for a different reason, diagnosed to the line by beacon-instrumented runs plus the Postgres statement log: the relay hub's tab snapshot could not see a policy-split table. `connetto-web/src/relay.rs::snapshot_patchset` enumerates the worker replica's schema with `type = 'table'` and intersects with the subscription's logical table names. For a split table the logical name (`orders`) is a view and the rows live under the physical backing table (`orders_rls`), so the intersection was empty and the hub silently served an empty snapshot. This is R40's silent-loss class in readers of the replica that R40 never covered: R40 taught the four client boundaries (`apply_patch`, `send_mutation`, `take_changed`, `clear_subscription_rows`) the logical-to-physical map, and the hub in `connetto-web` was never taught it. A second hub surface fell to the same class once the first was fixed: `handle_synced_mutation` applied a tab's mutation raw to the worker replica, and a tab sends it logical-named (its own client renames on send), so the apply hit the view and the write never reached Postgres.
+
+**Fixed the same day, and the whole browser suite is green.** The hub reads the map through a new `ConnettoConnection::policy_tables()` accessor, so it can never rename with a different map than the worker applies with. `serve_snapshot` reads a split table through its backing table via `synced_snapshot` and renames the patchset back to the logical name (pinned by the `connetto-web` unit test `a_split_table_snapshot_reads_the_backing_table_and_speaks_logically`), and `handle_synced_mutation` renames a tab's logical-named mutation onto the backing tables (`rename_to_physical`) before applying, which is what lets a tab write reach Postgres and its sibling tab. Alongside, the same-user login collisions in the tests were separated: `page`'s writer, `parity`'s writers, and `relay`'s writer and observer each take their own login of the same fixed user. Proof: all twenty wasm-smoke browser binaries pass, the seven that had never been green and the thirteen that already were re-run as regression. `connetto-web`'s seven wasm unit tests pass, the client's 38 lib tests and `rls_sync_path` stay green, and fmt and clippy are clean on the touched crates (the one remaining root clippy failure is `tests/uuid_rls_default.rs`, a pre-existing untracked work-in-progress file with one `doc_markdown` lint, not this work's).
 
 **Blocked on nothing, since 2026-08-12.** Not on design, which is settled, and no longer on the pins: R5b moved pg2sqlite off its revision pin onto `branch = "main"`, carrying the row-level-security semantics fixes, and moved `sql-traits` and `sqlparser` with it, so the chain this line used to describe is gone. **Land it before any synced table carries a policy, because the failure it prevents is silent**, and R5b has just made policies real on the change path. See `08-authorization.md` under "The replica enforces policy too", which is this phase's specification.
 
@@ -3704,11 +5099,15 @@ The rename lands at `apply_patch` on the way down and at `send_mutation` on the 
 
 **A second blocker is behind it, and it is not R40's.** `upstream/policy-bearing-table-refuses-an-owned-write.md`. With a policy on the table the change path refuses a client's insert of a row the caller already owns, while the read path over the same table and caller works. Four measurements place it: the identical write is **applied** when `CONNETTO_PG_POLICIES` is the empty document and nothing else changes, Postgres itself accepts the identical statement as the writer role with the setting bound, seeding an owned row and reloading the facts changes nothing, and the equivalent Docker-gated test over an `INT`-keyed table passes. So R40's rename produces a changeset the database accepts, and the refusal comes from the authorization model derived from the policy text. `FgaAuth::may_write` delegates straight through, so attribution between connetto's R5b integration, subql and rls2fga is open and is the first thing that finding asks.
 
+**Corrected 2026-08-19: this was wrong on both counts. The block was R40's and it was local, and it is now fixed.** The cause was `crates/connetto-server/src/pk.rs::from_wire` mapping a blob-shaped UUID key to `Value::Bytes` where the read path types it `Value::Uuid`. The four measurements below correctly placed the fault in the derived-authorization path but could not see that one line. See the "Landed and proven 2026-08-19" note in this section's status.
+
 **Where that leaves the browser suite: thirteen of twenty pass, seven are blocked on the second finding.** The seven all wait for a server echo of a local write. What passes still carries the phase's weight: `authenticated_boot` and its recovery twin boot the worker on a split replica, so the map, the caller function and the open refusal work end to end in a browser, and `opfs` and `notes_fanout` write locally to a split table and read the row back through the view.
 
 **Two connetto-side gaps that finding names, neither R40's to fix.** The client drops `MutationRejectReason` (`crates/connetto-client/src/lib.rs:2348`), so an application cannot tell a denial from a cannot-determine, which is exactly the distinction R5b added `Indeterminate` for. And the browser suite's `pump_until(LivePatch)` ignores a rejection and waits forever, so a refused write reads as a timeout rather than a failure.
 
 **Step 6 is therefore complete as work and incomplete as evidence.** The demo carries the policy, the dev stack runs with it, and the split path is proven on the production sync path by `rls_sync_path.rs` and in the browser by the thirteen that pass.
+
+**Completed 2026-08-19, all browser evidence in.** The codec block, the session-supersession collision, and the hub's two split-table holes are fixed and proven: all twenty browser binaries pass, thirteen re-run as regression. Step 6's evidence is complete.
 
 ### Done when
 
@@ -3722,9 +5121,11 @@ The policy text reaching the server's catalog, which is R5b step 7's business. T
 
 ## R25: device-to-device sync without a server
 
-**Status.** NOT STARTED, exploratory, and explicitly not now.
+**Status.** **DONE** (2026-08-22), concluded as a design. Everything is decided, was reviewed in full and amended in place, and lives in two places: `docs/architecture/19-device-to-device.md` is the normative record of the decisions, and `docs/research-device-to-device-sync.md` (process artifact, never committed) is the history of how they were reached, including the survey, the crate maturity verdicts and the field coverage table. **On 2026-08-22 the maintainer ordered the derivation this phase's own rule reserved to a separate decision**, yielding the seven committed build phases R74 to R80: device identity and certificates, the per-device applied frontier, the peer link, the exchange and provisional tier, courier recovery, media over the link, and the demos plus the iOS hotspot zero-coverage field test, which travels to R80. The decisions themselves, kept summarized here for the reader who stops at this section: several people collaborating offline on tasks (sample collection in the wild being the driving case), provisional semantics with the server adjudicating on reconnect, signed provisional exchange over LAN mutual TLS with deployment-CA device certificates, one exactly-once domain (the per-device applied frontier, the session watermark demoted to a cache of it), full pairwise camp topology with no relay, media pull-on-demand with thumbnails as ordinary derived files, courier recovery under five cryptographic-confinement constraints, the provisional signal surface in the device tier, and the archive carrying all peer bookkeeping while an import retires the old enrolment. This section was marked DONE prematurely for two hours on 2026-08-21, corrected by the maintainer, after which every remaining design area was settled and the whole design adversarially reviewed before this conclusion.
 
-**Blocked on nothing and wanted by nothing.** Recorded so the idea survives, not because it is next.
+**Reviewed in full, 2026-08-21, and amended in place.** Three passes (adversarial against the code, state-of-the-art cross-check, the author's own) found and fixed: a double-apply between the courier and reconnect dedup domains, resolved by one durable per-device applied frontier that every path consults with the session watermark demoted to a cache of it (a maintainer decision, and it touches the R2 watermark contract and makes enrolment load-bearing for all writes once built); the Secure Scuttlebutt fork condition on archive restore, resolved by retiring the archived enrolment and minting a fresh device key on import with (key, sequence) provenance carried for dedup; provisional rows that the eviction machinery would in fact have deleted, resolved by `_connetto_provisional` feeding its own spare clause; the physically impossible "both provisional versions" claim, replaced by an explicit peer-apply conflict rule (own-unsent wins locally, otherwise last-writer with displaced author recorded); the acked-but-uncovered provisional leak, resolved by the exchange carrying the author's acked frontier; the partial-replica limits of peer-side policy answers, now stated with the rebindable-identity mechanism named; the thumbnail claim corrected (ordinary derived files, a `thumb_hash` column, decided with the maintainer); the device key moved out of `ReplicaKeyStore` into its own record type on the same custody backend; and the mDNS service naming and TXT rules specified. All amendments live in the research document with the review section summarizing them.
+
+**Blocked on nothing.** Corrected 2026-08-21: this line said "wanted by nothing, recorded so the idea survives", and that was wrong. Real settings want it, and the maintainer then sharpened the use case to offline collaboration between people, not only one person's devices.
 
 ### Purpose
 
@@ -3751,27 +5152,69 @@ The question has a sourced answer instead of being absent. **No implementation f
 
 ## R30: grouped aggregates, revisited from the research
 
-**Status.** NOT STARTED, exploratory.
+**Status.** **DONE** (2026-08-22, as a design). Concluded with the maintainer, and the conclusion is wider than the phase asked: not a yes or no on grouped aggregates but a tier model for the whole subscription query surface, with grouped support inside it. Q5.7's status split records the outcome. The maintainer ordered the derivation the same day, yielding R82 to R85 as committed phases and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md`, phased U0 to U6 so a subql session can execute it, where the maintainer directed the bulk of the build to live.
 
-**Blocked on nothing.** The findings it starts from are already written: `docs/research-grouped-aggregates.md`, a process artifact, never committed, with a citation per claim at pinned revisions (Materialize `11ed4b6`, RisingWave `d4a8483`, Feldera `a7a7deb`, Kafka and ksqlDB by URL).
+**A defect was found while grounding this discussion, and it gates everything below.** At the pinned subql rev and at its current `origin/main`, an aggregate subscription carrying `GROUP BY` or `HAVING` is silently accepted: delta maintenance ignores the clause while the bootstrap SQL keeps it, so the seed and the live stream answer two different queries. Written to `upstream/subql-group-by-having-silently-dropped.md` with the probe and the expected refusal, unsent. The loud refusal must land upstream before any grouped path exists, or the new grouped path and the old silent path coexist.
 
-### Purpose
+### The tier model, decided 2026-08-22
 
-Grouped aggregate support is parked (Q5.7 status split in `docs/architecture/open-questions.md`) on the memory obstacle: one accumulator per distinct group value per subscription, worst case the base-table cardinality, and `DISTINCT` frequency maps carry that worst case even when the result is small. The research established what shipping systems do about it (disk-backed state, kill at a budget, or restricted semantics) and that none of them has connetto's option: an authoritative queryable Postgres behind the CDC, already used by the `MIN`/`MAX` re-execution path to avoid holding exactly this class of state. This phase decides, from those findings, whether grouped support is worth building.
+Every decision below was taken with the maintainer in the R30 discussion, one question at a time, grounded in the pinned subql source (probed by running registrations) and in `docs/research-grouped-aggregates.md`.
 
-### Steps
+**Decision 1: a general re-execution tier is the catch-all.** Any single-statement SELECT that Postgres itself can run (joins, HAVING, DISTINCT, expressions, window functions included) is accepted, re-run against Postgres when a table it reads changes, and its fresh result pushed, under R58's row ceiling and R81's time bound, with Q5.5's scheduling split unchanged (subql coalesces within a batch, the materializer owns cross-batch debounce, retry, and concurrency). Triggering is per table, because arbitrary SQL admits no finer sound trigger. Coverage therefore becomes nearly all of read-only SQL, priced by each query's own execution cost. Rejected: enumerated shapes only (coverage stays a list forever and ordinary SQL that Postgres answers trivially keeps refusing), and an opt-in per-subscription flag (a wire knob callers would cargo-cult to tune a distinction they cannot observe).
 
-1. Confirm or reject the candidate design in the research document: the accumulable family grouped in memory under a registration-time group-cardinality budget with loud refusal beyond it, `DISTINCT` and `MIN`/`MAX` grouped served by per-group re-execution through the existing `Connector`, restart re-seeded through the connector like the scalar bootstrap, client storage on the parked Q5.7 table with the wire's dormant `group_key` field as the delivery half.
-2. Decide the budget's shape (registration-declared versus server configuration) and its number, which the research deliberately left open.
-3. Conclude either way. Yes derives the real phases (a `subql` grouped `AggSpec` variant, the wire activation, the client keyed handle and table) as committed work outside this section. No reaffirms the parking, and this phase is deleted per this section's rule.
+**Decision 2: queries classify by delta-composability, and a query rides the strictest tier any of its parts needs.** Delta-composability: the new answer is computable from the old answer plus one changed row's before and after images, with no database read. The classification, per clause:
+
+| Part | Fold (arithmetic per event) | Hybrid (fold plus a narrow targeted read sometimes) | Full re-execution |
+|---|---|---|---|
+| Aggregate function | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, variance, stddev | `MIN`/`MAX`: re-query scoped to the affected group only when the extreme is removed or displaced (the scalar version already ships) | `COUNT(DISTINCT)` and friends (exact folding needs a frequency map sized by column cardinality, the recorded memory hazard) |
+| Group key | Bare columns (the changed row names its own group) | | Expression keys (`GROUP BY date_trunc(...)`, subql evaluates no functions in process) |
+| WHERE | subql's in-process predicate language | | Anything else (undecidable event match means nothing can fold) |
+| HAVING | Predicates over accumulators already maintained (`HAVING COUNT(*) > 10`, the Q5.2 fast path, groups entering and leaving push per-group deltas) | | HAVING over anything not in accumulator state |
+| Joins, set operations, window functions, derived tables | | | Always (join state maintenance is the problem Materialize and RisingWave exist to solve, and Postgres already solves it per query) |
+
+**Decision 3: a fold-tier group map that outgrows its budget demotes the subscription to the re-execution tier.** The fold state is dropped, the same query keeps working and stays correct, and the demotion is visible in server logs and metrics but never forced on the client. Rejected: loud refusal at the crossing (breaks a working dashboard the day the data reaches one group too many, and its remedy is exactly what demotion does automatically), and LRU eviction of cold groups (the RisingWave shape, more machinery for no better bound).
+
+**Decision 4: the group budget is server configuration, one number, default 1024.** Demotion makes the budget a pure server memory knob (roughly 50 bytes per group of fold state), not a client contract. Rejected: registration-declared per subscription (a new wire field to tune a fold-versus-re-execute distinction the client cannot observe), and a tighter default of 128 (demotes legitimate few-hundred-group workloads to save kilobytes).
+
+**Decision 5: the re-execution tier also accepts queries on RLS tables, run per viewer under that viewer's identity.** Results are keyed by query and viewer, so identical subscriptions from one viewer share an execution and different viewers never share, which is correct by construction. This serves per-viewer statistics over data the client does not hold (my totals over my full history) without replicating the rows. The cost corner is acknowledged: a change re-runs the query once per subscribed viewer, priced by the ceilings and debounce. Shared fold accumulators stay refused on RLS tables, unchanged. This amends chapter 05's "server-side aggregates are global non-RLS statistics only" decision, which remains true for the fold tier and is superseded for the re-execution tier. Rejected: keeping the refusal (a policy hole in a maximal-support taxonomy, for a shape Postgres answers trivially), and an aggregates-only carve-out (an extra classifier rule the pricing already handles, leaving RLS joins refused for no cost reason).
+
+**Decision 6: every server-computed result rests in the Q5.7 client table, scalars included.** `_connetto_aggregates (sub_id TEXT, group_key BLOB, result_json TEXT, PRIMARY KEY (sub_id, group_key))` becomes real: scalars are the single-row case with an empty key, grouped deltas upsert by the wire's `group_key`, re-executed row sets are keyed by position within a full-result replacement. JSON as the wire and decode format is unchanged (decided in chapter 05 and already built end to end in `AggregateUpdate.result_json` and the client's serde decode). The typed handles (`LiveValue` and its future keyed and row-shaped siblings) become reads over the table, so an offline restart shows the last synced value and the freeze-offline behavior becomes ordinary staleness. This dissolves the offline question the R30 prompt carried. Rejected: memory-only handles with the freeze documented (a permanent local-first hole that grows with every shape the tier serves), and persisting only the new shapes (two storage stories forever, with the hole kept for the values users see most).
+
+### Edges kept consistent
+
+- R81's time bound applies to every read the re-execution tier issues, and the tier multiplies reads (per group for hybrid re-query, per viewer on RLS tables), so R81 bounds one read while Q5.5's debounce and concurrency bound the fan-out count. A sentence to that effect belongs in R81 when its phase runs.
+- Grouped top-k stays out of the windowed-subscriptions upstream request, which already says so.
+- The chapter 13 drift the prompt reported was verified milder than described: the aspirational "Aggregate Query Routing" section is marked aspirational in place, and its open question 4 already carries the correct status split. No false claim of a built table exists.
 
 ### Proof
 
-A written conclusion citing the research document, at a level of detail the derived phases could be written from if the answer is yes.
+This section, the updated Q5.7 status split, and `upstream/subql-group-by-having-silently-dropped.md`.
 
 ### Done when
 
-Grouped aggregates are either phased as committed work or reaffirmed as parked, and Q5.7's status split says which.
+Done as a design, and derived. The subql side is phased in `docs/upstream-subql-grouped-and-reexecution-tiers.md` (U0 refusal fix, U4 row re-execution, U5 general capture, U1 grouped fold with budget and demotion, U2 grouped `MIN`/`MAX`, U3 HAVING fast path, U6 per-consumer RLS lift). connetto's side is R82 (server delivery), R83 (client resting table), R84 (typed handles), R85 (per-viewer RLS re-execution).
+
+---
+
+## R73: the PostgreSQL mesh question, reframed as failover verification
+
+**Status.** NOT STARTED, exploratory. X7 given an owner 2026-08-21 by the full review, then **reframed with the maintainer 2026-08-22**: the hard parts are existing Postgres features, so the phase is verification and a deployment recipe, not a design.
+
+**Blocked on nothing.**
+
+### Purpose
+
+`11-authentication.md` asserts a multi-server deployment where stores and the oplog replicate, written before any mechanism existed, and X7 flagged it as promising a topology nothing designs. The maintainer's reframe, checked against what Postgres provides: physical streaming replication already carries every deployment-owned table byte for byte, a client's cursor is a position in the oplog **table** so it stays meaningful on a promoted standby up to replication lag, the lag case is already connetto machinery (rows lost to async lag put clients ahead of the server, exactly what R32's resume-past-delivery detection answers with a resync, the same restored-to-earlier semantics R70 owns), synchronous commit is the existing knob for a deployment that cannot accept lag loss, and Postgres 17's failover slots (`failover = true` with slot synchronization) cover connetto's logical `pgoutput` slot, while on older Postgres a recreated slot lands on R32's built refusal-and-resync path. What was never designed and stays out is true multi-master (many writable instances), which contradicts the single-log foundation everything stands on.
+
+### Steps
+
+1. **Verify, Docker-gated:** a primary with a streaming standby, clients connected under load, the standby promoted, and the observed behavior asserted: cursors within the replicated window resume, clients ahead of the promoted server are forced to resync by R32's detection, and on Postgres 17 with failover slots the feed continues without a slot recreation.
+2. **Write the deployment recipe** into the architecture when the maintainer names the doc: streaming replication, failover slots on 17 and later, synchronous commit as the no-loss option, and the failover runbook in terms of what clients experience.
+3. **Correct chapter 11's sentence** from the replicating-mesh wording to this concrete high-availability story, scope out multi-master explicitly, and close X7 with the pointer.
+
+### Done when
+
+The failover test is green against a real primary-standby pair, the recipe is written, chapter 11 matches it, multi-master is scoped out in so many words, and X7 is closed.
 
 ---
 
@@ -3806,21 +5249,23 @@ Not a phase. The maintainer landed the pg2sqlite fix R27 asked for, fixed two co
 
 **And run the gated suites per file rather than in one invocation.** A whole-package `connetto-client` sweep wedged past 3000 s and a whole-package `connetto-server` sweep past 2600 s, both on the wedge above rather than on anything in the code, while every file passes on its own.
 
+**Both paragraphs above are superseded, 2026-08-22.** Neither the keyring failures nor the whole-package wedges are conditions of this machine. CI runs its suite as `keyctl session -- cargo +stable test --release --all-features`, and that wrapper is the whole answer: it starts a fresh kernel session keyring, so the secret stores have somewhere to write, `secret_stores`, `revocation` and every `e2e` client spawner pass, and nothing wedges. Measured twice on 2026-08-22, whole workspace in one invocation, roughly twenty minutes each and zero failures. **So the guidance is the opposite of what it says here: run the suite the way CI does, in one invocation under `keyctl session`, and treat a keyring failure as a missing wrapper rather than as a locked collection.** Per-file runs are still useful for bisecting a wedge, and they are no longer the way to get a clean sweep.
+
 ---
 
 # Cross-cutting checklist
 
 Tick these off across the whole programme, because each is easy to lose inside a phase.
 
-**Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R19 added `ControlMessage::RateLimited` and `FatalErrorReason::RateLimited` (**landed**). R20 added `ControlMessage::SyncStatus`, relay-to-tab only (**landed**, and its omission here until 2026-08-08 is why this list is checked against `connetto-core/src/messages` when it is consulted). R5b adds a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine. R7 adds a `FullResyncReason` variant. **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
+**Wire changes, and why they need no version coordination. This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it.** R2 makes `session_token` real and adds `ConnectionSuperseded`. R3 replaces the credential with a grant list. R19 added `ControlMessage::RateLimited` and `FatalErrorReason::RateLimited` (**landed**). R20 added `ControlMessage::SyncStatus`, relay-to-tab only (**landed**, and its omission here until 2026-08-08 is why this list is checked against `connetto-core/src/messages` when it is consulted). R5b added a delivery-paused signal and a `MutationRejectReason` variant for cannot-determine (**landed**, 2026-08-14). R7 added a `FullResyncReason` variant (**landed**, 2026-08-16). **Change the wire freely and do not plan bumps around these.** The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
 
-**Startup checks, all six refusing to start**: R1 on an unrecognised provider and on a missing reader role. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it. **Corrected 2026-08-07**: this list also named an R2 refusal on a stale watermark table shape, which does not exist. R13 deleted that check along with the audit shape check it was written beside, because hardcoding connetto's own column names while being generic over a schema trait would refuse exactly the application-owned table the trait exists to permit, and the shapes it caught fail loudly on the first write anyway. Six is now the count for the right reason, and it matches R36's own arithmetic, which called a threshold-confirmation refusal the seventh.
+**Startup checks, all refusing to start**: R1 on an unrecognised provider and on a missing reader role. R5b on a policy with no translation and no supplied mapping, and separately on a policy that reads a table the publication does not carry. R6 on a table without `REPLICA IDENTITY FULL`. R32 on a missing replication slot or publication. One pattern, so build it once and reuse it. **Corrected 2026-08-07**: this list also named an R2 refusal on a stale watermark table shape, which does not exist. R13 deleted that check along with the audit shape check it was written beside, because hardcoding connetto's own column names while being generic over a schema trait would refuse exactly the application-owned table the trait exists to permit, and the shapes it caught fail loudly on the first write anyway. **Corrected 2026-08-21**: this header said "all six" while the next paragraph recorded R32 taking the count past six, so the number leaves the header, and the current count is eight (two R1, two R5b, one R6, three R32).
 
 **The one pattern exists as of R32 (2026-08-09), and it took the count past six.** `crates/connetto-server/src/preflight.rs` is `require(pool, &[Artifact])` over a closed enum of things the deployment provisions and connetto only reads, so R5b's publication check and anything later is a variant and a list entry rather than another hand-rolled refusal. R32 uses it for three rather than the two listed above: the slot, the publication, and the reconnect log table its own step 0 made a deployment-owned artifact. The refusals that predate it are still hand-rolled in the binary and were left alone, because moving a working check buys nothing and this list is about the ones still to be written.
 
 **Type-enforced guards, not documentation**: both of R3's are built. The value handed to `connect` carries a marker for what the run keeps at rest and owns the device-private database beside it, so a durable one paired with an unkeyed replica is not a program, proven by `compile_fail` doctests on `Replica`. `Principal` makes all four arrival cases representable and, being an optional identity beside a set of capabilities, has no fifth state.
 
-**Symbols that must cease to exist**: `PermissiveProvider` (R1, gone), `TrustingSessionVerifier` (R2, gone), `Credential::{Anonymous, Token}` (R3, discharged: the symbol never existed after the E6 reset, so two chapters that claimed otherwise were corrected instead), `SessionVerifier` and `FatalErrorReason::AuthenticationFailed` (R3, gone), `AuthPolicy` (R5a), `PermissiveAuth` (R9, gone, and `HarnessAuth::Permissive` with it), `AuthContext.tenant_id`, `.roles`, `.claims` (R8, gone).
+**Symbols that must cease to exist**: `PermissiveProvider` (R1, gone), `TrustingSessionVerifier` (R2, gone), `Credential::{Anonymous, Token}` (R3, discharged: the symbol never existed after the E6 reset, so two chapters that claimed otherwise were corrected instead), `SessionVerifier` and `FatalErrorReason::AuthenticationFailed` (R3, gone), `AuthPolicy` (R5a, gone, verified by grep 2026-08-21), `PermissiveAuth` (R9, gone, and `HarnessAuth::Permissive` with it), `AuthContext.tenant_id`, `.roles`, `.claims` (R8, gone).
 
 **One sentence that is correct and must not be touched**: in `11-authentication.md` under "connetto session credential", `session_token` is the resume key doing a different job from the auth credential. R2 makes the code match a doc that has been right all along.
 
@@ -3837,11 +5282,11 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **The never-syncing attached database stays keyed to the identity.** ~~Decided, and needs no work.~~ **Built (R17, 2026-08-07)**, so this is no longer parked: its file is named from the replica's own name through `tier_db_name`, and a delete-my-data destroys it beside the replica.
 
-**Android as a web target.** Technically supported, verified by measurement: WebView 124 on Android 15 has every API connetto uses. What remains is a product decision, and the recorded exclusion stands until stated otherwise.
+**~~Android as a web target.~~ Superseded by the chapters (corrected 2026-08-21).** Q1.3 and Q9.2 in `open-questions.md` and chapter 12 record Android supported both on the web and as a native app, the chapters outrank this plan on decisions, and this entry's "the recorded exclusion stands" sentence contradicted all three. Kept as a pointer only.
 
-**When the authorization service is unreachable, fail closed.** R5b step 10, with two wire additions and its own outage test.
+**~~When the authorization service is unreachable, fail closed.~~ Built (R5b step 10, 2026-08-14), so this is no longer parked:** both wire additions (`DeliveryPaused`, `MutationRejectReason::Indeterminate`) and the outage test landed with R5b.
 
-**The `auth_events` audit table is phase R13, after R3.** It is a deployment-facing schema contract, because connetto emits no server DDL on any path a deployment runs, so it needs a schema trait and a convenience macro beside `ConnettoStoreSchema` and `ConnettoWatermarkSchema`. It also spans authentication and authorization events, so building it inside whichever phase happens to emit one would fragment a single contract across five phases. Nothing before it depends on it, which is what makes deferring it safe: **R3 does not need it**, because a rejected grant is a denial and denials go to structured logging, per the split at `08-authorization.md:227`.
+**~~The `auth_events` audit table is phase R13, after R3.~~ Built (R13, 2026-08-06), so this is no longer parked.** The reasoning is kept: it is a deployment-facing schema contract, because connetto emits no server DDL on any path a deployment runs, so it needed a schema trait and a convenience macro beside `ConnettoStoreSchema` and `ConnettoWatermarkSchema`, spanning authentication and authorization events rather than fragmenting one contract across five phases.
 
 **The unsynced-data warning as a session nears expiry needs no phase.** `expiry_warning` in `crates/connetto-client/src/teardown.rs` already takes the expiry, a lead time and the unsynced sequence numbers, and `session_expires_at` already reaches the client on the auth response. Its caller is the embedding application by design.
 
