@@ -4706,7 +4706,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#124250f93af33bdd9c3a72d76526863122aaf720"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#82d33101b0dce40b17c9228bbcdec62868a7ea6d"
 dependencies = [
  "openfga-client",
  "serde",
@@ -5364,7 +5364,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f903bceb33771214031f9b39cd6aa26dbe2752fa"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f9fb65d61bf66b2896a582884fd6bb4ea85c0bde"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -5499,7 +5499,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=2eddc98101cafd6fd56b4b02108d35c2e8b360c6#2eddc98101cafd6fd56b4b02108d35c2e8b360c6"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=8ad31be70f60146871b2131688c2aa74d043e5d5#8ad31be70f60146871b2131688c2aa74d043e5d5"
 dependencies = [
  "arc-swap",
  "async-lock",

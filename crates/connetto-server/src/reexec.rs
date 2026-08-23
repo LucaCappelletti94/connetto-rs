@@ -31,7 +31,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use subql::PgLsn;
-use subql::backend::{Postgres, ScalarKind, Value as PgValue};
+use subql::backend::{Postgres, ScalarKind, ScalarKindOf, Value as PgValue};
 use subql::reexec::{AsyncConnector, DieselBackend, ScalarRowError, Snapshot as ConnectorRead};
 
 /// What one re-execution read may spend, passed per call.
@@ -172,7 +172,7 @@ struct LsnRow {
 /// lets this wrap a query whose own projection has no name to reuse.
 ///
 /// The wrap costs nothing: Postgres flattens it (measured under R58 decision 6).
-fn as_decoded(sql: &str, kind: ScalarKind) -> Option<String> {
+fn as_decoded(sql: &str, kind: ScalarKindOf<Postgres>) -> Option<String> {
     let cast = match kind {
         ScalarKind::Int => "BIGINT",
         ScalarKind::Float => Postgres::double_cast_type(),
@@ -188,7 +188,7 @@ fn as_decoded(sql: &str, kind: ScalarKind) -> Option<String> {
 async fn load_scalar(
     conn: &mut AsyncPgConnection,
     sql: &str,
-    kind: ScalarKind,
+    kind: ScalarKindOf<Postgres>,
 ) -> QueryResult<PgValue<Postgres>> {
     let widened = as_decoded(sql, kind);
     let sql = widened.as_deref().unwrap_or(sql);
@@ -300,7 +300,7 @@ impl AsyncConnector for PgReadConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: ScalarKindOf<Postgres>,
         budget: &ReadBudget,
     ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgLsn>), ReadError>> + Send {
         let sql = sql.to_owned();
@@ -329,7 +329,7 @@ impl AsyncConnector for PgReadConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[ScalarKindOf<Postgres>],
         budget: &ReadBudget,
     ) -> impl Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<ReadError>>,

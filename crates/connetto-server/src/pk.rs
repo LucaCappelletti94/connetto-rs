@@ -15,7 +15,7 @@
 //! misses.
 
 use sqlite_diff_rs::Value as WireValue;
-use subql::backend::{Postgres, ScalarKind, Value};
+use subql::backend::{Postgres, ScalarKind, ScalarKindOf, Value};
 use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
 
 /// The sqlite-diff value shape carried by an uploaded row image.
@@ -32,7 +32,7 @@ type Wire = WireValue<String, Vec<u8>>;
 /// decodes to [`Value::Uuid`] from the catalog. A blob under a `UUID` column is
 /// lifted the same way here so the two paths agree. A `kind` of [`None`], or a
 /// blob that is not sixteen bytes, keeps the plain storage mapping.
-pub(crate) fn from_wire(value: &Wire, kind: Option<ScalarKind>) -> Value<Postgres> {
+pub(crate) fn from_wire(value: &Wire, kind: Option<ScalarKindOf<Postgres>>) -> Value<Postgres> {
     match (value, kind) {
         (WireValue::Blob(blob), Some(ScalarKind::Uuid)) => uuid_from_blob(blob),
         (WireValue::Null, _) => Value::Null,
@@ -59,8 +59,12 @@ pub(crate) fn scalar_kind<DB: DatabaseLike>(
     db: &DB,
     table_id: TableId,
     ordinal: usize,
-) -> Option<ScalarKind> {
-    catalog_helpers::column_scalar_kind(db, table_id, ColumnId::try_from(ordinal).ok()?)
+) -> Option<ScalarKindOf<Postgres>> {
+    catalog_helpers::column_scalar_kind::<Postgres, _>(
+        db,
+        table_id,
+        ColumnId::try_from(ordinal).ok()?,
+    )
 }
 
 /// Map a full uploaded row image to canonical values, directing each cell by

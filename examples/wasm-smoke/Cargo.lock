@@ -1773,7 +1773,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=2eddc98101cafd6fd56b4b02108d35c2e8b360c6#2eddc98101cafd6fd56b4b02108d35c2e8b360c6"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=8ad31be70f60146871b2131688c2aa74d043e5d5#8ad31be70f60146871b2131688c2aa74d043e5d5"
 dependencies = [
  "arc-swap",
  "async-lock",

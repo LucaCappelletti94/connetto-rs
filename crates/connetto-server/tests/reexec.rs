@@ -19,7 +19,7 @@ use connetto_server::{
     SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
-use subql::backend::{Postgres, ScalarKind, Value as PgValue};
+use subql::backend::{Postgres, ScalarKindOf, Value as PgValue};
 use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 
@@ -48,7 +48,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKind,
+        _kind: ScalarKindOf<Postgres>,
         _budget: &ReadBudget,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,

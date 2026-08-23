@@ -29,7 +29,7 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
-# on main. `e03786b` carries the whole row-visibility composition R5b consumes:
+# on main. `8ad31be` carries the whole row-visibility composition R5b consumes:
 # `RowPolicy` answering from the changed row, `OpenFgaPolicy` terminating it
 # against a server, and one shared `Shapes` index behind both. It also carries
 # the three answers connetto found the composition could not reach: the
@@ -39,9 +39,13 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # `c1f725a`'s change, that an UPDATE notifies every row subscription whose
 # predicate the row satisfies whichever columns changed, which is what stops a
 # replica keeping a stale value for any column its query does not filter on.
+# Moved off `2eddc98` by R63, for `describe_terms` (#34), the term-value notes
+# (#35) and the caller comparison served as a self-seeding term (#37), and
+# taking the visibility work in #36, #38 and #39 plus the backend's own scalar
+# types (#40) in the same move.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2eddc98101cafd6fd56b4b02108d35c2e8b360c6", default-features = false, features = [
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "8ad31be70f60146871b2131688c2aa74d043e5d5", default-features = false, features = [
   "std",
 ] }
 

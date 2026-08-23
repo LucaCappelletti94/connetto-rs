@@ -1135,8 +1135,9 @@ impl Client {
     /// `SnapshotEnd`, and return the snapshot patches seen in between (an empty
     /// snapshot has none).
     pub async fn expect_snapshot(&mut self, sub_id: &str) -> Vec<SnapshotPatch> {
-        let ControlMessage::SnapshotBegin(begin) = self.next_control().await else {
-            panic!("expected snapshot begin");
+        let frame = self.next_control().await;
+        let ControlMessage::SnapshotBegin(begin) = frame else {
+            panic!("expected snapshot begin, got {frame:?}");
         };
         assert_eq!(begin.sub_id, sub_id, "snapshot for the wrong subscription");
         let mut patches = Vec::new();
