@@ -338,6 +338,70 @@ async fn a_membership_change_moves_rows_without_a_resync() {
     );
 }
 
+/// The first row of a team the caller already belonged to.
+///
+/// A team holding nothing at registration appears in no snapshot row and moves
+/// no membership row afterwards, so its admission comes from what registration
+/// read rather than from anything the change stream carries.
+///
+/// **Measured while writing this, 2026-08-23: the term seed is not the only
+/// path that supplies it.** Emptying the seed entirely leaves this test green,
+/// because the hidden membership subscription's own snapshot moves the same
+/// term. So this pins the behaviour and not the mechanism, and it cannot fail
+/// for a defect in the seed read alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_row_of_a_team_already_joined_arrives_live() {
+    let fixture = Fixture::acquire().await;
+    let server = membership_term_fixture(&fixture).await;
+
+    // Team 2 exists and holds nothing, and alice is in it before she
+    // subscribes. She is in team 1 too, which holds the fixture's row, so the
+    // snapshot is non-empty and teaches the engine team 1 and only team 1.
+    // Team 3 she never joins.
+    fixture.exec("INSERT INTO teams (id) VALUES (2), (3)").await;
+    fixture
+        .exec("INSERT INTO team_members (team_id, member) VALUES (1, 'alice'), (2, 'alice')")
+        .await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("r27-alice", "user:alice").await;
+    alice.subscribe("docs", TERM_QUERY).await;
+    let mut replica = Replica::new();
+    for patch in alice.expect_snapshot("docs").await {
+        replica.apply(&patch.patchset_zstd);
+    }
+    expect_membership_opened(&mut alice).await;
+    while let Some(patch) = alice.try_live(QUIET).await {
+        if patch.sub_id == "docs" {
+            replica.apply(&patch.patchset_zstd);
+        }
+    }
+    assert_eq!(
+        replica.ids(),
+        vec![0],
+        "team 2 holds nothing yet, so the snapshot taught the engine team 1 alone"
+    );
+
+    // No membership row moves from here on, so only the seed can admit team 2.
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (21, 'bob', 2, 'first')")
+        .await;
+    let patch = live_for(&mut alice, "docs", DELIVERY).await;
+    replica.apply(&patch.patchset_zstd);
+    assert_eq!(
+        replica.ids(),
+        vec![0, 21],
+        "a team admitted only by the seed still admits its first row"
+    );
+
+    // A team she never joined stays out, so the seed admitted one team rather
+    // than everything.
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (31, 'bob', 3, 'nope')")
+        .await;
+    no_live_for(&mut alice, "docs", QUIET).await;
+}
+
 /// The intersection with the policy, in both directions, on a policy that
 /// never reads the membership: items are visible to their owner alone.
 ///

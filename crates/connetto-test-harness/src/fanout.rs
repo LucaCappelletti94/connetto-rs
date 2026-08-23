@@ -112,8 +112,11 @@ impl PolicyShape {
             Self::CrossTable => vec![
                 "CREATE TABLE teams (id INT PRIMARY KEY)".into(),
                 format!("INSERT INTO teams (id) VALUES ({TEAM})"),
-                "CREATE TABLE team_members (team_id INT REFERENCES teams(id), \
-                   member TEXT NOT NULL, PRIMARY KEY (team_id, member))"
+                // `member` is declared first on purpose: the seed projects `team_id`,
+                // so a reader that took the first decoded cell instead of the
+                // projected one would pass on any table whose key came first.
+                "CREATE TABLE team_members (member TEXT NOT NULL, \
+                   team_id INT REFERENCES teams(id), PRIMARY KEY (team_id, member))"
                     .into(),
                 format!("INSERT INTO team_members (team_id, member) VALUES ({TEAM}, '{OWNER}')"),
                 "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, \
@@ -129,8 +132,11 @@ impl PolicyShape {
             Self::OwnerOverTeams => vec![
                 "CREATE TABLE teams (id INT PRIMARY KEY)".into(),
                 format!("INSERT INTO teams (id) VALUES ({TEAM})"),
-                "CREATE TABLE team_members (team_id INT REFERENCES teams(id), \
-                   member TEXT NOT NULL, PRIMARY KEY (team_id, member))"
+                // `member` is declared first on purpose: the seed projects `team_id`,
+                // so a reader that took the first decoded cell instead of the
+                // projected one would pass on any table whose key came first.
+                "CREATE TABLE team_members (member TEXT NOT NULL, \
+                   team_id INT REFERENCES teams(id), PRIMARY KEY (team_id, member))"
                     .into(),
                 format!("INSERT INTO team_members (team_id, member) VALUES ({TEAM}, '{OWNER}')"),
                 "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, \
@@ -217,7 +223,7 @@ pub const WIDE_FILL: usize = 8192;
 
 /// The catalog the cross-table shape serves.
 pub const CROSS_TABLE_PG_DDL: &str = "CREATE TABLE teams (id INT PRIMARY KEY);
-CREATE TABLE team_members (team_id INT REFERENCES teams(id), member TEXT NOT NULL, PRIMARY KEY (team_id, member));
+CREATE TABLE team_members (member TEXT NOT NULL, team_id INT REFERENCES teams(id), PRIMARY KEY (team_id, member));
 CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, team_id INT NOT NULL REFERENCES teams(id), label TEXT);";
 
 /// The cross-table policy: membership of the row's team, which is not in the
