@@ -373,6 +373,15 @@ pub enum SetupError {
     /// The index refused the questions the model would need.
     #[error(transparent)]
     Index(#[from] OpenFgaError),
+    /// The translation could not be planned at all.
+    ///
+    /// Distinct from an untranslated expression: the policies were read, and
+    /// the model they describe cannot be built, because a table's canonical
+    /// type name is one a session attribute already claims. Refused at
+    /// startup for the same reason as the rest, since a model that answers
+    /// two things under one type name withdraws rows the snapshot showed.
+    #[error("the authorization model cannot be planned: {0}")]
+    Unplannable(String),
     /// The generated rules could not be inverted into what each fact reaches.
     ///
     /// Refused for the same reason as an untranslated policy: a rule shape the
@@ -466,7 +475,9 @@ impl Translated {
             ])
             .build();
 
-        let translation = translator.translate(&catalog);
+        let translation = translator
+            .translate(&catalog)
+            .map_err(|err| SetupError::Unplannable(err.to_string()))?;
         let relations = translation.relations();
         let naming = translation.row_naming();
         let notes = translation.notes().to_vec();
@@ -501,6 +512,7 @@ impl Translated {
         }
         let outputs = translator
             .translate(&catalog)
+            .map_err(|err| SetupError::Unplannable(err.to_string()))?
             .outputs()
             .map_err(|unhandled| SetupError::Untranslated(unhandled.to_string()))?;
         let model = outputs.json_model();
@@ -556,7 +568,7 @@ impl Translated {
     #[must_use]
     pub fn shapes(self) -> Arc<Shapes<ParserDB>> {
         Arc::new(
-            Shapes::new(self.catalog, &self.relations)
+            Shapes::new::<Postgres>(self.catalog, &self.relations)
                 .with_row_naming(&self.naming)
                 .with_action_relations(&self.answers)
                 .with_required_parameters(&self.notes)
@@ -625,7 +637,9 @@ impl Translated {
     /// # Errors
     ///
     /// [`SetupError::Store`] when a query failed or a row it returned does not
-    /// spell a fact the model holds.
+    /// spell a fact the model holds, and [`SetupError::Unplannable`] when the
+    /// translation cannot be planned, which startup already refused and this
+    /// re-derivation therefore never meets.
     pub async fn load_records(
         &self,
         pool: &Pool<AsyncPgConnection>,
@@ -637,6 +651,7 @@ impl Translated {
         let outputs = self
             .translator
             .translate(&self.catalog)
+            .map_err(|err| SetupError::Unplannable(err.to_string()))?
             .outputs_accepting_gaps();
         let mut conn = pool
             .get()
@@ -675,7 +690,7 @@ impl Translated {
         let translator = self.translator;
         let reach = self.reach;
         let shapes = Arc::new(
-            Shapes::new(self.catalog, &self.relations)
+            Shapes::new::<Postgres>(self.catalog, &self.relations)
                 .with_row_naming(&self.naming)
                 .with_action_relations(&self.answers)
                 .with_required_parameters(&self.notes)
@@ -1163,40 +1178,100 @@ mod tests {
         OR EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
           AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))))";
 
-    /// R49's refusal, which is the leak direction rather than the vanish one.
+    /// R49's refusal narrowed, which is what its own message promised.
     ///
-    /// Deleting the share row leaves the grant in the store, so the change path
-    /// keeps delivering to a caller whose access has gone. Measured before the
-    /// refusal existed: the key holder was still allowed after the row was gone,
-    /// against a real Postgres and a real `OpenFGA`, and `Shapes::diff` reported
-    /// nothing removed, one query to re-run, and nothing uncovered.
+    /// Deleting the share row used to leave the grant in the store, so the
+    /// change path kept delivering to a caller whose access had gone, and
+    /// startup refused the shape rather than serve it. Upstream repaired it on
+    /// 2026-08-19 (`rls2fga` PR #6 as `2003eff` reclassifies the shape as
+    /// `FromRow`, `subql` PR #36 as `eebf774` reconciles a replay against the
+    /// slice it determines), and `R63`'s pin move brought both, so the shape
+    /// boots now.
+    ///
+    /// The guard itself stays and still refuses a residual rls2fga cannot
+    /// settle from one row. What this pins is the narrowing: connetto no
+    /// longer refuses a share written as a join-table row.
+    ///
+    /// **The withdrawal is proven upstream and not yet here.** connetto's own
+    /// Docker-gated proof, that deleting the share row removes the grant from
+    /// the store and the row from the client, belongs to `R49`'s follow-up
+    /// phase along with the replay coverage its D4 deleted.
     #[test]
-    fn a_share_written_as_a_join_table_row_refuses_startup() {
-        let refusal =
-            match Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING) {
-                Err(super::SetupError::Unwithdrawable(named)) => {
-                    assert!(
-                        named.contains("paper_shares"),
-                        "the refusal names the table whose changes cannot be turned into a \
-                     removal, or an operator cannot find the policy to change: {named}"
-                    );
-                    super::SetupError::Unwithdrawable(named)
-                }
-                Err(other) => panic!("refused, but for the wrong reason: {other}"),
-                Ok(_) => panic!(
-                    "a withdrawal on this shape reaches nothing, so it must stop the \
-                 server rather than serve access the database has taken away"
-                ),
-            };
-        // The refusal is as wide as the gap is today rather than as wide as it has
-        // to be, so the message says the boot will start working again. An
-        // operator reading only the sentence above concludes the shape is
-        // permanently unsupported and rewrites a schema that did not need it.
-        let shown = refusal.to_string();
+    fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
+        let translated = Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING);
+        assert!(
+            translated.is_ok(),
+            "the shape settles from one row since the repair, so nothing refuses it: {:?}",
+            translated.err()
+        );
+    }
+    /// The narrowing has a floor: a residual only SQL can evaluate still stops
+    /// the boot.
+    ///
+    /// Upstream settles a share from one row when a unique key names the pair,
+    /// which is what freed the shape above. A row carrying a predicate the
+    /// model cannot decide is the case that remains, and it is the leak
+    /// direction: nothing in the store can be withdrawn when the grant depends
+    /// on a value only the database can compute.
+    #[test]
+    fn a_residual_only_sql_can_evaluate_refuses_startup() {
+        const SCHEMA: &str = "
+            CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
+            ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE paper_shares(paper_id INTEGER, viewer TEXT, weight INT, \
+                PRIMARY KEY(paper_id, viewer));
+        ";
+        const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
+            EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
+              AND s.viewer = current_setting('app.user_id', true) \
+              AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
+
+        let Err(super::SetupError::Unwithdrawable(named)) =
+            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING)
+        else {
+            panic!(
+                "a withdrawal on this shape reaches nothing, so it must stop the server \
+                 rather than serve access the database has taken away"
+            );
+        };
+        assert!(
+            named.contains("paper_shares"),
+            "the refusal names the table whose changes cannot be turned into a removal, \
+             or an operator cannot find the policy to change: {named}"
+        );
+        // The refusal is as wide as the gap is today rather than as wide as it
+        // has to be, so the message says the boot will start working again. An
+        // operator reading only the sentence concludes the shape is permanently
+        // unsupported and rewrites a schema that did not need it.
+        let shown = super::SetupError::Unwithdrawable(named).to_string();
         assert!(
             shown.contains("upstream repair"),
-            "the message an operator sees has to say the refusal narrows later, \
-             not only the rustdoc they never read: {shown}"
+            "the message an operator sees has to say the refusal narrows later, not only \
+             the rustdoc they never read: {shown}"
+        );
+    }
+    /// A table whose name is the one the identity type already answers to.
+    ///
+    /// The model would then hold two things under one type name, and a walk
+    /// that follows the wrong one withdraws rows the snapshot showed, so this
+    /// joins the other startup refusals rather than degrading per table.
+    #[test]
+    fn a_table_claiming_the_identity_type_name_refuses_startup() {
+        const SCHEMA: &str = "
+            CREATE TABLE \"user\"(id INTEGER PRIMARY KEY, owner TEXT);
+            ALTER TABLE \"user\" ENABLE ROW LEVEL SECURITY;
+        ";
+        const POLICY: &str = "CREATE POLICY p ON \"user\" FOR SELECT USING (\
+            owner = current_setting('app.user_id', true))";
+
+        let Err(super::SetupError::Unplannable(detail)) =
+            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING)
+        else {
+            panic!("two things under one type name must stop the boot");
+        };
+        assert!(
+            detail.contains("user"),
+            "the refusal names the table an operator has to rename: {detail}"
         );
     }
 }
