@@ -138,7 +138,7 @@
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Admission control</text>
       <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">per-handle throttling, abuse detection, bans</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved reader-pool share for identified callers</text>
+      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share, R58 page cap and per-tier read time limit</text>
     </g>
 
     <!-- Cluster: audit -->
@@ -259,6 +259,8 @@
     <text x="925" y="450" text-anchor="middle" font-size="8" fill="#4CAF50">control plane</text>
     <text x="925" y="462" text-anchor="middle" font-size="8" fill="#4CAF50">MessagePack</text>
     <text x="925" y="490" text-anchor="middle" font-size="8" fill="#4CAF50">aggregate values</text>
+    <text x="925" y="518" text-anchor="middle" font-size="8" fill="#4CAF50">snapshot pages,</text>
+    <text x="925" y="530" text-anchor="middle" font-size="8" fill="#4CAF50">keyset + acks (R58)</text>
   </g>
 
   <!-- ==================== FLOW ARROWS (numbered) ==================== -->
@@ -360,7 +362,7 @@
       <text x="315" y="36" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
       <text x="315" y="52" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
       <text x="315" y="70" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
-      <text x="315" y="86" text-anchor="middle" font-size="8.5" fill="#E65100">R23: user-verification unlock gate (pending WebAuthn PRF measurement)</text>
+      <text x="315" y="86" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser (R23). Native gates: R51 and R52 not started, R53 blocked on hardware</text>
     </g>
 
     <!-- Schema pipeline (build time) -->
@@ -388,16 +390,16 @@
 
     <!-- R26 and R42 -->
     <g transform="translate(995, 588)">
-      <rect width="300" height="52" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="52" rx="1" fill="#EF5350" />
-      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Local data export</text>
-      <text x="150" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R26</text>
+      <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="52" rx="1" fill="#4CAF50" />
+      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Local data export</text>
+      <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R26: zip archive, rows as a session patchset. Import: R56, next</text>
     </g>
     <g transform="translate(1325, 588)">
-      <rect width="300" height="52" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="52" rx="1" fill="#EF5350" />
-      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Several accounts signed in at once</text>
-      <text x="150" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R42, one local tier per account</text>
+      <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="52" rx="1" fill="#4CAF50" />
+      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
+      <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R42: a switch replaces the DB worker, own account index</text>
     </g>
   </g>
 
@@ -480,7 +482,7 @@
       <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">sqlite3mc over OPFS, SQLCipher v4 file format, per-replica key</text>
       <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, device key wraps the pre-identity refresh store</text>
       <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
-      <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#E65100">R23: user-verification unlock gate (pending WebAuthn PRF measurement)</text>
+      <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">R23 unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
     </g>
 
     <!-- retention and R42 (browser) -->
@@ -491,10 +493,10 @@
       <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">trims the OPFS replica</text>
     </g>
     <g transform="translate(1320, 1222)">
-      <rect width="296" height="48" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="3" height="48" rx="1" fill="#EF5350" />
-      <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="600" fill="#333">Several accounts signed in at once</text>
-      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#C62828">not started, R42</text>
+      <rect width="296" height="48" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="3" height="48" rx="1" fill="#4CAF50" />
+      <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
+      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R42: worker asks the tab which account after the gate</text>
     </g>
   </g>
 
@@ -502,22 +504,25 @@
   <path d="M 1625 374 L 1648 374 L 1648 1158 L 1616 1158" fill="none" stroke="#4CAF50" stroke-width="1.5" stroke-dasharray="5 3" />
   <text x="1658" y="766" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(90 1658 766)">same file format both sides: PRAGMA cipher 'sqlcipher', legacy 4 (R21 removes the pin)</text>
 
-  <!-- ==================== EXPLORATORY STRIP ==================== -->
+  <!-- ==================== BEYOND-THE-CORE STRIP ==================== -->
   <g id="exploratory-strip">
     <rect x="20" y="1360" width="1140" height="150" rx="8" fill="#FFF8E1" fill-opacity="0.6" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="8 4" />
-    <text x="40" y="1384" font-size="12" font-weight="600" fill="#E65100">Exploratory</text>
+    <text x="40" y="1384" font-size="12" font-weight="600" fill="#E65100">Beyond the core: committed file programme, designed peer sync</text>
     <g transform="translate(40, 1396)">
-      <rect width="540" height="100" rx="6" fill="#fff" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="6 3" />
-      <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">File-sync channel</text>
-      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#E65100">exploratory, R24</text>
-      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">file content on its own channel apart from row data</text>
-      <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">chunking, hashing, resumability (07-file-sync.md)</text>
+      <rect width="540" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
+      <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">File handling programme</text>
+      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#C62828">committed, not started: R64 to R69 (design concluded as R24)</text>
+      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">chunked content store: blake3 identity, zstd then XChaCha20-Poly1305</text>
+      <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">fs or object-store server, signed-URL tickets, metadata as ordinary rows</text>
+      <text x="270" y="90" text-anchor="middle" font-size="9" fill="#555">display is a URL, local sync only for pinned, processed, or unsent content</text>
     </g>
     <g transform="translate(600, 1396)">
-      <rect width="540" height="100" rx="6" fill="#fff" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="6 3" />
+      <rect width="540" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Device-to-device sync</text>
-      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#E65100">exploratory, R25, recorded in the plan as not now</text>
-      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">no server in the path</text>
+      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#C62828">committed, not started: R74 to R80 (design concluded as R25, chapter 19)</text>
+      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">signed provisional exchange over LAN mTLS with device certificates</text>
+      <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">server still adjudicates, courier recovery of a lost device's signed queue</text>
+      <text x="270" y="90" text-anchor="middle" font-size="9" fill="#555">one dedup domain, the (device key, sequence) frontier. BLE beacon bootstrap later</text>
     </g>
   </g>
 
@@ -550,5 +555,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1538" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status</text>
+  <text x="20" y="1538" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-08-22 to the plan's current state.</text>
 </svg>

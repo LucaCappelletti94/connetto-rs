@@ -15,7 +15,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `04-subscriptions.md` | How a client declares interest in data, and the life of a subscription |
 | `05-aggregate-queries.md` | Counts, sums and grouped results, which are a different problem from row subscriptions |
 | `06-reconnect.md` | Going offline and coming back: resume, catchup, the oplog and its retention window |
-| `07-file-sync.md` | File content sync, which connetto does **not** build. Retained as the record behind that decision and as input to the exploratory integration phase R24 |
+| `07-file-sync.md` | The historical record behind the file-handling decisions. Superseded by chapter 18, which is normative where they disagree |
 | `08-authorization.md` | Which caller may see which row, on reads, on changes and on writes. The two executors and the revocation path |
 | `09-wasm.md` | Running the client in a browser: the worker topology, storage, and what the platform does and does not offer |
 | `10-subscription-materializer.md` | The server component that hosts `subql` and turns its per-consumer output into per-session wire output |
@@ -23,9 +23,11 @@ The numbering records the order chapters were written, not a reading order and n
 | `12-identity-session-capability.md` | **The canonical chapter for identity.** The three concepts, what each keys, the status-marker discipline, and the threat model that bounds the encryption design. It governs where other chapters disagree with it |
 | `13-client-connection.md` | The client-side Diesel connection, reactivity, and the two framework adapters |
 | `14-at-rest-encryption.md` | The replica page codec, key custody, ordering constraints, and what the encryption does and does not defend |
-| `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming. **Decided, not built**, and blocked on upstream diesel work |
-| `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers. **Decided, not built** |
+| `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming |
+| `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers |
 | `17-fan-out.md` | How one change event reaches many subscribers: the unit of computation, what stays proportional to subscriber count, catchup, and what adopting the shape costs. **Decided, not built** |
+| `18-file-handling.md` | File handling as decided: identity, chunking, the encrypted stores, tickets, the availability convention, and the abuse surface. **Decided, not built**, phases R64 to R69 |
+| `19-device-to-device.md` | Offline collaboration between devices: certificates, the per-device frontier, the LAN link, the exchange, the provisional tier, and courier recovery. **Decided, not built**, phases R74 to R80 |
 
 ## Not chapters
 
