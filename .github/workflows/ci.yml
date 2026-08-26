@@ -377,9 +377,27 @@ jobs:
             ${{ matrix.target }}
 
   rust-tests:
-    name: Rust tests
+    name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Sharded by package so no single shard hits the execution cap: the two
+      # heavy Docker-backed crates run alone and the light ones share a shard.
+      # The graph compiles once per shard, which is duplicated work traded for
+      # wall-clock under the cap.
+      matrix:
+        include:
+          - name: server
+            packages: -p connetto-server
+          - name: client
+            packages: -p connetto-client
+          - name: rest
+            packages: >-
+              -p connetto-core
+              -p connetto-test-harness
+              -p connetto-dioxus
+              -p connetto-yew
     steps:
       - uses: actions/checkout@v7
 
@@ -398,9 +416,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: target
-          key: t-rust-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: t-rust-tests-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            t-rust-tests-${{ runner.os }}-
+            t-rust-tests-${{ matrix.name }}-${{ runner.os }}-
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
@@ -411,7 +429,7 @@ jobs:
           sudo apt-get install -y keyutils
 
       - name: Run Rust suite
-        run: keyctl session -- cargo +stable test --release --all-features
+        run: keyctl session -- cargo +stable test --release --all-features ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()
