@@ -105,6 +105,24 @@ fn encode_bind(value: &BindValue) -> (i32, Option<Vec<u8>>) {
     }
 }
 
+/// The canonical resting-table encoding of a bind list: every value in
+/// placeholder order, each as its [`encode_bind`] discriminant byte followed
+/// by a big-endian length and the value's bytes. This is the exact-identity
+/// form R83 keys `_connetto_aggregates` rows on, so a restart finds the row a
+/// live push wrote. One function so the upsert and the lookup share it.
+pub(crate) fn encode_binds(binds: &[BindValue]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in binds {
+        let (kind, bytes) = encode_bind(value);
+        out.push(u8::try_from(kind).unwrap_or_default());
+        let payload = bytes.as_deref().unwrap_or(&[]);
+        let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
 /// Rebuild a bind value from its stored discriminant and bytes.
 fn decode_bind(kind: i32, value: Option<Vec<u8>>) -> Result<BindValue, ClientError> {
     let malformed = || ClientError::Session("a persisted bind value is malformed".to_owned());
@@ -243,9 +261,82 @@ pub(crate) fn forget(db: &mut SqliteConnection, sub_id: &str) -> Result<(), Clie
             .filter(subscription::id.nullable().is_null())
             .select(query_text::id)
             .load::<i32>(conn)?;
-        diesel::delete(query_text::table.filter(query_text::id.eq_any(orphans))).execute(conn)?;
+        // A rested aggregate value keeps its query text alive past the
+        // subscription that produced it: an aggregate carries zero grace, so
+        // this sweep runs the moment its last handle drops, and deleting the
+        // text would strand the resting row a later restart reads through.
+        let referenced = crate::aggregates::aggregate::table
+            .filter(crate::aggregates::aggregate::query_id.eq_any(&orphans))
+            .select(crate::aggregates::aggregate::query_id)
+            .distinct()
+            .load::<i32>(conn)?;
+        let deletable: Vec<i32> = orphans
+            .into_iter()
+            .filter(|id| !referenced.contains(id))
+            .collect();
+        diesel::delete(query_text::table.filter(query_text::id.eq_any(deletable))).execute(conn)?;
         Ok(())
     })
+}
+
+/// The query identity a subscription id names: the shared `_connetto_query`
+/// row id and the binds in placeholder order, or `None` when no record names
+/// it. The resting table keys server-computed values on this identity rather
+/// than the run-local subscription id, so a value survives past its
+/// subscription and is found again after a restart mints fresh ids (R83).
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica cannot be read, or when a stored
+/// bind value does not decode.
+pub(crate) fn identity_of(
+    db: &mut SqliteConnection,
+    sub_id: &str,
+) -> Result<Option<(i32, Vec<BindValue>)>, ClientError> {
+    let query_id: Option<i32> = subscription::table
+        .filter(subscription::id.eq(sub_id))
+        .select(subscription::query_id)
+        .first(db)
+        .optional()?;
+    let Some(query_id) = query_id else {
+        return Ok(None);
+    };
+    Ok(Some((query_id, binds_of(db, sub_id)?)))
+}
+
+/// The (query id, canonical binds blob) of every subscription on record, the
+/// set the resting cap must never evict: a statistic still subscribed is still
+/// watched.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica cannot be read, or when a stored
+/// bind value does not decode.
+pub(crate) fn live_identities(
+    db: &mut SqliteConnection,
+) -> Result<Vec<(i32, Vec<u8>)>, ClientError> {
+    let subs: Vec<(String, i32)> = subscription::table
+        .select((subscription::id, subscription::query_id))
+        .load(db)?;
+    let mut out = Vec::with_capacity(subs.len());
+    for (sub_id, query_id) in subs {
+        out.push((query_id, encode_binds(&binds_of(db, &sub_id)?)));
+    }
+    Ok(out)
+}
+
+/// The binds of one subscription, in placeholder order.
+fn binds_of(db: &mut SqliteConnection, sub_id: &str) -> Result<Vec<BindValue>, ClientError> {
+    let stored: Vec<(i32, Option<Vec<u8>>)> = bind::table
+        .filter(bind::subscription_id.eq(sub_id))
+        .order(bind::position)
+        .select((bind::kind, bind::value))
+        .load(db)?;
+    let mut binds = Vec::with_capacity(stored.len());
+    for (kind, value) in stored {
+        binds.push(decode_bind(kind, value)?);
+    }
+    Ok(binds)
 }
 
 /// Every persisted subscription, in declaration order.
@@ -476,6 +567,10 @@ mod tests {
     fn replica() -> SqliteConnection {
         let mut db = SqliteConnection::establish(":memory:").expect("open");
         db.batch_execute(SUBSCRIPTION_DDL).expect("ddl");
+        // `forget` reads `_connetto_aggregates` to spare a query row a rested
+        // value references, so the fixture carries it like an open replica does.
+        db.batch_execute(crate::aggregates::AGGREGATE_DDL)
+            .expect("aggregate ddl");
         db
     }
 

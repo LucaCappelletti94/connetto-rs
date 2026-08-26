@@ -504,10 +504,30 @@ struct LiveEntry<T: Transport> {
     wire_ids: Vec<String>,
 }
 
-/// Driver-side apply callback of one live value: decode the pushed JSON and
-/// publish it when it differs from the current value. `None` clears the value
-/// (the server reported that the addressed key left the result set).
-type ApplyValue = Box<dyn FnMut(Option<&str>) -> Result<(), ClientError> + Send>;
+/// A rested scalar and when it was last synced: the pair a [`LiveValue`]
+/// holds. The as-of time is the stored `updated_at` on the local clock, so
+/// the application judges staleness by its age plus the connection-state
+/// events it already receives (R83 decision 6).
+struct Rested<V> {
+    value: Option<V>,
+    as_of: Option<i64>,
+}
+
+impl<V> Default for Rested<V> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            as_of: None,
+        }
+    }
+}
+
+/// Driver-side apply callback of one live value: decode the value and publish
+/// it with its as-of time. Both come from the resting table, the one home for
+/// the last value, so a live push and a bootstrap take the same path. `None`
+/// clears the value (the addressed key left the result set) and the as-of with
+/// it.
+type ApplyValue = Box<dyn FnMut(Option<&str>, Option<i64>) -> Result<(), ClientError> + Send>;
 
 /// One live value handle's driver-side state, with the id of the shared wire
 /// subscription that feeds it (the target of aggregate pushes and what a drop
@@ -520,14 +540,13 @@ struct ValueEntry {
 
 /// One shared wire subscription: declared once on the wire under `wire_id`,
 /// reference counted across every row and value handle that resolved to the
-/// same `spec`. `last_agg` caches the most recent aggregate result so a
-/// late-joining value handle resolves immediately, since the server sends the
-/// bootstrap only at subscribe time.
+/// same `spec`. The last aggregate value no longer lives here: R83 rests it in
+/// `_connetto_aggregates`, so a late joiner and a restart both bootstrap
+/// through that one row.
 struct WireSub {
     wire_id: String,
     spec: SubscriptionSpec,
     refs: usize,
-    last_agg: Option<String>,
 }
 
 /// The connection and the live registries, guarded together so a refresh
@@ -664,7 +683,7 @@ impl<R> LiveQuery<R> {
 /// [`LiveQuery`].
 pub struct LiveValue<V> {
     handle: LiveHandleCore,
-    value: Arc<RwLock<Option<V>>>,
+    value: Arc<RwLock<Rested<V>>>,
 }
 
 impl<V: Clone + Send + Sync> LiveHandle for LiveValue<V> {
@@ -684,13 +703,26 @@ impl<V: Clone + Send + Sync> LiveHandle for LiveValue<V> {
 }
 
 impl<V: Clone> LiveValue<V> {
-    /// The current value, or `None` before the server's bootstrap arrives.
+    /// The current value, or `None` before any value has arrived. On an
+    /// offline restart this is the last synced value read from the resting
+    /// table, not `None`, which is the whole of R83.
     #[must_use]
     pub fn value(&self) -> Option<V> {
         self.value.read().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |value| value.clone(),
+            |poisoned| poisoned.into_inner().value.clone(),
+            |slot| slot.value.clone(),
         )
+    }
+
+    /// When the current value was last synced, in seconds since the epoch on
+    /// the local clock, or `None` while no value has arrived. The application
+    /// judges staleness from its age together with the connection-state
+    /// events it already receives (R83 decision 6).
+    #[must_use]
+    pub fn as_of_secs(&self) -> Option<i64> {
+        self.value
+            .read()
+            .map_or_else(|poisoned| poisoned.into_inner().as_of, |slot| slot.as_of)
     }
 }
 
@@ -841,7 +873,6 @@ where
                 // one takes the count to one, and one never claimed stays here
                 // for R15's grace to retire.
                 refs: 0,
-                last_agg: None,
             })
             .collect();
         let shared = Arc::new(Shared {
@@ -1037,7 +1068,7 @@ where
         });
         let mut wire_ids = Vec::with_capacity(specs.len());
         for spec in specs {
-            let (wire_id, _) = attach_wire(state, &self.shared.next_wire, spec, grace).await?;
+            let wire_id = attach_wire(state, &self.shared.next_wire, spec, grace).await?;
             wire_ids.push(wire_id);
         }
         let reads_synced = !wire_ids.is_empty();
@@ -1156,7 +1187,7 @@ where
         let query = <R as HasTable>::table().find(key);
         let (sql, binds) = render_query(&query)?;
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
-        let (wire_id, _) = attach_wire(
+        let wire_id = attach_wire(
             &mut state,
             &self.shared.next_wire,
             spec.clone(),
@@ -1322,17 +1353,22 @@ where
         let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("live-{seq}");
 
-        let value = Arc::new(RwLock::new(None::<V>));
+        let value = Arc::new(RwLock::new(Rested::<V>::default()));
         let (tx, rx) = watch::channel(0_u64);
         let apply_value = Arc::clone(&value);
-        let mut apply: ApplyValue = Box::new(move |json: Option<&str>| {
+        let mut apply: ApplyValue = Box::new(move |json: Option<&str>, as_of: Option<i64>| {
             let fresh: Option<V> = json.map(decode).transpose()?;
-            let unchanged = apply_value.read().is_ok_and(|current| *current == fresh);
-            if !unchanged {
-                match apply_value.write() {
-                    Ok(mut value) => *value = fresh,
-                    Err(poisoned) => *poisoned.into_inner() = fresh,
-                }
+            let changed = {
+                let mut slot = match apply_value.write() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let changed = slot.value != fresh;
+                slot.value = fresh;
+                slot.as_of = as_of;
+                changed
+            };
+            if changed {
                 tx.send_modify(|generation| *generation += 1);
             }
             Ok(())
@@ -1363,13 +1399,22 @@ where
             // The bootstrap sets the value without a generation bump, like
             // the initial rows of a row handle: the first `changed()` must
             // wait for a real change, not report the registration itself.
+            let now = state.conn.now_secs()?;
             let bootstrap = decode(&run_probe(state.conn.conn(), &probe)?)?;
             match value.write() {
-                Ok(mut slot) => *slot = Some(bootstrap),
-                Err(poisoned) => *poisoned.into_inner() = Some(bootstrap),
+                Ok(mut slot) => {
+                    slot.value = Some(bootstrap);
+                    slot.as_of = Some(now);
+                }
+                Err(poisoned) => {
+                    let mut slot = poisoned.into_inner();
+                    slot.value = Some(bootstrap);
+                    slot.as_of = Some(now);
+                }
             }
             let refresh = Box::new(move |conn: &mut ConnettoConnection<T>| {
-                apply(Some(&run_probe(conn.conn(), &probe)?))
+                let now = conn.now_secs()?;
+                apply(Some(&run_probe(conn.conn(), &probe)?), Some(now))
             });
             state.registry.push(LiveEntry {
                 sub_id: sub_id.clone(),
@@ -1383,24 +1428,33 @@ where
             });
         }
 
-        let spec = SubscriptionSpec::new(sql).with_binds(binds);
-        // No grace for an aggregate. The grace exists so a re-watch does not
-        // re-pay a snapshot, and an aggregate handle holds no replica rows: its
-        // bootstrap is one scalar the server pushes again on the next
-        // subscribe, which is cheaper than keeping the subscription alive.
-        let (wire_id, cached) =
-            attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
-        if let Some(json) = cached {
-            // Late joiner: the server sends the bootstrap only at the first
-            // subscribe, so resolve from the cached last result now. Set the
-            // slot directly, without a generation bump, so the first changed()
-            // still waits for a real change (like a bootstrap).
+        // Bootstrap from the resting table before subscribing, so both cases,
+        // a same-run late joiner and an offline restart, resolve through the
+        // one rested row rather than a run-local cache (R83 decision 3). The
+        // server's next push overwrites it. Set the slot directly, with no
+        // generation bump, so the first changed() still waits for a real
+        // change, like any bootstrap.
+        if let Some((json, updated_at)) = state.conn.rested_scalar(&sql, &binds)? {
             let bootstrap = decode(&json)?;
             match value.write() {
-                Ok(mut slot) => *slot = Some(bootstrap),
-                Err(poisoned) => *poisoned.into_inner() = Some(bootstrap),
+                Ok(mut slot) => {
+                    slot.value = Some(bootstrap);
+                    slot.as_of = Some(updated_at);
+                }
+                Err(poisoned) => {
+                    let mut slot = poisoned.into_inner();
+                    slot.value = Some(bootstrap);
+                    slot.as_of = Some(updated_at);
+                }
             }
         }
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        // No grace for an aggregate. The grace exists so a re-watch does not
+        // re-pay a snapshot, but an aggregate handle holds no replica rows and
+        // its value rests durably in `_connetto_aggregates`, so keeping the
+        // subscription alive across a drop would buy nothing the resting table
+        // does not already give.
+        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
         state.values.push(ValueEntry {
             sub_id: sub_id.clone(),
             wire_id,
@@ -1447,7 +1501,7 @@ where
         self.shared.wake.notify_one();
         let mut state = self.shared.state.lock().await;
         let spec = SubscriptionSpec::new(query);
-        let (wire_id, _) = attach_wire(
+        let wire_id = attach_wire(
             &mut state,
             &self.shared.next_wire,
             spec.clone(),
@@ -1568,8 +1622,8 @@ fn release_wire(wire: &mut [WireSub], wire_id: &str, released: &mut Vec<String>)
 
 /// Attach a handle to the wire subscription for `spec`, sharing an existing
 /// one (increment its ref count) or declaring a new one (subscribe once, ref
-/// count 1). Returns the wire id and, for an aggregate handle joining an
-/// existing sub, the cached last aggregate result to resolve from at once.
+/// count 1). Returns the wire id. An aggregate handle bootstraps from the
+/// resting table rather than from a cached last value here (R83).
 /// The id space for shared wire subscriptions, distinct from handle ids.
 const WIRE_PREFIX: &str = "wire-";
 
@@ -1578,7 +1632,7 @@ async fn attach_wire<T>(
     next_wire: &AtomicU64,
     spec: SubscriptionSpec,
     grace: Duration,
-) -> Result<(String, Option<String>), ClientError>
+) -> Result<String, ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -1587,14 +1641,13 @@ where
         let reclaimed = existing.refs == 0;
         existing.refs += 1;
         let wire_id = existing.wire_id.clone();
-        let last_agg = existing.last_agg.clone();
         if reclaimed {
             // Held again, so the countdown stops. The server still has this
             // subscription, so nothing goes on the wire and no snapshot is
             // paid, which is the whole point of the grace.
             state.conn.hold_subscription(&wire_id)?;
         }
-        return Ok((wire_id, last_agg));
+        return Ok(wire_id);
     }
     let seq = next_wire.fetch_add(1, Ordering::Relaxed);
     let wire_id = format!("{WIRE_PREFIX}{seq}");
@@ -1606,9 +1659,8 @@ where
         wire_id: wire_id.clone(),
         spec,
         refs: 1,
-        last_agg: None,
     });
-    Ok((wire_id, None))
+    Ok(wire_id)
 }
 
 /// Drain the reaper queue: remove each dropped handle's driver-side entry,
@@ -1842,39 +1894,57 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
     }
 }
 
-/// Route an aggregate push to its live value handle before the broadcast,
-/// so observers of both see the same order.
+/// Push a rested scalar aggregate to its live value handles.
 ///
-/// Grouped frames (`group_key: Some`) are for the typed grouped consumer
-/// (R84) and are silently skipped here: the scalar `LiveValue` path does
-/// not decode per-group rows. A removal frame (`result_json: None`,
-/// `group_key: None`) clears the live value to no-value.
+/// The resting write already happened in the connection's frame-application
+/// path, so this only reads the rested scalar row back and fans it out, which
+/// makes the handle mirror the table exactly for both a live push and a
+/// bootstrap. A grouped or row-shaped frame (`group_key: Some`, or a whole
+/// re-executed answer) has no scalar handle to feed and rests no scalar row,
+/// so it is skipped here.
 fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
 where
     T: Transport,
 {
     let ClientEvent::Aggregate {
-        sub_id,
-        result_json,
-        group_key,
-        ..
+        sub_id, group_key, ..
     } = event
     else {
         return;
     };
-    // Grouped frames are not for this path.
     if group_key.is_some() {
         return;
     }
-    // Update the cache. A removal clears it so a late joiner starts with
-    // no-value rather than a stale prior push.
-    if let Some(wire) = state.wire.iter_mut().find(|w| w.wire_id == *sub_id) {
-        wire.last_agg.clone_from(result_json);
+    let State {
+        conn,
+        registry: _,
+        values,
+        wire,
+    } = state;
+    if !values.iter().any(|e| e.wire_id == *sub_id) {
+        return;
     }
+    let Some(target) = wire.iter().find(|w| w.wire_id == *sub_id) else {
+        return;
+    };
+    let rested = match conn.rested_scalar(target.spec.query.as_str(), &target.spec.binds) {
+        Ok(rested) => rested,
+        Err(err) => {
+            let _ = shared.events.send(ClientEvent::NonFatal {
+                related_to: Some(sub_id.clone()),
+                detail: format!("reading rested aggregate failed: {err}"),
+            });
+            return;
+        }
+    };
+    let (json, as_of) = match rested {
+        Some((json, as_of)) => (Some(json), Some(as_of)),
+        None => (None, None),
+    };
     // Fan out to every value handle sharing this wire sub, each with its own
     // decoder and typed value, not just the first.
-    for entry in state.values.iter_mut().filter(|e| e.wire_id == *sub_id) {
-        if let Err(err) = (entry.apply)(result_json.as_deref()) {
+    for entry in values.iter_mut().filter(|e| e.wire_id == *sub_id) {
+        if let Err(err) = (entry.apply)(json.as_deref(), as_of) {
             let _ = shared.events.send(ClientEvent::NonFatal {
                 related_to: Some(entry.sub_id.clone()),
                 detail: format!("live value update failed: {err}"),

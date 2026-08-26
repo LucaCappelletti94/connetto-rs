@@ -4289,3 +4289,105 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
     drop(client);
     server_two.abort();
 }
+
+/// R83 done-when: a client restarted offline shows the last synced scalar
+/// value from the resting table, not `None`, before any reconnect.
+///
+/// The first run subscribes a `COUNT(*)` value, sees the server's bootstrap,
+/// and its pump rests it in `_connetto_aggregates` on the file replica. The
+/// process then ends (the client and its pump are dropped and the connection
+/// closed), the same file is reopened with no server reachable, and the same
+/// value watch resolves from the rested row synchronously, so `value()` is the
+/// last synced value with nothing on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
+    let fixture = Fixture::acquire().await;
+    let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
+    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        .expect("build write target");
+    let manager = SessionManager::with_connector(
+        materializer,
+        SeedSnapshot,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
+        test_verifier(),
+        connector,
+        target,
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        manager.serve(transport).await.expect("session ok");
+    });
+
+    // A file replica, since surviving a restart against the same file is the
+    // whole property.
+    let db = tempfile::Builder::new()
+        .suffix(".sqlite")
+        .tempfile()
+        .expect("temp db");
+    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let replica =
+        Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
+            .expect("key provided");
+    let config = ClientConfig::new("resting").with_login(Some(Grant::new("user:token#resting")));
+
+    // First run: connect, watch the count, see the bootstrap, and let the
+    // pump rest it. Driven through `with_pump` so the reopen waits for a fully
+    // closed connection rather than racing a detached pump.
+    let conn = connect_client(addr, "resting", &db_path).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    let pump = tokio::spawn(pump);
+    let mut count = orders::table.count().live(&client).await.expect("live");
+    tokio::time::timeout(Duration::from_secs(5), count.changed())
+        .await
+        .expect("bootstrap timed out")
+        .expect("driver alive");
+    assert_eq!(
+        count.value(),
+        Some(1),
+        "the bootstrap value is the server's"
+    );
+    drop(count);
+    drop(client);
+    pump.await.expect("first pump ends");
+    server.abort();
+
+    // Restart offline against the same file, before any server is reachable.
+    let conn = ConnettoConnection::<WebSocketTransport<TcpStream>>::open(
+        &replica, SQLITE_DDL, &config, None,
+    )
+    .expect("reopen offline");
+    assert!(!conn.is_connected(), "the restart reaches no server");
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    let pump = tokio::spawn(pump);
+    let count = orders::table
+        .count()
+        .live(&client)
+        .await
+        .expect("live offline");
+    assert_eq!(
+        count.value(),
+        Some(1),
+        "the last synced value rests through the restart, read before any reconnect",
+    );
+    assert!(
+        count.as_of_secs().is_some(),
+        "the rested value carries its as-of time",
+    );
+    drop(count);
+    drop(client);
+    pump.await.expect("second pump ends");
+}

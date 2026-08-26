@@ -136,6 +136,10 @@ pub struct FakeTransport {
     /// Delivered once, right after the handshake ack, as a deliberate server
     /// close (a shutdown or a revocation) does.
     closing: Option<FatalErrorReason>,
+    /// Delivered in order right after the handshake ack, so a test can drive
+    /// the frames a connected session would receive (a snapshot, a live patch,
+    /// an aggregate push) before the stream drains and the peer looks gone.
+    post_handshake: VecDeque<IncomingFrame>,
 }
 
 impl FakeTransport {
@@ -177,6 +181,17 @@ impl FakeTransport {
         }
     }
 
+    /// A transport whose handshake succeeds and which then delivers `frames`
+    /// in order, as a connected session's snapshot, live patches, or aggregate
+    /// pushes arrive, before the stream drains and the peer looks gone.
+    #[must_use]
+    pub fn accepting_then_delivering(frames: impl IntoIterator<Item = IncomingFrame>) -> Self {
+        Self {
+            post_handshake: frames.into_iter().collect(),
+            ..Self::new(HandshakeReply::Accept)
+        }
+    }
+
     /// A transport answering with `reply`, whose peer looks gone once its inbox
     /// drains.
     #[must_use]
@@ -186,6 +201,7 @@ impl FakeTransport {
             inbox: VecDeque::new(),
             silent: false,
             closing: None,
+            post_handshake: VecDeque::new(),
         }
     }
 
@@ -217,6 +233,7 @@ impl Transport for FakeTransport {
         if matches!(message, ControlMessage::Handshake(_)) {
             let frame = self.answer();
             self.inbox.push_back(frame);
+            self.inbox.append(&mut self.post_handshake);
             if let Some(reason) = self.closing.take() {
                 self.inbox
                     .push_back(IncomingFrame::Control(ControlMessage::FatalError(

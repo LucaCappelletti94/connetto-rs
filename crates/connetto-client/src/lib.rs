@@ -31,7 +31,7 @@ pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatu
 pub use connetto_core::{Custody, NoGate};
 
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
+    AckCredits, BindValue, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
     MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -61,6 +61,7 @@ use sqlite_diff_rs::{
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+mod aggregates;
 pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
@@ -518,6 +519,12 @@ pub const DEFAULT_TRIM_THRESHOLD: u8 = 25;
 /// stalling pass (R15).
 pub const DEFAULT_TRIM_BUDGET: u32 = 1000;
 
+/// Default cap on the number of distinct rested statistics (one query plus
+/// binds, however many group rows it holds) the resting table keeps. Past it,
+/// the statistic updated longest ago that no handle currently watches is
+/// evicted, so the last N statistics you watched survive a restart (R83).
+pub const DEFAULT_RESTED_STATISTICS_CAP: usize = 256;
+
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -574,6 +581,10 @@ pub struct ClientConfig {
     /// large freelist never stalls the pump. Local, like `trim_threshold`.
     /// Defaults to [`DEFAULT_TRIM_BUDGET`].
     trim_budget: u32,
+    /// Cap on distinct rested statistics kept in `_connetto_aggregates`. Local
+    /// to this device, never a handshake input: the resting table is client
+    /// storage. Defaults to [`DEFAULT_RESTED_STATISTICS_CAP`].
+    rested_statistics_cap: usize,
     /// How the key protecting this connection is held. The default is honest
     /// for every native target today: no native gate exists until R51 and R52
     /// land, so reporting anything stronger would claim protection connetto
@@ -597,6 +608,7 @@ impl ClientConfig {
             caller: None,
             trim_threshold: DEFAULT_TRIM_THRESHOLD,
             trim_budget: DEFAULT_TRIM_BUDGET,
+            rested_statistics_cap: DEFAULT_RESTED_STATISTICS_CAP,
             custody: Custody::Unverified(NoGate::Unsupported),
         }
     }
@@ -699,6 +711,14 @@ impl ClientConfig {
     #[must_use]
     pub fn with_trim_budget(mut self, pages: u32) -> Self {
         self.trim_budget = pages;
+        self
+    }
+
+    /// The cap on distinct rested statistics kept in the resting table.
+    /// Defaults to [`DEFAULT_RESTED_STATISTICS_CAP`].
+    #[must_use]
+    pub fn with_rested_statistics_cap(mut self, cap: usize) -> Self {
+        self.rested_statistics_cap = cap;
         self
     }
 
@@ -2073,6 +2093,8 @@ where
         check_recorded_tables(&mut db, "main", &config.unrecorded_tables)?;
         db.batch_execute(META_DDL)?;
         db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+        // After the subscription tables, since it references `_connetto_query`.
+        db.batch_execute(aggregates::AGGREGATE_DDL)?;
         // Once per open, before anything can re-claim: a watch the previous run
         // died still holding gets its countdown from now, so the UI has this
         // run to re-claim it and an abandoned one retires. Ahead of the capture
@@ -2869,6 +2891,78 @@ where
         subscriptions::expired(&mut self.db)
     }
 
+    /// The current wall time in seconds since the epoch, from the replica's
+    /// own clock, so the resting table's as-of stamps and the expiry
+    /// comparisons agree on one clock.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub(crate) fn now_secs(&mut self) -> Result<i64, ClientError> {
+        clock::now_secs(&mut self.db)
+    }
+
+    /// Rest one server aggregate frame in `_connetto_aggregates`, then evict
+    /// down to the configured cap.
+    ///
+    /// The frame carries only its run-local subscription id, so the query
+    /// identity that keys the rested row (query text and binds) is resolved
+    /// from the persisted subscription record that same id names. A frame
+    /// whose subscription is not on record rests nothing: there is no identity
+    /// to key it on, and a live frame always has one. The write is a
+    /// `_connetto_*` write, so it runs under capture suspension and never rides
+    /// a mutation upload.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write.
+    fn rest_aggregate(
+        &mut self,
+        sub_id: &str,
+        group_key: Option<&[u8]>,
+        result_json: Option<&str>,
+        is_full_result: bool,
+    ) -> Result<(), ClientError> {
+        let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
+            return Ok(());
+        };
+        let now = clock::now_secs(&mut self.db)?;
+        // The statistics still on record are the ones a handle still watches,
+        // so the cap never evicts a value in use.
+        let protected = subscriptions::live_identities(&mut self.db)?;
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        aggregates::apply_frame(
+            &mut self.db,
+            query_id,
+            &binds,
+            group_key,
+            result_json,
+            is_full_result,
+            now,
+        )?;
+        // A removal cannot add a statistic, so only a write needs the cap.
+        if result_json.is_some() {
+            aggregates::enforce_cap(&mut self.db, self.config.rested_statistics_cap, &protected)?;
+        }
+        Ok(())
+    }
+
+    /// The rested scalar value and its as-of time for a subscription's query
+    /// and binds, or `None` when none rests. The scalar watch bootstraps from
+    /// this on an offline restart, and a relay answers a tab's aggregate watch
+    /// from it while its worker is offline.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub fn rested_scalar(
+        &mut self,
+        query: &str,
+        binds: &[BindValue],
+    ) -> Result<Option<(String, i64)>, ClientError> {
+        aggregates::lookup_scalar(&mut self.db, query, binds)
+    }
+
     /// Every subscription this replica has declared and not dropped, whether
     /// or not a server has ever seen them.
     ///
@@ -3289,12 +3383,24 @@ where
                 }
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
-            ControlMessage::AggregateUpdate(update) => Ok(ClientEvent::Aggregate {
-                sub_id: update.sub_id,
-                result_json: update.result_json,
-                group_key: update.group_key,
-                is_full_result: update.is_full_result,
-            }),
+            ControlMessage::AggregateUpdate(update) => {
+                // Resting is a durable consequence of receiving a server frame,
+                // the same class as the cursor and patch writes above, so it
+                // happens here on the one frame-application path every pump
+                // driver shares, not in a driver's own loop (R83).
+                self.rest_aggregate(
+                    &update.sub_id,
+                    update.group_key.as_deref(),
+                    update.result_json.as_deref(),
+                    update.is_full_result,
+                )?;
+                Ok(ClientEvent::Aggregate {
+                    sub_id: update.sub_id,
+                    result_json: update.result_json,
+                    group_key: update.group_key,
+                    is_full_result: update.is_full_result,
+                })
+            }
             ControlMessage::FullResyncRequired(resync) => {
                 self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
                 // The replacement snapshot is on its way, and the pending writes

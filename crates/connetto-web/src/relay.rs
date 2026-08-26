@@ -941,6 +941,7 @@ where
 async fn register_tab_aggregate<U>(
     worker: &mut ConnettoConnection<U>,
     agg_routes: &mut HashMap<String, AggRoute>,
+    tab: &mut TabState,
     id: TabId,
     subscribe: Subscribe,
 ) -> Result<(), TabFault>
@@ -953,6 +954,27 @@ where
         .subscribe_spec(&upstream_id, subscribe.spec.clone())
         .await
         .map_err(RelayError::from)?;
+    // While the worker is offline the server sends no bootstrap, so a tab would
+    // otherwise show nothing until the worker connects. Answer the watch from
+    // the resting table the worker keeps, synthesizing the scalar frame the
+    // server would have sent. The worker's next connect delivers the
+    // authoritative value and overwrites it (R83 decision 7).
+    if !worker.is_connected()
+        && let Some((result_json, _)) = worker
+            .rested_scalar(&subscribe.spec.query, &subscribe.spec.binds)
+            .map_err(RelayError::from)?
+    {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::AggregateUpdate(
+                AggregateUpdate {
+                    sub_id: subscribe.sub_id.clone(),
+                    group_key: None,
+                    result_json: Some(result_json),
+                    is_full_result: true,
+                },
+            )));
+    }
     agg_routes.insert(
         upstream_id,
         AggRoute {
@@ -1015,7 +1037,7 @@ where
             send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
             Ok(())
         }
-        Ok(true) => register_tab_aggregate(worker, agg_routes, id, subscribe).await,
+        Ok(true) => register_tab_aggregate(worker, agg_routes, tab, id, subscribe).await,
         Ok(false) => {
             let tables = match subscription_tables(&subscribe.spec.query) {
                 Ok(tables) => tables,
@@ -2568,5 +2590,106 @@ mod tests {
         };
         let names: Vec<String> = set.iter().map(|op| op.table().name().clone()).collect();
         assert_eq!(names, ["orders"], "one insert, under the logical name");
+    }
+
+    /// R83 browser done-when: a tab's aggregate watch is answered from the
+    /// resting table while the worker is offline, so the tab shows the last
+    /// synced value through the DB worker rather than nothing.
+    ///
+    /// The worker rests the value on the connection's own frame path, the same
+    /// path the native client uses, which is what lets the hub answer with no
+    /// server: it reads the rested scalar and synthesizes the bootstrap frame
+    /// the server would have sent.
+    #[wasm_bindgen_test]
+    async fn a_tab_aggregate_watch_is_answered_from_rest_while_offline() {
+        use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
+        use connetto_core::messages::{
+            AggregateUpdate, ControlMessage, Subscribe, SubscriptionSpec,
+        };
+        use connetto_core::test_support::FakeTransport;
+        use connetto_core::traits::IncomingFrame;
+        use std::collections::{HashMap, VecDeque};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        const AGG_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER)";
+        let query = "SELECT COUNT(*) FROM orders";
+        let spec = SubscriptionSpec::new(query);
+        let config = ClientConfig::new("worker").with_login(Some(Grant::new("user:token")));
+
+        // A fake server that acks the handshake, delivers one scalar bootstrap
+        // for the worker's upstream subscription, then drains so the worker
+        // goes offline with the value on record.
+        let transport = FakeTransport::accepting_then_delivering([IncomingFrame::Control(
+            ControlMessage::AggregateUpdate(AggregateUpdate {
+                sub_id: "wire-0".to_owned(),
+                group_key: None,
+                result_json: Some("7".to_owned()),
+                is_full_result: true,
+            }),
+        )]);
+        // Subscribe offline first, so the frame's sub id resolves to a query
+        // identity the instant it lands, then attach the fake server and pump
+        // until it drains, which drains the connect notice, rests the
+        // bootstrap, and takes the close.
+        let mut worker = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            AGG_DDL,
+            &config,
+            None,
+        )
+        .expect("worker opens offline");
+        worker
+            .subscribe_spec("wire-0", spec.clone())
+            .await
+            .expect("worker records its upstream subscription");
+        worker.attach(transport).await.expect("worker attaches");
+        while worker.is_connected() {
+            if worker.pump_one().await.is_err() {
+                break;
+            }
+        }
+        assert!(!worker.is_connected(), "the worker is offline for the test");
+
+        // A tab subscribes the same aggregate through the hub while offline.
+        let (out_tx, mut out_rx) = unbounded_channel();
+        let mut tab = super::TabState {
+            out: out_tx,
+            handshaken: true,
+            subs: Vec::new(),
+            pending_write: None,
+            client_id: None,
+            applied_watermark: None,
+            local_watermark: None,
+            credits: super::INITIAL_CREDITS,
+            pending: VecDeque::new(),
+        };
+        let mut agg_routes: HashMap<String, super::AggRoute> = HashMap::new();
+        let subscribe = Subscribe {
+            sub_id: "s1".to_owned(),
+            spec,
+        };
+        if super::register_tab_aggregate(&mut worker, &mut agg_routes, &mut tab, 1, subscribe)
+            .await
+            .is_err()
+        {
+            panic!("the hub failed to answer the tab from rest");
+        }
+
+        match out_rx
+            .try_recv()
+            .expect("a synthesized frame reaches the tab")
+        {
+            super::TabOut::Control(ControlMessage::AggregateUpdate(update)) => {
+                assert_eq!(update.sub_id, "s1", "under the tab's own sub id");
+                assert_eq!(
+                    update.result_json.as_deref(),
+                    Some("7"),
+                    "the last synced value, from rest"
+                );
+                assert_eq!(update.group_key, None, "a scalar answer addresses no group");
+                assert!(update.is_full_result, "a bootstrap is a full result");
+            }
+            _ => panic!("expected a synthesized aggregate frame toward the tab"),
+        }
     }
 }
