@@ -61,17 +61,14 @@
     <line x1="275" y1="138" x2="300" y2="138" stroke="#FFA726" stroke-width="1.5" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)" />
     <line x1="275" y1="214" x2="300" y2="214" stroke="#FFA726" stroke-width="1.5" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)" />
     <text x="287" y="130" text-anchor="middle" font-size="8" fill="#E65100">(8)</text>
-    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#E65100">mesh: open question X7</text>
-    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#E65100">failover, cursor validity across servers, slot layout: undecided</text>
+    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#E65100">mesh: open question X7, reframed as R73 failover verification (exploratory, not started)</text>
+    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#E65100">the hard parts are existing Postgres features, the phase is verification and a deployment recipe</text>
 
     <!-- PG panel to connetto-server arrows -->
     <line x1="495" y1="150" x2="537" y2="150" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
     <text x="516" y="141" text-anchor="middle" font-size="8" fill="#2E7D32">WAL events</text>
     <text x="516" y="163" text-anchor="middle" font-size="8" fill="#2E7D32">(pgoutput)</text>
     <line x1="537" y1="196" x2="495" y2="196" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
-    <text x="516" y="187" text-anchor="middle" font-size="8" fill="#2E7D32">reads (reader role)</text>
-    <text x="516" y="209" text-anchor="middle" font-size="8" fill="#2E7D32">writes under RLS</text>
-    <text x="516" y="220" text-anchor="middle" font-size="8" fill="#2E7D32">(SET LOCAL)</text>
 
     <!-- ===== External services ===== -->
     <rect x="35" y="410" width="460" height="120" rx="8" fill="#ECEFF1" stroke="#90A4AE" stroke-width="1" />
@@ -100,6 +97,22 @@
       <rect width="4" height="50" rx="1" fill="#EF5350" />
       <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Shared public store</text>
       <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R11</text>
+    </g>
+
+    <!-- ===== Backup and restore (R70) ===== -->
+    <g transform="translate(35, 726)">
+      <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="50" rx="1" fill="#EF5350" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Deployment backup and restore</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R70</text>
+    </g>
+
+    <!-- ===== Clock discipline (R72) ===== -->
+    <g transform="translate(35, 796)">
+      <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="50" rx="1" fill="#EF5350" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Clock discipline (open question X6)</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R72</text>
     </g>
 
     <!-- (5) FGA arrows: change-path checks and model write, both built -->
@@ -138,7 +151,7 @@
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Admission control</text>
       <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">per-handle throttling, abuse detection, bans</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share, R58 page cap and per-tier read time limit</text>
+      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share, snapshot page cap, per-tier read time bound</text>
     </g>
 
     <!-- Cluster: audit -->
@@ -184,26 +197,28 @@
     <g transform="translate(558, 596)">
       <rect width="284" height="60" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="60" rx="1" fill="#4CAF50" />
-      <text x="142" y="16" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Accumulator state (IVM), folded per CDC event</text>
-      <text x="142" y="31" text-anchor="middle" font-size="8.5" fill="#2E7D32">COUNT, SUM, AVG, VAR, STDDEV, scalar MIN and MAX</text>
-      <text x="142" y="46" text-anchor="middle" font-size="8.5" font-style="italic" fill="#E65100">grouped aggregates: exploratory, R30</text>
+      <text x="142" y="14" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Accumulator state (IVM), folded per CDC event</text>
+      <text x="142" y="28" text-anchor="middle" font-size="8.5" fill="#2E7D32">COUNT, SUM, AVG, VAR, STDDEV, scalar MIN and MAX</text>
+      <text x="142" y="42" text-anchor="middle" font-size="8.5" fill="#2E7D32">grouped GROUP BY / HAVING folds, keyed per group</text>
+      <text x="142" y="56" text-anchor="middle" font-size="8.5" fill="#2E7D32">over the group budget: demoted to whole re-reads</text>
     </g>
 
     <g transform="translate(558, 664)">
-      <rect width="284" height="40" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="40" rx="1" fill="#4CAF50" />
-      <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution fallback</text>
-      <text x="142" y="30" text-anchor="middle" font-size="8.5" fill="#555">scalar values via diesel connectors (MIN, MAX, joins)</text>
+      <rect width="284" height="54" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="54" rx="1" fill="#4CAF50" />
+      <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
+      <text x="142" y="29" text-anchor="middle" font-size="8.5" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
+      <text x="142" y="43" text-anchor="middle" font-size="8.5" fill="#C62828">per-viewer runs on RLS tables: not started, R85</text>
     </g>
 
-    <g transform="translate(558, 712)">
+    <g transform="translate(558, 724)">
       <rect width="284" height="40" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="40" rx="1" fill="#4CAF50" />
       <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Per-session cursor and pending buffer</text>
       <text x="142" y="30" text-anchor="middle" font-size="8.5" fill="#555">monotonic cursor, credit-aware delivery queue</text>
     </g>
 
-    <g transform="translate(558, 760)">
+    <g transform="translate(558, 770)">
       <rect width="284" height="58" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="58" rx="1" fill="#4CAF50" />
       <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Row visibility composition</text>
@@ -211,7 +226,7 @@
       <text x="142" y="45" text-anchor="middle" font-size="8.5" fill="#555">transitions (two-check form), membership term</text>
     </g>
 
-    <g transform="translate(558, 826)">
+    <g transform="translate(558, 834)">
       <rect width="284" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
       <text x="142" y="16" text-anchor="middle" font-size="10.5" font-weight="600" fill="#333">pg-walstream</text>
@@ -247,6 +262,12 @@
       <text x="150" y="56" text-anchor="middle" font-size="9" fill="#555">OIDC token verification on every session</text>
       <text x="150" y="72" text-anchor="middle" font-size="9" fill="#555">each grant resolves into a Principal</text>
     </g>
+
+    <!-- PG read/write arrow labels, painted after the zone fill so they stay legible -->
+    <text x="516" y="178" text-anchor="middle" font-size="8" fill="#2E7D32">snapshot + re-execution reads</text>
+    <text x="516" y="188" text-anchor="middle" font-size="8" fill="#2E7D32">(reader role, bounded)</text>
+    <text x="516" y="209" text-anchor="middle" font-size="8" fill="#2E7D32">writes under RLS</text>
+    <text x="516" y="220" text-anchor="middle" font-size="8" fill="#2E7D32">(SET LOCAL)</text>
   </g>
 
   <!-- ==================== TRANSPORT ==================== -->
@@ -260,7 +281,9 @@
     <text x="925" y="462" text-anchor="middle" font-size="8" fill="#4CAF50">MessagePack</text>
     <text x="925" y="490" text-anchor="middle" font-size="8" fill="#4CAF50">aggregate values</text>
     <text x="925" y="518" text-anchor="middle" font-size="8" fill="#4CAF50">snapshot pages,</text>
-    <text x="925" y="530" text-anchor="middle" font-size="8" fill="#4CAF50">keyset + acks (R58)</text>
+    <text x="925" y="530" text-anchor="middle" font-size="8" fill="#4CAF50">keyset + acks</text>
+    <text x="925" y="558" text-anchor="middle" font-size="8" fill="#4CAF50">keyed group results</text>
+    <text x="925" y="570" text-anchor="middle" font-size="8" fill="#4CAF50">(upserts, removals)</text>
   </g>
 
   <!-- ==================== FLOW ARROWS (numbered) ==================== -->
@@ -314,8 +337,9 @@
     <g transform="translate(1008, 120)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
-      <text x="148" y="17" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Aggregate live values</text>
-      <text x="148" y="33" text-anchor="middle" font-size="9" fill="#4CAF50">server-pushed LiveValue&lt;V&gt;</text>
+      <text x="148" y="14" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Aggregate live values</text>
+      <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">server-pushed LiveValue&lt;V&gt;</text>
+      <text x="148" y="40" text-anchor="middle" font-size="8.5" fill="#C62828">keyed and row-shaped handles: not started, R84</text>
     </g>
     <g transform="translate(1320, 120)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
@@ -349,29 +373,32 @@
     <g transform="translate(1325, 252)">
       <rect width="300" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
-      <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Local SQLite</text>
-      <text x="150" y="36" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">diesel</text>
-      <text x="150" y="50" text-anchor="middle" font-size="9" fill="#888">app tables, pending mutations, aggregates</text>
+      <text x="150" y="17" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Local SQLite</text>
+      <text x="150" y="30" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">diesel</text>
+      <text x="150" y="41" text-anchor="middle" font-size="8.5" fill="#888">app tables, pending mutations, aggregates</text>
+      <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#C62828">resting table for server results: not started, R83</text>
     </g>
 
     <!-- At-rest encryption (native) -->
     <g transform="translate(995, 324)">
       <rect width="630" height="100" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="100" rx="1" fill="#4CAF50" />
-      <text x="315" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
-      <text x="315" y="36" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
-      <text x="315" y="52" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
-      <text x="315" y="70" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
-      <text x="315" y="86" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser (R23). Native gates: R51 and R52 not started, R53 blocked on hardware</text>
+      <text x="315" y="16" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
+      <text x="315" y="32" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
+      <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
+      <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
+      <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates: R51 and R52 not started, R53 blocked on hardware</text>
+      <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: not started, R71</text>
     </g>
 
     <!-- Schema pipeline (build time) -->
     <g transform="translate(995, 440)">
       <rect width="630" height="60" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="60" rx="1" fill="#4CAF50" />
-      <text x="315" y="18" text-anchor="middle" font-size="11.5" font-weight="600" fill="#333">Schema pipeline (build time)</text>
-      <text x="315" y="36" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
-      <text x="315" y="51" text-anchor="middle" font-size="8.5" fill="#888">the client is refused without the manifest</text>
+      <text x="315" y="16" text-anchor="middle" font-size="11.5" font-weight="600" fill="#333">Schema pipeline (build time)</text>
+      <text x="315" y="30" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
+      <text x="315" y="43" text-anchor="middle" font-size="8.5" fill="#555">translation emits fail-closed write guards, server applies land exempt (connetto_write_exempt)</text>
+      <text x="315" y="56" text-anchor="middle" font-size="8.5" fill="#888">the client is refused without the manifest</text>
     </g>
 
     <!-- OAuth login and retention -->
@@ -390,16 +417,18 @@
 
     <!-- R26 and R42 -->
     <g transform="translate(995, 588)">
-      <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="52" rx="1" fill="#4CAF50" />
-      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Local data export</text>
-      <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R26: zip archive, rows as a session patchset. Import: R56, next</text>
+      <rect width="300" height="66" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="66" rx="1" fill="#4CAF50" />
+      <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Local data export and import</text>
+      <text x="150" y="30" text-anchor="middle" font-size="8.5" fill="#4CAF50">plain SQLite archive: manifest, synced replica, device tier</text>
+      <text x="150" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">import restores device tier and unsent writes, same account</text>
+      <text x="150" y="56" text-anchor="middle" font-size="8.5" fill="#C62828">portability download: not started, R61</text>
     </g>
     <g transform="translate(1325, 588)">
       <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="52" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
-      <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R42: a switch replaces the DB worker, own account index</text>
+      <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: a switch replaces the DB worker, own account index</text>
     </g>
   </g>
 
@@ -482,7 +511,7 @@
       <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">sqlite3mc over OPFS, SQLCipher v4 file format, per-replica key</text>
       <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, device key wraps the pre-identity refresh store</text>
       <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
-      <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">R23 unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
+      <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
     </g>
 
     <!-- retention and R42 (browser) -->
@@ -496,7 +525,15 @@
       <rect width="296" height="48" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="48" rx="1" fill="#4CAF50" />
       <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
-      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">built, R42: worker asks the tab which account after the gate</text>
+      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the worker asks the tab which account after the gate</text>
+    </g>
+
+    <!-- export and import (browser) -->
+    <g transform="translate(1008, 1276)">
+      <rect width="608" height="36" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="3" height="36" rx="1" fill="#4CAF50" />
+      <text x="304" y="15" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Local data export and import</text>
+      <text x="304" y="29" text-anchor="middle" font-size="8.5" fill="#4CAF50">the same plain SQLite archive through the DB worker, same account only</text>
     </g>
   </g>
 
@@ -555,5 +592,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1538" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-08-22 to the plan's current state.</text>
+  <text x="20" y="1538" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-08-26 to the plan's current state.</text>
 </svg>
