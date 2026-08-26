@@ -431,6 +431,8 @@ where
             && got == sub_id
         {
             return result_json
+                .as_deref()
+                .expect("aggregate value present")
                 .trim()
                 .trim_matches('"')
                 .parse()
