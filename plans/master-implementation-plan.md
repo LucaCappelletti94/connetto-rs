@@ -112,7 +112,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R59~~ **ABSORBED** | Folded into `R58` on 2026-08-21. Written as its sibling, and decision 6 showed paging is what makes a ceiling a policy rather than a crash guard, so it is one phase. The section survives as a pointer recording where each of its five questions was answered, and nothing is left open there (corrected 2026-08-21, when this row still claimed two were open) |
 | any | R60 | A "latest N" subscription syncs the whole table forever and disables its cleanup. Defect demonstrated 2026-08-22 (`retention.rs`, 23 rows held for a 3-row request, `tidy` removes none) and all four questions decided the same day: windowed subscriptions in subql (upstream request written, `docs/upstream-subql-windowed-subscriptions.md`, sending needs its own instruction), the eviction claim becomes the delivered window, the residual pass runs by default on a threshold with the application able to supplant it (superseding R15 D4), and the measure is a cheap applied-rows counter with a crossing event. Also owns the raw-unsubscribe stranding the demonstration exposed |
 | done | ~~R62~~ **DONE** | Completed 2026-08-22. A table keyed only by the implicit rowid was silently never captured: never uploaded if synced, never seen by sibling tabs if device-only. The refusal now runs at open over the replica and the device-private tier, and again before a write travels when either database's `PRAGMA schema_version` moved, and `ClientConfig::with_unrecorded_tables` accepts the tables whose missing key is intentional, restricted to unkeyed ones so the exemption needs no promise held by convention anywhere else. The gap was demonstrated first: a write to an unkeyed table produced no mutation at all |
-| any | R63 | The `R27` rewire: the three subql findings its step 5 surfaced merged upstream 2026-08-19, so the pin moves and connetto swaps its `Materializer::membership_terms` workaround for subql's term planning and seeding APIs, deleting the workaround. A cleanup `R27`'s own section names, split out 2026-08-21 so it is owned |
+| any | R63 | The `R27` rewire. **BUILT 2026-08-23 with one step blocked upstream.** The pin is on subql `8ad31be`, `#40`'s generic `ScalarKind` is carried through 60 mentions, `#38` and `#39` made `rls2fga::translate` fallible so `SetupError::Unplannable` joins the startup refusals, and term seeding goes through `describe_terms` with `Materializer::membership_terms` deleted. Retiring the caller bind and proving the direct dialect are blocked by `upstream/subql-caller-term-subscriber-kind-not-answerable.md`: a caller comparison needs a subscriber built at the compared column's kind, and no public API answers that kind |
+| any | R86 | Adopt the re-run path, so the boot refusal asks the real question. **BUILT 2026-08-23.** The guard refuses on `Shapes::uncovered()`, the re-run returns calling `reconcile_records`, and a replayed withdrawal is proven by breaking it. A replayed change costs 900us against 14.4us settled. The compound-key replay stays unexercised because rls2fga grades a two-column join below the confidence floor |
 | done | ~~R55~~ **DONE** | Containerised test services and CI landed 2026-08-20. Tests that need services provision them through `testcontainers`, the browser stack runner gates `verified_topology.rs`, `connetto-web` and all 21 `wasm-smoke` binaries, and `.github/workflows/ci.yml` runs the hand gate on pull requests. Widened 2026-08-22 after gating `R62` found four jobs covering less than they appeared to: formatting, docs and the nightly lint each ran on a fraction of the workspaces, and `R23`'s passkey driver ran nowhere at all |
 | any | R61 | The portability download, fully designed 2026-08-22: the application registers the person-scope query list, connetto runs it under that identity and produces one zip (plain SQLite rows, reassembled `files/`, a provenance manifest naming the queries). Erasure stays a documented recipe, no function, because connetto cannot verify the list's completeness. Deadline is the first real deployment, the `R31` class, and the file half needs `R65` |
 | done | ~~R43~~ **DONE** | The browser held two handles on one tier file. Found while grounding R17 on 2026-08-07 and landed the same day: the client's attachment is the only handle, the relay serves through it, and a tab write is replayed under the old conflict rule |
@@ -214,7 +215,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R11 shared public store | NOT STARTED | nothing | no |
 | R61 the portability download | NOT STARTED, fully designed (2026-08-22) | wanting it: the deadline is the first real deployment. The file half needs `R65` | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
-| R63 rewire the membership term onto subql's own APIs | NOT STARTED | nothing. Needs the subql pin bump to a revision carrying the three merged findings | landed 2026-08-19 |
+| R63 rewire the membership term onto subql's own APIs | **BUILT** (2026-08-23), one step blocked | `upstream/subql-caller-term-subscriber-kind-not-answerable.md` for step 4 and its proof. Steps 1 to 3 are done and green | landed 2026-08-19, one new request open |
+| R86 adopt the re-run path so the boot refusal asks the real question | **BUILT** (2026-08-23) | nothing. Step 4's compound key waits on the classifier grading a two-column join | landed 2026-08-19 |
 | R15 replica retention and trimming | **DONE** (2026-08-19) | **nothing.** The pin carries all nine APIs the phase uses (`wal_checkpoint`, `WalCheckpointMode`, `auto_vacuum` and its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum`, `vacuum_into`) | merged and pinned |
 | R31 application schema majors and the update path | NOT STARTED | nothing | no |
 | R32 replication slot lifecycle | **DONE** (2026-08-09) | nothing | no |
@@ -237,9 +239,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R78 courier recovery | NOT STARTED | R75 and R77 | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
 | R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
-| R25 device-to-device sync | **DONE** (2026-08-22, as a design) | nothing. R74 to R80 derived on the maintainer's instruction, chapter 19 written. The iOS hotspot zero-coverage field test travels to R80 | no |
-| R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | yes: the GROUP BY/HAVING refusal defect, written and unsent |
-| R82 grouped and re-executed delivery | NOT STARTED | upstream subql phases U0 to U5 | yes: `docs/upstream-subql-grouped-and-reexecution-tiers.md`, unsent |
+| R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | no longer: the GROUP BY/HAVING refusal defect is resolved upstream and adopted (2026-08-25) |
+| R82 grouped and re-executed delivery | **BUILT** (2026-08-26) | one upstream fix for the demotion done-when half: `upstream/subql-install-time-demotion-invisible-to-facade.md` | yes: that finding, unsent |
 | R83 client resting table | NOT STARTED | nothing | no |
 | R84 keyed and row-shaped handles | NOT STARTED | R82 and R83 | no |
 | R85 per-viewer RLS re-execution | NOT STARTED | upstream U6 and R82 | yes: U6 of the same request |
@@ -354,6 +355,7 @@ graph TD
   R2 -.->|registry only| R8
   R48[R48 a truncate empties the client's copy]
   R49[R49 a withdrawn cross-table grant] -->|held-key sub-case only| R7
+  R49 -->|repaired upstream, proof owed| R86[R86 prove the share shape withdraws]
   R50[R50 the policy answers a write it never asks]
   P --> R51[R51 native Apple gate]
   P --> R52[R52 native Android gate]
@@ -1775,6 +1777,8 @@ Docker-gated against `r6-pg` on 55480 and `r6-fga` on 55481: `connetto-server` 1
 ## R49: a withdrawn cross-table grant stays in the authorization store
 
 **Status.** **DONE (2026-08-18).** The finding travelled as `upstream/subql-joined-shape-never-removes.md`, the boot refusal landed, and the re-run-query machinery was deleted with it per D4. What ran is at the end of this section.
+
+**Superseded in part by `R86`, 2026-08-23, and a reader should take that section's word over this one on three points.** Upstream repaired the shape (`rls2fga` PR #6, `subql` PR #36), so the join-table share this phase refused now boots. The refusal no longer asks D3's question: it asks `Shapes::uncovered()`, which refuses a shape settled from one row that no row image can answer, a case this phase's derivation walk waved through. And D4's premise expired: the re-run machinery is reachable again and runs, calling the reconcile upstream added rather than the write that made it a leak.
 
 **Split out of R7's grounding on 2026-08-16.** Blocked on nothing. It blocks R7's held-key sub-case and nothing else.
 
@@ -3220,7 +3224,7 @@ Nine commits, source and tests only, no Markdown and no plan, in the order they 
 
 ## R63: rewire the membership term onto subql's own APIs
 
-**Status.** NOT STARTED. Split out of `R27`'s follow-up note on 2026-08-21 so the cleanup is owned rather than waiting on an unscheduled pin bump.
+**Status.** **BUILT, with one step blocked upstream** (2026-08-23). Steps 1 to 3 landed: the pin is on subql `8ad31be`, the generic `ScalarKind` is carried, and term seeding goes through `describe_terms` with connetto's own extraction deleted. Step 4 and decision 3's test are blocked by `upstream/subql-caller-term-subscriber-kind-not-answerable.md`, written rather than worked around. Split out of `R27`'s follow-up note on 2026-08-21, grounded and decided 2026-08-22 before any code.
 
 **Blocked on nothing.** The three subql findings `R27` step 5 surfaced (`upstream/subql-term-plan-not-queryable-before-registration.md`, `upstream/subql-term-values-doc-recommends-snapshot-seeding.md`, `upstream/subql-direct-caller-comparison-refused-as-unsupported.md`) merged upstream on 2026-08-19.
 
@@ -3228,18 +3232,66 @@ Nine commits, source and tests only, no Markdown and no plan, in the order they 
 
 `R27` serves the membership term end to end through a connetto-side workaround, `Materializer::membership_terms`, built because subql could not yet plan or seed a term at the time. Upstream now can, so the workaround is duplicated machinery that must track subql's behaviour by hand.
 
+### What grounding established, 2026-08-22, before any code
+
+Read from the tree and from subql's `main`, because two of the three decisions turn on it.
+
+- **The upstream replacement is field for field.** `SubscriptionEngine::describe_terms(&SubscriptionRequest) -> Result<Vec<TermDescription>, RegisterError>` (`src/runtime/engine.rs:451`) answers `column`, `member_table`, `member_key`, `member_subject`, `subject_kind` and a runnable `seed_sql`, which is every field of connetto's own `MembershipTerm`. Parity is structural rather than asserted: `describe_terms` and `register` share one private compile path, so a filter the caller is told to seed is a filter `register` accepts. That is what retires the drift the workaround risks.
+- **What the workaround costs today, so the deletion is sized.** `Materializer::membership_terms` (`materializer.rs:1577`) parses the Postgres text with `sqlparser`, walks the conjuncts and resolves each against the catalog. Its consumers are all in `register_subscription` (`session.rs:3353`): the subscriber's kind, the seed read, the publication probe, the mistyped refusal, and the `member_tables` pair list the hidden subscription and the teardown cascade key on.
+- **Seven commits sit between the pinned `2eddc98` and today's `main`, `8ad31be`**, of which three are this phase's (`9fe2ae8`, `a58b638`, `6b0ce94`). The other four are `#36`, `#38`, `#39` and `#40`, and two of them are not free: `#38` adds a refusal for a visibility shape reading a column kind the row side cannot spell, and `#40` makes `ScalarKind` generic (`ScalarKind<C>`, with `BuiltinKind` and `ScalarKindOf<B>`), which connetto names 60 times across 8 files.
+- **No manifest mirror moves.** subql tracks `rls2fga` and `pg2sqlite` on `branch = "main"`, which connetto's `[patch]` block does not patch, so the bump moves them through the lockfiles. That is the path the `indexmap` hazard took during the last pin move, so a lockfile diff is read rather than skimmed.
+- **The bump does not fix `R30`'s finding.** An aggregate carrying `GROUP BY` or `HAVING` is still silently accepted at `main`, per `upstream/subql-group-by-having-silently-dropped.md`. Nothing here changes that and nothing here should be read as having.
+
+### Open questions the discussion settled, 2026-08-22
+
+1. ~~**Which revision does the pin move to?**~~ **DECIDED: today's `main`, `8ad31be`.** One pin move rather than two, and it takes `#36`, `#38` and `#39`'s visibility fixes while the graph is already being disturbed. **Accepted cost, priced rather than assumed: the phase grows a mechanical `ScalarKind` sweep over 60 mentions in 8 files, `#38`'s new refusal may reject a fixture shape the way `R49`'s did, and a failure then has three candidate causes rather than one.** Rejected: `6b0ce94`, the earliest carrying all three findings, which keeps the phase to its two steps and leaves the same four commits for whoever bumps next, mixed with whatever lands after them. Rejected: `6b0ce94` now with a separate phase for the rest, which is a phase for a rename.
+2. ~~**Does the caller-bind workaround retire here?**~~ **DECIDED: yes, in this phase.** The hidden membership subscription is `SELECT * FROM <member_table> WHERE <member_subject> = ?` with the identity bound (`session.rs:3661`), and the comment beside it gives the reason: a filter naming the caller directly would itself be a term and would ask for a seed of its own. `#37` is exactly what makes that false, since a caller comparison now compiles into a term whose value set is the subscriber, self-seeding. So one predicate text serves every subscriber instead of one per identity. **Accepted cost: the hidden subscription becomes a term rather than a plain predicate, so a term opening a term has to be checked, along with `R19`'s charge and the teardown cascade, both of which key on that subscription.** Rejected: keeping the bind and correcting only the comment, which leaves subql holding one predicate per signed-in identity and teaches the next reader that the notes expire. Rejected: a phase of its own, when the interaction is cheapest to check while the term path is open.
+3. ~~**Does the phase prove the dialect the bump newly enables?**~~ **DECIDED: yes, one end-to-end test in the harness.** A direct comparison, `SELECT * FROM items WHERE owner = current_app_user()` with no subquery, was refused until `#37` and now registers and self-seeds. It is the shape a developer writes first and nothing in connetto drives it. The fixture already exists, `term_over_owner_fixture` (`fanout.rs:578`), used today only by the intersection test, so this is a test body rather than a fixture: subscribe, insert a row owned by the caller and assert it arrives, insert one owned by somebody else and assert silence. **Accepted cost: one more Docker-gated test, proving an upstream capability rather than connetto's own code.** Rejected: resting on the two existing term tests, which leaves the natural dialect to be discovered in an application. Rejected: a refusal-parity test, which restates an invariant upstream already holds structurally.
+
 ### Steps
 
-1. **Bump the subql pin** to a revision carrying the three merged findings.
-2. **Rewire term planning and seeding onto subql's APIs**, deleting the `Materializer::membership_terms` workaround and everything only it used, per the clean-cutover rule.
+1. **Bump the subql pin** to `8ad31be`, per decision 1, and read the lockfile diff rather than skimming it.
+2. **Carry `#40`'s generic `ScalarKind`** through the 60 mentions, spelling `BuiltinKind` or `ScalarKindOf<B>` as upstream intends rather than `ScalarKind<NoCustom>`.
+3. **Rewire term planning and seeding onto `describe_terms`**, deleting the `Materializer::membership_terms` workaround and everything only it used, per the clean-cutover rule. connetto keeps what is its own: the publication probe, the mistyped refusal, and the materializer lock held across the seed read and the register (`R27` decision 11).
+4. **Retire the caller bind** in the hidden membership subscription, per decision 2.
 
 ### Proof
 
-`crates/connetto-test-harness/tests/membership_term.rs` stays green in both directions plus the intersection fixture, with the workaround gone, and the gate runs in full since a pin move touches every workspace.
+`crates/connetto-test-harness/tests/membership_term.rs` stays green in both directions plus the intersection fixture, with the workaround gone, and gains the direct-dialect test of decision 3. The gate runs in full, since a pin move touches every workspace, and `#38`'s refusal is watched for on the way through: if it rejects a fixture shape, that stops the phase and is reported rather than worked around.
+
+### What landed, and the block, 2026-08-23
+
+**Steps 1 to 3 are done. Step 4 and decision 3's test are blocked upstream, and the block is a document rather than a workaround: `upstream/subql-caller-term-subscriber-kind-not-answerable.md`.**
+
+**The pin is on `8ad31be`, and the lockfile diff is three lines.** Moving it forced `rls2fga` (`124250f` to `82d3310`) and `sql-traits` with it, because subql tracks both on `main` and connetto patches neither. `cargo update` then re-resolved eight further edges downward under the MSRV-aware resolver, `indexmap 2.14.0` to `1.9.3` for `implicit-clone` among them, which is the hazard the 2026-08-17 record warns about and which breaks `yew` with a missing `From` impl. Each was repointed in the lockfile to what it had been, per that record's own remedy, so the committed diff is the three source moves and nothing else.
+
+**What `#40` cost, as priced: `ScalarKind` is generic now**, and the 60 mentions across 8 files spell `ScalarKindOf<Postgres>` at type positions, which is how upstream says a site names a column type of its backend. Two matches on `Value` gained an arm for the uninhabited `Custom` variant, discharged by matching the never type.
+
+**What `#38` and `#39` cost, which the decision did not foresee.** `rls2fga::translator::translate` is fallible now, so `Translated::of` and `load_records` handle a `PlanningError` and `SetupError` gains `Unplannable`, a startup refusal beside the others: a table whose canonical type name is one a session attribute already claims. No fixture shape was rejected, so the refusal the decision watched for did not fire.
+
+**Step 3 is the deletion the phase existed for.** `Materializer::membership_terms`, `term_of`, `MembershipTerm` and the five helpers only they used are gone, and `Materializer::describe_terms` asks subql instead. The seed loop keeps what is connetto's: the publication probe, the mistyped refusal, and the materializer lock across the read and the register. One behaviour change rides with it, and it is upstream's: `seed_sql` is the subquery verbatim and projects the membership key alone, so the seed reads the first column of each row rather than a catalog ordinal. The two unit tests that pinned the old extraction now pin `describe_terms`.
+
+**Why step 4 stopped.** Retiring the caller bind means rendering the hidden subscription as `WHERE member = current_app_user()`, which `#37` compiles into a self-seeding term. That term still needs a subscriber, and it must be built at the compared column's kind, and `describe_terms` reports only terms a membership table moves, so it describes a caller comparison not at all. Both the hidden subscription and decision 3's test were built, run, and refused with subql's own message. Guessing `String` would serve a text-keyed deployment and meet the kind refusal on a UUID-keyed one, so connetto declines to guess: the bind stays, its comment says why and points at the document, and the test is withdrawn until the answer exists.
+
+**The gate caught a regression step 3 introduced, and it is worth keeping.** Describing runs the plain compiler, which refuses shapes the re-execution wrapper goes on to accept, so consulting `describe_terms` before registering turned every `MIN` and `MAX` aggregate subscription into a refusal (`loop_emu`'s two aggregate tests, with the server's own log naming `MAX aggregate not supported, not delta-composable`). The lesson generalises past this seam: **subql's describing APIs answer for the compiler, not for the engine, so registration stays the only authority on what is accepted.** `session.rs` now takes the description for its terms and drops its error, since anything genuinely refused, term problems included, is re-raised by the register below it through the same compile path.
+
+**The pin move also narrowed `R49`'s startup refusal, which is why a second test failed.** `rls2fga` PR #6 (`2003eff`) settles the join-table share shape from one row and `subql` PR #36 (`eebf774`) reconciles a replay against the slice it determines, both recorded as resolved in `upstream/subql-joined-shape-never-removes.md` since 2026-08-19, so the shape connetto refused at startup now boots. The refusal itself stays and still covers a residual rls2fga cannot settle. Decided with the maintainer 2026-08-23: flip the unit test to pin the narrowing, and own the proof in a new phase rather than growing this one. **`R86`** carries connetto's own Docker-gated withdrawal proof and the replay coverage `R49`'s D4 deleted. Rejected: proving it here (this phase already carries a blocked step and an upstream document), hunting a shape that still refuses (may not exist in a realistic policy), and rolling the pin back (undoes decision 1 and strands the visibility repairs).
+
+### The review round, 2026-08-23
+
+Five checks over the diff, two by agents and the rest by hand. Four things came out of it, and one of them was a real defect this phase introduced.
+
+**The seed read the wrong cell.** Step 3 replaced the old `SELECT *` seed with subql's own `seed_sql`, which projects one column, and the call site was changed to take each decoded row's first value. That was wrong: `snapshot.rs` lowers the read through `pgbinary_patchset_builder`, which writes every cell at its **catalog** ordinal and leaves unprojected columns absent, so the first value is catalog column zero and not the projected one. The fixture hid it, since `project_members` and `team_members` both declared the projected key first. Fixed by moving the choice to the source, where the catalog is: `term_seed` now takes `member_key`, resolves it with `catalog_helpers::column_id`, and returns the admitted values rather than raw rows, so no caller can read a layout it does not own. Both membership fixtures now declare the subject column first, so the projected key never sits at ordinal zero again.
+
+**And measuring that defect found a second thing worth knowing: the seed's value is not observable end to end.** With the seed forced empty, a team joined before the subscription still admits its later rows and a team never joined still does not, because the hidden membership subscription's own snapshot moves the same term. So the seed read duplicates work the hidden subscription already does, which `R27` had no way to notice, since it built the seed first. The new test `the_first_row_of_a_team_already_joined_arrives_live` pins the behaviour and says in its own doc comment that it cannot fail for a seed defect alone. **Whether the seed still earns its cost is an open question this phase does not answer.**
+
+**The startup guard asks the wrong question, which is `R86` step 3's remaining half, now answered: yes.** `unwithdrawable_shapes` refuses `RecordDerivation::Joined` and nothing else, while subql already answers the exact question with `Shapes::uncovered()`, whose own doc calls it "shapes whose records nothing here can keep current". A `FromRow` shape that is not evaluable from a row image is reported there as `UncoveredReason::UnreadableColumn` (`shapes.rs:507`), and connetto never calls `uncovered()` anywhere. An array-membership policy reaches it, since `ValueSource::ListElements` is refused by `records.rs:187`. Not fixed here: widening a startup refusal is `R86`'s work and needs its withdrawal proof, and it belongs beside a decision rather than inside a membership-term phase.
+
+**Two branches this diff added had no test, and now do.** `a_residual_only_sql_can_evaluate_refuses_startup` pins the floor the narrowing leaves, and `a_table_claiming_the_identity_type_name_refuses_startup` pins the new `Unplannable` refusal. A third assertion that accepted either outcome now pins the one the tree gives.
 
 ### Done when
 
-Term planning and seeding go through subql's own APIs, the workaround is deleted, and `R27`'s follow-up note points here.
+Term planning and seeding go through subql's own APIs and the workaround is deleted, both done. The caller bind and the direct-dialect proof wait on the upstream answer, and `R27`'s follow-up note points here.
 
 ---
 
@@ -4881,9 +4933,11 @@ No aggregate path reads without the tier's time bound, proven against a real Pos
 
 ## R82: server delivery of grouped and re-executed results
 
-**Status.** NOT STARTED. Derived 2026-08-22 from R30's tier model on the maintainer's instruction, together with R83 to R85 and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md`.
+**Status.** **BUILT** (2026-08-26). Derived 2026-08-22 from R30's tier model on the maintainer's instruction, together with R83 to R85 and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md`, whose U0 to U12 are all delivered and adopted (subql `0832db4`). Built and proven: the wire's `group_key` is threaded end to end with `result_json: Option<String>` carrying removals, every server-computed movement (fold deltas, extremes, re-read row answers, keyed row changes) flows through one `Dispatched::computed` channel into one delivery path, the group budget is upstream with connetto's default of 1024, demotion is logged and counted (`TIER_TRANSITIONS`), and `grouped_wire.rs` proves the first done-when half over a real loopback (keyed seed, keyed delta on the seed's own key, a group born on the stream, a keyed removal). The named remainder outside this phase's work: the demotion loopback proof is written and `#[ignore]`d on `upstream/subql-install-time-demotion-invisible-to-facade.md`, the facade defect that makes a demoted seed's first answer never arrive. Un-ignore and demonstrate it when the pin moves past the fix, which is also when this phase may claim DONE.
 
-**Blocked on the upstream subql phases U0 to U5** in that request (the `GROUP BY`/`HAVING` refusal, the re-execution captures, and the grouped fold family with budget and demotion).
+**Blocked on** that one upstream fix, for the demotion done-when half only. Everything else is delivered.
+
+**Done-when wording, corrected 2026-08-26.** The second half says a demoted subscription "keeps answering with full results". The adopted shape answers a demoted grouped subscription with keyed per-group upserts served by a whole re-read, so the client-observable contract is sharper than the sentence: the demotion changes how the server computes, never what the client sees, and the log carries the transition. The ignored test asserts exactly that.
 
 ### Purpose
 
@@ -4965,6 +5019,79 @@ A re-executed query is not shared state, so the server can run it under the aski
 ### Done when
 
 The Docker-gated test above is green, and chapter 05's amended decision text matches the delivered behavior.
+
+---
+
+## R86: adopt the re-run path, so the boot refusal can ask the real question
+
+**Status.** **BUILT (2026-08-23), with one step blocked by the classifier rather than by this phase.** Minted while gating `R63`, grounded and scoped with the maintainer the same day, then executed. Steps 1, 2, 3, 5 and 6 are done and green. Step 4's compound-key half is not constructible today, recorded below with the measurement that shows why.
+
+**Blocked on nothing.** Everything it needs is in the pin: `rls2fga` PR #6 (`2003eff`) settles the conservative arms from one row, and `subql` PR #36 (`eebf774`) added `OpenFgaPolicy::reconcile_records`, which is the removal half `R49` found missing. `upstream/subql-joined-shape-never-removes.md` records both as resolved.
+
+### Purpose
+
+`R49` refused at startup every policy shape whose withdrawals could not reach the authorization store, because a deleted share row left the grant behind and the change path kept answering from it. Its `D4` then deleted the re-run machinery as unreachable, since a refused shape can never produce a re-run, and `R27`'s compound-key coverage went with it.
+
+The refusal was always meant to narrow, and the narrowing is not the whole of it. **connetto asks a question that is no longer the right one.** It refuses `RecordDerivation::Joined`, while subql now answers precisely what connetto wants to know, and the two sets are not nested in either direction.
+
+### What grounding established, 2026-08-23, before any code
+
+**The re-run path, read rather than recalled.** `Shapes::diff` returns `added` and `removed`, which one row's two images settle, plus `requeries` for a shape they do not. A `Requery` (`store.rs:143`) carries SQL rls2fga generated, taking the changed row's key as `$1..$n`, and the values to bind. The caller runs it, decodes the rows into facts, and hands them to `reconcile_records` (`openfga.rs:807`), which renders the slice the query's `ReplayScope` declares (`records.rs:614`, either every listed relation on one object or one relation from one subject over an object type), reads that slice back at `HigherConsistency`, deletes what the store holds and the replay no longer states, and writes what it now states, deletes first. Two descriptions claiming one slice are refused at construction rather than left to fight.
+
+**connetto's deleted `replay` is not the thing to restore.** It ran the query and passed the result to `write_records` (commit `9b5c4ec`, which deleted it), so it added facts and never removed one, which is the leak `R49` measured. The call that comes back is the reconcile, not the write.
+
+**The timing contract is already satisfied.** subql requires the reconcile to finish before the event is delivered, since until then the store still answers with the facts from before. connetto already runs `keep_store_current` ahead of delivery and already treats a store it cannot bring level as `AuthUnavailable`, the same class as an unreachable service (`session.rs:2102`). So this is wiring inside `FgaUpkeep::keep_current` rather than a change to the change path.
+
+**`uncovered()` is not a superset of the current walk, which is why the swap is not merely a widening.** It names an unevaluable `FromRow` shape (`UncoveredReason::UnreadableColumn`), a `Joined` shape with no bound query (`NoBoundQuery`), and one whose slice another description also claims (`SharedSlice`). A `Joined` shape that has a bound query and an unshared slice is refused today and boots under `uncovered()`, which is safe only once the re-run is adopted.
+
+**What stays refused is genuinely unserveable, and what starts booting is ordinary.** `R49`'s own arm-by-arm measurement found four of six arms conservative, and upstream has since reclassified them. What remains needs two tables, `ExplicitGrants` above all, where the grant row and the resource row it names are different rows keyed on different columns. That is a `shares(resource, principal)` table, the most ordinary sharing pattern there is.
+
+**The deleted test cannot come back as it was.** `a_replayed_query_binds_every_column_of_a_compound_key` ran on a `ConditionalAttributeGate` fixture (`r27_readings`, `starts_at <= now()`), which upstream's repair reclassifies, so restoring it verbatim would exercise no re-run at all. What it defended, a compound key bound in every column, is what comes back, on whichever path the shape now takes.
+
+**A withdrawal is already asserted here, for a different shape and only half way.** `a_withdrawn_grant_is_refused_at_once_for_both_questions` (`crates/connetto-server/tests/openfga_live.rs:471`) deletes a membership row, runs `keep_current`, and asserts both questions refuse. It never asserts the row leaves a client, and it does not cover the share shape.
+
+### Decisions taken with the maintainer 2026-08-23
+
+**D1, adopt the re-run path rather than refusing what needs it.** The guard asks `Shapes::uncovered()`, the re-run comes back calling `reconcile_records`, and the shapes that need two tables boot. **Cost:** roughly ninety lines of upkeep return three days after `D4` deleted them on the grounds that they were unreachable, which they no longer are, and an affected change pays one Postgres query and one paged store read before delivery. Rejected: refusing on both questions at once, which closes the hole in one small change but makes an explicit-grants schema permanently unbootable to save those ninety lines. Rejected as unsafe: swapping to `uncovered()` alone, which lets a two-table shape boot with nothing reconciling its re-run, reinstating exactly `R49`'s leak.
+
+**D2, measure what an affected change costs, do not assume it.** The per-event cost sits on the path before delivery, so a hot table under an `ExplicitGrants` policy turns a slow store into delivery latency rather than into stale answers. That is the right failure direction and an unmeasured one. **Cost:** one more container-backed test. Rejected: adopting without the number, which leaves the question to be discovered when some table gets hot.
+
+### Steps
+
+1. **Swap the guard to the question subql answers.** `unwithdrawable_shapes` goes, `Shapes::uncovered()` decides, and the refusal message keeps naming the table and saying the refusal narrows later. `a_table_claiming_the_identity_type_name_refuses_startup`, added in `R63`'s review round, stays green, and `R63`'s other refusal test moves with the floor rather than staying put.
+2. **Bring back the re-run, calling the reconcile.** Restore `replay` and `bind_key` from `9b5c4ec` with the decode they used, and hand each requery's records to `reconcile_records` instead of `write_records`. A reconcile that fails takes the existing `AuthUnavailable` path.
+3. **Prove the withdrawal for a share settled from one row**, Docker-gated: a caller holding a share reads it, the share row is deleted, the grant leaves the store, and the row leaves that caller's replica while a caller granted another way keeps it.
+4. **Prove it for a share that needs the re-run**, on an `ExplicitGrants` shape that boots only after step 1, including the compound-key binding `R49`'s deleted test defended.
+5. **Measure the per-event cost** of a change to a table under a re-run shape, and record the number in this section.
+6. **Amend `R49`'s section** so a later reader is not told a shape is refused when it boots, and is not told the machinery is unreachable when it runs.
+
+### What landed, 2026-08-23
+
+**Steps 1 and 2 landed together, because either alone is wrong.** The guard now refuses on `Shapes::uncovered()` (`uncovered_shapes` in `crates/connetto-server/src/openfga.rs`), the index is built once in `Translated::of` and kept, so the guard judges the object the change path uses, and `Translated` lost the five fields only the old walk read. `FgaUpkeep` regained `replay` and `bind_key` from `9b5c4ec`, now handing each requery's records to `reconcile_records` rather than `write_records`.
+
+**The swap moved the floor, in both directions, and both directions are pinned.** `a_grant_read_from_a_list_column_refuses_startup` covers what the old question missed: a grant read out of a list column is settled from one row, so the derivation walk waved it through, while no row image can answer it and it carries no query to fall back on. `a_share_with_a_residual_predicate_boots_since_the_reconcile` covers the other side, the shape the old question over-refused.
+
+**D3, taken in execution: a replayed withdrawal announces wide.** `reconcile_records` returns nothing about what it moved, so connetto cannot name who lost access without reading the slice a second time to difference it. `GrantHolder::Everybody` is what this file already uses for a fact whose holder it cannot resolve, on the recorded grounds that wider than necessary never leaves a row on a device while narrower silently does, so a replayed change announces the tables its scope reaches to everyone subscribed there. **Cost:** a change under a re-run shape can cost a replacement to subscribers whose access never moved. Rejected: reading the slice before the reconcile to difference it here, which doubles the store read on the path before delivery to save replacements that D2's measurement says are already the cheaper half.
+
+**D2's measurement, taken 2026-08-23 against a real Postgres and a real `OpenFGA` on this machine, twenty rounds each.** A change to a table no shape replays costs **14.4 microseconds**. A change under the re-run shape costs **900 microseconds**, about sixty times more, and both sit far inside what a delivery absorbs. `a_replayed_change_costs_more_than_a_settled_one_and_is_measured` keeps the number honest and asserts only the shape of it, that the replay cannot be free and stays under a second, bounded generously on purpose because CI runs it on a shared runner.
+
+**D3 confirmed with the maintainer 2026-08-23, and the narrow answer is asked for upstream.** The wide announcement stays as the behaviour connetto ships, because the safe direction is to refresh too many devices rather than too few, and `upstream/subql-reconcile-does-not-report-what-it-moved.md` asks subql to return what the reconcile added and removed, which it already computes and discards (`openfga.rs:864-883`). The document is written to be usable as the test specification for that change: it names three assertions, including the one that matters most here, that a reconcile changing nothing reports nothing, which is what would let connetto stay silent. Rejected again in the same conversation: differencing the slice inside connetto, which duplicates logic upstream performs a few lines later and doubles the store read on the path before delivery, and remembering the previous replay per slice, which adds invalidated state to a hot path and is wrong across a restart.
+
+**Deviation, step 3 needed half of what it asked for.** The store half already existed: `a_withdrawn_grant_is_refused_at_once_for_both_questions` deletes a membership row and takes both questions. Writing a second one would have duplicated it, so what this phase added is the half nothing covered, `crates/connetto-test-harness/tests/grant_withdrawal.rs`, which drives a real client and asserts the device is told `AuthorizationChange` and the replacement carries nothing.
+
+**Deviation, step 4's compound key is not constructible today, and that is a finding rather than an omission.** A replay keyed on two columns needs a two-column join, and rls2fga grades that clause below connetto's confidence floor, so the boot refuses it as untranslated before any of this is reached (measured, `ClauseBelowThreshold` at confidence D). The replay shape that does boot keys on one column. `bind_key` still loops over the whole key, so a composite key is carried by construction and exercised by nothing, which is exactly where `R49`'s deleted test left it. **The coverage cannot come back until the classifier grades that join, and it is a different blocker from the one `R49` recorded.** Isolated 2026-08-23 and asked upstream as `upstream/rls2fga-two-column-join-graded-below-threshold.md`: the second join column alone causes it, with no residual involved, and the same grading keeps three other branches of this phase unreachable, the conditional decode, the subject-scoped slice, and both refusal sentences for a shape with no query or a shared slice. **The wider cost is not the coverage: a share table keyed by tenant and resource cannot boot connetto at all today.**
+
+**The failure path is proven too, after the review round asked for it.** `a_replay_that_cannot_run_refuses_rather_than_letting_the_row_through` takes the share table away and asserts the upkeep reports the replay rather than succeeding, which is the entry to a chain `auth_retry` already proves: an error here becomes `SessionError::AuthUnavailable`, holds the cursor, and broadcasts `DeliveryPaused`. The staging is a dropped table, which is what a revoked grant looks like from the replay's side.
+
+**What the re-run test proves, checked by breaking it.** Swapping `reconcile_records` back for `write_records` makes `a_replayed_share_is_withdrawn_when_its_row_goes` fail with the caller still allowed after the row is gone, which is `R49`'s original measurement reproduced on demand.
+
+### Proof
+
+Both withdrawal tests are green against a real Postgres and a real `OpenFGA`, the one that needs the re-run failing to boot before step 1 and passing after it. The compound-key binding is exercised again. The per-event cost is a number in this section rather than an expectation. `R63`'s two refusal tests still fire, so the guard swap took nothing away.
+
+### Done when
+
+A share that spans two tables boots, stays correct when it is withdrawn, and costs a measured amount to keep so. connetto proves both withdrawals for itself instead of borrowing upstream's, and no document claims a refusal that no longer fires or machinery that no longer sits unreachable.
 
 ---
 
@@ -5215,6 +5342,28 @@ Done as a design, and derived. The subql side is phased in `docs/upstream-subql-
 ### Done when
 
 The failover test is green against a real primary-standby pair, the recipe is written, chapter 11 matches it, multi-master is scoped out in so many words, and X7 is closed.
+
+---
+
+# The 2026-08-25 subql adoption: grouped aggregates, read tiers, and the facade
+
+Not a phase. The R30-derived upstream work landed in subql and this records what adopting it cost and found. Completed 2026-08-26: U11 and U12 landed and were adopted, the R81 seed-tier split was restored, the grouped wire proof exists, and one new upstream finding per dependency remains recorded below.
+
+**The pins moved.** subql `8ad31be` to `4a500ee` (#41, the grouped and membership surface) to `2daba59` (U7 to U9) to `1e5382f` (`describe_terms` passthrough, U10) to `0832db4` (U11 the ungrouped fold channel through the facade, U12 bare `ORDER BY` staying in process). rls2fga branch pin resolved to `a028e3a` (the `Reconciled` report), pg2sqlite followed its branch pin to `e8151c16` and then, on 2026-08-26, to `6831231` (the write-exemption fix below), sql-traits followed its branch pin, and `sqlparser` moved to the apache branch head sql-traits compiles against. **The R40 `indexmap` hazard fired twice**, once per full `cargo update`, and the fix is the recorded lockfile edge repoint on `implicit-clone` back to `indexmap 2.14.0` (the targeted `cargo update -p pg2sqlite` did not fire it).
+
+**The architecture moved onto subql's auto-resolving facade.** The materializer hosts `AutoResolvingEngine` in async mode: registration answers with a `Tier`, dispatch returns every channel resolved (the engine drives its own reads inline, under the materializer lock, which is the recorded measured-risk item whose exit is `docs/upstream-subql-nonblocking-read-tier-drive.md`). `PgReadConnector` as an implementation is deleted: it is now an alias for `PgAsyncDieselConnector<ConnettoReadSetup>`, the shipped connector carrying connetto's `SET LOCAL statement_timeout` through the session-setup seam, which is also where R85's per-viewer identity will ride. connetto's own fold bookkeeping (`expect_aggregate`, `install_aggregate`, the pending-delta buffers) is deleted: the engine buffers changes during a seed read and reconciles them against the read's position. One `unregister(sub_id)` covers every tier. The wire's `AggregateUpdate.result_json` became `Option<String>` (`None` removes the addressed key), and `TermSeed`/`TermMove` carry column tuples for composite membership keys.
+
+**Behavior changes riding the adoption.** Grouped `GROUP BY`/`HAVING` queries register and fold (the R30 defect is structurally gone, pinned by `subscription_translate.rs`), a latest-N query registers as a read tier instead of silently syncing the whole table (the R60 defect closure, pinned there too, and the retention characterization test reframed onto the surviving filterless-subscription contract), the grant-change replay sends a resync notice only when `reconcile_records` reports movement, and a deterministic read timeout ends its one subscription instead of live-locking dispatch.
+
+**The two U11/U12 holes are closed and adopted.** All thirteen tests that reproduced them pass at `0832db4`, `registers_the_exact_shape_diesel_renders` expects rows again for order-only queries, and `a_change_during_an_aggregate_bootstrap_is_counted` pins the buffered-seed guarantee (the engine replays the in-flight change, so the first frame counts it).
+
+**The adoption had flattened R81 decision 2, restored 2026-08-26.** Routing every computed seed through the engine put a scalar (`MIN`/`MAX`) seed under the shared re-execution bound, and `read_ceiling.rs::aggregates` (that decision's recorded proofs, Docker-gated so they first ran in this sweep) caught it. `SeedPlan` regained a `Scalar { sql, kind }` arm: the session reads the seed through its own connector under the subscribing caller's tier and installs it with the new `Materializer::install_scalar`, while grouped and row tiers keep the engine bootstrap under the shared bound. Two log-shape assertions moved to the unified wording (`"a computed subscription's read was refused, ending the subscription"` in `refuse_computed`, `"computed bootstrap failed"` in `refuse_computed_subscribe`).
+
+**R82's done-when is now proven at the wire.** `crates/connetto-server/tests/grouped_wire.rs` drives a loopback session over the fixture Postgres: the grouped seed arrives as a keyed upsert, a delta addresses the seed's own key, a group born on the change stream appears under a new key, and emptying it arrives as a keyed removal. The demotion leg is written and `#[ignore]`d: it exposed a NEW upstream defect, `upstream/subql-install-time-demotion-invisible-to-facade.md`, reproduced at subql level with a minimal probe. A fold seed that demotes at install (groups already past the budget) updates the inner engine, but the facade's `Install` passthrough never applies the transition to its own context, so the follow-up `snapshot()` answers `None` and the subscribing client waits forever. Unresolved, and the only remaining hole from this adoption.
+
+**pg2sqlite's new backing-table check triggers broke the authoritative apply, found in this sweep and resolved upstream the same day.** `upstream/pg2sqlite-backing-table-check-triggers-break-authoritative-apply.md` (RESOLVED): `e5eaf75` made every server download of a row the caller may see but not write abort, failing five committed client tests. The durable upstream shape is scoped write exemptions (`with_write_exemption_function`), adopted here as `connetto_client::WRITE_EXEMPTION_FUNCTION` (`connetto_write_exempt`): registered on every replica connection, nondeterministic and innocuous, backed by a flag the capture-suspension guard holds true, so exactly connetto's own writes land underneath the policy. The test translations and the four demo builds opt in (the build scripts hardcode the name with a comment, since a build script should not depend on the client crate). `local_insert_still_obeys_the_owner_check` proves the local net still judges application writes. The contract paragraph in `docs/architecture/08-authorization.md` is amended in place.
+
+**Gates run on the final pins (subql `0832db4`, pg2sqlite `6831231`):** fmt, nightly clippy `-D warnings`, and `RUSTDOCFLAGS="-D warnings" doc` clean, wasm checks green (`crates/connetto-web` and the four example workspaces, the native dioxus demo included). The per-file Docker-gated sweep (keyring-wedge files `secret_stores`, `revocation`, `e2e` skipped per the 2026-08-17 record, runnable under `keyctl session` as amended there): every connetto-client, connetto-server, connetto-test-harness, connetto-core, and connetto-dioxus file passes, including the five pg2sqlite-blocked tests after the repin and R81's three `read_ceiling::aggregates` proofs. One `cdc_reconnect` failure inside the long sweep did not reproduce in isolation or on re-run (a lingering walsender from the preceding file's fixture).
 
 ---
 
