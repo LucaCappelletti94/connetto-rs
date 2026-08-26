@@ -505,8 +505,9 @@ struct LiveEntry<T: Transport> {
 }
 
 /// Driver-side apply callback of one live value: decode the pushed JSON and
-/// publish it when it differs from the current value.
-type ApplyValue = Box<dyn FnMut(&str) -> Result<(), ClientError> + Send>;
+/// publish it when it differs from the current value. `None` clears the value
+/// (the server reported that the addressed key left the result set).
+type ApplyValue = Box<dyn FnMut(Option<&str>) -> Result<(), ClientError> + Send>;
 
 /// One live value handle's driver-side state, with the id of the shared wire
 /// subscription that feeds it (the target of aggregate pushes and what a drop
@@ -1324,15 +1325,13 @@ where
         let value = Arc::new(RwLock::new(None::<V>));
         let (tx, rx) = watch::channel(0_u64);
         let apply_value = Arc::clone(&value);
-        let mut apply: ApplyValue = Box::new(move |json: &str| {
-            let fresh: V = decode(json)?;
-            let unchanged = apply_value
-                .read()
-                .is_ok_and(|current| current.as_ref() == Some(&fresh));
+        let mut apply: ApplyValue = Box::new(move |json: Option<&str>| {
+            let fresh: Option<V> = json.map(decode).transpose()?;
+            let unchanged = apply_value.read().is_ok_and(|current| *current == fresh);
             if !unchanged {
                 match apply_value.write() {
-                    Ok(mut value) => *value = Some(fresh),
-                    Err(poisoned) => *poisoned.into_inner() = Some(fresh),
+                    Ok(mut value) => *value = fresh,
+                    Err(poisoned) => *poisoned.into_inner() = fresh,
                 }
                 tx.send_modify(|generation| *generation += 1);
             }
@@ -1370,7 +1369,7 @@ where
                 Err(poisoned) => *poisoned.into_inner() = Some(bootstrap),
             }
             let refresh = Box::new(move |conn: &mut ConnettoConnection<T>| {
-                apply(&run_probe(conn.conn(), &probe)?)
+                apply(Some(&run_probe(conn.conn(), &probe)?))
             });
             state.registry.push(LiveEntry {
                 sub_id: sub_id.clone(),
@@ -1845,6 +1844,11 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
 
 /// Route an aggregate push to its live value handle before the broadcast,
 /// so observers of both see the same order.
+///
+/// Grouped frames (`group_key: Some`) are for the typed grouped consumer
+/// (R84) and are silently skipped here: the scalar `LiveValue` path does
+/// not decode per-group rows. A removal frame (`result_json: None`,
+/// `group_key: None`) clears the live value to no-value.
 fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
 where
     T: Transport,
@@ -1852,20 +1856,25 @@ where
     let ClientEvent::Aggregate {
         sub_id,
         result_json,
+        group_key,
         ..
     } = event
     else {
         return;
     };
-    // Cache the last result on the wire sub so a value handle joining later
-    // resolves immediately, since the server pushes the bootstrap only once.
+    // Grouped frames are not for this path.
+    if group_key.is_some() {
+        return;
+    }
+    // Update the cache. A removal clears it so a late joiner starts with
+    // no-value rather than a stale prior push.
     if let Some(wire) = state.wire.iter_mut().find(|w| w.wire_id == *sub_id) {
-        wire.last_agg = Some(result_json.clone());
+        wire.last_agg.clone_from(result_json);
     }
     // Fan out to every value handle sharing this wire sub, each with its own
     // decoder and typed value, not just the first.
     for entry in state.values.iter_mut().filter(|e| e.wire_id == *sub_id) {
-        if let Err(err) = (entry.apply)(result_json) {
+        if let Err(err) = (entry.apply)(result_json.as_deref()) {
             let _ = shared.events.send(ClientEvent::NonFatal {
                 related_to: Some(entry.sub_id.clone()),
                 detail: format!("live value update failed: {err}"),

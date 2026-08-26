@@ -68,6 +68,12 @@ pub static AUTHORIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
 /// row-level security can answer about.
 pub static VISIBILITY_DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
 
+/// Maintenance-tier transitions: a subscription that outgrew its fold budget
+/// or lost an image it needed and now answers by database read (R30's
+/// demotion). Correctness is unchanged, cost is not, which is why this is a
+/// counter beside a log line rather than a client-visible signal.
+pub static TIER_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Increment `counter` by `n`, relaxed.
 #[inline]
 pub fn add(counter: &AtomicU64, n: u64) {

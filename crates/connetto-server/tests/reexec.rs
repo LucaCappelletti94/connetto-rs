@@ -15,32 +15,34 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PageSpec, ReadBudget, RequestGuard, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ConnettoReadSetup, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
-use subql::backend::{Postgres, ScalarKindOf, Value as PgValue};
-use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
+use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::reexec::{AsyncConnector, RowPage, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
 
 /// A connector that answers `execute_scalar` from a queue of canned integers.
+/// Backed by an `Arc` so it can be cloned for the materializer and the session.
+#[derive(Clone)]
 struct QueuedConnector {
-    responses: Mutex<VecDeque<i64>>,
+    responses: Arc<Mutex<VecDeque<i64>>>,
 }
 
 impl QueuedConnector {
     fn new(responses: impl IntoIterator<Item = i64>) -> Self {
         Self {
-            responses: Mutex::new(responses.into_iter().collect()),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
         }
     }
 }
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for QueuedConnector {
-    type AuthContext = ReadBudget;
+    type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -48,8 +50,8 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKindOf<Postgres>,
-        _budget: &ReadBudget,
+        _kind: BuiltinKind,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -60,18 +62,15 @@ impl AsyncConnector for QueuedConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
-        _budget: &ReadBudget,
+        _max_bytes: usize,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
     > + Send {
-        async {
-            Err(std::io::Error::other(
-                "execute_rows not used in reexec tests",
-            ))
-        }
+        async { Err(std::io::Error::other("read_page not used in reexec tests")) }
     }
 }
 
@@ -128,7 +127,7 @@ fn aggregate_value(msg: ControlMessage) -> String {
         ControlMessage::AggregateUpdate(update) => {
             assert_eq!(update.sub_id, "cheapest");
             assert!(update.is_full_result);
-            update.result_json
+            update.result_json.expect("non-null aggregate result")
         }
         other => panic!("expected aggregate update, got {other:?}"),
     }
@@ -147,9 +146,16 @@ async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reexec_bootstraps_folds_and_retriggers() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    // Bootstrap answers 10, the re-execution after the delete answers 20.
     let connector = QueuedConnector::new([10, 20]);
+    // Bootstrap answers 10, the re-execution after the delete answers 20.
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(

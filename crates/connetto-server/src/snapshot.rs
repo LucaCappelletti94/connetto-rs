@@ -855,7 +855,7 @@ mod pg {
             &self,
             seed_sql: &str,
             member_table: &str,
-            member_key: &str,
+            member_keys: &[String],
             caller: &Principal<Id, Key>,
         ) -> Result<Option<TermSeedRead>, SnapshotError> {
             let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
@@ -906,14 +906,14 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             // Lower through the same encoder the snapshot uses, so a seed
-            // value and the same value delivered on the change path are one
+            // cell and the same value delivered on the change path are one
             // value, and the term lookup keyed by it matches. The encoder
             // writes each cell at its catalog ordinal and leaves every column
-            // the seed did not project absent, so the projected column is
+            // the seed did not project absent, so each projected column is
             // found by name and never by result position.
             let column_names = read.column_names();
             let cells = read.cells();
-            let mut values = Vec::with_capacity(cells.len());
+            let mut rows = Vec::with_capacity(cells.len());
             if !cells.is_empty() {
                 let member_table_id = catalog_helpers::table_id(&self.catalog, member_table)
                     .ok_or_else(|| {
@@ -921,13 +921,18 @@ mod pg {
                             "the membership table {member_table} is not in the catalog"
                         ))
                     })?;
-                let key_ordinal =
-                    catalog_helpers::column_id(&self.catalog, member_table_id, member_key)
-                        .ok_or_else(|| {
-                            SnapshotError::Encode(format!(
-                                "the seed projects {member_key}, which {member_table} does not have"
-                            ))
-                        })? as usize;
+                let mut key_ordinals = Vec::with_capacity(member_keys.len());
+                for member_key in member_keys {
+                    let ordinal =
+                        catalog_helpers::column_id(&self.catalog, member_table_id, member_key)
+                            .ok_or_else(|| {
+                                SnapshotError::Encode(format!(
+                                    "the seed projects {member_key}, which {member_table} does \
+                                     not have"
+                                ))
+                            })?;
+                    key_ordinals.push(usize::from(ordinal));
+                }
                 let built = subql::emit::pgbinary_patchset_builder(
                     &self.catalog,
                     member_table,
@@ -942,14 +947,19 @@ mod pg {
                         ));
                     };
                     let row = crate::pk::row_from_wire(&self.catalog, member_table_id, cells);
-                    values.push(row.get(key_ordinal).cloned().ok_or_else(|| {
-                        SnapshotError::Encode(format!(
-                            "the decoded membership row has no column at {member_key}'s ordinal"
-                        ))
-                    })?);
+                    let mut tuple = Vec::with_capacity(key_ordinals.len());
+                    for (ordinal, member_key) in key_ordinals.iter().zip(member_keys) {
+                        tuple.push(row.get(*ordinal).cloned().ok_or_else(|| {
+                            SnapshotError::Encode(format!(
+                                "the decoded membership row has no column at {member_key}'s \
+                                 ordinal"
+                            ))
+                        })?);
+                    }
+                    rows.push(tuple);
                 }
             }
-            Ok(Some(TermSeedRead { values, published }))
+            Ok(Some(TermSeedRead { rows, published }))
         }
     }
 }

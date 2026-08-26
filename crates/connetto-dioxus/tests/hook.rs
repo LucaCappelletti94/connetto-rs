@@ -16,15 +16,16 @@ use connetto_core::{
 };
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    Materializer, PageSpec, ReadBudget, RequestGuard, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
+    ConnettoReadSetup, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::backend::{Postgres, ScalarKindOf, Value as PgValue};
-use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
+use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::reexec::{AsyncConnector, RowPage, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -143,13 +144,14 @@ impl SnapshotSource for SeedOneOrder {
 }
 
 /// Serves only the multi-column aggregate seed, from a queue of canned rows.
+#[derive(Clone)]
 struct SeedRows {
-    rows: StdMutex<Vec<Vec<PgValue<Postgres>>>>,
+    rows: Arc<StdMutex<Vec<Vec<PgValue<Postgres>>>>>,
 }
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for SeedRows {
-    type AuthContext = ReadBudget;
+    type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -157,20 +159,21 @@ impl AsyncConnector for SeedRows {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKindOf<Postgres>,
-        _budget: &ReadBudget,
+        _kind: BuiltinKind,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("not used")) }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
-        _budget: &ReadBudget,
+        _max_bytes: usize,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("not used")) }
     }
@@ -178,8 +181,8 @@ impl AsyncConnector for SeedRows {
     fn execute_scalar_row(
         &self,
         _sql: &str,
-        _kinds: &[ScalarKindOf<Postgres>],
-        _budget: &ReadBudget,
+        _kinds: &[BuiltinKind],
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {
@@ -263,11 +266,18 @@ async fn render_until(vdom: &mut VirtualDom, pred: impl Fn(&str) -> bool) -> Str
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_live_renders_and_follows_cdc() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = SeedRows {
         // COUNT(*) seed over the empty backend.
-        rows: StdMutex::new(vec![vec![PgValue::Int(0)]]),
+        rows: Arc::new(StdMutex::new(vec![vec![PgValue::Int(0)]])),
     };
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(

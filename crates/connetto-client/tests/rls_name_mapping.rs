@@ -14,7 +14,11 @@
 //! `Pg2Sqlite::translation_manifest` exports the logical to physical map
 //! and `ParsedDiffSet::rename_tables` rewrites the bytes, both directions.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use diesel::connection::SimpleConnection;
+use diesel::sqlite::SqliteFunctionBehavior;
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{ConflictAction, ConflictType, SqliteSessionExt};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
@@ -66,14 +70,27 @@ fn options() -> Pg2SqliteOptions {
             "current_app_user",
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
+        // The download boundary: the apply below holds this function true
+        // while it lands server-authoritative rows, exactly as connetto's
+        // own apply does through its suspension guard.
+        .with_write_exemption_function(connetto_client::WRITE_EXEMPTION_FUNCTION)
 }
 
 /// Translate `ddl` and execute every emitted statement on a fresh in-memory
-/// connection with `current_app_user()` registered to return `user`.
-fn build_db(ddl: &str, user: &'static str) -> SqliteConnection {
+/// connection with `current_app_user()` registered to return `user` and the
+/// write exemption registered over the returned flag, false at rest.
+fn build_db(ddl: &str, user: &'static str) -> (SqliteConnection, Arc<AtomicBool>) {
     let mut conn = SqliteConnection::establish(":memory:").expect("open sqlite");
     current_app_user_utils::register_nondeterministic_impl(&mut conn, move || user.to_string())
         .expect("register current_app_user");
+    let exempt = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&exempt);
+    conn.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+        connetto_client::WRITE_EXEMPTION_FUNCTION,
+        SqliteFunctionBehavior::INNOCUOUS,
+        move || flag.load(Ordering::Relaxed),
+    )
+    .expect("register the write exemption");
     let statements = Pg2Sqlite::default()
         .sql(ddl)
         .expect("parse postgres ddl")
@@ -83,7 +100,7 @@ fn build_db(ddl: &str, user: &'static str) -> SqliteConnection {
         conn.batch_execute(statement)
             .unwrap_or_else(|e| panic!("ddl failed: {e}\n{statement}"));
     }
-    conn
+    (conn, exempt)
 }
 
 /// The logical to physical map for the policy-bearing document.
@@ -150,11 +167,11 @@ fn server_changeset(server: &mut SqliteConnection) -> Vec<u8> {
 #[test]
 fn logical_changeset_without_rename_is_silently_dropped() {
     let (logical, physical) = orders_mapping();
-    let mut server = build_db(PG_DDL_PLAIN, "alice");
+    let (mut server, _) = build_db(PG_DDL_PLAIN, "alice");
     let changeset = server_changeset(&mut server);
 
     let conflicts = std::cell::Cell::new(0u32);
-    let mut replica = build_db(PG_DDL, "alice");
+    let (mut replica, _) = build_db(PG_DDL, "alice");
     replica
         .apply_changeset(&changeset, |conflict: ConflictType| {
             conflicts.set(conflicts.get() + 1);
@@ -184,7 +201,7 @@ fn logical_changeset_without_rename_is_silently_dropped() {
 #[test]
 fn renamed_changeset_lands_in_backing_table_and_view_filters() {
     let (logical, physical) = orders_mapping();
-    let mut server = build_db(PG_DDL_PLAIN, "alice");
+    let (mut server, _) = build_db(PG_DDL_PLAIN, "alice");
     let changeset = server_changeset(&mut server);
 
     let mut parsed = ParsedDiffSet::parse(&changeset).expect("parse changeset");
@@ -192,10 +209,13 @@ fn renamed_changeset_lands_in_backing_table_and_view_filters() {
     assert_eq!(renamed, 1, "exactly the orders section is renamed");
     let rewritten: Vec<u8> = parsed.into();
 
-    let mut replica = build_db(PG_DDL, "alice");
+    let (mut replica, exempt) = build_db(PG_DDL, "alice");
+    // The download boundary holds the exemption, as connetto's own apply does.
+    exempt.store(true, Ordering::Relaxed);
     replica
         .apply_changeset(&rewritten, abort_on_conflict)
         .expect("apply renamed changeset");
+    exempt.store(false, Ordering::Relaxed);
 
     assert_eq!(
         count(&mut replica, &physical),
@@ -221,7 +241,7 @@ fn renamed_changeset_lands_in_backing_table_and_view_filters() {
 fn captured_local_write_renames_back_to_logical() {
     let (logical, physical) = orders_mapping();
 
-    let mut replica = build_db(PG_DDL, "alice");
+    let (mut replica, _) = build_db(PG_DDL, "alice");
     let mut capture = replica.create_session().expect("capture session");
     capture.attach_all().expect("attach");
     diesel::sql_query(format!(
@@ -247,7 +267,7 @@ fn captured_local_write_renames_back_to_logical() {
     assert_eq!(renamed, 1);
     let rewritten: Vec<u8> = parsed.into();
 
-    let mut server = build_db(PG_DDL_PLAIN, "alice");
+    let (mut server, _) = build_db(PG_DDL_PLAIN, "alice");
     server
         .apply_changeset(&rewritten, abort_on_conflict)
         .expect("apply upload");

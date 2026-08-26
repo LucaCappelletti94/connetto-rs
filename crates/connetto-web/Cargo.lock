@@ -506,12 +506,17 @@ name = "diesel"
 version = "2.3.12"
 source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
+ "bigdecimal",
  "bitflags",
  "byteorder",
+ "chrono",
  "diesel_derives",
  "downcast-rs",
  "itoa",
  "libsqlite3-sys",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "serde_json",
  "sqlite-wasm-rs",
  "time",
@@ -1327,12 +1332,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#124250f93af33bdd9c3a72d76526863122aaf720"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
 dependencies = [
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror",
 ]
 
 [[package]]
@@ -1558,7 +1564,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f903bceb33771214031f9b39cd6aa26dbe2752fa"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#88c01710e1dd077af608bb462c604c813df7e22e"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -1620,7 +1626,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "log",
  "recursive",
@@ -1631,7 +1637,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1666,7 +1672,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=8ad31be70f60146871b2131688c2aa74d043e5d5#8ad31be70f60146871b2131688c2aa74d043e5d5"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f#3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f"
 dependencies = [
  "arc-swap",
  "async-lock",

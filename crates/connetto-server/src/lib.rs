@@ -75,10 +75,9 @@ pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
 pub use materializer::{
-    AggregateCapture, AggregateChange, DeltaAggregateCapture, DeltaAggregateChange, Dispatched,
-    MatchedPatch, Materializer, MaterializerError, PendingReExec, Registration,
-    RuntimeVersionColumn, RuntimeWritableCatalog, RuntimeWritableCatalogBuilder,
-    SqliteRegistration,
+    ComputedCapture, ComputedChange, Dispatched, FoldSeeded, MatchedPatch, Materializer,
+    MaterializerError, ReadConnector, Registration, RuntimeVersionColumn, RuntimeWritableCatalog,
+    RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
 };
 pub use oplog::{
     CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, InMemoryOplog, Oplog,
@@ -86,11 +85,11 @@ pub use oplog::{
 };
 pub use oplog::{PgOplog, PgOplogError};
 pub use preflight::{Artifact, PreflightError};
-pub use reexec::{PgReadConnector, ReadBudget, ReadError, TimedOutRead};
+pub use reexec::{ConnettoReadSetup, NoConnector, PgReadConnector, ReadBudget, TimedOutRead};
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
-    NoConnector, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
+    PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
 };
 pub use slot::{SlotError, SlotLag};

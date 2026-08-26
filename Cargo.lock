@@ -703,6 +703,7 @@ dependencies = [
  "parking_lot",
  "pg2sqlite",
  "pg_walstream",
+ "postcard",
  "ring",
  "rls2fga",
  "rmp-serde",
@@ -1180,6 +1181,15 @@ dependencies = [
  "scoped-futures",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "diesel-dynamic-schema"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "030a2287b125235908614c5f32f9b3bdc43c4d639846853d66e8a68c75a02756"
+dependencies = [
+ "diesel",
 ]
 
 [[package]]
@@ -3640,7 +3650,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -3891,7 +3901,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#789e5a2e5b65e224a1abe047b84018b81a66aa77"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#683123173c611c03f0784ce7cc45e1fabb01d3bd"
 dependencies = [
  "git2",
  "sql-traits",
@@ -4706,13 +4716,14 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#82d33101b0dce40b17c9228bbcdec62868a7ea6d"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
 dependencies = [
  "openfga-client",
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5364,7 +5375,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f9fb65d61bf66b2896a582884fd6bb4ea85c0bde"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#88c01710e1dd077af608bb462c604c813df7e22e"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -5413,7 +5424,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "log",
  "recursive",
@@ -5424,7 +5435,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5499,7 +5510,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=8ad31be70f60146871b2131688c2aa74d043e5d5#8ad31be70f60146871b2131688c2aa74d043e5d5"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f#3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -5508,11 +5519,13 @@ dependencies = [
  "chrono",
  "diesel",
  "diesel-async",
+ "diesel-dynamic-schema",
  "diesel-sqlite-session",
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
  "openfga-client",
+ "parking_lot",
  "pg2sqlite",
  "pg_walstream",
  "postcard",

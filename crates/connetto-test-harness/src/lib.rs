@@ -912,15 +912,14 @@ pub fn spawn_server(
         translator,
         caller,
     } = config;
-    let materializer = match translator {
-        Some(translator) => Materializer::with_translation(&pg_ddl, writable, translator, caller)
-            .expect("build materializer"),
-        None => Materializer::with_write_catalog(&pg_ddl, writable).expect("build materializer"),
-    };
+    let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
+    let materializer =
+        Materializer::with_read_connector(&pg_ddl, writable, translator, caller, engine_connector)
+            .expect("build materializer");
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
-    let connector = PgReadConnector::new(connector_pool);
+    let connector = PgReadConnector::with_session_setup(connector_pool);
     // The manager requires a handshake authority with no default (R2). The
     // harness is test-only, so it installs the `test-support` stand-in that
     // reads the subject out of the grant string, which is what

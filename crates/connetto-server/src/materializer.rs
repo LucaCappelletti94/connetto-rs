@@ -48,17 +48,22 @@ use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
-use subql::backend::{CdcEvent, Postgres, RowKind, ScalarKind, ScalarKindOf, Value as PgValue};
+use subql::backend::{
+    BuiltinKind, CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue, encode_value_key,
+};
 use subql::emit::{
     WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
 };
 use subql::patchset::SqliteAdapter;
-use subql::reexec::{ReExecEngine, ReExecQueryId, Registered};
+use subql::reexec::{AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, RowsUpdate};
 use subql::{
-    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, ChangeEvent, DatabaseLike, DefaultIds,
-    OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId,
-    TableLike, catalog_helpers,
+    AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
+    ChangeEvent, DatabaseLike, DefaultIds, MaintenanceTransition, OpaqueCheckpoint, ParserDB,
+    SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
+    catalog_helpers,
 };
+
+use crate::reexec::ReadBudget;
 
 use crate::oplog::ChangeRecord;
 
@@ -114,6 +119,21 @@ pub enum MaterializerError {
     /// translated to Postgres for `subql`.
     #[error("subscription query translation failed: {0}")]
     Translate(String),
+    /// A database read the engine drove through its connector failed for one
+    /// subscription. `timed_out` distinguishes policy from outage (R81
+    /// decision 3): a timeout ends that subscription, an outage is retried.
+    #[error("re-execution read failed for subscription {subscription}: {detail}")]
+    Read {
+        /// The subscription whose triggered read failed.
+        subscription: SubscriptionId,
+        /// Whether the database cancelled the read at connetto's own limit.
+        timed_out: bool,
+        /// The connector's failure text.
+        detail: String,
+    },
+    /// A seed or re-read result the engine refused to install.
+    #[error("result installation refused: {0}")]
+    Install(String),
 }
 
 /// One matched, folded patch produced by [`Materializer::dispatch`].
@@ -323,119 +343,132 @@ pub struct SqliteRegistration {
 pub enum Registration {
     /// A row subscription the engine maintains directly, keyed for CDC routing.
     Row(SubscriptionId),
-    /// A captured single-table scalar aggregate the materializer must bootstrap
-    /// and re-execute through a connector.
-    Aggregate(AggregateCapture),
-    /// A single-table delta aggregate the materializer maintains in-process by
-    /// folding per-event deltas into a seeded accumulator (`COUNT`, `SUM`,
-    /// `AVG`, and the variance and stddev family).
-    DeltaAggregate(DeltaAggregateCapture),
+    /// A server-computed subscription: any tier whose answer the client cannot
+    /// derive from replica rows. Aggregates grouped and ungrouped, extremes,
+    /// and captured row-shaped reads all classify here, differing only in how
+    /// their first answer is produced ([`SeedPlan`]).
+    Computed(ComputedCapture),
 }
 
-/// A captured aggregate query awaiting bootstrap.
-pub struct AggregateCapture {
-    /// Engine-assigned id for the captured query.
-    pub query_id: ReExecQueryId,
+/// A server-computed subscription awaiting its first answer.
+pub struct ComputedCapture {
+    /// Engine-assigned identity, one id space with row subscriptions.
+    pub subscription_id: SubscriptionId,
     /// Consumer that registered it.
     pub consumer_id: u64,
-    /// SQL to run for the initial value and on each re-execution.
-    pub sql: String,
-    /// Decode hint for the scalar result.
-    pub kind: ScalarKindOf<Postgres>,
+    /// How the first answer is produced.
+    pub seed: SeedPlan,
 }
 
-/// A captured delta aggregate awaiting its bootstrap seed.
-///
-/// Unlike [`AggregateCapture`], the engine maintains this subscription directly
-/// (it has a [`SubscriptionId`] and matches CDC events), and the materializer
-/// folds the per-event [`AggDelta`](subql::AggDelta)s the engine produces into a running value.
-/// The session seeds the initial value through the connector before folding.
-pub struct DeltaAggregateCapture {
-    /// Consumer that registered it, the key for the folded accumulator state.
-    pub consumer_id: u64,
-    /// Engine subscription id, for CDC routing and unregistration.
-    pub subscription_id: SubscriptionId,
-    /// Aggregate the accumulator computes.
-    pub spec: AggSpec,
-    /// Runnable seed query and its per-column decode kinds.
-    pub bootstrap: AggregateBootstrap,
+/// How a computed subscription's first answer is produced.
+pub enum SeedPlan {
+    /// An in-process fold (grouped or not): the session runs the bootstrap
+    /// through its own connector outside the materializer lock, then installs
+    /// the decoded rows with [`Materializer::install_fold_seed`]. The engine
+    /// buffers changes that land during the read and reconciles them against
+    /// the seed's stream position.
+    Fold {
+        /// Runnable seed query with per-column decode kinds. Zero
+        /// `group_columns` means one seed row, an ungrouped total.
+        bootstrap: AggregateBootstrap,
+    },
+    /// A scalar extreme (`MIN`/`MAX`): the session runs the read through its
+    /// own connector under the subscribing caller's tier (R81 decision 2, a
+    /// slow seed delays the caller who asked and nobody else) and installs
+    /// the value with [`Materializer::install_scalar`]. Later triggered
+    /// re-reads ride the engine's connector under the shared bound.
+    Scalar {
+        /// SQL for the initial value, the same statement later triggers run.
+        sql: String,
+        /// Decode hint for the scalar result.
+        kind: BuiltinKind,
+    },
+    /// A grouped extreme or a row read tier: the engine bootstraps it through
+    /// its own connector inside [`Materializer::bootstrap_computed`].
+    Snapshot,
 }
 
 /// The result of dispatching one CDC event.
 pub struct Dispatched {
     /// Row patches to fan out to matched consumers.
     pub patches: Vec<MatchedPatch>,
-    /// Aggregate values that changed in-process (no re-execution needed).
-    pub aggregates: Vec<AggregateChange>,
-    /// Captured queries whose value must be re-executed through a connector,
-    /// coalesced by `query_id`.
-    pub triggers: Vec<PendingReExec>,
-    /// Delta aggregate values folded in-process from this event's per-consumer
-    /// [`AggDelta`](subql::AggDelta)s, ready to deliver to the owning session.
-    pub delta_aggregates: Vec<DeltaAggregateChange>,
+    /// Server-computed results that moved: fold deltas per group, replaced
+    /// scalar extremes, re-read row answers, and keyed row changes, each
+    /// already shaped for the wire.
+    pub computed: Vec<ComputedChange>,
     /// Membership moves this event caused: a subscription's answer changed
     /// because a relationship row moved, never because a row it reads changed
     /// (R27). Empty for every event until a membership term is registered.
     pub narrowings: Vec<TermMove>,
 }
 
-/// An aggregate value that changed in-process, ready to deliver.
-pub struct AggregateChange {
-    /// Captured query whose value changed.
-    pub query_id: ReExecQueryId,
+/// One server-computed result movement, ready to frame on the wire.
+pub struct ComputedChange {
+    /// The subscription whose answer moved.
+    pub subscription_id: SubscriptionId,
     /// Consumer that owns it.
     pub consumer_id: u64,
-    /// The new value serialized as JSON.
-    pub result_json: String,
-    /// Resume cursor for the event that produced it.
+    /// The addressed key: a fold group's opaque encoding, a keyed row's
+    /// key encoding, or `None` for a single-valued answer.
+    pub group_key: Option<Vec<u8>>,
+    /// The new value as JSON, or `None` when the addressed key left the
+    /// result.
+    pub result_json: Option<String>,
+    /// Whether this replaces the subscription's whole result rather than
+    /// upserting one key.
+    pub is_full_result: bool,
+    /// Resume cursor of the event that produced it, empty when the movement
+    /// came from a seed or a read with no position.
     pub cursor: Vec<u8>,
 }
 
-/// A delta aggregate value the materializer folded for one consumer.
-pub struct DeltaAggregateChange {
-    /// Consumer that owns the folded accumulator.
-    pub consumer_id: u64,
-    /// The new folded value serialized as JSON.
-    pub result_json: String,
+/// The engine the materializer hosts: subql's auto-resolving wrapper in async
+/// mode, which owns trigger servicing, per-subscription debounce, key
+/// batching, and paging, driving `C` for every database read. The lock-held
+/// read this implies is a recorded measured-risk item whose exit is
+/// `docs/upstream-subql-nonblocking-read-tier-drive.md`.
+type Engine<DB, C> = AutoResolvingEngine<ChangeEvent, DefaultIds, DB, AsyncMode<C>>;
+
+/// The connector shape the materializer drives: connetto's budget rides the
+/// per-registration auth context, so every read the engine issues is bounded
+/// by the tier of the caller who registered the subscription (R81).
+pub trait ReadConnector:
+    AsyncConnector<
+        Backend = Postgres,
+        Checkpoint = subql::PgLsn,
+        AuthContext = crate::reexec::ConnettoReadSetup,
+        Error: core::fmt::Display + crate::reexec::TimedOutRead + Send,
+    > + Send
+    + Sync
+{
 }
 
-/// A captured query needing re-execution against the backend.
-pub struct PendingReExec {
-    /// Captured query to re-execute.
-    pub query_id: ReExecQueryId,
-    /// Consumer that owns it.
-    pub consumer_id: u64,
-    /// SQL to run.
-    pub sql: String,
-    /// Decode hint for the scalar result.
-    pub kind: ScalarKindOf<Postgres>,
-    /// Resume cursor for the event that triggered it.
-    pub cursor: Vec<u8>,
-}
-
-/// Bootstrap metadata retained per captured query.
-struct ReExecMeta {
-    sql: String,
-    kind: ScalarKindOf<Postgres>,
+impl<C> ReadConnector for C where
+    C: AsyncConnector<
+            Backend = Postgres,
+            Checkpoint = subql::PgLsn,
+            AuthContext = crate::reexec::ConnettoReadSetup,
+            Error: core::fmt::Display + crate::reexec::TimedOutRead + Send,
+        > + Send
+        + Sync
+{
 }
 
 /// Hosts one `subql` engine over a Postgres-flavored catalog on the pgoutput
 /// vehicle ([`ChangeEvent`], the `pg_walstream` event type both matching and
 /// emission consume), plus the write policy the mutation path consults.
-pub struct Materializer<DB = ParserDB, W = RuntimeWritableCatalog>
+pub struct Materializer<DB = ParserDB, W = RuntimeWritableCatalog, C = crate::reexec::NoConnector>
 where
     DB: DatabaseLike,
     W: WritableCatalog,
+    C: ReadConnector,
 {
-    engine: ReExecEngine<ChangeEvent, DefaultIds, DB>,
+    engine: Engine<DB, C>,
+    /// The parsed catalog, cloned before the engine takes ownership of its
+    /// copy: emission, apply, and write planning read it directly rather
+    /// than through the engine.
+    catalog: DB,
     write: W,
-    reexec: HashMap<ReExecQueryId, ReExecMeta>,
-    /// Per-consumer delta aggregate state, keyed by consumer id. Seeded by the
-    /// session after bootstrap, then folded on each dispatched event.
-    deltas: HashMap<u64, (AggSpec, AggAccumulator)>,
-    /// Deltas that arrived while a consumer's seed was still being read, keyed
-    /// the same way. Drained into the accumulator by `install_aggregate`.
-    pending_deltas: HashMap<u64, Vec<subql::AggDelta>>,
     /// The deployment's caller mapping: how the client's local caller function
     /// (the no-arg SQLite function R40 registers) reverse translates into
     /// `current_setting('app.user_id', true)`, so a membership subquery reaches
@@ -469,13 +502,15 @@ impl Materializer<ParserDB, RuntimeWritableCatalog> {
 }
 
 impl<W: WritableCatalog> Materializer<ParserDB, W> {
-    /// Build a materializer over a Postgres DDL catalog and a write policy.
+    /// Build a materializer over a Postgres DDL catalog and a write policy,
+    /// with no re-execution connector: computed subscriptions register but
+    /// every read they need refuses.
     ///
     /// # Errors
     ///
     /// [`MaterializerError::Catalog`] when the DDL does not parse.
     pub fn with_write_catalog(pg_ddl: &str, write: W) -> Result<Self, MaterializerError> {
-        Self::build(pg_ddl, write, None, None)
+        Self::build(pg_ddl, write, None, None, crate::reexec::NoConnector)
     }
 
     /// Build a materializer whose engine can compile a membership subquery and
@@ -496,7 +531,33 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
         translator: Translator,
         caller: Option<SessionVariableMapping>,
     ) -> Result<Self, MaterializerError> {
-        Self::build(pg_ddl, write, Some(translator), caller)
+        Self::build(
+            pg_ddl,
+            write,
+            Some(translator),
+            caller,
+            crate::reexec::NoConnector,
+        )
+    }
+}
+
+impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
+    /// Build a materializer that drives `connector` for every database read
+    /// the engine's computed tiers need: fold seeds installed by the session
+    /// aside, extremes, grouped re-reads, and captured row answers all go
+    /// through it, each read bounded by the budget its registration carried.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Catalog`] when the DDL does not parse.
+    pub fn with_read_connector(
+        pg_ddl: &str,
+        write: W,
+        translator: Option<Translator>,
+        caller: Option<SessionVariableMapping>,
+        connector: C,
+    ) -> Result<Self, MaterializerError> {
+        Self::build(pg_ddl, write, translator, caller, connector)
     }
 
     fn build(
@@ -504,19 +565,18 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
         write: W,
         translator: Option<Translator>,
         caller: Option<SessionVariableMapping>,
+        connector: C,
     ) -> Result<Self, MaterializerError> {
         let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
             .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
         if let Some(translator) = translator {
             engine = engine.with_translator(translator);
         }
         Ok(Self {
-            engine: ReExecEngine::new(engine),
+            engine: AutoResolvingEngine::new(engine, AsyncMode::new(connector)),
+            catalog,
             write,
-            reexec: HashMap::new(),
-            deltas: HashMap::new(),
-            pending_deltas: HashMap::new(),
             caller,
         })
     }
@@ -544,9 +604,10 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
         consumer_id: u64,
         sqlite_sql: &str,
         binds: &[BindValue],
+        budget: ReadBudget,
     ) -> Result<SqliteRegistration, MaterializerError> {
         let pg_sql = self.translate_subscription_sql(sqlite_sql)?;
-        let registration = self.register_translated(consumer_id, &pg_sql, binds, None)?;
+        let registration = self.register_translated(consumer_id, &pg_sql, binds, None, budget)?;
         Ok(SqliteRegistration {
             registration,
             pg_sql,
@@ -581,7 +642,7 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
             options = options.with_session_variable(caller.clone());
         }
         let pg = statement
-            .reverse_translate(self.engine.inner().database(), &options)
+            .reverse_translate(&self.catalog, &options)
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
         Ok(pg.to_string())
     }
@@ -604,14 +665,18 @@ fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
         .collect()
 }
 
+/// One term's seed: the compared columns and the value rows the caller
+/// currently matches, one cell per column in the stated order.
+pub type TermValueRows = (Vec<String>, Vec<Vec<PgValue<Postgres>>>);
+
 /// What a term registration is seeded with: the subscriber it filters for and
 /// the values each compared column currently admits, read from the membership
 /// table as the caller.
 pub struct TermSeed {
     /// The caller, typed at `member_subject`'s kind (see [`typed_subscriber`]).
     pub subscriber: PgValue<Postgres>,
-    /// Per compared column, the values the caller currently matches.
-    pub term_values: Vec<(String, Vec<PgValue<Postgres>>)>,
+    /// Per term, its columns and value rows.
+    pub term_values: Vec<TermValueRows>,
 }
 
 /// Build the subscriber value at `member_subject`'s own scalar kind.
@@ -621,7 +686,7 @@ pub struct TermSeed {
 /// in silence. `None` refuses the term instead: an identity that cannot be
 /// read at the column's kind cannot be a member.
 #[must_use]
-pub fn typed_subscriber(identity: &str, kind: ScalarKindOf<Postgres>) -> Option<PgValue<Postgres>> {
+pub fn typed_subscriber(identity: &str, kind: BuiltinKind) -> Option<PgValue<Postgres>> {
     match kind {
         ScalarKind::String => Some(PgValue::String(identity.to_owned())),
         ScalarKind::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
@@ -641,9 +706,18 @@ fn term_moves<DB: DatabaseLike>(
         .map(|narrowing| TermMove {
             sub_id: narrowing.subscription,
             table: catalog_helpers::table_name(db, narrowing.table).unwrap_or_default(),
-            column: catalog_helpers::column_name(db, narrowing.table, narrowing.column)
-                .unwrap_or_default(),
-            value: narrowing.value.clone(),
+            pairs: narrowing
+                .columns
+                .iter()
+                .zip(&narrowing.values)
+                .map(|(column, value)| {
+                    (
+                        catalog_helpers::column_name(db, narrowing.table, *column)
+                            .unwrap_or_default(),
+                        value.clone(),
+                    )
+                })
+                .collect(),
             entered: narrowing.entered,
         })
         .collect()
@@ -657,23 +731,29 @@ pub struct TermMove {
     pub sub_id: SubscriptionId,
     /// The subscribed table, by catalog name.
     pub table: String,
-    /// The compared column, by catalog name.
-    pub column: String,
-    /// The value that entered or left the subscriber's set.
-    pub value: PgValue<Postgres>,
-    /// Whether it entered.
+    /// The compared columns and the value each now matches or stopped
+    /// matching, pairwise in the filter's order. A composite membership key
+    /// moves as a whole tuple, so the affected-rows read must constrain on
+    /// every pair or it re-reads on half a key.
+    pub pairs: Vec<(String, PgValue<Postgres>)>,
+    /// Whether the tuple entered.
     pub entered: bool,
 }
 
-/// The subscription's own SELECT with `AND <column> = <value>` conjoined, so
-/// the rest of the filter still applies to a moved row (R27 decision 2).
+/// The subscription's own SELECT with `AND <column> = <value>` conjoined per
+/// moved pair, so the rest of the filter still applies to a moved row (R27
+/// decision 2) and a composite membership key constrains on every column.
 ///
-/// The value rides as a SQL literal built from the AST, never by string
+/// Each value rides as a SQL literal built from the AST, never by string
 /// interpolation, and the query's `$N` placeholders are untouched, so the
-/// subscription's own binds still pair. `None` when the value's kind has no
-/// literal, which subql's term keys exclude at registration.
+/// subscription's own binds still pair. `None` for an empty pair list and
+/// when a value's kind has no literal, which subql's term keys exclude at
+/// registration.
 #[must_use]
-pub fn narrowed_sql(pg_sql: &str, column: &str, value: &PgValue<Postgres>) -> Option<String> {
+pub fn narrowed_sql(pg_sql: &str, pairs: &[(String, PgValue<Postgres>)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
     let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, pg_sql).ok()?;
     let [Statement::Query(query)] = statements.as_mut_slice() else {
         return None;
@@ -681,21 +761,23 @@ pub fn narrowed_sql(pg_sql: &str, column: &str, value: &PgValue<Postgres>) -> Op
     let SetExpr::Select(select) = query.body.as_mut() else {
         return None;
     };
-    let narrowing = Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
-            '"', column,
-        ))),
-        op: BinaryOperator::Eq,
-        right: Box::new(value_literal(value)?),
-    };
-    select.selection = Some(match select.selection.take() {
-        Some(existing) => Expr::BinaryOp {
-            left: Box::new(Expr::Nested(Box::new(existing))),
-            op: BinaryOperator::And,
-            right: Box::new(narrowing),
-        },
-        None => narrowing,
-    });
+    for (column, value) in pairs {
+        let narrowing = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
+                '"', column,
+            ))),
+            op: BinaryOperator::Eq,
+            right: Box::new(value_literal(value)?),
+        };
+        select.selection = Some(match select.selection.take() {
+            Some(existing) => Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(existing))),
+                op: BinaryOperator::And,
+                right: Box::new(narrowing),
+            },
+            None => narrowing,
+        });
+    }
     Some(statements[0].to_string())
 }
 
@@ -736,10 +818,11 @@ fn value_literal(value: &PgValue<Postgres>) -> Option<Expr> {
     Some(Expr::Value(literal.into()))
 }
 
-impl<DB, W> Materializer<DB, W>
+impl<DB, W, C> Materializer<DB, W, C>
 where
     DB: DatabaseLike + 'static,
     W: WritableCatalog,
+    C: ReadConnector,
 {
     /// The parsed catalog this materializer matches against.
     ///
@@ -747,18 +830,18 @@ where
     /// and it holds the row across an await, so it takes a clone at
     /// construction rather than reaching through the materializer's mutex.
     pub const fn catalog(&self) -> &DB {
-        self.engine.inner().database()
+        &self.catalog
     }
 
-    /// Register a subscription for `consumer_id` from a SQL `SELECT`.
+    /// Register a subscription for `consumer_id` from a SQL `SELECT`, with a
+    /// generous default read budget. Tests and doc examples only: a session
+    /// registers through [`Self::register_translated`] with its caller's tier
+    /// budget.
     ///
     /// A row subscription returns [`Registration::Row`] with its
-    /// [`SubscriptionId`]. A delta aggregate the engine maintains from row
-    /// images (`COUNT`, `SUM`, `AVG`, variance, stddev) returns
-    /// [`Registration::DeltaAggregate`], which the caller seeds through a
-    /// connector and then folds. A single-table scalar MIN or MAX the engine
-    /// cannot maintain returns [`Registration::Aggregate`], which the caller
-    /// bootstraps and re-executes.
+    /// [`SubscriptionId`]. Every other accepted shape returns
+    /// [`Registration::Computed`], whose [`SeedPlan`] says how the first
+    /// answer is produced.
     ///
     /// # Errors
     ///
@@ -771,152 +854,280 @@ where
         self.register_request(
             consumer_id,
             SubscriptionRequest::new(consumer_id, select_sql),
+            ReadBudget::new(core::time::Duration::from_secs(5)),
         )
     }
 
     /// Register one built [`SubscriptionRequest`], classifying the engine's
-    /// answer into a [`Registration`].
+    /// tier into a [`Registration`]. `budget` bounds every database read the
+    /// engine will ever run for this subscription.
     fn register_request(
         &mut self,
         consumer_id: u64,
         request: SubscriptionRequest<DefaultIds, Postgres>,
+        budget: ReadBudget,
     ) -> Result<Registration, MaterializerError> {
-        match self.engine.register(request)? {
-            Registered::Engine(result) => match result.aggregate_spec() {
-                Some(spec) => {
-                    let spec = spec.clone();
-                    let bootstrap = result
-                        .aggregate_bootstrap
-                        .clone()
-                        .expect("aggregate registration carries a bootstrap");
-                    Ok(Registration::DeltaAggregate(DeltaAggregateCapture {
-                        consumer_id,
-                        subscription_id: result.subscription_id,
-                        spec,
-                        bootstrap,
-                    }))
-                }
-                None => Ok(Registration::Row(result.subscription_id)),
-            },
-            Registered::ReExec {
-                query_id,
-                sql,
-                column_kind,
-            } => {
-                self.reexec.insert(
-                    query_id,
-                    ReExecMeta {
-                        sql: sql.clone(),
-                        kind: column_kind,
-                    },
-                );
-                Ok(Registration::Aggregate(AggregateCapture {
-                    query_id,
+        let registered = self
+            .engine
+            .register(request, crate::reexec::ConnettoReadSetup::of(budget))?;
+        let subscription_id = registered.subscription_id;
+        Ok(match registered.tier {
+            Tier::InProcess(served) => match served.aggregate_bootstrap {
+                Some(bootstrap) => Registration::Computed(ComputedCapture {
+                    subscription_id,
                     consumer_id,
+                    seed: SeedPlan::Fold { bootstrap },
+                }),
+                None => Registration::Row(subscription_id),
+            },
+            Tier::Scalar { sql, column_kind } => Registration::Computed(ComputedCapture {
+                subscription_id,
+                consumer_id,
+                seed: SeedPlan::Scalar {
                     sql,
                     kind: column_kind,
-                }))
+                },
+            }),
+            Tier::GroupedScalar { .. } | Tier::KeyedRows { .. } | Tier::WholeRows { .. } => {
+                Registration::Computed(ComputedCapture {
+                    subscription_id,
+                    consumer_id,
+                    seed: SeedPlan::Snapshot,
+                })
             }
-        }
+        })
     }
 
-    /// Drop a row subscription. Returns whether it existed.
-    pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
-        self.engine.inner_mut().unregister_subscription(sub_id)
-    }
-
-    /// Drop a captured aggregate query. Returns whether it existed.
-    pub fn unregister_aggregate(&mut self, query_id: ReExecQueryId) -> bool {
-        self.reexec.remove(&query_id);
-        self.engine.unregister_reexec_query(query_id)
-    }
-
-    /// Install a bootstrapped or re-executed scalar value for a captured query.
-    /// Returns whether the query exists.
-    pub fn install_scalar(&mut self, query_id: ReExecQueryId, value: PgValue<Postgres>) -> bool {
-        self.engine.install(query_id, value)
-    }
-
-    /// Announce that a seed is being read for `consumer_id`, so deltas
-    /// dispatched while the read is in flight are held rather than dropped.
+    /// Install a scalar extreme's seed value, read by the session through its
+    /// own connector under the subscribing caller's tier.
     ///
-    /// The seed is a value as of some moment before it arrives, and the
-    /// accumulator does not exist until it does, so without this every change
-    /// committed inside that window is folded into nothing. It cannot be
-    /// recovered later either: each update carries the whole accumulated
-    /// value, so the error is permanent rather than transient (R28 part B).
-    pub fn expect_aggregate(&mut self, consumer_id: u64) {
-        self.pending_deltas.insert(consumer_id, Vec::new());
+    /// # Errors
+    ///
+    /// [`MaterializerError::Install`] when the subscription is unknown or is
+    /// not a scalar read.
+    pub fn install_scalar(
+        &mut self,
+        subscription_id: SubscriptionId,
+        value: PgValue<Postgres>,
+        checkpoint: Option<subql::PgLsn>,
+    ) -> Result<ComputedChange, MaterializerError> {
+        let update = subql::Install::install(
+            &mut self.engine,
+            subscription_id,
+            subql::ScalarInstall { value, checkpoint },
+        )
+        .map_err(|err| MaterializerError::Install(err.to_string()))?;
+        Ok(ComputedChange {
+            subscription_id: update.subscription_id,
+            consumer_id: update.consumer_id,
+            group_key: None,
+            result_json: Some(value_to_json(&update.value)),
+            is_full_result: true,
+            cursor: cursor_bytes(update.checkpoint.as_ref()),
+        })
     }
 
-    /// Seed the folded accumulator for `consumer_id` with the value read by the
-    /// connector, then apply everything buffered since
-    /// [`expect_aggregate`](Self::expect_aggregate). Later
-    /// [`dispatch`](Self::dispatch) calls fold each event's
-    /// [`AggDelta`](subql::AggDelta) into this accumulator.
-    pub fn install_aggregate(&mut self, consumer_id: u64, spec: AggSpec, mut acc: AggAccumulator) {
-        for delta in self.pending_deltas.remove(&consumer_id).unwrap_or_default() {
-            acc.apply(&delta);
+    /// Drop a subscription of any tier by its engine id. Returns whether it
+    /// existed. One call for rows, folds, and read tiers alike: the wrapper
+    /// resolves whichever registry holds the id (U7).
+    pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
+        self.engine.unregister_subscription(sub_id)
+    }
+
+    /// Install a fold's seed rows, read by the session through its own
+    /// connector outside the materializer lock.
+    ///
+    /// The engine buffers changes dispatched while the read was in flight and
+    /// reconciles them against `read_at`, so nothing committed inside the
+    /// window is folded into nothing (the guarantee `expect_aggregate` used to
+    /// approximate connetto-side, now the engine's own).
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Install`] when the engine refuses the rows: an
+    /// unknown or already-seeded subscription, a malformed row, an unordered
+    /// read, or too many changes buffered during it.
+    pub fn install_fold_seed(
+        &mut self,
+        subscription_id: SubscriptionId,
+        rows: Vec<Vec<PgValue<Postgres>>>,
+        read_at: Option<subql::PgLsn>,
+    ) -> Result<FoldSeeded, MaterializerError> {
+        let output = subql::Install::install(
+            &mut self.engine,
+            subscription_id,
+            subql::AggregateSeedInstall { rows, read_at },
+        )
+        .map_err(|err| MaterializerError::Install(err.to_string()))?;
+        Self::log_transitions(&output.transitions);
+        Ok(FoldSeeded {
+            changes: output
+                .updates
+                .into_iter()
+                .map(|update| Self::aggregate_change(update, Vec::new()))
+                .collect(),
+            needs_snapshot: !output.triggers.is_empty(),
+        })
+    }
+
+    /// Produce a computed subscription's first answer through the engine's own
+    /// connector: the scalar read, the grouped seed, or the whole row answer,
+    /// depending on the registered tier. Also the recovery read after a
+    /// demotion ([`FoldSeeded::needs_snapshot`]).
+    ///
+    /// Returns no changes when the subscription raced an unregister.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Read`] when the connector refuses or the database
+    /// fails, [`MaterializerError::Install`] when the engine refuses the
+    /// result.
+    pub async fn bootstrap_computed(
+        &mut self,
+        subscription_id: SubscriptionId,
+        consumer_id: u64,
+    ) -> Result<Vec<ComputedChange>, MaterializerError> {
+        let Some(result) = self
+            .engine
+            .snapshot(subscription_id)
+            .await
+            .map_err(reexec_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(match result {
+            subql::reexec::SnapshotResult::Scalar(value, checkpoint) => {
+                vec![ComputedChange {
+                    subscription_id,
+                    consumer_id,
+                    group_key: None,
+                    result_json: Some(value_to_json(&value)),
+                    is_full_result: true,
+                    cursor: cursor_bytes(checkpoint.as_ref()),
+                }]
+            }
+            subql::reexec::SnapshotResult::GroupedAggregate {
+                updates,
+                checkpoint,
+            } => {
+                let cursor = cursor_bytes(checkpoint.as_ref());
+                updates
+                    .into_iter()
+                    .map(|update| Self::aggregate_change(update, cursor.clone()))
+                    .collect()
+            }
+            subql::reexec::SnapshotResult::Rows {
+                columns,
+                rows,
+                checkpoint,
+            } => vec![ComputedChange {
+                subscription_id,
+                consumer_id,
+                group_key: None,
+                result_json: Some(rows_json(&columns, &rows)),
+                is_full_result: true,
+                cursor: cursor_bytes(checkpoint.as_ref()),
+            }],
+            // The enum is non_exhaustive upstream: a tier this build does not
+            // know cannot be delivered, so it refuses rather than sending a
+            // shape the wire has no meaning for.
+            other => {
+                return Err(MaterializerError::Install(format!(
+                    "unknown snapshot result shape: {other:?}"
+                )));
+            }
+        })
+    }
+
+    /// One wire-shaped change from an engine aggregate movement.
+    fn aggregate_change(
+        update: AggregateValueUpdate<DefaultIds, Postgres>,
+        cursor: Vec<u8>,
+    ) -> ComputedChange {
+        let is_full_result = update.group.is_none();
+        ComputedChange {
+            subscription_id: update.subscription,
+            consumer_id: update.consumer,
+            group_key: update.group,
+            result_json: match update.change {
+                AggregateValueChange::Set(AggregateResultValue::Folded(value)) => {
+                    Some(agg_value_to_json(value))
+                }
+                AggregateValueChange::Set(AggregateResultValue::Scalar(value)) => {
+                    Some(value_to_json(&value))
+                }
+                AggregateValueChange::Remove => None,
+            },
+            is_full_result,
+            cursor,
         }
-        self.deltas.insert(consumer_id, (spec, acc));
     }
 
-    /// Drop a delta aggregate: its folded accumulator and its engine
-    /// subscription. Returns whether the subscription existed.
-    pub fn unregister_delta_aggregate(&mut self, consumer_id: u64, sub_id: SubscriptionId) -> bool {
-        self.deltas.remove(&consumer_id);
-        // A bootstrap that failed leaves a buffer nobody will ever drain.
-        self.pending_deltas.remove(&consumer_id);
-        self.engine.inner_mut().unregister_subscription(sub_id)
+    /// Log tier transitions: the demotion decision (R30) is server-visible
+    /// only, so a subscription that outgrew its fold budget keeps answering
+    /// while the operator sees why it now costs reads.
+    fn log_transitions(transitions: &[MaintenanceTransition]) {
+        for transition in transitions {
+            crate::counters::add(&crate::counters::TIER_TRANSITIONS, 1);
+            tracing::info!(
+                subscription = transition.subscription_id,
+                from = ?transition.from,
+                to = ?transition.to.kind(),
+                reason = ?transition.reason,
+                "subscription changed maintenance tier"
+            );
+        }
     }
 
-    /// Dispatch one CDC event into row patches, in-process aggregate changes,
-    /// and re-execution triggers.
+    /// Dispatch one CDC event into row patches and computed-result changes.
     ///
     /// Row notifications fold once into a compressed patchset shared across the
-    /// matched consumers. Scalar aggregates maintained in-process surface as
-    /// [`AggregateChange`]s. Captured queries the engine could not resolve
-    /// surface as [`PendingReExec`] triggers, coalesced by `query_id`, for the
-    /// caller to service through a connector.
+    /// matched consumers. Everything the engine's tiers produced (fold deltas,
+    /// replaced extremes, re-read row answers, keyed row changes) arrives
+    /// already resolved: the engine drove its connector for every read this
+    /// event required, each bounded by its registration's budget.
     ///
     /// # Errors
     ///
     /// [`MaterializerError::Dispatch`] on a dispatch failure,
+    /// [`MaterializerError::Read`] when a triggered read failed,
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
-    pub fn dispatch(&mut self, event: &ChangeEvent) -> Result<Dispatched, MaterializerError> {
-        let notifications = self.engine.consumers(event)?;
+    pub async fn dispatch(&mut self, event: &ChangeEvent) -> Result<Dispatched, MaterializerError> {
+        let notifications = self.engine.consumers(event).await.map_err(reexec_error)?;
         let cursor = event
             .checkpoint()
             .map(|lsn| lsn.0.to_be_bytes().to_vec())
             .unwrap_or_default();
+        Self::log_transitions(&notifications.transitions);
 
-        let aggregates = notifications
-            .scalar_updates
-            .iter()
-            .map(|update| AggregateChange {
-                query_id: update.query_id,
+        let mut computed = Vec::new();
+        for update in notifications.aggregate_updates {
+            computed.push(Self::aggregate_change(update, cursor.clone()));
+        }
+        for update in notifications.scalar_updates {
+            computed.push(ComputedChange {
+                subscription_id: update.subscription_id,
                 consumer_id: update.consumer_id,
-                result_json: value_to_json(&update.value),
+                group_key: None,
+                result_json: Some(value_to_json(&update.value)),
+                is_full_result: true,
                 cursor: cursor.clone(),
-            })
-            .collect();
-
-        let mut seen = HashSet::new();
-        let mut triggers = Vec::new();
-        for trigger in &notifications.triggers {
-            if !seen.insert(trigger.query_id) {
-                continue;
-            }
-            if let Some(meta) = self.reexec.get(&trigger.query_id) {
-                triggers.push(PendingReExec {
-                    query_id: trigger.query_id,
-                    consumer_id: trigger.consumer_id,
-                    sql: meta.sql.clone(),
-                    kind: meta.kind,
-                    cursor: cursor.clone(),
-                });
-            }
+            });
+        }
+        computed.extend(Self::rows_changes(notifications.rows_updates, &cursor));
+        for delta in notifications.row_deltas {
+            computed.push(ComputedChange {
+                subscription_id: delta.subscription_id,
+                consumer_id: delta.consumer_id,
+                // The key's canonical byte encoding, the same one the engine
+                // uses for group keys, so the client's keyed storage treats
+                // both uniformly.
+                group_key: Some(encode_value_key::<Postgres>(&delta.key).unwrap_or_default()),
+                result_json: delta.row.map(|row| row_json(&delta.columns, &row)),
+                is_full_result: false,
+                cursor: cursor.clone(),
+            });
         }
 
         let engine = &notifications.engine;
@@ -938,11 +1149,8 @@ where
         let patches = if consumers.is_empty() {
             Vec::new()
         } else {
-            let built = pgoutput_patchset_builder(
-                self.engine.inner().database(),
-                std::slice::from_ref(event),
-            )
-            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+            let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event))
+                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
             // One extra encode on an event that has departures, not one per
             // departing consumer: the notice carries a table and a primary key
             // and nothing consumer-specific, so every consumer that lost this
@@ -978,53 +1186,67 @@ where
                 .collect()
         };
 
-        let delta_aggregates = self.fold_delta_aggregates(event)?;
-
-        let narrowings = term_moves(
-            self.engine.inner().database(),
-            notifications.engine.narrowings(),
-        );
+        let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
 
         Ok(Dispatched {
             patches,
-            aggregates,
-            triggers,
-            delta_aggregates,
+            computed,
             narrowings,
         })
     }
 
-    /// Fold this event's per-consumer deltas into the seeded accumulators, and
-    /// buffer them for a consumer whose seed is still in flight.
+    /// Collapse re-read pages into one full-result change per subscription.
     ///
-    /// Skips the engine call entirely when neither map holds anything, which is
-    /// the common case and avoids a spurious error path for events the
-    /// aggregate machinery treats specially (e.g. Truncate).
-    fn fold_delta_aggregates(
-        &mut self,
-        event: &ChangeEvent,
-    ) -> Result<Vec<DeltaAggregateChange>, MaterializerError> {
-        if self.deltas.is_empty() && self.pending_deltas.is_empty() {
-            return Ok(Vec::new());
+    /// Pages of one re-read share a generation and arrive in delivery order
+    /// within one engine call, and a higher generation replaces a lower, so
+    /// only the newest generation per subscription survives and its pages
+    /// concatenate into one wire frame: the wire's full-result replacement is
+    /// atomic where a paged delivery would show a half-replaced answer.
+    fn rows_changes(
+        updates: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
+        cursor: &[u8],
+    ) -> Vec<ComputedChange> {
+        /// One subscription's newest re-read, its pages concatenated.
+        struct PendingRows {
+            consumer_id: u64,
+            generation: u64,
+            columns: Vec<String>,
+            rows: Vec<Vec<PgValue<Postgres>>>,
         }
-        let deltas = self.engine.inner_mut().aggregate_deltas(event)?;
-        let mut changes = Vec::with_capacity(deltas.len());
-        for (consumer_id, delta) in deltas {
-            if let Some((_, acc)) = self.deltas.get_mut(&consumer_id) {
-                acc.apply(&delta);
-                changes.push(DeltaAggregateChange {
-                    consumer_id,
-                    result_json: agg_value_to_json(acc.value()),
+        let mut latest: HashMap<u64, PendingRows> = HashMap::new();
+        for update in updates {
+            let entry = latest
+                .entry(update.subscription_id)
+                .or_insert_with(|| PendingRows {
+                    consumer_id: update.consumer_id,
+                    generation: update.generation,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
                 });
-            } else if let Some(buffered) = self.pending_deltas.get_mut(&consumer_id) {
-                // The seed this consumer will be built from was read before
-                // this event, so the delta is not in it. Hold it until
-                // `install_aggregate` can apply it on top, or it is lost for
-                // the life of the accumulator (R28 part B).
-                buffered.push(delta);
+            if update.generation > entry.generation {
+                *entry = PendingRows {
+                    consumer_id: update.consumer_id,
+                    generation: update.generation,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                };
             }
+            if entry.columns.is_empty() {
+                entry.columns = update.columns;
+            }
+            entry.rows.extend(update.rows);
         }
-        Ok(changes)
+        latest
+            .into_iter()
+            .map(|(subscription_id, pending)| ComputedChange {
+                subscription_id,
+                consumer_id: pending.consumer_id,
+                group_key: None,
+                result_json: Some(rows_json(&pending.columns, &pending.rows)),
+                is_full_result: true,
+                cursor: cursor.to_vec(),
+            })
+            .collect()
     }
 
     /// Build the oplog record for a dispatched CDC event.
@@ -1067,7 +1289,7 @@ where
         consumer_id: u64,
     ) -> Result<Option<(Vec<u8>, bool)>, MaterializerError> {
         let (matched, departing) = {
-            let notifs = self.engine.inner_mut().consumers(event)?;
+            let notifs = self.engine.match_rows(event)?;
             let departing = matches!(event.kind(), EventKind::Update)
                 && notifs.deleted().contains(&consumer_id);
             let matched = notifs.inserted().contains(&consumer_id)
@@ -1078,9 +1300,8 @@ where
         if !matched {
             return Ok(None);
         }
-        let built =
-            pgoutput_patchset_builder(self.engine.inner().database(), std::slice::from_ref(event))
-                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event))
+            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         if departing && let Some(notice) = Self::departure_patchset(&built) {
             return Ok(Some((compress(&notice)?, true)));
         }
@@ -1097,7 +1318,7 @@ where
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
     pub fn encode_patch(&self, event: &ChangeEvent) -> Result<Vec<u8>, MaterializerError> {
-        let raw = pgoutput_patchset(self.engine.inner().database(), std::slice::from_ref(event))
+        let raw = pgoutput_patchset(&self.catalog, std::slice::from_ref(event))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         Ok(compress(&raw)?)
     }
@@ -1157,9 +1378,8 @@ where
         &self,
         event: &ChangeEvent,
     ) -> Result<Option<Vec<u8>>, MaterializerError> {
-        let built =
-            pgoutput_changeset_builder(self.engine.inner().database(), std::slice::from_ref(event))
-                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        let built = pgoutput_changeset_builder(&self.catalog, std::slice::from_ref(event))
+            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         let Some(op) = built.iter().next() else {
             return Ok(None);
         };
@@ -1174,7 +1394,7 @@ where
     /// encoded by [`crate::pk`] into a stable, self-describing byte string the
     /// auth policy treats as opaque and decodes back into typed values.
     fn event_identity(&self, event: &ChangeEvent) -> Option<(String, Vec<u8>)> {
-        let db = self.engine.inner().database();
+        let db = &self.catalog;
         let table_id = event.table_id(db);
         let index = usize::try_from(table_id).ok()?;
         let table = db.table_by_id(index)?.table_name().to_owned();
@@ -1196,11 +1416,8 @@ where
         sub_id: SubscriptionId,
         cursor: &[u8],
     ) -> Result<(), MaterializerError> {
-        self.engine.inner_mut().advance_cursor(
-            session_id,
-            sub_id,
-            OpaqueCheckpoint(cursor.to_vec()),
-        )?;
+        self.engine
+            .advance_cursor(session_id, sub_id, OpaqueCheckpoint(cursor.to_vec()))?;
         Ok(())
     }
 
@@ -1240,7 +1457,7 @@ where
 
     /// Resolve `table` in the catalog, or report the schema mismatch.
     fn table_id(&self, table: &str) -> Result<TableId, MaterializerError> {
-        catalog_helpers::table_id(self.engine.inner().database(), table)
+        catalog_helpers::table_id(&self.catalog, table)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))
     }
 
@@ -1356,7 +1573,7 @@ where
         let Some(version) = self.write.version_column(table) else {
             return Ok(None);
         };
-        let db = self.engine.inner().database();
+        let db = &self.catalog;
         let table_id = catalog_helpers::table_id(db, table)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
         let version_column = version.name().to_owned();
@@ -1416,11 +1633,13 @@ where
         conn: &mut SqliteConnection,
     ) -> Result<usize, MaterializerError> {
         let bytes = decompress(payload_zstd)?;
-        let adapter = SqliteAdapter::new(self.engine.inner().database());
-        Ok(self
-            .engine
-            .inner()
-            .apply_diffset_bytes(&bytes, conn, &adapter)?)
+        let adapter = SqliteAdapter::new(&self.catalog);
+        Ok(subql::patchset::apply_diffset_bytes_with_catalog(
+            &self.catalog,
+            &bytes,
+            conn,
+            &adapter,
+        )?)
     }
 
     /// Apply a client-uploaded [`MutationPatch`] against an async Postgres
@@ -1455,12 +1674,14 @@ where
         conn: &mut AsyncPgConnection,
     ) -> Result<usize, MaterializerError> {
         let bytes = decompress(payload_zstd)?;
-        let adapter = PgAdapter::new(self.engine.inner().database());
-        Ok(self
-            .engine
-            .inner()
-            .apply_diffset_bytes_async(&bytes, conn, &adapter)
-            .await?)
+        let adapter = PgAdapter::new(&self.catalog);
+        Ok(subql::patchset::apply_diffset_bytes_async_with_catalog(
+            &self.catalog,
+            &bytes,
+            conn,
+            &adapter,
+        )
+        .await?)
     }
 
     /// What each membership term this subscription names needs seeded, as
@@ -1485,7 +1706,6 @@ where
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
         let request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
         self.engine
-            .inner()
             .describe_terms(&request)
             .map_err(MaterializerError::Register)
     }
@@ -1508,21 +1728,98 @@ where
         pg_sql: &str,
         binds: &[BindValue],
         seed: Option<TermSeed>,
+        budget: ReadBudget,
     ) -> Result<Registration, MaterializerError> {
         let mut request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
         if let Some(seed) = seed {
             request = request.subscriber(seed.subscriber);
-            for (column, values) in seed.term_values {
-                request = request.term_values(column, values);
+            for (columns, rows) in seed.term_values {
+                request = request.term_values(columns, rows);
             }
         }
-        self.register_request(consumer_id, request)
+        self.register_request(consumer_id, request, budget)
     }
 }
 
-/// Serialize a re-executed scalar value as a JSON string for delivery.
-pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
-    let json = match value {
+/// A fold's seed accepted: the initial values to deliver, and whether the
+/// seed itself demoted the subscription (its groups already exceed the
+/// budget), in which case [`Materializer::bootstrap_computed`] produces the
+/// first whole answer instead.
+pub struct FoldSeeded {
+    /// Initial per-group values, wire-shaped.
+    pub changes: Vec<ComputedChange>,
+    /// Whether a demotion left the first answer to a follow-up read.
+    pub needs_snapshot: bool,
+}
+
+/// Map an engine drive failure onto the materializer's error, keeping the
+/// dispatch-versus-read distinction and the failed subscription's identity,
+/// which the session's refusal paths act on (R81 decision 3).
+fn reexec_error<E>(err: ReExecError<E>) -> MaterializerError
+where
+    E: core::fmt::Display + crate::reexec::TimedOutRead,
+{
+    match err {
+        ReExecError::Dispatch(err) => MaterializerError::Dispatch(err),
+        ReExecError::Connector {
+            subscription,
+            error,
+        } => MaterializerError::Read {
+            subscription,
+            timed_out: error.timed_out(),
+            detail: error.to_string(),
+        },
+        ReExecError::Cursor {
+            subscription,
+            error,
+        } => MaterializerError::Read {
+            subscription,
+            // A cursor failure wraps the connector error one level deeper,
+            // and "this connector holds no cursors" is a configuration
+            // refusal that no retry clears, so it ends the subscription the
+            // same way a timeout does.
+            timed_out: matches!(
+                &error,
+                subql::reexec::CursorError::Connector(inner) if inner.timed_out()
+            ) || matches!(error, subql::reexec::CursorError::Unsupported),
+            detail: error.to_string(),
+        },
+        other => MaterializerError::Install(other.to_string()),
+    }
+}
+
+/// A resume cursor from a read's stream position, empty when unknown.
+fn cursor_bytes(checkpoint: Option<&subql::PgLsn>) -> Vec<u8> {
+    checkpoint
+        .map(|lsn| lsn.0.to_be_bytes().to_vec())
+        .unwrap_or_default()
+}
+
+/// One row as a JSON object keyed by column name, so the client deserializes
+/// it field-name-based per Q5.7, column order irrelevant.
+fn row_object(columns: &[String], row: &[PgValue<Postgres>]) -> serde_json::Value {
+    serde_json::Value::Object(
+        columns
+            .iter()
+            .zip(row)
+            .map(|(column, value)| (column.clone(), value_json(value)))
+            .collect(),
+    )
+}
+
+/// One keyed row as a JSON object string.
+pub(crate) fn row_json(columns: &[String], row: &[PgValue<Postgres>]) -> String {
+    row_object(columns, row).to_string()
+}
+
+/// A whole row answer as a JSON array of objects.
+pub(crate) fn rows_json(columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
+    serde_json::Value::Array(rows.iter().map(|row| row_object(columns, row)).collect()).to_string()
+}
+
+/// One scalar as a JSON value, the shared shape behind every delivery.
+fn value_json(value: &PgValue<Postgres>) -> serde_json::Value {
+    match value {
         PgValue::Missing | PgValue::Null => serde_json::Value::Null,
         PgValue::Bool(b) => serde_json::Value::Bool(*b),
         PgValue::Int(i) => serde_json::Value::from(*i),
@@ -1539,8 +1836,12 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
         PgValue::Json(j) | PgValue::Jsonb(j) => j.clone(),
         // Uninhabited for this backend, as above.
         PgValue::Custom(never) => match *never {},
-    };
-    json.to_string()
+    }
+}
+
+/// Serialize a re-executed scalar value as a JSON string for delivery.
+pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
+    value_json(value).to_string()
 }
 
 /// Serialize a folded [`AggValue`] as a JSON string for delivery, matching the
@@ -1795,6 +2096,7 @@ mod membership_term_tests {
     use super::*;
     use crate::capability::DEFAULT_USER_SETTING;
     use crate::openfga::Translated;
+    use subql::term::TermDescription;
 
     /// The motivating pair: a guarded table filtered through a membership.
     const SCHEMA: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\nCREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
@@ -1842,23 +2144,35 @@ mod membership_term_tests {
         let [term] = terms.as_slice() else {
             panic!("one canonical term describes, got {terms:?}");
         };
-        assert_eq!(term.column, "project_id");
-        assert_eq!(term.member_table, "project_members");
-        assert_eq!(term.member_key, "project_id");
-        assert_eq!(term.subject_kind, ScalarKind::String);
-        assert_eq!(term.member_subject, "user_id");
+        let TermDescription::Membership(membership) = term else {
+            panic!("expected a membership term");
+        };
+        assert_eq!(membership.pairs[0].column, "project_id");
+        assert_eq!(membership.member_table, "project_members");
+        assert_eq!(membership.pairs[0].member_key, "project_id");
+        assert_eq!(membership.subject_kind, ScalarKind::String);
+        assert_eq!(membership.member_subject, "user_id");
         assert!(
-            term.seed_sql.contains("project_members"),
+            membership.seed_sql.contains("project_members"),
             "the seed reads the membership table, got {}",
-            term.seed_sql
+            membership.seed_sql
         );
-        let subscriber =
-            typed_subscriber("alice", term.subject_kind).expect("a text subject takes any string");
+        let subscriber = typed_subscriber("alice", membership.subject_kind)
+            .expect("a text subject takes any string");
         let seed = TermSeed {
             subscriber,
-            term_values: vec![(term.column.clone(), vec![PgValue::Int(7)])],
+            term_values: vec![(
+                vec![membership.pairs[0].column.clone()],
+                vec![vec![PgValue::Int(7)]],
+            )],
         };
-        let registration = match mat.register_translated(1, &pg_sql, &[], Some(seed)) {
+        let registration = match mat.register_translated(
+            1,
+            &pg_sql,
+            &[],
+            Some(seed),
+            ReadBudget::new(core::time::Duration::from_secs(5)),
+        ) {
             Ok(registration) => registration,
             Err(err) => panic!("the seeded term must register, got {err}"),
         };
@@ -1874,7 +2188,13 @@ mod membership_term_tests {
         let pg_sql = mat
             .translate_subscription_sql(CLIENT_SQL)
             .expect("translates");
-        let refused = mat.register_translated(1, &pg_sql, &[], None);
+        let refused = mat.register_translated(
+            1,
+            &pg_sql,
+            &[],
+            None,
+            ReadBudget::new(core::time::Duration::from_secs(5)),
+        );
         assert!(
             matches!(refused, Err(MaterializerError::Register(_))),
             "a term without a subscriber must be refused"
@@ -1908,7 +2228,13 @@ mod membership_term_tests {
     fn without_the_mapping_the_caller_query_is_refused() {
         let mut mat = materializer(None);
         assert!(
-            mat.register_sqlite(1, CLIENT_SQL, &[]).is_err(),
+            mat.register_sqlite(
+                1,
+                CLIENT_SQL,
+                &[],
+                ReadBudget::new(core::time::Duration::from_secs(5))
+            )
+            .is_err(),
             "an unmapped caller function must refuse loudly"
         );
     }

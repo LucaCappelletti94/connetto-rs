@@ -17,8 +17,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PageSpec, PgOplog,
-    PgReadConnector, PgSnapshotSource, RequestGuard, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    PgReadConnector, PgSnapshotSource, ReadBudget, RequestGuard, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -372,17 +373,23 @@ async fn async_pg_reexec_bootstraps_min() {
             .expect("seed rows");
     }
 
-    let connector = PgReadConnector::new(pool.clone());
-    let materializer = Materializer::new(AGGS_PG_DDL).expect("build materializer");
-    let target =
-        pg_write_target::<ConnettoWatermark>(pool, AGGS_PG_DDL).expect("build write target");
+    let materializer = Materializer::with_read_connector(
+        AGGS_PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        PgReadConnector::with_session_setup(pool.clone()),
+    )
+    .expect("build materializer");
+    let target = pg_write_target::<ConnettoWatermark>(pool.clone(), AGGS_PG_DDL)
+        .expect("build write target");
     let session = SessionManager::with_connector(
         materializer,
         NoSnapshot,
         // Aggregate results never go through the policy.
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
-        connector,
+        PgReadConnector::with_session_setup(pool),
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
@@ -415,7 +422,8 @@ async fn async_pg_reexec_bootstraps_min() {
     };
     assert_eq!(update.sub_id, "cheapest");
     assert_eq!(
-        update.result_json, "5",
+        update.result_json.as_deref(),
+        Some("5"),
         "bootstrap reflects the real MIN in PG"
     );
 
@@ -659,7 +667,7 @@ async fn bootstrap_agg<T: Transport>(client: &mut T, sub_id: &str, query: &str) 
         ControlMessage::AggregateUpdate(update) => {
             assert_eq!(update.sub_id, sub_id);
             assert!(update.is_full_result);
-            update.result_json
+            update.result_json.expect("non-null aggregate bootstrap")
         }
         other => panic!("expected aggregate update, got {other:?}"),
     }
@@ -694,12 +702,16 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
             .expect("seed rows");
     }
 
-    let connector = PgReadConnector::new(pool.clone());
-    let materializer =
-        Materializer::new("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
-            .expect("build materializer");
+    let materializer = Materializer::with_read_connector(
+        "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        PgReadConnector::with_session_setup(pool.clone()),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(
-        pool,
+        pool.clone(),
         "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
     )
     .expect("build write target");
@@ -708,7 +720,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         NoSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
-        connector,
+        PgReadConnector::with_session_setup(pool),
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
@@ -816,6 +828,7 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
             "SELECT `translated`.`id`, `translated`.`quantity` FROM `translated` \
              WHERE (`translated`.`quantity` > ?) ORDER BY `translated`.`id`",
             &binds,
+            ReadBudget::new(core::time::Duration::from_secs(30)),
         )
         .expect("register the diesel shape");
     assert!(

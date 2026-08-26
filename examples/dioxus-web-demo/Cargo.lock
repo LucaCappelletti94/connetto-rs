@@ -883,12 +883,17 @@ name = "diesel"
 version = "2.3.12"
 source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
+ "bigdecimal",
  "bitflags",
  "byteorder",
+ "chrono",
  "diesel_derives",
  "downcast-rs",
  "itoa",
  "libsqlite3-sys",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "serde_json",
  "sqlite-wasm-rs",
  "time",
@@ -1490,7 +1495,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2806,7 +2811,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#789e5a2e5b65e224a1abe047b84018b81a66aa77"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#683123173c611c03f0784ce7cc45e1fabb01d3bd"
 dependencies = [
  "git2",
  "sql-traits",
@@ -3006,7 +3011,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3236,12 +3241,13 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#124250f93af33bdd9c3a72d76526863122aaf720"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
 dependencies = [
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -3333,7 +3339,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3653,7 +3659,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#f903bceb33771214031f9b39cd6aa26dbe2752fa"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#88c01710e1dd077af608bb462c604c813df7e22e"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -3715,7 +3721,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "log",
  "recursive",
@@ -3726,7 +3732,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3767,7 +3773,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=8ad31be70f60146871b2131688c2aa74d043e5d5#8ad31be70f60146871b2131688c2aa74d043e5d5"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f#3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -3883,10 +3889,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4500,7 +4506,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

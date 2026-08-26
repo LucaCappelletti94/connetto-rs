@@ -42,10 +42,20 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # Moved off `2eddc98` by R63, for `describe_terms` (#34), the term-value notes
 # (#35) and the caller comparison served as a self-seeding term (#37), and
 # taking the visibility work in #36, #38 and #39 plus the backend's own scalar
-# types (#40) in the same move.
+# types (#40) in the same move. Moved to `4a500ee` (#41) for the grouped and
+# membership surface: `GROUP BY`/`HAVING` register (grouped folds, grouped
+# `MIN`/`MAX`, `HAVING`) instead of being silently dropped, `TermDescription`
+# became an enum with per-row seeds, narrowings carry value rows, and
+# `reconcile_records` reports what it moved. Moved through `2daba59`,
+# `1e5382f` and `0832db4` for the adoption's ergonomics phases U7 to U12: the
+# auto-resolving wrapper is a complete facade (unified unregister, cursor
+# passthroughs, `match_rows`, `describe_terms`), the shipped connectors take
+# a `SessionSetup`, `row_bytes_of` is public, a failed triggered read names
+# its subscription, the facade drains the ungrouped fold channel, and bare
+# `ORDER BY` row queries stay in process.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "8ad31be70f60146871b2131688c2aa74d043e5d5", default-features = false, features = [
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f", default-features = false, features = [
   "std",
 ] }
 

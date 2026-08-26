@@ -75,7 +75,7 @@ async fn drain_to_replica(
     replica: &mut SqliteConnection,
 ) {
     while let Some(event) = source.next_event().await.expect("poll source") {
-        for patch in mat.dispatch(&event).expect("dispatch event").patches {
+        for patch in mat.dispatch(&event).await.expect("dispatch event").patches {
             mat.apply_diffset(&patch.payload_zstd, replica)
                 .expect("apply matched patch to replica");
         }

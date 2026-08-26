@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, MutationApplied, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
+    BulkMessage, ControlMessage, HandshakeAck, LivePatch, MutationApplied, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -538,4 +538,103 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
         .load(conn.conn())
         .expect("read drafts");
     assert_eq!(drafts, vec![1], "the local-tier row survives the pass");
+}
+
+/// R60's defect (a "latest N" subscription syncing the whole table forever)
+/// is structurally gone since subql `1e5382f`: `ORDER BY ... LIMIT` registers
+/// as a whole-answer read tier and delivers computed frames, never row
+/// patchsets, so the server-side classification is asserted in
+/// `connetto-server/tests/subscription_translate.rs`. What this test keeps
+/// pinning is the client contract that made the defect expensive and that
+/// remains correct for a genuinely filterless row subscription: `SELECT *`
+/// with no filter receives every insert, and `tidy` evicts none of them,
+/// because an absent filter is a claim on the whole table. The final
+/// unsubscribe-and-tidy is the internal control proving the pass was live and
+/// it was precisely the subscription holding the rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothing() {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        while let Ok(Some(frame)) = server.recv().await {
+            if let IncomingFrame::Control(ControlMessage::Subscribe(sub)) = frame {
+                if sub.sub_id != "w" {
+                    // The control subscription gets an empty snapshot: its row
+                    // is already on the replica.
+                    send_snapshot(&mut server, &sub.sub_id, &[], 2).await;
+                    continue;
+                }
+                // The snapshot: the three rows the table holds at subscribe.
+                send_snapshot(
+                    &mut server,
+                    &sub.sub_id,
+                    &[(8, "x"), (9, "x"), (10, "x")],
+                    1,
+                )
+                .await;
+                // Then every later insert is delivered: an absent filter
+                // admits every changed row, correct for a whole-table
+                // subscription.
+                for id in 11u8..=30 {
+                    server
+                        .send_bulk(BulkMessage::LivePatch(LivePatch::new(
+                            sub.sub_id.clone(),
+                            Cursor::new(vec![0, 0, 0, 0, 0, 0, 0, id]),
+                            snapshot_payload(&[(i64::from(id), "x")]),
+                        )))
+                        .await
+                        .expect("live patch");
+                }
+            }
+        }
+    });
+
+    let mut conn =
+        ConnettoConnection::connect(client_end, &Replica::in_memory(), DDL, &config(), None)
+            .await
+            .expect("connect");
+    conn.subscribe("w", "SELECT * FROM orders")
+        .await
+        .expect("subscribe whole table");
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![8, 9, 10],
+        "the snapshot delivers the rows the table held",
+    );
+
+    let mut applied = 0;
+    while applied < 20 {
+        if let ClientEvent::LivePatch { .. } = conn.pump_one().await.expect("pump") {
+            applied += 1;
+        }
+    }
+
+    assert_eq!(
+        replica_ids(&mut conn).len(),
+        23,
+        "a filterless subscription holds all twenty-three: every insert was delivered",
+    );
+
+    conn.tidy().expect("tidy");
+    assert_eq!(
+        replica_ids(&mut conn).len(),
+        23,
+        "tidy removed nothing: the absent filter marks the whole table untouchable",
+    );
+
+    // The control, the rotation pattern: replace the latest-N subscription
+    // with a narrow filtered one on the same table, keeping the table in the
+    // eviction scope, and the same pass now evicts everything but that row.
+    conn.subscribe("w2", "SELECT * FROM orders WHERE id = 8")
+        .await
+        .expect("subscribe control");
+    pump_to_snapshot_end(&mut conn).await;
+    conn.unsubscribe("w").await.expect("unsubscribe");
+    conn.tidy().expect("tidy after rotation");
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![8],
+        "the control: with a real filter in place of the absent one, the same pass evicts 22 of 23 rows, so it was the absent filter alone holding them",
+    );
 }

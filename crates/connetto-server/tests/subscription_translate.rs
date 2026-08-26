@@ -12,7 +12,7 @@
 //! unparseable query fails as `Translate` rather than reaching subql.
 
 use connetto_core::messages::BindValue;
-use connetto_server::{Materializer, MaterializerError, Registration};
+use connetto_server::{Materializer, MaterializerError, ReadBudget, Registration, SeedPlan};
 
 const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
@@ -95,7 +95,12 @@ fn register_sqlite_rejects_a_missing_bind() {
     // Placeholder pairing is subql's job now: a `$1` with no bind behind it
     // fails registration, not translation.
     let mut mat = materializer();
-    match mat.register_sqlite(1, "SELECT * FROM t WHERE amount > ?", &[]) {
+    match mat.register_sqlite(
+        1,
+        "SELECT * FROM t WHERE amount > ?",
+        &[],
+        ReadBudget::new(core::time::Duration::from_secs(5)),
+    ) {
         Err(MaterializerError::Register(_)) => {}
         Err(other) => panic!("expected a registration error, got {other:?}"),
         Ok(_) => panic!("a placeholder without a bind must not register"),
@@ -106,11 +111,16 @@ fn register_sqlite_rejects_a_missing_bind() {
 fn register_sqlite_classifies_translated_query() {
     let mut mat = materializer();
     let agg = mat
-        .register_sqlite(1, "SELECT COUNT(*) FROM t", &[])
+        .register_sqlite(
+            1,
+            "SELECT COUNT(*) FROM t",
+            &[],
+            ReadBudget::new(core::time::Duration::from_secs(5)),
+        )
         .expect("register aggregate");
     assert!(
-        matches!(agg.registration, Registration::DeltaAggregate(_)),
-        "COUNT(*) should classify as a delta aggregate after translation",
+        matches!(&agg.registration, Registration::Computed(cap) if matches!(cap.seed, SeedPlan::Fold { .. })),
+        "COUNT(*) should classify as a fold subscription after translation",
     );
 
     let row = mat
@@ -118,6 +128,7 @@ fn register_sqlite_classifies_translated_query() {
             2,
             "SELECT * FROM t WHERE amount > ?",
             &[BindValue::Integer(0)],
+            ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("register row");
     assert!(
@@ -141,6 +152,7 @@ fn register_sqlite_accepts_a_real_bind() {
             1,
             "SELECT * FROM t WHERE price > ?",
             &[BindValue::Real(1.5)],
+            ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("a REAL bind registers");
     assert!(matches!(row.registration, Registration::Row(_)));
@@ -155,6 +167,7 @@ fn register_sqlite_accepts_a_blob_bind() {
             1,
             "SELECT * FROM t WHERE tag = ?",
             &[BindValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])],
+            ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("a BLOB bind registers");
     assert!(matches!(row.registration, Registration::Row(_)));
@@ -163,7 +176,12 @@ fn register_sqlite_accepts_a_blob_bind() {
 #[test]
 fn register_sqlite_rejects_unparseable_query() {
     let mut mat = materializer();
-    match mat.register_sqlite(1, "SELECT ((( FROM", &[]) {
+    match mat.register_sqlite(
+        1,
+        "SELECT ((( FROM",
+        &[],
+        ReadBudget::new(core::time::Duration::from_secs(5)),
+    ) {
         Err(MaterializerError::Translate(_)) => {}
         Err(other) => panic!("expected a translation error, got {other:?}"),
         Ok(_) => panic!("unparseable query must not register"),
@@ -178,23 +196,49 @@ fn registers_the_exact_shape_diesel_renders() {
     // every typed live query produces, so it must register end to end, and
     // its translation must be parameterized Postgres SQL with double-quoted
     // identifiers.
+    //
+    // A bare ORDER BY changes nothing about which rows are in the answer, so
+    // since subql `0832db4` (U12) the ordered and unordered statements both
+    // register as row subscriptions and the replica applies the ordering at
+    // local execution. Only LIMIT or OFFSET moves a query to a read tier.
     let mut mat = materializer();
-    let row = mat
+    let reg = mat
         .register_sqlite(
             1,
             "SELECT `t`.`id`, `t`.`name`, `t`.`amount`, `t`.`price`, `t`.`tag` FROM `t` \
              WHERE (`t`.`amount` > ?) ORDER BY `t`.`id`",
             &[BindValue::Integer(0)],
+            ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("diesel-rendered shape registers");
     assert!(
-        matches!(row.registration, Registration::Row(_)),
-        "the diesel shape classifies as a row subscription",
+        matches!(&reg.registration, Registration::Row(_)),
+        "the diesel shape with a bare ORDER BY stays a row subscription (U12)",
     );
     assert!(
-        row.pg_sql.contains("$1") && !row.pg_sql.contains('`') && !row.pg_sql.contains('?'),
+        reg.pg_sql.contains("$1") && !reg.pg_sql.contains('`') && !reg.pg_sql.contains('?'),
         "the translation is parameterized Postgres SQL, got {}",
-        row.pg_sql,
+        reg.pg_sql,
+    );
+}
+
+/// Pins the R60 defect closure: a "latest N" query with ORDER BY and LIMIT but
+/// no WHERE predicate used to register as a filterless row subscription, which
+/// synced the whole table forever and disabled eviction. It must now register as
+/// a read-tier computed subscription (`SeedPlan::Snapshot`), never as `Row`.
+#[test]
+fn latest_n_row_query_registers_as_snapshot_not_row() {
+    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let reg = mat
+        .register(1, "SELECT * FROM t ORDER BY id DESC LIMIT 3")
+        .expect("register");
+    assert!(
+        matches!(&reg, Registration::Computed(cap) if matches!(cap.seed, SeedPlan::Snapshot)),
+        "ORDER BY + LIMIT without WHERE must register as Computed(Snapshot), not Row",
+    );
+    assert!(
+        !matches!(reg, Registration::Row(_)),
+        "ORDER BY + LIMIT must never register as a row subscription",
     );
 }
 

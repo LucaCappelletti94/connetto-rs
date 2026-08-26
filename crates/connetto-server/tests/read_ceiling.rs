@@ -471,8 +471,9 @@ mod aggregates {
     use connetto_core::messages::{ControlMessage, SUBSCRIPTION_REFUSED};
     use connetto_core::test_support::TestGrantChecker;
     use connetto_server::{
-        AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard, SessionConfig,
-        SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
+        AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
+        RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
+        loopback, pg_write_target,
     };
     use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
     use subql::{CdcSource, PgSqliteEmuSource};
@@ -502,15 +503,22 @@ mod aggregates {
     }
 
     fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> {
+        let pool = fixture.admin().clone();
         SessionManager::with_connector(
-            Materializer::new(PG_DDL).expect("build materializer"),
-            PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source"),
+            Materializer::with_read_connector(
+                PG_DDL,
+                RuntimeWritableCatalog::default(),
+                None,
+                None,
+                PgReadConnector::with_session_setup(pool.clone()),
+            )
+            .expect("build materializer"),
+            PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
             // An aggregate result is global, so the policy never sees it.
             RosterAuth::granting_nobody(),
             Arc::new(TestGrantChecker),
-            PgReadConnector::new(fixture.admin().clone()),
-            pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
-                .expect("build write target"),
+            PgReadConnector::with_session_setup(pool.clone()),
+            pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
             guard,
             SessionConfig::default(),
         )
@@ -597,7 +605,7 @@ mod aggregates {
                 logs.lines()
             );
         };
-        assert_eq!(seeded.result_json, "1");
+        assert_eq!(seeded.result_json.as_deref(), Some("1"));
 
         let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
         retire_the_extreme(&mut source, &manager).await;
@@ -608,7 +616,7 @@ mod aggregates {
         assert_eq!(refusal.related_to.as_deref(), Some("cheapest"));
         assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
         let named = logs.lines().into_iter().any(|line| {
-            line["message"] == "an aggregate re-execution was refused, ending the subscription"
+            line["message"] == "a computed subscription's read was refused, ending the subscription"
                 && line["sub_id"] == "cheapest"
         });
         assert!(named, "the log names the subscription it ended");
@@ -642,6 +650,6 @@ mod aggregates {
         let ControlMessage::AggregateUpdate(again) = client.next_control().await else {
             panic!("a triggered read inside the bound is delivered");
         };
-        assert_eq!(again.result_json, "1");
+        assert_eq!(again.result_json.as_deref(), Some("1"));
     }
 }

@@ -139,6 +139,16 @@ impl GrantReach {
         let Some((type_name, _)) = object.split_once(':') else {
             return &[];
         };
+        self.tables_for_type(type_name, relation)
+    }
+
+    /// The same, for a caller holding the type alone.
+    ///
+    /// A replayed query names the slice it determines by type and relation
+    /// rather than by one object, so `R86`'s reconcile has no `type:key` to
+    /// take apart.
+    #[must_use]
+    pub fn tables_for_type(&self, type_name: &str, relation: &str) -> &[String] {
         self.reached
             .get(&FactKind {
                 type_name: type_name.to_owned(),
@@ -158,7 +168,6 @@ fn read_relations(entry: &ActionRelations) -> Result<Vec<String>, ReachError> {
         // The database restricts nothing here, so no grant reaches it, and the
         // model refusing every row means no grant changes what is delivered.
         ActionAnswer::Unrestricted | ActionAnswer::Denied => Ok(Vec::new()),
-        ActionAnswer::NotSeparable { relation } => Ok(vec![relation.to_string()]),
         other => Err(ReachError::UnknownAnswer {
             type_name: entry.type_name.to_string(),
             answer: format!("{other:?}"),

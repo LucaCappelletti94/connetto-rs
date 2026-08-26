@@ -240,8 +240,7 @@ async fn refusals_are_byte_identical_across_causes() {
     );
     assert!(
         lines.iter().any(|line| {
-            (line["message"] == "aggregate bootstrap failed"
-                || line["message"] == "delta aggregate bootstrap failed")
+            line["message"] == "computed bootstrap failed"
                 && line["error"]
                     .as_str()
                     .is_some_and(|error| error.contains("multi-column aggregate seeds"))

@@ -53,6 +53,11 @@ fn options() -> Pg2SqliteOptions {
             CALLER_FUNCTION,
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
+        // connetto_client::WRITE_EXEMPTION_FUNCTION, hardcoded because a build
+        // script cannot cheaply depend on the client crate. connetto registers
+        // it on every replica connection and holds it true only while applying
+        // its own writes, so the fail-closed guards admit server data.
+        .with_write_exemption_function("connetto_write_exempt")
 }
 
 /// Parse every document in `documents` into one translator.

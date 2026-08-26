@@ -650,7 +650,7 @@ async fn provision_with(
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl())
         .expect("snapshot source")
         .with_publication(PUBLICATION);
-    let (fga, upkeep, translator) = fga_auth(fixture, shape).await;
+    let (fga, upkeep, translator) = fga_auth(fixture, shape, reader_pool.clone()).await;
     let compared = matches!(executor, Executor::Both);
     let auth = match executor {
         Executor::Shipped | Executor::Both => HarnessAuth::fga(fga),
@@ -686,6 +686,7 @@ async fn provision_with(
 async fn fga_auth(
     fixture: &Fixture,
     shape: PolicyShape,
+    pool: Pool<AsyncPgConnection>,
 ) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String>(
@@ -731,7 +732,7 @@ async fn fga_auth(
     // binary, so a row written after the load reaches the service before it
     // reaches a subscriber. Without it a cross-table policy would answer every
     // new row from facts that were never written.
-    let upkeep = auth.upkeep(reach);
+    let upkeep = auth.upkeep(reach, translator.clone(), pool);
     (auth, upkeep, translator)
 }
 

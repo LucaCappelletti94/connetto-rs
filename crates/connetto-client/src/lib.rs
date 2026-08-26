@@ -759,8 +759,9 @@ pub enum ClientEvent {
     Aggregate {
         /// Subscription id.
         sub_id: String,
-        /// JSON-encoded aggregate value.
-        result_json: String,
+        /// JSON-encoded aggregate value, or `None` when this key was removed
+        /// from the result set (the group or keyed row departed).
+        result_json: Option<String>,
         /// Opaque group key, or `None` for a single-group aggregate.
         group_key: Option<Vec<u8>>,
         /// Whether this update replaces the entire result set or upserts a
@@ -943,21 +944,30 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
 
 /// Suspends the capture session for the duration of a server-originated
 /// apply (a patch or a rollback), so the session never records what the
-/// server already knows. Re-enables on drop, so no exit path can leave
-/// capture switched off. `set_enabled` is a plain setter and cannot panic.
+/// server already knows, and holds the write exemption true for the same
+/// span, so the translated schema's fail-closed guards admit the write (the
+/// policy already judged it where it was authored). Re-enables capture and
+/// drops the exemption on drop, so no exit path can leave either switched.
+/// `set_enabled` is a plain setter and cannot panic.
 struct SuspendedCapture<'s> {
     session: &'s mut Session,
+    exempt: Arc<AtomicBool>,
 }
 
 impl<'s> SuspendedCapture<'s> {
-    fn new(session: &'s mut Session) -> Self {
+    fn new(session: &'s mut Session, exempt: &Arc<AtomicBool>) -> Self {
         session.set_enabled(false);
-        Self { session }
+        exempt.store(true, Ordering::Relaxed);
+        Self {
+            session,
+            exempt: Arc::clone(exempt),
+        }
     }
 }
 
 impl Drop for SuspendedCapture<'_> {
     fn drop(&mut self) {
+        self.exempt.store(false, Ordering::Relaxed);
         self.session.set_enabled(true);
     }
 }
@@ -1135,6 +1145,42 @@ fn register_caller(
         move || identity.clone(),
     )
     .map_err(|e| ClientError::Session(format!("registering the caller function: {e}")))
+}
+
+/// The SQLite function a translated schema's write guards call to let
+/// connetto's own writes land underneath the policy triggers.
+///
+/// pg2sqlite's write guards are fail-closed: a translation built with
+/// `with_write_exemption_function` names one function, and a backing-table
+/// write is admitted only while that function returns true. connetto holds it
+/// true exactly while its capture session is suspended, which is every write
+/// connetto authors itself: applying server-authoritative patches, rolling a
+/// refused mutation back, evicting uncovered rows, and its own bookkeeping.
+/// The application's writes always see it false, so the policy judges them.
+///
+/// A build that translates its schema with policies passes this name to
+/// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
+/// function on every replica connection it opens, whether or not the schema
+/// names it.
+pub const WRITE_EXEMPTION_FUNCTION: &str = "connetto_write_exempt";
+
+/// Register [`WRITE_EXEMPTION_FUNCTION`] backed by `flag`.
+///
+/// Nondeterministic on purpose: its value changes between statements (the
+/// suspension guard flips it), so SQLite must not hoist or cache it the way
+/// the caller function invites. Innocuous because the generated triggers are
+/// exactly the schema objects it has to be callable from.
+fn register_write_exemption(
+    db: &mut SqliteConnection,
+    flag: &Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    let flag = Arc::clone(flag);
+    db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+        WRITE_EXEMPTION_FUNCTION,
+        SqliteFunctionBehavior::INNOCUOUS,
+        move || flag.load(Ordering::Relaxed),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the write exemption function: {e}")))
 }
 
 /// Whether `name` is SQLite's or connetto's own, rather than the application's.
@@ -1824,6 +1870,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
     dirty: Arc<AtomicBool>,
+    /// True while [`SuspendedCapture`] holds it, read by the registered
+    /// [`WRITE_EXEMPTION_FUNCTION`], so the translated schema's fail-closed
+    /// write guards admit connetto's own writes and nobody else's.
+    write_exempt: Arc<AtomicBool>,
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
@@ -2006,6 +2056,11 @@ where
         if let Some((function, identity)) = &config.caller {
             register_caller(&mut db, function, identity.clone())?;
         }
+        // Beside the caller function and for the same reach: the generated
+        // write guards call it, so it exists before any trigger can run. A
+        // schema that never names it pays nothing.
+        let write_exempt = Arc::new(AtomicBool::new(false));
+        register_write_exemption(&mut db, &write_exempt)?;
         if let Some(ddl) = sqlite_ddl {
             db.batch_execute(ddl)?;
         }
@@ -2059,6 +2114,7 @@ where
             last_cursor: resume,
             next_seq,
             dirty,
+            write_exempt,
             changed,
             transaction_state: AnsiTransactionManager::default(),
             pending,
@@ -2205,7 +2261,7 @@ where
                 .map(|(seq, _)| *seq)
                 .collect();
             if !retired.is_empty() {
-                let _suspended = SuspendedCapture::new(&mut self.session);
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
                 for seq in retired {
                     self.pending.remove(&seq);
                     delete_pending(&mut self.db, seq)?;
@@ -2606,7 +2662,7 @@ where
         {
             // Suspended for the whole apply, so restoring a write does not
             // capture a second write of the same rows.
-            let _suspended = SuspendedCapture::new(&mut self.session);
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             self.db.transaction::<(), ClientError, _>(|db| {
                 for row in &plan.rows {
                     if choices.answer(row.collision) == Keep::Mine {
@@ -2720,7 +2776,7 @@ where
         // declaration, not a failure, and it takes effect on the first
         // connection.
         {
-            let _suspended = SuspendedCapture::new(&mut self.session);
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             subscriptions::remember(&mut self.db, sub_id, &spec, grace)?;
         }
         if self.is_connected() {
@@ -2756,7 +2812,7 @@ where
         sub_id: &str,
         spec: &SubscriptionSpec,
     ) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         subscriptions::pin(&mut self.db, name, sub_id, spec)
     }
 
@@ -2767,7 +2823,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn unpin_subscription(&mut self, name: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         subscriptions::unpin(&mut self.db, name)
     }
 
@@ -2789,7 +2845,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn release_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         subscriptions::release(&mut self.db, sub_id)
     }
 
@@ -2799,7 +2855,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn hold_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         subscriptions::hold(&mut self.db, sub_id)
     }
 
@@ -2846,7 +2902,7 @@ where
                 // D3). The server never saw it on this connection, so there is
                 // nothing to unsubscribe.
                 self.evict_subscription_rows(&record.sub_id)?;
-                let _suspended = SuspendedCapture::new(&mut self.session);
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
                 subscriptions::forget(&mut self.db, &record.sub_id)?;
             }
         }
@@ -2863,7 +2919,7 @@ where
         // Dropped from the record first, so a cancellation made offline is not
         // replayed as a subscription by the next attach.
         {
-            let _suspended = SuspendedCapture::new(&mut self.session);
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             subscriptions::forget(&mut self.db, sub_id)?;
         }
         if self.is_connected() {
@@ -3034,7 +3090,7 @@ where
         let seq = self.next_seq;
         self.next_seq += 1;
         {
-            let _suspended = SuspendedCapture::new(&mut self.session);
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             persist_pending(&mut self.db, seq, &changeset)?;
             // The cap is a safety valve against a server that never
             // acknowledges: evicting a record gives up its replay.
@@ -3108,7 +3164,7 @@ where
         let rows = affected_rows(&changeset, &self.config.policy_tables)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         delete_pending(&mut self.db, client_seq)?;
         self.db
             .apply_changeset(&inverse, rollback_omit)
@@ -3224,7 +3280,7 @@ where
                 // An empty cursor carries no resume information: never let
                 // it regress a real one, in memory or in the replica.
                 if !end.cursor.is_empty() {
-                    let _suspended = SuspendedCapture::new(&mut self.session);
+                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
                     persist_cursor(&mut self.db, &end.cursor)?;
                     self.last_cursor = Some(end.cursor);
                 }
@@ -3254,7 +3310,7 @@ where
             }
             ControlMessage::MutationApplied(ack) => {
                 if self.pending.remove(&ack.client_seq).is_some() {
-                    let _suspended = SuspendedCapture::new(&mut self.session);
+                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
                     delete_pending(&mut self.db, ack.client_seq)?;
                 }
                 Ok(ClientEvent::MutationApplied {
@@ -3406,7 +3462,7 @@ where
             }
         }
 
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         let tables = self.config.policy_tables.clone();
         self.db.transaction::<_, ClientError, _>(|conn| {
             let mut removed = 0usize;
@@ -3630,7 +3686,7 @@ where
             return Ok(());
         }
         let queued: Vec<Vec<u8>> = self.pending.values().cloned().collect();
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<_, ClientError, _>(|conn| {
             for changeset in &queued {
                 conn.apply_changeset(changeset, server_wins)
@@ -3667,7 +3723,7 @@ where
             .honour_departures(&bytes, addressed_to)?
             .map(|bytes| self.to_physical(bytes))
             .transpose()?;
-        let _suspended = SuspendedCapture::new(&mut self.session);
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,

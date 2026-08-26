@@ -629,7 +629,12 @@ async fn main() -> Result<()> {
     let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
     let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     let oplog = prepare_change_log(&pool, &slot, &publication, &oplog_table).await?;
-    let connector = PgReadConnector::new(pool.clone());
+    // Two handles on the shipped connector over the owner pool: one the
+    // engine drives for every computed read, one the session uses for fold
+    // seeds. Aggregate reads are global statistics, so the owner pool is the
+    // deliberate choice (no RLS applies to them by construction).
+    let connector = PgReadConnector::with_session_setup(pool.clone());
+    let engine_connector = PgReadConnector::with_session_setup(pool.clone());
 
     let (reader_pool_size, reader_gate) = reader_split()?;
 
@@ -666,10 +671,16 @@ async fn main() -> Result<()> {
         build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
     // The membership term's subquery classifies against the deployment's own
     // policies, so the materializer's engine gets the translator that read them.
-    let materializer =
-        Materializer::with_translation(&pg_ddl, writable_catalog(), translator, caller_mapping())
-            .map_err(|err| anyhow!("building materializer: {err}"))?;
-    let upkeep = auth.upkeep(reach);
+    let upkeep_translator = translator.clone();
+    let materializer = Materializer::with_read_connector(
+        &pg_ddl,
+        writable_catalog(),
+        Some(translator),
+        caller_mapping(),
+        engine_connector,
+    )
+    .map_err(|err| anyhow!("building materializer: {err}"))?;
+    let upkeep = auth.upkeep(reach, upkeep_translator, reader_pool.clone());
     let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
         .map_err(|err| anyhow!("building write target: {err}"))?;
 

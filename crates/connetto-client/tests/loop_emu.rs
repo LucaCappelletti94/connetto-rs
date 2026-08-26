@@ -26,16 +26,16 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog, ReadBudget,
-    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
+    ConnettoReadSetup, InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec,
+    PgOplog, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
     SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::backend::{Postgres, ScalarKindOf, Value as PgValue};
-use subql::reexec::{AsyncConnector, ScalarRowError, Snapshot as ConnectorRead};
+use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::reexec::{AsyncConnector, RowPage, ScalarRowError, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -1481,42 +1481,40 @@ async fn conflicting_write_converges_to_server_after_rollback() {
 /// scalars (the MIN/MAX re-execution path) and `execute_scalar_row` from a
 /// queue of canned component rows (the delta aggregate seed path), standing in
 /// for the Postgres backend in the Docker-free aggregate loop.
+#[derive(Clone)]
 struct QueuedConnector {
-    responses: Mutex<VecDeque<PgValue<Postgres>>>,
-    rows: Mutex<VecDeque<Vec<PgValue<Postgres>>>>,
+    responses: Arc<Mutex<VecDeque<PgValue<Postgres>>>>,
+    rows: Arc<Mutex<VecDeque<Vec<PgValue<Postgres>>>>>,
 }
 
 impl QueuedConnector {
     fn new(responses: impl IntoIterator<Item = i64>) -> Self {
         Self {
-            responses: Mutex::new(responses.into_iter().map(PgValue::Int).collect()),
-            rows: Mutex::new(VecDeque::new()),
+            responses: Arc::new(Mutex::new(
+                responses.into_iter().map(PgValue::Int).collect(),
+            )),
+            rows: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
-    /// A connector serving canned scalar re-execution values of any type, one
-    /// per `execute_scalar` call, in order. Drives a typed `live()` over a
-    /// column whose SQL type is outside the integer family.
     fn with_scalars(responses: impl IntoIterator<Item = PgValue<Postgres>>) -> Self {
         Self {
-            responses: Mutex::new(responses.into_iter().collect()),
-            rows: Mutex::new(VecDeque::new()),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            rows: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
-    /// A connector that only serves delta aggregate seeds, one canned component
-    /// row per `execute_scalar_row` call, in order.
     fn with_rows(rows: impl IntoIterator<Item = Vec<PgValue<Postgres>>>) -> Self {
         Self {
-            responses: Mutex::new(VecDeque::new()),
-            rows: Mutex::new(rows.into_iter().collect()),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
+            rows: Arc::new(Mutex::new(rows.into_iter().collect())),
         }
     }
 }
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for QueuedConnector {
-    type AuthContext = ReadBudget;
+    type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -1524,8 +1522,8 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKindOf<Postgres>,
-        _budget: &ReadBudget,
+        _kind: BuiltinKind,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
@@ -1536,16 +1534,17 @@ impl AsyncConnector for QueuedConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
-        _budget: &ReadBudget,
+        _max_bytes: usize,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
     > + Send {
         async {
             Err(std::io::Error::other(
-                "execute_rows is not used in the aggregate loop test",
+                "read_page not used in aggregate loop test",
             ))
         }
     }
@@ -1553,8 +1552,8 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar_row(
         &self,
         _sql: &str,
-        _kinds: &[ScalarKindOf<Postgres>],
-        _budget: &ReadBudget,
+        _kinds: &[BuiltinKind],
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {
@@ -1576,7 +1575,7 @@ fn aggregate_result(event: ClientEvent) -> String {
             ..
         } => {
             assert_eq!(sub_id, "cheapest");
-            result_json
+            result_json.expect("result_json present in aggregate event")
         }
         other => panic!("expected an aggregate event, got {other:?}"),
     }
@@ -1589,9 +1588,16 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     // through the connector, folds a lower insert in-process, and re-executes
     // through the connector when the current extreme is deleted. Each value
     // reaches the client as a ClientEvent::Aggregate.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Bootstrap answers 3; the re-execution after the delete answers 9.
     let connector = QueuedConnector::new([3, 9]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -1741,7 +1747,7 @@ async fn drain_events<S, C, O>(
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
+    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ConnettoReadSetup>
         + Send
         + Sync,
     C::Error: core::fmt::Display + connetto_server::TimedOutRead,
@@ -1772,7 +1778,10 @@ async fn collect_aggregates(
             ..
         } = event
         {
-            seen.insert(sub_id, result_json);
+            seen.insert(
+                sub_id,
+                result_json.expect("result_json present in aggregate event"),
+            );
         }
     }
     seen
@@ -1806,7 +1815,6 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     // once. The server seeds each through the connector's multi-column row path,
     // then folds every CDC insert and delete in-process (no connector
     // round-trip per event) and delivers the running value to the client.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // Seed rows in subscribe order over the empty table: COUNT(*)=0, SUM=NULL,
     // AVG=(NULL sum, 0 count).
     let connector = QueuedConnector::with_rows([
@@ -1814,6 +1822,14 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         vec![PgValue::Null],
         vec![PgValue::Null, PgValue::Int(0)],
     ]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -1905,15 +1921,16 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
 /// is held open until the test releases it, so a change can be dispatched
 /// inside the bootstrap window rather than raced into it. The
 /// [`GatedSnapshot`] of part A, for the aggregate path of part B.
+#[derive(Clone)]
 struct GatedSeed {
     entered: Arc<Notify>,
     release: Arc<Notify>,
-    rows: Mutex<VecDeque<Vec<PgValue<Postgres>>>>,
+    rows: Arc<Mutex<VecDeque<Vec<PgValue<Postgres>>>>>,
 }
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncConnector for GatedSeed {
-    type AuthContext = ReadBudget;
+    type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
     type Checkpoint = PgLsn;
     type Backend = Postgres;
@@ -1921,29 +1938,30 @@ impl AsyncConnector for GatedSeed {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKindOf<Postgres>,
-        _budget: &ReadBudget,
+        _kind: BuiltinKind,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("the gated seed serves no scalars")) }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
-        _budget: &ReadBudget,
+        _max_bytes: usize,
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
     > + Send {
-        async { Err(std::io::Error::other("the gated seed serves no rows")) }
+        async { Err(std::io::Error::other("the gated seed serves no pages")) }
     }
 
     fn execute_scalar_row(
         &self,
         _sql: &str,
-        _kinds: &[ScalarKindOf<Postgres>],
-        _budget: &ReadBudget,
+        _kinds: &[BuiltinKind],
+        _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
     > + Send {
@@ -1953,7 +1971,12 @@ impl AsyncConnector for GatedSeed {
         async move {
             entered.notify_one();
             release.notified().await;
-            next.map(|row| (row, Some(PgLsn(1)))).ok_or_else(|| {
+            // Position 0: the canned seed represents a read taken before any
+            // event this test dispatches, so every buffered change replays on
+            // top of it. A position at or past an event's LSN would mean that
+            // event was already inside the read, and the engine would rightly
+            // not replay it.
+            next.map(|row| (row, Some(PgLsn(0)))).ok_or_else(|| {
                 ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
             })
         }
@@ -1963,16 +1986,14 @@ impl AsyncConnector for GatedSeed {
 /// R28 part B. A change dispatched while a delta aggregate is reading its own
 /// bootstrap must still be counted.
 ///
-/// The accumulator is seeded from a read taken before the change, and the
-/// route does not exist yet, so the fold is computed and dropped by
-/// `Materializer::dispatch`, which skips a consumer with no installed
-/// accumulator. Nothing heals it: every later update sends the whole
-/// accumulated value, permanently short by one. The second insert is what
-/// makes that visible, since it forces a delivery whose value can be checked.
+/// The guarantee lives upstream since the `1e5382f` adoption: a registered but
+/// unseeded fold buffers the changes dispatched during its seed read, and
+/// `install_fold_seed` reconciles them against the read's stream position, so
+/// the very first delivered frame already counts the contested insert. The
+/// second insert then proves the accumulator stayed consistent afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     // The seed the connector will return once released: COUNT(*) over the
@@ -1980,8 +2001,16 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     let connector = GatedSeed {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
-        rows: Mutex::new(VecDeque::from([vec![PgValue::Int(0)]])),
+        rows: Arc::new(Mutex::new(VecDeque::from([vec![PgValue::Int(0)]]))),
     };
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -2026,7 +2055,10 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     release.notify_one();
 
     let seeded = collect_aggregates(&mut client, &["count"]).await;
-    assert_eq!(seeded["count"], "0", "the seed is the pre-change read");
+    assert_eq!(
+        seeded["count"], "1",
+        "the seed reconciles the change dispatched during the read window",
+    );
 
     // A second insert forces a delivery. The true count is two.
     source
@@ -2055,14 +2087,21 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aggregates_first_frame_is_its_full_result() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let connector = GatedSeed {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
-        rows: Mutex::new(VecDeque::from([vec![PgValue::Int(0)]])),
+        rows: Arc::new(Mutex::new(VecDeque::from([vec![PgValue::Int(0)]]))),
     };
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -2247,8 +2286,15 @@ async fn row_subscription_and_delta_aggregate_coexist() {
     // same table. A single insert must fan out on both paths at once: a row
     // LivePatch to the row route and a folded AggregateUpdate to the delta
     // route. The two delivery paths are independent in one dispatch.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -2331,7 +2377,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
                 result_json,
                 ..
             } if sub_id == "count" => {
-                count_val = Some(result_json);
+                count_val = result_json;
             }
             _ => {}
         }
@@ -2366,8 +2412,15 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
     let fixture = Fixture::acquire().await;
     // After an Unsubscribe, the server drops the accumulator and the route, so a
     // further CDC event produces no aggregate update for that consumer.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -2609,9 +2662,16 @@ async fn live_value_tracks_a_server_aggregate() {
     // through the connector seed, CDC folds arrive as AggregateUpdate, and
     // dropping the handle unsubscribes. The shape guards route misuse to the
     // right method with a clear error.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     // COUNT(*) seed over the backend at subscribe time: 1 (the snapshot row).
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -2732,12 +2792,19 @@ async fn live_value_decodes_a_temporal_aggregate() {
     // both the bootstrap and a later CDC-driven push.
     const METRICS_PG_DDL: &str = "CREATE TABLE metrics (id INT PRIMARY KEY, seen TIMESTAMP);";
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(METRICS_PG_DDL).expect("build materializer");
     let seen = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
         .expect("valid date")
         .and_hms_opt(3, 4, 5)
         .expect("valid time");
     let connector = QueuedConnector::with_scalars([PgValue::Timestamp(seen)]);
+    let materializer = Materializer::with_read_connector(
+        METRICS_PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(
@@ -3061,8 +3128,15 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
     // exactly one bootstrap seed, so a second independent subscribe would
     // starve it: the late joiner instead resolves immediately from the cached
     // last value, and both handles fold a CDC update.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
+    let materializer = Materializer::with_read_connector(
+        PG_DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        None,
+        connector.clone(),
+    )
+    .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = SessionManager::with_connector(

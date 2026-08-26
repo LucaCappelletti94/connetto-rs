@@ -61,6 +61,11 @@ zstd = "0.13"
 sqlite-diff-rs = { version = "0.9.0", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
+# The page budget's row-cost measure. subql prices a RowPage row as its
+# postcard-serialized size and keeps that function private, so this connector
+# computes the identical measure itself (an addendum to
+# docs/upstream-subql-connector-session-setup.md asks for the function).
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # Synchronous lock guarding the SQLite write target (never held across .await).
 parking_lot = "0.12"
 # Async Postgres write path: the diesel-async apply and re-exec connector over a

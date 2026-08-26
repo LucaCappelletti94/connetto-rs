@@ -4,11 +4,11 @@
 //! through the browser relay hub. The hub forwards the worker client's
 //! `ClientEvent::Aggregate` back down to the owning tab as an
 //! `AggregateUpdate`, so the event MUST carry every field the wire message
-//! does, not just the JSON payload. The direct server only ever emits a
-//! single-group full result (`group_key: None`, `is_full_result: true`), so
-//! faithful forwarding of a grouped delta (`group_key: Some`,
-//! `is_full_result: false`) can only be proven with a hand-crafted frame. This
-//! test drives the client's decode with exactly that frame over a loopback.
+//! does, not just the JSON payload. The server has emitted grouped deltas
+//! since the R82 adoption (proven end to end in connetto-server's
+//! `grouped_wire.rs`), and this test pins the client's decode alone with a
+//! hand-crafted frame over a loopback, so a decode regression cannot hide
+//! behind the server's construction.
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Cursor;
@@ -59,7 +59,7 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
     let transport = aggregate_pusher(AggregateUpdate {
         sub_id: "by-region".to_owned(),
         group_key: Some(b"region=eu".to_vec()),
-        result_json: "{\"count\":3}".to_owned(),
+        result_json: Some("{\"count\":3}".to_owned()),
         is_full_result: false,
     });
     let mut conn = ConnettoConnection::connect(
@@ -84,7 +84,43 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
         event,
         ClientEvent::Aggregate {
             sub_id: "by-region".to_owned(),
-            result_json: "{\"count\":3}".to_owned(),
+            result_json: Some("{\"count\":3}".to_owned()),
+            group_key: Some(b"region=eu".to_vec()),
+            is_full_result: false,
+        },
+    );
+}
+
+// A removal frame (result_json: None) decodes faithfully so a relay can
+// forward the key-departure signal to the tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_removal_decodes_as_none() {
+    let transport = aggregate_pusher(AggregateUpdate {
+        sub_id: "by-region".to_owned(),
+        group_key: Some(b"region=eu".to_vec()),
+        result_json: None,
+        is_full_result: false,
+    });
+    let mut conn = ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        SQLITE_DDL,
+        &config("t2"),
+        None,
+    )
+    .await
+    .expect("connect");
+
+    assert_eq!(
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)
+    );
+    let event = conn.pump_one().await.expect("pump");
+    assert_eq!(
+        event,
+        ClientEvent::Aggregate {
+            sub_id: "by-region".to_owned(),
+            result_json: None,
             group_key: Some(b"region=eu".to_vec()),
             is_full_result: false,
         },

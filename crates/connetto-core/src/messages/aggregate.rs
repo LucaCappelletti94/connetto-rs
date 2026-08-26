@@ -23,9 +23,11 @@ pub struct AggregateUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "serde_bytes_option")]
     pub group_key: Option<Vec<u8>>,
-    /// JSON-encoded result. Deserialised by the client into its
-    /// application-defined result struct.
-    pub result_json: String,
+    /// JSON-encoded result, deserialised by the client into its
+    /// application-defined result struct. `None` removes the addressed key:
+    /// the group (or keyed row) left the result set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_json: Option<String>,
     /// Whether this update replaces the entire result set (true) or upserts a
     /// single group (false). Full replacement is produced by re-execution.
     /// Per-group upserts are produced by the IVM fast path (Q5.6).
@@ -68,11 +70,12 @@ mod tests {
         let u = AggregateUpdate {
             sub_id: "s1".into(),
             group_key: None,
-            result_json: "{\"count\":10}".into(),
+            result_json: Some("{\"count\":10}".into()),
             is_full_result: false,
         };
         assert!(!u.is_full_result);
         assert!(u.group_key.is_none());
+        assert!(u.result_json.is_some());
     }
 
     #[test]
@@ -80,7 +83,7 @@ mod tests {
         let u = AggregateUpdate {
             sub_id: "s2".into(),
             group_key: Some(b"region=eu".to_vec()),
-            result_json: "{\"count\":3}".into(),
+            result_json: Some("{\"count\":3}".into()),
             is_full_result: false,
         };
         assert_eq!(u.group_key.as_deref(), Some(&b"region=eu"[..]));

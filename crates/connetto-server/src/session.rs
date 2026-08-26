@@ -37,14 +37,11 @@ use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, Sessio
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
-use subql::backend::{CdcEvent, Postgres, ScalarKindOf, Value as PgValue};
-use subql::reexec::{AsyncConnector, Snapshot as ConnectorRead};
+use subql::backend::{CdcEvent, Postgres, Value as PgValue};
+use subql::term::TermDescription;
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
-use subql::{
-    AggAccumulator, CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, PgLsn,
-    SubscriptionId, TableLike,
-};
+use subql::{CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId, TableLike};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -54,13 +51,13 @@ use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::guard::RequestGuard;
 use crate::materializer::{
-    DeltaAggregateCapture, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
-    Registration, SqliteRegistration, TermMove, TermSeed, agg_value_to_json, compress,
-    narrowed_sql, typed_subscriber, value_to_json,
+    ComputedCapture, ComputedChange, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
+    ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, SqliteRegistration, TermMove,
+    TermSeed, compress, narrowed_sql, typed_subscriber,
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
-use crate::reexec::{ReadBudget, TimedOutRead};
+use crate::reexec::{NoConnector, ReadBudget, TimedOutRead};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
@@ -131,15 +128,10 @@ pub struct SnapshotEstimate {
 /// The caller's own membership rows for a term at registration, read by a
 /// [`SnapshotSource`] that can run the seed under the caller's own binding.
 pub struct TermSeedRead {
-    /// The value each membership row admits, taken from the column subql's
-    /// seed projects and decoded the same way the snapshot decodes, so the
-    /// seed and the snapshot agree by construction.
-    ///
-    /// Which cell that is belongs to the source rather than to the caller: the
-    /// seed's one projected column is lowered through the table's full catalog
-    /// shape, so its position is the column's catalog ordinal and nothing the
-    /// result order can be read for.
-    pub values: Vec<PgValue<Postgres>>,
+    /// The value rows the membership rows admit, one cell per compared pair
+    /// in the term's stated order, decoded the same way the snapshot decodes,
+    /// so the seed and the snapshot agree by construction.
+    pub rows: Vec<Vec<PgValue<Postgres>>>,
     /// Whether the membership table is carried by the publication this source
     /// was configured with, or `None` when it has none to check against.
     pub published: Option<bool>,
@@ -293,8 +285,9 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// `seed_sql` run as `caller` under the same binding the snapshot uses,
     /// plus whether `member_table` is carried by the configured publication.
     ///
-    /// `member_key` names the column the seed projects, which the source
-    /// resolves against its own catalog to pick each row's admitted value.
+    /// `member_keys` names the columns the seed projects in order, one per
+    /// compared pair, which the source resolves against its own catalog to
+    /// pick each row's admitted cells.
     ///
     /// The default cannot seed and returns `Ok(None)`, which refuses the
     /// registration: a term served without its seed admits nobody in silence,
@@ -307,10 +300,10 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
         &self,
         seed_sql: &str,
         member_table: &str,
-        member_key: &str,
+        member_keys: &[String],
         caller: &Principal<Id, Key>,
     ) -> Result<Option<TermSeedRead>, Self::Error> {
-        let _ = (seed_sql, member_table, member_key, caller);
+        let _ = (seed_sql, member_table, member_keys, caller);
         Ok(None)
     }
 }
@@ -910,6 +903,11 @@ struct PagedRead {
     permit: Option<ReaderPermit>,
 }
 
+/// Byte budget for a grouped fold's one-page seed read. Generous next to what
+/// a within-budget grouped seed can produce (the engine's group limit times a
+/// few numeric cells), so hitting it means the fold would demote anyway.
+const GROUPED_SEED_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Mutable per-session state carried through the run loop.
 struct SessionState<Id, Key> {
     credits: u32,
@@ -922,10 +920,9 @@ struct SessionState<Id, Key> {
     /// subscriptions take turns rather than one finishing before the next
     /// starts.
     paging: VecDeque<PagedRead>,
-    agg_subs: HashMap<String, u64>,
-    /// Delta aggregate subscriptions by client label: consumer id and engine
-    /// subscription id, both needed to tear the subscription down.
-    delta_agg_subs: HashMap<String, (u64, SubscriptionId)>,
+    /// Computed subscriptions by client label: the engine subscription id,
+    /// one id space for every tier.
+    computed_subs: HashMap<String, SubscriptionId>,
     outbound: mpsc::UnboundedSender<Outbound>,
     /// The caller, established at handshake and consulted per read and write.
     principal: Arc<Principal<Id, Key>>,
@@ -947,48 +944,6 @@ struct SessionState<Id, Key> {
     closing: bool,
 }
 
-/// An [`AsyncConnector`] that fails every call: the default when a manager runs
-/// no re-execution backend, appropriate when no aggregate subscriptions exist.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoConnector;
-
-#[allow(clippy::manual_async_fn)]
-impl AsyncConnector for NoConnector {
-    type AuthContext = ReadBudget;
-    type Error = std::io::Error;
-    type Checkpoint = PgLsn;
-    type Backend = Postgres;
-
-    fn execute_scalar(
-        &self,
-        _sql: &str,
-        _kind: ScalarKindOf<Postgres>,
-        _budget: &ReadBudget,
-    ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
-    > + Send {
-        async {
-            Err(std::io::Error::other(
-                "no re-execution connector configured",
-            ))
-        }
-    }
-
-    fn execute_rows(
-        &self,
-        _sql: &str,
-        _budget: &ReadBudget,
-    ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<Vec<Vec<PgValue<Postgres>>>, PgLsn>, std::io::Error>,
-    > + Send {
-        async {
-            Err(std::io::Error::other(
-                "no re-execution connector configured",
-            ))
-        }
-    }
-}
-
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against a visibility policy, the Postgres write target, and a
 /// re-execution connector for aggregate subscriptions.
@@ -1003,23 +958,19 @@ pub struct SessionManager<
 > where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
-        + Send
-        + Sync,
+    C: ReadConnector,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
-    materializer: Arc<Mutex<Materializer>>,
+    materializer: Arc<Mutex<Materializer<ParserDB, RuntimeWritableCatalog, C>>>,
     /// The parsed catalog, cloned out of the materializer at construction.
     /// The visibility question holds a row view across an await, so it cannot
     /// borrow one through the materializer's mutex.
     catalog: Arc<ParserDB>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
-    agg_routes: Mutex<HashMap<u64, AggRoute>>,
-    /// Delta aggregate routes keyed by consumer id. Kept separate from
-    /// `agg_routes` (keyed by re-execution query id) because the two u64
-    /// keyspaces are distinct and could otherwise collide.
-    delta_agg_routes: Mutex<HashMap<u64, AggRoute>>,
+    /// Computed-subscription routes keyed by the engine subscription id, one
+    /// id space for every tier since the subql bump to `4a500ee`.
+    computed_routes: Mutex<HashMap<SubscriptionId, AggRoute>>,
     /// Live connections keyed by the durable session handle, for revocation
     /// and supersession. The per-subscription route map cannot serve either,
     /// because a session with no subscriptions has no route.
@@ -1113,10 +1064,8 @@ impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
-        + Send
-        + Sync,
-    C::Error: core::fmt::Display + TimedOutRead,
+    C: ReadConnector,
+    C::Error: TimedOutRead,
     W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with a re-execution connector and a default in-memory
@@ -1124,7 +1073,7 @@ where
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_connector(
-        materializer: Materializer,
+        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
         snapshot_source: Snap,
         auth: Auth,
         authority: Arc<dyn HandshakeAuthority>,
@@ -1151,10 +1100,8 @@ impl<Snap, Auth, C, O, W> SessionManager<Snap, Auth, W, C, O>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
-        + Send
-        + Sync,
-    C::Error: core::fmt::Display + TimedOutRead,
+    C: ReadConnector,
+    C::Error: TimedOutRead,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = String>,
 {
@@ -1166,7 +1113,7 @@ where
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_oplog(
-        materializer: Materializer,
+        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
         snapshot_source: Snap,
         auth: Auth,
         authority: Arc<dyn HandshakeAuthority>,
@@ -1180,8 +1127,7 @@ where
             catalog: Arc::new(materializer.catalog().clone()),
             materializer: Arc::new(Mutex::new(materializer)),
             routes: Mutex::new(HashMap::new()),
-            agg_routes: Mutex::new(HashMap::new()),
-            delta_agg_routes: Mutex::new(HashMap::new()),
+            computed_routes: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             snapshot_source,
             auth,
@@ -1206,10 +1152,8 @@ where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     Auth::Error: core::fmt::Display,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ReadBudget>
-        + Send
-        + Sync,
-    C::Error: core::fmt::Display + TimedOutRead,
+    C: ReadConnector,
+    C::Error: TimedOutRead,
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
@@ -1592,36 +1536,29 @@ where
         self.routes.lock().await.remove(&consumer_id);
     }
 
-    async fn add_agg_route(&self, query_id: u64, route: AggRoute) {
-        self.agg_routes.lock().await.insert(query_id, route);
-    }
-
-    async fn remove_agg_route(&self, query_id: u64) {
-        self.agg_routes.lock().await.remove(&query_id);
-    }
-
-    async fn add_delta_agg_route(&self, consumer_id: u64, route: AggRoute) {
-        self.delta_agg_routes
+    async fn add_computed_route(&self, subscription_id: SubscriptionId, route: AggRoute) {
+        self.computed_routes
             .lock()
             .await
-            .insert(consumer_id, route);
+            .insert(subscription_id, route);
     }
 
-    async fn remove_delta_agg_route(&self, consumer_id: u64) {
-        self.delta_agg_routes.lock().await.remove(&consumer_id);
+    async fn remove_computed_route(&self, subscription_id: SubscriptionId) {
+        self.computed_routes.lock().await.remove(&subscription_id);
     }
 
-    /// Dispatch one CDC event: fan row patches to sessions, deliver in-process
-    /// aggregate changes, and service re-execution triggers through the
-    /// connector.
-    ///
-    /// Locks the materializer only for the synchronous engine calls, never
-    /// across a channel send or a connector await.
+    /// Dispatch one CDC event: fan row patches to sessions and deliver every
+    /// computed-result change the engine produced. Since the subql `4a500ee`
+    /// bump the engine services its own re-execution reads inline through the
+    /// materializer's connector, so this holds the materializer lock across
+    /// those reads, each bounded by its registration's budget
+    /// (`docs/upstream-subql-nonblocking-read-tier-drive.md` is the recorded
+    /// exit from that).
     ///
     /// # Errors
     ///
-    /// [`SessionError`] when dispatch, a cursor advance, an install, or the
-    /// oplog append fails.
+    /// [`SessionError`] when dispatch, a triggered read, a cursor advance, or
+    /// the oplog append fails.
     pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
         self.dispatch_with_grants(event, &[]).await
     }
@@ -1636,10 +1573,30 @@ where
         event: &ChangeEvent,
         grant_moves: &[GrantMove],
     ) -> Result<(), SessionError> {
-        let dispatched = {
-            counters::timed_lock(&self.materializer)
-                .await
-                .dispatch(event)?
+        // A read the database cancelled at connetto's own limit is policy
+        // rather than an outage, so retrying it replaces nothing: every later
+        // change would meet the same read. The offending subscription ends and
+        // the event is redispatched without it (R81 decision 3). Terminates
+        // because each pass removes one subscription. A read that failed for
+        // any other reason bubbles up, and the ingest loop holds the event.
+        let dispatched = loop {
+            let outcome = {
+                counters::timed_lock(&self.materializer)
+                    .await
+                    .dispatch(event)
+                    .await
+            };
+            match outcome {
+                Ok(dispatched) => break dispatched,
+                Err(MaterializerError::Read {
+                    subscription,
+                    timed_out: true,
+                    detail,
+                }) => {
+                    self.refuse_computed(subscription, &detail).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
         };
 
         // Record the event in the oplog before fan-out. The append is per event,
@@ -1667,50 +1624,11 @@ where
         self.fan_out_moves(event, dispatched.narrowings, grant_moves)
             .await;
 
-        for change in dispatched.aggregates {
-            self.deliver_aggregate(change.query_id, change.result_json)
-                .await;
-        }
-
-        let budget = self.guard.reexec_budget();
-        for trigger in dispatched.triggers {
-            let value = match self
-                .connector
-                .execute_scalar(&trigger.sql, trigger.kind, &budget)
-                .await
-            {
-                Ok((value, _lsn)) => value,
-                Err(err) if err.timed_out() => {
-                    // A timeout is policy rather than an outage, so retrying it
-                    // replaces nothing: every later change would meet the same
-                    // read. The subscription ends instead, and the client is
-                    // told no more than any other refusal tells it (R81
-                    // decision 3).
-                    self.refuse_aggregate(trigger.query_id, &err).await;
-                    continue;
-                }
-                Err(_) => {
-                    // Re-execution failure: bounded retry and SyncFailure surfacing
-                    // land in Phase 6. Skip for now.
-                    continue;
-                }
-            };
-            let result_json = value_to_json(&value);
-            {
-                self.materializer
-                    .lock()
-                    .await
-                    .install_scalar(trigger.query_id, value);
-            }
-            self.deliver_aggregate(trigger.query_id, result_json).await;
-        }
-
-        // Delta aggregates are global by construction (subql rejects aggregators
-        // on RLS tables), so no per-row read filter applies: deliver each folded
-        // value unconditionally to its owning session.
-        for change in dispatched.delta_aggregates {
-            self.deliver_delta_aggregate(change.consumer_id, change.result_json)
-                .await;
+        // Computed results are global by construction (subql refuses shared
+        // state on RLS tables), so no per-row read filter applies: deliver
+        // each change unconditionally to its owning session.
+        for change in dispatched.computed {
+            self.deliver_computed(change).await;
         }
         Ok(())
     }
@@ -1886,7 +1804,7 @@ where
     /// policy forbids never arrives however much the term admits it. Returns
     /// whether the move was served.
     async fn move_in(&self, route: &Route<Id, Key>, term_move: &TermMove, cursor: &[u8]) -> bool {
-        let Some(sql) = narrowed_sql(&route.pg_sql, &term_move.column, &term_move.value) else {
+        let Some(sql) = narrowed_sql(&route.pg_sql, &term_move.pairs) else {
             return false;
         };
         let Some(snapshot) = self
@@ -2004,7 +1922,7 @@ where
             "SELECT * FROM {}",
             connetto_core::quote_ident(&term_move.table)
         );
-        let Some(sql) = narrowed_sql(&base, &term_move.column, &term_move.value) else {
+        let Some(sql) = narrowed_sql(&base, &term_move.pairs) else {
             return false;
         };
         let Some(snapshot) = self.move_page(source, &sql, &[], route).await else {
@@ -2354,42 +2272,50 @@ where
         }
     }
 
-    /// Send an aggregate result to the session owning `query_id`, if routed.
-    async fn deliver_aggregate(&self, query_id: u64, result_json: String) {
-        let route = { self.agg_routes.lock().await.get(&query_id).cloned() };
+    /// Send one computed-result change to the session owning its
+    /// subscription, if routed.
+    async fn deliver_computed(&self, change: ComputedChange) {
+        let route = {
+            self.computed_routes
+                .lock()
+                .await
+                .get(&change.subscription_id)
+                .cloned()
+        };
         let Some(route) = route else { return };
         let update = AggregateUpdate {
             sub_id: route.label,
-            group_key: None,
-            result_json,
-            is_full_result: true,
+            group_key: change.group_key,
+            result_json: change.result_json,
+            is_full_result: change.is_full_result,
         };
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
 
-    /// End one aggregate subscription because its read was refused, telling the
+    /// End one computed subscription because its read was refused, telling the
     /// client only what every refusal tells it.
     ///
     /// The wire carries R38's one fixed phrase and the log carries the cause, so
     /// a caller cannot tell an unusably heavy query from any other refusal while
-    /// the developer reads the reason. Called from the dispatch loop, which
-    /// holds no transport of its own, so the frame travels the route's channel
-    /// the same way an aggregate value does.
+    /// the developer reads the reason. Called from paths that hold no transport
+    /// of their own, so the frame travels the route's channel the same way a
+    /// computed value does.
     ///
-    /// The session's own `agg_subs` entry is left in place: a later unsubscribe
-    /// naming it removes nothing and reports nothing, which is what an already
-    /// ended subscription should do.
-    async fn refuse_aggregate<E: core::fmt::Display>(&self, query_id: u64, cause: &E) {
-        let route = { self.agg_routes.lock().await.remove(&query_id) };
-        self.materializer
-            .lock()
-            .await
-            .unregister_aggregate(query_id);
+    /// The session's own `computed_subs` entry is left in place: a later
+    /// unsubscribe naming it removes nothing and reports nothing, which is what
+    /// an already ended subscription should do.
+    async fn refuse_computed<E: core::fmt::Display>(
+        &self,
+        subscription_id: SubscriptionId,
+        cause: &E,
+    ) {
+        let route = { self.computed_routes.lock().await.remove(&subscription_id) };
+        self.materializer.lock().await.unregister(subscription_id);
         let Some(route) = route else { return };
         tracing::warn!(
             sub_id = %route.label,
             cause = %cause,
-            "an aggregate re-execution was refused, ending the subscription"
+            "a computed subscription's read was refused, ending the subscription"
         );
         let _ = route
             .tx
@@ -2399,26 +2325,6 @@ where
                     detail: SUBSCRIPTION_REFUSED.to_owned(),
                 },
             )));
-    }
-
-    /// Send a folded delta aggregate value to the session owning `consumer_id`,
-    /// if routed.
-    async fn deliver_delta_aggregate(&self, consumer_id: u64, result_json: String) {
-        let route = {
-            self.delta_agg_routes
-                .lock()
-                .await
-                .get(&consumer_id)
-                .cloned()
-        };
-        let Some(route) = route else { return };
-        let update = AggregateUpdate {
-            sub_id: route.label,
-            group_key: None,
-            result_json,
-            is_full_result: true,
-        };
-        let _ = route.tx.send(Outbound::Aggregate(update));
     }
 
     /// Receive and validate the handshake, decode the resume cursor, read the
@@ -2886,8 +2792,7 @@ where
             pending: VecDeque::new(),
             subs: HashMap::new(),
             paging: VecDeque::new(),
-            agg_subs: HashMap::new(),
-            delta_agg_subs: HashMap::new(),
+            computed_subs: HashMap::new(),
             outbound: outbound_tx,
             principal,
             pending_header: None,
@@ -3009,19 +2914,9 @@ where
             self.remove_route(consumer_id).await;
             self.materializer.lock().await.unregister(sub_id);
         }
-        for query_id in state.agg_subs.into_values() {
-            self.remove_agg_route(query_id).await;
-            self.materializer
-                .lock()
-                .await
-                .unregister_aggregate(query_id);
-        }
-        for (consumer_id, sub_id) in state.delta_agg_subs.into_values() {
-            self.remove_delta_agg_route(consumer_id).await;
-            self.materializer
-                .lock()
-                .await
-                .unregister_delta_aggregate(consumer_id, sub_id);
+        for subscription_id in state.computed_subs.into_values() {
+            self.remove_computed_route(subscription_id).await;
+            self.materializer.lock().await.unregister(subscription_id);
         }
     }
 
@@ -3056,19 +2951,9 @@ where
                         }
                     }
                 }
-                if let Some(query_id) = state.agg_subs.remove(&unsub.sub_id) {
-                    self.remove_agg_route(query_id).await;
-                    self.materializer
-                        .lock()
-                        .await
-                        .unregister_aggregate(query_id);
-                }
-                if let Some((consumer_id, sub_id)) = state.delta_agg_subs.remove(&unsub.sub_id) {
-                    self.remove_delta_agg_route(consumer_id).await;
-                    self.materializer
-                        .lock()
-                        .await
-                        .unregister_delta_aggregate(consumer_id, sub_id);
+                if let Some(subscription_id) = state.computed_subs.remove(&unsub.sub_id) {
+                    self.remove_computed_route(subscription_id).await;
+                    self.materializer.lock().await.unregister(subscription_id);
                 }
                 Ok(())
             }
@@ -3370,28 +3255,42 @@ where
             .unwrap_or_default();
         let seed = match terms.as_slice() {
             [] => None,
-            [first, rest @ ..] => {
+            all => {
                 let identity = state
                     .principal
                     .identity()
                     .ok_or(SubscribeRefusal::Anonymous)?;
-                if rest
-                    .iter()
-                    .any(|term| term.subject_kind != first.subject_kind)
-                {
+                // One subscriber kind across every term, membership or caller:
+                // the engine builds one typed subscriber per registration, so
+                // terms comparing at different kinds cannot share it.
+                let mut kinds = all.iter().map(|term| match term {
+                    TermDescription::Membership(membership) => membership.subject_kind,
+                    TermDescription::Caller(caller) => caller.kind,
+                });
+                let first_kind = kinds.next().expect("the slice is non-empty");
+                if kinds.any(|kind| kind != first_kind) {
                     return Err(SubscribeRefusal::Mistyped);
                 }
-                let subscriber =
-                    typed_subscriber(&identity.user_id.to_string(), first.subject_kind)
-                        .ok_or(SubscribeRefusal::Mistyped)?;
-                let mut term_values = Vec::with_capacity(terms.len());
-                for term in &terms {
+                let subscriber = typed_subscriber(&identity.user_id.to_string(), first_kind)
+                    .ok_or(SubscribeRefusal::Mistyped)?;
+                let mut term_values = Vec::new();
+                for term in all {
+                    // A caller comparison seeds itself from the subscriber:
+                    // there is no membership table to read.
+                    let TermDescription::Membership(membership) = term else {
+                        continue;
+                    };
+                    let member_keys: Vec<String> = membership
+                        .pairs
+                        .iter()
+                        .map(|pair| pair.member_key.clone())
+                        .collect();
                     let read = self
                         .snapshot_source
                         .term_seed(
-                            &term.seed_sql,
-                            &term.member_table,
-                            &term.member_key,
+                            &membership.seed_sql,
+                            &membership.member_table,
+                            &member_keys,
                             &state.principal,
                         )
                         .await
@@ -3400,16 +3299,28 @@ where
                     match read.published {
                         Some(true) => {}
                         Some(false) => {
-                            return Err(SubscribeRefusal::Unpublished(term.member_table.clone()));
+                            return Err(SubscribeRefusal::Unpublished(
+                                membership.member_table.clone(),
+                            ));
                         }
                         None => return Err(SubscribeRefusal::NoPublication),
                     }
-                    let values: Vec<PgValue<Postgres>> = read
-                        .values
+                    // Registration refuses a null cell inside a stated row, so
+                    // a row with one is dropped whole rather than half-stated.
+                    let rows: Vec<Vec<PgValue<Postgres>>> = read
+                        .rows
                         .into_iter()
-                        .filter(|value| !matches!(value, PgValue::Missing | PgValue::Null))
+                        .filter(|row| {
+                            !row.iter()
+                                .any(|value| matches!(value, PgValue::Missing | PgValue::Null))
+                        })
                         .collect();
-                    term_values.push((term.column.clone(), values));
+                    let columns: Vec<String> = membership
+                        .pairs
+                        .iter()
+                        .map(|pair| pair.column.clone())
+                        .collect();
+                    term_values.push((columns, rows));
                 }
                 Some(TermSeed {
                     subscriber,
@@ -3419,11 +3330,26 @@ where
         };
         let member_tables: std::sync::Arc<[(String, String)]> = terms
             .iter()
-            .map(|term| (term.member_table.clone(), term.member_subject.clone()))
+            .filter_map(|term| match term {
+                TermDescription::Membership(membership) => Some((
+                    membership.member_table.clone(),
+                    membership.member_subject.clone(),
+                )),
+                TermDescription::Caller(_) => None,
+            })
             .collect::<Vec<_>>()
             .into();
-        let registration =
-            materializer.register_translated(consumer_id, &pg_sql, &sub.spec.binds, seed)?;
+        // Every engine-driven read this registration ever needs (its bootstrap
+        // included) runs on the dispatch path or under the materializer lock,
+        // so it spends the shared re-execution bound rather than the caller's
+        // snapshot tier: what a slow read delays is everyone's change stream.
+        let registration = materializer.register_translated(
+            consumer_id,
+            &pg_sql,
+            &sub.spec.binds,
+            seed,
+            self.guard.reexec_budget(),
+        )?;
         Ok((
             SqliteRegistration {
                 registration,
@@ -3499,12 +3425,8 @@ where
                 };
                 self.serve_term_row(transport, sub, state, tier, reg).await
             }
-            Registration::Aggregate(capture) => {
-                self.subscribe_aggregate(transport, sub, state, capture)
-                    .await
-            }
-            Registration::DeltaAggregate(capture) => {
-                self.subscribe_delta_aggregate(transport, sub, state, capture)
+            Registration::Computed(capture) => {
+                self.subscribe_computed(transport, sub, state, capture)
                     .await
             }
         }
@@ -4413,138 +4335,170 @@ where
         }
     }
 
-    /// Bootstrap a captured aggregate through the connector, deliver its initial
-    /// value, and route future updates.
+    /// Produce a computed subscription's first answer, deliver it, and route
+    /// future changes.
     ///
-    /// The seed runs in the subscribing caller's own path, so it spends that
-    /// caller's tier budget: a slow seed delays the caller who asked for it and
-    /// nobody else (R81 decision 2).
-    async fn subscribe_aggregate<T: Transport>(
+    /// A fold's seed runs in the subscribing caller's own path through the
+    /// session's connector, so it spends that caller's tier budget: a slow
+    /// seed delays the caller who asked for it and nobody else (R81 decision
+    /// 2). A read tier bootstraps through the engine's own connector under
+    /// the shared re-execution bound, because that path holds the
+    /// materializer lock.
+    async fn subscribe_computed<T: Transport>(
         &self,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
-        capture: crate::materializer::AggregateCapture,
+        capture: ComputedCapture,
     ) -> Result<(), SessionError> {
-        let budget = ReadBudget::new(self.guard.read_limits(Tier::of(&state.principal)).timeout);
-        let value = match self
-            .connector
-            .execute_scalar(&capture.sql, capture.kind, &budget)
-            .await
-        {
-            Ok((value, _lsn)) => value,
+        let subscription_id = capture.subscription_id;
+        let changes = match self.first_answer(&capture, state).await {
+            Ok(changes) => changes,
             Err(err) => {
-                tracing::warn!(sub_id = %sub.sub_id, error = %err, "aggregate bootstrap failed");
-                self.materializer
-                    .lock()
-                    .await
-                    .unregister_aggregate(capture.query_id);
-                transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(sub.sub_id),
-                        detail: SUBSCRIPTION_REFUSED.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err)?;
-                return Ok(());
+                return self
+                    .refuse_computed_subscribe(transport, sub.sub_id, subscription_id, &err)
+                    .await;
             }
         };
-        let result_json = value_to_json(&value);
-        {
-            self.materializer
-                .lock()
-                .await
-                .install_scalar(capture.query_id, value);
-        }
 
-        self.add_agg_route(
-            capture.query_id,
+        self.add_computed_route(
+            subscription_id,
             AggRoute {
                 label: sub.sub_id.clone(),
                 tx: state.outbound.clone(),
             },
         )
         .await;
-        state.agg_subs.insert(sub.sub_id.clone(), capture.query_id);
-        transport
-            .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
-                sub_id: sub.sub_id,
-                group_key: None,
-                result_json,
-                is_full_result: true,
-            }))
-            .await
-            .map_err(transport_err)?;
+        state
+            .computed_subs
+            .insert(sub.sub_id.clone(), subscription_id);
+        for change in changes {
+            transport
+                .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
+                    sub_id: sub.sub_id.clone(),
+                    group_key: change.group_key,
+                    result_json: change.result_json,
+                    is_full_result: change.is_full_result,
+                }))
+                .await
+                .map_err(transport_err)?;
+        }
         Ok(())
     }
 
-    /// Seed a delta aggregate through the connector, deliver its initial value,
-    /// and route future folded updates keyed by consumer id.
-    async fn subscribe_delta_aggregate<T: Transport>(
+    /// Produce a computed subscription's first answer: a fold's seed or a
+    /// scalar extreme's read through the session's connector under the
+    /// caller's own tier (R81 decision 2), or the engine-driven bootstrap
+    /// for the read tiers (with the demotion follow-up read when a fold's
+    /// seed outgrew the budget).
+    async fn first_answer(
         &self,
-        transport: &mut T,
-        sub: Subscribe,
-        state: &mut SessionState<Id, Key>,
-        capture: DeltaAggregateCapture,
-    ) -> Result<(), SessionError> {
-        // Announce the seed before reading it, so a change dispatched while the
-        // connector is in flight is held and applied on top rather than folded
-        // into an accumulator that does not exist yet (R28 part B).
+        capture: &ComputedCapture,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Vec<ComputedChange>, String> {
+        let subscription_id = capture.subscription_id;
+        let caller_setup = || {
+            crate::reexec::ConnettoReadSetup::of(ReadBudget::new(
+                self.guard.read_limits(Tier::of(&state.principal)).timeout,
+            ))
+        };
+        let bootstrap = match &capture.seed {
+            SeedPlan::Snapshot => {
+                return self
+                    .bootstrap_computed(subscription_id, capture.consumer_id)
+                    .await;
+            }
+            SeedPlan::Scalar { sql, kind } => {
+                let (value, lsn) = self
+                    .connector
+                    .execute_scalar(sql, *kind, &caller_setup())
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let change = {
+                    self.materializer
+                        .lock()
+                        .await
+                        .install_scalar(subscription_id, value, lsn)
+                        .map_err(|err| err.to_string())?
+                };
+                return Ok(vec![change]);
+            }
+            SeedPlan::Fold { bootstrap } => bootstrap,
+        };
+        let setup = caller_setup();
+        // The engine buffers changes dispatched while this read is in flight
+        // and reconciles them against the read's position, so registering
+        // before reading loses nothing (the guarantee R28 part B built
+        // connetto-side now lives upstream).
+        let (rows, lsn) = if bootstrap.group_columns == 0 {
+            // One row of component columns under one snapshot.
+            self.connector
+                .execute_scalar_row(&bootstrap.sql, &bootstrap.kinds, &setup)
+                .await
+                .map(|(row, lsn)| (vec![row], lsn))
+                .map_err(|err| err.to_string())?
+        } else {
+            // One row per group. One generous page: a grouped seed is bounded
+            // by the engine's group budget, and a result past one page would
+            // demote past it regardless, so the refusal arrives at
+            // registration rather than as a torn seed.
+            let page = self
+                .connector
+                .read_page(&bootstrap.sql, GROUPED_SEED_PAGE_BYTES, &setup)
+                .await
+                .map_err(|err| err.to_string())?;
+            if page.value.more {
+                return Err("the grouped seed exceeded one page".to_owned());
+            }
+            (page.value.rows, page.checkpoint)
+        };
+        let seeded = {
+            self.materializer
+                .lock()
+                .await
+                .install_fold_seed(subscription_id, rows, lsn)
+                .map_err(|err| err.to_string())?
+        };
+        if seeded.needs_snapshot {
+            // The seed itself demoted the subscription (its groups already
+            // exceed the budget), so the first answer is the whole re-read
+            // the transition asked for.
+            return self
+                .bootstrap_computed(subscription_id, capture.consumer_id)
+                .await;
+        }
+        Ok(seeded.changes)
+    }
+
+    /// The engine-driven bootstrap, its error rendered for the refusal path.
+    async fn bootstrap_computed(
+        &self,
+        subscription_id: SubscriptionId,
+        consumer_id: u64,
+    ) -> Result<Vec<ComputedChange>, String> {
         self.materializer
             .lock()
             .await
-            .expect_aggregate(capture.consumer_id);
-        let budget = ReadBudget::new(self.guard.read_limits(Tier::of(&state.principal)).timeout);
-        let row = match self
-            .connector
-            .execute_scalar_row(&capture.bootstrap.sql, &capture.bootstrap.kinds, &budget)
+            .bootstrap_computed(subscription_id, consumer_id)
             .await
-        {
-            Ok((row, _lsn)) => row,
-            Err(err) => {
-                tracing::warn!(sub_id = %sub.sub_id, error = %err, "delta aggregate bootstrap failed");
-                self.materializer
-                    .lock()
-                    .await
-                    .unregister_delta_aggregate(capture.consumer_id, capture.subscription_id);
-                transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(sub.sub_id),
-                        detail: SUBSCRIPTION_REFUSED.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err)?;
-                return Ok(());
-            }
-        };
-        let acc = AggAccumulator::seed_from_row(&capture.spec, &row);
-        let result_json = agg_value_to_json(acc.value());
-        {
-            self.materializer.lock().await.install_aggregate(
-                capture.consumer_id,
-                capture.spec,
-                acc,
-            );
-        }
+            .map_err(|err| err.to_string())
+    }
 
-        self.add_delta_agg_route(
-            capture.consumer_id,
-            AggRoute {
-                label: sub.sub_id.clone(),
-                tx: state.outbound.clone(),
-            },
-        )
-        .await;
-        state.delta_agg_subs.insert(
-            sub.sub_id.clone(),
-            (capture.consumer_id, capture.subscription_id),
-        );
+    /// Roll back a computed registration whose first answer could not be
+    /// produced, telling the caller only what every refusal tells it.
+    async fn refuse_computed_subscribe<T: Transport, E: core::fmt::Display>(
+        &self,
+        transport: &mut T,
+        sub_label: String,
+        subscription_id: SubscriptionId,
+        cause: &E,
+    ) -> Result<(), SessionError> {
+        tracing::warn!(sub_id = %sub_label, error = %cause, "computed bootstrap failed");
+        self.materializer.lock().await.unregister(subscription_id);
         transport
-            .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
-                sub_id: sub.sub_id,
-                group_key: None,
-                result_json,
-                is_full_result: true,
+            .send_control(ControlMessage::NonFatalError(NonFatalError {
+                related_to: Some(sub_label),
+                detail: SUBSCRIPTION_REFUSED.to_owned(),
             }))
             .await
             .map_err(transport_err)?;

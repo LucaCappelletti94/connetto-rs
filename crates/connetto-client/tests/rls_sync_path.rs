@@ -48,6 +48,67 @@ CREATE POLICY orders_p ON orders
     USING (owner_id = current_setting('app.user_id', true));
 ";
 
+/// Alice may read every order but may insert only her own.
+const SHARED_READ_DDL: &str = "
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    quantity BIGINT NOT NULL
+);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY orders_select ON orders
+    FOR SELECT
+    USING (true);
+
+CREATE POLICY orders_insert ON orders
+    FOR INSERT
+    WITH CHECK (owner_id = current_setting('app.user_id', true));
+";
+
+/// Alice reads through an ownership row but only Bob may create the order.
+const NESTED_OWNERSHIP_DDL: &str = "
+CREATE TABLE order_ownership (
+    order_id BIGINT PRIMARY KEY,
+    reader_id TEXT NOT NULL,
+    writer_id TEXT NOT NULL
+);
+
+INSERT INTO order_ownership (order_id, reader_id, writer_id)
+VALUES (1, 'alice', 'bob');
+
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    quantity BIGINT NOT NULL
+);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY orders_select ON orders
+    FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1
+            FROM order_ownership AS ownership
+            WHERE ownership.order_id = orders.id
+              AND ownership.reader_id = current_setting('app.user_id', true)
+        )
+    );
+
+CREATE POLICY orders_insert ON orders
+    FOR INSERT
+    WITH CHECK (
+        EXISTS (
+            SELECT 1
+            FROM order_ownership AS ownership
+            WHERE ownership.order_id = orders.id
+              AND ownership.writer_id = current_setting('app.user_id', true)
+        )
+    );
+";
+
 /// The signed-in caller for every test here. The replica is named from the
 /// identity that opened it, so this value is fixed for its whole life.
 const ALICE: &str = "alice";
@@ -102,18 +163,16 @@ fn options() -> Pg2SqliteOptions {
             CALLER_FUNCTION,
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
+        // The download boundary: connetto holds this function true while it
+        // applies server-authoritative data, so the fail-closed write guards
+        // admit rows the caller may see but not write.
+        .with_write_exemption_function(connetto_client::WRITE_EXEMPTION_FUNCTION)
 }
 
-/// The two artifacts a build emits from one source document: the SQLite DDL,
-/// and the map plus view list the client is configured with.
-///
-/// The view list is read from a throwaway database the DDL is applied to,
-/// which is what the example builds do, because a translation emits views of
-/// its own beside the one carrying the logical name and only the built
-/// database knows all of them.
-fn translation() -> (String, PolicyTables) {
+/// Emits the SQLite DDL and policy table map for `pg_ddl`.
+fn translation_for(pg_ddl: &str) -> (String, PolicyTables) {
     let statements = Pg2Sqlite::default()
-        .sql(PG_DDL)
+        .sql(pg_ddl)
         .expect("parse the Postgres document")
         .translate_to_sql(&options())
         .expect("translate to SQLite");
@@ -121,7 +180,7 @@ fn translation() -> (String, PolicyTables) {
     ddl.push(';');
 
     let manifest = Pg2Sqlite::default()
-        .sql(PG_DDL)
+        .sql(pg_ddl)
         .expect("parse the Postgres document")
         .translation_manifest(&options())
         .expect("manifest");
@@ -136,9 +195,6 @@ fn translation() -> (String, PolicyTables) {
         "the translation splits exactly the policy-bearing table",
     );
 
-    // No caller function is registered on the probe, and none is needed:
-    // SQLite resolves a function name when a statement is prepared, not when a
-    // view or trigger is created. This is exactly what the example builds do.
     let mut probe = SqliteConnection::establish(":memory:").expect("open the probe database");
     diesel::connection::SimpleConnection::batch_execute(&mut probe, &ddl)
         .expect("SQLite accepts the translated DDL");
@@ -149,6 +205,10 @@ fn translation() -> (String, PolicyTables) {
         .expect("list the views the translation created");
 
     (ddl, PolicyTables::from_translation(pairs, views))
+}
+
+fn translation() -> (String, PolicyTables) {
+    translation_for(PG_DDL)
 }
 
 diesel::table! {
@@ -339,6 +399,125 @@ async fn a_server_row_lands_and_the_view_still_filters() {
         conn.push().await.expect("push").is_none(),
         "and nothing was captured for upload, because the apply suspends capture",
     );
+}
+
+/// A readable server row is not rejudged under the local INSERT policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
+    let (ddl, tables) = translation_for(SHARED_READ_DDL);
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        wait_subscribe(&mut server).await;
+        send_snapshot(&mut server, "sub", &[(2, "bob", 7)], 1).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ConnettoConnection::connect(
+        client_end,
+        &Replica::in_memory(),
+        &ddl,
+        &client_config(tables),
+        None,
+    )
+    .await
+    .expect("connect");
+    conn.subscribe("sub", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+
+    let stored: Vec<i64> = orders_rls::table
+        .select(orders_rls::id)
+        .load(conn.conn())
+        .expect("read the backing table");
+    assert_eq!(stored, vec![2], "the authoritative row must land");
+
+    let visible: Vec<i64> = orders::table
+        .select(orders::id)
+        .load(conn.conn())
+        .expect("read through the logical name");
+    assert_eq!(visible, vec![2], "the SELECT policy admits the row");
+}
+
+/// Local writes remain subject to the INSERT policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_insert_still_obeys_the_owner_check() {
+    let (ddl, tables) = translation_for(SHARED_READ_DDL);
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ConnettoConnection::connect(
+        client_end,
+        &Replica::in_memory(),
+        &ddl,
+        &client_config(tables),
+        None,
+    )
+    .await
+    .expect("connect");
+
+    let error = diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(2),
+            orders::owner_id.eq("bob"),
+            orders::quantity.eq(7),
+        ))
+        .execute(conn.conn())
+        .expect_err("Alice may not create Bob's row");
+    assert!(
+        error.to_string().contains("row-level security policy"),
+        "the policy refusal must remain explicit: {error}",
+    );
+    assert_eq!(
+        orders_rls::table
+            .count()
+            .get_result::<i64>(conn.conn())
+            .expect("count backing rows"),
+        0,
+    );
+}
+
+/// A nested ownership predicate has the same authoritative apply contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_local_insert() {
+    let (ddl, tables) = translation_for(NESTED_OWNERSHIP_DDL);
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        wait_subscribe(&mut server).await;
+        send_snapshot(&mut server, "sub", &[(1, "bob", 7)], 1).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ConnettoConnection::connect(
+        client_end,
+        &Replica::in_memory(),
+        &ddl,
+        &client_config(tables),
+        None,
+    )
+    .await
+    .expect("connect");
+    conn.subscribe("sub", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+
+    let stored: Vec<i64> = orders_rls::table
+        .select(orders_rls::id)
+        .load(conn.conn())
+        .expect("read the backing table");
+    assert_eq!(stored, vec![1], "the authoritative row must land");
+
+    let visible: Vec<i64> = orders::table
+        .select(orders::id)
+        .load(conn.conn())
+        .expect("read through the logical name");
+    assert_eq!(visible, vec![1], "the nested SELECT policy admits the row");
 }
 
 /// The application is told the logical table changed, not the backing one.

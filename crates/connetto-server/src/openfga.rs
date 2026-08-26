@@ -27,8 +27,10 @@ use std::task::{Context, Poll};
 
 use connetto_core::auth::Principal;
 use diesel::QueryableByName;
+use diesel::pg::Pg;
+use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;
-use diesel::sql_types::{Jsonb, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Double, Jsonb, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::{
@@ -38,15 +40,15 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http};
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-use rls2fga::generator::records::{Record, RecordDerivation};
+use rls2fga::generator::records::{Record, ReplayScope};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
 use subql::ParserDB;
-use subql::backend::Postgres;
+use subql::backend::{Postgres, Value};
 use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
-use subql::visibility::store::{StoreDiff, StoreDiffError};
+use subql::visibility::store::{StoreDiff, StoreDiffError, UncoveredReason};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use crate::capability::CapabilityKey;
@@ -263,7 +265,12 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
     /// and questioned against another names rows that do not exist. `reach` is
     /// walked over the model the same translation produced, for the same reason.
     #[must_use]
-    pub fn upkeep(&self, reach: GrantReach) -> Arc<dyn StoreUpkeep>
+    pub fn upkeep(
+        &self,
+        reach: GrantReach,
+        translator: Translator,
+        pool: Pool<AsyncPgConnection>,
+    ) -> Arc<dyn StoreUpkeep>
     where
         Id: Display + Send + Sync + 'static,
         Key: CapabilityKey,
@@ -279,6 +286,8 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
             delegate: self.inner.inner().clone(),
             reach,
             naming: Arc::clone(&self.naming),
+            translator,
+            pool,
         })
     }
 
@@ -421,13 +430,10 @@ pub enum SetupError {
 /// schema could disagree, and every question would then name rows that do not
 /// exist.
 pub struct Translated {
-    catalog: ParserDB,
+    /// The index every reader shares, built once at startup so the boot guard
+    /// and the change path cannot hold two opinions about the same policies.
+    shapes: Arc<Shapes<ParserDB>>,
     translator: Translator,
-    relations: Vec<rls2fga::generator::relations::RelationShapes>,
-    naming: Vec<rls2fga::generator::row_naming::RowNaming>,
-    notes: Vec<rls2fga::generator::notes::TranslationNote>,
-    answers: Vec<rls2fga::generator::action_relations::ActionRelations>,
-    open: Vec<rls2fga::generator::unrestricted::UnrestrictedTable>,
     model: rls2fga::generator::json_model::AuthorizationModel,
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
     policy_tables: Vec<String>,
@@ -435,8 +441,8 @@ pub struct Translated {
 }
 
 impl Translated {
-    /// Translate the deployment's policies over its schema, refusing anything
-    /// the translator cannot express.
+    /// Translate a schema and its policies, refusing anything this cannot keep
+    /// current or the translator cannot express.
     ///
     /// The two documents are parsed as one catalog, because a policy is a
     /// catalog object and `DatabaseLike::policies()` is what reports it. The
@@ -522,19 +528,28 @@ impl Translated {
         // Walked here rather than where it is first read, so a model this
         // cannot follow refuses the boot beside every other startup refusal.
         let reach = GrantReach::of(&model, &naming, &answers)?;
-        let unwithdrawable = unwithdrawable_shapes(&relations);
-        if !unwithdrawable.is_empty() {
-            return Err(SetupError::Unwithdrawable(unwithdrawable.join("; ")));
+        // Built once and kept, so the guard below judges the very index the
+        // change path will use rather than a copy of it.
+        let shapes = Arc::new(
+            Shapes::new::<Postgres>(catalog, &relations)
+                .with_row_naming(&naming)
+                .with_action_relations(&answers)
+                .with_required_parameters(&notes)
+                .with_unrestricted_tables(&open),
+        );
+        // Ask subql which shapes it cannot keep current, rather than guessing
+        // from a derivation (R86). The guess was wrong in both directions: it
+        // missed a shape settled from one row whose column a row image cannot
+        // answer, and it refused a two-table shape whose replay reconciles
+        // perfectly well.
+        let uncovered = uncovered_shapes(&shapes);
+        if !uncovered.is_empty() {
+            return Err(SetupError::Unwithdrawable(uncovered.join("; ")));
         }
 
         Ok(Self {
-            catalog,
+            shapes,
             translator,
-            relations,
-            naming,
-            notes,
-            answers,
-            open,
             model,
             tuples,
             policy_tables,
@@ -567,13 +582,7 @@ impl Translated {
     /// The index every reader of this translation shares.
     #[must_use]
     pub fn shapes(self) -> Arc<Shapes<ParserDB>> {
-        Arc::new(
-            Shapes::new::<Postgres>(self.catalog, &self.relations)
-                .with_row_naming(&self.naming)
-                .with_action_relations(&self.answers)
-                .with_required_parameters(&self.notes)
-                .with_unrestricted_tables(&self.open),
-        )
+        self.shapes
     }
 
     /// Put this translation's rule description on the service, adopting the
@@ -650,7 +659,7 @@ impl Translated {
 
         let outputs = self
             .translator
-            .translate(&self.catalog)
+            .translate(self.shapes.catalog())
             .map_err(|err| SetupError::Unplannable(err.to_string()))?
             .outputs_accepting_gaps();
         let mut conn = pool
@@ -689,14 +698,7 @@ impl Translated {
     pub fn into_parts(self) -> (Arc<Shapes<ParserDB>>, Translator, GrantReach) {
         let translator = self.translator;
         let reach = self.reach;
-        let shapes = Arc::new(
-            Shapes::new::<Postgres>(self.catalog, &self.relations)
-                .with_row_naming(&self.naming)
-                .with_action_relations(&self.answers)
-                .with_required_parameters(&self.notes)
-                .with_unrestricted_tables(&self.open),
-        );
-        (shapes, translator, reach)
+        (self.shapes, translator, reach)
     }
 }
 
@@ -834,33 +836,39 @@ fn policy_tables<DB: subql::DatabaseLike>(
     tables
 }
 
-/// Every shape whose facts travel as a query to re-run, named for the refusal.
+/// Every shape subql says it cannot keep current, named for the refusal.
 ///
-/// **One question rather than a classification connetto invents.** Whether a
-/// shape carries a re-run query is exactly whether its withdrawals can reach the
-/// store, because the re-run is the only path its facts take and that path only
-/// writes. Naming a narrower set would mean deciding upstream's business here,
-/// off a reason string.
-///
-/// Read off the relation descriptions rather than off `Shapes`, which indexes the
-/// same thing but keeps it private, and which is built after this has already
-/// refused.
-fn unwithdrawable_shapes(
-    relations: &[rls2fga::generator::relations::RelationShapes],
-) -> Vec<String> {
-    let mut named = Vec::new();
-    for entry in relations {
-        for shape in &entry.shapes {
-            if let RecordDerivation::Joined { reason, .. } = &shape.derivation {
-                named.push(format!(
-                    "{}#{} over {} ({reason})",
-                    entry.type_name,
-                    entry.relation,
-                    shape.tables.join(", ")
-                ));
-            }
-        }
-    }
+/// **The question is asked rather than guessed (R86).** connetto used to refuse
+/// every shape whose facts travel as a query to re-run, on the reasoning that
+/// the re-run only ever wrote. That was wrong in both directions once upstream
+/// added the reconcile: it missed a shape settled from one row whose column no
+/// row image can answer, and it refused a two-table shape whose replay
+/// reconciles exactly. `Shapes` already answers the real question, so this
+/// reads its answer instead of inventing a classification from a derivation.
+fn uncovered_shapes(shapes: &Shapes<ParserDB>) -> Vec<String> {
+    let mut named: Vec<String> = shapes
+        .uncovered()
+        .iter()
+        .map(|gap| {
+            let reason = match gap.reason {
+                UncoveredReason::UnreadableColumn => {
+                    "the grant reads a column no row image can answer, a list or a kind with no \
+                     row-side spelling, and carries no query to fall back on"
+                }
+                UncoveredReason::NoBoundQuery => {
+                    "a change to this table has no query to replay, so nothing states its facts"
+                }
+                UncoveredReason::SharedSlice => {
+                    "another shape states the same slice, so reconciling one would delete the \
+                     other's facts"
+                }
+            };
+            format!(
+                "{}#{} over {} ({reason})",
+                gap.type_name, gap.relation, gap.table
+            )
+        })
+        .collect();
     named.sort_unstable();
     named.dedup();
     named
@@ -883,6 +891,9 @@ pub enum UpkeepError {
     /// The store refused the write.
     #[error("writing the difference to the authorization store: {0}")]
     Write(String),
+    /// A query the changed row asks to be replayed could not be run or read.
+    #[error("replaying a query the changed row requires: {0}")]
+    Replay(String),
 }
 
 /// One authorization fact that moved, and who it concerned.
@@ -901,6 +912,39 @@ pub struct GrantMove {
     pub tables: Vec<String>,
     /// Who the fact concerned.
     pub holder: GrantHolder,
+}
+
+/// Bind every column of one key as `$1` through `$n`, refusing a type no
+/// placeholder carries.
+///
+/// One key rather than several, so a composite key binds in
+/// `BoundQuery::key_columns` order and a single-column key is the same code
+/// path with one value.
+///
+/// Refusing rather than skipping: a query left unreplayed leaves the store
+/// holding facts the change already invalidated, which is the failure the
+/// whole path exists to remove.
+fn bind_key<'a>(
+    mut query: BoxedSqlQuery<'a, Pg, SqlQuery>,
+    key: &[Value<Postgres>],
+) -> Result<BoxedSqlQuery<'a, Pg, SqlQuery>, UpkeepError> {
+    for value in key {
+        query = match value {
+            Value::Bool(value) => query.bind::<Bool, _>(*value),
+            Value::Int(value) => query.bind::<BigInt, _>(*value),
+            Value::Float(value) => query.bind::<Double, _>(*value),
+            Value::String(value) => query.bind::<Text, _>(value.clone()),
+            Value::Bytes(value) => query.bind::<Binary, _>(value.clone()),
+            Value::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
+            other => {
+                return Err(UpkeepError::Replay(format!(
+                    "a replayed query keys on a {:?}, which no placeholder here carries",
+                    other.scalar_kind()
+                )));
+            }
+        };
+    }
+    Ok(query)
 }
 
 /// Who a moved fact concerned.
@@ -945,6 +989,12 @@ pub trait StoreUpkeep: Send + Sync {
 /// The upkeep behind [`FgaAuth`], over the same index it answers from.
 struct FgaUpkeep<Id, Key, T> {
     shapes: Arc<Shapes<ParserDB>>,
+    /// Re-derives the outputs a replayed query's rows are read through, which
+    /// is the same translation the boot used.
+    translator: Translator,
+    /// Runs a replayed query as the deployment, not as a caller: it asks what
+    /// the database now states, not what one viewer may see.
+    pool: Pool<AsyncPgConnection>,
     delegate: OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>,
     /// What each kind of fact reaches, walked once at startup.
     reach: GrantReach,
@@ -980,15 +1030,138 @@ where
                 .apply(&diff)
                 .await
                 .map_err(|err| UpkeepError::Write(err.to_string()))?;
+            let replayed = self.reconcile(&diff).await?;
             // Read after the store is level, never before: a replacement
             // snapshot produced against the old facts would hand back exactly
             // the rows the change took away.
-            Ok(self.moved(event, &diff))
+            let mut moves = self.moved(event, &diff);
+            moves.extend(replayed);
+            Ok(moves)
         })
     }
 }
 
 impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
+    /// Replay every query this difference asks for and reconcile the store
+    /// against what came back, reporting what that may have moved.
+    ///
+    /// **The reconcile is the half `R49` found missing.** The replay used to
+    /// hand its rows to `write_records`, which adds facts and removes none, so
+    /// a share deleted from a join table stayed granted. `reconcile_records`
+    /// reads back the slice the query declares it determines and deletes what
+    /// the replay no longer states, which is what makes a two-table share
+    /// withdrawable and therefore bootable at all (`R86`).
+    ///
+    /// **The move is announced wide, because the reconcile does not say who.**
+    /// It reports no delta, and the alternative is reading the slice a second
+    /// time to difference it here. `GrantHolder::Everybody` is what this file
+    /// already uses for a fact whose holder it cannot resolve, on the recorded
+    /// grounds that wider than necessary never leaves a row on a device while
+    /// narrower silently does. What that costs is `R86` D2's measurement.
+    ///
+    /// # Errors
+    ///
+    /// [`UpkeepError::Replay`] when the query cannot be run or its rows cannot
+    /// be read, and [`UpkeepError::Write`] when the reconcile is refused.
+    async fn reconcile(&self, diff: &StoreDiff<'_, Postgres>) -> Result<Vec<GrantMove>, UpkeepError>
+    where
+        Id: Display + Send + Sync,
+        Key: CapabilityKey,
+        T: GrpcService<Body> + Clone + Send + Sync + 'static,
+        T::Error: Into<StdError>,
+        T::ResponseBody: ResponseBody<Data = Bytes> + Send + 'static,
+        <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
+        T::Future: Send,
+    {
+        use diesel_async::RunQueryDsl as _;
+
+        if diff.requeries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let outputs = self
+            .translator
+            .translate(self.shapes.catalog())
+            .map_err(|err| UpkeepError::Replay(err.to_string()))?
+            .outputs_accepting_gaps();
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+        let mut moves = Vec::new();
+        for requery in &diff.requeries {
+            let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
+            let rows = if requery.query.condition.is_some() {
+                TupleRows::Conditional(
+                    query
+                        .load(&mut *conn)
+                        .await
+                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                )
+            } else {
+                TupleRows::Plain(
+                    query
+                        .load(&mut *conn)
+                        .await
+                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                )
+            };
+            let mut records = Vec::new();
+            rows.read_into(&outputs, &mut records)
+                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+            let report = self
+                .delegate
+                .reconcile_records(requery, &records)
+                .await
+                .map_err(|err| UpkeepError::Write(err.to_string()))?;
+            tracing::debug!(
+                added = report.added.len(),
+                removed = report.removed.len(),
+                "reconcile report"
+            );
+            if !report.added.is_empty() || !report.removed.is_empty() {
+                moves.extend(self.reached_by(requery));
+            }
+        }
+        Ok(moves)
+    }
+
+    /// The tables a replayed query's slice can have moved, named for the
+    /// replacement notice.
+    fn reached_by(
+        &self,
+        requery: &subql::visibility::store::Requery<'_, Postgres>,
+    ) -> Vec<GrantMove> {
+        let (object_type, relations) = match &requery.query.scope {
+            ReplayScope::Object {
+                object_type,
+                relations,
+            } => (object_type, relations.clone()),
+            ReplayScope::Subject {
+                object_type,
+                relation,
+                ..
+            } => (object_type, vec![relation.clone()]),
+        };
+        let mut tables: Vec<String> = relations
+            .iter()
+            .flat_map(|relation| {
+                self.reach
+                    .tables_for_type(object_type, relation.as_str())
+                    .to_vec()
+            })
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        if tables.is_empty() {
+            return Vec::new();
+        }
+        vec![GrantMove {
+            tables,
+            holder: GrantHolder::Everybody,
+        }]
+    }
+
     /// What this difference changed about who can reach what, outside the table
     /// the change arrived on.
     ///
@@ -1205,39 +1378,39 @@ mod tests {
             translated.err()
         );
     }
-    /// The narrowing has a floor: a residual only SQL can evaluate still stops
-    /// the boot.
+
+    /// The narrowing has a floor, and it is not where connetto used to draw it.
     ///
-    /// Upstream settles a share from one row when a unique key names the pair,
-    /// which is what freed the shape above. A row carrying a predicate the
-    /// model cannot decide is the case that remains, and it is the leak
-    /// direction: nothing in the store can be withdrawn when the grant depends
-    /// on a value only the database can compute.
+    /// A grant read out of a list column is settled from one row, so the old
+    /// guard waved it through, and yet no row image can answer it and it
+    /// carries no query to fall back on, so nothing can ever withdraw it.
+    /// **That is the leak the old question missed**, and `R86` is why it is
+    /// caught: subql reports the shape as one it cannot keep current, and the
+    /// boot refuses on that report rather than on a derivation.
+    ///
+    /// The shape this test used to name, a share row carrying a predicate only
+    /// SQL can evaluate, now boots. It has a query to replay and a slice of its
+    /// own, so the reconcile keeps it current.
     #[test]
-    fn a_residual_only_sql_can_evaluate_refuses_startup() {
+    fn a_grant_read_from_a_list_column_refuses_startup() {
         const SCHEMA: &str = "
-            CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
+            CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT, viewers TEXT[]);
             ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
-            CREATE TABLE paper_shares(paper_id INTEGER, viewer TEXT, weight INT, \
-                PRIMARY KEY(paper_id, viewer));
         ";
         const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
-            EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
-              AND s.viewer = current_setting('app.user_id', true) \
-              AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
+            current_setting('app.user_id', true) = ANY(viewers))";
 
         let Err(super::SetupError::Unwithdrawable(named)) =
             Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING)
         else {
             panic!(
-                "a withdrawal on this shape reaches nothing, so it must stop the server \
-                 rather than serve access the database has taken away"
+                "nothing can withdraw this grant, so it must stop the server rather than \
+                 serve access the database has taken away"
             );
         };
         assert!(
-            named.contains("paper_shares"),
-            "the refusal names the table whose changes cannot be turned into a removal, \
-             or an operator cannot find the policy to change: {named}"
+            named.contains("papers"),
+            "the refusal names the table an operator has to change: {named}"
         );
         // The refusal is as wide as the gap is today rather than as wide as it
         // has to be, so the message says the boot will start working again. An
@@ -1250,6 +1423,31 @@ mod tests {
              the rustdoc they never read: {shown}"
         );
     }
+
+    /// The other side of the same floor: a share carrying a residual predicate
+    /// boots now, because its replay has a slice to reconcile.
+    #[test]
+    fn a_share_with_a_residual_predicate_boots_since_the_reconcile() {
+        const SCHEMA: &str = "
+            CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
+            ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE paper_shares(paper_id INTEGER, viewer TEXT, weight INT, \
+                PRIMARY KEY(paper_id, viewer));
+        ";
+        const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
+            EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
+              AND s.viewer = current_setting('app.user_id', true) \
+              AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
+
+        let translated = Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING);
+        assert!(
+            translated.is_ok(),
+            "the replay declares the slice it determines, so the reconcile keeps it \
+             current and the boot has nothing to refuse: {:?}",
+            translated.err()
+        );
+    }
+
     /// A table whose name is the one the identity type already answers to.
     ///
     /// The model would then hold two things under one type name, and a walk
