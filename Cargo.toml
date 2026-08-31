@@ -141,3 +141,13 @@ module_name_repetitions = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Fast test iteration: release-grade optimization without the fat link.
+# Mirrors subql's profile of the same name. Use via
+# `cargo +stable test --profile testfast` or `cargo nextest run
+# --cargo-profile testfast`.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
