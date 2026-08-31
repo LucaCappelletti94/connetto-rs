@@ -494,3 +494,62 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
         "the rows the policy still grants stay on the device"
     );
 }
+
+/// R63 decision 3: the dialect a developer writes first, a direct caller
+/// comparison with no subquery, registers and self-seeds as a term.
+///
+/// Withdrawn while `upstream/subql-caller-term-subscriber-kind-not-answerable.md`
+/// was open, restored when `describe_terms` gained the `Caller` entry naming
+/// the compared column's kind. No membership table is involved, so no
+/// `MembershipOpened` announce is expected either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_caller_comparison_registers_and_self_seeds() {
+    let fixture = Fixture::acquire().await;
+    let server = term_over_owner_fixture(&fixture).await;
+
+    fixture
+        .exec(
+            "INSERT INTO items (id, owner, team_id, label) VALUES \
+             (51, 'alice', 1, 'hers'), (52, 'bob', 1, 'his')",
+        )
+        .await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("r63-direct", "user:alice").await;
+    alice
+        .subscribe(
+            "mine",
+            "SELECT * FROM items WHERE owner = current_app_user()",
+        )
+        .await;
+    let mut replica = Replica::new();
+    for patch in alice.expect_snapshot("mine").await {
+        replica.apply(&patch.patchset_zstd);
+    }
+    // Drain the R28 backlog overlap, as above, so the next frame is the
+    // insert's own.
+    while let Some(patch) = alice.try_live(QUIET).await {
+        if patch.sub_id == "mine" {
+            replica.apply(&patch.patchset_zstd);
+        }
+    }
+    assert_eq!(replica.ids(), vec![51], "the seed is the caller's own rows");
+
+    // A live row owned by the caller arrives.
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (53, 'alice', 1, 'new')")
+        .await;
+    let patch = live_for(&mut alice, "mine", DELIVERY).await;
+    replica.apply(&patch.patchset_zstd);
+    assert_eq!(
+        replica.ids(),
+        vec![51, 53],
+        "the caller's own insert arrives"
+    );
+
+    // One owned by somebody else stays silent.
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (54, 'bob', 1, 'not-hers')")
+        .await;
+    no_live_for(&mut alice, "mine", QUIET).await;
+}

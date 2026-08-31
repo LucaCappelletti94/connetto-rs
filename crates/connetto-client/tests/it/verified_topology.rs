@@ -14,8 +14,6 @@
 //!
 //! The browser-stack runner supplies the server binary and service environment.
 
-#![cfg(feature = "native-auth")]
-
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};

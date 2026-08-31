@@ -12,8 +12,6 @@
 //! type, with no `Display` or `FromStr` anywhere on the path, and the replica
 //! file the client opens is named from it.
 
-#![cfg(feature = "native-auth")]
-
 use std::sync::Arc;
 
 use connetto_client::{
@@ -204,6 +202,7 @@ fn fake_browser(subject: &str) -> BrowserOpener {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_login_refreshes_and_silently_reacquires() {
+    connetto_test_harness::isolated_session_keyring();
     let (base, _idp) = spawn_auth_server().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
@@ -283,6 +282,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
 /// same type, so nothing on the `user_id` path is text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_user_id_round_trips_and_names_the_replica() {
+    connetto_test_harness::isolated_session_keyring();
     let (base, _idp) = spawn_typed_auth_server().await;
 
     let alice = login_as(&base, "alice").await;
@@ -318,6 +318,7 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
 /// device stay isolated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
+    connetto_test_harness::isolated_session_keyring();
     let (base, _idp) = spawn_typed_auth_server().await;
     let keys = MemoryKeyStore::default();
 
@@ -382,6 +383,7 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 /// The stored refresh token is gone too, and a copy of it kept elsewhere is dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
+    connetto_test_harness::isolated_session_keyring();
     let (base, service, _idp) = spawn_auth_server_with_service().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
@@ -470,6 +472,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 /// expires on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed() {
+    connetto_test_harness::isolated_session_keyring();
     // The encoded form of the id the mock provider would return on a real login.
     let encoded_account = encode_identity("native-user").expect("encode offline account");
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());

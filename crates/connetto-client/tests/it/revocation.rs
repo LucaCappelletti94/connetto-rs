@@ -168,6 +168,7 @@ where
 /// who lost it, and disturbs nobody else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
+    connetto_test_harness::isolated_session_keyring();
     let fixture = Fixture::acquire().await;
     let server = cross_table_visibility_fixture(&fixture).await;
 

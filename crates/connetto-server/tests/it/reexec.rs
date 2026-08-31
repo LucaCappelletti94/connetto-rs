@@ -20,7 +20,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
-use subql::reexec::{AsyncConnector, RowPage, Snapshot as ConnectorRead};
+use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
@@ -49,7 +49,7 @@ impl AsyncConnector for QueuedConnector {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
@@ -64,7 +64,7 @@ impl AsyncConnector for QueuedConnector {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
