@@ -645,6 +645,15 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
         Ok(pg.to_string())
     }
+
+    /// The client-dialect name of the deployment's caller function, or `None`
+    /// for a deployment serving no membership term.
+    #[must_use]
+    pub fn caller_function(&self) -> Option<&str> {
+        self.caller
+            .as_ref()
+            .map(|mapping| mapping.sqlite_function.as_str())
+    }
 }
 
 /// Convert wire bind values into the typed subql values a
