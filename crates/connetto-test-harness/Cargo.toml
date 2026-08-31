@@ -79,3 +79,8 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
 sqlite-diff-rs = { version = "0.10.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Joining a fresh anonymous session keyring in-process, replacing the external
+# `keyctl session` wrapper the OS-keyring tests used to need.
+keyutils = "0.4"

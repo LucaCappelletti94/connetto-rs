@@ -158,6 +158,26 @@ fn container_labels(role: &str) -> [(String, String); 2] {
     ]
 }
 
+/// Join a fresh anonymous session keyring for this thread and its descendants.
+///
+/// The OS-keyring tests used to need an external `keyctl session` wrapper: a
+/// locked login collection wedged them silently, and parallel runs shared the
+/// caller's real session. `KEYCTL_JOIN_SESSION_KEYRING` scopes the join to the
+/// calling thread, and every thread or child process created afterwards
+/// inherits it, so calling this as the FIRST statement of a test covers the
+/// tokio runtime the test macro builds, the blocking pool, and any spawned
+/// client binary, whose stored key the test can then read back. Each calling
+/// test gets its own fresh session, so keyring tests cannot see each other's
+/// entries whichever runner schedules them.
+#[cfg(target_os = "linux")]
+pub fn isolated_session_keyring() {
+    keyutils::Keyring::join_anonymous_session().expect("join a fresh anonymous session keyring");
+}
+
+/// On non-Linux targets the platform store needs no session isolation.
+#[cfg(not(target_os = "linux"))]
+pub fn isolated_session_keyring() {}
+
 /// Remove containers an earlier run abandoned, once per process.
 ///
 /// Dropping a [`Fixture`] stops its containers on every ordinary path, panic
