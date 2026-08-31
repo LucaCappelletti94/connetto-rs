@@ -15,7 +15,7 @@
 //! misses.
 
 use sqlite_diff_rs::Value as WireValue;
-use subql::backend::{Postgres, ScalarKind, ScalarKindOf, Value};
+use subql::backend::{BuiltinKind, Postgres, ScalarKind, ScalarKindOf, Value};
 use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
 
 /// The sqlite-diff value shape carried by an uploaded row image.
@@ -34,7 +34,9 @@ type Wire = WireValue<String, Vec<u8>>;
 /// blob that is not sixteen bytes, keeps the plain storage mapping.
 pub(crate) fn from_wire(value: &Wire, kind: Option<ScalarKindOf<Postgres>>) -> Value<Postgres> {
     match (value, kind) {
-        (WireValue::Blob(blob), Some(ScalarKind::Uuid)) => uuid_from_blob(blob),
+        (WireValue::Blob(blob), Some(ScalarKind::Builtin(BuiltinKind::Uuid))) => {
+            uuid_from_blob(blob)
+        }
         (WireValue::Null, _) => Value::Null,
         (WireValue::Integer(int), _) => Value::Int(*int),
         (WireValue::Real(real), _) => Value::Float(*real),
@@ -116,9 +118,9 @@ mod tests {
             Wire::Blob(id.as_bytes().to_vec()),
         ];
         let kinds = [
-            Some(ScalarKind::Int),
-            Some(ScalarKind::String),
-            Some(ScalarKind::Uuid),
+            Some(ScalarKind::Builtin(BuiltinKind::Int)),
+            Some(ScalarKind::Builtin(BuiltinKind::String)),
+            Some(ScalarKind::Builtin(BuiltinKind::Uuid)),
         ];
         let read = [
             Value::<Postgres>::Int(7),
@@ -137,13 +139,19 @@ mod tests {
     fn a_blob_under_a_uuid_column_lifts_to_a_uuid() {
         let id = uuid::Uuid::from_u128(1);
         assert_eq!(
-            from_wire(&Wire::Blob(id.as_bytes().to_vec()), Some(ScalarKind::Uuid)),
+            from_wire(
+                &Wire::Blob(id.as_bytes().to_vec()),
+                Some(ScalarKind::Builtin(BuiltinKind::Uuid))
+            ),
             Value::<Postgres>::Uuid(id),
         );
         // A blob that is not sixteen bytes is not a UUID image, so it stays
         // bytes rather than being forced into one.
         assert_eq!(
-            from_wire(&Wire::Blob(vec![0, 1, 2]), Some(ScalarKind::Uuid)),
+            from_wire(
+                &Wire::Blob(vec![0, 1, 2]),
+                Some(ScalarKind::Builtin(BuiltinKind::Uuid))
+            ),
             Value::<Postgres>::Bytes(vec![0, 1, 2]),
         );
     }

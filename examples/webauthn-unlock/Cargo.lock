@@ -1381,6 +1381,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maxwell-cdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae3f4a5b983efc9aa97039d4db23c211c0c55638a3b851dc9ccd9d73902685ee"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "maybe-dangling"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,6 +1548,16 @@ dependencies = [
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "serde",
+]
+
+[[package]]
+name = "postgres-jsonb-canonical"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cefe35610bb56653dd85d53b2c00504c05415ab9b4581de1a2c2cc83e86bbb5"
+dependencies = [
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1719,12 +1740,22 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#bbe4f57af6b645e558f37fb82a80b1685badedb5"
 dependencies = [
+ "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror",
+]
+
+[[package]]
+name = "rls2fga-types"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#bbe4f57af6b645e558f37fb82a80b1685badedb5"
+dependencies = [
+ "serde",
  "thiserror",
 ]
 
@@ -1990,9 +2021,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sql-scalar-text"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c8a68d907abe87d261288a6753ba0ce1451ecef845ad13dba2be60b652605c"
+dependencies = [
+ "bigdecimal",
+ "chrono",
+]
+
+[[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#88c01710e1dd077af608bb462c604c813df7e22e"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -2012,15 +2053,16 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
+checksum = "e000bff095eeb6527bca67810065049d73ced690901d9fdcfd9f8356fabe2b9a"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
- "serde",
+ "maxwell-cdc",
  "serde_json",
  "thiserror",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -2063,9 +2105,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-canonicalize"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#1f6d7b5f7bf61cec3708e4c3e922dad39a3a95b1"
+dependencies = [
+ "seahash",
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c0054b7785322fe9e4b0ce485749ad730e7ef278"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2106,7 +2158,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f#3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=2c632f0d7b47bbc5fd12ccdc494fc79dc23b0699#2c632f0d7b47bbc5fd12ccdc494fc79dc23b0699"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -2117,20 +2169,25 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
+ "maxwell-cdc",
  "pg_walstream",
  "postcard",
+ "postgres-jsonb-canonical",
  "rls2fga",
+ "rls2fga-types",
  "roaring",
- "seahash",
  "serde",
  "serde_json",
  "slab",
+ "sql-scalar-text",
  "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",
+ "sqlparser-canonicalize",
  "thiserror",
  "toml",
  "uuid",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -2531,6 +2588,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wal2json-events"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e07472d540f81a13c811ca9132d9839326a2be5f61823bc6f9c94a6c67886269"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "want"

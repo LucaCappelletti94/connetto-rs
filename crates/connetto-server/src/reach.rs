@@ -16,9 +16,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rls2fga::generator::action_relations::{ActionAnswer, ActionRelations, ActionStatement};
 use rls2fga::generator::json_model::{AuthorizationModel, TypeDefinition, Userset};
-use rls2fga::generator::row_naming::RowNaming;
+use rls2fga::types::{ActionAnswer, ActionRelations, ActionStatement, RowNaming};
 
 /// Why the generated rules could not be turned into a reach index.
 #[derive(Debug, thiserror::Error)]
@@ -105,7 +104,7 @@ impl GrantReach {
             let tables: Vec<&str> = naming
                 .iter()
                 .filter(|named| named.type_name == type_name)
-                .map(|named| named.table.as_str())
+                .map(|named| named.table.name())
                 .collect();
             if tables.is_empty() {
                 continue;

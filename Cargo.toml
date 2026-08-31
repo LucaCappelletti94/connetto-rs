@@ -52,10 +52,15 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # passthroughs, `match_rows`, `describe_terms`), the shipped connectors take
 # a `SessionSetup`, `row_bytes_of` is public, a failed triggered read names
 # its subscription, the facade drains the ungrouped fold channel, and bare
-# `ORDER BY` row queries stay in process.
+# `ORDER BY` row queries stay in process. Moved to `2c632f0` for U6
+# (per-consumer database reads on RLS tables via
+# `database_reads_per_consumer`), U13 (`GroupIdentity` carrying the typed
+# group values beside the opaque key), and the canonical group keys
+# (`Backend::group_key_encoder`, collation-aware, database-proven), which
+# widen the folded grouped path to float and jsonb group columns.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "3d75cca5c93dde6c1b6cfa6dc81f5b94160b218f", default-features = false, features = [
+subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "2c632f0d7b47bbc5fd12ccdc494fc79dc23b0699", default-features = false, features = [
   "std",
 ] }
 

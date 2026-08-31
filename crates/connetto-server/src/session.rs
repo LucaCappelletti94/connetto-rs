@@ -63,6 +63,7 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
+use subql::reexec::ReadQuery;
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -4411,7 +4412,7 @@ where
             SeedPlan::Scalar { sql, kind } => {
                 let (value, lsn) = self
                     .connector
-                    .execute_scalar(sql, *kind, &caller_setup())
+                    .execute_scalar(&ReadQuery::without_binds(sql), *kind, &caller_setup())
                     .await
                     .map_err(|err| err.to_string())?;
                 let change = {
@@ -4433,7 +4434,11 @@ where
         let (rows, lsn) = if bootstrap.group_columns == 0 {
             // One row of component columns under one snapshot.
             self.connector
-                .execute_scalar_row(&bootstrap.sql, &bootstrap.kinds, &setup)
+                .execute_scalar_row(
+                    &ReadQuery::without_binds(&bootstrap.sql),
+                    &bootstrap.kinds,
+                    &setup,
+                )
                 .await
                 .map(|(row, lsn)| (vec![row], lsn))
                 .map_err(|err| err.to_string())?
@@ -4444,7 +4449,11 @@ where
             // registration rather than as a torn seed.
             let page = self
                 .connector
-                .read_page(&bootstrap.sql, GROUPED_SEED_PAGE_BYTES, &setup)
+                .read_page(
+                    &ReadQuery::without_binds(&bootstrap.sql),
+                    GROUPED_SEED_PAGE_BYTES,
+                    &setup,
+                )
                 .await
                 .map_err(|err| err.to_string())?;
             if page.value.more {

@@ -40,9 +40,9 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http};
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-use rls2fga::generator::records::{Record, ReplayScope};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
+use rls2fga::types::{Record, ReplayScope};
 use subql::ParserDB;
 use subql::backend::{Postgres, Value};
 use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
@@ -474,7 +474,7 @@ impl Translated {
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let translator = rls2fga::translator::TranslatorBuilder::new()
-            .with_min_confidence(rls2fga::classifier::patterns::ConfidenceLevel::B)
+            .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .with_session_attributes([
                 SessionAttribute::setting(user_setting, SessionAttributeKind::CallerId),
                 SessionAttribute::setting(Key::SETTING, SessionAttributeKind::SetAttribute),
@@ -484,7 +484,7 @@ impl Translated {
         let translation = translator
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?;
-        let relations = translation.relations();
+        let relations = translation.relations().to_vec();
         let naming = translation.row_naming();
         let notes = translation.notes().to_vec();
         let answers = translation.action_relations();
@@ -522,7 +522,7 @@ impl Translated {
             .outputs()
             .map_err(|unhandled| SetupError::Untranslated(unhandled.to_string()))?;
         let model = outputs.json_model();
-        let tuples = outputs.tuple_queries();
+        let tuples = outputs.tuple_queries().to_vec();
         let policy_tables = policy_tables(&outputs);
         drop(outputs);
         // Walked here rather than where it is first read, so a model this
@@ -829,7 +829,12 @@ fn policy_tables<DB: subql::DatabaseLike>(
         .tuple_queries()
         .iter()
         .filter_map(|query| query.description.as_ref())
-        .flat_map(|description| description.tables.iter().cloned())
+        .flat_map(|description| {
+            description
+                .tables
+                .iter()
+                .map(|table| table.name().to_string())
+        })
         .collect();
     tables.sort_unstable();
     tables.dedup();
@@ -1200,7 +1205,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
 
 #[cfg(test)]
 mod tests {
-    use rls2fga::generator::action_relations::ActionStatement;
+    use rls2fga::types::ActionStatement;
     use subql::catalog_helpers;
 
     use super::{SubjectNaming, Translated};
