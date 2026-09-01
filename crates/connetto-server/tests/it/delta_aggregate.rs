@@ -28,9 +28,9 @@ fn register_classifies_fold_aggregate_and_row() {
     assert_eq!(bootstrap.group_columns, 0, "COUNT(*) is ungrouped");
     assert_eq!(bootstrap.kinds, vec![BuiltinKind::Int]);
     assert!(
-        bootstrap.sql.contains("COUNT(*)"),
+        bootstrap.query.sql().contains("COUNT(*)"),
         "bootstrap SQL should carry the aggregate, got {:?}",
-        bootstrap.sql,
+        bootstrap.query,
     );
 
     let row = mat

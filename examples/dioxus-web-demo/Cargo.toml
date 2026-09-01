@@ -65,17 +65,16 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 
 # Verbatim mirror of the root workspace patch blocks. Cargo patches do not
 # cross workspaces, so the demo needs the same routing or the diesel backed
-# graph will not resolve. The sources must match the root ones exactly, branch
-# refs included: a rev pinned patch would be a distinct source id, duplicating
-# crates in the graph. The demo lockfile does the pinning.
+# graph will not resolve. The sources and revisions must match the root ones
+# exactly. The demo lockfile pins the rest of the graph.
 [patch.crates-io]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", rev = "caf515ee06de34f2fc59579355aecb17907e3521" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 
 [patch."https://github.com/diesel-rs/diesel"]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", rev = "caf515ee06de34f2fc59579355aecb17907e3521" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

@@ -63,7 +63,6 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
-use subql::reexec::ReadQuery;
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -337,6 +336,11 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     schema_version: Option<SchemaVersion>,
+    /// The Postgres setting a per-viewer re-execution binds the caller's
+    /// identity to (R85), the same one the deployment's row policies read.
+    /// Must match the snapshot source's and write target's setting when a
+    /// deployment overrides theirs.
+    rls_user_setting: std::sync::Arc<str>,
 }
 
 impl Default for SessionConfig {
@@ -344,6 +348,7 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
+            rls_user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
         }
     }
 }
@@ -366,6 +371,13 @@ impl SessionConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+
+    /// Sets the identity setting a per-viewer re-execution binds (R85).
+    #[must_use]
+    pub fn with_rls_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
+        self.rls_user_setting = setting.into();
         self
     }
 
@@ -2287,6 +2299,7 @@ where
         let update = AggregateUpdate {
             sub_id: route.label,
             group_key: change.group_key,
+            group_values_json: change.group_values_json,
             result_json: change.result_json,
             is_full_result: change.is_full_result,
         };
@@ -3329,7 +3342,55 @@ where
                 })
             }
         };
-        let member_tables: std::sync::Arc<[(String, String)]> = terms
+        let member_tables = Self::member_tables_of(&terms);
+        // Engine-driven reads run on the dispatch path, so they spend the
+        // shared re-execution bound: a slow read delays everyone's stream.
+        let viewer = self.viewer_read_setup(state);
+        let registration = materializer.register_translated(
+            consumer_id,
+            &pg_sql,
+            &sub.spec.binds,
+            seed,
+            self.guard.reexec_budget(),
+            viewer,
+        )?;
+        Ok((
+            SqliteRegistration {
+                registration,
+                pg_sql,
+            },
+            member_tables,
+        ))
+    }
+
+    /// The read setup a per-consumer registration would run under: the shared
+    /// re-execution budget plus this caller's own binding, or `None` for a
+    /// caller whose handshake resolved no identity. An aggregate over a
+    /// row-level-security table cannot share one fold, and offering this is
+    /// what lets registration retry it with per-consumer reads that answer as
+    /// this viewer (R85); with nobody to read as, the refusal stands.
+    fn viewer_read_setup(
+        &self,
+        state: &SessionState<Id, Key>,
+    ) -> Option<crate::reexec::ConnettoReadSetup> {
+        state.principal.identity().is_some().then(|| {
+            crate::reexec::ConnettoReadSetup::of(ReadBudget::new(
+                self.guard.reexec_budget().timeout,
+            ))
+            .with_statements(
+                crate::capability::CallerBinding::of(
+                    &state.principal,
+                    std::sync::Arc::clone(&self.config.rls_user_setting),
+                )
+                .setup_statements(),
+            )
+        })
+    }
+
+    /// The membership tables a registration's terms read, paired with the member
+    /// subject column, for the session's term-move routing.
+    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[(String, String)]> {
+        terms
             .iter()
             .filter_map(|term| match term {
                 TermDescription::Membership(membership) => Some((
@@ -3339,25 +3400,7 @@ where
                 TermDescription::Caller(_) => None,
             })
             .collect::<Vec<_>>()
-            .into();
-        // Every engine-driven read this registration ever needs (its bootstrap
-        // included) runs on the dispatch path or under the materializer lock,
-        // so it spends the shared re-execution bound rather than the caller's
-        // snapshot tier: what a slow read delays is everyone's change stream.
-        let registration = materializer.register_translated(
-            consumer_id,
-            &pg_sql,
-            &sub.spec.binds,
-            seed,
-            self.guard.reexec_budget(),
-        )?;
-        Ok((
-            SqliteRegistration {
-                registration,
-                pg_sql,
-            },
-            member_tables,
-        ))
+            .into()
     }
 
     async fn handle_subscribe<T: Transport>(
@@ -4387,6 +4430,7 @@ where
                 .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
                     sub_id: sub.sub_id.clone(),
                     group_key: change.group_key,
+                    group_values_json: change.group_values_json,
                     result_json: change.result_json,
                     is_full_result: change.is_full_result,
                 }))
@@ -4418,10 +4462,10 @@ where
                     .bootstrap_computed(subscription_id, capture.consumer_id)
                     .await;
             }
-            SeedPlan::Scalar { sql, kind } => {
+            SeedPlan::Scalar { query, kind } => {
                 let (value, lsn) = self
                     .connector
-                    .execute_scalar(&ReadQuery::without_binds(sql), *kind, &caller_setup())
+                    .execute_scalar(&query.as_read_query(), *kind, &caller_setup())
                     .await
                     .map_err(|err| err.to_string())?;
                 let change = {
@@ -4443,11 +4487,7 @@ where
         let (rows, lsn) = if bootstrap.group_columns == 0 {
             // One row of component columns under one snapshot.
             self.connector
-                .execute_scalar_row(
-                    &ReadQuery::without_binds(&bootstrap.sql),
-                    &bootstrap.kinds,
-                    &setup,
-                )
+                .execute_scalar_row(&bootstrap.query.as_read_query(), &bootstrap.kinds, &setup)
                 .await
                 .map(|(row, lsn)| (vec![row], lsn))
                 .map_err(|err| err.to_string())?
@@ -4459,7 +4499,7 @@ where
             let page = self
                 .connector
                 .read_page(
-                    &ReadQuery::without_binds(&bootstrap.sql),
+                    &bootstrap.query.as_read_query(),
                     GROUPED_SEED_PAGE_BYTES,
                     &setup,
                 )

@@ -59,6 +59,7 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
     let transport = aggregate_pusher(AggregateUpdate {
         sub_id: "by-region".to_owned(),
         group_key: Some(b"region=eu".to_vec()),
+        group_values_json: Some("[\"eu\"]".to_owned()),
         result_json: Some("{\"count\":3}".to_owned()),
         is_full_result: false,
     });
@@ -86,6 +87,7 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
             sub_id: "by-region".to_owned(),
             result_json: Some("{\"count\":3}".to_owned()),
             group_key: Some(b"region=eu".to_vec()),
+            group_values_json: Some("[\"eu\"]".to_owned()),
             is_full_result: false,
         },
     );
@@ -98,6 +100,7 @@ async fn aggregate_removal_decodes_as_none() {
     let transport = aggregate_pusher(AggregateUpdate {
         sub_id: "by-region".to_owned(),
         group_key: Some(b"region=eu".to_vec()),
+        group_values_json: Some("[\"eu\"]".to_owned()),
         result_json: None,
         is_full_result: false,
     });
@@ -122,6 +125,7 @@ async fn aggregate_removal_decodes_as_none() {
             sub_id: "by-region".to_owned(),
             result_json: None,
             group_key: Some(b"region=eu".to_vec()),
+            group_values_json: Some("[\"eu\"]".to_owned()),
             is_full_result: false,
         },
     );

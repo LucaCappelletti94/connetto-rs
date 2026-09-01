@@ -158,6 +158,34 @@ impl CallerBinding {
             .map(drop),
         }
     }
+
+    /// The same binding as [`apply`](Self::apply), rendered as SQL statement
+    /// strings for a path that cannot run typed queries: the re-execution
+    /// connector takes its per-transaction setup as plain statements
+    /// (`SessionSetup`), so a per-viewer read binds its caller through these
+    /// (R85). Values ride as quoted literals with their quotes doubled, the
+    /// one escape single-quoted Postgres literals need.
+    pub(crate) fn setup_statements(&self) -> Vec<String> {
+        fn quoted(value: &str) -> String {
+            value.replace('\'', "''")
+        }
+        let mut statements = Vec::with_capacity(2);
+        if let Some(user) = &self.user_id {
+            statements.push(format!(
+                "SELECT set_config('{}', '{}', true)",
+                quoted(&self.user_setting),
+                quoted(user)
+            ));
+        }
+        if let Some(subjects) = &self.subjects {
+            statements.push(format!(
+                "SELECT set_config('{}', '{}', true)",
+                quoted(self.setting),
+                quoted(subjects)
+            ));
+        }
+        statements
+    }
 }
 
 /// The setting an application's policies read the caller's identity from,

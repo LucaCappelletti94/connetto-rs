@@ -89,8 +89,8 @@ pub use auth::{
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
 pub use live::{
-    ConnettoClient, LiveHandle, LiveQuery, LiveValue, subscription_is_aggregate,
-    subscription_tables,
+    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
+    subscription_is_aggregate, subscription_tables,
 };
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
@@ -784,6 +784,10 @@ pub enum ClientEvent {
         result_json: Option<String>,
         /// Opaque group key, or `None` for a single-group aggregate.
         group_key: Option<Vec<u8>>,
+        /// The decoded group values as a JSON array in `GROUP BY` order,
+        /// present exactly when `group_key` is. A typed keyed handle decodes
+        /// its public map key from these, never from the key bytes (R84).
+        group_values_json: Option<String>,
         /// Whether this update replaces the entire result set or upserts a
         /// single group.
         is_full_result: bool,
@@ -2919,9 +2923,7 @@ where
     fn rest_aggregate(
         &mut self,
         sub_id: &str,
-        group_key: Option<&[u8]>,
-        result_json: Option<&str>,
-        is_full_result: bool,
+        frame: &aggregates::AggregateFrame<'_>,
     ) -> Result<(), ClientError> {
         let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
@@ -2931,17 +2933,9 @@ where
         // so the cap never evicts a value in use.
         let protected = subscriptions::live_identities(&mut self.db)?;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        aggregates::apply_frame(
-            &mut self.db,
-            query_id,
-            &binds,
-            group_key,
-            result_json,
-            is_full_result,
-            now,
-        )?;
+        aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
-        if result_json.is_some() {
+        if frame.result_json.is_some() {
             aggregates::enforce_cap(&mut self.db, self.config.rested_statistics_cap, &protected)?;
         }
         Ok(())
@@ -2961,6 +2955,22 @@ where
         binds: &[BindValue],
     ) -> Result<Option<(String, i64)>, ClientError> {
         aggregates::lookup_scalar(&mut self.db, query, binds)
+    }
+
+    /// Every rested group row for a subscription's query and binds, the
+    /// scalar row excluded, in stored-key order. A keyed or row-shaped handle
+    /// bootstraps from these on an offline restart and a late join, whichever
+    /// resting shape it finds (R84).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read.
+    pub(crate) fn rested_groups(
+        &mut self,
+        query: &str,
+        binds: &[BindValue],
+    ) -> Result<Vec<aggregates::RestedGroup>, ClientError> {
+        aggregates::lookup_groups(&mut self.db, query, binds)
     }
 
     /// Every subscription this replica has declared and not dropped, whether
@@ -3390,14 +3400,18 @@ where
                 // driver shares, not in a driver's own loop (R83).
                 self.rest_aggregate(
                     &update.sub_id,
-                    update.group_key.as_deref(),
-                    update.result_json.as_deref(),
-                    update.is_full_result,
+                    &aggregates::AggregateFrame {
+                        group_key: update.group_key.as_deref(),
+                        group_values_json: update.group_values_json.as_deref(),
+                        result_json: update.result_json.as_deref(),
+                        is_full_result: update.is_full_result,
+                    },
                 )?;
                 Ok(ClientEvent::Aggregate {
                     sub_id: update.sub_id,
                     result_json: update.result_json,
                     group_key: update.group_key,
+                    group_values_json: update.group_values_json,
                     is_full_result: update.is_full_result,
                 })
             }

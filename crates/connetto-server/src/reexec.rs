@@ -75,6 +75,16 @@ impl ConnettoReadSetup {
             statements: vec![format!("SET LOCAL statement_timeout = {timeout_ms}")],
         }
     }
+
+    /// The same setup with `extra` statements appended, in order, after the
+    /// budget. This is where a per-viewer registration's caller binding rides
+    /// (R85): the statements run inside every transaction the connector opens
+    /// for the subscription, so each of its reads answers as that viewer.
+    #[must_use]
+    pub fn with_statements(mut self, extra: Vec<String>) -> Self {
+        self.statements.extend(extra);
+        self
+    }
 }
 
 impl From<ReadBudget> for ConnettoReadSetup {

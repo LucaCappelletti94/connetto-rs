@@ -57,6 +57,8 @@ mod reexec;
 
 mod reserve;
 
+mod rls_computed;
+
 mod rls_read_filter;
 
 mod rls_write_filter;

@@ -23,7 +23,7 @@
 use core::future::Future;
 use core::task::Poll;
 use core::time::Duration;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
@@ -91,13 +91,19 @@ enum QueryShape {
     Rows,
     /// A single ungrouped scalar aggregate: answered by server pushes.
     Aggregate,
+    /// A grouped aggregate projecting its group columns and one aggregate:
+    /// answered by server pushes keyed by group (R84).
+    Grouped,
 }
 
 /// What the client needs from a rendered subscription query: the tables it
-/// reads (for targeted refresh) and its shape (for answer-path routing).
+/// reads (for targeted refresh), its shape (for answer-path routing), and,
+/// for a grouped statistic, the group column names in `GROUP BY` order (what
+/// a keyed handle extracts its map key with from a whole answer's objects).
 struct ParsedSubscription {
     tables: HashSet<String>,
     shape: QueryShape,
+    group_columns: Vec<String>,
 }
 
 /// The lowercased names of every table a subscription query reads.
@@ -114,12 +120,14 @@ pub fn subscription_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
 }
 
 /// Whether a rendered subscription query is answered by server-pushed
-/// aggregates rather than from the replica.
+/// aggregate frames rather than from the replica: a scalar aggregate or a
+/// grouped statistic (R84), whose keyed frames ride the same path.
 ///
 /// The same shape classification the pump uses to route a query to
-/// [`ConnettoClient::watch_value`], exposed so a relay serving the wire
-/// protocol from a worker-held connection can route a tab `Subscribe` to the
-/// aggregate path instead of a row snapshot, matching the direct client.
+/// [`ConnettoClient::watch_value`] or [`ConnettoClient::watch_groups`],
+/// exposed so a relay serving the wire protocol from a worker-held connection
+/// can route a tab `Subscribe` to the aggregate path instead of a row
+/// snapshot, matching the direct client.
 ///
 /// This classifies from the rendered SQL by function name, so it recognizes
 /// only the built-in scalar aggregate family (`COUNT`, `SUM`, `AVG`, the
@@ -135,7 +143,7 @@ pub fn subscription_tables(sql: &str) -> Result<HashSet<String>, ClientError> {
 ///
 /// [`ClientError::Session`] when the SQL cannot be parsed.
 pub fn subscription_is_aggregate(sql: &str) -> Result<bool, ClientError> {
-    Ok(parse_subscription(sql)?.shape == QueryShape::Aggregate)
+    Ok(parse_subscription(sql)?.shape != QueryShape::Rows)
 }
 
 /// The scalar aggregate functions the server maintains, lowercased.
@@ -184,45 +192,254 @@ fn parse_subscription(sql: &str) -> Result<ParsedSubscription, ClientError> {
         }
         core::ops::ControlFlow::<()>::Continue(())
     });
-    let shape = match statements.as_slice() {
+    let (shape, group_columns) = match statements.as_slice() {
         [Statement::Query(query)] => query_shape(query),
-        _ => QueryShape::Rows,
+        _ => (QueryShape::Rows, Vec::new()),
     };
-    Ok(ParsedSubscription { tables, shape })
+    Ok(ParsedSubscription {
+        tables,
+        shape,
+        group_columns,
+    })
 }
 
-/// A query is aggregate-shaped when it projects exactly one ungrouped call to
-/// a known scalar aggregate, mirroring the server's classification closely
-/// enough to route the client's answer path.
-fn query_shape(query: &sqlparser::ast::Query) -> QueryShape {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return QueryShape::Rows;
-    };
-    let ungrouped = matches!(
-        &select.group_by,
-        GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty()
-    );
-    if !ungrouped || select.projection.len() != 1 {
-        return QueryShape::Rows;
-    }
-    let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) =
-        &select.projection[0]
-    else {
-        return QueryShape::Rows;
-    };
+/// Whether `expr` is a call to one of the built-in aggregate functions.
+fn is_aggregate_call(expr: &Expr) -> bool {
     let Expr::Function(function) = expr else {
-        return QueryShape::Rows;
+        return false;
     };
-    let is_aggregate = function
+    function
         .name
         .0
         .last()
         .and_then(|part| part.as_ident())
-        .is_some_and(|ident| AGGREGATE_FUNCTIONS.contains(&ident.value.to_lowercase().as_str()));
-    if is_aggregate {
-        QueryShape::Aggregate
+        .is_some_and(|ident| AGGREGATE_FUNCTIONS.contains(&ident.value.to_lowercase().as_str()))
+}
+
+/// The lowercased column name of a plain identifier expression, unqualified
+/// or table-qualified, or `None` for anything else.
+fn plain_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.to_lowercase()),
+        _ => None,
+    }
+}
+
+/// A query is aggregate-shaped when it projects exactly one ungrouped call to
+/// a known scalar aggregate, mirroring the server's classification closely
+/// enough to route the client's answer path. It is grouped when a plain-column
+/// `GROUP BY` is projected in full alongside exactly one such call, which is
+/// the shape whose whole-answer objects a keyed handle can take its map key
+/// from (R84). Anything else, a `GROUP BY` over expressions or one whose
+/// columns the projection hides included, stays a row query.
+fn query_shape(query: &sqlparser::ast::Query) -> (QueryShape, Vec<String>) {
+    let rows = (QueryShape::Rows, Vec::new());
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return rows;
+    };
+    let group_exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) if mods.is_empty() => exprs,
+        GroupByExpr::Expressions(..) | GroupByExpr::All(_) => return rows,
+    };
+    if group_exprs.is_empty() {
+        if select.projection.len() != 1 {
+            return rows;
+        }
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) =
+            &select.projection[0]
+        else {
+            return rows;
+        };
+        if is_aggregate_call(expr) {
+            return (QueryShape::Aggregate, Vec::new());
+        }
+        return rows;
+    }
+    // Grouped: every GROUP BY entry is a plain column, and the projection is
+    // exactly those columns plus one aggregate call, in any order.
+    let Some(group_columns) = group_exprs
+        .iter()
+        .map(plain_column)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return rows;
+    };
+    let mut aggregates = 0_usize;
+    let mut projected: Vec<String> = Vec::new();
+    for item in &select.projection {
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            return (QueryShape::Rows, group_columns);
+        };
+        if is_aggregate_call(expr) {
+            aggregates += 1;
+        } else if let Some(column) = plain_column(expr) {
+            projected.push(column);
+        } else {
+            return (QueryShape::Rows, group_columns);
+        }
+    }
+    let mut wanted = group_columns.clone();
+    wanted.sort_unstable();
+    projected.sort_unstable();
+    if aggregates == 1 && projected == wanted {
+        (QueryShape::Grouped, group_columns)
     } else {
-        QueryShape::Rows
+        (QueryShape::Rows, group_columns)
+    }
+}
+
+/// Decode a keyed handle's map key from the JSON array of group values with
+/// serde: the bare element for a single group column (so `K = i64` or
+/// `String` needs no tuple), the whole array for several (a tuple decodes
+/// from it).
+fn decode_group_key<K: DeserializeOwned>(json: &str) -> Result<K, ClientError> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()))?;
+    if let serde_json::Value::Array(elements) = &value
+        && let [element] = elements.as_slice()
+        && let Ok(key) = serde_json::from_value(element.clone())
+    {
+        return Ok(key);
+    }
+    serde_json::from_value(value).map_err(|e| ClientError::Session(e.to_string()))
+}
+
+/// Split one whole-answer object into the key's JSON array (the group
+/// columns, in `GROUP BY` order) and the one remaining member's JSON, which
+/// is the aggregate value. The projection was checked at registration to be
+/// exactly the group columns plus one aggregate, so a differently shaped
+/// object is a fault worth naming, not a case.
+fn split_whole_object(
+    json: &str,
+    group_columns: &[String],
+) -> Result<(String, String), ClientError> {
+    let serde_json::Value::Object(mut object) =
+        serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()))?
+    else {
+        return Err(ClientError::Session(format!(
+            "a whole answer's element is not an object: {json}"
+        )));
+    };
+    let mut key_values = Vec::with_capacity(group_columns.len());
+    for column in group_columns {
+        let Some(value) = object.remove(column) else {
+            return Err(ClientError::Session(format!(
+                "a whole answer's element misses group column {column}: {json}"
+            )));
+        };
+        key_values.push(value);
+    }
+    let mut rest = object.into_iter();
+    let (Some((_, aggregate)), None) = (rest.next(), rest.next()) else {
+        return Err(ClientError::Session(format!(
+            "a whole answer's element does not hold exactly one aggregate beside its group \
+             columns: {json}"
+        )));
+    };
+    Ok((
+        serde_json::Value::Array(key_values).to_string(),
+        aggregate.to_string(),
+    ))
+}
+
+/// Build a keyed handle's map from the rested rows of its statistic, both
+/// resting shapes admitted: a keyed row decodes from the group values beside
+/// its key, a whole answer's positional row from its object by group column
+/// name. Returns the map and the newest row's as-of time.
+fn build_groups_map<K, V>(
+    rows: &[crate::aggregates::RestedGroup],
+    group_columns: &[String],
+    decode_key: fn(&str) -> Result<K, ClientError>,
+    decode_value: fn(&str) -> Result<V, ClientError>,
+) -> Result<(HashMap<K, V>, Option<i64>), ClientError>
+where
+    K: Eq + core::hash::Hash,
+{
+    let mut map = HashMap::with_capacity(rows.len());
+    let mut as_of: Option<i64> = None;
+    for row in rows {
+        as_of = as_of.max(Some(row.updated_at));
+        let (key, value) = if let Some(values) = &row.group_values_json {
+            (decode_key(values)?, decode_value(&row.result_json)?)
+        } else {
+            let (key_json, value_json) = split_whole_object(&row.result_json, group_columns)?;
+            (decode_key(&key_json)?, decode_value(&value_json)?)
+        };
+        map.insert(key, value);
+    }
+    Ok((map, as_of))
+}
+
+/// Decode a row-shaped handle's answer from the rested rows of its
+/// statistic, in stored order (answer order for a whole answer's positional
+/// rows, key order for a keyed row set). Every body is one row's JSON
+/// object, whichever tier rested it. Returns the rows and the newest row's
+/// as-of time.
+fn decode_rested_rows<R: DeserializeOwned>(
+    rows: &[crate::aggregates::RestedGroup],
+) -> Result<(Vec<R>, Option<i64>), ClientError> {
+    let mut decoded = Vec::with_capacity(rows.len());
+    let mut as_of: Option<i64> = None;
+    for row in rows {
+        as_of = as_of.max(Some(row.updated_at));
+        decoded.push(
+            serde_json::from_str(&row.result_json)
+                .map_err(|e| ClientError::Session(e.to_string()))?,
+        );
+    }
+    Ok((decoded, as_of))
+}
+
+/// Refuse a scalar value watch whose rendered SQL is not a scalar aggregate,
+/// naming the right method, unless a type-level marker already proved the
+/// shape.
+fn require_scalar_shape(
+    shape: ShapeSource,
+    parsed: &ParsedSubscription,
+) -> Result<(), ClientError> {
+    if matches!(shape, ShapeSource::Marker) {
+        return Ok(());
+    }
+    match parsed.shape {
+        QueryShape::Aggregate => Ok(()),
+        QueryShape::Grouped => Err(ClientError::Session(
+            "grouped aggregate: use watch_groups, one scalar cannot carry a keyed result"
+                .to_owned(),
+        )),
+        QueryShape::Rows => Err(ClientError::Session(
+            "row query: use watch, a row projection is answered from the replica".to_owned(),
+        )),
+    }
+}
+
+/// Refuse a grouped watch unless the rendered SQL proves the runtime grouped
+/// shape, or a type-level marker already proved the aggregate and the parser
+/// can still name every plain group column needed to rebuild a whole answer.
+fn require_grouped_shape(
+    shape: ShapeSource,
+    parsed: &ParsedSubscription,
+) -> Result<(), ClientError> {
+    if matches!(shape, ShapeSource::Marker) {
+        return if parsed.group_columns.is_empty() {
+            Err(ClientError::Session(
+                "typed grouped statistic: GROUP BY expressions must be plain projected columns"
+                    .to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    match parsed.shape {
+        QueryShape::Grouped => Ok(()),
+        QueryShape::Aggregate => Err(ClientError::Session(
+            "scalar aggregate: use watch_value, there is no group to key on".to_owned(),
+        )),
+        QueryShape::Rows => Err(ClientError::Session(
+            "not a grouped statistic: watch_groups needs a plain-column GROUP BY projected in \
+             full beside exactly one aggregate"
+                .to_owned(),
+        )),
     }
 }
 
@@ -280,7 +497,7 @@ pub(crate) struct Coverage {
 pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, ClientError> {
     let sql = inline_binds(&spec.query, &spec.binds)?;
     let parsed = parse_subscription(&sql)?;
-    if matches!(parsed.shape, QueryShape::Aggregate) {
+    if matches!(parsed.shape, QueryShape::Aggregate | QueryShape::Grouped) {
         return Ok(None);
     }
     let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
@@ -539,6 +756,22 @@ struct ValueEntry {
     apply: ApplyValue,
 }
 
+/// Apply the full rested row set of a computed statistic to one handle (a
+/// keyed grouped map or a row-shaped answer). Called by the pump with the
+/// rows it just re-read after any frame of the statistic, so delta, removal,
+/// and whole-answer replacement all take the same path and a handle never
+/// sees which tier served it (R84, decision 4).
+type ApplyComputed =
+    Box<dyn FnMut(&[crate::aggregates::RestedGroup]) -> Result<(), ClientError> + Send>;
+
+/// One computed handle's driver-side state, with the id of the shared wire
+/// subscription that feeds it.
+struct ComputedEntry {
+    sub_id: String,
+    wire_id: String,
+    apply: ApplyComputed,
+}
+
 /// One shared wire subscription: declared once on the wire under `wire_id`,
 /// reference counted across every row and value handle that resolved to the
 /// same `spec`. The last aggregate value no longer lives here: R83 rests it in
@@ -558,6 +791,7 @@ struct State<T: Transport> {
     conn: ConnettoConnection<T>,
     registry: Vec<LiveEntry<T>>,
     values: Vec<ValueEntry>,
+    computed: Vec<ComputedEntry>,
     wire: Vec<WireSub>,
 }
 
@@ -766,6 +1000,185 @@ impl<V> LiveValue<V> {
     }
 }
 
+/// A grouped statistic and when it was last synced: the pair a [`LiveGroups`]
+/// holds. Empty until the server's seed arrives (or a rested set bootstraps
+/// it offline), like the scalar's `None`.
+struct RestedGroups<K, V> {
+    map: HashMap<K, V>,
+    as_of: Option<i64>,
+}
+
+impl<K, V> Default for RestedGroups<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            as_of: None,
+        }
+    }
+}
+
+/// A server-maintained grouped aggregate kept fresh by the client's pump, one
+/// entry per group (R84).
+///
+/// Created by [`ConnettoClient::watch_groups`] for grouped aggregate queries.
+/// The replica holds only this client's authorized rows, so it cannot answer
+/// a global statistic: the map comes exclusively from server pushes, resting
+/// in `_connetto_aggregates` (R83), so an offline restart shows the last
+/// synced map. A fold delta upserts one entry, a group's departure removes
+/// one, and a server-side demotion to whole answers rebuilds the map without
+/// surfacing as a distinct state. Dropping the handle queues the server
+/// unsubscribe, exactly like [`LiveQuery`].
+pub struct LiveGroups<K, V> {
+    handle: LiveHandleCore,
+    state: Arc<RwLock<RestedGroups<K, V>>>,
+}
+
+impl<K, V> LiveHandle for LiveGroups<K, V>
+where
+    K: Clone + Send + Sync,
+    V: Clone + Send + Sync,
+{
+    type Snapshot = HashMap<K, V>;
+
+    fn snapshot(&self) -> HashMap<K, V> {
+        self.map()
+    }
+
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send {
+        LiveGroups::changed(self)
+    }
+
+    fn sub_id(&self) -> &str {
+        LiveGroups::sub_id(self)
+    }
+}
+
+impl<K: Clone, V: Clone> LiveGroups<K, V> {
+    /// The current map, one entry per group. Empty before any value has
+    /// arrived. On an offline restart this is the last synced map read from
+    /// the resting table, not empty, which is R83 extended to groups.
+    #[must_use]
+    pub fn map(&self) -> HashMap<K, V> {
+        self.state.read().map_or_else(
+            |poisoned| poisoned.into_inner().map.clone(),
+            |slot| slot.map.clone(),
+        )
+    }
+
+    /// When the map was last synced, in seconds since the epoch on the local
+    /// clock, or `None` while nothing has arrived. The application judges
+    /// staleness from its age together with the connection-state events it
+    /// already receives (R83 decision 6).
+    #[must_use]
+    pub fn as_of_secs(&self) -> Option<i64> {
+        self.state
+            .read()
+            .map_or_else(|poisoned| poisoned.into_inner().as_of, |slot| slot.as_of)
+    }
+}
+
+impl<K, V> LiveGroups<K, V> {
+    /// The subscription id backing this handle.
+    #[must_use]
+    pub fn sub_id(&self) -> &str {
+        self.handle.sub_id()
+    }
+
+    /// Wait until the map changes, the initial seed included.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
+    pub async fn changed(&mut self) -> Result<(), ClientError> {
+        self.handle.changed().await
+    }
+}
+
+/// A rested row-shaped answer and when it was last synced: the pair a
+/// [`LiveRows`] holds.
+struct RestedRows<R> {
+    rows: Vec<R>,
+    as_of: Option<i64>,
+}
+
+impl<R> Default for RestedRows<R> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            as_of: None,
+        }
+    }
+}
+
+/// A server-computed row answer kept fresh by the client's pump (R84).
+///
+/// Created by [`ConnettoClient::watch_rows`] for row-shaped queries the
+/// server re-executes rather than syncing (joins, `DISTINCT`, expression
+/// projections). The whole answer replaces the rows on every move: there are
+/// no per-row patches to a computed result. Each answer rests in
+/// `_connetto_aggregates` (R83), so an offline restart shows the last synced
+/// rows. Dropping the handle queues the server unsubscribe, exactly like
+/// [`LiveQuery`].
+pub struct LiveRows<R> {
+    handle: LiveHandleCore,
+    state: Arc<RwLock<RestedRows<R>>>,
+}
+
+impl<R: Clone + Send + Sync> LiveHandle for LiveRows<R> {
+    type Snapshot = Vec<R>;
+
+    fn snapshot(&self) -> Vec<R> {
+        self.rows()
+    }
+
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send {
+        LiveRows::changed(self)
+    }
+
+    fn sub_id(&self) -> &str {
+        LiveRows::sub_id(self)
+    }
+}
+
+impl<R: Clone> LiveRows<R> {
+    /// The current answer, in the order the server produced it. Empty before
+    /// any answer has arrived. On an offline restart this is the last synced
+    /// answer read from the resting table, not empty.
+    #[must_use]
+    pub fn rows(&self) -> Vec<R> {
+        self.state.read().map_or_else(
+            |poisoned| poisoned.into_inner().rows.clone(),
+            |slot| slot.rows.clone(),
+        )
+    }
+
+    /// When the answer was last synced, in seconds since the epoch on the
+    /// local clock, or `None` while nothing has arrived (R83 decision 6).
+    #[must_use]
+    pub fn as_of_secs(&self) -> Option<i64> {
+        self.state
+            .read()
+            .map_or_else(|poisoned| poisoned.into_inner().as_of, |slot| slot.as_of)
+    }
+}
+
+impl<R> LiveRows<R> {
+    /// The subscription id backing this handle.
+    #[must_use]
+    pub fn sub_id(&self) -> &str {
+        self.handle.sub_id()
+    }
+
+    /// Wait until the answer changes, the initial one included.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the driving [`ConnettoClient`] is gone.
+    pub async fn changed(&mut self) -> Result<(), ClientError> {
+        self.handle.changed().await
+    }
+}
+
 /// Liveness token every [`ConnettoClient`] clone holds. Dropping the last one
 /// wakes the pump, which then closes the connection gracefully and exits.
 struct ClientToken {
@@ -904,6 +1317,7 @@ where
                 conn,
                 registry: Vec::new(),
                 values: Vec::new(),
+                computed: Vec::new(),
                 wire,
             }),
             wake: Arc::clone(&wake),
@@ -1050,6 +1464,22 @@ where
         if parsed.shape == QueryShape::Aggregate {
             return Err(ClientError::Session(
                 "aggregate query: use watch_value, the replica cannot answer a global statistic"
+                    .to_owned(),
+            ));
+        }
+        // A grouped statistic over complete local tables is an ordinary row
+        // query the replica answers exactly, so only the synced case routes
+        // away.
+        if parsed.shape == QueryShape::Grouped
+            && parsed
+                .tables
+                .intersection(state.conn.local_tables())
+                .count()
+                != parsed.tables.len()
+        {
+            return Err(ClientError::Session(
+                "grouped statistic: use watch_groups, the replica cannot answer a global \
+                 statistic as rows"
                     .to_owned(),
             ));
         }
@@ -1364,11 +1794,7 @@ where
     {
         let (sql, binds) = render_query(&query)?;
         let parsed = parse_subscription(&sql)?;
-        if matches!(shape, ShapeSource::Sql) && parsed.shape != QueryShape::Aggregate {
-            return Err(ClientError::Session(
-                "row query: use watch, a row projection is answered from the replica".to_owned(),
-            ));
-        }
+        require_scalar_shape(shape, &parsed)?;
         let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("live-{seq}");
 
@@ -1481,6 +1907,309 @@ where
         Ok(LiveValue {
             handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
             value,
+        })
+    }
+
+    /// Watch a grouped aggregate as a live map, one entry per group,
+    /// decoding the key and the value with serde (R84).
+    ///
+    /// The query must project its group columns and exactly one aggregate,
+    /// for example `SELECT status, COUNT(*) FROM orders GROUP BY status`,
+    /// which is what lets a whole-answer demotion rebuild the map. `K`
+    /// decodes from the group values the server pushes beside each key: the
+    /// bare value for a single group column, a JSON array in `GROUP BY` order
+    /// for several (a tuple decodes from it). `V` decodes from the aggregate
+    /// value with plain serde: for a wire-lenient decode (the `SUM`
+    /// accumulator's float rendering, `NUMERIC` extremes as strings), pass a
+    /// [`AggregateWire`](crate::dsl::AggregateWire) decoder through
+    /// [`watch_groups_with`](Self::watch_groups_with).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the query cannot be rendered, is not
+    /// grouped-aggregate-shaped, reads a local table (a local tier is
+    /// complete, so `watch` answers it as rows), or the subscribe frame
+    /// cannot be sent. A server-side refusal arrives later as
+    /// [`ClientEvent::NonFatal`] on [`events`](Self::events).
+    pub async fn watch_groups<Q, K, V>(&self, query: Q) -> Result<LiveGroups<K, V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        K: DeserializeOwned + Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
+        V: DeserializeOwned + Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_groups_with(query, decode_group_key::<K>, |json| {
+            serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()))
+        })
+        .await
+    }
+
+    /// Watch a grouped aggregate, decoding key and value with caller-supplied
+    /// decoders. The decoder-parameterized peer of
+    /// [`watch_groups`](Self::watch_groups): `decode_key` receives the JSON
+    /// array of group values in `GROUP BY` order, `decode_value` one
+    /// aggregate value's JSON.
+    ///
+    /// # Errors
+    ///
+    /// See [`watch_groups`](Self::watch_groups).
+    pub async fn watch_groups_with<Q, K, V>(
+        &self,
+        query: Q,
+        decode_key: fn(&str) -> Result<K, ClientError>,
+        decode_value: fn(&str) -> Result<V, ClientError>,
+    ) -> Result<LiveGroups<K, V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        K: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_groups_core(query, decode_key, decode_value, ShapeSource::Sql)
+            .await
+    }
+
+    /// The typed `live()` grouped entry: diesel proved the grouped aggregate
+    /// shape, so only the plain-column requirement needed for whole-answer
+    /// rebuilds remains a runtime check.
+    pub(crate) async fn watch_groups_typed<Q, K, V>(
+        &self,
+        query: Q,
+        decode_key: fn(&str) -> Result<K, ClientError>,
+        decode_value: fn(&str) -> Result<V, ClientError>,
+    ) -> Result<LiveGroups<K, V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        K: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
+        self.watch_groups_core(query, decode_key, decode_value, ShapeSource::Marker)
+            .await
+    }
+
+    async fn watch_groups_core<Q, K, V>(
+        &self,
+        query: Q,
+        decode_key: fn(&str) -> Result<K, ClientError>,
+        decode_value: fn(&str) -> Result<V, ClientError>,
+        shape: ShapeSource,
+    ) -> Result<LiveGroups<K, V>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        K: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
+        V: Clone + PartialEq + Send + Sync + 'static,
+    {
+        let (sql, binds) = render_query(&query)?;
+        let parsed = parse_subscription(&sql)?;
+        require_grouped_shape(shape, &parsed)?;
+        let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let sub_id = format!("live-{seq}");
+        let groups_state = Arc::new(RwLock::new(RestedGroups::<K, V>::default()));
+        let (tx, rx) = watch::channel(0_u64);
+
+        let apply_state = Arc::clone(&groups_state);
+        let group_columns = parsed.group_columns.clone();
+        let apply: ApplyComputed = Box::new(move |rows| {
+            let (fresh, as_of) = build_groups_map(rows, &group_columns, decode_key, decode_value)?;
+            let changed = {
+                let mut slot = match apply_state.write() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let changed = slot.map != fresh;
+                slot.map = fresh;
+                // An emptied statistic rests no row to date itself by, so the
+                // last data's as-of stands.
+                if as_of.is_some() {
+                    slot.as_of = as_of;
+                }
+                changed
+            };
+            if changed {
+                tx.send_modify(|generation| *generation += 1);
+            }
+            Ok(())
+        });
+
+        let mut state = self.shared.lock_interrupting().await;
+
+        // Tier dispatch, mirroring the scalar watch: a local tier is complete,
+        // so a grouped query over it is an ordinary row query the replica
+        // answers exactly, and a statistic cannot span the tiers.
+        let local_count = parsed
+            .tables
+            .intersection(state.conn.local_tables())
+            .count();
+        if local_count > 0 {
+            if local_count != parsed.tables.len() {
+                return Err(ClientError::Session(
+                    "mixed-tier aggregate: a statistic cannot span local and synced tables"
+                        .to_owned(),
+                ));
+            }
+            return Err(ClientError::Session(
+                "local grouped query: use watch, a complete local tier answers it as rows"
+                    .to_owned(),
+            ));
+        }
+
+        // Bootstrap from the resting table before subscribing, so a same-run
+        // late joiner and an offline restart both resolve through the rested
+        // rows (R83 decision 3, extended to groups). Set the slot directly,
+        // with no generation bump, so the first changed() still waits for a
+        // real change.
+        let rested = state.conn.rested_groups(&sql, &binds)?;
+        if !rested.is_empty() {
+            let (map, as_of) =
+                build_groups_map(&rested, &parsed.group_columns, decode_key, decode_value)?;
+            match groups_state.write() {
+                Ok(mut slot) => {
+                    slot.map = map;
+                    slot.as_of = as_of;
+                }
+                Err(poisoned) => {
+                    let mut slot = poisoned.into_inner();
+                    slot.map = map;
+                    slot.as_of = as_of;
+                }
+            }
+        }
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        // No grace, as for the scalar watch: the map rests durably in
+        // `_connetto_aggregates` and the handle holds no replica rows.
+        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
+        state.computed.push(ComputedEntry {
+            sub_id: sub_id.clone(),
+            wire_id,
+            apply,
+        });
+
+        Ok(LiveGroups {
+            handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
+            state: groups_state,
+        })
+    }
+
+    /// Watch a row-shaped query the server computes, decoding each answer row
+    /// into `R` with serde (R84).
+    ///
+    /// This is the explicit surface for queries the server serves by
+    /// re-execution rather than by syncing rows (joins, `DISTINCT`,
+    /// expression projections): whether a query is re-executed is the
+    /// server's tiering decision, invisible to the client's type system, so
+    /// this handle is asked for by name and never dispatched to. The whole
+    /// answer replaces [`rows`](LiveRows::rows) on every move, in the order
+    /// the server produced it, and each answer rests in
+    /// `_connetto_aggregates` so an offline restart shows the last synced
+    /// one. `R` decodes from one answer row's JSON object by column name,
+    /// like a diesel row from `#[derive(Deserialize)]`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the query cannot be rendered, is
+    /// aggregate-shaped (use [`watch_value`](Self::watch_value) or
+    /// [`watch_groups`](Self::watch_groups)), reads a local table (a
+    /// complete local tier answers it through [`watch`](Self::watch)), or
+    /// the subscribe frame cannot be sent. A server-side refusal arrives
+    /// later as [`ClientEvent::NonFatal`] on [`events`](Self::events).
+    pub async fn watch_rows<Q, R>(&self, query: Q) -> Result<LiveRows<R>, ClientError>
+    where
+        Q: QueryFragment<Sqlite>,
+        R: DeserializeOwned + Clone + PartialEq + Send + Sync + 'static,
+    {
+        let (sql, binds) = render_query(&query)?;
+        let parsed = parse_subscription(&sql)?;
+        match parsed.shape {
+            QueryShape::Rows => {}
+            QueryShape::Aggregate => {
+                return Err(ClientError::Session(
+                    "scalar aggregate: use watch_value, an answer row cannot carry it".to_owned(),
+                ));
+            }
+            QueryShape::Grouped => {
+                return Err(ClientError::Session(
+                    "grouped statistic: use watch_groups, the keyed map is its shape".to_owned(),
+                ));
+            }
+        }
+        let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let sub_id = format!("live-{seq}");
+        let rows_state = Arc::new(RwLock::new(RestedRows::<R>::default()));
+        let (tx, rx) = watch::channel(0_u64);
+
+        let apply_state = Arc::clone(&rows_state);
+        let apply: ApplyComputed = Box::new(move |rested| {
+            let (fresh, as_of) = decode_rested_rows(rested)?;
+            let changed = {
+                let mut slot = match apply_state.write() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let changed = slot.rows != fresh;
+                slot.rows = fresh;
+                // An emptied answer rests no row to date itself by, so the
+                // last data's as-of stands.
+                if as_of.is_some() {
+                    slot.as_of = as_of;
+                }
+                changed
+            };
+            if changed {
+                tx.send_modify(|generation| *generation += 1);
+            }
+            Ok(())
+        });
+
+        let mut state = self.shared.lock_interrupting().await;
+
+        // Tier dispatch, as for the other computed watches: a complete local
+        // tier answers the query exactly through watch, and a computed answer
+        // cannot span the tiers.
+        let local_count = parsed
+            .tables
+            .intersection(state.conn.local_tables())
+            .count();
+        if local_count > 0 {
+            if local_count != parsed.tables.len() {
+                return Err(ClientError::Session(
+                    "mixed-tier query: a computed answer cannot span local and synced tables"
+                        .to_owned(),
+                ));
+            }
+            return Err(ClientError::Session(
+                "local query: use watch, a complete local tier answers it as rows".to_owned(),
+            ));
+        }
+
+        // Bootstrap from the resting table before subscribing (R83 decision
+        // 3). Set the slot directly, with no generation bump, so the first
+        // changed() still waits for a real change.
+        let rested = state.conn.rested_groups(&sql, &binds)?;
+        if !rested.is_empty() {
+            let (rows, as_of) = decode_rested_rows(&rested)?;
+            match rows_state.write() {
+                Ok(mut slot) => {
+                    slot.rows = rows;
+                    slot.as_of = as_of;
+                }
+                Err(poisoned) => {
+                    let mut slot = poisoned.into_inner();
+                    slot.rows = rows;
+                    slot.as_of = as_of;
+                }
+            }
+        }
+        let spec = SubscriptionSpec::new(sql).with_binds(binds);
+        // No grace, as for the other computed watches: the answer rests
+        // durably and the handle holds no replica rows.
+        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
+        state.computed.push(ComputedEntry {
+            sub_id: sub_id.clone(),
+            wire_id,
+            apply,
+        });
+
+        Ok(LiveRows {
+            handle: LiveHandleCore::new(sub_id, rx, &self.shared.reaper),
+            state: rows_state,
         })
     }
 
@@ -1708,6 +2437,10 @@ where
             let entry = state.values.remove(pos);
             release_wire(&mut state.wire, &entry.wire_id, &mut released);
         }
+        if let Some(pos) = state.computed.iter().position(|e| e.sub_id == sub_id) {
+            let entry = state.computed.remove(pos);
+            release_wire(&mut state.wire, &entry.wire_id, &mut released);
+        }
     }
     // The last handle dropping starts a countdown, it does not end the
     // subscription. Navigating away and back inside the grace re-claims the
@@ -1896,6 +2629,7 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
         conn,
         registry,
         values: _,
+        computed: _,
         wire: _,
     } = state;
     for entry in registry.iter_mut() {
@@ -1911,14 +2645,16 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
     }
 }
 
-/// Push a rested scalar aggregate to its live value handles.
+/// Push a rested aggregate to its live handles.
 ///
 /// The resting write already happened in the connection's frame-application
-/// path, so this only reads the rested scalar row back and fans it out, which
-/// makes the handle mirror the table exactly for both a live push and a
-/// bootstrap. A grouped or row-shaped frame (`group_key: Some`, or a whole
-/// re-executed answer) has no scalar handle to feed and rests no scalar row,
-/// so it is skipped here.
+/// path, so this only reads the rested rows back and fans them out, which
+/// makes each handle mirror the table exactly for both a live push and a
+/// bootstrap. A scalar frame feeds the value handles from the one rested
+/// scalar row. Any frame of a grouped statistic (a keyed delta, a group's
+/// departure, or a whole-answer demotion) feeds the keyed handles from the
+/// full rested group set, so all three shapes take one path and a demotion
+/// never surfaces (R84, decision 4).
 fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
 where
     T: Transport,
@@ -1929,42 +2665,62 @@ where
     else {
         return;
     };
-    if group_key.is_some() {
-        return;
-    }
     let State {
         conn,
         registry: _,
         values,
+        computed,
         wire,
     } = state;
-    if !values.iter().any(|e| e.wire_id == *sub_id) {
-        return;
-    }
     let Some(target) = wire.iter().find(|w| w.wire_id == *sub_id) else {
         return;
     };
-    let rested = match conn.rested_scalar(target.spec.query.as_str(), &target.spec.binds) {
+    if group_key.is_none() && values.iter().any(|e| e.wire_id == *sub_id) {
+        let rested = match conn.rested_scalar(target.spec.query.as_str(), &target.spec.binds) {
+            Ok(rested) => rested,
+            Err(err) => {
+                let _ = shared.events.send(ClientEvent::NonFatal {
+                    related_to: Some(sub_id.clone()),
+                    detail: format!("reading rested aggregate failed: {err}"),
+                });
+                return;
+            }
+        };
+        let (json, as_of) = match rested {
+            Some((json, as_of)) => (Some(json), Some(as_of)),
+            None => (None, None),
+        };
+        // Fan out to every value handle sharing this wire sub, each with its
+        // own decoder and typed value, not just the first.
+        for entry in values.iter_mut().filter(|e| e.wire_id == *sub_id) {
+            if let Err(err) = (entry.apply)(json.as_deref(), as_of) {
+                let _ = shared.events.send(ClientEvent::NonFatal {
+                    related_to: Some(entry.sub_id.clone()),
+                    detail: format!("live value update failed: {err}"),
+                });
+            }
+        }
+    }
+    if !computed.iter().any(|e| e.wire_id == *sub_id) {
+        return;
+    }
+    let rested = match conn.rested_groups(target.spec.query.as_str(), &target.spec.binds) {
         Ok(rested) => rested,
         Err(err) => {
             let _ = shared.events.send(ClientEvent::NonFatal {
                 related_to: Some(sub_id.clone()),
-                detail: format!("reading rested aggregate failed: {err}"),
+                detail: format!("reading rested computed rows failed: {err}"),
             });
             return;
         }
     };
-    let (json, as_of) = match rested {
-        Some((json, as_of)) => (Some(json), Some(as_of)),
-        None => (None, None),
-    };
-    // Fan out to every value handle sharing this wire sub, each with its own
-    // decoder and typed value, not just the first.
-    for entry in values.iter_mut().filter(|e| e.wire_id == *sub_id) {
-        if let Err(err) = (entry.apply)(json.as_deref(), as_of) {
+    // Fan out to every keyed handle sharing this wire sub, each with its own
+    // decoders and typed map.
+    for entry in computed.iter_mut().filter(|e| e.wire_id == *sub_id) {
+        if let Err(err) = (entry.apply)(&rested) {
             let _ = shared.events.send(ClientEvent::NonFatal {
                 related_to: Some(entry.sub_id.clone()),
-                detail: format!("live value update failed: {err}"),
+                detail: format!("live groups update failed: {err}"),
             });
         }
     }
@@ -2068,7 +2824,8 @@ mod tests {
         assert_eq!(parsed.shape, QueryShape::Rows);
     }
 
-    // Shape classification routes aggregates to watch_value and rows to watch.
+    // Shape classification routes scalar aggregates to watch_value, grouped
+    // statistics to watch_groups, and rows to watch.
     #[test]
     fn shape_classifies_aggregates_and_rows() {
         let agg = parse_subscription("SELECT COUNT(*) FROM `orders`").expect("parse");
@@ -2077,12 +2834,46 @@ mod tests {
         assert_eq!(rows.shape, QueryShape::Rows);
         let grouped = parse_subscription("SELECT status, COUNT(*) FROM orders GROUP BY status")
             .expect("parse");
-        assert_eq!(grouped.shape, QueryShape::Rows);
+        assert_eq!(grouped.shape, QueryShape::Grouped);
+        assert_eq!(grouped.group_columns, vec!["status".to_owned()]);
+    }
+
+    // The grouped shape needs its group columns projected and plain: an
+    // expression GROUP BY, a hidden group column, or a second aggregate all
+    // stay row queries, which watch then refuses or serves as such.
+    #[test]
+    fn grouped_shape_requires_projected_plain_columns_and_one_aggregate() {
+        let quoted = parse_subscription(
+            "SELECT `orders`.`status`, count(*) FROM `orders` GROUP BY `orders`.`status`",
+        )
+        .expect("parse");
+        assert_eq!(quoted.shape, QueryShape::Grouped);
+        assert_eq!(quoted.group_columns, vec!["status".to_owned()]);
+        let composite = parse_subscription(
+            "SELECT region, status, COUNT(*) FROM orders GROUP BY region, status",
+        )
+        .expect("parse");
+        assert_eq!(composite.shape, QueryShape::Grouped);
+        assert_eq!(
+            composite.group_columns,
+            vec!["region".to_owned(), "status".to_owned()],
+            "group columns keep GROUP BY order, not projection order"
+        );
+        for hidden in [
+            "SELECT COUNT(*) FROM orders GROUP BY status",
+            "SELECT upper(status), COUNT(*) FROM orders GROUP BY upper(status)",
+            "SELECT status, COUNT(*), SUM(quantity) FROM orders GROUP BY status",
+            "SELECT status, quantity, COUNT(*) FROM orders GROUP BY status",
+        ] {
+            let parsed = parse_subscription(hidden).expect("parse");
+            assert_eq!(parsed.shape, QueryShape::Rows, "not grouped: {hidden}");
+        }
     }
 
     // The public aggregate-shape classifier mirrors subscription_tables: it is
     // the relay's way to route a tab Subscribe to the aggregate path instead of
-    // a row snapshot, matching the client's own routing.
+    // a row snapshot, matching the client's own routing. A grouped statistic
+    // rides the aggregate path too: its frames are aggregate frames.
     #[test]
     fn subscription_is_aggregate_classifies_shape() {
         assert!(subscription_is_aggregate("SELECT COUNT(*) FROM `orders`").expect("parse"));
@@ -2091,10 +2882,80 @@ mod tests {
             !subscription_is_aggregate("SELECT * FROM orders WHERE quantity > 0").expect("parse")
         );
         assert!(
-            !subscription_is_aggregate("SELECT status, COUNT(*) FROM orders GROUP BY status")
+            subscription_is_aggregate("SELECT status, COUNT(*) FROM orders GROUP BY status")
                 .expect("parse")
         );
         assert!(subscription_is_aggregate("NOT SQL AT ALL (").is_err());
+    }
+
+    // The keyed handle's serde key decode: a single group column decodes from
+    // its bare value, several from the array, and a one-element tuple still
+    // decodes from a one-element array.
+    #[test]
+    fn group_key_decodes_bare_and_tuple() {
+        let single: String = decode_group_key("[\"eu\"]").expect("decode");
+        assert_eq!(single, "eu");
+        let number: i64 = decode_group_key("[7]").expect("decode");
+        assert_eq!(number, 7);
+        let tuple: (String, i64) = decode_group_key("[\"eu\",7]").expect("decode");
+        assert_eq!(tuple, ("eu".to_owned(), 7));
+        let one_tuple: (String,) = decode_group_key("[\"eu\"]").expect("decode");
+        assert_eq!(one_tuple, ("eu".to_owned(),));
+    }
+
+    // A whole answer's object splits into the key array (in GROUP BY order,
+    // not object order) and the one remaining aggregate value; an element
+    // missing a group column or holding two extra members names the fault.
+    #[test]
+    fn whole_object_splits_into_key_and_value() {
+        let (key, value) =
+            split_whole_object("{\"count\":3,\"status\":\"open\"}", &["status".to_owned()])
+                .expect("split");
+        assert_eq!(key, "[\"open\"]");
+        assert_eq!(value, "3");
+        let (key, _) = split_whole_object(
+            "{\"region\":\"eu\",\"count\":3,\"status\":\"open\"}",
+            &["status".to_owned(), "region".to_owned()],
+        )
+        .expect("split");
+        assert_eq!(key, "[\"open\",\"eu\"]", "key order follows GROUP BY");
+        assert!(split_whole_object("{\"count\":3}", &["status".to_owned()]).is_err());
+        assert!(
+            split_whole_object(
+                "{\"count\":3,\"sum\":9,\"status\":\"open\"}",
+                &["status".to_owned()],
+            )
+            .is_err()
+        );
+    }
+
+    // The map builder admits both resting shapes at once and keeps the newest
+    // as-of, so a demotion mid-life never surfaces to the handle.
+    #[test]
+    fn groups_map_builds_from_both_resting_shapes() {
+        let rows = vec![
+            crate::aggregates::RestedGroup {
+                group_values_json: Some("[\"open\"]".to_owned()),
+                result_json: "2".to_owned(),
+                updated_at: 10,
+            },
+            crate::aggregates::RestedGroup {
+                group_values_json: None,
+                result_json: "{\"status\":\"done\",\"count\":1}".to_owned(),
+                updated_at: 12,
+            },
+        ];
+        let decode_key: fn(&str) -> Result<String, ClientError> = decode_group_key;
+        let decode_value: fn(&str) -> Result<i64, ClientError> =
+            |json| serde_json::from_str(json).map_err(|e| ClientError::Session(e.to_string()));
+        let (map, as_of) =
+            build_groups_map(&rows, &["status".to_owned()], decode_key, decode_value)
+                .expect("build");
+        assert_eq!(
+            map,
+            HashMap::from([("open".to_owned(), 2), ("done".to_owned(), 1)]),
+        );
+        assert_eq!(as_of, Some(12), "the newest row dates the map");
     }
 
     // A membership term reads a second table inside `IN (SELECT ...)`. Refresh

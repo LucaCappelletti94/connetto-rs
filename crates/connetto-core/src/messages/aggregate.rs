@@ -23,6 +23,12 @@ pub struct AggregateUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "serde_bytes_option")]
     pub group_key: Option<Vec<u8>>,
+    /// The decoded group values as a JSON array in `GROUP BY` order, present
+    /// exactly when `group_key` is. The key bytes stay the stored identity
+    /// (their encoding is a backend detail), while these values are what a
+    /// typed keyed handle exposes as its public map key (R84).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_values_json: Option<String>,
     /// JSON-encoded result, deserialised by the client into its
     /// application-defined result struct. `None` removes the addressed key:
     /// the group (or keyed row) left the result set.
@@ -70,6 +76,7 @@ mod tests {
         let u = AggregateUpdate {
             sub_id: "s1".into(),
             group_key: None,
+            group_values_json: None,
             result_json: Some("{\"count\":10}".into()),
             is_full_result: false,
         };
@@ -83,9 +90,11 @@ mod tests {
         let u = AggregateUpdate {
             sub_id: "s2".into(),
             group_key: Some(b"region=eu".to_vec()),
+            group_values_json: Some("[\"eu\"]".into()),
             result_json: Some("{\"count\":3}".into()),
             is_full_result: false,
         };
         assert_eq!(u.group_key.as_deref(), Some(&b"region=eu"[..]));
+        assert_eq!(u.group_values_json.as_deref(), Some("[\"eu\"]"));
     }
 }

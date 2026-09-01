@@ -138,12 +138,14 @@ fn aggregate_update_round_trip() {
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-count".into(),
         group_key: Some(b"region=eu".to_vec()),
+        group_values_json: Some(r#"["eu"]"#.into()),
         result_json: Some(r#"{"count":42}"#.into()),
         is_full_result: false,
     }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-total".into(),
         group_key: None,
+        group_values_json: None,
         result_json: Some(r#"{"total":9001}"#.into()),
         is_full_result: true,
     }));
@@ -155,6 +157,7 @@ fn aggregate_removal_round_trip() {
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-count".into(),
         group_key: Some(b"region=eu".to_vec()),
+        group_values_json: Some(r#"["eu"]"#.into()),
         result_json: None,
         is_full_result: false,
     }));

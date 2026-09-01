@@ -970,6 +970,7 @@ where
                 AggregateUpdate {
                     sub_id: subscribe.sub_id.clone(),
                     group_key: None,
+                    group_values_json: None,
                     result_json: Some(result_json),
                     is_full_result: true,
                 },
@@ -1721,6 +1722,34 @@ fn rename_to_physical(changeset: &[u8], map: &PolicyTables) -> Result<Vec<u8>, R
     Ok(parsed.into())
 }
 
+/// Demux one worker aggregate push to the tab that owns its multiplexed
+/// subscription, rebuilding the frame under the tab's own id.
+fn forward_aggregate(
+    state: &HubState,
+    sub_id: &str,
+    group_key: Option<Vec<u8>>,
+    group_values_json: Option<String>,
+    result_json: Option<String>,
+    is_full_result: bool,
+) {
+    let Some(route) = state.agg_routes.get(sub_id) else {
+        return;
+    };
+    if let Some(tab) = state.tabs.get(&route.tab) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::AggregateUpdate(
+                AggregateUpdate {
+                    sub_id: route.tab_sub.clone(),
+                    group_key,
+                    group_values_json,
+                    result_json,
+                    is_full_result,
+                },
+            )));
+    }
+}
+
 /// Handle one upstream event from the worker connection.
 fn handle_worker_event<U>(
     worker: &mut ConnettoConnection<U>,
@@ -1786,26 +1815,17 @@ where
             sub_id,
             result_json,
             group_key,
+            group_values_json,
             is_full_result,
         } => {
-            // Demux the worker's aggregate push back to the tab that owns the
-            // multiplexed upstream subscription, rebuilding a faithful
-            // AggregateUpdate under the tab's own sub id.
-            let Some(route) = state.agg_routes.get(&sub_id) else {
-                return Ok(());
-            };
-            if let Some(tab) = state.tabs.get(&route.tab) {
-                let _ = tab
-                    .out
-                    .send(TabOut::Control(ControlMessage::AggregateUpdate(
-                        AggregateUpdate {
-                            sub_id: route.tab_sub.clone(),
-                            group_key,
-                            result_json,
-                            is_full_result,
-                        },
-                    )));
-            }
+            forward_aggregate(
+                state,
+                &sub_id,
+                group_key,
+                group_values_json,
+                result_json,
+                is_full_result,
+            );
             Ok(())
         }
         ClientEvent::FullResync { sub_id, reason } => {
@@ -2623,6 +2643,7 @@ mod tests {
             ControlMessage::AggregateUpdate(AggregateUpdate {
                 sub_id: "wire-0".to_owned(),
                 group_key: None,
+                group_values_json: None,
                 result_json: Some("7".to_owned()),
                 is_full_result: true,
             }),

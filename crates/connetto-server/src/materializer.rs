@@ -377,8 +377,9 @@ pub enum SeedPlan {
     /// the value with [`Materializer::install_scalar`]. Later triggered
     /// re-reads ride the engine's connector under the shared bound.
     Scalar {
-        /// SQL for the initial value, the same statement later triggers run.
-        sql: String,
+        /// Bound query for the initial value, the same statement and binds
+        /// later triggers run.
+        query: subql::reexec::BoundQuery<Postgres>,
         /// Decode hint for the scalar result.
         kind: BuiltinKind,
     },
@@ -410,6 +411,10 @@ pub struct ComputedChange {
     /// The addressed key: a fold group's opaque encoding, a keyed row's
     /// key encoding, or `None` for a single-valued answer.
     pub group_key: Option<Vec<u8>>,
+    /// The decoded group values as a JSON array in `GROUP BY` order, present
+    /// exactly when `group_key` is, so a typed keyed handle never decodes the
+    /// opaque key bytes (R84).
+    pub group_values_json: Option<String>,
     /// The new value as JSON, or `None` when the addressed key left the
     /// result.
     pub result_json: Option<String>,
@@ -606,7 +611,8 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         budget: ReadBudget,
     ) -> Result<SqliteRegistration, MaterializerError> {
         let pg_sql = self.translate_subscription_sql(sqlite_sql)?;
-        let registration = self.register_translated(consumer_id, &pg_sql, binds, None, budget)?;
+        let registration =
+            self.register_translated(consumer_id, &pg_sql, binds, None, budget, None)?;
         Ok(SqliteRegistration {
             registration,
             pg_sql,
@@ -680,6 +686,7 @@ pub type TermValueRows = (Vec<String>, Vec<Vec<PgValue<Postgres>>>);
 /// What a term registration is seeded with: the subscriber it filters for and
 /// the values each compared column currently admits, read from the membership
 /// table as the caller.
+#[derive(Clone)]
 pub struct TermSeed {
     /// The caller, typed at `member_subject`'s kind (see [`typed_subscriber`]).
     pub subscriber: PgValue<Postgres>,
@@ -875,9 +882,27 @@ where
         request: SubscriptionRequest<DefaultIds, Postgres>,
         budget: ReadBudget,
     ) -> Result<Registration, MaterializerError> {
-        let registered = self
-            .engine
-            .register(request, crate::reexec::ConnettoReadSetup::of(budget))?;
+        self.register_request_with(
+            consumer_id,
+            request,
+            crate::reexec::ConnettoReadSetup::of(budget),
+        )
+    }
+
+    /// Register one built request under a supplied read setup, classifying the
+    /// engine's tier into a [`Registration`]. The setup is stored as the
+    /// subscription's auth context and re-presented to the connector on every
+    /// read, which is what carries a per-viewer identity (R85).
+    fn register_request_with<R>(
+        &mut self,
+        consumer_id: u64,
+        request: R,
+        setup: crate::reexec::ConnettoReadSetup,
+    ) -> Result<Registration, MaterializerError>
+    where
+        R: subql::RegistrationRequest<DefaultIds, Postgres>,
+    {
+        let registered = self.engine.register(request, setup)?;
         let subscription_id = registered.subscription_id;
         Ok(match registered.tier {
             Tier::InProcess(served) => match served.aggregate_bootstrap {
@@ -888,11 +913,11 @@ where
                 }),
                 None => Registration::Row(subscription_id),
             },
-            Tier::Scalar { sql, column_kind } => Registration::Computed(ComputedCapture {
+            Tier::Scalar { query, column_kind } => Registration::Computed(ComputedCapture {
                 subscription_id,
                 consumer_id,
                 seed: SeedPlan::Scalar {
-                    sql,
+                    query,
                     kind: column_kind,
                 },
             }),
@@ -929,6 +954,7 @@ where
             subscription_id: update.subscription_id,
             consumer_id: update.consumer_id,
             group_key: None,
+            group_values_json: None,
             result_json: Some(value_to_json(&update.value)),
             is_full_result: true,
             cursor: cursor_bytes(update.checkpoint.as_ref()),
@@ -1009,6 +1035,7 @@ where
                     subscription_id,
                     consumer_id,
                     group_key: None,
+                    group_values_json: None,
                     result_json: Some(value_to_json(&value)),
                     is_full_result: true,
                     cursor: cursor_bytes(checkpoint.as_ref()),
@@ -1032,6 +1059,7 @@ where
                 subscription_id,
                 consumer_id,
                 group_key: None,
+                group_values_json: None,
                 result_json: Some(rows_json(&columns, &rows)),
                 is_full_result: true,
                 cursor: cursor_bytes(checkpoint.as_ref()),
@@ -1053,10 +1081,15 @@ where
         cursor: Vec<u8>,
     ) -> ComputedChange {
         let is_full_result = update.group.is_none();
+        let (group_key, group_values_json) = match update.group {
+            Some(group) => (Some(group.key), Some(values_json(&group.values))),
+            None => (None, None),
+        };
         ComputedChange {
             subscription_id: update.subscription,
             consumer_id: update.consumer,
-            group_key: update.group.map(|group| group.key),
+            group_key,
+            group_values_json,
             result_json: match update.change {
                 AggregateValueChange::Set(AggregateResultValue::Folded(value)) => {
                     Some(agg_value_to_json(value))
@@ -1118,6 +1151,7 @@ where
                 subscription_id: update.subscription_id,
                 consumer_id: update.consumer_id,
                 group_key: None,
+                group_values_json: None,
                 result_json: Some(value_to_json(&update.value)),
                 is_full_result: true,
                 cursor: cursor.clone(),
@@ -1130,8 +1164,10 @@ where
                 consumer_id: delta.consumer_id,
                 // The key's canonical byte encoding, the same one the engine
                 // uses for group keys, so the client's keyed storage treats
-                // both uniformly.
+                // both uniformly. The decoded key travels beside it, keeping
+                // the wire invariant that values accompany every key.
                 group_key: Some(encode_value_key::<Postgres>(&delta.key).unwrap_or_default()),
+                group_values_json: Some(values_json(&delta.key)),
                 result_json: delta.row.map(|row| row_json(&delta.columns, &row)),
                 is_full_result: false,
                 cursor: cursor.clone(),
@@ -1250,6 +1286,7 @@ where
                 subscription_id,
                 consumer_id: pending.consumer_id,
                 group_key: None,
+                group_values_json: None,
                 result_json: Some(rows_json(&pending.columns, &pending.rows)),
                 is_full_result: true,
                 cursor: cursor.to_vec(),
@@ -1726,6 +1763,17 @@ where
     /// without a subscriber is refused, and one registered without values
     /// admits nobody until a membership row changes.
     ///
+    /// An aggregate over a row-level-security table cannot share one fold
+    /// across viewers, which subql refuses at registration. When `viewer`
+    /// carries the caller's own read setup, the refusal is answered by
+    /// re-registering with per-consumer database reads (R85): every read the
+    /// engine runs for the subscription then executes under that viewer's
+    /// identity, so each subscriber gets their own answer over the rows their
+    /// policies grant. A registration with no viewer (an unidentified caller)
+    /// keeps the refusal: there is nobody to read as. The retry is asked for
+    /// by the refusal rather than by probing the catalog, so the shared fold
+    /// fast path stays untouched for every table without row policies.
+    ///
     /// # Errors
     ///
     /// [`MaterializerError::Register`] when `subql` rejects the SELECT, the
@@ -1737,15 +1785,33 @@ where
         binds: &[BindValue],
         seed: Option<TermSeed>,
         budget: ReadBudget,
+        viewer: Option<crate::reexec::ConnettoReadSetup>,
     ) -> Result<Registration, MaterializerError> {
-        let mut request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
-        if let Some(seed) = seed {
-            request = request.subscriber(seed.subscriber);
-            for (columns, rows) in seed.term_values {
-                request = request.term_values(columns, rows);
+        let build = |seed: Option<TermSeed>| {
+            let mut request =
+                SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+            if let Some(seed) = seed {
+                request = request.subscriber(seed.subscriber);
+                for (columns, rows) in seed.term_values {
+                    request = request.term_values(columns, rows);
+                }
             }
+            request
+        };
+        let retry_seed = viewer.as_ref().and_then(|_| seed.clone());
+        match self.register_request(consumer_id, build(seed), budget) {
+            Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
+                ..
+            })) if viewer.is_some() => {
+                let setup = viewer.expect("matched Some above");
+                self.register_request_with(
+                    consumer_id,
+                    build(retry_seed).database_reads_per_consumer(),
+                    setup,
+                )
+            }
+            other => other,
         }
-        self.register_request(consumer_id, request, budget)
     }
 }
 
@@ -1823,6 +1889,11 @@ pub(crate) fn row_json(columns: &[String], row: &[PgValue<Postgres>]) -> String 
 /// A whole row answer as a JSON array of objects.
 pub(crate) fn rows_json(columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
     serde_json::Value::Array(rows.iter().map(|row| row_object(columns, row)).collect()).to_string()
+}
+
+/// Decoded group values as a JSON array string, in `GROUP BY` order (R84).
+fn values_json(values: &[PgValue<Postgres>]) -> String {
+    serde_json::Value::Array(values.iter().map(value_json).collect()).to_string()
 }
 
 /// One scalar as a JSON value, the shared shape behind every delivery.
@@ -2180,6 +2251,7 @@ mod membership_term_tests {
             &[],
             Some(seed),
             ReadBudget::new(core::time::Duration::from_secs(5)),
+            None,
         ) {
             Ok(registration) => registration,
             Err(err) => panic!("the seeded term must register, got {err}"),
@@ -2202,6 +2274,7 @@ mod membership_term_tests {
             &[],
             None,
             ReadBudget::new(core::time::Duration::from_secs(5)),
+            None,
         );
         assert!(
             matches!(refused, Err(MaterializerError::Register(_))),

@@ -43,14 +43,19 @@ use core::future::Future;
 
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::expression::{Expression, ValidGrouping, is_aggregate};
-use diesel::query_builder::{AsQuery, QueryFragment, SelectClauseExpression, SelectStatement};
+use diesel::query_builder::{
+    AsQuery, GroupByClause, NoGroupByClause, QueryFragment, SelectClauseExpression, SelectStatement,
+};
 use diesel::query_dsl::methods::LoadQuery;
 use diesel::sql_types;
 use diesel::sqlite::Sqlite;
 
 use crate::ClientError;
-use crate::live::{ConnettoClient, LiveHandle, LiveQuery, LiveValue};
+use crate::live::{ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveValue};
 
+/// Compile-time dispatch marker for a grouped query, carrying its `GROUP BY`
+/// expression's SQL type.
+pub struct Grouped<G>(core::marker::PhantomData<G>);
 /// The selection expression and aggregation marker of a built select
 /// statement, projected purely at the type level.
 pub trait SelectionMarker {
@@ -60,13 +65,25 @@ pub trait SelectionMarker {
     type Marker;
 }
 
-impl<F, S, D, W, O, LOf, G, H, LC> SelectionMarker for SelectStatement<F, S, D, W, O, LOf, G, H, LC>
+impl<F, S, D, W, O, LOf, H, LC> SelectionMarker
+    for SelectStatement<F, S, D, W, O, LOf, NoGroupByClause, H, LC>
 where
     S: SelectClauseExpression<F>,
     S::Selection: ValidGrouping<()>,
 {
     type Selection = S::Selection;
     type Marker = <S::Selection as ValidGrouping<()>>::IsAggregate;
+}
+
+impl<F, S, D, W, O, LOf, G, H, LC> SelectionMarker
+    for SelectStatement<F, S, D, W, O, LOf, GroupByClause<G>, H, LC>
+where
+    S: SelectClauseExpression<F>,
+    G: Expression,
+    S::Selection: ValidGrouping<G>,
+{
+    type Selection = S::Selection;
+    type Marker = Grouped<G::SqlType>;
 }
 
 /// Wire-lenient decode primitives shared by every [`AggregateWire`] impl.
@@ -266,7 +283,33 @@ pub trait AggregateWire {
     fn decode(json: &str) -> Result<Self::Value, ClientError>;
 }
 
-/// Implement [`AggregateWire`] for a SQL type by delegating to a decode helper.
+/// Decode the `GROUP BY` values that form a keyed handle's public map key.
+trait GroupKeyWire {
+    /// The typed map key.
+    type Key: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static;
+
+    /// Decode the JSON array of group values, in `GROUP BY` order.
+    fn decode_group(json: &str) -> Result<Self::Key, ClientError>;
+}
+
+/// Parse and check one group-values array.
+fn group_values(json: &str, expected: usize) -> Result<Vec<serde_json::Value>, ClientError> {
+    let serde_json::Value::Array(values) = wire::json_value(json)? else {
+        return Err(ClientError::Session(format!(
+            "expected a group-values array, got {json}"
+        )));
+    };
+    if values.len() != expected {
+        return Err(ClientError::Session(format!(
+            "expected {expected} group values, got {}",
+            values.len()
+        )));
+    }
+    Ok(values)
+}
+
+/// Implement [`AggregateWire`] for a SQL type by delegating to one decode
+/// helper.
 macro_rules! aggregate_wire {
     ($sql:ty => $value:ty, $decode:path) => {
         impl AggregateWire for $sql {
@@ -278,6 +321,53 @@ macro_rules! aggregate_wire {
         }
     };
 }
+
+/// Implement single-column [`GroupKeyWire`] only for SQL types with a
+/// canonical backend key and a Rust `Eq + Hash` value. Float, numeric and JSON
+/// keys deliberately get no impl (R84 decision 5).
+macro_rules! group_key_wire {
+    ($sql:ty => $value:ty, $decode:path) => {
+        impl GroupKeyWire for $sql {
+            type Key = $value;
+
+            fn decode_group(json: &str) -> Result<$value, ClientError> {
+                let values = group_values(json, 1)?;
+                $decode(&values[0].to_string())
+            }
+        }
+    };
+}
+
+/// Implement a composite group key, decoding each component through its own
+/// SQL type's wire mapping.
+macro_rules! group_key_tuple {
+    ($len:expr; $($sql:ident : $index:tt),+ $(,)?) => {
+        impl<$($sql),+> GroupKeyWire for ($($sql,)+)
+        where
+            $($sql: AggregateWire,)+
+            $(<$sql as AggregateWire>::Value:
+                Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,)+
+        {
+            type Key = ($(<$sql as AggregateWire>::Value,)+);
+
+            fn decode_group(json: &str) -> Result<Self::Key, ClientError> {
+                let values = group_values(json, $len)?;
+                Ok(($(<$sql as AggregateWire>::decode(
+                    &values[$index].to_string(),
+                )?,)+))
+            }
+        }
+    };
+}
+
+group_key_tuple!(1; A: 0);
+group_key_tuple!(2; A: 0, B: 1);
+group_key_tuple!(3; A: 0, B: 1, C: 2);
+group_key_tuple!(4; A: 0, B: 1, C: 2, D: 3);
+group_key_tuple!(5; A: 0, B: 1, C: 2, D: 3, E: 4);
+group_key_tuple!(6; A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+group_key_tuple!(7; A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+group_key_tuple!(8; A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
 
 aggregate_wire!(sql_types::Bool => bool, decode_bool);
 aggregate_wire!(sql_types::SmallInt => i16, decode_int);
@@ -309,6 +399,28 @@ aggregate_wire!(sql_types::Nullable<sql_types::Timestamp> => Option<String>, dec
 aggregate_wire!(sql_types::Nullable<sql_types::Json> => Option<serde_json::Value>, decode_nullable_json);
 aggregate_wire!(sql_types::Nullable<sql_types::Jsonb> => Option<serde_json::Value>, decode_nullable_json);
 
+group_key_wire!(sql_types::Bool => bool, decode_bool);
+group_key_wire!(sql_types::SmallInt => i16, decode_int);
+group_key_wire!(sql_types::Integer => i32, decode_int);
+group_key_wire!(sql_types::BigInt => i64, decode_int);
+group_key_wire!(sql_types::Text => String, decode_string);
+group_key_wire!(sql_types::Binary => String, decode_string);
+group_key_wire!(sql_types::Date => String, decode_string);
+group_key_wire!(sql_types::Time => String, decode_string);
+group_key_wire!(sql_types::Timestamp => String, decode_string);
+group_key_wire!(sql_types::Nullable<sql_types::Bool> => Option<bool>, decode_nullable_bool);
+group_key_wire!(sql_types::Nullable<sql_types::SmallInt> => Option<i16>, decode_nullable_int);
+group_key_wire!(sql_types::Nullable<sql_types::Integer> => Option<i32>, decode_nullable_int);
+group_key_wire!(sql_types::Nullable<sql_types::BigInt> => Option<i64>, decode_nullable_int);
+group_key_wire!(sql_types::Nullable<sql_types::Text> => Option<String>, decode_nullable_string);
+group_key_wire!(sql_types::Nullable<sql_types::Binary> => Option<String>, decode_nullable_string);
+group_key_wire!(sql_types::Nullable<sql_types::Date> => Option<String>, decode_nullable_string);
+group_key_wire!(sql_types::Nullable<sql_types::Time> => Option<String>, decode_nullable_string);
+group_key_wire!(
+    sql_types::Nullable<sql_types::Timestamp> => Option<String>,
+    decode_nullable_string
+);
+
 // Postgres-only SQL types. Their diesel markers live behind diesel's
 // postgres_backend, and the orphan rule forbids a downstream crate from
 // mapping them, so this crate maps them behind an opt-in feature that keeps
@@ -322,6 +434,83 @@ aggregate_wire!(sql_types::Timestamptz => String, decode_string);
 aggregate_wire!(sql_types::Nullable<sql_types::Uuid> => Option<String>, decode_nullable_string);
 #[cfg(feature = "postgres-types")]
 aggregate_wire!(sql_types::Nullable<sql_types::Timestamptz> => Option<String>, decode_nullable_string);
+#[cfg(feature = "postgres-types")]
+group_key_wire!(sql_types::Uuid => String, decode_string);
+#[cfg(feature = "postgres-types")]
+group_key_wire!(sql_types::Timestamptz => String, decode_string);
+#[cfg(feature = "postgres-types")]
+group_key_wire!(sql_types::Nullable<sql_types::Uuid> => Option<String>, decode_nullable_string);
+#[cfg(feature = "postgres-types")]
+group_key_wire!(
+    sql_types::Nullable<sql_types::Timestamptz> => Option<String>,
+    decode_nullable_string
+);
+
+/// Decode the key and value of one grouped selection from their independent
+/// wire fields. `G` is the `GROUP BY` expression's SQL type and `Self` the
+/// whole projection's SQL type.
+trait GroupedProjectionWire<G> {
+    /// The typed map key.
+    type Key: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static;
+    /// The typed aggregate value.
+    type Value: Clone + PartialEq + Send + Sync + 'static;
+
+    /// Decode the group-values JSON array.
+    fn decode_key(json: &str) -> Result<Self::Key, ClientError>;
+    /// Decode one aggregate value.
+    fn decode_value(json: &str) -> Result<Self::Value, ClientError>;
+}
+
+/// A scalar or nested-tuple group projected beside one aggregate.
+impl<G, A> GroupedProjectionWire<G> for (G, A)
+where
+    G: GroupKeyWire,
+    A: AggregateWire,
+{
+    type Key = G::Key;
+    type Value = A::Value;
+
+    fn decode_key(json: &str) -> Result<Self::Key, ClientError> {
+        G::decode_group(json)
+    }
+
+    fn decode_value(json: &str) -> Result<Self::Value, ClientError> {
+        A::decode(json)
+    }
+}
+
+/// Implement the flat diesel tuple shape: group columns followed by one
+/// aggregate, against the tuple SQL type of the `GROUP BY` expression.
+macro_rules! grouped_projection_tuple {
+    ($($group:ident),+ ; $aggregate:ident) => {
+        impl<$($group,)+ $aggregate> GroupedProjectionWire<($($group,)+)>
+            for ($($group,)+ $aggregate)
+        where
+            ($($group,)+): GroupKeyWire,
+            $aggregate: AggregateWire,
+        {
+            type Key = <($($group,)+) as GroupKeyWire>::Key;
+            type Value = <$aggregate as AggregateWire>::Value;
+
+            fn decode_key(json: &str) -> Result<Self::Key, ClientError> {
+                <($($group,)+) as GroupKeyWire>::decode_group(json)
+            }
+
+            fn decode_value(json: &str) -> Result<Self::Value, ClientError> {
+                <$aggregate as AggregateWire>::decode(json)
+            }
+        }
+    };
+}
+
+grouped_projection_tuple!(A; V);
+grouped_projection_tuple!(A, B; V);
+grouped_projection_tuple!(A, B, C; V);
+grouped_projection_tuple!(A, B, C, D; V);
+grouped_projection_tuple!(A, B, C, D, E; V);
+grouped_projection_tuple!(A, B, C, D, E, F; V);
+grouped_projection_tuple!(A, B, C, D, E, F, G; V);
+grouped_projection_tuple!(A, B, C, D, E, F, G, H; V);
 
 /// Dispatch machinery behind [`Watchable`], keyed on the aggregation marker
 /// `M` as a type parameter so the row and scalar impls stay coherent. `R` is
@@ -383,6 +572,39 @@ where
         client.watch_value_typed(
             self,
             <<<Q::Query as SelectionMarker>::Selection as Expression>::SqlType as AggregateWire>::decode,
+        )
+    }
+}
+
+impl<T, Q, G, K, V> WatchDispatch<T, Grouped<G>, (K, V)> for Q
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+    Q: AsQuery + QueryFragment<Sqlite> + Send + 'static,
+    Q::Query: SelectionMarker,
+    <Q::Query as SelectionMarker>::Selection: Expression,
+    <<Q::Query as SelectionMarker>::Selection as Expression>::SqlType:
+        GroupedProjectionWire<G, Key = K, Value = V>,
+    K: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
+    V: Clone + PartialEq + Send + Sync + 'static,
+{
+    type Handle = LiveGroups<K, V>;
+
+    fn dispatch<'a>(
+        self,
+        client: &'a ConnettoClient<T>,
+    ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend + 'a
+    where
+        Self: 'a,
+    {
+        client.watch_groups_typed(
+            self,
+            <<<Q::Query as SelectionMarker>::Selection as Expression>::SqlType as GroupedProjectionWire<
+                G,
+            >>::decode_key,
+            <<<Q::Query as SelectionMarker>::Selection as Expression>::SqlType as GroupedProjectionWire<
+                G,
+            >>::decode_value,
         )
     }
 }

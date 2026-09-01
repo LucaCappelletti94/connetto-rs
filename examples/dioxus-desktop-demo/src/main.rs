@@ -585,6 +585,12 @@ fn app() -> Element {
         orders::table.order((orders::created_at.asc(), orders::id.asc())),
     );
     let count = use_live(&client, orders::table.count());
+    let counts_by_quantity = use_live(
+        &client,
+        orders::table
+            .group_by(orders::quantity)
+            .select((orders::quantity, diesel::dsl::count_star())),
+    );
 
     // Features 3 and 5: status line updated by client events. The receiver is
     // obtained before the hook so `client` is not moved into it.
@@ -676,6 +682,23 @@ fn app() -> Element {
         .map_or_else(|| "pending".to_owned(), |v| v.to_string());
     let rows_error = rows.error().read().clone();
     let count_error = count.error().read().clone();
+    let mut grouped_counts: Vec<(i64, i64)> = counts_by_quantity
+        .value()
+        .read()
+        .iter()
+        .map(|(quantity, count)| (*quantity, *count))
+        .collect();
+    grouped_counts.sort_unstable();
+    let grouped_text = if grouped_counts.is_empty() {
+        "pending".to_owned()
+    } else {
+        grouped_counts
+            .iter()
+            .map(|(quantity, count)| format!("{quantity}: {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let grouped_error = counts_by_quantity.error().read().clone();
 
     let (pages, free) = *footprint.read();
     let kb = pages * 4;
@@ -954,6 +977,10 @@ fn app() -> Element {
                 "COUNT(*) pushed by the server: "
                 strong { {count_text} }
             }
+            p {
+                "COUNT(*) grouped by quantity: "
+                strong { {grouped_text} }
+            }
             div {
                 style: "display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;",
                 button {
@@ -993,6 +1020,9 @@ fn app() -> Element {
             }
             if let Some(err) = count_error {
                 p { style: "color: #b00;", "count subscription error: {err}" }
+            }
+            if let Some(err) = grouped_error {
+                p { style: "color: #b00;", "grouped subscription error: {err}" }
             }
             h2 { "local replica (live query)" }
             p {

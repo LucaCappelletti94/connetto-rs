@@ -27,7 +27,8 @@ use crate::subscriptions::{encode_binds, query_text};
 /// whose `group_key` is the empty blob.
 pub(crate) const AGGREGATE_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_aggregates \
     (query_id INTEGER NOT NULL REFERENCES _connetto_query(id), \
-    binds BLOB NOT NULL, group_key BLOB NOT NULL, result_json TEXT NOT NULL, \
+    binds BLOB NOT NULL, group_key BLOB NOT NULL, group_values_json TEXT, \
+    result_json TEXT NOT NULL, \
     updated_at INTEGER NOT NULL, PRIMARY KEY (query_id, binds, group_key))";
 
 diesel::table! {
@@ -40,6 +41,10 @@ diesel::table! {
         binds -> Binary,
         /// The wire's opaque group key, or the empty blob for a scalar.
         group_key -> Binary,
+        /// The decoded group values the wire carried beside the key, as a
+        /// JSON array in `GROUP BY` order. `NULL` for the scalar row and for
+        /// the positional rows of a whole answer (R84).
+        group_values_json -> Nullable<Text>,
         /// The JSON the server pushed, decoded by the handle into its type.
         result_json -> Text,
         /// When this row was last written, in seconds since the epoch on the
@@ -68,6 +73,19 @@ fn query_id_of(conn: &mut SqliteConnection, query: &str) -> QueryResult<Option<i
         .optional()
 }
 
+/// One server aggregate frame as the resting table consumes it, borrowed
+/// from the wire message.
+pub(crate) struct AggregateFrame<'a> {
+    /// The addressed group's opaque key, `None` for a scalar or whole answer.
+    pub group_key: Option<&'a [u8]>,
+    /// The decoded group values beside the key, present exactly when it is.
+    pub group_values_json: Option<&'a str>,
+    /// The body, or `None` for a removal.
+    pub result_json: Option<&'a str>,
+    /// Whether the body replaces the whole result.
+    pub is_full_result: bool,
+}
+
 /// Apply one server aggregate frame to the resting table, under the query
 /// identity `query_id` and `binds` the caller resolved from the frame's
 /// subscription.
@@ -83,20 +101,31 @@ pub(crate) fn apply_frame(
     conn: &mut SqliteConnection,
     query_id: i32,
     binds: &[BindValue],
-    group_key: Option<&[u8]>,
-    result_json: Option<&str>,
-    is_full_result: bool,
+    frame: &AggregateFrame<'_>,
     now: i64,
 ) -> Result<(), ClientError> {
     let binds_blob = encode_binds(binds);
-    match result_json {
-        None => remove(conn, query_id, &binds_blob, group_key.unwrap_or(SCALAR_KEY)),
-        Some(json) => match group_key {
-            Some(key) => upsert(conn, query_id, &binds_blob, key, json, now),
-            None if is_full_result && is_json_array(json) => {
+    match frame.result_json {
+        None => remove(
+            conn,
+            query_id,
+            &binds_blob,
+            frame.group_key.unwrap_or(SCALAR_KEY),
+        ),
+        Some(json) => match frame.group_key {
+            Some(key) => upsert(
+                conn,
+                query_id,
+                &binds_blob,
+                key,
+                frame.group_values_json,
+                json,
+                now,
+            ),
+            None if frame.is_full_result && is_json_array(json) => {
                 replace_whole(conn, query_id, &binds_blob, json, now)
             }
-            None => upsert(conn, query_id, &binds_blob, SCALAR_KEY, json, now),
+            None => upsert(conn, query_id, &binds_blob, SCALAR_KEY, None, json, now),
         },
     }
 }
@@ -113,6 +142,7 @@ fn upsert(
     query_id: i32,
     binds_blob: &[u8],
     group_key: &[u8],
+    group_values_json: Option<&str>,
     result_json: &str,
     now: i64,
 ) -> Result<(), ClientError> {
@@ -121,12 +151,14 @@ fn upsert(
             aggregate::query_id.eq(query_id),
             aggregate::binds.eq(binds_blob),
             aggregate::group_key.eq(group_key),
+            aggregate::group_values_json.eq(group_values_json),
             aggregate::result_json.eq(result_json),
             aggregate::updated_at.eq(now),
         ))
         .on_conflict((aggregate::query_id, aggregate::binds, aggregate::group_key))
         .do_update()
         .set((
+            aggregate::group_values_json.eq(group_values_json),
             aggregate::result_json.eq(result_json),
             aggregate::updated_at.eq(now),
         ))
@@ -174,6 +206,7 @@ fn replace_whole(
                 query_id,
                 binds_blob,
                 SCALAR_KEY,
+                None,
                 &other.to_string(),
                 now,
             );
@@ -230,6 +263,61 @@ pub(crate) fn lookup_scalar(
         .select((aggregate::result_json, aggregate::updated_at))
         .first(conn)
         .optional()?)
+}
+
+/// One rested group row of a statistic: the decoded group values the wire
+/// carried beside its key (`None` for the positional rows a whole answer
+/// rests as), the value body, and its as-of time. The opaque stored key stays
+/// in the table as identity and ordering; a handle keys on decoded values,
+/// so it never travels up.
+pub(crate) struct RestedGroup {
+    /// The decoded group values as a JSON array, `None` for positional rows.
+    pub group_values_json: Option<String>,
+    /// The JSON body: a bare value for a keyed delta row, a whole object for
+    /// a positional row.
+    pub result_json: String,
+    /// When the row was last written, seconds since the epoch, local clock.
+    pub updated_at: i64,
+}
+
+/// Every rested group row of the statistic for `query` under `binds`, the
+/// scalar row excluded, ordered by stored key so positional rows come back in
+/// answer order. A keyed or row-shaped handle bootstraps from this on an
+/// offline restart and a late join, whichever resting shape it finds (a keyed
+/// delta set or a whole answer's positional rows), so a server-side demotion
+/// stays invisible across a restart (R84).
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica cannot be read.
+pub(crate) fn lookup_groups(
+    conn: &mut SqliteConnection,
+    query: &str,
+    binds: &[BindValue],
+) -> Result<Vec<RestedGroup>, ClientError> {
+    let Some(query_id) = query_id_of(conn, query)? else {
+        return Ok(Vec::new());
+    };
+    let binds_blob = encode_binds(binds);
+    let rows: Vec<(Option<String>, String, i64)> = aggregate::table
+        .filter(aggregate::query_id.eq(query_id))
+        .filter(aggregate::binds.eq(&binds_blob))
+        .filter(aggregate::group_key.ne(SCALAR_KEY))
+        .order(aggregate::group_key)
+        .select((
+            aggregate::group_values_json,
+            aggregate::result_json,
+            aggregate::updated_at,
+        ))
+        .load(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|(group_values_json, result_json, updated_at)| RestedGroup {
+            group_values_json,
+            result_json,
+            updated_at,
+        })
+        .collect())
 }
 
 /// Evict rested statistics down to `cap`, oldest updated first, never one that

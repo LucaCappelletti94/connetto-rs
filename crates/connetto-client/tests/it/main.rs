@@ -17,6 +17,8 @@ mod encrypted_replica;
 
 mod full_resync;
 
+mod grouped_live;
+
 mod hardening;
 
 mod key_requirement;

@@ -9,8 +9,8 @@
 //! clause into `Box<dyn QueryFragment>`, so boxed queries cannot participate
 //! and stay on the explicit `watch` and `watch_value` methods.
 
-use connetto_client::dsl::{SelectionMarker, Watchable};
-use connetto_client::{LiveQuery, LiveValue};
+use connetto_client::dsl::{Grouped, SelectionMarker, Watchable};
+use connetto_client::{LiveGroups, LiveQuery, LiveValue};
 use connetto_core::transport::LoopbackTransport;
 use diesel::dsl;
 use diesel::expression::is_aggregate;
@@ -44,6 +44,9 @@ impl MarkerName for is_aggregate::No {
 }
 impl MarkerName for is_aggregate::Never {
     const NAME: &'static str = "never";
+}
+impl<G> MarkerName for Grouped<G> {
+    const NAME: &'static str = "grouped";
 }
 
 fn marker_of<Q>(_query: &Q) -> &'static str
@@ -84,6 +87,14 @@ fn aggregation_marker_is_reachable_from_built_queries() {
         ),
         "yes",
     );
+    assert_eq!(
+        marker_of(
+            &orders::table
+                .group_by(orders::status)
+                .select((orders::status, dsl::count_star())),
+        ),
+        "grouped",
+    );
 }
 
 #[test]
@@ -110,5 +121,18 @@ fn live_dispatch_resolves_handle_and_value_types() {
     );
     resolves::<_, Option<String>, LiveValue<Option<String>>>(
         &orders::table.select(dsl::min(orders::status)),
+    );
+
+    // A grouped projection resolves to a keyed map. One group column is the
+    // scalar key; several form a tuple in GROUP BY order.
+    resolves::<_, (String, i64), LiveGroups<String, i64>>(
+        &orders::table
+            .group_by(orders::status)
+            .select((orders::status, dsl::count_star())),
+    );
+    resolves::<_, ((String, i64), i64), LiveGroups<(String, i64), i64>>(
+        &orders::table
+            .group_by((orders::status, orders::quantity))
+            .select((orders::status, orders::quantity, dsl::count_star())),
     );
 }

@@ -528,7 +528,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.12"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
+source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -561,7 +561,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
+source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -571,7 +571,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
+source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
+source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
 dependencies = [
  "syn 3.0.3",
 ]
@@ -608,7 +608,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
+source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
 dependencies = [
  "darling",
  "either",
@@ -1831,7 +1831,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?rev=2c632f0d7b47bbc5fd12ccdc494fc79dc23b0699#2c632f0d7b47bbc5fd12ccdc494fc79dc23b0699"
+source = "git+https://github.com/LucaCappelletti94/subql?rev=c6f75f664d474dfed1a64bf2f0a8c42db9e05923#c6f75f664d474dfed1a64bf2f0a8c42db9e05923"
 dependencies = [
  "arc-swap",
  "async-lock",
