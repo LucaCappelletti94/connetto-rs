@@ -1,6 +1,6 @@
 # Master implementation plan: identity, session, capability, and the change path
 
-This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Both halves are built: the identity phases and the whole change path (R5b, R6, R7, R9, R27, R48, R49, R50) are done, as are export, multi-account, retention, the browser unlock gate and CI. What remains committed is the pair running next in parallel (R56 import and R58 read ceiling with paging), the platform gates (R51, R52, and R53 blocked on hardware), the follow-ups (R57, R60, R63), the six file-handling phases R24's design derived (R64 to R69), and the parked R11, R21, R31 and R61. (This paragraph was frozen at the 2026-08-06 state until 2026-08-21.)
+This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Both halves are built: the identity phases and whole change path (R5b, R6, R7, R9, R27, R48, R49, R50) are done, as are export and import, multi-account, retention, browser unlock, CI, and the aggregate programme R81 to R86 (folded groups, re-executed rows, durable client rest, typed handles, and per-viewer RLS reads). Immediate remaining work is R60 steps 4 to 6. The committed platform gates (R51 to R53), demo gaps R57, file programme R64 to R69, peer programme R74 to R80, and parked R11, R21, R31, R61, R70 to R73 remain as the canonical status table below records. (This paragraph was frozen at the 2026-08-06 state until 2026-08-21, then refreshed through 2026-09-01.)
 
 ## How to read this
 
@@ -152,8 +152,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R80 | Peer sync in every demo, plus the iOS hotspot field test. Needs R77, R78 and R79 |
 | done | ~~R82~~ **DONE** | Server delivery of grouped and re-executed results, landed 2026-08-26 by the subql adoption (U0 to U12 plus the facade fix, pin `3d75cca`) and proven end to end by `grouped_wire.rs`. Derived from R30 on 2026-08-22 |
 | done | ~~R83~~ **DONE** | The client resting table for server-computed results, scalars included, landed 2026-08-26. Every server push rests in `_connetto_aggregates` keyed by query identity on the connection's frame path, so the native client and the browser worker both rest for free, and a restarted client (native, proven by `a_restart_reads_the_last_synced_value_from_the_resting_table`, and browser, by `a_tab_aggregate_watch_is_answered_from_rest_while_offline`) shows the last synced value offline. Derived from R30 |
-| any | R84 | Typed keyed and row-shaped live handles. Everything upstream is delivered and adopted (U13, canonical group keys), the pin move is green in the working tree, so this is buildable now. Derived from R30 |
-| any | R85 | Per-viewer RLS re-execution. U6 (`database_reads_per_consumer`) delivered and adopted, buildable now. Derived from R30 |
+| done | ~~R84~~ **DONE** | Typed keyed and row-shaped live handles, landed 2026-09-01. `LiveGroups<K, V>` serves grouped folds and demotions with offline rest, `LiveRows<R>` serves whole-reexecuted row answers with offline rest, and grouped `query.live(&client)` dispatches at compile time through diesel's public group clause types. Proven by all three `grouped_live.rs` tests and exercised through generic `use_live` in the Dioxus desktop demo (`COUNT(*) GROUP BY quantity`). subql `c6f75f6` preserves registration binds in every re-read; diesel `caf515e` exposes the grouping types. Derived from R30 |
+| done | ~~R85~~ **DONE** | Per-viewer RLS re-execution, landed 2026-09-01. An aggregate subql refuses on an RLS table re-registers with `database_reads_per_consumer()` under the viewer's own `set_config` binding, appended to the budgeted read setup, so each subscriber's reads answer as that viewer through the non-superuser reader role; an unidentified caller keeps the refusal and non-RLS folds keep the shared fast path. Proven by `rls_computed.rs` (two viewers, own counts, one viewer's change moves only their number, refusal preserved). Derived from R30 |
 | done | ~~R24~~ **DONE** | Concluded 2026-08-21 as a design: ten positions recorded in its section, `FileStore`'s deletion justified, and R64 to R69 derived as committed work |
 | done | ~~R25~~ **DONE** | Concluded 2026-08-22 as a design: every area decided, reviewed in full and amended in place, `docs/research-device-to-device-sync.md` and chapter 19 carry it, and the maintainer ordered the derivation its own rule reserved, yielding R74 to R80 |
 | done | ~~R30~~ **DONE** | Concluded 2026-08-22 as a design: the tier model (fold, hybrid, re-execution catch-all) recorded in its section with six decisions, Q5.7's status split updated, one upstream defect written (`upstream/subql-group-by-having-silently-dropped.md`), and the maintainer ordered the derivation the same day, yielding R82 to R85 and the upstream request `docs/upstream-subql-grouped-and-reexecution-tiers.md` |
@@ -252,8 +252,8 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | no longer: the GROUP BY/HAVING refusal defect is resolved upstream and adopted (2026-08-25) |
 | R82 grouped and re-executed delivery | **DONE** (2026-08-26) | nothing | no longer: everything it needed is upstream and adopted (subql `3d75cca`) |
 | R83 client resting table | **DONE** (2026-08-26) | nothing | no: it needed nothing and the design's eight decisions were built as recorded, with decision 1 amending R30's decision 6 (the resting key is query identity, not `sub_id`) |
-| R84 keyed and row-shaped handles | NOT STARTED | nothing. The pin move (subql `2c632f0`, rls2fga `bbe4f57a`, pg2sqlite `66fa4c0`, sqlite-diff-rs 0.10) is green across the whole gate in the working tree, uncommitted | delivered and verified: U13 at `d732331`, canonical group keys at `2c632f0`, the blocking rls2fga finding fixed and adopted 2026-08-31 |
-| R85 per-viewer RLS re-execution | NOT STARTED | nothing, same green pin move | delivered and verified: U6 at `d732331` (`database_reads_per_consumer`) |
+| R84 keyed and row-shaped handles | **DONE** (2026-09-01) | nothing | no longer: subql bind fix `c6f75f6` and diesel grouping export `caf515e` are merged, adopted, and proven |
+| R85 per-viewer RLS re-execution | **DONE** (2026-09-01) | nothing | no longer: U6 at `d732331` delivered, adopted, and proven by `rls_computed.rs` |
 | R73 failover verification (X7, reframed) | NOT STARTED, exploratory | nothing | no |
 
 ## Dependency graph
@@ -344,9 +344,9 @@ graph TD
   R58 -.->|the bound it extends| R81[R81 aggregate read time bound]
   R30 --> R82[R82 grouped and re-executed delivery]
   R30 --> R83[R83 client resting table]
-  R82 --> R84[R84 keyed and row-shaped handles]
+  R82 --> R84[R84 keyed and row-shaped handles, DONE]
   R83 --> R84
-  R82 --> R85[R85 per-viewer RLS re-execution]
+  R82 --> R85[R85 per-viewer RLS re-execution, DONE]
   R81 -.->|bounds every tier read| R82
   R25 --> R74[R74 device identity and certificates]
   R74 --> R75[R75 per-device applied frontier]
@@ -5022,9 +5022,9 @@ A client restarted offline shows the last synced scalar value instead of `None`,
 
 ## R84: typed keyed and row-shaped live handles
 
-**Status.** NOT STARTED. Derived 2026-08-22 from R30.
+**Status.** **DONE (2026-09-01).** Started the same day on the maintainer's instruction. Derived 2026-08-22 from R30. All three steps landed, every proof is green, and the Dioxus desktop demo exercises the grouped typed hook.
 
-**Blocked on the subql pin move.** R82 and R83 are done. U13 and the canonical group keys (`docs/upstream-subql-canonical-group-keys.md`) are delivered and verified at upstream `HEAD` `2c632f0` (2026-08-30): registration selects a `Backend::group_key_encoder`, every grouped update carries `GroupIdentity { key, values }`, and the database-backed equivalence tests pass on this machine. Two shapes stay refused upstream by design: Postgres `numeric` group columns (Diesel #5168) and MySQL float group columns (measured signed-zero grouping quirk). Adoption note for the pin move: subql derives collation facts from the parsed DDL itself (`catalog_helpers::group_key_column`, no `COLLATE` clause maps to `DatabaseDefault`, which Postgres accepts), so connetto needs no catalog change unless its schema declares a collation whose facts `sql-traits` cannot determine, which then refuses as `GroupKeyCollation::Unknown`.
+**Blocked on nothing.** The adopted pins now include the two upstream repairs found during the build: subql `c6f75f664d474dfed1a64bf2f0a8c42db9e05923` preserves registration binds across every re-execution read (PR #49), and diesel `caf515ee06de34f2fc59579355aecb17907e3521` exposes `GroupByClause` and `NoGroupByClause` under its third-party-backend opt-in (upstream PR #5180, merged as `37367a0`). U13 and canonical group keys remain the basis of the keyed path. Two group-key shapes stay refused by design: float or numeric keys (not Rust `Eq + Hash`, with the upstream canonical restrictions already recorded) and JSON-like keys (no typed hash key).
 
 ### Purpose
 
@@ -5038,23 +5038,33 @@ A client restarted offline shows the last synced scalar value instead of `None`,
 4. If a folded grouped subscription demotes to whole answers, the keyed handle rebuilds its map from the whole answer and does not expose the transition as a separate client state.
 5. Grouped aggregate queries keep one keyed API. Decimal, floating point, and JSON-like group columns wait for upstream canonical keys rather than taking a row-shaped fallback.
 
+### Mechanism, grounded 2026-09-01 before code
+
+The five decisions above left the transport and the typed contract to the build, and the tree settles both.
+
+- **The wire must carry the decoded group values, so it grows a field.** `AggregateUpdate` (`crates/connetto-core/src/messages/aggregate.rs`) carries only the opaque `group_key` bytes: `Materializer::aggregate_change` throws `GroupIdentity::values` away today. Decision 1 keys the public map from those values, and an offline restart needs them too, so they travel as `group_values_json` (a JSON array in `GROUP BY` order, rendered by the same `value_json` every delivery already uses) next to `group_key`, ride `ClientEvent::Aggregate`, and rest in a new `_connetto_aggregates.group_values_json` column. Rejected: decoding the opaque key bytes client-side, which decision 1 already refused (the canonical encoding is a backend detail), and re-reading values from the replica, which holds no grouped rows at all.
+- **The typed grouped contract projects its group columns.** The demotion proof (`a_demoted_subscription_answers_whole_and_logs_the_transition`) shows a whole answer is the query's own projection re-read as JSON objects keyed by column name, nothing more. A grouped query that projects only its aggregate would demote into rows carrying no group identity, and decision 4's rebuild would be impossible. So the typed path accepts a selection of the group columns followed by exactly one aggregate expression, matching the `group_by` clause, and `K` and `V` derive from those types (`K` through the existing `AggregateWire` value mapping per column, `V` through the aggregate's own). A delta decodes `K` from `group_values_json` and `V` from the scalar body. A whole answer decodes each object by name: the group columns form `K`, the one remaining column is `V`.
+- **The keyed API serves the fold shape, one aggregate per group.** A fold delta carries exactly one `AggregateResultValue`, so a keyed delta can never deliver two statistics. A grouped query projecting several aggregates rides whole answers only and belongs to the row-shaped handle, whose element type names every column. This is decision 5's "one keyed API" made precise, not a narrowing: the fold tier itself has no wider shape.
+- **The row-shaped handle is explicit, not dispatched.** Whether a join or DISTINCT query is served by re-execution is the server's tiering decision, invisible to the client's type system, so `live()` keeps resolving row projections to `LiveQuery` and the row-shaped handle is asked for by name (a `watch_rows` on the client), full replacement only, decoding the whole answer's objects into the application's `serde` type.
+- **Offline rebuild reads the rested rows back in both shapes.** A keyed statistic rests one row per group (scalar body plus the new values column), a demoted one rests positional rows holding whole objects, and the handle's bootstrap decodes whichever shape it finds, so the demotion stays invisible across a restart too (decision 4).
+
 ### Steps
 
-1. A keyed handle for grouped results: decoded per-group values form the public map key, the opaque `group_key` remains the stored identity, deltas upsert one entry, full results rebuild the map, and startup reads through the R83 table.
-2. A row-shaped handle for re-executed results (joins, DISTINCT, expression projections), decoding `result_json` rows into the application's type, full-replacement semantics only.
-3. Extend `query.live(&client)` dispatch and the `use_live` hooks so a grouped query resolves to the keyed handle at compile time where diesel's markers allow, with the SQL-text path as the fallback for shapes diesel cannot mark.
+1. ~~A keyed handle for grouped results~~ **DONE (2026-09-01).** `LiveGroups<K, V>` in `crates/connetto-client/src/live.rs`, registered by `watch_groups` (serde decode) and `watch_groups_with` (caller decoders), mirroring the `watch_value` family. The wire, `ClientEvent::Aggregate`, and the resting table all carry the new `group_values_json` beside the opaque key, the server renders it from `GroupIdentity::values` in `Materializer::aggregate_change` (keyed row deltas carry their decoded key the same way), and the relay forwards it. Every grouped frame makes the pump re-read the statistic's rested rows and rebuild each sharing handle's map, so keyed deltas, removals, and whole-answer demotions take one path (decision 4), and the offline bootstrap is that same read. The classifier grew a third shape: `QueryShape::Grouped` requires a plain-column `GROUP BY` projected in full beside exactly one aggregate, `subscription_is_aggregate` now routes it to the relay's aggregate path, and `coverage_of` treats it like the scalar shape (no replica rows). Two build decisions recorded here: a grouped query over complete local tables stays an ordinary `watch` row query (the local tier answers it exactly, so `watch_groups` refuses local and mixed rather than duplicating that answer), and a synced grouped query through `watch` is now refused toward `watch_groups` (before this it silently subscribed rows and showed nothing). Proof: `crates/connetto-client/tests/it/grouped_live.rs` (`a_grouped_watch_maintains_one_entry_per_group` for seed, delta, group birth and departure; `a_restart_reads_the_last_synced_map_from_the_resting_table` for the offline restart), plus six classifier and decode unit tests in `live.rs`. Client 222/222, server and core 303/303 at testfast.
+2. ~~A row-shaped handle for re-executed results~~ **DONE (2026-09-01).** `LiveRows<R>` and explicit `watch_rows` decode each whole-answer JSON object into the application's serde type, replace the vector in server order, carry `as_of_secs`, use the shared `ComputedEntry` resting-row router, and bootstrap offline through R83. Proof: `a_row_shaped_watch_replaces_the_answer_whole`, a typed diesel latest-two window whose `LIMIT` bind survives bootstrap and triggered re-execution under subql `c6f75f6`, then survives an offline restart.
+3. ~~Extend `query.live(&client)` dispatch and the `use_live` hooks~~ **DONE (2026-09-01).** Diesel `caf515e` makes the no-group/group clause split structural and coherent. `SelectionMarker` now carries `Grouped<G::SqlType>` for grouped statements; `GroupedProjectionWire` derives `K` from the group SQL types and `V` from the one aggregate type, supports scalar and tuple keys through eight columns, and deliberately has no float, numeric, or JSON map-key impl. The typed path calls `watch_groups_typed`, so custom diesel aggregates bypass the SQL name classifier while still requiring plain projected group columns for whole-answer rebuilds. The existing Dioxus and Yew hooks required no code change because they are generic over `Watchable` and `LiveHandle`; the Dioxus desktop demo now runs `COUNT(*) GROUP BY quantity` through `use_live` and renders the map.
 
 ### Done when
 
-A grouped subscription renders as a live map that updates one entry per delta, offline restart included, exercised in at least one demo.
+**DONE.** A grouped subscription renders as a live map that updates one entry per delta, offline restart included (`grouped_live.rs`), and the Dioxus desktop demo exercises the generic `use_live` grouped path with counts keyed by quantity.
 
 ---
 
 ## R85: per-viewer re-execution on RLS tables
 
-**Status.** NOT STARTED. Derived 2026-08-22 from R30 (decision 5, which amended chapter 05's global-only restriction for the re-execution tier).
+**Status.** **DONE (2026-09-01).** Derived 2026-08-22 from R30 (decision 5, which amended chapter 05's global-only restriction for the re-execution tier). All three steps landed and the Docker-gated proof is green, see the step records below.
 
-**Blocked on the subql pin move.** R82 is done. U6 is delivered and verified 2026-08-30 at `d732331`: a registration opts in with `SubscriptionRequest::database_reads_per_consumer()`, every read tier keeps one authorization value per subscription (`tests/it/rls_reread.rs` upstream), a per-consumer in-process aggregate rides the whole-read tier so no fold state is shared, and a registration without the opt-in still refuses `AggregatorOnRlsTable`.
+**Blocked on nothing.** U6 was delivered and verified 2026-08-30 at `d732331` and is now adopted: a registration opts in with `SubscriptionRequest::database_reads_per_consumer()`, every read tier keeps one authorization value per subscription (`tests/it/rls_reread.rs` upstream), a per-consumer in-process aggregate rides the whole-read tier so no fold state is shared, and a registration without the opt-in still refuses `AggregatorOnRlsTable`.
 
 ### Purpose
 
@@ -5062,13 +5072,13 @@ A re-executed query is not shared state, so the server can run it under the aski
 
 ### Steps
 
-1. connetto's connector executes captured RLS-table queries inside a transaction that sets the viewer's identity (`SET LOCAL app.user_id`, the same shape the write path and the RLS read tests already use), under R81's time bound.
-2. Key the server-side captured state and the delivery routing by query and viewer, and pass the viewer's auth context through subql's `Connector::AuthContext` seam.
-3. Docker-gated proof: two viewers subscribing the same aggregate over an RLS table each receive their own value, a change to one viewer's rows re-executes for both but changes only the affected viewer's result, and the refusal still fires for the shared fold family.
+1. ~~connetto's connector executes captured RLS-table queries under the viewer's identity~~ **DONE (2026-09-01).** `ConnettoReadSetup::with_statements` (`crates/connetto-server/src/reexec.rs`) appends the caller binding to the budget statement, rendered by the new `CallerBinding::setup_statements` (`capability.rs`): the identity and the packed capability subjects as escaped `SELECT set_config(...)` literals, the same pairing `apply` runs typed on the write and snapshot paths, running inside every transaction the connector opens for the subscription and under R81's time bound. The statement shape is `set_config`, not `SET LOCAL`, because `SessionSetup` takes plain statements and `set_config` is the one spelling that pairs both values.
+2. ~~Key the captured state and routing by query and viewer~~ **DONE (2026-09-01), by adoption rather than new keying.** connetto already registers one subql subscription per session consumer, and U6 stores one auth context per subscription, so per-viewer keying falls out of the existing shape: `Materializer::register_translated` gained a `viewer` argument, and an aggregate subql refuses with `AggregatorOnRlsTable` is re-registered as `SubscriptionRequest::database_reads_per_consumer()` under the viewer's bound setup (`register_request_with`). The retry is asked for by the refusal rather than by probing the catalog, so every non-RLS fold keeps the shared fast path (the per-consumer flag turns extreme folds into per-event re-reads upstream, which must never be paid where no policy exists). An unidentified caller offers no binding and keeps the refusal. `SessionConfig` gained `rls_user_setting` (default `app.user_id`) naming the setting the binding writes, matching the snapshot and write configuration.
+3. ~~Docker-gated proof~~ **DONE (2026-09-01).** `crates/connetto-server/tests/it/rls_computed.rs`: `two_viewers_get_their_own_statistic_over_an_rls_table` (alice counts 3, bob 1, alice's insert moves only alice's number past a ping fence on bob's stream) and `an_unidentified_caller_keeps_the_rls_aggregate_refusal`. The reads run as a non-superuser `app_reader` role, and the catalog DDL carries `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, which is what subql classifies RLS from: a catalog without the marker registers a shared fold and none of this fires, the trap the first run of the proof found.
 
 ### Done when
 
-The Docker-gated test above is green, and chapter 05's amended decision text matches the delivered behavior.
+The Docker-gated test above is green (it is), and chapter 05's amended decision text matches the delivered behavior (recorded in the docs pass).
 
 ---
 

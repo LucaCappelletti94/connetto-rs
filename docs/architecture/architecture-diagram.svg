@@ -208,7 +208,7 @@
       <rect width="3" height="54" rx="1" fill="#4CAF50" />
       <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
       <text x="142" y="29" text-anchor="middle" font-size="8.5" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
-      <text x="142" y="43" text-anchor="middle" font-size="8.5" fill="#C62828">per-viewer runs on RLS tables: not started, R85</text>
+      <text x="142" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer, R85</text>
     </g>
 
     <g transform="translate(558, 724)">
@@ -335,11 +335,12 @@
     <text x="1310" y="110" text-anchor="middle" font-size="10" fill="#4CAF50">custom diesel connection wrapper</text>
 
     <g transform="translate(1008, 120)">
-      <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="44" rx="1" fill="#4CAF50" />
+      <rect width="296" height="60" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="60" rx="1" fill="#4CAF50" />
       <text x="148" y="14" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Aggregate live values</text>
       <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">server-pushed LiveValue&lt;V&gt;</text>
-      <text x="148" y="40" text-anchor="middle" font-size="8.5" fill="#C62828">keyed and row-shaped handles: not started, R84</text>
+      <text x="148" y="40" text-anchor="middle" font-size="8.5" fill="#4CAF50">keyed LiveGroups&lt;K, V&gt; map delivered, R84</text>
+      <text x="148" y="51" text-anchor="middle" font-size="8.5" fill="#4CAF50">LiveRows&lt;R&gt; + grouped typed live() + generic hooks delivered</text>
     </g>
     <g transform="translate(1320, 120)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
@@ -376,7 +377,7 @@
       <text x="150" y="17" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Local SQLite</text>
       <text x="150" y="30" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">diesel</text>
       <text x="150" y="41" text-anchor="middle" font-size="8.5" fill="#888">app tables, pending mutations, aggregates</text>
-      <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#C62828">resting table for server results: not started, R83</text>
+      <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#4CAF50">resting table for server results: offline restart shows the last synced value</text>
     </g>
 
     <!-- At-rest encryption (native) -->
