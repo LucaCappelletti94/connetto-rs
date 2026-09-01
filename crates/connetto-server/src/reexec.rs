@@ -30,7 +30,8 @@ use core::time::Duration;
 use subql::PgLsn;
 use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
 use subql::reexec::{
-    AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, RowPage, SessionSetup, Snapshot,
+    AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
+    Snapshot,
 };
 
 /// What one re-execution read may spend, passed per call.
@@ -184,7 +185,7 @@ impl AsyncConnector for NoConnector {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _setup: &ConnettoReadSetup,
     ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>> + Send
@@ -198,7 +199,7 @@ impl AsyncConnector for NoConnector {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, PgLsn>, std::io::Error>> + Send

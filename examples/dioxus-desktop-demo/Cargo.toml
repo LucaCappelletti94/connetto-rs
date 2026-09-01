@@ -56,3 +56,11 @@ pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", bran
 
 [patch."https://github.com/diesel-rs/diesel"]
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
+# Fast test iteration: release-grade optimization without the fat link.
+# Mirrors the root workspace profile of the same name.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

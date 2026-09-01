@@ -390,14 +390,19 @@ jobs:
         include:
           - name: server
             packages: -p connetto-server
+            # The e2e tests spawn both binaries from the release target dir,
+            # and neither cargo test nor nextest builds another package's bin.
+            bins: -p connetto-server -p connetto-client
           - name: client
             packages: -p connetto-client
+            bins: ''
           - name: rest
             packages: >-
               -p connetto-core
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew
+            bins: ''
     steps:
       - uses: actions/checkout@v7
 
@@ -428,8 +433,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y keyutils
 
+      - uses: taiki-e/install-action@nextest
+
+      - name: Build spawned binaries
+        if: matrix.bins != ''
+        run: cargo +stable build --release --all-features --bins ${{ matrix.bins }}
+
+      # nextest rather than cargo test, matching the local runner: each test
+      # gets its own process, which the merged tests/it targets rely on for
+      # log-capture isolation, and a wedged test is killed and named instead
+      # of holding the shard to the job timeout.
       - name: Run Rust suite
-        run: keyctl session -- cargo +stable test --release --all-features ${{ matrix.packages }}
+        run: keyctl session -- cargo +stable nextest run --release --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()

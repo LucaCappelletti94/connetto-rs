@@ -6,7 +6,7 @@
 //! split or the dispatch fold surfaces here before the full end-to-end loop.
 
 use connetto_server::{Materializer, Registration, SeedPlan};
-use subql::backend::{ScalarKind, Value as PgValue};
+use subql::backend::{BuiltinKind, Value as PgValue};
 use subql::{CdcSource, PgSqliteEmuSource};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
@@ -26,7 +26,7 @@ fn register_classifies_fold_aggregate_and_row() {
         panic!("ungrouped COUNT(*) should seed as a fold");
     };
     assert_eq!(bootstrap.group_columns, 0, "COUNT(*) is ungrouped");
-    assert_eq!(bootstrap.kinds, vec![ScalarKind::Int]);
+    assert_eq!(bootstrap.kinds, vec![BuiltinKind::Int]);
     assert!(
         bootstrap.sql.contains("COUNT(*)"),
         "bootstrap SQL should carry the aggregate, got {:?}",

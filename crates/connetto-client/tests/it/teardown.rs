@@ -11,8 +11,6 @@
 //! teardown alone the replica opens from its cached key with its persisted cursor
 //! and its unsynced work intact, which is what makes a fast return possible.
 
-#![cfg(feature = "native-auth")]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -112,6 +110,7 @@ async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, 
 /// keeps both, so its replica still opens under its own key.
 #[tokio::test]
 async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
+    connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
 
@@ -162,6 +161,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 /// the queued writes can still be uploaded with the credential that is still live.
 #[tokio::test]
 async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
+    connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
@@ -195,6 +195,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
 /// logout.
 #[tokio::test]
 async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
+    connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
@@ -238,6 +239,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
 /// of the file alone, after which a fresh connect rebuilds.
 #[tokio::test]
 async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
+    connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, _) = seed_replica(dir.path(), &keys, "alice").await;
@@ -287,6 +289,7 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
 /// never be uploaded, so a guard that ran afterwards would be protecting nothing.
 #[tokio::test]
 async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
+    connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;

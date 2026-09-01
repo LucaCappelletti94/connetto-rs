@@ -67,7 +67,7 @@ wasm-bindgen-test = "0.3"
 serde_json = "1"
 # The full-resync parity test hand-builds snapshot patchsets to feed a fake
 # upstream through the relay hub, the same native encoding the wire carries.
-sqlite-diff-rs = { version = "0.9.0", default-features = false }
+sqlite-diff-rs = { version = "0.10.0", default-features = false }
 zstd = "0.13"
 
 # Standalone workspace: wasm-only spike, never enters the root gate.
@@ -84,3 +84,11 @@ pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", bran
 
 [patch."https://github.com/diesel-rs/diesel"]
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
+# Fast test iteration: release-grade optimization without the fat link.
+# Mirrors the root workspace profile of the same name.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

@@ -21,6 +21,7 @@
 //! contract of the handles themselves.
 
 use core::future::Future;
+use core::task::Poll;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -576,6 +577,28 @@ struct Shared<T: Transport> {
     ever_synced: Arc<AtomicBool>,
 }
 
+impl<T: Transport> Shared<T> {
+    /// Take the state lock, interrupting the pump's idle wait.
+    ///
+    /// Queue first, then wake: the fair mutex hands the pump's released lock
+    /// to an already queued caller before the pump can take it back. Waking
+    /// before queueing races instead: the pump can consume the wake, finish
+    /// its cycle, re-acquire the lock, and park on a fresh wake future all
+    /// inside the caller's descheduling window, after which the caller queues
+    /// on a lock the idle pump holds forever. CPU-starved CI hit exactly that.
+    async fn lock_interrupting(&self) -> tokio::sync::MutexGuard<'_, State<T>> {
+        let mut lock = core::pin::pin!(self.state.lock());
+        let first = core::future::poll_fn(|cx| Poll::Ready(lock.as_mut().poll(cx))).await;
+        match first {
+            Poll::Ready(guard) => guard,
+            Poll::Pending => {
+                self.wake.notify_one();
+                lock.await
+            }
+        }
+    }
+}
+
 /// The shared surface of every live handle: a current snapshot, an awaitable
 /// change signal, the backing subscription id, and drop-unsubscribe. Framework
 /// adapters build on this so a single hook serves row and scalar handles
@@ -1002,8 +1025,7 @@ where
         Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         self.register_watch(&mut state, build, grace).await
     }
 
@@ -1119,8 +1141,7 @@ where
         InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         let row: R = diesel::insert_into(<R as HasTable>::table())
             .values(values)
             .get_result(state.conn.conn())
@@ -1177,8 +1198,7 @@ where
         InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         let row: R = diesel::insert_into(<R as HasTable>::table())
             .values(values)
             .get_result(state.conn.conn())
@@ -1225,8 +1245,7 @@ where
             <C as AsChangeset>::Changeset,
         >: AsQuery + for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         let row: R = diesel::update(target)
             .set(changeset)
             .get_result(state.conn.conn())
@@ -1374,9 +1393,7 @@ where
             Ok(())
         });
 
-        // Interrupt the pump's idle wait so the FIFO lock admits us promptly.
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
 
         // Tier dispatch. A local tier table is complete by definition, so a
         // local aggregate is served by exact local re-execution on change,
@@ -1475,8 +1492,7 @@ where
     where
         F: FnOnce(&mut ConnettoConnection<T>) -> O,
     {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         let out = f(&mut state.conn);
         drop(state);
         // A write may have landed: let the pump flush and refresh promptly.
@@ -1498,8 +1514,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the record.
     pub async fn pin(&self, name: &str, query: &str) -> Result<(), ClientError> {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         let spec = SubscriptionSpec::new(query);
         let wire_id = attach_wire(
             &mut state,
@@ -1519,8 +1534,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub async fn unpin(&self, name: &str) -> Result<(), ClientError> {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         state.conn.unpin_subscription(name)
     }
 
@@ -1530,7 +1544,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica cannot be read.
     pub async fn pins(&self) -> Result<Vec<(String, String)>, ClientError> {
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         state.conn.pins()
     }
 
@@ -1546,21 +1560,24 @@ where
     ///
     /// [`ClientError`] on a replica read or write failure.
     pub async fn tidy(&self) -> Result<(), ClientError> {
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
         state.conn.tidy()
     }
 
     /// Send a keepalive probe. The matching [`ClientEvent::Pong`] on the
     /// [`events`](Self::events) stream doubles as a barrier: the server
     /// processes frames in order, so the pong proves every frame sent before
-    /// the ping (subscribes and unsubscribes included) was handled.
+    /// the ping (subscribes and unsubscribes included) was handled. Dropped
+    /// handles queue their unsubscribes for the pump, so the ping drains that
+    /// queue first: without that, the ping could overtake a queued
+    /// unsubscribe and the pong would fence nothing.
     ///
     /// # Errors
     ///
     /// [`ClientError::Transport`] when the ping cannot be sent.
     pub async fn ping(&self, nonce: u64) -> Result<(), ClientError> {
-        self.shared.wake.notify_one();
-        let mut state = self.shared.state.lock().await;
+        let mut state = self.shared.lock_interrupting().await;
+        drain_dropped(&mut state, &self.shared.reaper).await?;
         state.conn.ping(nonce).await
     }
 

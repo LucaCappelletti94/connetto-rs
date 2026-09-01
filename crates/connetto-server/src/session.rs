@@ -63,6 +63,7 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
+use subql::reexec::ReadQuery;
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -3586,31 +3587,40 @@ where
             return Ok(());
         }
         // `register_subscription` requires an identified caller for any term,
-        // so the membership subscription always has an identity to filter by.
-        let Some(identity) = state.principal.identity() else {
+        // so the membership subscription always has an identity to seed with.
+        if state.principal.identity().is_none() {
             return Err(SessionError::Snapshot(
                 "a membership subscription needs an identified caller".to_owned(),
             ));
-        };
+        }
         // The caller's own rows only (decision 12): a membership table
         // typically carries no policy of its own, so an unfiltered read would
-        // snapshot every tenant's membership rows to every client. The
-        // identity rides as a bind rather than as the caller function.
-        //
-        // R63 decision 2 set out to retire this spelling, because subql
-        // `6b0ce94` serves a caller comparison as a self-seeding term. It is
-        // blocked upstream instead: such a term needs a subscriber built at
-        // the compared column's kind, and no public API answers that kind
-        // (`upstream/subql-caller-term-subscriber-kind-not-answerable.md`).
+        // snapshot every tenant's membership rows to every client. The caller
+        // rides as the deployment's own caller function (R63 decision 2), so
+        // subql compiles one self-seeding term whose predicate text is shared
+        // by every subscriber, instead of one inlined-literal predicate per
+        // identity. A term subscription only exists because the application's
+        // query named this function, so the mapping is present whenever this
+        // runs, and its absence is a server-side defect.
+        let Some(caller_function) = self
+            .materializer
+            .lock()
+            .await
+            .caller_function()
+            .map(str::to_owned)
+        else {
+            return Err(SessionError::Snapshot(
+                "a membership subscription needs the deployment's caller mapping".to_owned(),
+            ));
+        };
         let query = format!(
-            "SELECT * FROM {} WHERE {} = ?",
+            "SELECT * FROM {} WHERE {} = {caller_function}()",
             connetto_core::quote_ident(member_table),
             connetto_core::quote_ident(member_subject),
         );
         let hidden = Subscribe {
             sub_id: label.clone(),
-            spec: SubscriptionSpec::new(query)
-                .with_binds(vec![BindValue::Text(identity.user_id.to_string())]),
+            spec: SubscriptionSpec::new(query),
         };
         transport
             .send_control(ControlMessage::MembershipOpened(MembershipOpened {
@@ -4411,7 +4421,7 @@ where
             SeedPlan::Scalar { sql, kind } => {
                 let (value, lsn) = self
                     .connector
-                    .execute_scalar(sql, *kind, &caller_setup())
+                    .execute_scalar(&ReadQuery::without_binds(sql), *kind, &caller_setup())
                     .await
                     .map_err(|err| err.to_string())?;
                 let change = {
@@ -4433,7 +4443,11 @@ where
         let (rows, lsn) = if bootstrap.group_columns == 0 {
             // One row of component columns under one snapshot.
             self.connector
-                .execute_scalar_row(&bootstrap.sql, &bootstrap.kinds, &setup)
+                .execute_scalar_row(
+                    &ReadQuery::without_binds(&bootstrap.sql),
+                    &bootstrap.kinds,
+                    &setup,
+                )
                 .await
                 .map(|(row, lsn)| (vec![row], lsn))
                 .map_err(|err| err.to_string())?
@@ -4444,7 +4458,11 @@ where
             // registration rather than as a torn seed.
             let page = self
                 .connector
-                .read_page(&bootstrap.sql, GROUPED_SEED_PAGE_BYTES, &setup)
+                .read_page(
+                    &ReadQuery::without_binds(&bootstrap.sql),
+                    GROUPED_SEED_PAGE_BYTES,
+                    &setup,
+                )
                 .await
                 .map_err(|err| err.to_string())?;
             if page.value.more {

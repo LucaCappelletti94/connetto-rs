@@ -22,7 +22,6 @@ use diesel::sqlite::SqliteFunctionBehavior;
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{ConflictAction, ConflictType, SqliteSessionExt};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
-use pg2sqlite::traits::TranslationOptions;
 use sqlite_diff_rs::ParsedDiffSet;
 
 /// The Postgres source document: one policy-bearing table. The SELECT

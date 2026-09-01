@@ -302,8 +302,9 @@ async fn run_verified_topology(services: &Services) -> Result<()> {
         "connetto-client",
         "--all-features",
         "--test",
-        "verified_topology",
+        "it",
         "--",
+        "verified_topology",
         "--ignored",
     ]);
     run_process(OsStr::new("cargo"), &args, &services.envs).await
@@ -316,34 +317,64 @@ async fn run_default_browser_suites(services: &Services) -> Result<()> {
     if std::env::var_os("WASM_BINDGEN_TEST_TIMEOUT").is_none() {
         envs.push(("WASM_BINDGEN_TEST_TIMEOUT".to_owned(), "60".to_owned()));
     }
+    // One shared artifact dir for every wasm invocation: the web crate and the
+    // smoke binaries build near-identical dependency graphs, and separate
+    // per-workspace target trees rebuilt that graph from scratch each.
+    if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+        envs.push((
+            "CARGO_TARGET_DIR".to_owned(),
+            repo_path(&["target-wasm"])?.to_string_lossy().into_owned(),
+        ));
+    }
 
-    let web_args = strings(&["test", "--headless", "--chrome", "crates/connetto-web"]);
-    run_browser_suite(&web_args, &envs).await?;
+    // Every suite is its own wasm-pack invocation, one target each: the R46
+    // headless hang and the chromedriver port race strike per session, so a
+    // per-suite invocation confines the retry to the one suite that lost its
+    // report instead of rolling every suite's dice again. The suites run
+    // SERIALLY on purpose: they drive one shared stack as one dev user, and a
+    // concurrent sibling's logins and logouts reach the same server-side
+    // sessions (measured 2026-08-31 as a mid-suite 404 under four-way
+    // parallelism). Their bodies cost seconds each, so serial order costs
+    // little beyond the per-invocation overhead.
+    let mut suite_args = vec![strings(&[
+        "test",
+        "--headless",
+        "--chrome",
+        "crates/connetto-web",
+        "--lib",
+    ])];
+    for test in test_files(&["crates", "connetto-web", "tests"])? {
+        suite_args.push(per_test_args("crates/connetto-web", test));
+    }
+    for test in test_files(&["examples", "wasm-smoke", "tests"])? {
+        suite_args.push(per_test_args("examples/wasm-smoke", test));
+    }
 
-    for test in wasm_smoke_tests()? {
-        let args = vec![
-            OsString::from("test"),
-            OsString::from("--headless"),
-            OsString::from("--chrome"),
-            OsString::from("examples/wasm-smoke"),
-            OsString::from("--test"),
-            test,
-        ];
-        run_browser_suite(&args, &envs).await?;
+    for args in &suite_args {
+        run_browser_suite(args, &envs).await?;
     }
     Ok(())
 }
 
-fn wasm_smoke_tests() -> Result<Vec<OsString>> {
+fn per_test_args(workspace: &str, test: OsString) -> Vec<OsString> {
+    vec![
+        OsString::from("test"),
+        OsString::from("--headless"),
+        OsString::from("--chrome"),
+        OsString::from(workspace),
+        OsString::from("--test"),
+        test,
+    ]
+}
+
+fn test_files(dir: &[&str]) -> Result<Vec<OsString>> {
     let mut tests = Vec::new();
-    for entry in fs::read_dir(repo_path(&["examples", "wasm-smoke", "tests"])?)
-        .context("reading wasm smoke tests")?
-    {
+    for entry in fs::read_dir(repo_path(dir)?).context("reading a tests directory")? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "rs") {
             tests.push(
                 path.file_stem()
-                    .ok_or_else(|| anyhow!("wasm smoke test has no file stem"))?
+                    .ok_or_else(|| anyhow!("a test file has no stem"))?
                     .to_owned(),
             );
         }
@@ -364,11 +395,16 @@ async fn run_process(program: &OsStr, args: &[OsString], envs: &[(String, String
     require_success(&display, status)
 }
 
-/// What the headless runner prints when it loses a suite's report, kills
-/// chromedriver and fails through no fault of the suite. R46 documented it as
-/// an upstream defect (`docs/upstream-wasm-bindgen-headless-hang.md`), and it
-/// is why a browser suite is retried once rather than failing the whole run.
-const HEADLESS_HANG: &str = "Failed to detect test as having been run";
+/// What the headless runner prints when the environment lost the session
+/// through no fault of the suite. The first is R46's report loss, documented
+/// as an upstream defect (`docs/upstream-wasm-bindgen-headless-hang.md`). The
+/// second is a chromedriver startup port race, which concurrent suites can
+/// hit because each runner picks its port before binding it. Either is why a
+/// browser suite is retried once rather than failing the whole run.
+const RETRYABLE_SIGNATURES: [&str; 2] = [
+    "Failed to detect test as having been run",
+    "driver failed to bind port during startup",
+];
 
 /// One child run: how it exited, and whether its output carried the hang.
 struct BrowserRun {
@@ -439,7 +475,9 @@ where
     let mut lines = tokio::io::BufReader::new(reader).lines();
     let mut hung = false;
     while let Some(line) = lines.next_line().await.context("reading child output")? {
-        hung |= line.contains(HEADLESS_HANG);
+        hung |= RETRYABLE_SIGNATURES
+            .iter()
+            .any(|signature| line.contains(signature));
         eprintln!("{line}");
     }
     Ok(hung)
@@ -615,18 +653,21 @@ fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADLESS_HANG, echo_watching};
+    use super::{RETRYABLE_SIGNATURES, echo_watching};
 
-    /// The retry exists for one signature, so the reader has to recognise it
-    /// among ordinary output and nothing else. A false positive would retry a
-    /// real failure and make it look intermittent.
+    /// The retry exists for the environment-loss signatures alone, so the
+    /// reader has to recognise each among ordinary output and nothing else. A
+    /// false positive would retry a real failure and make it look
+    /// intermittent.
     #[tokio::test]
-    async fn the_reader_recognises_only_the_hang() {
-        let hung = format!("Loading Wasm module...\n{HEADLESS_HANG}\ndriver status: signal: 9\n");
-        assert!(
-            echo_watching(hung.as_bytes()).await.expect("read"),
-            "the runner's own words are what the retry keys on"
-        );
+    async fn the_reader_recognises_only_the_environment_losses() {
+        for signature in RETRYABLE_SIGNATURES {
+            let lost = format!("Loading Wasm module...\n{signature}\ndriver status: signal: 9\n");
+            assert!(
+                echo_watching(lost.as_bytes()).await.expect("read"),
+                "the runner's own words are what the retry keys on"
+            );
+        }
         let failed = "running 1 test\ntest a_real_one ... FAILED\ntest result: FAILED.\n";
         assert!(
             !echo_watching(failed.as_bytes()).await.expect("read"),

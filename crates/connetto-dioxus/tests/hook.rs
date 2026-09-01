@@ -25,7 +25,9 @@ use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
-use subql::reexec::{AsyncConnector, RowPage, ScalarRowError, Snapshot as ConnectorRead};
+use subql::reexec::{
+    AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
+};
 use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -158,7 +160,7 @@ impl AsyncConnector for SeedRows {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
@@ -169,7 +171,7 @@ impl AsyncConnector for SeedRows {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
@@ -180,7 +182,7 @@ impl AsyncConnector for SeedRows {
 
     fn execute_scalar_row(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _kinds: &[BuiltinKind],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<

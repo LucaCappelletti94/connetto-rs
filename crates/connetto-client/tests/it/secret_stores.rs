@@ -6,7 +6,6 @@
 //! encrypted `SQLite` file. `connetto-web`'s `secret_stores.rs` runs the same
 //! two functions against the browser stores, so the seam is proven by one
 //! caller working on both targets rather than by the rename.
-#![cfg(feature = "native-auth")]
 
 use connetto_client::{IDENTITY_RECORD, MemoryKeyStore, MemoryRefreshStore};
 use connetto_core::test_support::{
@@ -39,6 +38,7 @@ async fn the_in_memory_key_store_keeps_two_accounts_apart() {
 #[test]
 fn the_keyring_refresh_store_keeps_two_accounts_apart() {
     use connetto_client::KeyringStore;
+    connetto_test_harness::isolated_session_keyring();
 
     let service = format!("connetto-r41-refresh-{}", std::process::id());
     two_accounts_keep_their_own_token(&KeyringStore::new(service), "alice", "bob");
@@ -48,6 +48,7 @@ fn the_keyring_refresh_store_keeps_two_accounts_apart() {
 #[test]
 fn the_keyring_refresh_store_lists_every_account_it_holds() {
     use connetto_client::KeyringStore;
+    connetto_test_harness::isolated_session_keyring();
 
     let service = format!("connetto-r42-refresh-{}", std::process::id());
     every_stored_account_is_listed(&KeyringStore::new(service), "alice", "bob", IDENTITY_RECORD);
@@ -56,6 +57,7 @@ fn the_keyring_refresh_store_lists_every_account_it_holds() {
 #[tokio::test]
 async fn the_keyring_key_store_keeps_two_accounts_apart() {
     use connetto_client::KeyringKeyStore;
+    connetto_test_harness::isolated_session_keyring();
 
     let service = format!("connetto-r41-keys-{}", std::process::id());
     two_accounts_keep_their_own_key(&KeyringKeyStore::new(service), "alice", "bob").await;

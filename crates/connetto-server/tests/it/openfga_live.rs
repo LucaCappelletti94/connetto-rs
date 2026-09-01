@@ -32,6 +32,7 @@ use connetto_server::openfga::{
 };
 use connetto_server::row_view::ValuesRow;
 use connetto_test_harness::Fixture;
+use diesel::prelude::ExpressionMethods;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use openfga_client::client::OpenFgaServiceClient;
@@ -999,4 +1000,257 @@ async fn a_replay_that_cannot_run_refuses_rather_than_letting_the_row_through() 
         "the cause has to name the replay, or an operator reads it as the store \
          being down and waits for a service that is fine: {refused:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R86 step 4: composite-key (tenant-scoped) share, compound-key binding
+// ---------------------------------------------------------------------------
+
+diesel::table! {
+    /// Guarded table for the composite-key fixture.
+    ck_papers (tenant_id, id) {
+        /// Tenant identifier, part of the composite primary key.
+        tenant_id -> diesel::sql_types::Integer,
+        /// Paper identifier within the tenant, part of the composite primary key.
+        id -> diesel::sql_types::Integer,
+        /// Paper owner (nullable).
+        owner -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+    }
+}
+
+diesel::table! {
+    /// Share table for the composite-key fixture.
+    ck_shares (tenant_id, paper_id, viewer) {
+        /// Tenant identifier, part of the composite primary key.
+        tenant_id -> diesel::sql_types::Integer,
+        /// Paper identifier within the tenant, part of the composite primary key.
+        paper_id -> diesel::sql_types::Integer,
+        /// Viewer identity, part of the composite primary key.
+        viewer -> diesel::sql_types::Text,
+    }
+}
+
+/// Composite-key guarded table and share table, exactly the p2/s2 fixture from
+/// upstream/rls2fga-two-column-join-graded-below-threshold.md.
+///
+/// No residual: one share row determines the grant, keyed on both join columns.
+/// rls2fga 98bda106 produces a from-row derivation whose object is named by
+/// (`tenant_id`, `paper_id`), so tenant 1 and tenant 2 holding paper id=1 are
+/// independent facts.
+const COMPOSITE_SCHEMA_STATEMENTS: [&str; 3] = [
+    "CREATE TABLE ck_papers (tenant_id INT NOT NULL, id INT NOT NULL, owner TEXT, \
+       PRIMARY KEY (tenant_id, id))",
+    "CREATE TABLE ck_shares (tenant_id INT NOT NULL, paper_id INT NOT NULL, \
+       viewer TEXT NOT NULL, PRIMARY KEY (tenant_id, paper_id, viewer))",
+    "ALTER TABLE ck_papers ENABLE ROW LEVEL SECURITY",
+];
+
+const COMPOSITE_POLICY: &str = "CREATE POLICY ck_papers_p ON ck_papers FOR SELECT USING (\
+    EXISTS (SELECT 1 FROM ck_shares s WHERE s.tenant_id = ck_papers.tenant_id \
+      AND s.paper_id = ck_papers.id \
+      AND s.viewer = current_setting('app.user_id', true)))";
+
+fn composite_schema() -> String {
+    COMPOSITE_SCHEMA_STATEMENTS.join(";\n") + ";"
+}
+
+/// Provision the composite-key fixture, dropping whatever a previous run left.
+async fn provision_composite(pool: &Pool<AsyncPgConnection>) {
+    let mut conn = pool.get().await.expect("a connection");
+    // DDL cannot be expressed in diesel's typed query DSL.
+    let mut statements = vec!["DROP TABLE IF EXISTS ck_papers, ck_shares CASCADE"];
+    statements.extend(COMPOSITE_SCHEMA_STATEMENTS);
+    statements.push(COMPOSITE_POLICY);
+    for statement in statements {
+        diesel::sql_query(statement)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+    }
+    diesel::insert_into(ck_papers::table)
+        .values(&[
+            (
+                ck_papers::tenant_id.eq(1_i32),
+                ck_papers::id.eq(1_i32),
+                ck_papers::owner.eq(Some("owner1")),
+            ),
+            (
+                ck_papers::tenant_id.eq(2_i32),
+                ck_papers::id.eq(1_i32),
+                ck_papers::owner.eq(Some("owner2")),
+            ),
+        ])
+        .execute(&mut *conn)
+        .await
+        .expect("insert ck_papers");
+    diesel::insert_into(ck_shares::table)
+        .values(&[
+            (
+                ck_shares::tenant_id.eq(1_i32),
+                ck_shares::paper_id.eq(1_i32),
+                ck_shares::viewer.eq("viewer1"),
+            ),
+            (
+                ck_shares::tenant_id.eq(2_i32),
+                ck_shares::paper_id.eq(1_i32),
+                ck_shares::viewer.eq("viewer2"),
+            ),
+        ])
+        .execute(&mut *conn)
+        .await
+        .expect("insert ck_shares");
+}
+
+/// One `ck_papers` row as the change stream would carry it.
+fn ck_paper_row(tenant: i64, id: i64, owner: &str) -> [Value<Postgres>; 3] {
+    [
+        Value::Int(tenant),
+        Value::Int(id),
+        Value::String(owner.to_owned()),
+    ]
+}
+
+/// The deletion of tenant 1's share row, as the change stream reports it.
+fn ck_share_delete_event() -> ChangeEvent {
+    ChangeEvent::delete(
+        "public",
+        "ck_shares",
+        0,
+        row_data(&[("tenant_id", "1"), ("paper_id", "1"), ("viewer", "viewer1")]),
+        ReplicaIdentity::Full,
+        vec![
+            Arc::from("tenant_id"),
+            Arc::from("paper_id"),
+            Arc::from("viewer"),
+        ],
+        Lsn::new(2),
+    )
+}
+
+/// R86 step 4: a composite-key share withdraws through the upkeep for exactly
+/// the right tenant, proving the compound-key binding is correct.
+///
+/// The p2/s2 fixture graded at D until rls2fga 98bda106 fixed the two-column-
+/// join classifier. Boot acceptance (a) and model install (b) must pass today,
+/// proving the fix is live. Seeding (c) hits the known rls2fga unqualified-
+/// table comment-query defect, so the test currently fails at the first verdict
+/// assertion after seeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision_composite(&pool).await;
+
+    // (a) Boot acceptance. Translated::of returns Err on ClauseBelowThreshold
+    // and on Unwithdrawable shapes, so expect() covers both the grading and
+    // the startup guard. Before rls2fga 98bda106 this returned Err.
+    let schema = composite_schema();
+    let translated = Translated::of::<String>(&schema, COMPOSITE_POLICY, "app.user_id")
+        .expect("composite shape: no ClauseBelowThreshold, no uncovered refusal");
+
+    // (b) The model installs on a live service.
+    let (channel, store) = fixture.fga_store().await;
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the composite model installs");
+
+    // (c) Seeding. rls2fga 98bda106 emits a comment-only query for unqualified
+    // table names, so load_records returns zero facts. The store stays empty
+    // and the verdict assertions below fail here.
+    let records = translated
+        .load_records(&pool)
+        .await
+        .expect("the facts load");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        Arc::clone(&shapes),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned())
+    .write_records(&records)
+    .await
+    .expect("the facts are written");
+
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
+    let upkeep = auth.upkeep(reach, translator, pool.clone());
+
+    // (d) Two tenants sharing id=1 each grant their own viewer. The compound
+    // key (tenant_id, paper_id) binds both join columns, so the grants are
+    // independent facts that a first-column-only key would have merged.
+    let papers = catalog_helpers::table_id(shapes.catalog(), "ck_papers").expect("in the catalog");
+    let t1_p1 = ck_paper_row(1, 1, "owner1");
+    let t2_p1 = ck_paper_row(2, 1, "owner2");
+    let view1 = ValuesRow::new(papers, &t1_p1);
+    let view2 = ValuesRow::new(papers, &t2_p1);
+    let v1 = [caller("viewer1")];
+    let v2 = [caller("viewer2")];
+
+    let mut verdicts = Vec::new();
+    for (view, callers, why) in [
+        (&view1, &v1, "viewer1 holds a share on tenant 1 paper 1"),
+        (&view2, &v2, "viewer2 holds a share on tenant 2 paper 1"),
+    ] {
+        Verdict::reset(&mut verdicts, 1);
+        auth.may_see(view, callers, &mut verdicts)
+            .await
+            .expect("the composition answered");
+        assert_eq!(
+            verdicts,
+            [Verdict::Allow],
+            "{why}: granted before any withdrawal"
+        );
+    }
+
+    // (e) Delete tenant 1's share and run the upkeep. The database changes
+    // first, as the withdrawal is read from current state.
+    {
+        let mut conn = pool.get().await.expect("a connection");
+        diesel::delete(ck_shares::table)
+            .filter(ck_shares::tenant_id.eq(1_i32))
+            .filter(ck_shares::paper_id.eq(1_i32))
+            .filter(ck_shares::viewer.eq("viewer1"))
+            .execute(&mut *conn)
+            .await
+            .expect("the share row goes");
+    }
+    upkeep
+        .keep_current(&ck_share_delete_event())
+        .await
+        .expect("the withdrawal reached the store");
+
+    // Compound-key binding: deleting tenant 1's share must not affect tenant 2.
+    for (view, callers, want, why) in [
+        (
+            &view1,
+            &v1,
+            Verdict::Deny,
+            "viewer1's share is gone, so the grant must leave the store",
+        ),
+        (
+            &view2,
+            &v2,
+            Verdict::Allow,
+            "viewer2's share is intact: the compound key bound both join columns, \
+             so tenant 1's deletion cannot reach tenant 2's fact",
+        ),
+    ] {
+        Verdict::reset(&mut verdicts, 1);
+        auth.may_see(view, callers, &mut verdicts)
+            .await
+            .expect("the composition answered");
+        assert_eq!(verdicts, [want], "{why}");
+    }
 }

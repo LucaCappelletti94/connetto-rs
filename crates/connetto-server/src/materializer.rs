@@ -38,7 +38,6 @@ use diesel::{QueryableByName, SqliteConnection, sql_query};
 use pg2sqlite::options::Pg2SqliteOptions;
 use pg2sqlite::prelude::ReverseTranslator;
 use pg2sqlite::prelude::SessionVariableMapping;
-use pg2sqlite::traits::TranslationOptions;
 use rls2fga::translator::Translator;
 use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
@@ -49,7 +48,7 @@ use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
 use subql::backend::{
-    BuiltinKind, CdcEvent, Postgres, RowKind, ScalarKind, Value as PgValue, encode_value_key,
+    BuiltinKind, CdcEvent, Postgres, RowKind, Value as PgValue, encode_value_key,
 };
 use subql::emit::{
     WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
@@ -646,6 +645,15 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
         Ok(pg.to_string())
     }
+
+    /// The client-dialect name of the deployment's caller function, or `None`
+    /// for a deployment serving no membership term.
+    #[must_use]
+    pub fn caller_function(&self) -> Option<&str> {
+        self.caller
+            .as_ref()
+            .map(|mapping| mapping.sqlite_function.as_str())
+    }
 }
 
 /// Convert wire bind values into the typed subql values a
@@ -688,9 +696,9 @@ pub struct TermSeed {
 #[must_use]
 pub fn typed_subscriber(identity: &str, kind: BuiltinKind) -> Option<PgValue<Postgres>> {
     match kind {
-        ScalarKind::String => Some(PgValue::String(identity.to_owned())),
-        ScalarKind::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
-        ScalarKind::Int => identity.parse().ok().map(PgValue::Int),
+        BuiltinKind::String => Some(PgValue::String(identity.to_owned())),
+        BuiltinKind::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
+        BuiltinKind::Int => identity.parse().ok().map(PgValue::Int),
         _ => None,
     }
 }
@@ -1048,7 +1056,7 @@ where
         ComputedChange {
             subscription_id: update.subscription,
             consumer_id: update.consumer,
-            group_key: update.group,
+            group_key: update.group.map(|group| group.key),
             result_json: match update.change {
                 AggregateValueChange::Set(AggregateResultValue::Folded(value)) => {
                     Some(agg_value_to_json(value))
@@ -2150,7 +2158,7 @@ mod membership_term_tests {
         assert_eq!(membership.pairs[0].column, "project_id");
         assert_eq!(membership.member_table, "project_members");
         assert_eq!(membership.pairs[0].member_key, "project_id");
-        assert_eq!(membership.subject_kind, ScalarKind::String);
+        assert_eq!(membership.subject_kind, BuiltinKind::String);
         assert_eq!(membership.member_subject, "user_id");
         assert!(
             membership.seed_sql.contains("project_members"),
@@ -2205,20 +2213,20 @@ mod membership_term_tests {
     #[test]
     fn the_subscriber_is_typed_at_the_columns_kind() {
         assert_eq!(
-            typed_subscriber("alice", ScalarKind::String),
+            typed_subscriber("alice", BuiltinKind::String),
             Some(PgValue::String("alice".to_owned()))
         );
-        assert!(typed_subscriber("alice", ScalarKind::Uuid).is_none());
-        assert!(typed_subscriber("alice", ScalarKind::Int).is_none());
+        assert!(typed_subscriber("alice", BuiltinKind::Uuid).is_none());
+        assert!(typed_subscriber("alice", BuiltinKind::Int).is_none());
         assert_eq!(
-            typed_subscriber("42", ScalarKind::Int),
+            typed_subscriber("42", BuiltinKind::Int),
             Some(PgValue::Int(42))
         );
         assert!(matches!(
-            typed_subscriber("0193c8e5-1111-7abc-8def-000000000000", ScalarKind::Uuid),
+            typed_subscriber("0193c8e5-1111-7abc-8def-000000000000", BuiltinKind::Uuid),
             Some(PgValue::Uuid(_))
         ));
-        assert!(typed_subscriber("alice", ScalarKind::Bytes).is_none());
+        assert!(typed_subscriber("alice", BuiltinKind::Bytes).is_none());
     }
 
     // Without the deployment's mapping the client's caller function cannot

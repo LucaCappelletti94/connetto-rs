@@ -16,7 +16,6 @@
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
-use pg2sqlite::traits::TranslationOptions;
 
 /// The exact schema the wasm-smoke demo uses: schema.sql plus policies.sql.
 const PG_DDL: &str = "

@@ -52,7 +52,7 @@ diesel-async = { version = "0.7", default-features = false, features = [
   "bb8",
 ] }
 # Building the mutation changeset a client uploads.
-sqlite-diff-rs = { version = "0.9.0", default-features = false }
+sqlite-diff-rs = { version = "0.10.0", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
@@ -73,9 +73,22 @@ openidconnect = { version = "4.0.1", default-features = false, features = [
   "rustls-tls",
 ] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# Diagnostic logging for wedged-test hunts: `Fixture::acquire` installs a
+# stderr subscriber when `CONNETTO_TEST_LOG` is set, so a killed test's
+# captured output names its last state transition.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "env-filter",
+  "std",
+] }
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
-sqlite-diff-rs = { version = "0.9.0", default-features = false }
+sqlite-diff-rs = { version = "0.10.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Joining a fresh anonymous session keyring in-process, replacing the external
+# `keyctl session` wrapper the OS-keyring tests used to need.
+keyutils = "0.4"

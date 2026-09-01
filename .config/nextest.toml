@@ -1,0 +1,53 @@
+# Test runner configuration (S3 of plans/test-suite-speedup.md).
+#
+# Local iteration: cargo nextest run --cargo-profile testfast
+# One old file's tests: cargo nextest run --cargo-profile testfast -E 'test(retention::)'
+# The pre-push gate archives with --release instead, matching CI.
+
+[profile.default]
+# A test that outlives five slow periods is wedged, not slow: kill and report
+# it instead of hanging the whole invocation. The slowest legitimate tests
+# (emulator loops with five-second silence assertions) finish well under one
+# period times five.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Bounded below the machine's 64 threads: an unbounded run starved the
+# container-backed tests into their in-test timeouts (measured 2026-08-31,
+# five failures at exactly their 120 s waits, each passing alone).
+test-threads = 32
+
+[test-groups]
+# Each Docker-gated test starts its own throwaway container (Postgres, and
+# lazily OpenFGA or MySQL). Four at a time keeps container startup off the
+# starvation path that unbounded parallelism produced.
+docker = { max-threads = 4 }
+# The OS-keyring tests each join their own fresh session keyring in-process,
+# so the group exists only to keep the plain-cargo path calm and stays
+# serialized out of caution rather than need.
+keyring = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(secret_stores::) | test(teardown::) | test(e2e::) | test(revocation::)'
+test-group = 'keyring'
+# The e2e tests spawn a server and clients each, so one counts as several.
+threads-required = 4
+
+[[profile.default.overrides]]
+filter = '''
+package(connetto-test-harness)
+| test(abuse::) | test(audit_table::) | test(auth_retry::) | test(authentication::)
+| test(authn_db::) | test(authn_flow::) | test(capabilities::) | test(cdc_reconnect::)
+| test(grants::) | test(grouped_wire::) | test(inprocess_loop::) | test(openfga_live::)
+| test(pg_async::) | test(preflight_previous_image::) | test(read_ceiling::)
+| test(read_filter::) | test(reconnect::) | test(reexec::) | test(reserve::)
+| test(rls_read_filter::) | test(rls_write_filter::) | test(rls_write_question::)
+| test(session_loop::) | test(slot_watch::) | test(snapshot_nonfatal::)
+| test(snapshot_order::) | test(stream_gap::) | test(throttle::) | test(write_path::)
+| test(local_tier::) | test(mutation_replay::) | test(reconnect_live::) | test(loop_emu::)
+'''
+test-group = 'docker'
+# A fixture test owns a container plus an in-process server loop, so it
+# counts as several scheduler slots, keeping the CPU-bound rest of the run
+# from starving it. Container startup under load also stretches legitimate
+# runtimes, so the wedge kill waits longer here.
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 5 }

@@ -29,7 +29,6 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, WrapperKind};
-use pg2sqlite::traits::TranslationOptions;
 use sqlite_diff_rs::{DiffOps, Insert, ParsedDiffSet, PatchSet, SimpleTable, Value};
 
 /// The Postgres source document, shaped like the demo's: one policy-bearing
