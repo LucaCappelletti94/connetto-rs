@@ -73,6 +73,14 @@ openidconnect = { version = "4.0.1", default-features = false, features = [
   "rustls-tls",
 ] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# Diagnostic logging for wedged-test hunts: `Fixture::acquire` installs a
+# stderr subscriber when `CONNETTO_TEST_LOG` is set, so a killed test's
+# captured output names its last state transition.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "env-filter",
+  "std",
+] }
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.

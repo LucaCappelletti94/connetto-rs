@@ -458,6 +458,15 @@ struct Authorization {
 impl Fixture {
     /// Start this test's own `Postgres` and create the watermark table.
     pub async fn acquire() -> Self {
+        if let Some(directives) = std::env::var("CONNETTO_TEST_LOG")
+            .ok()
+            .filter(|directives| !directives.is_empty())
+        {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
         sweep_abandoned_containers();
         let postgres = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
