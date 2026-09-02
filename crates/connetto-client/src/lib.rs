@@ -765,10 +765,12 @@ impl ClientConfig {
 
     /// How many applied rows, summed across tables since the last `tidy`, arm
     /// the residual pass and [`ClientEvent::TidyDue`]. Defaults to
-    /// [`DEFAULT_RESIDUAL_THRESHOLD`].
+    /// [`DEFAULT_RESIDUAL_THRESHOLD`]. A value of zero is clamped to one because
+    /// zero would make `residual_check` fire after every patch, including
+    /// rowless cursor-only ones where no rows changed at all.
     #[must_use]
     pub fn with_residual_threshold(mut self, rows: u64) -> Self {
-        self.residual_threshold = rows;
+        self.residual_threshold = rows.max(1);
         self
     }
 
@@ -958,8 +960,10 @@ pub enum ClientEvent {
     /// (R60): enough rows have arrived since the last `tidy` that a pass is
     /// worth running. Fires once per crossing and re-arms when a pass resets
     /// the measure. Under [`ResidualPass::Automatic`] the connection has
-    /// already run the pass by the time this is observed; under
-    /// [`ResidualPass::Manual`] it is the application's cue.
+    /// already run the pass, successfully, by the time this is observed: a
+    /// failed pass surfaces as the pump error instead and retries at the
+    /// next apply. Under [`ResidualPass::Manual`] it is the application's
+    /// cue.
     TidyDue {
         /// Rows applied across all tables since the last pass, at the
         /// crossing. The per-table breakdown is
@@ -1898,16 +1902,17 @@ where
 /// The same hook maintains the residual measure (R60 decision 4): while
 /// `counting` is set, which is exactly while a server patch is being applied,
 /// each changed row of an application table adds one to its table's entry in
-/// `applied`. One atomic load and one map bump per row, the O(1) the decision
-/// asked for.
+/// `staging`. `apply_patch` merges staging into `applied_rows` only after the
+/// transaction commits, so a rolled-back apply leaves no phantom counts.
+/// One atomic load and one map bump per row, the O(1) the decision asked for.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
-    applied: &Arc<Mutex<HashMap<String, u64>>>,
+    staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
 ) {
     let sink = Arc::clone(changed);
-    let rows = Arc::clone(applied);
+    let rows = Arc::clone(staging);
     let gate = Arc::clone(counting);
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
@@ -1992,11 +1997,16 @@ pub struct ConnettoConnection<T: Transport> {
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
     /// Rows applied per application table since the last residual pass, the
-    /// R60 measure. Bumped by the update hook while `apply_counting` is set.
+    /// R60 measure. Accumulated via `apply_staging` during each apply and
+    /// merged here only after the transaction commits.
     applied_rows: Arc<Mutex<HashMap<String, u64>>>,
-    /// Raised for the duration of a server-patch apply, so the hook counts
-    /// applied rows and never local writes.
+    /// Raised for the duration of a server-patch apply, so the hook tallies
+    /// rows into `apply_staging` and never into `applied_rows` directly.
     apply_counting: Arc<AtomicBool>,
+    /// Staging accumulator for the residual measure: rows are tallied here
+    /// while `apply_counting` is up and merged into `applied_rows` only after
+    /// the transaction commits. Cleared on rollback to leave no phantom counts.
+    apply_staging: Arc<Mutex<HashMap<String, u64>>>,
     /// Whether [`ClientEvent::TidyDue`] has fired since the measure last
     /// reset, so a crossing fires once rather than once per frame.
     residual_warned: bool,
@@ -2211,9 +2221,10 @@ where
         let pending = load_pending(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let applied_rows: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_counting = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(false));
-        install_change_tracker(&mut db, &changed, &applied_rows, &apply_counting);
+        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -2245,6 +2256,7 @@ where
             changed,
             applied_rows,
             apply_counting,
+            apply_staging,
             residual_warned: false,
             transaction_state: AnsiTransactionManager::default(),
             pending,
@@ -3991,9 +4003,11 @@ where
             .map(|bytes| self.to_physical(bytes))
             .transpose()?;
         let suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        // The counting gate makes the update hook attribute every row of this
-        // transaction to the residual measure (R60 decision 4). Cleared before
-        // any error propagates so a failed apply never leaves it up.
+        // The counting gate makes the update hook tally each row into
+        // `apply_staging` (R60 decision 4). Cleared before any error propagates
+        // so a failed apply never leaves the gate up. The staging map merges
+        // into `applied_rows` only after the transaction commits and is cleared
+        // on rollback, so a failed apply leaves no phantom counts.
         self.apply_counting.store(true, Ordering::Relaxed);
         let applied = self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
@@ -4010,15 +4024,28 @@ where
         });
         self.apply_counting.store(false, Ordering::Relaxed);
         drop(suspended);
+        if applied.is_ok() {
+            if let (Ok(mut stage), Ok(mut rows)) =
+                (self.apply_staging.lock(), self.applied_rows.lock())
+            {
+                for (table, n) in stage.drain() {
+                    *rows.entry(table).or_insert(0) += n;
+                }
+            }
+        } else if let Ok(mut stage) = self.apply_staging.lock() {
+            stage.clear();
+        }
         applied?;
         self.residual_check()
     }
 
-    /// After a server patch lands: fire [`ClientEvent::TidyDue`] when the
-    /// applied-rows sum crosses the configured threshold, once per crossing,
-    /// and run the pass right here under [`ResidualPass::Automatic`] (R60
-    /// decision 3). `tidy` resets the measure and re-arms the event, whoever
-    /// calls it.
+    /// After a server patch lands: run the pass under
+    /// [`ResidualPass::Automatic`] when the applied-rows sum crosses the
+    /// configured threshold, then fire [`ClientEvent::TidyDue`], once per
+    /// crossing (R60 decision 3). A failed automatic pass queues nothing and
+    /// re-arms, so the event never claims a pass that did not happen and the
+    /// next apply retries. `tidy` resets the measure and re-arms the event,
+    /// whoever calls it.
     fn residual_check(&mut self) -> Result<(), ClientError> {
         if self.residual_warned {
             return Ok(());
@@ -4031,12 +4058,15 @@ where
             return Ok(());
         }
         self.residual_warned = true;
+        if self.config.residual_pass == ResidualPass::Automatic
+            && let Err(err) = self.tidy()
+        {
+            self.residual_warned = false;
+            return Err(err);
+        }
         self.notices.push_back(ClientEvent::TidyDue {
             rows_applied: total,
         });
-        if self.config.residual_pass == ResidualPass::Automatic {
-            self.tidy()?;
-        }
         Ok(())
     }
 

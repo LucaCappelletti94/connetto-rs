@@ -2475,11 +2475,13 @@ where
             if state.wire.iter().any(|w| w.wire_id == sub_id && w.refs > 0) {
                 continue;
             }
-            state.wire.retain(|w| w.wire_id != sub_id);
-            // The raw unsubscribe evicts scoped to this subscription's tables
-            // before the record goes, sparing rows a survivor or a pending
-            // write still wants.
+            // The raw unsubscribe evicts rows scoped to this subscription's
+            // tables before the record goes, sparing rows a survivor or a
+            // pending write still wants. The retain follows success so a
+            // failure leaves the refs == 0 entry in place and the next drain
+            // retries it rather than stranding the expired record.
             state.conn.unsubscribe(&sub_id).await?;
+            state.wire.retain(|w| w.wire_id != sub_id);
         }
     }
     Ok(())
