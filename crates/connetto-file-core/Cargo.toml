@@ -1,0 +1,50 @@
+[package]
+name = "connetto-file-core"
+description = "Platform-neutral file core for connetto-rs: content identity, CDC chunking, manifests, the ChunkStore trait, and the encrypting decorator."
+readme = "README.md"
+categories = ["cryptography", "encoding", "data-structures"]
+keywords = ["chunking", "encryption", "blake3", "fastcdc", "content-addressable"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# File identity and chunk-key derivation.
+blake3 = "1"
+# Content-defined chunking with the 2020 algorithm.
+fastcdc = "3"
+# XChaCha20-Poly1305: 192-bit nonce eliminates the birthday-bound risk of
+# AES-GCM-128 and requires no AES hardware acceleration (relevant on mobile).
+# Default features disabled: we generate nonces via getrandom 0.3 directly
+# and do not need chacha20poly1305's own OsRng path, which would pull in
+# rand_core 0.6 -> getrandom 0.2 and break the wasm32 build.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# Bulk compression between chunking and encryption: level 3 halves text-heavy
+# scientific data (FASTA, MGF) without wasting CPU on already-compressed media.
+zstd = "0.13"
+thiserror.workspace = true
+# Random nonce generation. On native the OS backend is used automatically.
+getrandom = "0.3"
+
+# On wasm32 the Crypto.getRandomValues backend is required.
+# Cargo merges this with the unconditional entry above, activating wasm_js
+# only when compiling for that target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+# wasm-bindgen-test is unconditional here so the wasm build compiles it.
+# On native the cfg attribute on each test routes to #[test] instead.
+wasm-bindgen-test = "0.3"
+
+# Proptest forks a subprocess for failure persistence, which is unavailable on
+# wasm32. Gate it to native targets and disable the fork feature explicitly.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

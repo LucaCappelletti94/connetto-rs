@@ -402,6 +402,7 @@ jobs:
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew
+              -p connetto-file-core
             bins: ''
     steps:
       - uses: actions/checkout@v7
@@ -523,6 +524,46 @@ jobs:
           rm -rf target-wasm/wasm32-unknown-unknown/debug/incremental
           rm -rf target-wasm/debug/incremental
           rm -rf target/tmp
+
+  file-core-wasm:
+    name: File core wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable browser toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.14.0
+
+      - name: Configure ChromeDriver
+        run: |
+          echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
+          echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
+      # nextest skips doctests, and the README fence must execute.
+      - name: Run file core doctests
+        run: cargo +stable test --release --doc -p connetto-file-core
+
+
+      # R64: the file core proves its whole surface under wasm, no services.
+      - name: Run file core wasm tests
+        run: wasm-pack test --headless --chrome crates/connetto-file-core
 
   passkey-gate:
     name: Passkey gate
