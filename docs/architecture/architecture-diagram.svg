@@ -413,7 +413,7 @@
       <rect width="300" height="56" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="22" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Replica retention and trimming</text>
-      <text x="150" y="42" text-anchor="middle" font-size="9" fill="#4CAF50">evicts uncovered rows, trims freed pages</text>
+      <text x="150" y="42" text-anchor="middle" font-size="9" fill="#4CAF50">evicts uncovered rows, runs by itself on a row threshold</text>
     </g>
 
     <!-- R26 and R42 -->
@@ -520,7 +520,7 @@
       <rect width="296" height="48" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="48" rx="1" fill="#4CAF50" />
       <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Replica retention and trimming</text>
-      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">trims the OPFS replica</text>
+      <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">evicts and trims the OPFS replica, same threshold</text>
     </g>
     <g transform="translate(1320, 1222)">
       <rect width="296" height="48" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
