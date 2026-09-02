@@ -212,6 +212,37 @@ async fn live_for(client: &mut Client, sub_id: &str, timeout: Duration) -> LiveP
     }
 }
 
+/// Apply every `sub_id` frame until the replica holds exactly `expected`. A
+/// straggler frame from the settling phase can reach the wire ahead of the
+/// row a test just wrote (seen on 2-core CI runners, 2026-09-02), so waiting
+/// for one frame races while waiting for content does not.
+async fn live_until(
+    client: &mut Client,
+    sub_id: &str,
+    replica: &mut Replica,
+    expected: &[i32],
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if replica.ids() == expected {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match client.try_live(remaining).await {
+            Some(patch) if patch.sub_id == sub_id => replica.apply(&patch.patchset_zstd),
+            Some(patch) => assert_eq!(
+                patch.sub_id, MEMBERSHIP_SUB,
+                "only the hidden subscription may interleave"
+            ),
+            None => panic!(
+                "timed out waiting for {sub_id} to reach {expected:?}, the replica holds {:?}",
+                replica.ids()
+            ),
+        }
+    }
+}
+
 /// Assert no live patch for `sub_id` arrives within `timeout`. Hidden
 /// membership patches may arrive and are tolerated, which is what makes the
 /// silence assertion about the subscription rather than about the wire.
@@ -386,13 +417,9 @@ async fn the_first_row_of_a_team_already_joined_arrives_live() {
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (21, 'bob', 2, 'first')")
         .await;
-    let patch = live_for(&mut alice, "docs", DELIVERY).await;
-    replica.apply(&patch.patchset_zstd);
-    assert_eq!(
-        replica.ids(),
-        vec![0, 21],
-        "a team admitted only by the seed still admits its first row"
-    );
+    // Content-targeted: a team admitted only by the seed still admits its
+    // first row, however many settling frames interleave before it.
+    live_until(&mut alice, "docs", &mut replica, &[0, 21], DELIVERY).await;
 
     // A team she never joined stays out, so the seed admitted one team rather
     // than everything.
