@@ -456,9 +456,16 @@ jobs:
           rm -rf target/tmp
 
   browser-tests:
-    name: Browser tests
+    name: Browser tests ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A shard compiles the stack (cached below) and runs a quarter of the
+    # suites, each against its own machine-local stack, so the serial rule
+    # inside one process holds while the wall clock divides by four.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
 
@@ -472,6 +479,19 @@ jobs:
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             dl-${{ runner.os }}-
+
+      # The stack builds three graphs (the debug harness, the release server
+      # and client test binaries, and the shared wasm tree in target-wasm),
+      # which dominated the old 40-minute job. Warm shards skip all three.
+      - name: Cache browser build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            target
+            target-wasm
+          key: t-browser-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            t-browser-${{ runner.os }}-
 
       - name: Install stable browser toolchain
         run: rustup toolchain install stable --profile minimal
@@ -491,14 +511,72 @@ jobs:
         run: |
           cargo +stable run \
             -p connetto-test-harness \
-            --bin connetto-browser-stack
+            --bin connetto-browser-stack \
+            -- \
+            --shard ${{ matrix.shard }}/4
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf target/debug/incremental
+          rm -rf target/release/incremental
+          rm -rf target-wasm/wasm32-unknown-unknown/debug/incremental
+          rm -rf target-wasm/debug/incremental
+          rm -rf target/tmp
+
+  passkey-gate:
+    name: Passkey gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Cache passkey build output
+        uses: actions/cache@v6
+        with:
+          path: examples/webauthn-unlock/target
+          key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            t-passkey-${{ runner.os }}-
+
+      - name: Install stable browser toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown --toolchain stable
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.14.0
+
+      - name: Configure ChromeDriver
+        run: |
+          echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
+          echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
 
       # The R23 passkey gate's end-to-end driver. It lives in a workspace the
       # root excludes, so no other job can reach it, and it needs the wasm
-      # package on disk before it can drive a browser at it.
+      # package on disk before it can drive a browser at it. It serves its
+      # own page and spawns no stack services, so it runs beside the shards.
       - name: Build the passkey demo package
         run: wasm-pack build examples/webauthn-unlock --target web
 
       - name: Run the passkey gate driver
         working-directory: examples/webauthn-unlock
         run: cargo +stable test --release --test webauthn_unlock
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf examples/webauthn-unlock/target/release/incremental
+          rm -rf examples/webauthn-unlock/target/wasm32-unknown-unknown/release/incremental

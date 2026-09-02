@@ -80,43 +80,96 @@ impl Drop for TaskGuard {
     }
 }
 
+/// One slice of the suite list, `--shard I/N`: this process runs every suite
+/// whose position lands on `index` round-robin, so N separate machines cover
+/// the list exactly once with no shared stack between them. The serial-order
+/// rule inside one process is untouched: each shard still runs its suites
+/// one at a time against its own stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shard {
+    /// 1-based slice index.
+    index: usize,
+    /// Total slice count.
+    count: usize,
+}
+
+impl Shard {
+    fn admits(self, position: usize) -> bool {
+        position % self.count == self.index - 1
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
     require_free(SYNC_BIND)?;
     require_free(AUTH_BIND)?;
 
+    let (shard, command) = cli_arguments()?;
     let server_bin = ensure_server_bin().await?;
     let services = prepare_services(server_bin).await?;
-    let command = cli_command();
 
     if let Some((program, args)) = command {
         let _auth = start_auth_stack(&services).await?;
         let _server = start_sync_server(&services).await?;
         run_process(&program, &args, &services.envs).await?;
     } else {
-        run_verified_topology(&services).await?;
-        wait_until_closed(SYNC_BIND, Duration::from_secs(5)).await;
-        wait_until_closed(AUTH_BIND, Duration::from_secs(5)).await;
+        // The verified-topology pass is one native run, so only the first
+        // shard pays it. A bare invocation is shard 1 of 1 and keeps it.
+        if shard.is_none_or(|shard| shard.index == 1) {
+            run_verified_topology(&services).await?;
+            wait_until_closed(SYNC_BIND, Duration::from_secs(5)).await;
+            wait_until_closed(AUTH_BIND, Duration::from_secs(5)).await;
+        }
         let _auth = start_auth_stack(&services).await?;
         let _server = start_sync_server(&services).await?;
-        run_default_browser_suites(&services).await?;
+        run_default_browser_suites(&services, shard).await?;
     }
 
     Ok(())
 }
 
-fn cli_command() -> Option<(OsString, Vec<OsString>)> {
+/// A program with its arguments to run against the stack instead of the
+/// default suites.
+type StackCommand = (OsString, Vec<OsString>);
+
+/// The optional `--shard I/N` selector, then optionally a [`StackCommand`].
+fn cli_arguments() -> Result<(Option<Shard>, Option<StackCommand>)> {
     let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "--") {
         args.remove(0);
     }
-    if args.is_empty() {
+    let mut shard = None;
+    if args.first().is_some_and(|arg| arg == "--shard") {
+        args.remove(0);
+        let value = args
+            .first()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("--shard needs a value of the form I/N"))?;
+        shard = Some(parse_shard(value)?);
+        args.remove(0);
+        if !args.is_empty() {
+            return Err(anyhow!("--shard applies to the default suites only"));
+        }
+    }
+    let command = if args.is_empty() {
         None
     } else {
         let program = args.remove(0);
         Some((program, args))
+    };
+    Ok((shard, command))
+}
+
+fn parse_shard(value: &str) -> Result<Shard> {
+    let malformed = || anyhow!("--shard wants I/N with 1 <= I <= N, got {value:?}");
+    let (index, count) = value.split_once('/').ok_or_else(malformed)?;
+    let index: usize = index.parse().map_err(|_| malformed())?;
+    let count: usize = count.parse().map_err(|_| malformed())?;
+    if index == 0 || count == 0 || index > count {
+        return Err(malformed());
     }
+    Ok(Shard { index, count })
 }
 
 fn require_free(bind: &str) -> Result<()> {
@@ -310,7 +363,7 @@ async fn run_verified_topology(services: &Services) -> Result<()> {
     run_process(OsStr::new("cargo"), &args, &services.envs).await
 }
 
-async fn run_default_browser_suites(services: &Services) -> Result<()> {
+async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -> Result<()> {
     // A suite that never reports leaves the runner waiting, so the children
     // carry their own deadline unless the caller already set one.
     let mut envs = services.envs.clone();
@@ -350,6 +403,21 @@ async fn run_default_browser_suites(services: &Services) -> Result<()> {
         suite_args.push(per_test_args("examples/wasm-smoke", test));
     }
 
+    let total = suite_args.len();
+    if let Some(shard) = shard {
+        suite_args = suite_args
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| shard.admits(*position))
+            .map(|(_, args)| args)
+            .collect();
+        eprintln!(
+            "shard {}/{} runs {} of {total} suites",
+            shard.index,
+            shard.count,
+            suite_args.len()
+        );
+    }
     for args in &suite_args {
         run_browser_suite(args, &envs).await?;
     }
@@ -653,7 +721,7 @@ fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RETRYABLE_SIGNATURES, echo_watching};
+    use super::{RETRYABLE_SIGNATURES, echo_watching, parse_shard};
 
     /// The retry exists for the environment-loss signatures alone, so the
     /// reader has to recognise each among ordinary output and nothing else. A
@@ -673,5 +741,33 @@ mod tests {
             !echo_watching(failed.as_bytes()).await.expect("read"),
             "an ordinary failure is reported, never retried"
         );
+    }
+
+    /// Every suite position lands in exactly one shard, whatever the count,
+    /// so N machines cover the list once with no overlap and no gap.
+    #[test]
+    fn shards_partition_every_position_exactly_once() {
+        for count in 1..=6 {
+            for position in 0..40 {
+                let owners = (1..=count)
+                    .filter(|index| {
+                        parse_shard(&format!("{index}/{count}"))
+                            .expect("a valid shard")
+                            .admits(position)
+                    })
+                    .count();
+                assert_eq!(owners, 1, "position {position} under {count} shards");
+            }
+        }
+    }
+
+    /// The selector accepts only 1-based I/N with I inside N.
+    #[test]
+    fn shard_parsing_refuses_malformed_selectors() {
+        assert!(parse_shard("2/4").is_ok());
+        assert!(parse_shard("1/1").is_ok());
+        for bad in ["0/4", "5/4", "0/0", "x/4", "2", "2/", "/4", "2/4/6"] {
+            assert!(parse_shard(bad).is_err(), "{bad} was accepted");
+        }
     }
 }
