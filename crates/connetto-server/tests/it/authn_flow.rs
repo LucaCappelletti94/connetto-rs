@@ -279,7 +279,11 @@ async fn logout_closes_the_live_connection_it_revoked() {
         "the refresh token names a live session"
     );
 
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Thirty seconds, the delivery-class wait: the close travels through the
+    // revocation hook, a spawned task, and a frame, and five seconds lost
+    // that race on a saturated CI runner (2026-09-02). The contract is that
+    // the connection closes, not that it closes fast.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if let ControlMessage::FatalError(fatal) = next_control(&mut client).await {
                 return fatal;
@@ -342,7 +346,8 @@ async fn token_reuse_closes_the_live_connection_it_revoked() {
         "a replayed refresh token is refused"
     );
 
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Thirty seconds for the same reason as the logout twin above.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if let ControlMessage::FatalError(fatal) = next_control(&mut client).await {
                 return fatal;
