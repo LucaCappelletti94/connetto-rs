@@ -44,6 +44,8 @@ mod offline_start;
 
 mod reconnect_live;
 
+mod residual;
+
 mod retention;
 
 mod revocation;

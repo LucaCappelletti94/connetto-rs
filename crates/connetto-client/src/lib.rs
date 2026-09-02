@@ -525,6 +525,38 @@ pub const DEFAULT_TRIM_BUDGET: u32 = 1000;
 /// evicted, so the last N statistics you watched survive a restart (R83).
 pub const DEFAULT_RESTED_STATISTICS_CAP: usize = 256;
 
+/// Default number of applied rows, summed across tables, at which the
+/// residual pass and its crossing event arm (R60 decision 4). A pass over a
+/// replica this size costs well under a second on any target device.
+pub const DEFAULT_RESIDUAL_THRESHOLD: u64 = 10_000;
+
+/// Who runs the residual eviction pass when the applied-rows measure crosses
+/// its threshold (R60 decision 3). The crossing event is delivered either
+/// way: connetto supplies the signal, this decides who acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidualPass {
+    /// The connection runs [`ConnettoConnection::tidy`] itself at the
+    /// crossing, then resets the measure. The default.
+    #[default]
+    Automatic,
+    /// The application supplants the default: it observes
+    /// [`ClientEvent::TidyDue`] and calls [`ConnettoConnection::tidy`] at a
+    /// moment of its own choosing.
+    Manual,
+}
+
+/// The accumulation measure behind the residual pass (R60 decision 4),
+/// queryable at any time through
+/// [`ConnettoConnection::residual_pressure`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidualPressure {
+    /// Rows applied per table since the last `tidy`, sorted by table name.
+    pub rows_applied: Vec<(String, u64)>,
+    /// Percentage of the replica's pages sitting on the freelist, the same
+    /// ratio the trim gate reads.
+    pub freelist_percent: u8,
+}
+
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -585,6 +617,13 @@ pub struct ClientConfig {
     /// to this device, never a handshake input: the resting table is client
     /// storage. Defaults to [`DEFAULT_RESTED_STATISTICS_CAP`].
     rested_statistics_cap: usize,
+    /// How many applied rows, summed across tables since the last `tidy`, arm
+    /// the residual pass and its crossing event. Local to this device, like
+    /// the trim knobs. Defaults to [`DEFAULT_RESIDUAL_THRESHOLD`].
+    residual_threshold: u64,
+    /// Who runs the residual pass at the crossing. Defaults to
+    /// [`ResidualPass::Automatic`].
+    residual_pass: ResidualPass,
     /// How the key protecting this connection is held. The default is honest
     /// for every native target today: no native gate exists until R51 and R52
     /// land, so reporting anything stronger would claim protection connetto
@@ -609,6 +648,8 @@ impl ClientConfig {
             trim_threshold: DEFAULT_TRIM_THRESHOLD,
             trim_budget: DEFAULT_TRIM_BUDGET,
             rested_statistics_cap: DEFAULT_RESTED_STATISTICS_CAP,
+            residual_threshold: DEFAULT_RESIDUAL_THRESHOLD,
+            residual_pass: ResidualPass::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
         }
     }
@@ -719,6 +760,26 @@ impl ClientConfig {
     #[must_use]
     pub fn with_rested_statistics_cap(mut self, cap: usize) -> Self {
         self.rested_statistics_cap = cap;
+        self
+    }
+
+    /// How many applied rows, summed across tables since the last `tidy`, arm
+    /// the residual pass and [`ClientEvent::TidyDue`]. Defaults to
+    /// [`DEFAULT_RESIDUAL_THRESHOLD`]. A value of zero is clamped to one because
+    /// zero would make `residual_check` fire after every patch, including
+    /// rowless cursor-only ones where no rows changed at all.
+    #[must_use]
+    pub fn with_residual_threshold(mut self, rows: u64) -> Self {
+        self.residual_threshold = rows.max(1);
+        self
+    }
+
+    /// Who runs the residual pass at the threshold crossing. Defaults to
+    /// [`ResidualPass::Automatic`]; [`ResidualPass::Manual`] keeps the
+    /// crossing event and leaves the pass to the application.
+    #[must_use]
+    pub fn with_residual_pass(mut self, pass: ResidualPass) -> Self {
+        self.residual_pass = pass;
         self
     }
 
@@ -895,6 +956,20 @@ pub enum ClientEvent {
     },
     /// Live delivery has resumed after a pause.
     DeliveryResumed,
+    /// The applied-rows measure crossed the configured residual threshold
+    /// (R60): enough rows have arrived since the last `tidy` that a pass is
+    /// worth running. Fires once per crossing and re-arms when a pass resets
+    /// the measure. Under [`ResidualPass::Automatic`] the connection has
+    /// already run the pass, successfully, by the time this is observed: a
+    /// failed pass surfaces as the pump error instead and retries at the
+    /// next apply. Under [`ResidualPass::Manual`] it is the application's
+    /// cue.
+    TidyDue {
+        /// Rows applied across all tables since the last pass, at the
+        /// crossing. The per-table breakdown is
+        /// [`ConnettoConnection::residual_pressure`].
+        rows_applied: u64,
+    },
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -1823,12 +1898,32 @@ where
 /// Install an update hook recording the name of every table whose rows change on
 /// `conn` into the shared `changed` set. Feeds the reactivity signal that tells
 /// the app which tables to re-query.
-fn install_change_tracker(conn: &mut SqliteConnection, changed: &Arc<Mutex<HashSet<String>>>) {
+///
+/// The same hook maintains the residual measure (R60 decision 4): while
+/// `counting` is set, which is exactly while a server patch is being applied,
+/// each changed row of an application table adds one to its table's entry in
+/// `staging`. `apply_patch` merges staging into `applied_rows` only after the
+/// transaction commits, so a rolled-back apply leaves no phantom counts.
+/// One atomic load and one map bump per row, the O(1) the decision asked for.
+fn install_change_tracker(
+    conn: &mut SqliteConnection,
+    changed: &Arc<Mutex<HashSet<String>>>,
+    staging: &Arc<Mutex<HashMap<String, u64>>>,
+    counting: &Arc<AtomicBool>,
+) {
     let sink = Arc::clone(changed);
+    let rows = Arc::clone(staging);
+    let gate = Arc::clone(counting);
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
             if let Ok(mut tables) = sink.lock() {
                 tables.insert(event.table_name.to_owned());
+            }
+            if gate.load(Ordering::Relaxed)
+                && !is_internal_table(event.table_name)
+                && let Ok(mut counts) = rows.lock()
+            {
+                *counts.entry(event.table_name.to_owned()).or_insert(0) += 1;
             }
         }),
     );
@@ -1901,6 +1996,20 @@ pub struct ConnettoConnection<T: Transport> {
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
+    /// Rows applied per application table since the last residual pass, the
+    /// R60 measure. Accumulated via `apply_staging` during each apply and
+    /// merged here only after the transaction commits.
+    applied_rows: Arc<Mutex<HashMap<String, u64>>>,
+    /// Raised for the duration of a server-patch apply, so the hook tallies
+    /// rows into `apply_staging` and never into `applied_rows` directly.
+    apply_counting: Arc<AtomicBool>,
+    /// Staging accumulator for the residual measure: rows are tallied here
+    /// while `apply_counting` is up and merged into `applied_rows` only after
+    /// the transaction commits. Cleared on rollback to leave no phantom counts.
+    apply_staging: Arc<Mutex<HashMap<String, u64>>>,
+    /// Whether [`ClientEvent::TidyDue`] has fired since the measure last
+    /// reset, so a crossing fires once rather than once per frame.
+    residual_warned: bool,
     /// Transaction bookkeeping for the diesel `Connection` impl. The manager
     /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `db`.
     transaction_state: AnsiTransactionManager,
@@ -2111,8 +2220,11 @@ where
         let resume = resume.or_else(|| load_cursor(&mut db));
         let pending = load_pending(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let applied_rows: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let apply_counting = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(false));
-        install_change_tracker(&mut db, &changed);
+        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -2142,6 +2254,10 @@ where
             dirty,
             write_exempt,
             changed,
+            applied_rows,
+            apply_counting,
+            apply_staging,
+            residual_warned: false,
             transaction_state: AnsiTransactionManager::default(),
             pending,
             config: config.clone(),
@@ -3016,17 +3132,24 @@ where
     /// Cancel a subscription (row or aggregate) by its client-assigned id. The
     /// server tolerates an unknown id silently.
     ///
+    /// Connected, the rows the subscription synced are evicted before the
+    /// record goes, the live teardown's order, because a forgotten record
+    /// takes its table out of every later pass's scope and would strand the
+    /// rows for ever. Offline, eviction is barred (a row discarded offline
+    /// cannot be re-fetched, R15 D3), so the record is ended rather than
+    /// forgotten: the next connected attach evicts and then forgets it, and an
+    /// ended record is never replayed as a subscription.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Transport`] when the unsubscribe frame cannot be sent.
     pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        // Dropped from the record first, so a cancellation made offline is not
-        // replayed as a subscription by the next attach.
-        {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            subscriptions::forget(&mut self.db, sub_id)?;
-        }
         if self.is_connected() {
+            self.evict_subscription_rows(sub_id)?;
+            {
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                subscriptions::forget(&mut self.db, sub_id)?;
+            }
             self.wire()?
                 .transport
                 .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -3034,6 +3157,9 @@ where
                 }))
                 .await
                 .map_err(|e| ClientError::Transport(e.to_string()))?;
+        } else {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            subscriptions::end(&mut self.db, sub_id)?;
         }
         Ok(())
     }
@@ -3775,7 +3901,40 @@ where
             self.delete_uncovered(&scope, None, None, &spare)?;
         }
         self.trim_replica()?;
+        // The pass is the residual measure's reset point (R60 decision 4):
+        // counters cleared, crossing event re-armed.
+        if let Ok(mut counts) = self.applied_rows.lock() {
+            counts.clear();
+        }
+        self.residual_warned = false;
         Ok(())
+    }
+
+    /// The accumulation measure (R60 decision 4): rows applied per table
+    /// since the last `tidy`, and the freelist's share of the file the trim
+    /// gate reads. Queryable at any time; [`ClientEvent::TidyDue`] fires when
+    /// the row sum crosses the configured threshold.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the replica's page statistics cannot be read.
+    pub fn residual_pressure(&mut self) -> Result<ResidualPressure, ClientError> {
+        let mut rows_applied: Vec<(String, u64)> = self.applied_rows.lock().map_or_else(
+            |_| Vec::new(),
+            |counts| counts.iter().map(|(t, n)| (t.clone(), *n)).collect(),
+        );
+        rows_applied.sort();
+        let total = self.db.page_count(None)?;
+        let free = self.db.freelist_count(None)?;
+        let freelist_percent = if total > 0 {
+            u8::try_from(free.saturating_mul(100) / total).unwrap_or(100)
+        } else {
+            0
+        };
+        Ok(ResidualPressure {
+            rows_applied,
+            freelist_percent,
+        })
     }
 
     /// Put this replica's own unacknowledged writes back after a replacement
@@ -3843,8 +4002,14 @@ where
             .honour_departures(&bytes, addressed_to)?
             .map(|bytes| self.to_physical(bytes))
             .transpose()?;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        self.db.transaction::<_, ClientError, _>(|conn| {
+        let suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        // The counting gate makes the update hook tally each row into
+        // `apply_staging` (R60 decision 4). Cleared before any error propagates
+        // so a failed apply never leaves the gate up. The staging map merges
+        // into `applied_rows` only after the transaction commits and is cleared
+        // on rollback, so a failed apply leaves no phantom counts.
+        self.apply_counting.store(true, Ordering::Relaxed);
+        let applied = self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,
             // and not recording it would replay the same decision for ever.
@@ -3856,7 +4021,53 @@ where
                 persist_cursor(conn, cursor)?;
             }
             Ok(())
-        })
+        });
+        self.apply_counting.store(false, Ordering::Relaxed);
+        drop(suspended);
+        if applied.is_ok() {
+            if let (Ok(mut stage), Ok(mut rows)) =
+                (self.apply_staging.lock(), self.applied_rows.lock())
+            {
+                for (table, n) in stage.drain() {
+                    *rows.entry(table).or_insert(0) += n;
+                }
+            }
+        } else if let Ok(mut stage) = self.apply_staging.lock() {
+            stage.clear();
+        }
+        applied?;
+        self.residual_check()
+    }
+
+    /// After a server patch lands: run the pass under
+    /// [`ResidualPass::Automatic`] when the applied-rows sum crosses the
+    /// configured threshold, then fire [`ClientEvent::TidyDue`], once per
+    /// crossing (R60 decision 3). A failed automatic pass queues nothing and
+    /// re-arms, so the event never claims a pass that did not happen and the
+    /// next apply retries. `tidy` resets the measure and re-arms the event,
+    /// whoever calls it.
+    fn residual_check(&mut self) -> Result<(), ClientError> {
+        if self.residual_warned {
+            return Ok(());
+        }
+        let total: u64 = self
+            .applied_rows
+            .lock()
+            .map_or(0, |counts| counts.values().sum());
+        if total < self.config.residual_threshold {
+            return Ok(());
+        }
+        self.residual_warned = true;
+        if self.config.residual_pass == ResidualPass::Automatic
+            && let Err(err) = self.tidy()
+        {
+            self.residual_warned = false;
+            return Err(err);
+        }
+        self.notices.push_back(ClientEvent::TidyDue {
+            rows_applied: total,
+        });
+        Ok(())
     }
 
     /// Rewrite a payload from the wire's logical names onto the replica's

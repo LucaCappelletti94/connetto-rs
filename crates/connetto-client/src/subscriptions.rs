@@ -519,6 +519,27 @@ pub(crate) fn unpin(db: &mut SqliteConnection, name: &str) -> Result<(), ClientE
     Ok(())
 }
 
+/// End `sub_id` immediately: no pin, no grace, but the record stays. An
+/// offline cancellation cannot evict the rows it strands (they could not be
+/// re-fetched), so the record is kept for the next connected attach, whose
+/// ended-record branch evicts and then forgets it. An ended record is never
+/// replayed as a subscription, which preserves what forget-first bought.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica rejects the write.
+pub(crate) fn end(db: &mut SqliteConnection, sub_id: &str) -> Result<(), ClientError> {
+    let now = now_secs(db)?;
+    diesel::update(subscription::table.filter(subscription::id.eq(sub_id)))
+        .set((
+            subscription::pin_name.eq(None::<String>),
+            subscription::stopped_at.eq(Some(now)),
+            subscription::grace_secs.eq(0_i64),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
 /// Take the pin off `sub_id`, leaving it an ordinary watch.
 fn release_pin(db: &mut SqliteConnection, sub_id: &str) -> Result<(), ClientError> {
     diesel::update(subscription::table.filter(subscription::id.eq(sub_id)))
