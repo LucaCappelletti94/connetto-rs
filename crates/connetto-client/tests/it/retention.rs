@@ -548,9 +548,10 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
 /// pinning is the client contract that made the defect expensive and that
 /// remains correct for a genuinely filterless row subscription: `SELECT *`
 /// with no filter receives every insert, and `tidy` evicts none of them,
-/// because an absent filter is a claim on the whole table. The final
-/// unsubscribe-and-tidy is the internal control proving the pass was live and
-/// it was precisely the subscription holding the rows.
+/// because an absent filter is a claim on the whole table. The final raw
+/// unsubscribe is the internal control proving it was precisely the
+/// subscription holding the rows, and the R60 step 4 proof that the raw API
+/// reclaims on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothing() {
     let (mut server, client_end) = loopback();
@@ -623,18 +624,139 @@ async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothin
         "tidy removed nothing: the absent filter marks the whole table untouchable",
     );
 
-    // The control, the rotation pattern: replace the latest-N subscription
-    // with a narrow filtered one on the same table, keeping the table in the
-    // eviction scope, and the same pass now evicts everything but that row.
+    // The control, rewritten on the raw API (R60 step 4): keep one narrow
+    // survivor on the table and raw-unsubscribe the filterless subscription.
+    // The unsubscribe itself evicts what its subscription synced, sparing what
+    // the survivor covers, with no tidy in between.
     conn.subscribe("w2", "SELECT * FROM orders WHERE id = 8")
         .await
         .expect("subscribe control");
     pump_to_snapshot_end(&mut conn).await;
     conn.unsubscribe("w").await.expect("unsubscribe");
-    conn.tidy().expect("tidy after rotation");
     assert_eq!(
         replica_ids(&mut conn),
         vec![8],
-        "the control: with a real filter in place of the absent one, the same pass evicts 22 of 23 rows, so it was the absent filter alone holding them",
+        "raw unsubscribe evicts 22 of 23 rows on its own, sparing the survivor's row, so it was the absent filter alone holding them",
+    );
+}
+
+/// R60 step 4, the stranding fix at its sharpest: raw-unsubscribing the only
+/// subscription naming a table reclaims everything it synced, even though the
+/// table then leaves every later pass's scope. Before the fix this exact
+/// sequence left the rows on the replica forever, invisible to `tidy`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_unsubscribe_reclaims_what_its_subscription_synced() {
+    let server = snapshot_server(vec![(
+        "w",
+        vec![(1, "x".into()), (2, "x".into()), (3, "x".into())],
+        1,
+    )]);
+    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config(), None)
+        .await
+        .expect("connect");
+    conn.subscribe("w", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(replica_ids(&mut conn), vec![1, 2, 3]);
+
+    conn.unsubscribe("w").await.expect("unsubscribe");
+    assert!(
+        replica_ids(&mut conn).is_empty(),
+        "the rows go with the subscription, with no survivor and no tidy call",
+    );
+    assert!(
+        conn.declared_subscriptions()
+            .expect("read the declared set")
+            .is_empty(),
+        "and the record goes with them",
+    );
+}
+
+/// R60 step 4's offline half: an offline cancellation cannot evict (a row
+/// discarded offline could not be re-fetched, R15 D3), so `unsubscribe` ends
+/// the record instead of forgetting it, and the next connected attach evicts
+/// the rows, drops the record, and never resurrects the subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offline_unsubscribe_defers_eviction_to_the_next_connected_attach() {
+    // A server that answers the one subscription, then hangs up when the
+    // client confirms delivery with a ping: dropping the peer earlier would
+    // race the queued snapshot frames out of the client's reach.
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        while let Ok(Some(frame)) = server.recv().await {
+            match frame {
+                IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
+                    send_snapshot(&mut server, &sub.sub_id, &[(1, "x"), (2, "x"), (3, "x")], 1)
+                        .await;
+                }
+                IncomingFrame::Control(ControlMessage::Ping(_)) => return,
+                _ => {}
+            }
+        }
+    });
+    let mut conn =
+        ConnettoConnection::connect(client_end, &Replica::in_memory(), DDL, &config(), None)
+            .await
+            .expect("connect");
+    conn.subscribe("w", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(replica_ids(&mut conn), vec![1, 2, 3]);
+    conn.ping(1).await.expect("ping");
+
+    // The server going away takes the connection offline.
+    loop {
+        match conn.pump_one().await {
+            Ok(ClientEvent::Closed) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    assert!(!conn.is_connected(), "the peer is gone");
+
+    conn.unsubscribe("w").await.expect("offline unsubscribe");
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![1, 2, 3],
+        "offline, nothing is evicted: a row discarded here could not be re-fetched",
+    );
+    assert_eq!(
+        conn.declared_subscriptions()
+            .expect("read the declared set")
+            .len(),
+        1,
+        "the ended record stays for the next connected pass",
+    );
+
+    // A server turns up. The attach must retire the ended record, evict its
+    // rows, and never re-subscribe it.
+    let (mut server, client_end) = loopback();
+    let resubscribed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = resubscribed.clone();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        while let Ok(Some(frame)) = server.recv().await {
+            if let IncomingFrame::Control(ControlMessage::Subscribe(sub)) = frame {
+                seen.lock().expect("subscribes lock").push(sub.sub_id);
+            }
+        }
+    });
+    conn.attach(client_end).await.expect("attach");
+
+    assert!(
+        replica_ids(&mut conn).is_empty(),
+        "the first connected moment evicts what the offline cancellation could not",
+    );
+    assert!(
+        conn.declared_subscriptions()
+            .expect("read the declared set")
+            .is_empty(),
+        "and then the record goes",
+    );
+    assert!(
+        resubscribed.lock().expect("subscribes lock").is_empty(),
+        "an ended record is never replayed as a subscription",
     );
 }

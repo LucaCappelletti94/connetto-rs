@@ -2475,10 +2475,10 @@ where
             if state.wire.iter().any(|w| w.wire_id == sub_id && w.refs > 0) {
                 continue;
             }
-            // Evict scoped to this subscription's tables before the record goes,
-            // sparing rows a survivor or a pending write still wants.
-            state.conn.evict_subscription_rows(&sub_id)?;
             state.wire.retain(|w| w.wire_id != sub_id);
+            // The raw unsubscribe evicts scoped to this subscription's tables
+            // before the record goes, sparing rows a survivor or a pending
+            // write still wants.
             state.conn.unsubscribe(&sub_id).await?;
         }
     }
