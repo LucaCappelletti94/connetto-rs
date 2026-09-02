@@ -314,13 +314,7 @@ async fn a_membership_change_moves_rows_without_a_resync() {
     fixture
         .exec("INSERT INTO team_members (team_id, member) VALUES (2, 'alice')")
         .await;
-    let patch = live_for(&mut alice, "docs", DELIVERY).await;
-    replica.apply(&patch.patchset_zstd);
-    assert_eq!(
-        replica.ids(),
-        vec![0, 11, 21, 22],
-        "joining team 2 moves its rows in"
-    );
+    live_until(&mut alice, "docs", &mut replica, &[0, 11, 21, 22], DELIVERY).await;
     assert!(
         alice.try_resync("docs", QUIET).await.is_none(),
         "a membership change must move rows without a resync (decision 2)"
@@ -338,13 +332,7 @@ async fn a_membership_change_moves_rows_without_a_resync() {
     fixture
         .exec("DELETE FROM team_members WHERE team_id = 2 AND member = 'alice'")
         .await;
-    let patch = live_for(&mut alice, "docs", DELIVERY).await;
-    replica.apply(&patch.patchset_zstd);
-    assert_eq!(
-        replica.ids(),
-        vec![0, 11],
-        "leaving team 2 takes its rows off the device"
-    );
+    live_until(&mut alice, "docs", &mut replica, &[0, 11], DELIVERY).await;
     assert!(
         alice.try_resync("docs", QUIET).await.is_none(),
         "a membership removal must withdraw rows without a resync (decision 2)"
@@ -484,13 +472,7 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
     fixture
         .exec("INSERT INTO team_members (team_id, member) VALUES (2, 'alice')")
         .await;
-    let patch = live_for(&mut alice, "docs", DELIVERY).await;
-    replica.apply(&patch.patchset_zstd);
-    assert_eq!(
-        replica.ids(),
-        vec![11, 21],
-        "a move-in delivers only rows the policy admits"
-    );
+    live_until(&mut alice, "docs", &mut replica, &[11, 21], DELIVERY).await;
     assert!(
         alice.try_resync("docs", QUIET).await.is_none(),
         "the move-in must not re-snapshot"
@@ -566,13 +548,7 @@ async fn a_direct_caller_comparison_registers_and_self_seeds() {
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (53, 'alice', 1, 'new')")
         .await;
-    let patch = live_for(&mut alice, "mine", DELIVERY).await;
-    replica.apply(&patch.patchset_zstd);
-    assert_eq!(
-        replica.ids(),
-        vec![51, 53],
-        "the caller's own insert arrives"
-    );
+    live_until(&mut alice, "mine", &mut replica, &[51, 53], DELIVERY).await;
 
     // One owned by somebody else stays silent.
     fixture
