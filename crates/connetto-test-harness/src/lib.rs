@@ -187,37 +187,41 @@ pub fn isolated_session_keyring() {}
 /// process is using is minutes old, never hours. A container whose stamp is
 /// missing or unreadable comes from an older build of this harness and goes.
 fn sweep_abandoned_containers() {
-    static SWEPT: LazyLock<()> = LazyLock::new(|| {
-        let Ok(listed) = Command::new("docker")
-            .args([
-                "ps",
-                "-a",
-                "--filter",
-                &format!("label={CONTAINER_LABEL}"),
-                "--format",
-                "{{.ID}} {{.Labels}}",
-            ])
-            .output()
-        else {
-            return;
-        };
-        let now = now_secs();
-        for line in String::from_utf8_lossy(&listed.stdout).lines() {
-            let Some((id, labels)) = line.split_once(' ') else {
-                continue;
-            };
-            let started = labels
-                .split(',')
-                .find_map(|label| label.strip_prefix(STARTED_LABEL)?.strip_prefix('='))
-                .and_then(|stamp| stamp.parse::<u64>().ok())
-                .unwrap_or(0);
-            if now.saturating_sub(started) < STALE_AFTER.as_secs() {
-                continue;
-            }
-            let _ = Command::new("docker").args(["rm", "-f", id]).output();
-        }
-    });
+    static SWEPT: LazyLock<()> = LazyLock::new(remove_abandoned_containers);
     LazyLock::force(&SWEPT);
+}
+
+/// The sweep itself. A container goes with its anonymous volume: `docker rm`
+/// alone leaves the volume the image's `VOLUME` declaration created.
+fn remove_abandoned_containers() {
+    let Ok(listed) = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={CONTAINER_LABEL}"),
+            "--format",
+            "{{.ID}} {{.Labels}}",
+        ])
+        .output()
+    else {
+        return;
+    };
+    let now = now_secs();
+    for line in String::from_utf8_lossy(&listed.stdout).lines() {
+        let Some((id, labels)) = line.split_once(' ') else {
+            continue;
+        };
+        let started = labels
+            .split(',')
+            .find_map(|label| label.strip_prefix(STARTED_LABEL)?.strip_prefix('='))
+            .and_then(|stamp| stamp.parse::<u64>().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(started) < STALE_AFTER.as_secs() {
+            continue;
+        }
+        let _ = Command::new("docker").args(["rm", "-f", "-v", id]).output();
+    }
 }
 
 /// Build the admin pool, retrying while the server finishes starting.
@@ -1276,4 +1280,119 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use std::process::Command;
+
+    use super::{CONTAINER_LABEL, STARTED_LABEL, now_secs, remove_abandoned_containers};
+
+    fn docker(args: &[&str]) -> std::process::Output {
+        Command::new("docker")
+            .args(args)
+            .output()
+            .expect("run docker")
+    }
+
+    fn container_exists(id: &str) -> bool {
+        docker(&["inspect", "--format", "{{.Id}}", id])
+            .status
+            .success()
+    }
+
+    fn volume_exists(name: &str) -> bool {
+        docker(&["volume", "inspect", name]).status.success()
+    }
+
+    /// The anonymous volumes the image's `VOLUME` declaration gave a container.
+    fn volumes_of(id: &str) -> Vec<String> {
+        let out = docker(&[
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
+            id,
+        ]);
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Removes containers and volumes when dropped, so a failed assertion
+    /// cannot strand what the sweep exists to prevent. `Drop` is infallible.
+    struct Cleanup {
+        containers: Vec<String>,
+        volumes: Vec<String>,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for c in &self.containers {
+                let _ = Command::new("docker").args(["rm", "-f", "-v", c]).output();
+            }
+            for v in &self.volumes {
+                let _ = Command::new("docker")
+                    .args(["volume", "rm", "-f", v])
+                    .output();
+            }
+        }
+    }
+
+    fn create(started: &str) -> String {
+        let out = docker(&[
+            "create",
+            "--label",
+            &format!("{CONTAINER_LABEL}=postgres"),
+            "--label",
+            &format!("{STARTED_LABEL}={started}"),
+            &format!("{}:{}", super::POSTGRES_IMAGE, super::POSTGRES_TAG),
+        ]);
+        assert!(
+            out.status.success(),
+            "docker create: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// `docker rm` without `-v` strands the anonymous volume the image
+    /// declares, so a swept container must go together with its volume,
+    /// while a container a concurrent run is using is left alone.
+    #[test]
+    fn sweep_removes_an_abandoned_container_with_its_volume_and_keeps_a_live_one() {
+        let mut cleanup = Cleanup {
+            containers: vec![create("0")],
+            volumes: Vec::new(),
+        };
+        cleanup.volumes = volumes_of(&cleanup.containers[0]);
+        cleanup.containers.push(create(&now_secs().to_string()));
+        let [abandoned, live] = cleanup.containers.as_slice() else {
+            unreachable!("two ids")
+        };
+        assert!(
+            !cleanup.volumes.is_empty(),
+            "the image declares a volume; none was created"
+        );
+
+        remove_abandoned_containers();
+
+        assert!(
+            !container_exists(abandoned),
+            "a container stamped at the epoch was not swept"
+        );
+        let stranded: Vec<&String> = cleanup
+            .volumes
+            .iter()
+            .filter(|v| volume_exists(v))
+            .collect();
+        assert!(
+            stranded.is_empty(),
+            "the sweep left the swept container's volume behind: {stranded:?}"
+        );
+        assert!(
+            container_exists(live),
+            "a container stamped just now was swept: a sibling run would lose its server"
+        );
+    }
 }
