@@ -34,7 +34,7 @@ use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID}
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
@@ -1524,7 +1524,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
@@ -1554,7 +1554,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar_row(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kinds: &[BuiltinKind],
+        _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
@@ -1942,7 +1942,7 @@ impl AsyncConnector for GatedSeed {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
@@ -1964,7 +1964,7 @@ impl AsyncConnector for GatedSeed {
     fn execute_scalar_row(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kinds: &[BuiltinKind],
+        _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,

@@ -48,7 +48,7 @@ use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
 use subql::backend::{
-    BuiltinKind, CdcEvent, Postgres, RowKind, Value as PgValue, encode_value_key,
+    CdcEvent, Postgres, RowKind, ScalarFamily, Value as PgValue, encode_value_key,
 };
 use subql::emit::{
     WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
@@ -383,7 +383,7 @@ pub enum SeedPlan {
         /// later triggers run.
         query: subql::reexec::BoundQuery<Postgres>,
         /// Decode hint for the scalar result.
-        kind: BuiltinKind,
+        kind: ScalarFamily,
     },
     /// A grouped extreme or a row read tier: the engine bootstraps it through
     /// its own connector inside [`Materializer::bootstrap_computed`].
@@ -704,11 +704,11 @@ pub struct TermSeed {
 /// in silence. `None` refuses the term instead: an identity that cannot be
 /// read at the column's kind cannot be a member.
 #[must_use]
-pub fn typed_subscriber(identity: &str, kind: BuiltinKind) -> Option<PgValue<Postgres>> {
+pub fn typed_subscriber(identity: &str, kind: ScalarFamily) -> Option<PgValue<Postgres>> {
     match kind {
-        BuiltinKind::String => Some(PgValue::String(identity.to_owned())),
-        BuiltinKind::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
-        BuiltinKind::Int => identity.parse().ok().map(PgValue::Int),
+        ScalarFamily::String => Some(PgValue::String(identity.to_owned())),
+        ScalarFamily::Uuid => uuid::Uuid::parse_str(identity).ok().map(PgValue::Uuid),
+        ScalarFamily::Int => identity.parse().ok().map(PgValue::Int),
         _ => None,
     }
 }
@@ -1143,13 +1143,16 @@ where
             .consumers(event)
             .await
             .map_err(MaterializerError::Dispatch)?;
-        // Drive any reads the event queued: whole-rows captures re-read their
-        // query through the connector when the change stream triggers them.
-        let mut resolved = ResolvedReads::default();
-        self.engine
-            .resolve(|delivery| resolved.push(delivery))
-            .await
-            .map_err(reexec_error)?;
+        // Resolve reads queued by this event. `pending_read_count` is the
+        // signal: non-zero means whole-row captures, scalar extremes, or keyed
+        // rows need a database round-trip. The notifications' rows_updates and
+        // row_deltas are always empty (the inner engine holds no connector);
+        // resolved data arrives only through resolve_collect.
+        let resolved = if self.engine.pending_read_count() > 0 {
+            self.engine.resolve_collect().await.map_err(reexec_error)?
+        } else {
+            ResolvedReads::default()
+        };
         Self::log_transitions(&resolved.transitions);
         let cursor = event
             .checkpoint()
@@ -1162,9 +1165,7 @@ where
             resolved.aggregate_updates,
             notifications.scalar_updates,
             resolved.scalar_updates,
-            notifications.rows_updates,
             resolved.rows_updates,
-            notifications.row_deltas,
             resolved.row_deltas,
             &cursor,
         );
@@ -1235,17 +1236,14 @@ where
     }
 
     /// Build the computed-result changes from a dispatch's immediate results
-    /// plus the connector reads that the dispatch queued and `resolve` executed.
-    #[allow(clippy::too_many_arguments)]
+    /// plus the connector reads that the dispatch resolved.
     fn computed_changes(
         agg_updates: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
         resolved_agg: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
         scalar_updates: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
         resolved_scalar: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
         rows_updates: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
-        resolved_rows: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
         row_deltas: Vec<subql::reexec::RowDelta<DefaultIds, Postgres, subql::PgLsn>>,
-        resolved_deltas: Vec<subql::reexec::RowDelta<DefaultIds, Postgres, subql::PgLsn>>,
         cursor: &[u8],
     ) -> Vec<ComputedChange> {
         let mut computed = Vec::new();
@@ -1263,9 +1261,8 @@ where
                 cursor: cursor.to_vec(),
             });
         }
-        let all_rows: Vec<_> = rows_updates.into_iter().chain(resolved_rows).collect();
-        computed.extend(Self::rows_changes(all_rows, cursor));
-        for delta in row_deltas.into_iter().chain(resolved_deltas) {
+        computed.extend(Self::rows_changes(rows_updates, cursor));
+        for delta in row_deltas {
             computed.push(ComputedChange {
                 subscription_id: delta.subscription_id,
                 consumer_id: delta.consumer_id,
@@ -1971,24 +1968,27 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
 ///
 /// The JSON type per variant matches what [`value_to_json`] produces for the
 /// equivalent Postgres value on the scalar re-execution path:
-/// - `Count` → JSON integer (same as `PgValue::Int`)
+/// - `CountStar`/`CountColumn` → JSON integer (same as `PgValue::Int`)
 /// - `Sum`/`Avg` with `Integer` → JSON integer (same as `PgValue::Int`)
 /// - `Sum`/`Avg` with `Decimal` → JSON string (same as `PgValue::Decimal`)
-/// - `Sum`/`Avg` with `Double` and `Real` → JSON float (same as `PgValue::Float`)
-/// - any `None` → JSON null (no rows contributed; SQL returns NULL for empty SUM)
+/// - `Sum`/`Avg`/`VarPop`/`VarSamp`/`StddevPop`/`StddevSamp` with `Double` → JSON float
+/// - any `None` → JSON null (no rows contributed; SQL returns NULL for an empty aggregate)
 ///
-/// A non-finite `Double` or `Real` (infinity, `NaN`) becomes a JSON string of
-/// its IEEE representation so no real aggregate value is silently discarded.
+/// A non-finite double (infinity, `NaN`) becomes a JSON string of its IEEE
+/// representation so no real aggregate value is silently discarded.
 pub(crate) fn agg_value_to_json(value: AggValue) -> String {
     let json = match value {
-        AggValue::Count(c) => serde_json::Value::from(c),
+        AggValue::CountStar(c) | AggValue::CountColumn(c) => serde_json::Value::from(c),
         AggValue::Sum(Some(NumericValue::Integer(i)))
         | AggValue::Avg(Some(NumericValue::Integer(i))) => serde_json::Value::from(i),
         AggValue::Sum(Some(NumericValue::Decimal(d)))
         | AggValue::Avg(Some(NumericValue::Decimal(d))) => serde_json::Value::String(d.to_string()),
         AggValue::Sum(Some(NumericValue::Double(f)))
         | AggValue::Avg(Some(NumericValue::Double(f)))
-        | AggValue::Real(Some(f)) => {
+        | AggValue::VarPop(Some(f))
+        | AggValue::VarSamp(Some(f))
+        | AggValue::StddevPop(Some(f))
+        | AggValue::StddevSamp(Some(f)) => {
             if f.is_finite() {
                 serde_json::Number::from_f64(f)
                     .map_or(serde_json::Value::Null, serde_json::Value::Number)
@@ -1998,7 +1998,12 @@ pub(crate) fn agg_value_to_json(value: AggValue) -> String {
                 serde_json::Value::String(f.to_string())
             }
         }
-        AggValue::Sum(None) | AggValue::Avg(None) | AggValue::Real(None) => serde_json::Value::Null,
+        AggValue::Sum(None)
+        | AggValue::Avg(None)
+        | AggValue::VarPop(None)
+        | AggValue::VarSamp(None)
+        | AggValue::StddevPop(None)
+        | AggValue::StddevSamp(None) => serde_json::Value::Null,
     };
     json.to_string()
 }
@@ -2233,9 +2238,12 @@ mod wire_contract {
 
     #[test]
     fn agg_value_to_json_matches_wire_contract() {
-        // COUNT is a JSON integer.
-        assert_eq!(agg_value_to_json(AggValue::Count(0)), "0");
-        assert_eq!(agg_value_to_json(AggValue::Count(1)), "1");
+        // COUNT(*): rows matched, never NULL, always a JSON integer.
+        assert_eq!(agg_value_to_json(AggValue::CountStar(0)), "0");
+        assert_eq!(agg_value_to_json(AggValue::CountStar(1)), "1");
+        // COUNT(col): non-null row count, same wire shape as CountStar.
+        assert_eq!(agg_value_to_json(AggValue::CountColumn(0)), "0");
+        assert_eq!(agg_value_to_json(AggValue::CountColumn(42)), "42");
 
         // SUM over an empty table is null, matching SQL and the scalar path.
         assert_eq!(agg_value_to_json(AggValue::Sum(None)), "null");
@@ -2251,7 +2259,6 @@ mod wire_contract {
             "9007199254740993",
         );
         // SUM over a decimal column is a JSON string, preserving exactness.
-        // The inner type is inferred from NumericValue::Decimal; no direct bigdecimal dep.
         let precise = "123456789.1234567890123456789"
             .parse()
             .expect("parse decimal");
@@ -2273,7 +2280,6 @@ mod wire_contract {
         // AVG over an empty table is null (undefined for an empty set).
         assert_eq!(agg_value_to_json(AggValue::Avg(None)), "null");
         // AVG with a decimal result is a JSON string.
-        // Type inferred from NumericValue::Decimal.
         let avg_decimal = "15.0000000000000000".parse().expect("parse avg decimal");
         assert_eq!(
             agg_value_to_json(AggValue::Avg(Some(NumericValue::Decimal(avg_decimal)))),
@@ -2285,14 +2291,32 @@ mod wire_contract {
             "15.0",
         );
 
-        // Real (variance, stddev) with a finite value is a JSON float.
-        assert_eq!(agg_value_to_json(AggValue::Real(Some(2.5))), "2.5");
-        // Real with a non-finite value surfaces as a JSON string, not null.
+        // VAR_POP: population variance. Each variant is now distinct so a
+        // consumer can tell them apart (VarPop(1.0) != StddevPop(1.0) on the
+        // wire even though their payloads over rows 5 and 7 are byte-identical).
+        assert_eq!(agg_value_to_json(AggValue::VarPop(Some(1.0))), "1.0");
+        assert_eq!(agg_value_to_json(AggValue::VarPop(None)), "null");
         assert_eq!(
-            agg_value_to_json(AggValue::Real(Some(f64::NEG_INFINITY))),
+            agg_value_to_json(AggValue::VarPop(Some(f64::NEG_INFINITY))),
             "\"-inf\"",
         );
-        assert_eq!(agg_value_to_json(AggValue::Real(None)), "null");
+
+        // VAR_SAMP: sample variance.
+        assert_eq!(agg_value_to_json(AggValue::VarSamp(Some(2.0))), "2.0");
+        assert_eq!(agg_value_to_json(AggValue::VarSamp(None)), "null");
+        assert_eq!(
+            agg_value_to_json(AggValue::VarSamp(Some(f64::INFINITY))),
+            "\"inf\"",
+        );
+
+        // STDDEV_POP: population standard deviation.
+        assert_eq!(agg_value_to_json(AggValue::StddevPop(Some(1.0))), "1.0");
+        assert_eq!(agg_value_to_json(AggValue::StddevPop(None)), "null");
+
+        // STDDEV_SAMP: sample standard deviation. Use a value that is not
+        // close to a named constant so the literal lint does not fire.
+        assert_eq!(agg_value_to_json(AggValue::StddevSamp(Some(3.5))), "3.5");
+        assert_eq!(agg_value_to_json(AggValue::StddevSamp(None)), "null");
     }
 }
 
@@ -2361,7 +2385,7 @@ mod membership_term_tests {
         assert_eq!(membership.pairs[0].column, "project_id");
         assert_eq!(membership.member_table, "project_members");
         assert_eq!(membership.pairs[0].member_key, "project_id");
-        assert_eq!(membership.subject_kind, BuiltinKind::String);
+        assert_eq!(membership.subject_kind, ScalarFamily::String);
         assert_eq!(membership.member_subject, "user_id");
         assert!(
             membership.seed_sql.contains("project_members"),
@@ -2418,20 +2442,20 @@ mod membership_term_tests {
     #[test]
     fn the_subscriber_is_typed_at_the_columns_kind() {
         assert_eq!(
-            typed_subscriber("alice", BuiltinKind::String),
+            typed_subscriber("alice", ScalarFamily::String),
             Some(PgValue::String("alice".to_owned()))
         );
-        assert!(typed_subscriber("alice", BuiltinKind::Uuid).is_none());
-        assert!(typed_subscriber("alice", BuiltinKind::Int).is_none());
+        assert!(typed_subscriber("alice", ScalarFamily::Uuid).is_none());
+        assert!(typed_subscriber("alice", ScalarFamily::Int).is_none());
         assert_eq!(
-            typed_subscriber("42", BuiltinKind::Int),
+            typed_subscriber("42", ScalarFamily::Int),
             Some(PgValue::Int(42))
         );
         assert!(matches!(
-            typed_subscriber("0193c8e5-1111-7abc-8def-000000000000", BuiltinKind::Uuid),
+            typed_subscriber("0193c8e5-1111-7abc-8def-000000000000", ScalarFamily::Uuid),
             Some(PgValue::Uuid(_))
         ));
-        assert!(typed_subscriber("alice", BuiltinKind::Bytes).is_none());
+        assert!(typed_subscriber("alice", ScalarFamily::Bytes).is_none());
     }
 
     // Without the deployment's mapping the client's caller function cannot

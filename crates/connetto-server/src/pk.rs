@@ -15,7 +15,7 @@
 //! misses.
 
 use sqlite_diff_rs::Value as WireValue;
-use subql::backend::{BuiltinType, Postgres, ScalarKind, ScalarKindOf, Value};
+use subql::backend::{DeclaredType, Postgres, ScalarKind, ScalarKindOf, Value};
 use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
 
 /// The sqlite-diff value shape carried by an uploaded row image.
@@ -34,7 +34,7 @@ type Wire = WireValue<String, Vec<u8>>;
 /// blob that is not sixteen bytes, keeps the plain storage mapping.
 pub(crate) fn from_wire(value: &Wire, kind: Option<ScalarKindOf<Postgres>>) -> Value<Postgres> {
     match (value, kind) {
-        (WireValue::Blob(blob), Some(ScalarKind::Builtin(BuiltinType::Uuid))) => {
+        (WireValue::Blob(blob), Some(ScalarKind::Builtin(DeclaredType::Uuid))) => {
             uuid_from_blob(blob)
         }
         (WireValue::Null, _) => Value::Null,
@@ -119,9 +119,9 @@ mod tests {
             Wire::Blob(id.as_bytes().to_vec()),
         ];
         let kinds = [
-            Some(ScalarKind::Builtin(BuiltinType::Int(IntWidth::SixtyFour))),
-            Some(ScalarKind::Builtin(BuiltinType::Text(TextWidth::Varying))),
-            Some(ScalarKind::Builtin(BuiltinType::Uuid)),
+            Some(ScalarKind::Builtin(DeclaredType::Int(IntWidth::SixtyFour))),
+            Some(ScalarKind::Builtin(DeclaredType::Text(TextWidth::Varying))),
+            Some(ScalarKind::Builtin(DeclaredType::Uuid)),
         ];
         let read = [
             Value::<Postgres>::Int(7),
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(
             from_wire(
                 &Wire::Blob(id.as_bytes().to_vec()),
-                Some(ScalarKind::Builtin(BuiltinType::Uuid))
+                Some(ScalarKind::Builtin(DeclaredType::Uuid))
             ),
             Value::<Postgres>::Uuid(id),
         );
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(
             from_wire(
                 &Wire::Blob(vec![0, 1, 2]),
-                Some(ScalarKind::Builtin(BuiltinType::Uuid))
+                Some(ScalarKind::Builtin(DeclaredType::Uuid))
             ),
             Value::<Postgres>::Bytes(vec![0, 1, 2]),
         );

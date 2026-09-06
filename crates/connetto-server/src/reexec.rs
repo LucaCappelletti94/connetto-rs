@@ -28,7 +28,7 @@ use core::future::Future;
 use core::time::Duration;
 
 use subql::PgLsn;
-use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
     Snapshot,
@@ -196,7 +196,7 @@ impl AsyncConnector for NoConnector {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>> + Send
     {
