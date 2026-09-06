@@ -1,0 +1,533 @@
+//! Serve tests: absent / uncommitted files answer 404, headers are correct.
+
+use axum::http::StatusCode;
+use connetto_file_server::ticket::{TicketPayload, Verb};
+use tower::ServiceExt;
+
+use crate::fixture::{Pg, build_router, fs_store, make_signer};
+
+#[tokio::test]
+async fn absent_file_answers_404() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id = [9u8; 32];
+    let token = signer
+        .mint(&TicketPayload {
+            file_id,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let id_hex = hex(&file_id);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bad_ticket_answers_404() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, _) = build_router(&pg, fs_store(&dir)).await;
+    let (other_signer, _) = make_signer();
+
+    let file_id = [5u8; 32];
+    let token = other_signer
+        .mint(&TicketPayload {
+            file_id,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let id_hex = hex(&file_id);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "bad ticket must answer 404"
+    );
+}
+
+#[tokio::test]
+async fn expired_ticket_answers_404() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id = [3u8; 32];
+    let token = signer
+        .mint(&TicketPayload {
+            file_id,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() - 1,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let id_hex = hex(&file_id);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "expired ticket must answer 404"
+    );
+}
+
+#[tokio::test]
+async fn write_ticket_on_read_endpoint_answers_404() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id = [4u8; 32];
+    let token = signer
+        .mint(&TicketPayload {
+            file_id,
+            verb: Verb::Write,
+            ceiling: 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let id_hex = hex(&file_id);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "wrong-verb ticket must answer 404"
+    );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Defect 6: empty files
+// ---------------------------------------------------------------------------
+
+/// An empty committed file must serve with 200 and an empty body.
+#[tokio::test]
+async fn empty_file_serves_200_with_empty_body() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let mem = MemStore::new();
+    let manifest = process_file(&[], MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = hex(file_id.as_bytes());
+
+    {
+        use connetto_file_server::FsStore;
+        let fs = FsStore::new(dir.path()).unwrap();
+        for c in manifest.chunks() {
+            let data = mem.read_chunk(&c.hash).await.unwrap();
+            fs.write_chunk(&c.hash, &data).await.unwrap();
+        }
+    }
+
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{file_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "empty file must answer 200");
+    let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+    assert!(body.is_empty(), "empty file body must be empty");
+}
+
+/// A range request on an empty committed file must return 416.
+#[tokio::test]
+async fn empty_file_range_request_answers_416() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let mem = MemStore::new();
+    let manifest = process_file(&[], MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = hex(file_id.as_bytes());
+
+    {
+        use connetto_file_server::FsStore;
+        let fs = FsStore::new(dir.path()).unwrap();
+        for c in manifest.chunks() {
+            let data = mem.read_chunk(&c.hash).await.unwrap();
+            fs.write_chunk(&c.hash, &data).await.unwrap();
+        }
+    }
+
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{file_hex}?t={token}"))
+        .header("range", "bytes=0-0")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "range on empty file must be 416"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Defect 7: streaming serve
+// ---------------------------------------------------------------------------
+
+/// Headers and the first chunk must arrive before the store releases the second
+/// chunk read.  This proves the response is genuinely streamed.
+#[tokio::test]
+async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
+    use crate::fixture::{
+        Pg, connect_admin, gated_read_store, insert_committed_manifest, make_signer,
+    };
+    use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
+    use connetto_file_server::{AppPools, Config, DefaultFileSchema, FsStore, serve};
+    use http_body_util::BodyExt;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let chunk1_data = vec![0xAAu8; 64];
+    let chunk2_data = vec![0xBBu8; 64];
+    let hash1 = ChunkHash::from_bytes(*blake3::hash(&chunk1_data).as_bytes());
+    let hash2 = ChunkHash::from_bytes(*blake3::hash(&chunk2_data).as_bytes());
+
+    // Write chunks to the backing fs store.
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        fs.write_chunk(&hash1, &chunk1_data).await.unwrap();
+        fs.write_chunk(&hash2, &chunk2_data).await.unwrap();
+    }
+
+    // Gated store blocks the 2nd read until gate.notify_one().
+    let (store, _entered, gate) = gated_read_store(FsStore::new(dir.path()).unwrap(), 2);
+
+    let (signer, verifier) = make_signer();
+    // Pg::start() already applied DEPLOYMENT_DDL and FIXTURE_STMTS, so
+    // serve() preflight passes without extra setup.
+    let app = serve::<DefaultFileSchema>(Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.reader_pool().await,
+        },
+        store,
+        verifier,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    })
+    .await
+    .expect("preflight passed in streaming test");
+
+    let file_id = FileId::from_bytes([0xFEu8; 32]);
+    let chunks = vec![
+        ChunkMeta {
+            hash: hash1,
+            len: 64,
+        },
+        ChunkMeta {
+            hash: hash2,
+            len: 64,
+        },
+    ];
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &chunks).await;
+    drop(admin_conn);
+
+    let file_hex = hex(file_id.as_bytes());
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 128,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{file_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Headers arrive before any store read: the response is streamed.
+    assert!(
+        resp.headers().contains_key("etag"),
+        "etag must be present in headers"
+    );
+
+    let mut body = resp.into_body();
+
+    // First chunk arrives without releasing the gate.
+    let frame1 = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("first chunk timed out")
+        .expect("stream error on first chunk")
+        .expect("no frame");
+    let data1 = frame1.into_data().expect("first frame must be data");
+    assert_eq!(&data1[..], &chunk1_data[..], "first chunk must match");
+
+    // Release the gate; second chunk must then arrive.
+    gate.notify_one();
+
+    let frame2 = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("second chunk timed out after gate")
+        .expect("stream error on second chunk")
+        .expect("no second frame");
+    let data2 = frame2.into_data().expect("second frame must be data");
+    assert_eq!(&data2[..], &chunk2_data[..], "second chunk must match");
+}
+// ---------------------------------------------------------------------------
+// Item 4: Content-Length and Accept-Ranges headers
+// ---------------------------------------------------------------------------
+
+/// Proves: a full GET response carries `Content-Length: file_size` and
+/// `Accept-Ranges: bytes` on a non-empty committed file.
+#[tokio::test]
+async fn content_length_present_on_full_response() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"header test payload for full response";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let total: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+
+    let fs = FsStore::new(dir.path()).unwrap();
+    for c in manifest.chunks() {
+        let bytes = mem.read_chunk(&c.hash).await.unwrap();
+        fs.write_chunk(&c.hash, &bytes).await.unwrap();
+    }
+    let mut conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: total + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "full response must be 200");
+    let cl = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("Content-Length must be present and numeric");
+    assert_eq!(cl, total, "Content-Length must equal file size");
+    let ar = resp
+        .headers()
+        .get(axum::http::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .expect("Accept-Ranges must be present");
+    assert_eq!(ar, "bytes", "Accept-Ranges must be 'bytes'");
+}
+
+/// Proves: a partial (ranged) GET response carries `Content-Length: range_size`
+/// and `Accept-Ranges: bytes`.
+#[tokio::test]
+async fn content_length_present_on_partial_response() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"partial response header test payload needs some bytes";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let total: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+    assert!(total >= 10, "test data must be at least 10 bytes");
+
+    let fs = FsStore::new(dir.path()).unwrap();
+    for c in manifest.chunks() {
+        let bytes = mem.read_chunk(&c.hash).await.unwrap();
+        fs.write_chunk(&c.hash, &bytes).await.unwrap();
+    }
+    let mut conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: total + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    // Request bytes 0-4 (5 bytes).
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .header("range", "bytes=0-4")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "ranged response must be 206"
+    );
+    let cl = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("Content-Length must be present and numeric on partial response");
+    assert_eq!(
+        cl, 5,
+        "Content-Length must equal range size (bytes 0-4 = 5 bytes)"
+    );
+    let ar = resp
+        .headers()
+        .get(axum::http::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .expect("Accept-Ranges must be present on partial response");
+    assert_eq!(
+        ar, "bytes",
+        "Accept-Ranges must be 'bytes' on partial response"
+    );
+}
+
+/// Proves: an empty committed file GET response carries `Content-Length: 0`
+/// and `Accept-Ranges: bytes`.
+#[tokio::test]
+async fn content_length_present_on_empty_file_response() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let mem = MemStore::new();
+    let manifest = process_file(&[], MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+
+    let fs = FsStore::new(dir.path()).unwrap();
+    for c in manifest.chunks() {
+        let bytes = mem.read_chunk(&c.hash).await.unwrap();
+        fs.write_chunk(&c.hash, &bytes).await.unwrap();
+    }
+    let mut conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "empty file must answer 200");
+    let cl = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("Content-Length must be present on empty file response");
+    assert_eq!(cl, 0, "Content-Length must be 0 for empty file");
+    let ar = resp
+        .headers()
+        .get(axum::http::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .expect("Accept-Ranges must be present on empty file response");
+    assert_eq!(
+        ar, "bytes",
+        "Accept-Ranges must be 'bytes' on empty file response"
+    );
+}

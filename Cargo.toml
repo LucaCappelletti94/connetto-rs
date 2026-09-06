@@ -8,6 +8,7 @@ members = [
   "crates/connetto-yew",
   "crates/connetto-test-harness",
   "crates/connetto-file-core",
+  "crates/connetto-file-server",
 ]
 exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 
@@ -61,7 +62,7 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # widen the folded grouped path to float and jsonb group columns.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", rev = "c6f75f664d474dfed1a64bf2f0a8c42db9e05923", default-features = false, features = [
+subql = { git = "https://github.com/LucaCappelletti94/subql", branch = "fix/semantic-divergence", default-features = false, features = [
   "std",
 ] }
 

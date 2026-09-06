@@ -264,7 +264,7 @@ fn walk_userset(
             for target in related {
                 walk_relation(
                     types,
-                    &target,
+                    target.as_str(),
                     tuple_to_userset.computed_userset.relation.as_str(),
                     seen,
                     depends,

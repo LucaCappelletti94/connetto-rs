@@ -48,7 +48,10 @@ use subql::backend::{Postgres, Value};
 use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
-use subql::visibility::store::{StoreDiff, StoreDiffError, UncoveredReason};
+use subql::visibility::store::{
+    Enumeration, KeyedRequery, Materialisation, Replay, Replayer, StoreDiff, StoreDiffError,
+    UncoveredReason,
+};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use crate::capability::CapabilityKey;
@@ -485,7 +488,7 @@ impl Translated {
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?;
         let relations = translation.relations().to_vec();
-        let naming = translation.row_naming();
+        let naming = translation.row_naming().to_vec();
         let notes = translation.notes().to_vec();
         let answers = translation.action_relations();
         // Read beside the action report, never instead of it. A table the
@@ -524,18 +527,29 @@ impl Translated {
         let model = outputs.json_model();
         let tuples = outputs.tuple_queries().to_vec();
         let policy_tables = policy_tables(&outputs);
-        drop(outputs);
+        // Borrowed into enumerations below; outputs lives until Shapes::new returns.
+        let enumerations: Vec<Enumeration<'_>> = outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|q| {
+                q.description.as_ref().map(|d| Enumeration {
+                    description: d,
+                    sql: &q.sql,
+                    condition: q.condition.as_deref(),
+                })
+            })
+            .collect();
         // Walked here rather than where it is first read, so a model this
         // cannot follow refuses the boot beside every other startup refusal.
-        let reach = GrantReach::of(&model, &naming, &answers)?;
+        let reach = GrantReach::of(&model, &naming, answers)?;
         // Built once and kept, so the guard below judges the very index the
         // change path will use rather than a copy of it.
         let shapes = Arc::new(
-            Shapes::new::<Postgres>(catalog, &relations)
+            Shapes::new::<Postgres>(catalog, &relations, &enumerations)
                 .with_row_naming(&naming)
-                .with_action_relations(&answers)
+                .with_action_relations(answers)
                 .with_required_parameters(&notes)
-                .with_unrestricted_tables(&open),
+                .with_unrestricted_tables(open),
         );
         // Ask subql which shapes it cannot keep current, rather than guessing
         // from a derivation (R86). The guess was wrong in both directions: it
@@ -583,6 +597,16 @@ impl Translated {
     #[must_use]
     pub fn shapes(self) -> Arc<Shapes<ParserDB>> {
         self.shapes
+    }
+
+    /// A cloned handle to the index every reader of this translation shares.
+    ///
+    /// Use this to build a policy for [`Self::load_into`] before consuming the
+    /// translation with `into_parts`: the Arc clone is cheap, and `load_into`
+    /// still needs `&self` to access the translator.
+    #[must_use]
+    pub fn shapes_arc(&self) -> Arc<Shapes<ParserDB>> {
+        Arc::clone(&self.shapes)
     }
 
     /// Put this translation's rule description on the service, adopting the
@@ -634,22 +658,18 @@ impl Translated {
             .map_err(|err| SetupError::Model(err.to_string()))
     }
 
-    /// Run every query that produces a fact and hand the facts back.
+    /// Run every keyed-fact query from the translation and collect the results.
     ///
-    /// **Raw statements on purpose.** The SQL is emitted by `rls2fga` from the
-    /// deployment's own policies, so there is no schema to express it against
-    /// and no column list connetto could type. What is not guessed is the shape
-    /// of a result row: `TupleQuery::condition` says whether it carries three
-    /// columns or five, and `Outputs::record_from_tuple_row` reads it back, so
-    /// the mapping lives in the crate that emitted the query.
+    /// Whole-shape queries are skipped here because those must be replayed and
+    /// reconciled as a unit; [`Self::load_into`] runs that pass after this one,
+    /// which is why neither pass is exposed alone.
     ///
     /// # Errors
     ///
     /// [`SetupError::Store`] when a query failed or a row it returned does not
     /// spell a fact the model holds, and [`SetupError::Unplannable`] when the
-    /// translation cannot be planned, which startup already refused and this
-    /// re-derivation therefore never meets.
-    pub async fn load_records(
+    /// translation cannot be planned.
+    async fn keyed_records(
         &self,
         pool: &Pool<AsyncPgConnection>,
     ) -> Result<Vec<Record>, SetupError> {
@@ -666,8 +686,20 @@ impl Translated {
             .get()
             .await
             .map_err(|err| SetupError::Store(err.to_string()))?;
+        // Whole-shape queries are loaded through OpenFgaPolicy::materialise at boot;
+        // running them here too would duplicate the work with no correctness gain.
+        let whole_shape_sqls: std::collections::HashSet<&str> = self
+            .shapes
+            .materialisations()
+            .iter()
+            .flat_map(subql::visibility::store::Materialisation::members)
+            .map(Replay::sql)
+            .collect();
         let mut records = Vec::new();
         for query in &self.tuples {
+            if whole_shape_sqls.contains(query.sql.as_str()) {
+                continue;
+            }
             let rows = if query.condition.is_some() {
                 let wide: Vec<WideRow> = sql_query(&query.sql)
                     .load(&mut *conn)
@@ -686,6 +718,44 @@ impl Translated {
         Ok(records)
     }
 
+    /// Load every authorization fact the translation describes into the store
+    /// through `policy`.
+    ///
+    /// **Two passes, one call.** A keyed fact comes back from its own row query
+    /// and is written directly. A whole-shape region has no key and must be
+    /// replayed and reconciled as a unit. A caller that ran only the first pass
+    /// would leave the second silently unloaded, which is the footgun this
+    /// entry point exists to close.
+    ///
+    /// Returns the number of keyed facts written. The whole-shape pass runs
+    /// after and writes through the same policy.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupError::Store`] when a query failed, a row does not spell a valid
+    /// fact, or the store refused a write, and [`SetupError::Unplannable`] when
+    /// the translation cannot be re-derived, which startup already refused.
+    pub async fn load_into<T>(
+        &self,
+        pool: &Pool<AsyncPgConnection>,
+        policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
+    ) -> Result<usize, SetupError>
+    where
+        T: GrpcService<Body> + Clone + Send + Sync + 'static,
+        T::Error: Into<StdError>,
+        T::ResponseBody: ResponseBody<Data = Bytes> + Send + 'static,
+        <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
+        T::Future: Send,
+    {
+        let records = self.keyed_records(pool).await?;
+        policy
+            .write_records(&records)
+            .await
+            .map_err(|err| SetupError::Store(err.to_string()))?;
+        materialise_groups(&self.shapes, &self.translator, pool, policy).await?;
+        Ok(records.len())
+    }
+
     /// The index every reader shares, the translator the materializer's engine
     /// classifies with, and what each kind of fact reaches.
     ///
@@ -701,6 +771,42 @@ impl Translated {
         (self.shapes, translator, reach)
     }
 }
+/// Run the whole-shape materialise pass for the boot sequence.
+///
+/// Keyed facts are gathered first inside [`Translated::load_into`]; this
+/// covers the regions whose producers require a full-group replay.
+///
+/// # Errors
+///
+/// [`SetupError::Unplannable`] when the translation cannot be re-derived, and
+/// [`SetupError::Store`] when a member query fails or the store refuses a write.
+async fn materialise_groups<T>(
+    shapes: &Shapes<ParserDB>,
+    translator: &Translator,
+    pool: &Pool<AsyncPgConnection>,
+    policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
+) -> Result<(), SetupError>
+where
+    T: GrpcService<Body> + Clone + Send + Sync + 'static,
+    T::Error: Into<StdError>,
+    T::ResponseBody: ResponseBody<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
+    T::Future: Send,
+{
+    let outputs = translator
+        .translate(shapes.catalog())
+        .map_err(|err| SetupError::Unplannable(err.to_string()))?
+        .outputs_accepting_gaps();
+    let replayer = ConnettoReplayer {
+        pool,
+        outputs: &outputs,
+    };
+    policy
+        .materialise(shapes.materialisations(), &replayer)
+        .await
+        .map_err(|err| SetupError::Store(err.to_string()))
+        .map(drop)
+}
 
 /// One query's rows, in whichever shape it projects.
 enum TupleRows {
@@ -715,9 +821,9 @@ impl TupleRows {
     ///
     /// The reader belongs to the crate that emitted the query, so what a column
     /// means is stated once rather than guessed here.
-    fn read_into<DB: subql::DatabaseLike>(
+    fn read_into(
         &self,
-        outputs: &rls2fga::translator::Outputs<'_, DB>,
+        outputs: &rls2fga::translator::Outputs,
         records: &mut Vec<Record>,
     ) -> Result<(), SetupError> {
         let read = |row: TupleRow<'_>| {
@@ -822,9 +928,7 @@ struct PlainRow {
 /// `rls2fga`'s refusal path, so a policy that failed to translate cannot leave
 /// a hole in the safety net exactly where one is most wanted. Nothing reaches
 /// here until [`Translated::of`] has refused an untranslated policy.
-fn policy_tables<DB: subql::DatabaseLike>(
-    outputs: &rls2fga::translator::Outputs<'_, DB>,
-) -> Vec<String> {
+fn policy_tables(outputs: &rls2fga::translator::Outputs) -> Vec<String> {
     let mut tables: Vec<String> = outputs
         .tuple_queries()
         .iter()
@@ -863,9 +967,12 @@ fn uncovered_shapes(shapes: &Shapes<ParserDB>) -> Vec<String> {
                 UncoveredReason::NoBoundQuery => {
                     "a change to this table has no query to replay, so nothing states its facts"
                 }
-                UncoveredReason::SharedSlice => {
-                    "another shape states the same slice, so reconciling one would delete the \
-                     other's facts"
+                UncoveredReason::MissingEnumeration => {
+                    "the region has no producer that enumerates all its facts, so the group \
+                     cannot be reconciled"
+                }
+                UncoveredReason::UnknownDerivation => {
+                    "the shape follows from a derivation this version does not understand"
                 }
             };
             format!(
@@ -1046,6 +1153,53 @@ where
     }
 }
 
+/// Runs one whole-shape member's SQL against the deployment's Postgres and
+/// converts the result rows to [`Record`]s via the translation outputs.
+struct ConnettoReplayer<'a> {
+    pool: &'a Pool<AsyncPgConnection>,
+    outputs: &'a rls2fga::translator::Outputs,
+}
+
+impl Replayer for ConnettoReplayer<'_> {
+    type Error = UpkeepError;
+
+    fn replay(
+        &self,
+        member: &Replay,
+    ) -> impl Future<Output = Result<Vec<Record>, Self::Error>> + Send {
+        use diesel_async::RunQueryDsl as _;
+        let pool = self.pool;
+        let outputs = self.outputs;
+        let sql = member.sql().to_owned();
+        let has_condition = member.condition().is_some();
+        async move {
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+            let rows = if has_condition {
+                TupleRows::Conditional(
+                    sql_query(&sql)
+                        .load::<WideRow>(&mut *conn)
+                        .await
+                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                )
+            } else {
+                TupleRows::Plain(
+                    sql_query(&sql)
+                        .load::<PlainRow>(&mut *conn)
+                        .await
+                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                )
+            };
+            let mut records = Vec::new();
+            rows.read_into(outputs, &mut records)
+                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+            Ok(records)
+        }
+    }
+}
+
 impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// Replay every query this difference asks for and reconcile the store
     /// against what came back, reporting what that may have moved.
@@ -1093,66 +1247,114 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             .get()
             .await
             .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+        let replayer = ConnettoReplayer {
+            pool: &self.pool,
+            outputs: &outputs,
+        };
         let mut moves = Vec::new();
         for requery in &diff.requeries {
-            let query = bind_key(sql_query(&requery.query.sql).into_boxed(), &requery.key)?;
-            let rows = if requery.query.condition.is_some() {
-                TupleRows::Conditional(
-                    query
-                        .load(&mut *conn)
+            match requery {
+                subql::visibility::store::Requery::Keyed(k) => {
+                    let query = bind_key(sql_query(k.query.sql()).into_boxed(), &k.key)?;
+                    let rows = if k.query.condition().is_some() {
+                        TupleRows::Conditional(
+                            query
+                                .load(&mut *conn)
+                                .await
+                                .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                        )
+                    } else {
+                        TupleRows::Plain(
+                            query
+                                .load(&mut *conn)
+                                .await
+                                .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                        )
+                    };
+                    let mut records = Vec::new();
+                    rows.read_into(&outputs, &mut records)
+                        .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+                    let report = self
+                        .delegate
+                        .reconcile_records(k, &records)
                         .await
-                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
-                )
-            } else {
-                TupleRows::Plain(
-                    query
-                        .load(&mut *conn)
+                        .map_err(|err| UpkeepError::Write(err.to_string()))?;
+                    tracing::debug!(
+                        added = report.added.len(),
+                        removed = report.removed.len(),
+                        "reconcile report"
+                    );
+                    if !report.added.is_empty() || !report.removed.is_empty() {
+                        moves.extend(self.reached_by_keyed(k));
+                    }
+                }
+                subql::visibility::store::Requery::Whole(m) => {
+                    let reports = self
+                        .delegate
+                        .materialise(std::iter::once(*m), &replayer)
                         .await
-                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
-                )
-            };
-            let mut records = Vec::new();
-            rows.read_into(&outputs, &mut records)
-                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-            let report = self
-                .delegate
-                .reconcile_records(requery, &records)
-                .await
-                .map_err(|err| UpkeepError::Write(err.to_string()))?;
-            tracing::debug!(
-                added = report.added.len(),
-                removed = report.removed.len(),
-                "reconcile report"
-            );
-            if !report.added.is_empty() || !report.removed.is_empty() {
-                moves.extend(self.reached_by(requery));
+                        // A query that cannot run is a replay failure, not the
+                        // store being down, and an operator acts on that
+                        // difference.
+                        .map_err(|err| match err {
+                            subql::visibility::openfga::MaterialiseError::Replay(inner) => inner,
+                            other => UpkeepError::Write(other.to_string()),
+                        })?;
+                    if reports
+                        .iter()
+                        .any(|r| !r.added.is_empty() || !r.removed.is_empty())
+                    {
+                        moves.extend(self.reached_by_whole(m));
+                    }
+                }
             }
         }
         Ok(moves)
     }
 
-    /// The tables a replayed query's slice can have moved, named for the
-    /// replacement notice.
-    fn reached_by(
-        &self,
-        requery: &subql::visibility::store::Requery<'_, Postgres>,
-    ) -> Vec<GrantMove> {
-        let (object_type, relations) = match &requery.query.scope {
+    /// The tables a keyed replay's scope can have moved, named for the replacement notice.
+    fn reached_by_keyed(&self, k: &KeyedRequery<'_, Postgres>) -> Vec<GrantMove> {
+        let mut tables: Vec<String> = match k.query.scope() {
             ReplayScope::Object {
                 object_type,
                 relations,
-            } => (object_type, relations.clone()),
+            } => relations
+                .iter()
+                .flat_map(|r| {
+                    self.reach
+                        .tables_for_type(object_type.as_str(), r.as_str())
+                        .to_vec()
+                })
+                .collect(),
             ReplayScope::Subject {
                 object_type,
                 relation,
                 ..
-            } => (object_type, vec![relation.clone()]),
+            } => self
+                .reach
+                .tables_for_type(object_type.as_str(), relation.as_str())
+                .to_vec(),
         };
-        let mut tables: Vec<String> = relations
+        tables.sort_unstable();
+        tables.dedup();
+        if tables.is_empty() {
+            return Vec::new();
+        }
+        vec![GrantMove {
+            tables,
+            holder: GrantHolder::Everybody,
+        }]
+    }
+
+    /// The tables a whole-shape reconcile can have moved, named for the replacement notice.
+    fn reached_by_whole(&self, m: &Materialisation) -> Vec<GrantMove> {
+        let mut tables: Vec<String> = m
+            .region()
+            .parts()
             .iter()
-            .flat_map(|relation| {
+            .flat_map(|part| {
                 self.reach
-                    .tables_for_type(object_type, relation.as_str())
+                    .tables_for_type(part.object_type(), part.relation().as_str())
                     .to_vec()
             })
             .collect();

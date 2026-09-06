@@ -43,8 +43,13 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # wasm-bindgen-test is unconditional here so the wasm build compiles it.
 # On native the cfg attribute on each test routes to #[test] instead.
 wasm-bindgen-test = "0.3"
+# The README doctest runs on both targets, and tokio has no wasm32 build, so
+# the example drives its future with this executor instead.
+futures-executor = "0.3"
 
 # Proptest forks a subprocess for failure persistence, which is unavailable on
 # wasm32. Gate it to native targets and disable the fork feature explicitly.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Multi-thread runtime for the #[tokio::test] async test runner.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

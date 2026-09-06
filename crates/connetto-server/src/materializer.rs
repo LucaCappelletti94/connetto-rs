@@ -35,7 +35,7 @@ use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use diesel::{QueryableByName, SqliteConnection, sql_query};
-use pg2sqlite::options::Pg2SqliteOptions;
+use pg2sqlite::options::{Pg2SqliteOptions, TranslationContext};
 use pg2sqlite::prelude::ReverseTranslator;
 use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
@@ -54,12 +54,14 @@ use subql::emit::{
     WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
 };
 use subql::patchset::SqliteAdapter;
-use subql::reexec::{AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, RowsUpdate};
+use subql::reexec::{
+    AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, ResolvedReads, RowsUpdate,
+};
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    ChangeEvent, DatabaseLike, DefaultIds, MaintenanceTransition, OpaqueCheckpoint, ParserDB,
-    SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
-    catalog_helpers,
+    AsyncSubscriptionDispatch, ChangeEvent, DatabaseLike, DefaultIds, MaintenanceTransition,
+    NumericValue, OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId,
+    SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
 };
 
 use crate::reexec::ReadBudget;
@@ -646,8 +648,9 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         if let Some(caller) = &self.caller {
             options = options.with_session_variable(caller.clone());
         }
+        let context = TranslationContext::new(&options);
         let pg = statement
-            .reverse_translate(&self.catalog, &options)
+            .reverse_translate(&self.catalog, &context)
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
         Ok(pg.to_string())
     }
@@ -1135,44 +1138,36 @@ where
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
     pub async fn dispatch(&mut self, event: &ChangeEvent) -> Result<Dispatched, MaterializerError> {
-        let notifications = self.engine.consumers(event).await.map_err(reexec_error)?;
+        let notifications = self
+            .engine
+            .consumers(event)
+            .await
+            .map_err(MaterializerError::Dispatch)?;
+        // Drive any reads the event queued: whole-rows captures re-read their
+        // query through the connector when the change stream triggers them.
+        let mut resolved = ResolvedReads::default();
+        self.engine
+            .resolve(|delivery| resolved.push(delivery))
+            .await
+            .map_err(reexec_error)?;
+        Self::log_transitions(&resolved.transitions);
         let cursor = event
             .checkpoint()
             .map(|lsn| lsn.0.to_be_bytes().to_vec())
             .unwrap_or_default();
         Self::log_transitions(&notifications.transitions);
 
-        let mut computed = Vec::new();
-        for update in notifications.aggregate_updates {
-            computed.push(Self::aggregate_change(update, cursor.clone()));
-        }
-        for update in notifications.scalar_updates {
-            computed.push(ComputedChange {
-                subscription_id: update.subscription_id,
-                consumer_id: update.consumer_id,
-                group_key: None,
-                group_values_json: None,
-                result_json: Some(value_to_json(&update.value)),
-                is_full_result: true,
-                cursor: cursor.clone(),
-            });
-        }
-        computed.extend(Self::rows_changes(notifications.rows_updates, &cursor));
-        for delta in notifications.row_deltas {
-            computed.push(ComputedChange {
-                subscription_id: delta.subscription_id,
-                consumer_id: delta.consumer_id,
-                // The key's canonical byte encoding, the same one the engine
-                // uses for group keys, so the client's keyed storage treats
-                // both uniformly. The decoded key travels beside it, keeping
-                // the wire invariant that values accompany every key.
-                group_key: Some(encode_value_key::<Postgres>(&delta.key).unwrap_or_default()),
-                group_values_json: Some(values_json(&delta.key)),
-                result_json: delta.row.map(|row| row_json(&delta.columns, &row)),
-                is_full_result: false,
-                cursor: cursor.clone(),
-            });
-        }
+        let computed = Self::computed_changes(
+            notifications.aggregate_updates,
+            resolved.aggregate_updates,
+            notifications.scalar_updates,
+            resolved.scalar_updates,
+            notifications.rows_updates,
+            resolved.rows_updates,
+            notifications.row_deltas,
+            resolved.row_deltas,
+            &cursor,
+        );
 
         let engine = &notifications.engine;
         // A consumer the engine reports as deleted on an UPDATE did not lose
@@ -1237,6 +1232,53 @@ where
             computed,
             narrowings,
         })
+    }
+
+    /// Build the computed-result changes from a dispatch's immediate results
+    /// plus the connector reads that the dispatch queued and `resolve` executed.
+    #[allow(clippy::too_many_arguments)]
+    fn computed_changes(
+        agg_updates: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
+        resolved_agg: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
+        scalar_updates: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
+        resolved_scalar: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
+        rows_updates: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
+        resolved_rows: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
+        row_deltas: Vec<subql::reexec::RowDelta<DefaultIds, Postgres, subql::PgLsn>>,
+        resolved_deltas: Vec<subql::reexec::RowDelta<DefaultIds, Postgres, subql::PgLsn>>,
+        cursor: &[u8],
+    ) -> Vec<ComputedChange> {
+        let mut computed = Vec::new();
+        for update in agg_updates.into_iter().chain(resolved_agg) {
+            computed.push(Self::aggregate_change(update, cursor.to_vec()));
+        }
+        for update in scalar_updates.into_iter().chain(resolved_scalar) {
+            computed.push(ComputedChange {
+                subscription_id: update.subscription_id,
+                consumer_id: update.consumer_id,
+                group_key: None,
+                group_values_json: None,
+                result_json: Some(value_to_json(&update.value)),
+                is_full_result: true,
+                cursor: cursor.to_vec(),
+            });
+        }
+        let all_rows: Vec<_> = rows_updates.into_iter().chain(resolved_rows).collect();
+        computed.extend(Self::rows_changes(all_rows, cursor));
+        for delta in row_deltas.into_iter().chain(resolved_deltas) {
+            computed.push(ComputedChange {
+                subscription_id: delta.subscription_id,
+                consumer_id: delta.consumer_id,
+                group_key: Some(encode_value_key::<Postgres>(&delta.key).unwrap_or_default()),
+                group_values_json: Some(values_json(&delta.key)),
+                result_json: delta
+                    .row
+                    .map(|row| row_json(&delta.columns, row.as_slice())),
+                is_full_result: false,
+                cursor: cursor.to_vec(),
+            });
+        }
+        computed
     }
 
     /// Collapse re-read pages into one full-result change per subscription.
@@ -1678,7 +1720,8 @@ where
         conn: &mut SqliteConnection,
     ) -> Result<usize, MaterializerError> {
         let bytes = decompress(payload_zstd)?;
-        let adapter = SqliteAdapter::new(&self.catalog);
+        let adapter = SqliteAdapter::new(&self.catalog)
+            .map_err(|e| MaterializerError::Catalog(e.to_string()))?;
         Ok(subql::patchset::apply_diffset_bytes_with_catalog(
             &self.catalog,
             &bytes,
@@ -1719,7 +1762,8 @@ where
         conn: &mut AsyncPgConnection,
     ) -> Result<usize, MaterializerError> {
         let bytes = decompress(payload_zstd)?;
-        let adapter = PgAdapter::new(&self.catalog);
+        let adapter =
+            PgAdapter::new(&self.catalog).map_err(|e| MaterializerError::Catalog(e.to_string()))?;
         Ok(subql::patchset::apply_diffset_bytes_async_with_catalog(
             &self.catalog,
             &bytes,
@@ -1928,9 +1972,33 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
 pub(crate) fn agg_value_to_json(value: AggValue) -> String {
     let json = match value {
         AggValue::Count(c) => serde_json::Value::from(c),
-        AggValue::Sum(s) | AggValue::Real(Some(s)) => serde_json::Number::from_f64(s)
+        // A fold over an integer column arrives as Integer and over a numeric
+        // one as Decimal, but the wire contract for SUM and AVG is a float, so
+        // both render through f64 rather than as an integer or exact string.
+        AggValue::Sum(Some(NumericValue::Integer(i)))
+        | AggValue::Avg(Some(NumericValue::Integer(i))) => i
+            .to_string()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        AggValue::Real(None) => serde_json::Value::Null,
+        AggValue::Sum(Some(NumericValue::Decimal(d)))
+        | AggValue::Avg(Some(NumericValue::Decimal(d))) => d
+            .to_string()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        AggValue::Sum(Some(NumericValue::Double(f)))
+        | AggValue::Avg(Some(NumericValue::Double(f)))
+        | AggValue::Real(Some(f)) => serde_json::Number::from_f64(f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        // SUM over an empty set is 0 (the additive identity), so None renders
+        // as the float zero the client expects.  AVG over an empty set is
+        // undefined, so None stays null for that function.
+        AggValue::Sum(None) => serde_json::Number::from_f64(0.0)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        AggValue::Avg(None) | AggValue::Real(None) => serde_json::Value::Null,
     };
     json.to_string()
 }
@@ -2087,7 +2155,7 @@ mod wire_contract {
     //! that is not mirrored there is a wire break, and this test is the
     //! canary.
 
-    use super::{PgValue, Postgres, value_to_json};
+    use super::{AggValue, NumericValue, PgValue, Postgres, agg_value_to_json, value_to_json};
 
     #[test]
     fn value_to_json_renders_each_scalar_variant() {
@@ -2161,6 +2229,33 @@ mod wire_contract {
             "{\"k\":1}",
         );
         assert_eq!(value_to_json(&PgValue::<Postgres>::Jsonb(doc)), "{\"k\":1}");
+    }
+
+    #[test]
+    fn agg_value_to_json_matches_wire_contract() {
+        // COUNT is an integer, never a float.
+        assert_eq!(agg_value_to_json(AggValue::Count(0)), "0");
+        assert_eq!(agg_value_to_json(AggValue::Count(1)), "1");
+
+        // SUM over an empty table is the additive identity: 0.0.
+        assert_eq!(agg_value_to_json(AggValue::Sum(None)), "0.0");
+        // SUM with rows renders as float regardless of the storage kind.
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Integer(10)))),
+            "10.0",
+        );
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Double(10.0)))),
+            "10.0",
+        );
+
+        // AVG over an empty table is undefined.
+        assert_eq!(agg_value_to_json(AggValue::Avg(None)), "null");
+        // AVG with rows renders as float.
+        assert_eq!(
+            agg_value_to_json(AggValue::Avg(Some(NumericValue::Double(15.0)))),
+            "15.0",
+        );
     }
 }
 

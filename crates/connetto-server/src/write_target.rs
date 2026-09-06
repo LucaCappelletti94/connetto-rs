@@ -203,7 +203,9 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
                             return Ok(conflict_outcome(conflict, row));
                         }
                     }
-                    let adapter = PgAdapter::new(catalog);
+                    let adapter = PgAdapter::new(catalog).map_err(|e| {
+                        CommitError::Probe(MaterializerError::Catalog(e.to_string()))
+                    })?;
                     let affected =
                         apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter)
                             .await?;

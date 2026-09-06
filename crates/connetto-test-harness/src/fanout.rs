@@ -700,23 +700,20 @@ async fn fga_auth(
         .install_model(&mut setup, &store)
         .await
         .expect("the service accepted the rules");
-    let records = translated
-        .load_records(fixture.admin())
-        .await
-        .expect("the generated queries ran");
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        Arc::clone(&shapes),
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts loaded");
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(fixture.admin(), &loader)
+        .await
+        .expect("the generated queries ran and the facts loaded");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     // The questions go through the counted transport and the setup above does
     // not, so the counter reads change-path round trips alone.

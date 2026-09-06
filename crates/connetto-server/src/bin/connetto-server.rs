@@ -871,35 +871,30 @@ async fn build_authorization(
     let model = translated.install_model(&mut setup, &store_id).await?;
     // The rules being new means nothing on the service stands behind them yet.
     // An unchanged description means the facts were loaded on the boot that
-    // wrote it, and the change stream has kept them current since. Read before
-    // the index is built, because both come out of the one translation and the
-    // index consumes it.
-    let load = match &model {
-        ModelState::Written(_) => Some(translated.load_records(reader_pool).await?),
-        ModelState::Adopted(_) => None,
-    };
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    if let Some(records) = load {
-        tracing::info!(
-            model = model.id(),
-            facts = records.len(),
-            "authorization rules are new, loading the facts behind them"
-        );
+    // wrote it, and the change stream has kept them current since.
+    if let ModelState::Written(_) = &model {
         // The same writer the per-row upkeep uses, over the same index, on the
         // uncounted client so a load does not read as change-path questions.
-        OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-            Arc::clone(&shapes),
+        let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+            translated.shapes_arc(),
             setup,
             store_id.clone(),
         )
         .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
-        .authorization_model_id(model.id().to_owned())
-        .write_records(&records)
-        .await
-        .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
+        .authorization_model_id(model.id().to_owned());
+        let n = translated
+            .load_into(reader_pool, &loader)
+            .await
+            .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
+        tracing::info!(
+            model = model.id(),
+            facts = n,
+            "authorization rules are new, loading the facts behind them"
+        );
     }
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),

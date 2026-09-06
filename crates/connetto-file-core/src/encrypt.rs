@@ -72,10 +72,6 @@ pub struct EncryptingStore<S: ChunkStore> {
 
 impl<S: ChunkStore> EncryptingStore<S> {
     /// Wraps `inner` with encryption and compression enabled.
-    ///
-    /// Use for text, scientific, and generic MIME classes where zstd reduces
-    /// storage significantly. The chunk key is derived from `root_key` using
-    /// [`PURPOSE_LABEL`].
     pub fn new(inner: S, root_key: &[u8; 32]) -> Self {
         Self {
             inner,
@@ -87,9 +83,7 @@ impl<S: ChunkStore> EncryptingStore<S> {
     /// Wraps `inner` with encryption and a configurable compression setting.
     ///
     /// Pass `skip_compression = true` for already-compressed content classes
-    /// (JPEG, PNG, video, gzip, zip) where zstd produces no gain. Use
-    /// [`MimeClass::params`](crate::MimeClass::params) to look up the right
-    /// value for a given MIME class.
+    /// (JPEG, PNG, video, gzip, zip) where zstd produces no gain.
     pub fn new_with(inner: S, root_key: &[u8; 32], skip_compression: bool) -> Self {
         Self {
             inner,
@@ -99,76 +93,92 @@ impl<S: ChunkStore> EncryptingStore<S> {
     }
 }
 
-impl<S: ChunkStore> ChunkStore for EncryptingStore<S> {
+impl<S: ChunkStore + Sync> ChunkStore for EncryptingStore<S> {
     type Error = EncryptStoreError<S::Error>;
 
-    fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
-        let (flag, payload) =
-            compress_payload(data, self.skip_compression).map_err(EncryptStoreError::Compress)?;
-
-        let mut flagged = Vec::with_capacity(1 + payload.len());
-        flagged.push(flag);
-        flagged.extend_from_slice(&payload);
-
-        let nonce_bytes = fresh_nonce().map_err(EncryptStoreError::Nonce)?;
-        let nonce = XNonce::from_slice(&nonce_bytes);
-        let cipher = make_cipher(&self.key);
-        let aead_payload = Payload {
-            msg: &flagged,
-            aad: hash.as_bytes().as_slice(),
-        };
-        let ciphertext = cipher
-            .encrypt(nonce, aead_payload)
-            .map_err(|_| EncryptStoreError::Encrypt)?;
-
-        let mut stored = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        stored.extend_from_slice(&nonce_bytes);
-        stored.extend_from_slice(&ciphertext);
-
+    async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
+        let stored = encrypt_chunk(hash, data, &self.key, self.skip_compression)?;
         self.inner
             .write_chunk(hash, &stored)
+            .await
             .map_err(EncryptStoreError::Inner)
     }
 
-    fn read_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Self::Error> {
+    async fn read_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Self::Error> {
         let stored = self
             .inner
             .read_chunk(hash)
+            .await
             .map_err(EncryptStoreError::Inner)?;
-
-        // Minimum: 24-byte nonce + 1 flag byte + 16-byte Poly1305 tag.
-        if stored.len() < NONCE_LEN + 17 {
-            return Err(EncryptStoreError::BadFormat);
-        }
-
-        let nonce = XNonce::from_slice(&stored[..NONCE_LEN]);
-        let ciphertext = &stored[NONCE_LEN..];
-        let cipher = make_cipher(&self.key);
-        let aead_payload = Payload {
-            msg: ciphertext,
-            aad: hash.as_bytes().as_slice(),
-        };
-        let flagged = cipher
-            .decrypt(nonce, aead_payload)
-            .map_err(|_| EncryptStoreError::Decrypt)?;
-
-        let (&flag, payload) = flagged.split_first().ok_or(EncryptStoreError::BadFormat)?;
-
-        match flag {
-            FLAG_COMPRESSED => zstd::decode_all(payload).map_err(EncryptStoreError::Decompress),
-            FLAG_RAW => Ok(payload.to_vec()),
-            _ => Err(EncryptStoreError::BadFormat),
-        }
+        decrypt_chunk(hash, &stored, &self.key)
     }
 
-    fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, Self::Error> {
-        self.inner.has_chunk(hash).map_err(EncryptStoreError::Inner)
+    async fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, Self::Error> {
+        self.inner
+            .has_chunk(hash)
+            .await
+            .map_err(EncryptStoreError::Inner)
     }
 }
 
-/// Compresses `data` at zstd level 3 if `skip` is false. Returns the flag byte
-/// and the (possibly compressed) payload. If compression produces a larger
-/// result the raw bytes are returned with `FLAG_RAW`.
+// ---------------------------------------------------------------------------
+// Pure-sync crypto helpers (no I/O, called from async fn bodies)
+// ---------------------------------------------------------------------------
+
+fn encrypt_chunk<E: std::error::Error + Send + Sync + 'static>(
+    hash: &ChunkHash,
+    data: &[u8],
+    key: &[u8; 32],
+    skip_compression: bool,
+) -> Result<Vec<u8>, EncryptStoreError<E>> {
+    let (flag, payload) =
+        compress_payload(data, skip_compression).map_err(EncryptStoreError::Compress)?;
+    let mut flagged = Vec::with_capacity(1 + payload.len());
+    flagged.push(flag);
+    flagged.extend_from_slice(&payload);
+    let nonce_bytes = fresh_nonce().map_err(EncryptStoreError::Nonce)?;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let cipher = make_cipher(key);
+    let aead_payload = Payload {
+        msg: &flagged,
+        aad: hash.as_bytes().as_slice(),
+    };
+    let ciphertext = cipher
+        .encrypt(nonce, aead_payload)
+        .map_err(|_| EncryptStoreError::Encrypt)?;
+    let mut stored = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    stored.extend_from_slice(&nonce_bytes);
+    stored.extend_from_slice(&ciphertext);
+    Ok(stored)
+}
+
+fn decrypt_chunk<E: std::error::Error + Send + Sync + 'static>(
+    hash: &ChunkHash,
+    stored: &[u8],
+    key: &[u8; 32],
+) -> Result<Vec<u8>, EncryptStoreError<E>> {
+    // Minimum: 24-byte nonce + 1 flag byte + 16-byte Poly1305 tag.
+    if stored.len() < NONCE_LEN + 17 {
+        return Err(EncryptStoreError::BadFormat);
+    }
+    let nonce = XNonce::from_slice(&stored[..NONCE_LEN]);
+    let ciphertext = &stored[NONCE_LEN..];
+    let cipher = make_cipher(key);
+    let aead_payload = Payload {
+        msg: ciphertext,
+        aad: hash.as_bytes().as_slice(),
+    };
+    let flagged = cipher
+        .decrypt(nonce, aead_payload)
+        .map_err(|_| EncryptStoreError::Decrypt)?;
+    let (&flag, payload) = flagged.split_first().ok_or(EncryptStoreError::BadFormat)?;
+    match flag {
+        FLAG_COMPRESSED => zstd::decode_all(payload).map_err(EncryptStoreError::Decompress),
+        FLAG_RAW => Ok(payload.to_vec()),
+        _ => Err(EncryptStoreError::BadFormat),
+    }
+}
+
 fn compress_payload(data: &[u8], skip: bool) -> Result<(u8, Vec<u8>), std::io::Error> {
     if skip {
         return Ok((FLAG_RAW, data.to_vec()));
