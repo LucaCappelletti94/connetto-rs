@@ -21,13 +21,11 @@ pub enum ServerError {
     #[error("chunk hash mismatch")]
     HashMismatch,
 
-    /// Commit rejected: one or more declared chunks are absent from the store.
-    #[error("chunk missing from store")]
-    ChunkMissing,
-
-    /// Commit rejected: reassembled bytes do not match the declared file identity.
-    #[error("file identity mismatch")]
-    IdentityMismatch,
+    /// Commit rejected: not all declared chunks were stored by this upload, or
+    /// the reassembled bytes do not reconstruct to the declared file identity.
+    /// Always 409; callers must not learn which condition was tripped.
+    #[error("commit refused")]
+    CommitRefused,
 
     /// PUT would push the upload past the ticket's byte ceiling.
     #[error("upload ceiling exceeded")]
@@ -80,8 +78,8 @@ impl IntoResponse for ServerError {
             Self::NotFound | Self::Ticket(_) => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::CeilingExceeded | Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::HashMismatch | Self::IdentityMismatch => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::ChunkMissing => StatusCode::CONFLICT,
+            Self::HashMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::CommitRefused => StatusCode::CONFLICT,
             // 503: transient condition; the client should retry after a delay.
             Self::RegistryConflict => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadParam(_) => StatusCode::BAD_REQUEST,

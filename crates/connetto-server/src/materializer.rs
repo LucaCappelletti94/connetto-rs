@@ -1967,38 +1967,38 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
     value_json(value).to_string()
 }
 
-/// Serialize a folded [`AggValue`] as a JSON string for delivery, matching the
-/// numeric and null shape [`value_to_json`] produces for the re-execution path.
+/// Serialize a folded [`AggValue`] as a JSON string for delivery.
+///
+/// The JSON type per variant matches what [`value_to_json`] produces for the
+/// equivalent Postgres value on the scalar re-execution path:
+/// - `Count` → JSON integer (same as `PgValue::Int`)
+/// - `Sum`/`Avg` with `Integer` → JSON integer (same as `PgValue::Int`)
+/// - `Sum`/`Avg` with `Decimal` → JSON string (same as `PgValue::Decimal`)
+/// - `Sum`/`Avg` with `Double` and `Real` → JSON float (same as `PgValue::Float`)
+/// - any `None` → JSON null (no rows contributed; SQL returns NULL for empty SUM)
+///
+/// A non-finite `Double` or `Real` (infinity, `NaN`) becomes a JSON string of
+/// its IEEE representation so no real aggregate value is silently discarded.
 pub(crate) fn agg_value_to_json(value: AggValue) -> String {
     let json = match value {
         AggValue::Count(c) => serde_json::Value::from(c),
-        // A fold over an integer column arrives as Integer and over a numeric
-        // one as Decimal, but the wire contract for SUM and AVG is a float, so
-        // both render through f64 rather than as an integer or exact string.
         AggValue::Sum(Some(NumericValue::Integer(i)))
-        | AggValue::Avg(Some(NumericValue::Integer(i))) => i
-            .to_string()
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        | AggValue::Avg(Some(NumericValue::Integer(i))) => serde_json::Value::from(i),
         AggValue::Sum(Some(NumericValue::Decimal(d)))
-        | AggValue::Avg(Some(NumericValue::Decimal(d))) => d
-            .to_string()
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        | AggValue::Avg(Some(NumericValue::Decimal(d))) => serde_json::Value::String(d.to_string()),
         AggValue::Sum(Some(NumericValue::Double(f)))
         | AggValue::Avg(Some(NumericValue::Double(f)))
-        | AggValue::Real(Some(f)) => serde_json::Number::from_f64(f)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        // SUM over an empty set is 0 (the additive identity), so None renders
-        // as the float zero the client expects.  AVG over an empty set is
-        // undefined, so None stays null for that function.
-        AggValue::Sum(None) => serde_json::Number::from_f64(0.0)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        AggValue::Avg(None) | AggValue::Real(None) => serde_json::Value::Null,
+        | AggValue::Real(Some(f)) => {
+            if f.is_finite() {
+                serde_json::Number::from_f64(f)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            } else {
+                // Infinity or NaN cannot be represented in JSON; the raw IEEE
+                // string preserves the value so no real aggregate is discarded.
+                serde_json::Value::String(f.to_string())
+            }
+        }
+        AggValue::Sum(None) | AggValue::Avg(None) | AggValue::Real(None) => serde_json::Value::Null,
     };
     json.to_string()
 }
@@ -2233,29 +2233,66 @@ mod wire_contract {
 
     #[test]
     fn agg_value_to_json_matches_wire_contract() {
-        // COUNT is an integer, never a float.
+        // COUNT is a JSON integer.
         assert_eq!(agg_value_to_json(AggValue::Count(0)), "0");
         assert_eq!(agg_value_to_json(AggValue::Count(1)), "1");
 
-        // SUM over an empty table is the additive identity: 0.0.
-        assert_eq!(agg_value_to_json(AggValue::Sum(None)), "0.0");
-        // SUM with rows renders as float regardless of the storage kind.
+        // SUM over an empty table is null, matching SQL and the scalar path.
+        assert_eq!(agg_value_to_json(AggValue::Sum(None)), "null");
+        // SUM over an integer column is a JSON integer.
         assert_eq!(
             agg_value_to_json(AggValue::Sum(Some(NumericValue::Integer(10)))),
-            "10.0",
+            "10",
         );
+        // An i64 beyond f64's exact range stays exact as a JSON integer.
+        let large: i64 = 9_007_199_254_740_993;
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Integer(large)))),
+            "9007199254740993",
+        );
+        // SUM over a decimal column is a JSON string, preserving exactness.
+        // The inner type is inferred from NumericValue::Decimal; no direct bigdecimal dep.
+        let precise = "123456789.1234567890123456789"
+            .parse()
+            .expect("parse decimal");
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Decimal(precise)))),
+            "\"123456789.1234567890123456789\"",
+        );
+        // SUM over a float column is a JSON float.
         assert_eq!(
             agg_value_to_json(AggValue::Sum(Some(NumericValue::Double(10.0)))),
             "10.0",
         );
+        // A non-finite double surfaces as a JSON string, not null.
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
+            "\"inf\"",
+        );
 
-        // AVG over an empty table is undefined.
+        // AVG over an empty table is null (undefined for an empty set).
         assert_eq!(agg_value_to_json(AggValue::Avg(None)), "null");
-        // AVG with rows renders as float.
+        // AVG with a decimal result is a JSON string.
+        // Type inferred from NumericValue::Decimal.
+        let avg_decimal = "15.0000000000000000".parse().expect("parse avg decimal");
+        assert_eq!(
+            agg_value_to_json(AggValue::Avg(Some(NumericValue::Decimal(avg_decimal)))),
+            "\"15.0000000000000000\"",
+        );
+        // AVG with a double result is a JSON float.
         assert_eq!(
             agg_value_to_json(AggValue::Avg(Some(NumericValue::Double(15.0)))),
             "15.0",
         );
+
+        // Real (variance, stddev) with a finite value is a JSON float.
+        assert_eq!(agg_value_to_json(AggValue::Real(Some(2.5))), "2.5");
+        // Real with a non-finite value surfaces as a JSON string, not null.
+        assert_eq!(
+            agg_value_to_json(AggValue::Real(Some(f64::NEG_INFINITY))),
+            "\"-inf\"",
+        );
+        assert_eq!(agg_value_to_json(AggValue::Real(None)), "null");
     }
 }
 

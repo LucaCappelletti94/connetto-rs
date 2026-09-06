@@ -1879,7 +1879,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     let subs = ["count", "sum", "avg"];
     let seeded = collect_aggregates(&mut client, &subs).await;
     assert_eq!(seeded["count"], "0", "COUNT(*) seed over empty table");
-    assert_eq!(seeded["sum"], "0.0", "SUM seed over empty table");
+    assert_eq!(seeded["sum"], "null", "SUM seed over empty table");
     assert_eq!(
         seeded["avg"], "null",
         "AVG seed over empty table is undefined"
@@ -1894,8 +1894,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_first = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_first["count"], "1");
-    assert_eq!(after_first["sum"], "10.0");
-    assert_eq!(after_first["avg"], "10.0");
+    assert_eq!(after_first["sum"], "10");
+    assert_eq!(after_first["avg"], "\"10.0000000000000000\"");
 
     // Insert quantity 20: COUNT 2, SUM 30, AVG 15.
     source
@@ -1904,8 +1904,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_second = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_second["count"], "2");
-    assert_eq!(after_second["sum"], "30.0");
-    assert_eq!(after_second["avg"], "15.0");
+    assert_eq!(after_second["sum"], "30");
+    assert_eq!(after_second["avg"], "\"15.0000000000000000\"");
 
     // Delete quantity 10: COUNT 1, SUM 20, AVG 20.
     source
@@ -1914,8 +1914,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_delete = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_delete["count"], "1");
-    assert_eq!(after_delete["sum"], "20.0");
-    assert_eq!(after_delete["avg"], "20.0");
+    assert_eq!(after_delete["sum"], "20");
+    assert_eq!(after_delete["avg"], "\"20.0000000000000000\"");
 
     client.close().await.expect("close");
     server.await.expect("join server");

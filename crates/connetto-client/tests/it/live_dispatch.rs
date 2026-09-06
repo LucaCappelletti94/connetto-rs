@@ -110,7 +110,8 @@ fn live_dispatch_resolves_handle_and_value_types() {
 
     // Aggregates resolve to LiveValue with the wire-derived value type:
     // COUNT is an exact integer, SUM maps through diesel's own Numeric
-    // SqlType to Option<f64> (matching the server's float accumulator),
+    // SqlType to Option<f64> (the column type; the fold path now sends
+    // integers or decimal strings, which serde_json coerces into f64),
     // extremes carry the column's type, all nullable ones as Option.
     resolves::<_, i64, LiveValue<i64>>(&orders::table.count());
     resolves::<_, Option<f64>, LiveValue<Option<f64>>>(

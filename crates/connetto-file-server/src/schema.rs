@@ -403,6 +403,14 @@ where
     fn delete_orphaned_stmt(
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
+
+    /// Build `SELECT chunk_hash FROM manifest_chunks WHERE file_id = ? AND stored = FALSE LIMIT 1`.
+    ///
+    /// Returns one row when at least one chunk for this manifest was never
+    /// stored through a PUT; returns zero rows when all chunks are stored.
+    fn any_unstored_chunk_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +683,24 @@ impl ConnettoFileSchema for DefaultFileSchema {
             _cfs_manifests::created_at.lt(cutoff),
         ))
         .returning(_cfs_manifests::file_id)
+    }
+
+    fn any_unstored_chunk_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
+        diesel::QueryDsl::limit(
+            diesel::QueryDsl::select(
+                diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        _cfs_manifest_chunks::table,
+                        _cfs_manifest_chunks::file_id.eq(file_id),
+                    ),
+                    _cfs_manifest_chunks::stored.eq(false),
+                ),
+                _cfs_manifest_chunks::chunk_hash,
+            ),
+            1,
+        )
     }
 }
 
@@ -1039,6 +1065,28 @@ macro_rules! connetto_file_tables {
                         .filter($manifests::created_at.lt(cutoff)),
                 )
                 .returning($manifests::file_id)
+            }
+            fn any_unstored_chunk_stmt(
+                file_id: Vec<u8>,
+            ) -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                Vec<u8>,
+            > + Send
+            + 'static {
+                diesel::QueryDsl::limit(
+                    diesel::QueryDsl::select(
+                        diesel::QueryDsl::filter(
+                            diesel::QueryDsl::filter(
+                                $manifest_chunks::table,
+                                $manifest_chunks::file_id.eq(file_id),
+                            ),
+                            $manifest_chunks::stored.eq(false),
+                        ),
+                        $manifest_chunks::chunk_hash,
+                    ),
+                    1,
+                )
             }
         }
     };

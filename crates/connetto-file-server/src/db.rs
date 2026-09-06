@@ -233,6 +233,19 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     Ok(ChunkPutResult::Accepted)
 }
 
+/// Returns `true` when every chunk row for `file_id` has `stored = TRUE`.
+///
+/// False means at least one declared chunk was not PUT through this manifest.
+pub(crate) async fn all_chunks_stored<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+) -> Result<bool, diesel::result::Error> {
+    let rows: Vec<Vec<u8>> = S::any_unstored_chunk_stmt(file_id.as_bytes().to_vec())
+        .load(conn)
+        .await?;
+    Ok(rows.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Commit operations
 // ---------------------------------------------------------------------------

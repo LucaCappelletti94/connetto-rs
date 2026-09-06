@@ -1341,3 +1341,139 @@ async fn intent_duplicate_hash_conflicting_lengths_refused() {
         "conflicting lengths for same hash must be refused"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Security: commit must prove this upload supplied the bytes
+// ---------------------------------------------------------------------------
+
+/// Proves: a caller that skips PUT but declares a chunk another caller already
+/// stored is refused at commit (stored flag on this manifest's rows is false).
+///
+/// The refusal must be indistinguishable from committing a manifest whose chunk
+/// was never uploaded anywhere, closing the existence oracle.
+#[tokio::test]
+async fn commit_without_put_refused_same_as_chunk_never_stored() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"bytes uploaded by caller a for cross-caller attack test";
+    // Caller A completes a full upload so the chunk hash exists in the store.
+    do_upload(&app, &signer, data).await;
+
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body = serde_json::json!({
+        "total_len": u64::try_from(data.len()).unwrap(),
+        "chunks": chunks_json,
+    });
+
+    // Caller B declares a different file id but the same chunk hash.
+    let ticket_b = signer
+        .mint(&TicketPayload {
+            file_id: [0x02u8; 32],
+            verb: Verb::Write,
+            ceiling: 1024 * 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+    let bob_hex = "02".repeat(32);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{bob_hex}/intent?t={ticket_b}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&intent_body).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "intent must succeed");
+
+    // Caller B commits without PUTting anything.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{bob_hex}/commit?t={ticket_b}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let cross_caller_status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(
+        cross_caller_status,
+        StatusCode::CONFLICT,
+        "commit without PUT must be refused even when the store holds the bytes"
+    );
+
+    // Caller C declares a file whose chunk was never uploaded anywhere, then
+    // commits without PUTting. The status must be identical to caller B's refusal
+    // so neither case leaks which condition was tripped.
+    let other_data = b"bytes that will never be uploaded anywhere at all";
+    let mem2 = MemStore::new();
+    let manifest2 = process_file(other_data, MimeClass::Generic, &mem2)
+        .await
+        .unwrap();
+    let chunks_json2: Vec<serde_json::Value> = manifest2
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body2 = serde_json::json!({
+        "total_len": u64::try_from(other_data.len()).unwrap(),
+        "chunks": chunks_json2,
+    });
+
+    let ticket_c = signer
+        .mint(&TicketPayload {
+            file_id: [0x03u8; 32],
+            verb: Verb::Write,
+            ceiling: 1024 * 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "carol".into(),
+        })
+        .unwrap();
+    let carol_hex = "03".repeat(32);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{carol_hex}/intent?t={ticket_c}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&intent_body2).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "intent for C must succeed");
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{carol_hex}/commit?t={ticket_c}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let never_stored_status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(
+        never_stored_status, cross_caller_status,
+        "chunk-never-stored refusal must be indistinguishable from cross-caller refusal"
+    );
+}
+
+/// Proves: a caller that fully supplies all chunks still commits successfully.
+/// Guards against a regression where the stored-flag check wrongly rejects a
+/// legitimate upload.
+#[tokio::test]
+async fn commit_after_full_put_still_succeeds() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+    // do_upload asserts the commit returns 200; a regression would panic here.
+    do_upload(
+        &app,
+        &signer,
+        b"full upload must still commit after stored-flag check",
+    )
+    .await;
+}

@@ -160,14 +160,13 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
         .await
 }
 
-/// Verifies all declared chunks are present, checks file identity, marks the
-/// manifest committed, and calls the state setter — all inside one atomic
-/// Postgres transaction.
+/// Verifies declared chunks were supplied by this upload, checks file identity,
+/// marks the manifest committed, and calls the state setter atomically.
 ///
 /// Three outcomes by manifest state:
 /// - Absent file id: 404.
 /// - Already committed (sequential retry after a lost response): idempotent 200.
-/// - Uncommitted: verify chunks, run [`db::commit_manifest_atomic`], return 200.
+/// - Uncommitted: require all chunks stored, verify identity, commit, return 200.
 ///   A concurrent commit races inside the transaction; the loser returns 200.
 pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
@@ -193,7 +192,9 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
                     Some(db::ManifestState::Uncommitted(manifest)) => manifest,
                 };
-                verify_all_chunks_present(store, manifest.chunks()).await?;
+                if !db::all_chunks_stored::<S>(conn, &file_id).await? {
+                    return Err(ServerError::CommitRefused);
+                }
                 verify_file_identity(store, &manifest).await?;
                 db::commit_manifest_atomic::<S>(conn, &file_id).await?;
                 Ok(StatusCode::OK)
@@ -207,18 +208,6 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn verify_all_chunks_present(
-    store: &AnyStore,
-    chunks: &[ChunkMeta],
-) -> Result<(), ServerError> {
-    for chunk in chunks {
-        if !store.exists(&chunk.hash).await? {
-            return Err(ServerError::ChunkMissing);
-        }
-    }
-    Ok(())
-}
-
 async fn verify_file_identity(
     store: &AnyStore,
     manifest: &connetto_file_core::Manifest,
@@ -230,7 +219,7 @@ async fn verify_file_identity(
     }
     let computed: [u8; 32] = *hasher.finalize().as_bytes();
     if computed != *manifest.file_id().as_bytes() {
-        return Err(ServerError::IdentityMismatch);
+        return Err(ServerError::CommitRefused);
     }
     Ok(())
 }
