@@ -644,8 +644,6 @@ async fn provision_with(
     statements.push(shape.insert(0, ""));
     let borrowed: Vec<&str> = statements.iter().map(String::as_str).collect();
     fixture.setup(&borrowed).await;
-    fixture.start_replication(shape.published()).await;
-
     let reader_pool = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl())
         .expect("snapshot source")
@@ -653,22 +651,23 @@ async fn provision_with(
     let (fga, upkeep, translator) = fga_auth(fixture, shape, reader_pool.clone()).await;
     let compared = matches!(executor, Executor::Both);
     let auth = match executor {
-        Executor::Shipped | Executor::Both => HarnessAuth::fga(fga),
+        Executor::Shipped | Executor::Both => HarnessAuth::fga(fga, upkeep),
         // An outage run stages the service going away, so a second opinion that
         // keeps answering would report a disagreement on every held event. It
         // is the one run that compares nothing.
-        Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga),
+        Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga, upkeep),
     };
     let server = spawn_server(
         ServerConfig::new(shape.ddl(), fixture.admin_url())
             .with_writable(RuntimeWritableCatalog::builder().writable("items").build())
-            .with_translation(translator, caller),
+            .with_translation(translator, caller)
+            .with_replication(shape.published().iter().copied()),
         snapshot,
         auth,
         fixture.admin().clone(),
         fixture.admin().clone(),
-    );
-    server.install_store_upkeep(upkeep);
+    )
+    .await;
     // Since R6 the comparison is asked where the two row versions are still
     // told apart, at the delivery sites, rather than inside the policy: row-level
     // security cannot answer about a previous version at all, so a wrapper over

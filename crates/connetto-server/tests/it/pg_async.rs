@@ -393,6 +393,7 @@ async fn async_pg_reexec_bootstraps_min() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_transport, mut client) = loopback();
@@ -724,6 +725,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_transport, mut client) = loopback();

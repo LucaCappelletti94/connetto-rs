@@ -44,7 +44,6 @@ async fn provision(fixture: &Fixture) {
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
         .await;
-    fixture.start_replication(&["notes"]).await;
 }
 
 /// A server over that fixture, reading as the restricted role.
@@ -55,12 +54,14 @@ async fn spawn(fixture: &Fixture) -> connetto_test_harness::Server {
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
-            .with_writable(RuntimeWritableCatalog::builder().build()),
+            .with_writable(RuntimeWritableCatalog::builder().build())
+            .with_replication(["notes"]),
         snapshot,
         auth,
         writer_pool,
         fixture.admin().clone(),
     )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

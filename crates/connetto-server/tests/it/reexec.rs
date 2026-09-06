@@ -168,6 +168,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_transport, mut client) = loopback();

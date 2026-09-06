@@ -694,16 +694,8 @@ async fn main() -> Result<()> {
         write,
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
+        Some(upkeep),
     );
-
-    // The store follows the change stream from here: every changed row's
-    // difference is written before the row reaches anybody.
-    if manager.install_store_upkeep(upkeep).is_err() {
-        return Err(anyhow!(
-            "the authorization store upkeep was installed twice, which would answer \
-             events either side of the swap against two different stores"
-        ));
-    }
     install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing
     // its next handshake. The hook fires synchronously inside the revoke, so

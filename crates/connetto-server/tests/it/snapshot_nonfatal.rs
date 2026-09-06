@@ -282,6 +282,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
             .expect("build write target"),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

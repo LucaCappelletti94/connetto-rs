@@ -291,6 +291,7 @@ async fn use_live_renders_and_follows_cdc() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

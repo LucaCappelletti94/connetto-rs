@@ -1611,6 +1611,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1843,6 +1844,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2024,6 +2026,7 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2115,6 +2118,7 @@ async fn an_aggregates_first_frame_is_its_full_result() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2308,6 +2312,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2434,6 +2439,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2685,6 +2691,7 @@ async fn live_value_tracks_a_server_aggregate() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2818,6 +2825,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3150,6 +3158,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -4056,6 +4065,7 @@ fn status_manager<O: Oplog>(
         server_write_target(fixture),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     )
 }
 
@@ -4324,6 +4334,7 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

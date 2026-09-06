@@ -1017,7 +1017,7 @@ pub struct SessionManager<
     /// waits for it, because a patch delivered before the store catches up is
     /// answered from facts the change already invalidated, and in the allow
     /// direction no later correction takes the row back.
-    upkeep: OnceLock<Arc<dyn crate::openfga::StoreUpkeep>>,
+    upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     /// A second executor asked about the row as it is now, alongside the one
     /// that delivers, so a divergence between them fails a run.
     ///
@@ -1069,6 +1069,7 @@ where
             target,
             guard,
             config,
+            None,
         )
     }
 }
@@ -1094,6 +1095,7 @@ where
         target: PgWriteTarget<W>,
         guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
+        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     ) -> Arc<Self> {
         Self::with_oplog(
             materializer,
@@ -1105,6 +1107,7 @@ where
             target,
             guard,
             config,
+            upkeep,
         )
     }
 }
@@ -1135,6 +1138,7 @@ where
         target: PgWriteTarget<W>,
         guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
+        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
@@ -1153,7 +1157,7 @@ where
             config,
             guard,
             auth_retry: RetryPolicy::new(),
-            upkeep: OnceLock::new(),
+            upkeep,
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
         })
@@ -1172,24 +1176,6 @@ where
     Key: CapabilityKey,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
-    /// Maintain the authorization store from the change stream.
-    ///
-    /// Set once, after construction, because the upkeep is built from the
-    /// executor this manager already holds and so cannot be assembled before
-    /// it. A second call is refused rather than allowed to replace a live
-    /// collaborator, which would leave events either side of the swap
-    /// answered against two different stores.
-    ///
-    /// # Errors
-    ///
-    /// The upkeep handed over, when one is already installed.
-    pub fn install_store_upkeep(
-        &self,
-        upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
-    ) -> Result<(), Arc<dyn crate::openfga::StoreUpkeep>> {
-        self.upkeep.set(upkeep)
-    }
-
     /// Ask a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
     ///
@@ -2034,7 +2020,7 @@ where
         &self,
         event: &ChangeEvent,
     ) -> Result<Vec<GrantMove>, SessionError> {
-        match self.upkeep.get() {
+        match &self.upkeep {
             Some(upkeep) => upkeep
                 .keep_current(event)
                 .await

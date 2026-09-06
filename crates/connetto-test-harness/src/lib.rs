@@ -34,7 +34,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
-use connetto_server::openfga::{Counted, FgaAuth};
+use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
     LoopbackTransport, Materializer, OidcProviderConfig, PgReadConnector, PgSnapshotSource,
     ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
@@ -438,6 +438,29 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
     .expect("provisioning the oplog table");
 }
 
+/// Set up the publication, slot, and oplog table for logical replication.
+pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str]) {
+    drop_slot(pool).await;
+    exec(pool, &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}")).await;
+    for table in tables {
+        exec(pool, &format!("ALTER TABLE {table} REPLICA IDENTITY FULL")).await;
+    }
+    provision_oplog(pool).await;
+    exec(
+        pool,
+        &format!(
+            "CREATE PUBLICATION {PUBLICATION} FOR TABLE {}",
+            tables.join(", ")
+        ),
+    )
+    .await;
+    exec(
+        pool,
+        &format!("SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')"),
+    )
+    .await;
+}
+
 /// One test's own Postgres, and the authorization service it may ask for.
 ///
 /// Dropping the fixture stops whatever it started, so a test needs no cleanup
@@ -531,33 +554,7 @@ impl Fixture {
 
     /// Put each published table in full previous-image mode, then create the publication, slot and oplog table.
     pub async fn start_replication(&self, tables: &[&str]) {
-        drop_slot(&self.admin).await;
-        exec(
-            &self.admin,
-            &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"),
-        )
-        .await;
-        for table in tables {
-            exec(
-                &self.admin,
-                &format!("ALTER TABLE {table} REPLICA IDENTITY FULL"),
-            )
-            .await;
-        }
-        provision_oplog(&self.admin).await;
-        exec(
-            &self.admin,
-            &format!(
-                "CREATE PUBLICATION {PUBLICATION} FOR TABLE {}",
-                tables.join(", ")
-            ),
-        )
-        .await;
-        exec(
-            &self.admin,
-            &format!("SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')"),
-        )
-        .await;
+        start_replication_on(&self.admin, tables).await;
     }
 
     /// Where this fixture's authorization service listens, starting it if this
@@ -640,7 +637,7 @@ pub enum HarnessAuth {
     Rls(Box<RlsAuth>),
     /// Authorize the way the shipped binary does: from the changed row where
     /// the schema decides, and an `OpenFGA` server for the rest.
-    Fga(Box<HarnessFga>),
+    Fga(Box<HarnessFga>, Arc<dyn StoreUpkeep>),
     /// The shipped policy, with the service taken away and given back on a
     /// flag.
     ///
@@ -650,7 +647,7 @@ pub enum HarnessAuth {
     /// trait documents as failure to reach an answer rather than an answer of
     /// denied. What is proven through it is connetto's response, not the
     /// service's failure mode.
-    Reachable(Arc<AtomicBool>, Box<HarnessFga>),
+    Reachable(Arc<AtomicBool>, Box<HarnessFga>, Arc<dyn StoreUpkeep>),
 }
 
 /// The executor the server binary builds, as the harness holds it.
@@ -686,14 +683,26 @@ impl HarnessAuth {
 
     /// The shipped policy: the changed row, then the authorization service.
     #[must_use]
-    pub fn fga(auth: HarnessFga) -> Self {
-        Self::Fga(Box::new(auth))
+    pub fn fga(auth: HarnessFga, upkeep: Arc<dyn StoreUpkeep>) -> Self {
+        Self::Fga(Box::new(auth), upkeep)
     }
 
     /// The shipped policy behind a flag a test lowers to stage an outage.
     #[must_use]
-    pub fn reachable(reachable: Arc<AtomicBool>, auth: HarnessFga) -> Self {
-        Self::Reachable(reachable, Box::new(auth))
+    pub fn reachable(
+        reachable: Arc<AtomicBool>,
+        auth: HarnessFga,
+        upkeep: Arc<dyn StoreUpkeep>,
+    ) -> Self {
+        Self::Reachable(reachable, Box::new(auth), upkeep)
+    }
+
+    /// The authorization store upkeep, if this policy carries one.
+    fn upkeep(&self) -> Option<Arc<dyn StoreUpkeep>> {
+        match self {
+            Self::Fga(_, upkeep) | Self::Reachable(_, _, upkeep) => Some(Arc::clone(upkeep)),
+            Self::Roster(_) | Self::Rls(_) => None,
+        }
     }
 }
 
@@ -717,8 +726,8 @@ impl VisibilityPolicy for HarnessAuth {
                 .await
                 .map_err(|e| match e {}),
             Self::Rls(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
-            Self::Fga(auth) => Ok(auth.may_see(row, watchers, verdicts).await?),
-            Self::Reachable(up, auth) => {
+            Self::Fga(auth, _) => Ok(auth.may_see(row, watchers, verdicts).await?),
+            Self::Reachable(up, auth, _) => {
                 // Spelled out because diesel's blanket `load` shadows the atomic's.
                 if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
                     Ok(auth.may_see(row, watchers, verdicts).await?)
@@ -740,8 +749,8 @@ impl VisibilityPolicy for HarnessAuth {
         match self {
             Self::Roster(auth) => auth.may_write(write, watcher).await.map_err(|e| match e {}),
             Self::Rls(auth) => Ok(auth.may_write(write, watcher).await?),
-            Self::Fga(auth) => Ok(auth.may_write(write, watcher).await?),
-            Self::Reachable(up, auth) => {
+            Self::Fga(auth, _) => Ok(auth.may_write(write, watcher).await?),
+            Self::Reachable(up, auth, _) => {
                 // Spelled out because diesel's blanket `load` shadows the atomic's.
                 if AtomicBool::load(up, std::sync::atomic::Ordering::Acquire) {
                     Ok(auth.may_write(write, watcher).await?)
@@ -788,6 +797,10 @@ pub struct ServerConfig {
     /// The caller mapping reverse translation rewrites the client's local caller
     /// function with. `None` when no policy names the caller.
     caller: Option<SessionVariableMapping>,
+    /// Tables to set up for logical replication before CDC starts. When
+    /// non-empty, `spawn_server` calls `start_replication` using the admin URL
+    /// so the slot and publication exist before the ingest loop connects.
+    replication_tables: Vec<String>,
 }
 
 impl ServerConfig {
@@ -802,6 +815,7 @@ impl ServerConfig {
             guard: Arc::new(RequestGuard::default()),
             translator: None,
             caller: None,
+            replication_tables: Vec::new(),
         }
     }
 
@@ -839,6 +853,13 @@ impl ServerConfig {
         self.caller = caller;
         self
     }
+
+    /// Set up logical replication for these tables before CDC starts.
+    #[must_use]
+    pub fn with_replication(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.replication_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// A running harness server: a [`SessionManager`] wired to the full production
@@ -860,20 +881,6 @@ impl Server {
     #[must_use]
     pub fn manager(&self) -> &Arc<HarnessManager> {
         &self.manager
-    }
-
-    /// Maintain the authorization store from the change stream, as the binary
-    /// does.
-    ///
-    /// # Panics
-    ///
-    /// When one is already installed, which would answer events either side of
-    /// the swap against two different stores.
-    pub fn install_store_upkeep(&self, upkeep: Arc<dyn connetto_server::openfga::StoreUpkeep>) {
-        assert!(
-            self.manager.install_store_upkeep(upkeep).is_ok(),
-            "a store upkeep is already installed on this server"
-        );
     }
 
     /// Ask Postgres row-level security about every current row alongside the
@@ -928,8 +935,11 @@ impl Server {
 /// not bypassed). `connector_pool` backs aggregate re-execution (the server
 /// binary uses the primary pool here). The snapshot source and auth policy are
 /// built by the caller from whichever pool the test wants under RLS.
-#[must_use]
-pub fn spawn_server(
+///
+/// When `config` carries replication tables, this function calls
+/// [`start_replication`](Fixture::start_replication) over the admin URL before
+/// starting CDC, so the ordering cannot be forgotten.
+pub async fn spawn_server(
     config: ServerConfig,
     snapshot: PgSnapshotSource,
     auth: HarnessAuth,
@@ -944,7 +954,14 @@ pub fn spawn_server(
         guard,
         translator,
         caller,
+        replication_tables,
     } = config;
+    if !replication_tables.is_empty() {
+        let admin_pool = pool_for(&admin_url).await;
+        let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
+        start_replication_on(&admin_pool, &table_refs).await;
+    }
+    let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
     let materializer =
         Materializer::with_read_connector(&pg_ddl, writable, translator, caller, engine_connector)
@@ -969,6 +986,7 @@ pub fn spawn_server(
         write,
         guard,
         session,
+        upkeep,
     );
     // R27 decision 6: move-out withdrawals are read on the admin pool, as the
     // binary reads them on DATABASE_URL's, because the caller can no longer

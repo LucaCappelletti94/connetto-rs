@@ -95,16 +95,15 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
         .await;
-    fixture.start_replication(&["notes"]).await;
-
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let server = spawn_server(
-        ServerConfig::new(PG_DDL, fixture.admin_url()),
+        ServerConfig::new(PG_DDL, fixture.admin_url()).with_replication(["notes"]),
         PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source"),
         HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth")),
         writer_pool,
         fixture.admin().clone(),
-    );
+    )
+    .await;
 
     // A caller with no identity whatsoever, holding one share key.
     let mut bearer = server.connect();
