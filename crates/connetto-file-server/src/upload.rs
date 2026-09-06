@@ -57,9 +57,10 @@ pub(crate) struct IntentResponse {
 
 /// Declares the manifest for a new upload and answers which chunks are needed.
 ///
-/// Refuses if any declared chunk hash is in the registry's `deleting` state,
-/// returning 409 Conflict.  The client must retry after the current sweep cycle
-/// finishes.
+/// Refuses when:
+/// - any declared chunk hash is in `deleting` state (509 retry later)
+/// - a re-declaration for the same file id does not match the stored manifest (409)
+/// - the chunk count exceeds the ceiling-derived cap (413)
 pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -69,6 +70,19 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
+    // Cap chunk count to prevent the zero-length-chunk DoS under a zero ceiling.
+    // Any ceiling allows at most ceiling+1 chunks (one per byte plus one for empty files).
+    // The absolute cap is MEDIA_PARAMS.max / 256 = 65536, matching the 2 MiB body budget.
+    // ceiling=0 gives max 1 chunk, preventing 25k zero-length-chunk declarations.
+    let max_chunk_count: usize = ticket
+        .ceiling
+        .saturating_add(1)
+        .min(u64::from(connetto_file_core::MEDIA_PARAMS.max) / 256)
+        .try_into()
+        .map_err(|_| ServerError::BadParam("chunk count cap overflows usize".into()))?;
+    if body.chunks.len() > max_chunk_count {
+        return Err(ServerError::TooManyChunks);
+    }
     let chunks = parse_chunk_metas(&body.chunks)?;
     // Declared chunk lengths must sum to total_len with no overflow.
     let declared_sum: u64 = chunks
@@ -87,17 +101,18 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     let total_len = i64::try_from(body.total_len)
         .map_err(|_| ServerError::BadParam("total_len overflows i64".into()))?;
     let mut admin_conn = state.pools.admin.get().await?;
-    // insert_manifest returns false if any hash is in 'deleting' state.
-    let inserted = db::insert_manifest::<S>(
+    match db::insert_manifest::<S>(
         &mut admin_conn,
         &file_id,
         total_len,
         &ticket.caller,
         &chunks,
     )
-    .await?;
-    if !inserted {
-        return Err(ServerError::RegistryConflict);
+    .await?
+    {
+        db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
+        db::InsertManifestOutcome::ManifestConflict => return Err(ServerError::ManifestConflict),
+        db::InsertManifestOutcome::Inserted | db::InsertManifestOutcome::AlreadyPresent => {}
     }
     let mut reader_conn = state.pools.reader.get().await?;
     let needed_hashes =
@@ -166,7 +181,8 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
 /// Three outcomes by manifest state:
 /// - Absent file id: 404.
 /// - Already committed (sequential retry after a lost response): idempotent 200.
-/// - Uncommitted: require all chunks stored, verify identity, commit, return 200.
+/// - Uncommitted: verify all chunks are satisfied (stored through this upload OR deduped
+///   from a committed manifest visible to the caller), verify identity, commit, return 200.
 ///   A concurrent commit races inside the transaction; the loser returns 200.
 pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
@@ -182,7 +198,25 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
             state.content_state_fn
         )));
     }
+    let caller = ticket.caller;
     let store = &state.store;
+    // Ordering: acquire reader before admin so a saturated reader pool never
+    // blocks a holder of the manifest FOR UPDATE lock.
+    let mut reader_conn = state.pools.reader.get().await?;
+    // Evaluate chunk satisfaction as the reader role so RLS applies inside
+    // connetto_visible_files.  The admin role owns the tables and bypasses RLS,
+    // so calling this on the admin connection would silently pass for files the
+    // caller cannot see when the function relies on RLS rather than an explicit
+    // current_setting predicate.
+    //
+    // The check runs before the manifest lock is taken.  A concurrent visibility
+    // change between the check and the commit is acceptable: the same window
+    // already exists between the intent answer and this call, and a committed
+    // manifest referenced by any chunk row cannot be collected by the sweep
+    // while that reference exists, so the deduped bytes are stable.
+    if !db::all_chunks_satisfied::<S>(&mut reader_conn, &file_id, &caller).await? {
+        return Err(ServerError::CommitRefused);
+    }
     let mut admin_conn = state.pools.admin.get().await?;
     admin_conn
         .transaction::<StatusCode, ServerError, _>(move |conn| {
@@ -192,9 +226,6 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
                     Some(db::ManifestState::Uncommitted(manifest)) => manifest,
                 };
-                if !db::all_chunks_stored::<S>(conn, &file_id).await? {
-                    return Err(ServerError::CommitRefused);
-                }
                 verify_file_identity(store, &manifest).await?;
                 db::commit_manifest_atomic::<S>(conn, &file_id).await?;
                 Ok(StatusCode::OK)

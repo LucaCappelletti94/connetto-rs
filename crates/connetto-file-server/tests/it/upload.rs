@@ -1477,3 +1477,711 @@ async fn commit_after_full_put_still_succeeds() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Finding 1: dedup commit tests
+// ---------------------------------------------------------------------------
+
+/// Proves the dedup scenario from Finding 1: commit X as [A, B], intent Y as [A, C],
+/// PUT only C (following the server's needed answer), commit Y succeeds.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn dedup_commit_round_trip() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Upload file X = [A] as alice (small data produces one chunk).
+    let data_x = b"dedup-test chunk A";
+    let mem_x = MemStore::new();
+    let manifest_x = process_file(data_x, MimeClass::Generic, &mem_x)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest_x.chunks().len(),
+        1,
+        "data_x must produce exactly one chunk"
+    );
+    let chunk_a = &manifest_x.chunks()[0];
+    let data_a_stored = mem_x.read_chunk(&chunk_a.hash).await.unwrap();
+
+    let file_x_id = manifest_x.file_id();
+    let file_x_hex = format!("{file_x_id}");
+    let ticket_x = write_payload(
+        &signer,
+        &file_x_id,
+        u64::try_from(data_a_stored.len()).unwrap() + 256,
+    );
+
+    // Declare intent for file X and upload chunk A.
+    {
+        let chunks_json: Vec<serde_json::Value> = manifest_x
+            .chunks()
+            .iter()
+            .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+            .collect();
+        let body = serde_json::json!({ "total_len": chunk_a.len, "chunks": chunks_json });
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/intent?t={ticket_x}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={ticket_x}", chunk_a.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(data_a_stored.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/commit?t={ticket_x}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Register file X as visible to alice.
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    register_file_ownership(&mut admin_conn, &file_x_id, "alice").await;
+
+    // Build file Y = [A, C] where C is a distinct chunk.
+    let data_c_raw = b"dedup-test chunk C";
+    let mem_c = MemStore::new();
+    let manifest_c = process_file(data_c_raw, MimeClass::Generic, &mem_c)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest_c.chunks().len(),
+        1,
+        "data_c must produce exactly one chunk"
+    );
+    let chunk_c = &manifest_c.chunks()[0];
+    let chunk_c_bytes = mem_c.read_chunk(&chunk_c.hash).await.unwrap();
+
+    // target_file_id = BLAKE3(stored_A || stored_C) mirrors how verify_file_identity works.
+    let target_file_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(&data_a_stored);
+        h.update(&chunk_c_bytes);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    let target_hex = format!("{target_file_id}");
+    let target_ceiling = u64::try_from(data_a_stored.len() + chunk_c_bytes.len()).unwrap() + 256;
+    let target_ticket = signer
+        .mint(&TicketPayload {
+            file_id: *target_file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: target_ceiling,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+
+    // Intent for file Y = [A, C].
+    let total_len_y = u64::try_from(data_a_stored.len() + chunk_c_bytes.len()).unwrap();
+    let body_y = serde_json::json!({
+        "total_len": total_len_y,
+        "chunks": [
+            { "hash": format!("{}", chunk_a.hash), "len": chunk_a.len },
+            { "hash": format!("{}", chunk_c.hash), "len": chunk_c.len },
+        ],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{target_hex}/intent?t={target_ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body_y).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "intent for Y must succeed");
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+    let needed: Vec<String> = serde_json::from_value(json["needed"].clone()).unwrap();
+    assert_eq!(
+        needed.len(),
+        1,
+        "only chunk C must be needed (A deduped from file X)"
+    );
+    assert_eq!(
+        needed[0],
+        format!("{}", chunk_c.hash),
+        "the needed chunk must be C"
+    );
+
+    // PUT only chunk C, skipping A per the server's instruction.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{}?t={target_ticket}", chunk_c.hash))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(chunk_c_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "PUT C must succeed");
+
+    // Commit file Y; A is satisfied by dedup visibility from file X.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{target_hex}/commit?t={target_ticket}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "commit must succeed via dedup from file X"
+    );
+}
+
+/// Proves Finding 1's security invariant: a caller who cannot see file X is still
+/// told chunk A is needed and is refused at commit if the PUT is skipped.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[tokio::test]
+async fn dedup_commit_rejected_for_invisible_file() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Upload and commit file X = [A, B] as alice.  Two chunks are required so
+    // file_x_id = BLAKE3(A || B) differs from BLAKE3(A) = chunk_a.hash, giving
+    // bob a distinct uncommitted manifest to attack rather than alice's committed one.
+    let data_a = b"security-test chunk A";
+    let data_b = b"security-test chunk B";
+    let mem_a = MemStore::new();
+    let mem_b = MemStore::new();
+    let manifest_a = process_file(data_a, MimeClass::Generic, &mem_a)
+        .await
+        .unwrap();
+    let manifest_b = process_file(data_b, MimeClass::Generic, &mem_b)
+        .await
+        .unwrap();
+    let chunk_a = &manifest_a.chunks()[0];
+    let chunk_b = &manifest_b.chunks()[0];
+    let data_a_stored = mem_a.read_chunk(&chunk_a.hash).await.unwrap();
+    let data_b_stored = mem_b.read_chunk(&chunk_b.hash).await.unwrap();
+
+    // file_x_id mirrors what verify_file_identity computes: BLAKE3 over stored chunk bytes.
+    let file_x_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(&data_a_stored);
+        h.update(&data_b_stored);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    let file_x_hex = format!("{file_x_id}");
+    let alice_ceiling = chunk_a.len + chunk_b.len + 256;
+    let ticket_x = write_payload(&signer, &file_x_id, alice_ceiling);
+    {
+        let total_len_x = chunk_a.len + chunk_b.len;
+        let body = serde_json::json!({
+            "total_len": total_len_x,
+            "chunks": [
+                { "hash": format!("{}", chunk_a.hash), "len": chunk_a.len },
+                { "hash": format!("{}", chunk_b.hash), "len": chunk_b.len },
+            ],
+        });
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/intent?t={ticket_x}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={ticket_x}", chunk_a.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(data_a_stored))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={ticket_x}", chunk_b.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(data_b_stored))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/commit?t={ticket_x}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    // File X is visible to alice ONLY (bob cannot see it).
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    register_file_ownership(&mut admin_conn, &file_x_id, "alice").await;
+
+    // Bob's attack: declare file Y whose id = BLAKE3(chunk A stored bytes).
+    // Any other id makes verify_file_identity refuse the commit regardless of
+    // visibility, so the test would pass vacuously even if the visibility check
+    // were broken.  This id is the one that lets the commit succeed when the
+    // visibility check wrongly passes, proving the guard actually fires.
+    let bob_file_id = FileId::from_bytes(*chunk_a.hash.as_bytes());
+    let bob_file_hex = format!("{bob_file_id}");
+    let bob_ceiling = chunk_a.len + 256;
+    let ticket_bob = signer
+        .mint(&TicketPayload {
+            file_id: *chunk_a.hash.as_bytes(),
+            verb: Verb::Write,
+            ceiling: bob_ceiling,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+
+    let body_bob = serde_json::json!({
+        "total_len": chunk_a.len,
+        "chunks": [{ "hash": format!("{}", chunk_a.hash), "len": chunk_a.len }],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/intent?t={ticket_bob}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body_bob).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "bob's intent must succeed");
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+    let needed: Vec<String> = serde_json::from_value(json["needed"].clone()).unwrap();
+    assert_eq!(
+        needed.len(),
+        1,
+        "bob must be told A is needed (he cannot see alice's file X)"
+    );
+
+    // Bob skips the PUT and tries to commit, hoping to free-ride on alice's chunk.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/commit?t={ticket_bob}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "commit must be refused: A not stored and file X not visible to bob"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 2: manifest immutability
+// ---------------------------------------------------------------------------
+
+/// Proves that a second intent for the same file id with different chunks is refused.
+#[tokio::test]
+async fn second_intent_with_different_chunks_refused() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // First intent: file Y = [A].
+    let data_a = b"immutability chunk A";
+    let mem_a = MemStore::new();
+    let manifest_a = process_file(data_a, MimeClass::Generic, &mem_a)
+        .await
+        .unwrap();
+    let chunk_a = &manifest_a.chunks()[0];
+    let file_y_id = manifest_a.file_id();
+    let file_y_hex = format!("{file_y_id}");
+    let ticket_y = write_payload(
+        &signer,
+        &file_y_id,
+        u64::try_from(data_a.len()).unwrap() + 256,
+    );
+
+    let body_first = serde_json::json!({
+        "total_len": chunk_a.len,
+        "chunks": [{ "hash": format!("{}", chunk_a.hash), "len": chunk_a.len }],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_y_hex}/intent?t={ticket_y}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body_first).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "first intent must succeed");
+
+    // Second intent: same file id but different chunks (different hash).
+    let data_b = b"immutability chunk B - different content";
+    let mem_b = MemStore::new();
+    let manifest_b = process_file(data_b, MimeClass::Generic, &mem_b)
+        .await
+        .unwrap();
+    let chunk_b = &manifest_b.chunks()[0];
+    let body_second = serde_json::json!({
+        "total_len": chunk_b.len,
+        "chunks": [{ "hash": format!("{}", chunk_b.hash), "len": chunk_b.len }],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_y_hex}/intent?t={ticket_y}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body_second).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "second intent with different chunks must be refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: range clipping
+// ---------------------------------------------------------------------------
+
+/// Proves RFC 7233 clipping: a range whose stated end exceeds the file returns 206
+/// with the clipped length, while a range starting past the end returns 416.
+#[tokio::test]
+async fn range_clipped_to_file_end() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"short file for range clip test";
+    let file_id = do_upload(&app, &signer, data).await;
+    let file_hex = format!("{file_id}");
+    let file_size = u64::try_from(data.len()).unwrap();
+    let read_ticket = read_payload(&signer, &file_id, "alice", file_size);
+
+    // Stated end = 1 MiB - 1; file is only 30 bytes. Must clip and return 206.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/files/{file_hex}?t={read_ticket}"))
+                .header("range", "bytes=0-1048575")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "range extending past EOF must return 206 not 416"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        data.as_ref(),
+        "clipped range must return full file bytes"
+    );
+
+    // Start past EOF: 416.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/files/{file_hex}?t={read_ticket}"))
+                .header("range", "bytes=9999-19999")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "range starting past EOF must return 416"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: chunk count cap
+// ---------------------------------------------------------------------------
+
+/// Proves that an intent declaring more chunks than the ceiling-derived cap is refused.
+#[tokio::test]
+async fn intent_refuses_too_many_chunks() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // ceiling = 0 means only zero-length chunks are legal; the cap is 1.
+    let file_id = FileId::from_bytes([0xCCu8; 32]);
+    let ticket = signer
+        .mint(&TicketPayload {
+            file_id: [0xCCu8; 32],
+            verb: Verb::Write,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let file_hex = format!("{file_id}");
+
+    // Build 200 zero-length chunk entries; any hash will do.
+    let zero_chunk_hash = blake3::hash(b"").to_hex().to_string();
+    let chunks: Vec<serde_json::Value> = (0..200)
+        .map(|_| serde_json::json!({ "hash": zero_chunk_hash, "len": 0_u64 }))
+        .collect();
+    let body = serde_json::json!({ "total_len": 0_u64, "chunks": chunks });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "intent with 200 chunks under ceiling=0 must be refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: reader-role visibility check covers RLS-only deployments
+// ---------------------------------------------------------------------------
+
+/// Proves the security invariant under a deployment whose `connetto_visible_files`
+/// relies on RLS alone (no `current_setting` predicate in its body).
+///
+/// This test fails against the previous admin-pool `all_chunks_satisfied`: when
+/// called as admin the function bypasses RLS and returns every file, so bob's
+/// commit would wrongly succeed.  With the reader-role implementation the RLS
+/// policy on `test_file_metadata` correctly hides alice's file from bob.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[tokio::test]
+async fn dedup_commit_rejected_for_invisible_file_rls_only() {
+    let pg = Pg::start_rls_only().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Upload and commit file X = [A, B] as alice.  Two chunks are required so
+    // file_x_id = BLAKE3(A || B) differs from BLAKE3(A) = chunk_a.hash, giving
+    // bob a distinct uncommitted manifest to attack rather than alice's committed one.
+    let data_a = b"rls-only security-test chunk A";
+    let data_b = b"rls-only security-test chunk B";
+    let mem_a = MemStore::new();
+    let mem_b = MemStore::new();
+    let manifest_a = process_file(data_a, MimeClass::Generic, &mem_a)
+        .await
+        .unwrap();
+    let manifest_b = process_file(data_b, MimeClass::Generic, &mem_b)
+        .await
+        .unwrap();
+    let chunk_a = &manifest_a.chunks()[0];
+    let chunk_b = &manifest_b.chunks()[0];
+    let data_a_stored = mem_a.read_chunk(&chunk_a.hash).await.unwrap();
+    let data_b_stored = mem_b.read_chunk(&chunk_b.hash).await.unwrap();
+
+    // file_x_id mirrors what verify_file_identity computes: BLAKE3 over stored chunk bytes.
+    let file_x_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(&data_a_stored);
+        h.update(&data_b_stored);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    let file_x_hex = format!("{file_x_id}");
+    let alice_ceiling = chunk_a.len + chunk_b.len + 256;
+    let ticket_x = write_payload(&signer, &file_x_id, alice_ceiling);
+    {
+        let total_len_x = chunk_a.len + chunk_b.len;
+        let body = serde_json::json!({
+            "total_len": total_len_x,
+            "chunks": [
+                { "hash": format!("{}", chunk_a.hash), "len": chunk_a.len },
+                { "hash": format!("{}", chunk_b.hash), "len": chunk_b.len },
+            ],
+        });
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/intent?t={ticket_x}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={ticket_x}", chunk_a.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(data_a_stored))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={ticket_x}", chunk_b.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(data_b_stored))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/files/{file_x_hex}/commit?t={ticket_x}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    // Register file X as owned by alice only; bob has no visibility of it.
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    register_file_ownership(&mut admin_conn, &file_x_id, "alice").await;
+
+    // Bob's attack: declare file Y whose id = BLAKE3(chunk A stored bytes).
+    // Any other id makes verify_file_identity refuse the commit regardless of
+    // visibility, so the test would pass vacuously even if the visibility check
+    // were broken.  This id is the one that lets the commit succeed when the
+    // visibility check wrongly passes, proving the reader-role RLS guard fires.
+    let bob_file_id = FileId::from_bytes(*chunk_a.hash.as_bytes());
+    let bob_file_hex = format!("{bob_file_id}");
+    let bob_ceiling = chunk_a.len + 256;
+    let ticket_bob = signer
+        .mint(&TicketPayload {
+            file_id: *chunk_a.hash.as_bytes(),
+            verb: Verb::Write,
+            ceiling: bob_ceiling,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+
+    let body_bob = serde_json::json!({
+        "total_len": chunk_a.len,
+        "chunks": [{ "hash": format!("{}", chunk_a.hash), "len": chunk_a.len }],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/intent?t={ticket_bob}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body_bob).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "bob's intent must succeed");
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+    let needed: Vec<String> = serde_json::from_value(json["needed"].clone()).unwrap();
+    assert_eq!(
+        needed.len(),
+        1,
+        "bob must be told A is needed (he cannot see alice's file X under RLS-only policy)"
+    );
+
+    // Bob skips the PUT and tries to commit.  The reader-role check enforces
+    // RLS on connetto_visible_files so alice's file remains invisible to bob.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/commit?t={ticket_bob}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "commit must be refused under RLS-only policy: file X not visible to bob"
+    );
+}

@@ -204,15 +204,20 @@ fn parse_range(
         .trim()
         .parse()
         .map_err(|_| ServerError::RangeNotSatisfiable)?;
+    // Empty file: any range is unsatisfiable.
+    if total == 0 || lo >= total {
+        return Err(ServerError::RangeNotSatisfiable);
+    }
+    // RFC 7233 s2.1: clip the stated end rather than refusing when it exceeds the file.
     let hi: u64 = if hi_s.trim().is_empty() {
-        total.saturating_sub(1)
+        total - 1
     } else {
         hi_s.trim()
-            .parse()
+            .parse::<u64>()
             .map_err(|_| ServerError::RangeNotSatisfiable)?
+            .min(total - 1)
     };
-    // When total = 0, any range is unsatisfiable.
-    if lo > hi || hi >= total {
+    if lo > hi {
         return Err(ServerError::RangeNotSatisfiable);
     }
     Ok(Some((lo, hi)))

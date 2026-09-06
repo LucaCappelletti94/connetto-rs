@@ -43,6 +43,8 @@ pub const FIXTURE_STMTS: &[&str] = &[
     "GRANT SELECT ON _cfs_manifests        TO connetto_file_server",
     "GRANT SELECT ON _cfs_manifest_chunks  TO connetto_file_server",
     "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
+    // Predicate-based variant: connetto_visible_files filters on current_setting directly.
+    // Works even when called as a role that bypasses RLS.
     "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
      RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER AS $$
          SELECT ARRAY(
@@ -51,6 +53,57 @@ pub const FIXTURE_STMTS: &[&str] = &[
                  SELECT 1 FROM test_file_metadata m
                  WHERE m.file_id = f
                    AND m.uploaded_by = current_setting('app.user_id', TRUE)
+             )
+         )
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+         p_file_id   BYTEA,
+         p_new_state TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+     BEGIN
+         UPDATE test_file_metadata
+         SET    uploaded_by = uploaded_by
+         WHERE  file_id = p_file_id;
+         RETURN p_file_id;
+     END;
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+];
+
+/// DDL statements for a deployment whose `connetto_visible_files` relies on RLS
+/// alone, with no `current_setting` predicate in its body.
+///
+/// When called as admin (table owner, RLS bypassed) the function returns every
+/// file that exists in `test_file_metadata`, regardless of `app.user_id`.  When
+/// called as the reader role (non-owner, RLS enforced) it returns only files
+/// where the RLS policy allows access.  This shape exposes the defect that the
+/// previous admin-pool implementation introduced: `all_chunks_satisfied` running
+/// as admin would see every file and accept invisible dedup targets.
+pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS test_file_metadata (
+         file_id     BYTEA NOT NULL PRIMARY KEY,
+         uploaded_by TEXT  NOT NULL
+     )",
+    "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY test_metadata_rls ON test_file_metadata FOR SELECT
+         USING (uploaded_by = current_setting('app.user_id', TRUE))",
+    "DO $$ BEGIN
+         CREATE ROLE connetto_file_server LOGIN PASSWORD 'cfs_reader' NOINHERIT;
+     EXCEPTION WHEN duplicate_object THEN NULL;
+     END $$",
+    "GRANT SELECT ON _cfs_manifests        TO connetto_file_server",
+    "GRANT SELECT ON _cfs_manifest_chunks  TO connetto_file_server",
+    "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
+    // RLS-only variant: no current_setting predicate in the function body.
+    // Visibility is enforced entirely by the RLS policy on test_file_metadata.
+    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER AS $$
+         SELECT ARRAY(
+             SELECT f FROM UNNEST(p_file_ids) AS f
+             WHERE EXISTS (
+                 SELECT 1 FROM test_file_metadata m
+                 WHERE m.file_id = f
              )
          )
      $$",
@@ -81,6 +134,15 @@ pub struct Pg {
 
 impl Pg {
     pub async fn start() -> Self {
+        Self::start_with_fixture_stmts(FIXTURE_STMTS).await
+    }
+
+    /// Starts a container whose `connetto_visible_files` relies on RLS alone.
+    pub async fn start_rls_only() -> Self {
+        Self::start_with_fixture_stmts(FIXTURE_STMTS_RLS_ONLY).await
+    }
+
+    async fn start_with_fixture_stmts(fixture_stmts: &[&str]) -> Self {
         let container = GenericImage::new("postgres", "16")
             .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -100,16 +162,18 @@ impl Pg {
             url_admin,
             url_reader,
         };
-        pg.apply_ddl().await;
+        pg.apply_ddl(fixture_stmts).await;
         pg
     }
 
-    async fn apply_ddl(&self) {
+    async fn apply_ddl(&self, fixture_stmts: &[&str]) {
         let mut conn = connect_admin(&self.url_admin).await;
+        // DEPLOYMENT_DDL and fixture_stmts are DDL: CREATE TABLE, ALTER TABLE,
+        // CREATE ROLE, GRANT, CREATE FUNCTION.  The typed DSL cannot express DDL.
         for stmt in split_simple(DEPLOYMENT_DDL) {
             diesel::sql_query(stmt).execute(&mut conn).await.ok();
         }
-        for stmt in FIXTURE_STMTS {
+        for stmt in fixture_stmts {
             diesel::sql_query(*stmt)
                 .execute(&mut conn)
                 .await

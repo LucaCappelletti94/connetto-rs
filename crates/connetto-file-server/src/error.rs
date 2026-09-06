@@ -38,6 +38,14 @@ pub enum ServerError {
     #[error("registry conflict: hash is being deleted")]
     RegistryConflict,
 
+    /// A second intent for the same file id declares a different manifest.
+    #[error("manifest conflict: re-declaration does not match stored manifest")]
+    ManifestConflict,
+
+    /// Intent declares more chunks than the ceiling permits.
+    #[error("too many chunks declared")]
+    TooManyChunks,
+
     /// Range request outside the file's bounds.
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
@@ -77,9 +85,11 @@ impl IntoResponse for ServerError {
         let status = match self {
             Self::NotFound | Self::Ticket(_) => StatusCode::NOT_FOUND,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
-            Self::CeilingExceeded | Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::CeilingExceeded | Self::BodyTooLarge | Self::TooManyChunks => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             Self::HashMismatch => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::CommitRefused => StatusCode::CONFLICT,
+            Self::CommitRefused | Self::ManifestConflict => StatusCode::CONFLICT,
             // 503: transient condition; the client should retry after a delay.
             Self::RegistryConflict => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadParam(_) => StatusCode::BAD_REQUEST,

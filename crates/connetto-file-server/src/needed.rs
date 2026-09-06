@@ -78,7 +78,7 @@ pub(crate) async fn needed_hashes<S: ConnettoFileSchema>(
 ///
 /// Uses `sql_query` because a generic `INNER JOIN` over two laundered table
 /// types is not expressible through the trait's where clauses.
-async fn committed_file_ids_for<S: ConnettoFileSchema>(
+pub(crate) async fn committed_file_ids_for<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     declared_hashes: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, diesel::result::Error> {
@@ -107,7 +107,7 @@ async fn committed_file_ids_for<S: ConnettoFileSchema>(
 ///
 /// Uses `sql_query` because `eq_any` over a generic laundered column type is
 /// not covered by the trait's where clauses.
-async fn present_chunk_hashes<S: ConnettoFileSchema>(
+pub(crate) async fn present_chunk_hashes<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     visible_file_ids: &[Vec<u8>],
     declared_hashes: &[Vec<u8>],

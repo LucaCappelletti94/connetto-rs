@@ -612,11 +612,11 @@ impl Translated {
     /// Put this translation's rule description on the service, adopting the
     /// one already there when it is the same description.
     ///
-    /// An unchanged description means the facts behind it were loaded on the
-    /// boot that wrote it, so an ordinary restart reads one page and writes
-    /// nothing. Comparison is structural, over the same conversion the write
-    /// call itself uses, so a description that differs in any field the server
-    /// stores is a new one.
+    /// An unchanged description means the model was previously written to this
+    /// store; the caller reconciles the whole-shape facts on every adopted boot.
+    /// Comparison is structural, over the same conversion the write call itself
+    /// uses, so a description that differs in any field the server stores is a
+    /// new one.
     ///
     /// # Errors
     ///
@@ -754,6 +754,37 @@ impl Translated {
             .map_err(|err| SetupError::Store(err.to_string()))?;
         materialise_groups(&self.shapes, &self.translator, pool, policy).await?;
         Ok(records.len())
+    }
+
+    /// Reconcile every whole-shape materialisation region against the database.
+    ///
+    /// Each region is read from both Postgres and the OpenFGA store; only the
+    /// diff is written. A region whose tuples are already correct costs a read
+    /// round-trip to both sides with zero writes. A region whose tuples are
+    /// absent or stale is brought up to date.
+    ///
+    /// Call this on every adopted boot to complete a load that a previous boot
+    /// started but did not finish. A boot that ran [`Self::load_into`] fully
+    /// left a correct store, so this becomes a cheap verification pass.
+    ///
+    /// # Errors
+    ///
+    /// [`SetupError::Unplannable`] when the translation cannot be re-derived,
+    /// and [`SetupError::Store`] when a member query fails or the store refuses
+    /// a write.
+    pub async fn reconcile_materialised<T>(
+        &self,
+        pool: &Pool<AsyncPgConnection>,
+        policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
+    ) -> Result<(), SetupError>
+    where
+        T: GrpcService<Body> + Clone + Send + Sync + 'static,
+        T::Error: Into<StdError>,
+        T::ResponseBody: ResponseBody<Data = Bytes> + Send + 'static,
+        <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
+        T::Future: Send,
+    {
+        materialise_groups(&self.shapes, &self.translator, pool, policy).await
     }
 
     /// The index every reader shares, the translator the materializer's engine
@@ -1653,6 +1684,48 @@ mod tests {
              current and the boot has nothing to refuse: {:?}",
             translated.err()
         );
+    }
+
+    /// A residual-predicate share policy (with an AVG subquery) creates a whole-shape
+    /// materialisation region. The region carries the SQL that fills the grants on boot
+    /// and that `reconcile_materialised` re-runs on an adopted boot to recover from a
+    /// previous boot that failed before the materialise pass completed.
+    #[test]
+    fn a_share_with_a_residual_predicate_has_materialised_regions() {
+        const SCHEMA: &str = "
+            CREATE TABLE item (id INT PRIMARY KEY, owner TEXT NOT NULL);
+            CREATE TABLE item_share (item_id INT NOT NULL, viewer TEXT NOT NULL, \
+                weight INT NOT NULL, PRIMARY KEY (item_id, viewer));
+            ALTER TABLE item ENABLE ROW LEVEL SECURITY;
+        ";
+        const POLICY: &str = "CREATE POLICY item_p ON item FOR SELECT USING (\
+            EXISTS (SELECT 1 FROM item_share s WHERE s.item_id = item.id \
+              AND s.viewer = current_setting('app.user_id', true) \
+              AND s.weight > (SELECT avg(weight) FROM item_share)))";
+        let translated =
+            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING).expect("translates");
+        let mats = translated.shapes.materialisations();
+        assert!(
+            !mats.is_empty(),
+            "a residual-predicate share must materialise its whole-shape region \
+             so that reconcile_materialised fills it when the previous boot failed"
+        );
+        let item_id = catalog_helpers::table_id(translated.shapes.catalog(), "item")
+            .expect("item is in the catalog");
+        let type_name = translated
+            .shapes
+            .naming(item_id)
+            .map_or("item", |n| n.type_name.as_str());
+        for m in mats {
+            for mem in m.members() {
+                assert!(
+                    mem.sql().contains(&format!("'{type_name}:'")),
+                    "materialise SQL object prefix must match the type name auth checks use \
+                     (`{type_name}:`); otherwise reconcile writes facts the check never finds: {}",
+                    mem.sql()
+                );
+            }
+        }
     }
 
     /// A table whose name is the one the identity type already answers to.

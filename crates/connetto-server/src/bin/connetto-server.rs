@@ -861,28 +861,44 @@ async fn build_authorization(
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated.install_model(&mut setup, &store_id).await?;
-    // The rules being new means nothing on the service stands behind them yet.
-    // An unchanged description means the facts were loaded on the boot that
-    // wrote it, and the change stream has kept them current since.
-    if let ModelState::Written(_) = &model {
-        // The same writer the per-row upkeep uses, over the same index, on the
-        // uncounted client so a load does not read as change-path questions.
-        let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-            translated.shapes_arc(),
-            setup,
-            store_id.clone(),
-        )
-        .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
-        .authorization_model_id(model.id().to_owned());
-        let n = translated
-            .load_into(reader_pool, &loader)
-            .await
-            .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
-        tracing::info!(
-            model = model.id(),
-            facts = n,
-            "authorization rules are new, loading the facts behind them"
-        );
+    // Build the loader once: both the Written and Adopted paths use it, though
+    // for different passes. The uncounted client keeps boot writes out of the
+    // authorization-call counter.
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
+        setup,
+        store_id.clone(),
+    )
+    .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
+    .authorization_model_id(model.id().to_owned());
+    match &model {
+        ModelState::Written(_) => {
+            let n = translated
+                .load_into(reader_pool, &loader)
+                .await
+                .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
+            tracing::info!(
+                model = model.id(),
+                facts = n,
+                "authorization rules are new, loading the facts behind them"
+            );
+        }
+        ModelState::Adopted(_) => {
+            // Reconcile the whole-shape materialisation regions on every
+            // adopted boot. A previous boot may have written keyed facts then
+            // failed before materialise_groups completed, leaving the store
+            // with keyed facts and no whole-shape facts. A region already
+            // correct costs a read round-trip to both sides with zero writes;
+            // a missing region is filled.
+            translated
+                .reconcile_materialised(reader_pool, &loader)
+                .await
+                .map_err(|err| anyhow!("reconciling the authorization store: {err}"))?;
+            tracing::info!(
+                model = model.id(),
+                "authorization rules already installed, reconciling whole-shape regions"
+            );
+        }
     }
 
     let (shapes, translator, reach) = translated.into_parts();

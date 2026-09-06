@@ -11,6 +11,8 @@ use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
 
+use crate::functions;
+use crate::needed;
 use crate::schema::ConnettoFileSchema;
 
 // ---------------------------------------------------------------------------
@@ -25,6 +27,18 @@ pub(crate) enum ChunkPutResult {
     AlreadyStored,
     /// Adding this chunk would push `accepted_bytes` past the ticket ceiling.
     WouldExceedCeiling,
+}
+
+/// Outcome of [`insert_manifest`].
+pub(crate) enum InsertManifestOutcome {
+    /// New manifest declared; chunk rows inserted.
+    Inserted,
+    /// Manifest already exists and the re-declaration matches it exactly.
+    AlreadyPresent,
+    /// Manifest already exists but the re-declaration differs from it.
+    ManifestConflict,
+    /// A declared chunk hash is in `deleting` state; the intent must be retried.
+    RegistryConflict,
 }
 
 /// Outcome of [`commit_manifest_atomic`].
@@ -60,80 +74,105 @@ enum CommitTxError {
 // Intent operations
 // ---------------------------------------------------------------------------
 
-/// Locks the registry row for `hash` and returns its state.
-pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
-    conn: &mut AsyncPgConnection,
-    hash: &ChunkHash,
-) -> Result<Option<String>, diesel::result::Error> {
-    let mut rows: Vec<(Vec<u8>, String)> =
-        S::lock_registry_rows_stmt(vec![hash.as_bytes().to_vec()])
-            .load(conn)
-            .await?;
-    Ok(rows.pop().map(|(_, state)| state))
-}
-
 /// Inserts registry rows, locks them, then inserts the manifest and chunk references atomically.
 ///
-/// A `deleting` row rolls back the transaction.
+/// Returns [`InsertManifestOutcome::RegistryConflict`] when a hash is in `deleting` state,
+/// [`InsertManifestOutcome::ManifestConflict`] when the file id already has a different manifest,
+/// [`InsertManifestOutcome::AlreadyPresent`] when the re-declaration matches exactly, and
+/// [`InsertManifestOutcome::Inserted`] on success.
+///
+/// Registry and chunk inserts are batched into one SQL statement each so intent for
+/// a large manifest does not issue O(n) sequential round trips.
 pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
     total_len: i64,
     caller: &str,
     chunks: &[ChunkMeta],
-) -> Result<bool, diesel::result::Error> {
+) -> Result<InsertManifestOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
     let caller_owned = caller.to_owned();
     let chunks_owned: Vec<ChunkMeta> = chunks.to_vec();
     let now = Utc::now();
 
-    conn.transaction::<bool, diesel::result::Error, _>(move |c| {
+    conn.transaction::<InsertManifestOutcome, diesel::result::Error, _>(move |c| {
         async move {
-            let mut declared = chunks_owned
+            // Collect unique hashes in sorted order for deterministic locking.
+            let mut unique_hashes: Vec<Vec<u8>> = chunks_owned
                 .iter()
-                .map(|chunk| chunk.hash.as_bytes().to_vec())
-                .collect::<Vec<_>>();
-            declared.sort_unstable();
-            declared.dedup();
-            for hash in &declared {
-                c.execute_returning_count(S::insert_registry_pending_stmt(hash.clone()))
-                    .await?;
-            }
+                .map(|ch| ch.hash.as_bytes().to_vec())
+                .collect();
+            unique_hashes.sort_unstable();
+            unique_hashes.dedup();
 
-            let locked: Vec<(Vec<u8>, String)> =
-                S::lock_registry_rows_stmt(declared).load(c).await?;
-            if locked.iter().any(|(_, state)| state == "deleting") {
-                return Err(diesel::result::Error::RollbackTransaction);
-            }
-
-            c.execute_returning_count(S::insert_manifest_stmt(
-                file_id_bytes.clone(),
-                total_len,
-                caller_owned,
-                now,
-            ))
-            .await?;
-
-            for (i, chunk) in chunks_owned.iter().enumerate() {
-                let position = i32::try_from(i).expect("chunk count fits i32");
-                let chunk_len =
-                    i64::try_from(chunk.len).expect("validated chunk length must fit i64");
-                c.execute_returning_count(S::insert_chunk_row_stmt(
-                    file_id_bytes.clone(),
-                    position,
-                    chunk.hash.as_bytes().to_vec(),
-                    chunk_len,
+            // Batch-insert registry rows; clone the hashes because INSERT and the subsequent
+            // lock both consume an owned Vec and the INSERT must run first.
+            if !unique_hashes.is_empty() {
+                c.execute_returning_count(S::insert_registry_pending_batch_stmt(
+                    unique_hashes.clone(),
                 ))
                 .await?;
             }
 
-            Ok(true)
+            // Lock registry rows in hash order to prevent deadlocks with other uploads.
+            let locked: Vec<(Vec<u8>, String)> =
+                S::lock_registry_rows_stmt(unique_hashes).load(c).await?;
+            if locked.iter().any(|(_, state)| state == "deleting") {
+                return Err(diesel::result::Error::RollbackTransaction);
+            }
+
+            // Try to insert the manifest header.
+            let inserted = c
+                .execute_returning_count(S::insert_manifest_stmt(
+                    file_id_bytes.clone(),
+                    total_len,
+                    caller_owned,
+                    now,
+                ))
+                .await?;
+
+            if inserted == 0 {
+                // Manifest already exists; compare with stored chunk rows.
+                let existing = load_chunk_rows::<S>(c, file_id_bytes).await?;
+                return Ok(
+                    if declared_matches_stored(&chunks_owned, existing.chunks()) {
+                        InsertManifestOutcome::AlreadyPresent
+                    } else {
+                        InsertManifestOutcome::ManifestConflict
+                    },
+                );
+            }
+
+            // Batch-insert chunk rows (one SQL statement, not one per chunk).
+            if !chunks_owned.is_empty() {
+                let rows: Vec<(i32, Vec<u8>, i64)> = chunks_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ch)| {
+                        let pos = i32::try_from(i).map_err(|_| {
+                            diesel::result::Error::DeserializationError(
+                                "chunk count overflows i32".into(),
+                            )
+                        })?;
+                        let len = i64::try_from(ch.len).map_err(|_| {
+                            diesel::result::Error::DeserializationError(
+                                "chunk len overflows i64".into(),
+                            )
+                        })?;
+                        Ok((pos, ch.hash.as_bytes().to_vec(), len))
+                    })
+                    .collect::<Result<Vec<_>, diesel::result::Error>>()?;
+                c.execute_returning_count(S::insert_chunk_rows_batch_stmt(file_id_bytes, rows))
+                    .await?;
+            }
+
+            Ok(InsertManifestOutcome::Inserted)
         }
         .scope_boxed()
     })
     .await
     .or_else(|e| match e {
-        diesel::result::Error::RollbackTransaction => Ok(false),
+        diesel::result::Error::RollbackTransaction => Ok(InsertManifestOutcome::RegistryConflict),
         other => Err(other),
     })
 }
@@ -197,7 +236,13 @@ pub(crate) async fn declared_chunk_len<S: ConnettoFileSchema>(
     );
     let query = SelectDsl::select(filtered2, S::MCColChunkLen::default());
     let mut rows: Vec<i64> = LimitDsl::limit(query, 1).load(conn).await?;
-    Ok(rows.pop().map(|l| u64::try_from(l).unwrap_or(0)))
+    rows.pop()
+        .map(|l| {
+            u64::try_from(l).map_err(|_| {
+                diesel::result::Error::DeserializationError("negative chunk_len".into())
+            })
+        })
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -214,11 +259,15 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
 ) -> Result<ChunkPutResult, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
     let hash_bytes = chunk_hash.as_bytes().to_vec();
-    let chunk_len_i64 = i64::try_from(chunk_len).unwrap_or(i64::MAX);
-    let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
+    let chunk_len_i64 = i64::try_from(chunk_len).map_err(|_| {
+        diesel::result::Error::DeserializationError("chunk_len overflows i64".into())
+    })?;
+    let ceiling_i64 = i64::try_from(ceiling)
+        .map_err(|_| diesel::result::Error::DeserializationError("ceiling overflows i64".into()))?;
     let allowed = ceiling_i64.checked_sub(chunk_len_i64).unwrap_or(-1);
 
-    let mark_stored = S::mark_chunk_stored_stmt(file_id_bytes.clone(), hash_bytes.clone());
+    let mark_stored =
+        S::mark_chunk_stored_stmt(file_id_bytes.clone(), hash_bytes.clone(), chunk_len_i64);
     if conn.execute_returning_count(mark_stored).await? == 0 {
         return Ok(ChunkPutResult::AlreadyStored);
     }
@@ -233,22 +282,85 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     Ok(ChunkPutResult::Accepted)
 }
 
-/// Returns `true` when every chunk row for `file_id` has `stored = TRUE`.
-///
-/// False means at least one declared chunk was not PUT through this manifest.
-pub(crate) async fn all_chunks_stored<S: ConnettoFileSchema>(
-    conn: &mut AsyncPgConnection,
-    file_id: &FileId,
-) -> Result<bool, diesel::result::Error> {
-    let rows: Vec<Vec<u8>> = S::any_unstored_chunk_stmt(file_id.as_bytes().to_vec())
-        .load(conn)
-        .await?;
-    Ok(rows.is_empty())
-}
-
 // ---------------------------------------------------------------------------
 // Commit operations
 // ---------------------------------------------------------------------------
+
+/// Returns `true` when every chunk for `file_id` is either stored through this
+/// manifest OR is present in a committed manifest visible to `caller`.
+///
+/// Runs on the reader connection so the deployment's row-level security applies
+/// inside `connetto_visible_files`.  The admin role owns the tables and bypasses
+/// RLS, so evaluating this on the admin connection silently allows a SECURITY
+/// INVOKER function that relies on RLS alone to return every candidate file and
+/// accept invisible dedup targets, reopening the original critical hole.
+pub(crate) async fn all_chunks_satisfied<S: ConnettoFileSchema>(
+    reader_conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+    caller: &str,
+) -> Result<bool, diesel::result::Error> {
+    let caller = caller.to_owned();
+    let file_id_bytes = file_id.as_bytes().to_vec();
+    reader_conn
+        .transaction::<bool, diesel::result::Error, _>(|conn| {
+            async move {
+                // Step 1: collect hashes of chunk rows with stored = FALSE.
+                let unstored: Vec<Vec<u8>> = S::all_unstored_chunk_hashes_stmt(file_id_bytes)
+                    .load(conn)
+                    .await?;
+                if unstored.is_empty() {
+                    return Ok(true);
+                }
+
+                // Step 2: thread caller identity so RLS fires for this transaction.
+                diesel::select(functions::set_config("app.user_id", &caller, true))
+                    .get_result::<String>(conn)
+                    .await?;
+
+                // Steps 3-5: reuse needed.rs's three-step visibility machinery.
+                let candidate_ids = needed::committed_file_ids_for::<S>(conn, &unstored).await?;
+                if candidate_ids.is_empty() {
+                    return Ok(false);
+                }
+                let visible_ids: Vec<Vec<u8>> =
+                    diesel::select(functions::connetto_visible_files(candidate_ids))
+                        .get_result(conn)
+                        .await?;
+                if visible_ids.is_empty() {
+                    return Ok(false);
+                }
+                let present =
+                    needed::present_chunk_hashes::<S>(conn, &visible_ids, &unstored).await?;
+
+                // Every unstored hash must be covered by a visible committed manifest.
+                for h in &unstored {
+                    let arr: [u8; 32] = h.as_slice().try_into().map_err(|_| {
+                        diesel::result::Error::DeserializationError(
+                            "unstored hash not 32 bytes".into(),
+                        )
+                    })?;
+                    if !present.contains(&arr) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            .scope_boxed()
+        })
+        .await
+}
+
+/// Locks the registry row for `hash` and returns its state.
+pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    hash: &ChunkHash,
+) -> Result<Option<String>, diesel::result::Error> {
+    let mut rows: Vec<(Vec<u8>, String)> =
+        S::lock_registry_rows_stmt(vec![hash.as_bytes().to_vec()])
+            .load(conn)
+            .await?;
+    Ok(rows.pop().map(|(_, state)| state))
+}
 
 /// Atomically marks the manifest committed and calls the deployment setter,
 /// all inside one Postgres transaction.
@@ -393,4 +505,15 @@ fn manifest_from_rows(
         })
         .collect();
     Ok(Manifest::new(file_id, metas?))
+}
+
+/// Returns `true` when the declared chunks match the stored manifest exactly.
+///
+/// Checks count, hash, and length at each position in order.
+fn declared_matches_stored(declared: &[ChunkMeta], stored: &[ChunkMeta]) -> bool {
+    declared.len() == stored.len()
+        && declared
+            .iter()
+            .zip(stored.iter())
+            .all(|(d, s)| d.hash == s.hash && d.len == s.len)
 }

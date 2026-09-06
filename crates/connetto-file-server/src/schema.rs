@@ -329,9 +329,12 @@ where
         at: chrono::DateTime<chrono::Utc>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `INSERT INTO chunk_registry (hash, 'pending') ON CONFLICT DO NOTHING`.
-    fn insert_registry_pending_stmt(
-        hash: Vec<u8>,
+    /// Batch-insert registry rows (pending) for the given hashes in one statement.
+    ///
+    /// Runs `INSERT INTO chunk_registry (chunk_hash, state) VALUES (...) ON CONFLICT DO NOTHING`.
+    /// Calling with an empty `hashes` slice is a no-op.
+    fn insert_registry_pending_batch_stmt(
+        hashes: Vec<Vec<u8>>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Lock the named registry rows in hash order and return their states.
@@ -355,10 +358,14 @@ where
     // so the internal UPDATE / DELETE type hierarchy never surfaces here)
     // ================================================================
 
-    /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND chunk_hash=? AND stored=FALSE`.
+    /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND chunk_hash=? AND chunk_len=? AND stored=FALSE`.
+    ///
+    /// Binding the declared length ties the stored mark to the same row the PUT length
+    /// check was derived from, preventing a row with a different length from being marked.
     fn mark_chunk_stored_stmt(
         file_id: Vec<u8>,
         hash: Vec<u8>,
+        chunk_len: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Build `UPDATE manifests SET accepted_bytes = accepted_bytes + chunk_len WHERE file_id=? AND accepted_bytes <= allowed`.
@@ -383,12 +390,14 @@ where
         hashes: Vec<Vec<u8>>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
-    /// Build `INSERT INTO manifest_chunks VALUES (file_id, position, chunk_hash, chunk_len, FALSE) ON CONFLICT DO NOTHING`.
-    fn insert_chunk_row_stmt(
+    /// Batch-insert chunk rows in one statement.
+    ///
+    /// Each element of `rows` is `(position, chunk_hash, chunk_len)`.
+    /// Runs `INSERT INTO manifest_chunks (...) VALUES (...) ON CONFLICT DO NOTHING`.
+    /// Calling with an empty `rows` slice is a no-op.
+    fn insert_chunk_rows_batch_stmt(
         file_id: Vec<u8>,
-        position: i32,
-        chunk_hash: Vec<u8>,
-        chunk_len: i64,
+        rows: Vec<(i32, Vec<u8>, i64)>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Build `DELETE FROM chunk_registry WHERE chunk_hash=?`.
@@ -404,11 +413,11 @@ where
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
-    /// Build `SELECT chunk_hash FROM manifest_chunks WHERE file_id = ? AND stored = FALSE LIMIT 1`.
+    /// Build `SELECT chunk_hash FROM manifest_chunks WHERE file_id = ? AND stored = FALSE`.
     ///
-    /// Returns one row when at least one chunk for this manifest was never
-    /// stored through a PUT; returns zero rows when all chunks are stored.
-    fn any_unstored_chunk_stmt(
+    /// Returns one row per unsatisfied chunk for this manifest.  Used by the commit
+    /// dedup check to find which chunk hashes still need store evidence.
+    fn all_unstored_chunk_hashes_stmt(
         file_id: Vec<u8>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 }
@@ -496,14 +505,21 @@ impl ConnettoFileSchema for DefaultFileSchema {
             .on_conflict_do_nothing()
     }
 
-    fn insert_registry_pending_stmt(
-        hash: Vec<u8>,
+    fn insert_registry_pending_batch_stmt(
+        hashes: Vec<Vec<u8>>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::insert_into(_cfs_chunk_registry::table)
-            .values((
-                _cfs_chunk_registry::chunk_hash.eq(hash),
-                _cfs_chunk_registry::state.eq("pending"),
-            ))
+            .values(
+                hashes
+                    .into_iter()
+                    .map(|h| {
+                        (
+                            _cfs_chunk_registry::chunk_hash.eq(h),
+                            _cfs_chunk_registry::state.eq("pending"),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .on_conflict_do_nothing()
     }
 
@@ -577,14 +593,18 @@ impl ConnettoFileSchema for DefaultFileSchema {
     fn mark_chunk_stored_stmt(
         file_id: Vec<u8>,
         hash: Vec<u8>,
+        chunk_len: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::update(diesel::QueryDsl::filter(
             diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
-                    _cfs_manifest_chunks::table,
-                    _cfs_manifest_chunks::file_id.eq(file_id),
+                    diesel::QueryDsl::filter(
+                        _cfs_manifest_chunks::table,
+                        _cfs_manifest_chunks::file_id.eq(file_id),
+                    ),
+                    _cfs_manifest_chunks::chunk_hash.eq(hash),
                 ),
-                _cfs_manifest_chunks::chunk_hash.eq(hash),
+                _cfs_manifest_chunks::chunk_len.eq(chunk_len),
             ),
             _cfs_manifest_chunks::stored.eq(false),
         ))
@@ -649,20 +669,24 @@ impl ConnettoFileSchema for DefaultFileSchema {
         .returning(_cfs_chunk_registry::chunk_hash)
     }
 
-    fn insert_chunk_row_stmt(
+    fn insert_chunk_rows_batch_stmt(
         file_id: Vec<u8>,
-        position: i32,
-        chunk_hash: Vec<u8>,
-        chunk_len: i64,
+        rows: Vec<(i32, Vec<u8>, i64)>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::insert_into(_cfs_manifest_chunks::table)
-            .values((
-                _cfs_manifest_chunks::file_id.eq(file_id),
-                _cfs_manifest_chunks::position.eq(position),
-                _cfs_manifest_chunks::chunk_hash.eq(chunk_hash),
-                _cfs_manifest_chunks::chunk_len.eq(chunk_len),
-                _cfs_manifest_chunks::stored.eq(false),
-            ))
+            .values(
+                rows.into_iter()
+                    .map(|(pos, hash, len)| {
+                        (
+                            _cfs_manifest_chunks::file_id.eq(file_id.clone()),
+                            _cfs_manifest_chunks::position.eq(pos),
+                            _cfs_manifest_chunks::chunk_hash.eq(hash),
+                            _cfs_manifest_chunks::chunk_len.eq(len),
+                            _cfs_manifest_chunks::stored.eq(false),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .on_conflict_do_nothing()
     }
 
@@ -685,21 +709,18 @@ impl ConnettoFileSchema for DefaultFileSchema {
         .returning(_cfs_manifests::file_id)
     }
 
-    fn any_unstored_chunk_stmt(
+    fn all_unstored_chunk_hashes_stmt(
         file_id: Vec<u8>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
-        diesel::QueryDsl::limit(
-            diesel::QueryDsl::select(
+        diesel::QueryDsl::select(
+            diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
-                    diesel::QueryDsl::filter(
-                        _cfs_manifest_chunks::table,
-                        _cfs_manifest_chunks::file_id.eq(file_id),
-                    ),
-                    _cfs_manifest_chunks::stored.eq(false),
+                    _cfs_manifest_chunks::table,
+                    _cfs_manifest_chunks::file_id.eq(file_id),
                 ),
-                _cfs_manifest_chunks::chunk_hash,
+                _cfs_manifest_chunks::stored.eq(false),
             ),
-            1,
+            _cfs_manifest_chunks::chunk_hash,
         )
     }
 }
@@ -848,17 +869,24 @@ macro_rules! connetto_file_tables {
                     ))
                     .on_conflict_do_nothing()
             }
-            fn insert_registry_pending_stmt(
-                hash: Vec<u8>,
+            fn insert_registry_pending_batch_stmt(
+                hashes: Vec<Vec<u8>>,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
             + 'static {
                 diesel::insert_into($chunk_registry::table)
-                    .values((
-                        $chunk_registry::chunk_hash.eq(hash),
-                        $chunk_registry::state.eq("pending"),
-                    ))
+                    .values(
+                        hashes
+                            .into_iter()
+                            .map(|h| {
+                                (
+                                    $chunk_registry::chunk_hash.eq(h),
+                                    $chunk_registry::state.eq("pending"),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .on_conflict_do_nothing()
             }
             fn lock_registry_rows_stmt(
@@ -942,6 +970,7 @@ macro_rules! connetto_file_tables {
             fn mark_chunk_stored_stmt(
                 file_id: Vec<u8>,
                 hash: Vec<u8>,
+                chunk_len: i64,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
@@ -950,6 +979,7 @@ macro_rules! connetto_file_tables {
                     $manifest_chunks::table
                         .filter($manifest_chunks::file_id.eq(file_id))
                         .filter($manifest_chunks::chunk_hash.eq(hash))
+                        .filter($manifest_chunks::chunk_len.eq(chunk_len))
                         .filter($manifest_chunks::stored.eq(false)),
                 )
                 .set($manifest_chunks::stored.eq(true))
@@ -1024,23 +1054,27 @@ macro_rules! connetto_file_tables {
                 .set($chunk_registry::state.eq("deleting"))
                 .returning($chunk_registry::chunk_hash)
             }
-            fn insert_chunk_row_stmt(
+            fn insert_chunk_rows_batch_stmt(
                 file_id: Vec<u8>,
-                position: i32,
-                chunk_hash: Vec<u8>,
-                chunk_len: i64,
+                rows: Vec<(i32, Vec<u8>, i64)>,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
             + 'static {
                 diesel::insert_into($manifest_chunks::table)
-                    .values((
-                        $manifest_chunks::file_id.eq(file_id),
-                        $manifest_chunks::position.eq(position),
-                        $manifest_chunks::chunk_hash.eq(chunk_hash),
-                        $manifest_chunks::chunk_len.eq(chunk_len),
-                        $manifest_chunks::stored.eq(false),
-                    ))
+                    .values(
+                        rows.into_iter()
+                            .map(|(pos, hash, len)| {
+                                (
+                                    $manifest_chunks::file_id.eq(file_id.clone()),
+                                    $manifest_chunks::position.eq(pos),
+                                    $manifest_chunks::chunk_hash.eq(hash),
+                                    $manifest_chunks::chunk_len.eq(len),
+                                    $manifest_chunks::stored.eq(false),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .on_conflict_do_nothing()
             }
             fn delete_registry_row_stmt(
@@ -1066,7 +1100,7 @@ macro_rules! connetto_file_tables {
                 )
                 .returning($manifests::file_id)
             }
-            fn any_unstored_chunk_stmt(
+            fn all_unstored_chunk_hashes_stmt(
                 file_id: Vec<u8>,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
@@ -1074,18 +1108,15 @@ macro_rules! connetto_file_tables {
                 Vec<u8>,
             > + Send
             + 'static {
-                diesel::QueryDsl::limit(
-                    diesel::QueryDsl::select(
+                diesel::QueryDsl::select(
+                    diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
-                            diesel::QueryDsl::filter(
-                                $manifest_chunks::table,
-                                $manifest_chunks::file_id.eq(file_id),
-                            ),
-                            $manifest_chunks::stored.eq(false),
+                            $manifest_chunks::table,
+                            $manifest_chunks::file_id.eq(file_id),
                         ),
-                        $manifest_chunks::chunk_hash,
+                        $manifest_chunks::stored.eq(false),
                     ),
-                    1,
+                    $manifest_chunks::chunk_hash,
                 )
             }
         }

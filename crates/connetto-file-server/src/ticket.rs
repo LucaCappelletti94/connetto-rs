@@ -30,7 +30,7 @@ pub struct TicketPayload {
     pub file_id: [u8; 32],
     /// Authorized operation.
     pub verb: Verb,
-    /// Maximum upload bytes for [`Verb::Write`]; zero for [`Verb::Read`].
+    /// Bytes one response may serve under [`Verb::Read`], per response rather than per ticket.
     pub ceiling: u64,
     /// Unix timestamp (seconds) after which the ticket is expired.
     pub expiry: i64,
