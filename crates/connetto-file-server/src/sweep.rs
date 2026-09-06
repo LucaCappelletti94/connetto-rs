@@ -24,6 +24,9 @@ pub enum SweepError {
     /// Chunk store deletion error.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    /// Grace period Duration exceeds chrono's representable range.
+    #[error("grace period out of range")]
+    GracePeriodOutOfRange,
 }
 
 impl<E: std::error::Error + 'static> From<bb8::RunError<E>> for SweepError {
@@ -38,8 +41,8 @@ pub async fn sweep<S: ConnettoFileSchema>(
     store: &AnyStore,
     grace: Duration,
 ) -> Result<usize, SweepError> {
+    let delta = TimeDelta::from_std(grace).map_err(|_| SweepError::GracePeriodOutOfRange)?;
     let mut conn = pool.get().await?;
-    let delta = TimeDelta::from_std(grace).unwrap_or(TimeDelta::seconds(3600));
     let cutoff = Utc::now() - delta;
 
     let removed_manifests = db::prepare_sweep::<S>(&mut conn, cutoff).await?;

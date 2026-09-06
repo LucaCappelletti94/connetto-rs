@@ -246,6 +246,10 @@ async fn verify_file_identity(
     let mut hasher = blake3::Hasher::new();
     for chunk in manifest.chunks() {
         let data = store.read(&chunk.hash).await?;
+        let actual_len = u64::try_from(data.len()).map_err(|_| ServerError::CommitRefused)?;
+        if actual_len != chunk.len {
+            return Err(ServerError::CommitRefused);
+        }
         hasher.update(&data);
     }
     let computed: [u8; 32] = *hasher.finalize().as_bytes();

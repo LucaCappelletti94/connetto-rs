@@ -2185,3 +2185,199 @@ async fn dedup_commit_rejected_for_invisible_file_rls_only() {
         "commit must be refused under RLS-only policy: file X not visible to bob"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 6: dedup chunk declared length must match the stored object
+// ---------------------------------------------------------------------------
+
+/// Proves: a deduplicated chunk whose declared length does not match the stored
+/// object's actual byte count is refused at commit.
+///
+/// File X = [A, B] is committed first, making both chunks visible to alice.
+/// Malicious file Y = [B (length lied to 999), A] uses blake3 of the real
+/// bytes in reversed order as its identity so the identity check passes.
+/// The length check on stored B (real length != 999) must be the gate that refuses.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn dedup_commit_with_lying_chunk_length_refused() {
+    use connetto_file_core::ChunkStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Produce two single-chunk manifests so each raw slice maps to one chunk.
+    let raw_a: &[u8] = b"chunk-A-payload-bytes";
+    let raw_b: &[u8] = b"chunk-B-payload-bytes-different";
+    let mem_a = MemStore::new();
+    let mem_b = MemStore::new();
+    let mf_a = process_file(raw_a, MimeClass::Generic, &mem_a)
+        .await
+        .unwrap();
+    let mf_b = process_file(raw_b, MimeClass::Generic, &mem_b)
+        .await
+        .unwrap();
+    assert_eq!(
+        mf_a.chunks().len(),
+        1,
+        "raw_a must produce exactly one chunk"
+    );
+    assert_eq!(
+        mf_b.chunks().len(),
+        1,
+        "raw_b must produce exactly one chunk"
+    );
+    let chunk_a = &mf_a.chunks()[0];
+    let chunk_b = &mf_b.chunks()[0];
+    let stored_a = mem_a.read_chunk(&chunk_a.hash).await.unwrap();
+    let stored_b = mem_b.read_chunk(&chunk_b.hash).await.unwrap();
+    // Compute all IDs using references before any value is consumed.
+    // File X = [A, B]: file_id_X = blake3(stored_A || stored_B).
+    let file_id_x = {
+        let mut h = blake3::Hasher::new();
+        h.update(&stored_a);
+        h.update(&stored_b);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    // Malicious file Y = [B, A] (reversed): file_id_Y = blake3(stored_B || stored_A).
+    let file_id_y = {
+        let mut h = blake3::Hasher::new();
+        h.update(&stored_b);
+        h.update(&stored_a);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    let stored_b_len = stored_b.len();
+
+    let x_path = format!("{file_id_x}");
+    let total_len_x = chunk_a.len + chunk_b.len;
+    let ticket_x = write_payload(&signer, &file_id_x, total_len_x + 256);
+    let hash_a = chunk_a.hash;
+    let hash_b = chunk_b.hash;
+    let len_a = chunk_a.len;
+    let len_b = chunk_b.len;
+
+    let intent_x = serde_json::json!({
+        "total_len": total_len_x,
+        "chunks": [
+            { "hash": format!("{hash_a}"), "len": len_a },
+            { "hash": format!("{hash_b}"), "len": len_b },
+        ],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{x_path}/intent?t={ticket_x}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_x).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "X intent must succeed");
+
+    // Move stored_a and stored_b into the PUT bodies; references are done.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{hash_a}?t={ticket_x}"))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(stored_a))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "PUT A must succeed");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{hash_b}?t={ticket_x}"))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(stored_b))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "PUT B must succeed");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{x_path}/commit?t={ticket_x}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "X commit must succeed");
+
+    // Make X visible to alice so Y can dedup its chunks.
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    register_file_ownership(&mut admin_conn, &file_id_x, "alice").await;
+
+    // Intent for malicious Y: B with lying len=999, A with honest len.
+    // Both chunks are deduped from X (alice can see X), so needed must be empty.
+    let lying_len: u64 = 999;
+    let total_len_y = lying_len + len_a;
+    let ticket_y = write_payload(&signer, &file_id_y, total_len_y + 256);
+    let y_path = format!("{file_id_y}");
+
+    let intent_y = serde_json::json!({
+        "total_len": total_len_y,
+        "chunks": [
+            { "hash": format!("{hash_b}"), "len": lying_len },
+            { "hash": format!("{hash_a}"), "len": len_a },
+        ],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{y_path}/intent?t={ticket_y}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_y).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "Y intent must succeed");
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+    let needed: Vec<String> = serde_json::from_value(json["needed"].clone()).unwrap();
+    assert!(
+        needed.is_empty(),
+        "both chunks must be deduped from file X (needed={needed:?})"
+    );
+
+    // Commit Y: identity passes (blake3(real_B || real_A) = file_id_Y) but the
+    // length check must refuse because stored_B is {stored_b_len} bytes, not 999.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{y_path}/commit?t={ticket_y}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "commit must be refused: chunk B declared {lying_len} bytes but stored object is {stored_b_len} bytes",
+    );
+}
