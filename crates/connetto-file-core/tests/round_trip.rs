@@ -280,3 +280,27 @@ async fn reader_multi_chunk_generic_short_reads() {
         "round-trip must restore original bytes"
     );
 }
+
+/// No slab from `stream_slabs` exceeds the configured max bytes.
+///
+/// A Jpeg-class file of 2 * max + 1 bytes forces `stream_slabs` to produce
+/// at least one full second slab; before the fix `read_prefix` looped to
+/// limit + 1, so that slab was max + 1 bytes.
+#[tokio::test]
+async fn slab_chunks_do_not_exceed_max() {
+    let params = MimeClass::Jpeg.params();
+    let max = usize::try_from(params.max).expect("max fits usize");
+    let size = 2 * max + 1;
+    let data = xorshift_bytes(0x1234_5678, size);
+    let store = EncryptingStore::new_with(MemStore::new(), &[0u8; 32], true);
+    let mf = process_file(&data, MimeClass::Jpeg, &store).await.unwrap();
+    let max_u64 = u64::from(params.max);
+    for chunk in mf.chunks() {
+        assert!(
+            chunk.len <= max_u64,
+            "chunk of {} bytes exceeds configured max {}",
+            chunk.len,
+            max_u64
+        );
+    }
+}

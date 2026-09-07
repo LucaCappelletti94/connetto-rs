@@ -112,10 +112,10 @@ pub async fn reassemble<S: ChunkStore>(
 
 /// Reads up to `limit` bytes from `reader`, stopping at EOF.
 fn read_prefix<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, std::io::Error> {
-    let mut buf = Vec::with_capacity(limit + 1);
+    let mut buf = Vec::with_capacity(limit);
     let mut tmp = [0u8; 8192];
-    while buf.len() < limit + 1 {
-        let remaining = limit + 1 - buf.len();
+    while buf.len() < limit {
+        let remaining = limit - buf.len();
         let to_read = remaining.min(tmp.len());
         let n = reader.read(&mut tmp[..to_read])?;
         if n == 0 {
