@@ -26,8 +26,9 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 /// on `;` inside dollar-quoted function bodies.
 pub const FIXTURE_STMTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS test_file_metadata (
-         file_id     BYTEA NOT NULL PRIMARY KEY,
-         uploaded_by TEXT  NOT NULL
+         file_id     BYTEA NOT NULL,
+         uploaded_by TEXT  NOT NULL,
+         PRIMARY KEY (file_id, uploaded_by)
      )",
     "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
     "CREATE POLICY test_metadata_rls ON test_file_metadata FOR SELECT
@@ -56,6 +57,9 @@ pub const FIXTURE_STMTS: &[&str] = &[
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
     // SET search_path TO '' pins the path. p_caller carries the uploader identity.
+    // connecto_set_content_state registers the committer as an admitted reader
+    // in test_file_metadata so that a GET under a valid ticket succeeds without
+    // requiring an explicit register_file_ownership call in every test.
     "CREATE OR REPLACE FUNCTION connetto_set_content_state(
          p_file_id   BYTEA,
          p_new_state TEXT,
@@ -63,9 +67,9 @@ pub const FIXTURE_STMTS: &[&str] = &[
      ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
          SET search_path TO '' AS $$
      BEGIN
-         UPDATE public.test_file_metadata
-         SET    uploaded_by = uploaded_by
-         WHERE  file_id = p_file_id;
+         INSERT INTO public.test_file_metadata (file_id, uploaded_by)
+         VALUES (p_file_id, p_caller)
+         ON CONFLICT DO NOTHING;
          RETURN p_file_id;
      END;
      $$",
@@ -83,8 +87,9 @@ pub const FIXTURE_STMTS: &[&str] = &[
 /// as admin would see every file and accept invisible dedup targets.
 pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS test_file_metadata (
-         file_id     BYTEA NOT NULL PRIMARY KEY,
-         uploaded_by TEXT  NOT NULL
+         file_id     BYTEA NOT NULL,
+         uploaded_by TEXT  NOT NULL,
+         PRIMARY KEY (file_id, uploaded_by)
      )",
     "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
     "CREATE POLICY test_metadata_rls ON test_file_metadata FOR SELECT
@@ -118,9 +123,9 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
      ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
          SET search_path TO '' AS $$
      BEGIN
-         UPDATE public.test_file_metadata
-         SET    uploaded_by = uploaded_by
-         WHERE  file_id = p_file_id;
+         INSERT INTO public.test_file_metadata (file_id, uploaded_by)
+         VALUES (p_file_id, p_caller)
+         ON CONFLICT DO NOTHING;
          RETURN p_file_id;
      END;
      $$",
@@ -478,7 +483,6 @@ pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
         },
         store,
         verifier,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };

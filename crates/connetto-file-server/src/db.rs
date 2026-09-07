@@ -14,10 +14,6 @@ use crate::functions;
 use crate::needed;
 use crate::schema::ConnettoFileSchema;
 
-// ---------------------------------------------------------------------------
-// Public outcome types
-// ---------------------------------------------------------------------------
-
 /// Outcome of [`account_chunk_put`].
 pub(crate) enum ChunkPutResult {
     /// Chunk newly accounted for; stored flag set, tally incremented, registry advanced to `stored`.
@@ -59,10 +55,6 @@ pub(crate) enum ManifestState {
     Uncommitted(Manifest),
 }
 
-// ---------------------------------------------------------------------------
-// Internal transaction error types
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, thiserror::Error)]
 enum CommitTxError {
     #[error(transparent)]
@@ -86,10 +78,6 @@ impl From<diesel::result::Error> for IntentTxErr {
         Self::Db(e)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Intent operations
-// ---------------------------------------------------------------------------
 
 /// Inserts registry rows, locks them, then inserts the manifest and chunk references atomically.
 ///
@@ -192,33 +180,52 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Load helpers
-// ---------------------------------------------------------------------------
-
-/// Returns the manifest for `(file_id, caller)` only if it is committed.
+/// Returns `true` when the deployment's visibility function admits `file_id` for `caller`.
 ///
-/// Scoped to the caller's own row: the admin role bypasses RLS but we apply
-/// the `uploaded_by` filter explicitly so no cross-caller row is ever returned.
-pub(crate) async fn load_committed_manifest<S: ConnettoFileSchema>(
-    conn: &mut AsyncPgConnection,
+/// Runs inside a transaction on the reader connection so `set_config(is_local = true)`
+/// stays in scope for the duration of the `connetto_visible_files` call. The reader
+/// role does not own the tables, so RLS fires inside SECURITY INVOKER functions;
+/// running this on the admin connection would bypass RLS and silently admit everything.
+pub(crate) async fn file_visible_to_caller(
+    reader_conn: &mut AsyncPgConnection,
     file_id: &FileId,
     caller: &str,
+) -> Result<bool, diesel::result::Error> {
+    let file_id_bytes = file_id.as_bytes().to_vec();
+    let caller = caller.to_owned();
+    reader_conn
+        .transaction::<bool, diesel::result::Error, _>(async move |conn| {
+            diesel::select(functions::set_config("app.user_id", &caller, true))
+                .get_result::<String>(conn)
+                .await?;
+            let visible: Vec<Vec<u8>> = diesel::select(functions::connetto_visible_files(vec![
+                file_id_bytes.clone(),
+            ]))
+            .get_result(conn)
+            .await?;
+            Ok(visible.contains(&file_id_bytes))
+        })
+        .await
+}
+
+/// Returns any committed manifest for `file_id`, or `None` if no committed manifest exists.
+///
+/// The alphabetically first `uploaded_by` among committed rows for this `file_id` is chosen. This choice is safe because every committed manifest for one `file_id` carries identical chunk content, BLAKE3 identity being verified at commit, so any row yields the correct bytes.
+///
+/// Callers must have verified visibility through `file_visible_to_caller` first, since the admin connection used here bypasses RLS.
+pub(crate) async fn load_any_committed_manifest<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
 ) -> Result<Option<Manifest>, diesel::result::Error> {
-    let filtered = FilterDsl::filter(
-        S::ManifestsQuery::default(),
-        S::manifest_pk_eq(file_id.as_bytes().to_vec(), caller.to_owned()),
-    );
-    let query = SelectDsl::select(
-        filtered,
-        (S::MColFileId::default(), S::MColCommitted::default()),
-    );
-    let mut rows: Vec<(Vec<u8>, bool)> = LimitDsl::limit(query, 1).load(conn).await?;
+    let file_id_bytes = file_id.as_bytes().to_vec();
+    let mut rows: Vec<String> = S::any_committed_manifest_caller_stmt(file_id_bytes.clone())
+        .load(conn)
+        .await?;
     match rows.pop() {
-        Some((fid, true)) => load_chunk_rows::<S>(conn, fid, caller.to_owned())
+        Some(caller) => load_chunk_rows::<S>(conn, file_id_bytes, caller)
             .await
             .map(Some),
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -273,10 +280,6 @@ pub(crate) async fn declared_chunk_len<S: ConnettoFileSchema>(
         .transpose()
 }
 
-// ---------------------------------------------------------------------------
-// PUT operations
-// ---------------------------------------------------------------------------
-
 /// Accounts one durably written chunk inside the caller's registry-lock transaction.
 pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
@@ -313,10 +316,6 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
         .await?;
     Ok(ChunkPutResult::Accepted)
 }
-
-// ---------------------------------------------------------------------------
-// Commit operations
-// ---------------------------------------------------------------------------
 
 /// Returns `true` when every chunk for `(file_id, caller)` is either stored through this
 /// manifest OR is present in a committed manifest visible to `caller`.
@@ -434,10 +433,6 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Sweep operations
-// ---------------------------------------------------------------------------
-
 /// Locks the sweep set, deletes stale manifests, then marks still-unreferenced hashes.
 ///
 /// Bounded lock set argument: registry rows are locked in `chunk_hash` ASC order,
@@ -488,10 +483,6 @@ pub(crate) async fn delete_registry_row<S: ConnettoFileSchema>(
         .await
         .map(|_| ())
 }
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
 
 /// Loads chunk rows for `(file_id_bytes, caller)` ordered by position, then builds a
 /// [`Manifest`].

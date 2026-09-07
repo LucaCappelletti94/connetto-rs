@@ -34,7 +34,7 @@ async fn absent_file_answers_404() {
 
 #[tokio::test]
 async fn bad_ticket_answers_404() {
-    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use crate::fixture::{connect_admin, insert_committed_manifest, register_file_ownership};
     use connetto_file_core::FileId;
 
     let pg = Pg::start().await;
@@ -47,6 +47,7 @@ async fn bad_ticket_answers_404() {
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A valid read ticket for the committed file must serve 200, proving that
     // the manifest lookup succeeds and only the signature check can cause 404.
@@ -94,7 +95,7 @@ async fn bad_ticket_answers_404() {
 
 #[tokio::test]
 async fn expired_ticket_answers_404() {
-    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use crate::fixture::{connect_admin, insert_committed_manifest, register_file_ownership};
     use connetto_file_core::FileId;
 
     let pg = Pg::start().await;
@@ -106,6 +107,7 @@ async fn expired_ticket_answers_404() {
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A valid (non-expired) read ticket for the committed file must serve 200,
     // proving that the manifest lookup succeeds and only expiry can cause 404.
@@ -153,7 +155,7 @@ async fn expired_ticket_answers_404() {
 
 #[tokio::test]
 async fn write_ticket_on_read_endpoint_answers_404() {
-    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use crate::fixture::{connect_admin, insert_committed_manifest, register_file_ownership};
     use connetto_file_core::FileId;
 
     let pg = Pg::start().await;
@@ -165,6 +167,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A read ticket for the committed file must serve 200, proving that the
     // manifest lookup succeeds and only the wrong verb can cause 404.
@@ -217,7 +220,10 @@ async fn write_ticket_on_read_endpoint_answers_404() {
 /// An empty committed file must serve with 200 and an empty body.
 #[tokio::test]
 async fn empty_file_serves_200_with_empty_body() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
 
     let pg = Pg::start().await;
@@ -240,6 +246,7 @@ async fn empty_file_serves_200_with_empty_body() {
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -264,7 +271,10 @@ async fn empty_file_serves_200_with_empty_body() {
 /// A range request on an empty committed file must return 416.
 #[tokio::test]
 async fn empty_file_range_request_answers_416() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
 
     let pg = Pg::start().await;
@@ -287,6 +297,7 @@ async fn empty_file_range_request_answers_416() {
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -321,6 +332,7 @@ async fn empty_file_range_request_answers_416() {
 async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
     use crate::fixture::{
         Pg, connect_admin, gated_read_store, insert_committed_manifest, make_signer,
+        register_file_ownership,
     };
     use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
     use connetto_file_server::{AppPools, Config, DefaultFileSchema, FsStore, serve};
@@ -354,7 +366,6 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         },
         store,
         verifier,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     })
@@ -374,6 +385,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
     drop(admin_conn);
 
     let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
@@ -430,7 +442,10 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
 /// `Accept-Ranges: bytes` on a non-empty committed file.
 #[tokio::test]
 async fn content_length_present_on_full_response() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
     use connetto_file_server::FsStore;
 
@@ -451,6 +466,7 @@ async fn content_length_present_on_full_response() {
     }
     let mut conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -490,7 +506,10 @@ async fn content_length_present_on_full_response() {
 /// and `Accept-Ranges: bytes`.
 #[tokio::test]
 async fn content_length_present_on_partial_response() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
     use connetto_file_server::FsStore;
 
@@ -512,6 +531,7 @@ async fn content_length_present_on_partial_response() {
     }
     let mut conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -563,7 +583,10 @@ async fn content_length_present_on_partial_response() {
 /// and `Accept-Ranges: bytes`.
 #[tokio::test]
 async fn content_length_present_on_empty_file_response() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
     use connetto_file_server::FsStore;
 
@@ -582,6 +605,7 @@ async fn content_length_present_on_empty_file_response() {
     }
     let mut conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -627,7 +651,10 @@ async fn content_length_present_on_empty_file_response() {
 /// A suffix range bytes=-N delivers the last N bytes with 206.
 #[tokio::test]
 async fn suffix_byte_range_serves_206() {
-    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
     use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
     use connetto_file_server::FsStore;
 
@@ -650,6 +677,7 @@ async fn suffix_byte_range_serves_206() {
     }
     let mut conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -692,7 +720,8 @@ async fn suffix_byte_range_serves_206() {
 #[tokio::test]
 async fn short_store_read_terminates_stream_with_error() {
     use crate::fixture::{
-        Pg, connect_admin, insert_committed_manifest, make_signer, short_read_store,
+        Pg, connect_admin, insert_committed_manifest, make_signer, register_file_ownership,
+        short_read_store,
     };
     use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
     use connetto_file_server::{AppPools, Config, DefaultFileSchema, FsStore, serve};
@@ -719,7 +748,6 @@ async fn short_store_read_terminates_stream_with_error() {
         },
         store,
         verifier,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     })
@@ -730,6 +758,7 @@ async fn short_store_read_terminates_stream_with_error() {
     let chunks = vec![ChunkMeta { hash, len: 64 }];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
     drop(admin_conn);
 
     let token = signer
@@ -758,4 +787,112 @@ async fn short_store_read_terminates_stream_with_error() {
     // Body collection must fail, not panic: the stream returns a store error.
     let result = axum::body::to_bytes(resp.into_body(), 128).await;
     assert!(result.is_err(), "body must fail on short store read");
+}
+
+/// Pins that a caller the visibility function admits is served a file another caller committed.
+#[tokio::test]
+async fn cross_caller_read_with_visible_file_serves_200() {
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"shared file accessible to bob";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
+    let total: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        for c in manifest.chunks() {
+            let bytes = mem.read_chunk(&c.hash).await.unwrap();
+            fs.write_chunk(&c.hash, &bytes).await.unwrap();
+        }
+    }
+
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    // alice holds the only committed manifest row for this file_id
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    // the deployment's visibility function admits bob for this file_id
+    register_file_ownership(&mut admin_conn, &file_id, "bob").await;
+
+    let token = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: total + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{file_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "bob must be served alice's committed file when the visibility function admits him"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::try_from(total + 1024).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        &body[..],
+        data.as_slice(),
+        "served bytes must match uploaded content"
+    );
+}
+
+/// Pins that only the visibility function authorizes a read, so a caller it refuses gets 404 even holding a committed manifest row of their own.
+#[tokio::test]
+async fn unauthorized_caller_gets_404_even_with_own_manifest_row() {
+    use crate::fixture::{
+        Pg, build_router, connect_admin, fs_store, insert_committed_manifest,
+        register_file_ownership,
+    };
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id = connetto_file_core::FileId::from_bytes([0xD4u8; 32]);
+    let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
+
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    // dave has his own committed manifest row (an empty file) for this file_id
+    insert_committed_manifest(&mut admin_conn, &file_id, "dave", &[]).await;
+    // the visibility function admits alice only; dave is not admitted
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
+
+    let token = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "dave".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{file_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dave must be refused even though his manifest row exists; only the visibility function may authorize reads"
+    );
 }

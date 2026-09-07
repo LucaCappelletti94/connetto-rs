@@ -19,10 +19,6 @@ use diesel::sql_types::{BigInt, Bool, Bytea, Integer, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::methods::LoadQuery as AsyncLoadQuery;
 
-// ---------------------------------------------------------------------------
-// diesel::table! declarations for the default `_cfs_*` tables
-// ---------------------------------------------------------------------------
-
 diesel::table! {
     /// File manifests: one row per (upload, uploader) pair.
     _cfs_manifests (file_id, uploaded_by) {
@@ -80,10 +76,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     _cfs_chunk_registry,
 );
 
-// ---------------------------------------------------------------------------
-// Column marker helper trait
-// ---------------------------------------------------------------------------
-
 /// A column usable in typed diesel expressions for table `Tab` with SQL type `St`.
 pub trait FileSchemaColumn<Tab, St>:
     Column<Table = Tab> + Expression<SqlType = St> + Default + Send
@@ -94,10 +86,6 @@ impl<C, Tab, St> FileSchemaColumn<Tab, St> for C where
     C: Column<Table = Tab> + Expression<SqlType = St> + Default + Send
 {
 }
-
-// ---------------------------------------------------------------------------
-// ConnettoFileSchema
-// ---------------------------------------------------------------------------
 
 /// The three tables the file server writes its queries against.
 ///
@@ -209,10 +197,6 @@ where
         Self::CRColChunkHash,
     >: AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send,
 {
-    // ================================================================
-    // TABLE TYPES (INSERT / UPDATE / DELETE targets)
-    // ================================================================
-
     /// The manifests table.
     type Manifests: Table + QueryId + Default + Send + Sync + 'static;
 
@@ -221,11 +205,6 @@ where
 
     /// The `chunk_registry` table.
     type ChunkRegistry: Table + QueryId + Default + Send + Sync + 'static;
-
-    // ================================================================
-    // LAUNDERED QUERY SOURCES (SELECT shapes only; separate from Table
-    // to avoid the blanket FilterDsl E0275 divergence)
-    // ================================================================
 
     /// Manifests table as an opaque SELECT source.
     type ManifestsQuery: Default + Send;
@@ -236,10 +215,6 @@ where
     /// `chunk_registry` table as an opaque SELECT source.
     type ChunkRegistryQuery: Default + Send;
 
-    // ================================================================
-    // COLUMN TYPES — manifests
-    // ================================================================
-
     /// `manifests.file_id` (`BYTEA`).
     type MColFileId: FileSchemaColumn<Self::Manifests, Bytea>;
     /// `manifests.committed` (`BOOLEAN`).
@@ -248,10 +223,6 @@ where
     type MColCreatedAt: FileSchemaColumn<Self::Manifests, Timestamptz>;
     /// `manifests.accepted_bytes` (`BIGINT`).
     type MColAcceptedBytes: FileSchemaColumn<Self::Manifests, BigInt>;
-
-    // ================================================================
-    // COLUMN TYPES — manifest_chunks
-    // ================================================================
 
     /// `manifest_chunks.file_id` (`BYTEA`).
     type MCColFileId: FileSchemaColumn<Self::ManifestChunks, Bytea>;
@@ -264,18 +235,10 @@ where
     /// `manifest_chunks.stored` (`BOOLEAN`).
     type MCColStored: FileSchemaColumn<Self::ManifestChunks, Bool>;
 
-    // ================================================================
-    // COLUMN TYPES — chunk_registry
-    // ================================================================
-
     /// `chunk_registry.chunk_hash` (`BYTEA`).
     type CRColChunkHash: FileSchemaColumn<Self::ChunkRegistry, Bytea>;
     /// `chunk_registry.state` (`TEXT`).
     type CRColState: FileSchemaColumn<Self::ChunkRegistry, Text>;
-
-    // ================================================================
-    // OPAQUE WHERE PREDICATE TYPES
-    // ================================================================
 
     /// Opaque `manifests.file_id = ? AND manifests.uploaded_by = ?` predicate.
     type ManifestPkEq: Send;
@@ -288,21 +251,12 @@ where
     /// Opaque `chunk_registry.state = 'deleting'` predicate.
     type CRStateEq: Send;
 
-    // ================================================================
-    // SQL TABLE NAMES (used only in NOT EXISTS sweep and COUNT checks —
-    // these sql_query uses cannot be expressed in the typed DSL)
-    // ================================================================
-
     /// SQL name of the manifests table.
     const MANIFESTS_SQL: &'static str;
     /// SQL name of the `manifest_chunks` table.
     const MANIFEST_CHUNKS_SQL: &'static str;
     /// SQL name of the `chunk_registry` table.
     const CHUNK_REGISTRY_SQL: &'static str;
-
-    // ================================================================
-    // FACTORY METHODS — WHERE predicates
-    // ================================================================
 
     /// Build `manifests.file_id = file_id AND manifests.uploaded_by = caller`.
     fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq;
@@ -314,14 +268,6 @@ where
     fn cr_chunk_hash_eq(hash: Vec<u8>) -> Self::CRChunkHashEq;
     /// Build `chunk_registry.state = 'deleting'`.
     fn cr_state_eq_deleting() -> Self::CRStateEq;
-
-    // ================================================================
-    // FACTORY METHODS — INSERT statements
-    //
-    // Returning impl Trait hides the IntoConflictValueClause /
-    // UndecoratedInsertRecord / CanInsertInSingleQuery bound complexity
-    // inside the concrete impl where all column types are known.
-    // ================================================================
 
     /// Build `INSERT INTO manifests … ON CONFLICT DO NOTHING`.
     fn insert_manifest_stmt(
@@ -359,11 +305,6 @@ where
         file_id: Vec<u8>,
         caller: String,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + Send + 'static;
-
-    // ================================================================
-    // FACTORY METHODS — typed diesel statements (return-position impl Trait
-    // so the internal UPDATE / DELETE type hierarchy never surfaces here)
-    // ================================================================
 
     /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND uploaded_by=?
     /// AND chunk_hash=? AND chunk_len=? AND stored=FALSE`.
@@ -436,11 +377,18 @@ where
         file_id: Vec<u8>,
         caller: String,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
-}
 
-// ---------------------------------------------------------------------------
-// DefaultFileSchema
-// ---------------------------------------------------------------------------
+    /// Returns the `uploaded_by` of the alphabetically first committed manifest for
+    /// `file_id`, limited to one row.
+    ///
+    /// All committed manifests for one `file_id` carry identical chunk content because
+    /// BLAKE3 identity is verified at commit, so any row is representative. Ordering by
+    /// `uploaded_by ASC` makes the selection deterministic when multiple callers hold
+    /// committed rows for the same file.
+    fn any_committed_manifest_caller_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+}
 
 /// The default file-server schema over the `_cfs_` prefix tables.
 ///
@@ -785,11 +733,28 @@ impl ConnettoFileSchema for DefaultFileSchema {
             _cfs_manifest_chunks::chunk_hash,
         )
     }
-}
 
-// ---------------------------------------------------------------------------
-// connetto_file_tables! macro
-// ---------------------------------------------------------------------------
+    fn any_committed_manifest_caller_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static {
+        diesel::QueryDsl::select(
+            diesel::QueryDsl::limit(
+                diesel::QueryDsl::order(
+                    diesel::QueryDsl::filter(
+                        diesel::QueryDsl::filter(
+                            _cfs_manifests::table,
+                            _cfs_manifests::file_id.eq(file_id),
+                        ),
+                        _cfs_manifests::committed.eq(true),
+                    ),
+                    _cfs_manifests::uploaded_by.asc(),
+                ),
+                1,
+            ),
+            _cfs_manifests::uploaded_by,
+        )
+    }
+}
 
 /// Generate the file-server tables and their [`ConnettoFileSchema`] impl
 /// under deployment-chosen names.
@@ -1210,6 +1175,31 @@ macro_rules! connetto_file_tables {
                         $manifest_chunks::stored.eq(false),
                     ),
                     $manifest_chunks::chunk_hash,
+                )
+            }
+            fn any_committed_manifest_caller_stmt(
+                file_id: Vec<u8>,
+            ) -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                String,
+            > + Send
+            + 'static {
+                diesel::QueryDsl::select(
+                    diesel::QueryDsl::limit(
+                        diesel::QueryDsl::order(
+                            diesel::QueryDsl::filter(
+                                diesel::QueryDsl::filter(
+                                    $manifests::table,
+                                    $manifests::file_id.eq(file_id),
+                                ),
+                                $manifests::committed.eq(true),
+                            ),
+                            $manifests::uploaded_by.asc(),
+                        ),
+                        1,
+                    ),
+                    $manifests::uploaded_by,
                 )
             }
         }

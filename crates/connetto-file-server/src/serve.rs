@@ -19,7 +19,7 @@ use crate::{db, error::ServerError, ticket::Verb, upload::parse_file_id};
 /// Response codes:
 /// - 200 full fetch
 /// - 206 ranged fetch
-/// - 404 absent, uncommitted, wrong verb, bad ticket, or response too large
+/// - 404 absent, uncommitted, wrong verb, bad ticket, unauthorized, or response too large
 /// - 416 range outside the file
 ///
 /// Every response carries `Content-Length: <bytes_to_serve>` and
@@ -34,12 +34,17 @@ use crate::{db, error::ServerError, ticket::Verb, upload::parse_file_id};
 /// Per-request ceiling: `ticket.ceiling` must be at least as large as the
 /// bytes this specific response will serve.
 ///
-/// Manifest selection: only the committed manifest row for `(file_id,
-/// ticket.caller)` is loaded.  Every committed manifest for the same file id
-/// carries identical content (BLAKE3 identity is verified at commit), so the
-/// caller's own row yields the correct bytes.  The admin connection bypasses
-/// RLS, but the `uploaded_by` filter is applied explicitly, so no cross-caller
-/// manifest is ever reachable.
+/// Authorization: `connetto_visible_files` is called on the reader connection
+/// (non-owner role, so RLS fires inside SECURITY INVOKER bodies) after threading
+/// the caller identity through `set_config`.  An unauthorized or absent file
+/// both answer 404 so callers cannot distinguish the two.
+///
+/// Manifest selection: any committed manifest for the file id is used. All
+/// committed manifests for one file id carry identical content because BLAKE3
+/// identity is verified at commit, so which row supplies the chunk list is
+/// immaterial. The alphabetically first `uploaded_by` is chosen for determinism.
+/// The reader connection is acquired before the admin connection so a saturated
+/// reader pool never blocks while an admin connection holds manifest locks.
 pub(crate) async fn get_file<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -51,8 +56,15 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     if file_id.as_bytes() != &ticket.file_id {
         return Err(ServerError::NotFound);
     }
+    // Reader connection acquired first: a saturated reader pool must not stall
+    // while an admin connection holds manifest locks.
+    let mut reader_conn = state.pools.reader.get().await?;
+    let visible = db::file_visible_to_caller(&mut reader_conn, &file_id, &ticket.caller).await?;
+    if !visible {
+        return Err(ServerError::NotFound);
+    }
     let mut admin_conn = state.pools.admin.get().await?;
-    let manifest = db::load_committed_manifest::<S>(&mut admin_conn, &file_id, &ticket.caller)
+    let manifest = db::load_any_committed_manifest::<S>(&mut admin_conn, &file_id)
         .await?
         .ok_or(ServerError::NotFound)?;
     let etag = etag_value(&file_id);
@@ -100,10 +112,6 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
         .body(axum::body::Body::from_stream(body_stream))
         .map_err(|_| ServerError::NotFound)
 }
-
-// ---------------------------------------------------------------------------
-// Streaming body
-// ---------------------------------------------------------------------------
 
 /// Error produced mid-stream while reading a chunk from the store.
 #[derive(Debug, Error)]
@@ -196,10 +204,6 @@ fn serving_stream<S: ConnettoFileSchema>(
         },
     )
 }
-
-// ---------------------------------------------------------------------------
-// Range helpers
-// ---------------------------------------------------------------------------
 
 /// An inclusive byte range, or `None` for the full file.
 type ByteRange = Option<(u64, u64)>;
