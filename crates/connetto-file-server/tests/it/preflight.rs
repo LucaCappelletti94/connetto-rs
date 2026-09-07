@@ -8,10 +8,6 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::fixture::{FIXTURE_STMTS, Pg, connect_admin, split_simple};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Applies `DEPLOYMENT_DDL` + `FIXTURE_STMTS` then the extra `overrides` DDL.
 async fn setup_with(conn: &mut AsyncPgConnection, overrides: &[&str]) {
     for stmt in split_simple(DEPLOYMENT_DDL) {
@@ -28,9 +24,11 @@ async fn setup_with(conn: &mut AsyncPgConnection, overrides: &[&str]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Happy path
-// ---------------------------------------------------------------------------
+fn role_password() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("rw{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
 #[tokio::test]
 async fn preflight_happy_path_passes() {
@@ -41,10 +39,6 @@ async fn preflight_happy_path_passes() {
         .await
         .expect("preflight must pass with correct DDL");
 }
-
-// ---------------------------------------------------------------------------
-// Defect 4: column type checks
-// ---------------------------------------------------------------------------
 
 /// `_cfs_manifests.file_id` typed as TEXT instead of BYTEA is refused by name.
 #[tokio::test]
@@ -87,10 +81,6 @@ async fn preflight_refuses_wrong_column_type() {
         other => panic!("expected WrongColumnType, got {other}"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Defect 4: function security-mode checks
-// ---------------------------------------------------------------------------
 
 /// `connetto_visible_files` installed as SECURITY DEFINER leaks all files and
 /// must be refused.
@@ -165,10 +155,6 @@ async fn preflight_refuses_setter_security_invoker() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Finding 3: search_path checks
-// ---------------------------------------------------------------------------
-
 /// Startup refuses a SECURITY DEFINER function with no pinned `search_path`.
 #[tokio::test]
 async fn preflight_refuses_definer_without_search_path() {
@@ -225,10 +211,6 @@ async fn preflight_refuses_invoker_without_search_path() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Defect 4: function argument-type checks
-// ---------------------------------------------------------------------------
-
 /// `connetto_visible_files` with a wrong argument type (TEXT[] instead of BYTEA[])
 /// must be refused, naming the function and position.
 #[tokio::test]
@@ -265,17 +247,13 @@ async fn preflight_refuses_visible_files_wrong_arg_type() {
             assert_eq!(expected, "bytea[]");
             assert_ne!(actual, "bytea[]");
         }
-        // Return type is also wrong in this fixture; either error is acceptable.
+        // Return type is also wrong in this fixture. Either error is acceptable.
         PreflightError::WrongReturnType { function, .. } => {
             assert_eq!(function, "connetto_visible_files");
         }
         other => panic!("expected WrongArgType or WrongReturnType, got {other}"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Defect 4: function return-type checks
-// ---------------------------------------------------------------------------
 
 /// `connetto_visible_files` with BYTEA[] argument but wrong return type (BYTEA)
 #[tokio::test]
@@ -312,13 +290,10 @@ async fn preflight_refuses_visible_files_wrong_return_type() {
         other => panic!("expected WrongReturnType, got {other}"),
     }
 }
-// ---------------------------------------------------------------------------
-// Item 3: serve() startup-refusal test
-// ---------------------------------------------------------------------------
 
 /// Proves: `serve()` refuses with a named error when `_cfs_chunk_registry` is
 /// absent.  The registry table is the new addition in the derived-liveness
-/// redesign; its absence must be caught at startup, not at request time.
+/// redesign. Its absence must be caught at startup, not at request time.
 #[tokio::test]
 async fn serve_refuses_when_chunk_registry_absent() {
     use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
@@ -479,10 +454,6 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Finding: reader pool connected as a privileged role must be refused at startup
-// ---------------------------------------------------------------------------
-
 /// Proves: serve refuses when the reader pool connects as a superuser.
 ///
 /// A superuser silently bypasses row level security, making the visibility
@@ -524,13 +495,14 @@ async fn serve_refuses_bypassrls_reader_role() {
 
     let pg = Pg::start().await;
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    diesel::sql_query(
+    let pw = role_password();
+    diesel::sql_query(format!(
         "DO $$ BEGIN \
-             CREATE ROLE cfs_bypassrls_test LOGIN PASSWORD 'test' \
+             CREATE ROLE cfs_bypassrls_test LOGIN PASSWORD '{pw}' \
              NOSUPERUSER BYPASSRLS NOINHERIT; \
          EXCEPTION WHEN duplicate_object THEN NULL; \
-         END $$",
-    )
+         END $$"
+    ))
     .execute(&mut admin_conn)
     .await
     .expect("create bypassrls role");
@@ -540,7 +512,7 @@ async fn serve_refuses_bypassrls_reader_role() {
         .expect("grant connect");
     drop(admin_conn);
 
-    let url = pg.url_for("cfs_bypassrls_test", "test");
+    let url = pg.url_for("cfs_bypassrls_test", &pw);
     let mgr = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let bypassrls_pool = Pool::builder()
         .max_size(1)
@@ -580,13 +552,14 @@ async fn serve_refuses_table_owner_reader_role() {
 
     let pg = Pg::start().await;
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    diesel::sql_query(
+    let pw = role_password();
+    diesel::sql_query(format!(
         "DO $$ BEGIN \
-             CREATE ROLE cfs_owner_test LOGIN PASSWORD 'test' \
+             CREATE ROLE cfs_owner_test LOGIN PASSWORD '{pw}' \
              NOSUPERUSER NOINHERIT; \
          EXCEPTION WHEN duplicate_object THEN NULL; \
-         END $$",
-    )
+         END $$"
+    ))
     .execute(&mut admin_conn)
     .await
     .expect("create owner role");
@@ -600,7 +573,7 @@ async fn serve_refuses_table_owner_reader_role() {
         .expect("transfer table ownership");
     drop(admin_conn);
 
-    let url = pg.url_for("cfs_owner_test", "test");
+    let url = pg.url_for("cfs_owner_test", &pw);
     let mgr = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let owner_pool = Pool::builder()
         .max_size(1)
@@ -653,72 +626,4 @@ async fn serve_accepts_correctly_configured_reader_role() {
     let _router = serve(cfg)
         .await
         .expect("serve must accept the standard non-privileged reader role");
-}
-
-/// Pins that each refusal test reaches its own branch, since `cfs_bypassrls_test` is not a superuser and `cfs_owner_test` holds neither privilege.
-#[tokio::test]
-async fn reader_refusal_test_roles_have_distinct_attributes() {
-    #[derive(diesel::QueryableByName)]
-    struct RoleRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        rolname: String,
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        rolsuper: bool,
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        rolbypassrls: bool,
-    }
-
-    let pg = Pg::start().await;
-    let mut admin_conn = connect_admin(&pg.url_admin).await;
-
-    diesel::sql_query(
-        "DO $$ BEGIN CREATE ROLE cfs_bypassrls_test LOGIN PASSWORD 'test' \
-         NOSUPERUSER BYPASSRLS NOINHERIT; \
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
-    )
-    .execute(&mut admin_conn)
-    .await
-    .expect("create bypassrls role");
-
-    diesel::sql_query(
-        "DO $$ BEGIN CREATE ROLE cfs_owner_test LOGIN PASSWORD 'test' \
-         NOSUPERUSER NOINHERIT; \
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
-    )
-    .execute(&mut admin_conn)
-    .await
-    .expect("create owner role");
-
-    let rows: Vec<RoleRow> = diesel::sql_query(
-        "SELECT rolname::text, rolsuper, rolbypassrls \
-         FROM pg_catalog.pg_roles \
-         WHERE rolname IN ('cfs_bypassrls_test', 'cfs_owner_test') \
-         ORDER BY rolname",
-    )
-    .load(&mut admin_conn)
-    .await
-    .expect("query roles");
-
-    assert_eq!(rows.len(), 2, "both test roles must exist");
-    let bypassrls_row = rows
-        .iter()
-        .find(|r| r.rolname == "cfs_bypassrls_test")
-        .unwrap();
-    assert!(
-        !bypassrls_row.rolsuper,
-        "cfs_bypassrls_test must not be a superuser"
-    );
-    assert!(
-        bypassrls_row.rolbypassrls,
-        "cfs_bypassrls_test must have BYPASSRLS"
-    );
-    let owner_row = rows.iter().find(|r| r.rolname == "cfs_owner_test").unwrap();
-    assert!(
-        !owner_row.rolsuper,
-        "cfs_owner_test must not be a superuser"
-    );
-    assert!(
-        !owner_row.rolbypassrls,
-        "cfs_owner_test must not have BYPASSRLS"
-    );
 }

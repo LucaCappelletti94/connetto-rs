@@ -22,7 +22,7 @@ async fn absent_file_answers_404() {
             caller: "alice".into(),
         })
         .unwrap();
-    let id_hex = hex(&file_id);
+    let id_hex = connetto_file_server::hex_32(&file_id);
     let req = axum::http::Request::builder()
         .method("GET")
         .uri(format!("/files/{id_hex}?t={token}"))
@@ -34,60 +34,118 @@ async fn absent_file_answers_404() {
 
 #[tokio::test]
 async fn bad_ticket_answers_404() {
+    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use connetto_file_core::FileId;
+
     let pg = Pg::start().await;
     let dir = tempfile::TempDir::new().unwrap();
-    let (app, _) = build_router(&pg, fs_store(&dir)).await;
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
     let (other_signer, _) = make_signer();
 
-    let file_id = [5u8; 32];
-    let token = other_signer
+    let file_id_bytes = [5u8; 32];
+    let file_id = FileId::from_bytes(file_id_bytes);
+    let id_hex = connetto_file_server::hex_32(&file_id_bytes);
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+
+    // A valid read ticket for the committed file must serve 200, proving that
+    // the manifest lookup succeeds and only the signature check can cause 404.
+    let valid_token = signer
         .mint(&TicketPayload {
-            file_id,
+            file_id: file_id_bytes,
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: "alice".into(),
         })
         .unwrap();
-    let id_hex = hex(&file_id);
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{id_hex}?t={token}"))
+        .uri(format!("/files/{id_hex}?t={valid_token}"))
         .body(axum::body::Body::empty())
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
-        resp.status(),
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "valid ticket on committed file must answer 200"
+    );
+
+    // A token signed by a different key must be refused regardless of the manifest.
+    let bad_token = other_signer
+        .mint(&TicketPayload {
+            file_id: file_id_bytes,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={bad_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::NOT_FOUND,
-        "bad ticket must answer 404"
+        "bad ticket (wrong signing key) must answer 404"
     );
 }
 
 #[tokio::test]
 async fn expired_ticket_answers_404() {
+    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use connetto_file_core::FileId;
+
     let pg = Pg::start().await;
     let dir = tempfile::TempDir::new().unwrap();
     let (app, signer) = build_router(&pg, fs_store(&dir)).await;
 
-    let file_id = [3u8; 32];
-    let token = signer
+    let file_id_bytes = [3u8; 32];
+    let file_id = FileId::from_bytes(file_id_bytes);
+    let id_hex = connetto_file_server::hex_32(&file_id_bytes);
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+
+    // A valid (non-expired) read ticket for the committed file must serve 200,
+    // proving that the manifest lookup succeeds and only expiry can cause 404.
+    let valid_token = signer
         .mint(&TicketPayload {
-            file_id,
+            file_id: file_id_bytes,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={valid_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "valid ticket on committed file must answer 200"
+    );
+
+    // An expired ticket must be refused regardless of the manifest.
+    let expired_token = signer
+        .mint(&TicketPayload {
+            file_id: file_id_bytes,
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() - 1,
             caller: "alice".into(),
         })
         .unwrap();
-    let id_hex = hex(&file_id);
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{id_hex}?t={token}"))
+        .uri(format!("/files/{id_hex}?t={expired_token}"))
         .body(axum::body::Body::empty())
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
-        resp.status(),
+        app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::NOT_FOUND,
         "expired ticket must answer 404"
     );
@@ -95,40 +153,61 @@ async fn expired_ticket_answers_404() {
 
 #[tokio::test]
 async fn write_ticket_on_read_endpoint_answers_404() {
+    use crate::fixture::{connect_admin, insert_committed_manifest};
+    use connetto_file_core::FileId;
+
     let pg = Pg::start().await;
     let dir = tempfile::TempDir::new().unwrap();
     let (app, signer) = build_router(&pg, fs_store(&dir)).await;
 
-    let file_id = [4u8; 32];
-    let token = signer
+    let file_id_bytes = [4u8; 32];
+    let file_id = FileId::from_bytes(file_id_bytes);
+    let id_hex = connetto_file_server::hex_32(&file_id_bytes);
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+
+    // A read ticket for the committed file must serve 200, proving that the
+    // manifest lookup succeeds and only the wrong verb can cause 404.
+    let read_token = signer
         .mint(&TicketPayload {
-            file_id,
+            file_id: file_id_bytes,
+            verb: Verb::Read,
+            ceiling: 0,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={read_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "read ticket on committed file must answer 200"
+    );
+
+    // A write ticket presented at the read endpoint must be refused.
+    let write_token = signer
+        .mint(&TicketPayload {
+            file_id: file_id_bytes,
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: "alice".into(),
         })
         .unwrap();
-    let id_hex = hex(&file_id);
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{id_hex}?t={token}"))
+        .uri(format!("/files/{id_hex}?t={write_token}"))
         .body(axum::body::Body::empty())
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
-        resp.status(),
+        app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::NOT_FOUND,
-        "wrong-verb ticket must answer 404"
+        "write ticket on read endpoint must answer 404"
     );
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +227,7 @@ async fn empty_file_serves_200_with_empty_body() {
     let mem = MemStore::new();
     let manifest = process_file(&[], MimeClass::Generic, &mem).await.unwrap();
     let file_id = manifest.file_id();
-    let file_hex = hex(file_id.as_bytes());
+    let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
 
     {
         use connetto_file_server::FsStore;
@@ -195,7 +274,7 @@ async fn empty_file_range_request_answers_416() {
     let mem = MemStore::new();
     let manifest = process_file(&[], MimeClass::Generic, &mem).await.unwrap();
     let file_id = manifest.file_id();
-    let file_hex = hex(file_id.as_bytes());
+    let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
 
     {
         use connetto_file_server::FsStore;
@@ -297,7 +376,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
     insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
     drop(admin_conn);
 
-    let file_hex = hex(file_id.as_bytes());
+    let file_hex = connetto_file_server::hex_32(file_id.as_bytes());
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
             file_id: *file_id.as_bytes(),
@@ -384,7 +463,10 @@ async fn content_length_present_on_full_response() {
         .unwrap();
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .uri(format!(
+            "/files/{}?t={token}",
+            connetto_file_server::hex_32(file_id.as_bytes())
+        ))
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -443,7 +525,10 @@ async fn content_length_present_on_partial_response() {
     // Request bytes 0-4 (5 bytes).
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .uri(format!(
+            "/files/{}?t={token}",
+            connetto_file_server::hex_32(file_id.as_bytes())
+        ))
         .header("range", "bytes=0-4")
         .body(axum::body::Body::empty())
         .unwrap();
@@ -509,7 +594,10 @@ async fn content_length_present_on_empty_file_response() {
         .unwrap();
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .uri(format!(
+            "/files/{}?t={token}",
+            connetto_file_server::hex_32(file_id.as_bytes())
+        ))
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -575,7 +663,10 @@ async fn suffix_byte_range_serves_206() {
     // Request the last 4 bytes via suffix range.
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .uri(format!(
+            "/files/{}?t={token}",
+            connetto_file_server::hex_32(file_id.as_bytes())
+        ))
         .header("range", "bytes=-4")
         .body(axum::body::Body::empty())
         .unwrap();
@@ -652,7 +743,10 @@ async fn short_store_read_terminates_stream_with_error() {
         .unwrap();
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .uri(format!(
+            "/files/{}?t={token}",
+            connetto_file_server::hex_32(file_id.as_bytes())
+        ))
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();

@@ -210,9 +210,6 @@ async fn sweep_fail_once_delete_keeps_candidate_retry_succeeds() {
         "second sweep must remove the retained chunk candidate"
     );
 }
-// ---------------------------------------------------------------------------
-// Item 1: Race tests
-// ---------------------------------------------------------------------------
 
 /// Proves (race: sweep vs commit): sweep does not collect a manifest that was
 /// committed before the sweep ran, even with zero grace.
@@ -327,7 +324,10 @@ async fn sweep_does_not_collect_committed_manifest() {
 /// is refused with 503.  Uploads may not reclaim a hash the sweep has marked
 /// for deletion until the registry row is fully removed.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "proves a state machine sequence covering intent, registry and 503 response in strict order. Splitting hides the causal chain"
+)]
 async fn deleting_hash_blocks_new_intent_with_503() {
     use connetto_file_core::ChunkStore;
     use connetto_file_server::{DefaultFileSchema, FsStore};
@@ -404,7 +404,7 @@ async fn deleting_hash_blocks_new_intent_with_503() {
     assert_eq!(count, 0, "registry row must be gone after sweep");
 
     // We test the blocked-by-deleting scenario by directly inserting a deleting row.
-    // The library schema is private; sql_query is the only path from integration-test code.
+    // The library schema is private. sql_query is the only path from integration-test code.
     diesel::sql_query(
         "INSERT INTO _cfs_chunk_registry (chunk_hash, state) VALUES ($1, 'deleting')
          ON CONFLICT (chunk_hash) DO UPDATE SET state = 'deleting'",
@@ -466,7 +466,7 @@ async fn deleting_hash_blocks_put_with_503() {
     // Directly insert a registry row with state='deleting', simulating a sweep
     // that has marked H for deletion but not yet completed the store delete.
     // This is the race window where a PUT for H must be refused.
-    // The library schema is private; sql_query is the only path from integration-test code.
+    // The library schema is private. sql_query is the only path from integration-test code.
     let mut admin_conn = crate::fixture::connect_admin(&pg.url_admin).await;
     diesel::sql_query(
         "INSERT INTO _cfs_chunk_registry (chunk_hash, state) VALUES ($1, 'deleting')
@@ -526,10 +526,6 @@ async fn deleting_hash_blocks_put_with_503() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Item 2: Crash-point tests
-// ---------------------------------------------------------------------------
-
 /// Proves (crash window 1: after intent, before store write): a manifest with
 /// chunk rows and pending registry entries but no store object is fully cleaned
 /// up by the next sweep.  No permanently invisible orphan survives.
@@ -564,7 +560,7 @@ async fn crash_window_1_intent_no_store_write_sweep_cleans_registry() {
     )
     .await;
     // Insert registry row with state=pending (intent creates this transactionally).
-    // The library schema is private; sql_query is the only path from integration-test code.
+    // The library schema is private. sql_query is the only path from integration-test code.
     diesel::sql_query(
         "INSERT INTO _cfs_chunk_registry (chunk_hash, state) VALUES ($1, 'pending')
          ON CONFLICT (chunk_hash) DO NOTHING",
@@ -634,7 +630,7 @@ async fn crash_window_2_store_written_registry_pending_sweep_cleans_up() {
     )
     .await;
     // Insert registry row with state=pending.
-    // The library schema is private; sql_query is the only path from integration-test code.
+    // The library schema is private. sql_query is the only path from integration-test code.
     diesel::sql_query(
         "INSERT INTO _cfs_chunk_registry (chunk_hash, state) VALUES ($1, 'pending')
          ON CONFLICT (chunk_hash) DO NOTHING",
@@ -681,7 +677,10 @@ async fn crash_window_2_store_written_registry_pending_sweep_cleans_up() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the race is one ordered sequence. Splitting hides the advisory lock acquire-and-wait ordering"
+)]
 async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
     use connetto_file_core::{ChunkStore, MemStore};
     use connetto_file_server::{AnyStore, DefaultFileSchema, FsStore};
@@ -762,7 +761,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
     let intent_task = tokio::spawn(app.oneshot(intent));
 
     let mut intent_waiting = false;
-    for _ in 0..200 {
+    for _ in 0..12_000 {
         let rows: Vec<WaitingRow> = diesel::sql_query(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_stat_activity
@@ -797,7 +796,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
     });
 
     let mut sweep_waiting = false;
-    for _ in 0..200 {
+    for _ in 0..12_000 {
         let rows: Vec<WaitingRow> = diesel::sql_query(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_stat_activity
@@ -842,7 +841,10 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the race is one ordered sequence. Splitting hides the gated write and lock wait ordering"
+)]
 async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
     use connetto_file_core::{ChunkStore, MemStore};
     use connetto_file_server::{AnyStore, DefaultFileSchema, FsStore};
@@ -921,7 +923,7 @@ async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
 
     let mut check_conn = crate::fixture::connect_admin(&pg.url_admin).await;
     let mut waiting = false;
-    for _ in 0..200 {
+    for _ in 0..12_000 {
         let rows: Vec<WaitingRow> = diesel::sql_query(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_stat_activity
@@ -962,7 +964,10 @@ async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the race is one ordered sequence. Splitting hides the gated read and lock wait ordering"
+)]
 async fn sweep_waits_for_overlapping_commit_verification() {
     use connetto_file_core::{ChunkStore, MemStore};
     use connetto_file_server::{AnyStore, DefaultFileSchema, FsStore};
@@ -1050,7 +1055,7 @@ async fn sweep_waits_for_overlapping_commit_verification() {
 
     let mut check_conn = crate::fixture::connect_admin(&pg.url_admin).await;
     let mut waiting = false;
-    for _ in 0..200 {
+    for _ in 0..12_000 {
         let rows: Vec<WaitingRow> = diesel::sql_query(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_stat_activity
@@ -1086,7 +1091,6 @@ async fn sweep_waits_for_overlapping_commit_verification() {
 /// A sweep must not lock live content: it completes while a PUT for a fresh
 /// manifest still holds that hash's registry row.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn sweep_does_not_lock_live_content_held_by_an_active_put() {
     use connetto_file_core::MemStore;
     use connetto_file_server::{AnyStore, DefaultFileSchema, FsStore};
@@ -1140,7 +1144,7 @@ async fn sweep_does_not_lock_live_content_held_by_an_active_put() {
     write_entered.notified().await;
 
     // The PUT now holds this hash's registry row.  A sweep whose lock set is
-    // bounded to doomed hashes must still finish; a table-wide lock would hang.
+    // bounded to doomed hashes must still finish. A table-wide lock would hang.
     let sweep_url = format!("{}?application_name=cfs_live_lock_probe", pg.url_admin);
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(sweep_url);
     let sweep_pool = Pool::builder().max_size(1).build(manager).await.unwrap();
@@ -1270,10 +1274,6 @@ async fn sweep_ignores_a_held_lock_on_a_committed_hash() {
         data
     );
 }
-
-// ---------------------------------------------------------------------------
-// Round 6: out-of-range grace period must propagate as an error
-// ---------------------------------------------------------------------------
 
 /// Proves: sweep returns `SweepError::GracePeriodOutOfRange` rather than silently
 /// substituting a one-hour cutoff when the grace Duration overflows chrono's range.

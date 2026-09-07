@@ -340,12 +340,7 @@ fn check_ids_match(url_id: &FileId, ticket_id: &[u8; 32]) -> Result<(), ServerEr
     Ok(())
 }
 
+/// Encodes a [`ChunkHash`] as a 64-character lowercase hex string.
 pub(crate) fn hex_hash(h: &ChunkHash) -> String {
-    h.as_bytes()
-        .iter()
-        .fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    crate::hex_32(h.as_bytes())
 }

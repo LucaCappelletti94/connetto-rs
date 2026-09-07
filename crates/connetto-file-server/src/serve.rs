@@ -247,13 +247,5 @@ fn parse_range(
 }
 
 fn etag_value(file_id: &connetto_file_core::FileId) -> String {
-    let hex: String = file_id
-        .as_bytes()
-        .iter()
-        .fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        });
-    format!("\"{hex}\"")
+    format!("\"{}\"", crate::hex_32(file_id.as_bytes()))
 }

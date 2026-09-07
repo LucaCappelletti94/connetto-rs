@@ -26,7 +26,7 @@ impl FsStore {
     }
 
     fn chunk_path(&self, hash: &ChunkHash) -> PathBuf {
-        let h = hex_str(hash.as_bytes());
+        let h = crate::hex_32(hash.as_bytes());
         self.root.join(&h[..2]).join(&h[2..4]).join(&h)
     }
 }
@@ -71,14 +71,6 @@ pub(super) async fn delete_chunk(store: &FsStore, hash: &ChunkHash) -> Result<()
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StoreError::Io(e)),
     }
-}
-
-fn hex_str(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// Generates a unique temp path by combining the process ID and a

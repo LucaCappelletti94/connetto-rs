@@ -42,8 +42,11 @@ async fn expired_ticket_is_refused() {
     let payload = payload_for(Verb::Read, 0, -1);
     let token = signer.mint(&payload).unwrap();
     assert!(
-        verifier.verify(&token).is_err(),
-        "expired token must be refused"
+        matches!(
+            verifier.verify(&token),
+            Err(connetto_file_server::ticket::TicketError::Expired)
+        ),
+        "expired token must be refused with Expired"
     );
 }
 
@@ -106,8 +109,8 @@ async fn different_signers_do_not_cross_verify() {
     assert!(verifier_a.verify(&token_b).is_err());
 }
 
-/// Produces a `TicketSigner` from the given raw public-key bytes — verifies that
-/// `public_key_bytes()` is compatible with `TicketVerifier::new`.
+/// Proves: `public_key_bytes()` is accepted by `TicketVerifier::new`, and the
+/// resulting verifier accepts a token minted by that signer.
 #[tokio::test]
 async fn signer_exposes_public_key() {
     let (signer, _) = make_signer();

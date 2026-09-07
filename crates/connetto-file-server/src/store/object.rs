@@ -21,7 +21,7 @@ impl ObjectStoreBackend {
     }
 
     fn chunk_path(hash: &ChunkHash) -> Path {
-        let h = hex(hash.as_bytes());
+        let h = crate::hex_32(hash.as_bytes());
         Path::from(format!("chunks/{}/{}/{}", &h[..2], &h[2..4], h))
     }
 }
@@ -67,12 +67,4 @@ pub(super) async fn delete_chunk(
         Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
         Err(e) => Err(StoreError::from(e)),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }

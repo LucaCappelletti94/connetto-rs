@@ -20,10 +20,6 @@ use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-// ---------------------------------------------------------------------------
-// Test-only fixture DDL (NOT part of the shipped DDL const)
-// ---------------------------------------------------------------------------
-
 /// Individual DDL statements applied by tests (not part of the shipped DDL const).
 ///
 /// Each entry is a complete Postgres statement. Using a slice avoids splitting
@@ -59,7 +55,7 @@ pub const FIXTURE_STMTS: &[&str] = &[
          )
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
-    // SET search_path TO '' pins the path; p_caller carries the uploader identity.
+    // SET search_path TO '' pins the path. p_caller carries the uploader identity.
     "CREATE OR REPLACE FUNCTION connetto_set_content_state(
          p_file_id   BYTEA,
          p_new_state TEXT,
@@ -130,10 +126,6 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
 ];
-
-// ---------------------------------------------------------------------------
-// Container
-// ---------------------------------------------------------------------------
 
 pub struct Pg {
     pub _container: ContainerAsync<GenericImage>,
@@ -221,10 +213,6 @@ async fn make_pool(url: &str) -> Pool<AsyncPgConnection> {
         .expect("pool")
 }
 
-// ---------------------------------------------------------------------------
-// Store construction
-// ---------------------------------------------------------------------------
-
 pub fn fs_store(dir: &tempfile::TempDir) -> AnyStore {
     AnyStore::Fs(FsStore::new(dir.path()).expect("fs store"))
 }
@@ -283,14 +271,6 @@ pub fn gated_write_store(
     }));
     (store, entered, release)
 }
-
-// ---------------------------------------------------------------------------
-// CustomStore implementations (test-only; not shipped in the library)
-//
-// Each implementation wraps an `AnyStore` internally so it can delegate
-// non-faulting operations through the same dispatch path as production code,
-// without needing access to any private function in the library crate.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Fault {
@@ -489,10 +469,6 @@ pub fn short_read_store(inner: FsStore, truncate_to: usize) -> AnyStore {
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Router construction
-// ---------------------------------------------------------------------------
-
 pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
     let (signer, verifier) = make_signer();
     let cfg: Config<DefaultFileSchema> = Config {
@@ -518,15 +494,6 @@ pub fn make_signer() -> (TicketSigner, TicketVerifier) {
     (signer, verifier)
 }
 
-// ---------------------------------------------------------------------------
-// DB helpers
-//
-// These insert directly via sql_query because the library's schema module is
-// private (not re-exported) and integration tests therefore cannot use the
-// typed DSL against those tables.  The raw SQL mirrors the schema.sql DDL
-// exactly; any drift will surface as a test failure.
-// ---------------------------------------------------------------------------
-
 /// Inserts an uncommitted manifest and chunk rows, bypassing intent validation.
 ///
 /// Use in adversarial tests that need manifests whose chunk sums exceed the
@@ -541,7 +508,7 @@ pub async fn insert_manifest_bypassing_intent(
         .iter()
         .map(|c| i64::try_from(c.len).expect("chunk len fits i64"))
         .sum();
-    // The library schema is private; sql_query is the only path available
+    // The library schema is private. sql_query is the only path available
     // from integration-test code.
     diesel::sql_query(
         "INSERT INTO _cfs_manifests
@@ -621,7 +588,7 @@ pub async fn insert_committed_manifest(
     .expect("mark manifest committed");
 
     // Upsert registry rows in `stored` state.
-    // The library schema is private; sql_query is the only path from integration-test code.
+    // The library schema is private. sql_query is the only path from integration-test code.
     for chunk in chunks {
         diesel::sql_query(
             "INSERT INTO _cfs_chunk_registry (chunk_hash, state)
@@ -634,10 +601,6 @@ pub async fn insert_committed_manifest(
         .expect("upsert registry row");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Splits simple DDL (no dollar-quoted strings) on semicolons.
 /// Used only for the shipped `DEPLOYMENT_DDL` which contains only table DDL.
@@ -669,7 +632,7 @@ pub async fn register_file_ownership(conn: &mut AsyncPgConnection, file_id: &Fil
 
 /// Returns the number of rows in `_cfs_chunk_registry` for `hash`.
 ///
-/// The library schema is private; `sql_query` is the only path from integration-test code.
+/// The library schema is private. `sql_query` is the only path from integration-test code.
 pub async fn registry_row_count(
     conn: &mut AsyncPgConnection,
     hash: &connetto_file_core::ChunkHash,
