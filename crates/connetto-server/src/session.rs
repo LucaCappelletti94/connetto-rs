@@ -716,6 +716,10 @@ struct HandshakeOutcome<Id, Key> {
     /// The logging context, opened as soon as the run has a handle so that a
     /// refused grant is recorded inside it.
     span: tracing::Span,
+    /// The sending half of the outbound channel, held by `SessionState`. Created here rather than in the run loop so the session is registered before the handshake ack leaves, since a revocation crossing that gap would otherwise find no session to close.
+    outbound_tx: mpsc::UnboundedSender<Outbound>,
+    /// The receiving half of the outbound channel, drained by the run loop.
+    outbound_rx: mpsc::UnboundedReceiver<Outbound>,
 }
 
 /// One item waiting on the outbound queue.
@@ -2333,6 +2337,10 @@ where
     ///
     /// Returns the session identity, or `None` when the peer closed before
     /// sending a handshake.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "registration must sit between the grant checks and the ack, so splitting it would let a revocation cross the gap again"
+    )]
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
@@ -2448,6 +2456,20 @@ where
             .authority
             .mint_handle(session_id)
             .map_err(|err| SessionError::Handle(err.to_string()))?;
+        // Register BEFORE sending the ack. The ack is the client's signal that
+        // this session handle is addressable: close_session and revocation hooks
+        // fire as soon as the ack arrives. Without the entry already in the map
+        // those calls see None and the fatal frame is never delivered.
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        self.register_connection(
+            session_id,
+            connection_num,
+            principal
+                .identity()
+                .map(|identity| identity.user_id.to_string()),
+            &outbound_tx,
+        )
+        .await;
 
         transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
@@ -2468,6 +2490,8 @@ where
             applied_watermark,
             refused_grants,
             span,
+            outbound_tx,
+            outbound_rx,
         }))
     }
     /// Refuse a caller that is over a rate limit, reporting whether it was.
@@ -2767,23 +2791,16 @@ where
             applied_watermark,
             refused_grants,
             span: _,
+            outbound_tx,
+            mut outbound_rx,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(resume_lsn, "connection established");
 
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
-        self.register_connection(
-            session_id,
-            connection_num,
-            principal
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
-            &outbound_tx,
-        )
-        .await;
         // The refusals the handshake collected are tallied here rather than as
-        // they happened, because only now is the caller resolved, and only now
-        // is the connection registered so a ban can close it.
+        // they happened, because the caller may not be fully resolved until all
+        // grants are checked. The connection is already registered (in
+        // run_handshake, before the ack) so a crossing ban can close it.
         let refused = self
             .guard
             .refused_grants(Self::caller(&principal), refused_grants);
