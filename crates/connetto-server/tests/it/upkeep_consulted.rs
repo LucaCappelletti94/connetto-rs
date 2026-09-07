@@ -46,7 +46,10 @@ struct EmptySnapshot;
 impl SnapshotSource for EmptySnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
     async fn estimate(
         &self,
         _sql: &str,
@@ -59,7 +62,10 @@ impl SnapshotSource for EmptySnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
     async fn snapshot_page(
         &self,
         _sql: &str,
@@ -93,7 +99,10 @@ impl CdcSource for OneEvent {
         async move { Ok(next) }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
     async fn ack(&mut self, _upto: PgLsn) -> Result<(), io::Error> {
         Ok(())
     }
@@ -140,8 +149,9 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
         .await
         .expect("ingest completed");
 
-    assert!(
-        count.load(Ordering::Relaxed) >= 1,
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
         "the upkeep must be consulted for every CDC event"
     );
 }

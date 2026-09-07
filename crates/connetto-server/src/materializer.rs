@@ -55,12 +55,13 @@ use subql::emit::{
 };
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{
-    AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, ResolvedReads, RowsUpdate,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, ResolvedReads, RowDelta,
+    RowsUpdate, ScalarUpdate,
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
     AsyncSubscriptionDispatch, ChangeEvent, DatabaseLike, DefaultIds, MaintenanceTransition,
-    NumericValue, OpaqueCheckpoint, ParserDB, SubscriptionEngine, SubscriptionId,
+    NumericValue, OpaqueCheckpoint, ParserDB, PgLsn, SubscriptionEngine, SubscriptionId,
     SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
 };
 
@@ -73,6 +74,14 @@ use subql::patchset::PgAdapter;
 
 /// The wire `Value` flavor a parsed upload carries: owned text and blobs.
 type WireValue = Value<String, Vec<u8>>;
+/// Aggregate value update pinned to connetto's backend and default id set.
+type AggUpdate = AggregateValueUpdate<DefaultIds, Postgres>;
+/// Scalar re-execution update pinned to connetto's backend and default id set.
+type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, PgLsn>;
+/// Re-executed rows update pinned to connetto's backend and default id set.
+type RowsUpd = RowsUpdate<DefaultIds, Postgres, PgLsn>;
+/// Row-level keyed delta pinned to connetto's backend and default id set.
+type RowDlt = RowDelta<DefaultIds, Postgres, PgLsn>;
 
 /// Zstd level for bulk payloads. Level 3 is the library default: a sound size
 /// versus speed tradeoff for patchset-sized blobs.
@@ -1079,10 +1088,7 @@ where
     }
 
     /// One wire-shaped change from an engine aggregate movement.
-    fn aggregate_change(
-        update: AggregateValueUpdate<DefaultIds, Postgres>,
-        cursor: Vec<u8>,
-    ) -> ComputedChange {
+    fn aggregate_change(update: AggUpdate, cursor: Vec<u8>) -> ComputedChange {
         let is_full_result = update.group.is_none();
         let (group_key, group_values_json) = match update.group {
             Some(group) => (Some(group.key), Some(values_json(&group.values))),
@@ -1238,12 +1244,12 @@ where
     /// Build the computed-result changes from a dispatch's immediate results
     /// plus the connector reads that the dispatch resolved.
     fn computed_changes(
-        agg_updates: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
-        resolved_agg: Vec<AggregateValueUpdate<DefaultIds, Postgres>>,
-        scalar_updates: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
-        resolved_scalar: Vec<subql::reexec::ScalarUpdate<DefaultIds, Postgres, subql::PgLsn>>,
-        rows_updates: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
-        row_deltas: Vec<subql::reexec::RowDelta<DefaultIds, Postgres, subql::PgLsn>>,
+        agg_updates: Vec<AggUpdate>,
+        resolved_agg: Vec<AggUpdate>,
+        scalar_updates: Vec<ScalarUpd>,
+        resolved_scalar: Vec<ScalarUpd>,
+        rows_updates: Vec<RowsUpd>,
+        row_deltas: Vec<RowDlt>,
         cursor: &[u8],
     ) -> Vec<ComputedChange> {
         let mut computed = Vec::new();
@@ -1285,10 +1291,7 @@ where
     /// only the newest generation per subscription survives and its pages
     /// concatenate into one wire frame: the wire's full-result replacement is
     /// atomic where a paged delivery would show a half-replaced answer.
-    fn rows_changes(
-        updates: Vec<RowsUpdate<DefaultIds, Postgres, subql::PgLsn>>,
-        cursor: &[u8],
-    ) -> Vec<ComputedChange> {
+    fn rows_changes(updates: Vec<RowsUpd>, cursor: &[u8]) -> Vec<ComputedChange> {
         /// One subscription's newest re-read, its pages concatenated.
         struct PendingRows {
             consumer_id: u64,
@@ -1710,6 +1713,7 @@ where
     /// # Errors
     ///
     /// [`MaterializerError::Compression`] when the payload does not decompress,
+    /// [`MaterializerError::Catalog`] when the catalog adapter cannot be built,
     /// [`MaterializerError::Apply`] when the diffset fails to parse or apply.
     pub fn apply_diffset(
         &self,
@@ -1752,6 +1756,7 @@ where
     /// # Errors
     ///
     /// [`MaterializerError::Compression`] when the payload does not decompress,
+    /// [`MaterializerError::Catalog`] when the catalog adapter cannot be built,
     /// [`MaterializerError::Apply`] when the diffset fails to parse or apply.
     pub async fn apply_diffset_async(
         &self,
@@ -1943,8 +1948,16 @@ fn value_json(value: &PgValue<Postgres>) -> serde_json::Value {
         PgValue::Missing | PgValue::Null => serde_json::Value::Null,
         PgValue::Bool(b) => serde_json::Value::Bool(*b),
         PgValue::Int(i) => serde_json::Value::from(*i),
-        PgValue::Float(f) => serde_json::Number::from_f64(*f)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        PgValue::Float(f) => {
+            if f.is_finite() {
+                serde_json::Number::from_f64(*f)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            } else {
+                // Infinity or NaN cannot be represented in JSON; the raw IEEE
+                // string preserves the value, matching agg_value_to_json.
+                serde_json::Value::String(f.to_string())
+            }
+        }
         PgValue::String(s) => serde_json::Value::String(s.clone()),
         PgValue::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
         PgValue::Uuid(u) => serde_json::Value::String(u.to_string()),
@@ -2175,6 +2188,19 @@ mod wire_contract {
         // Integers are JSON integers, floats are JSON numbers.
         assert_eq!(value_to_json(&PgValue::<Postgres>::Int(42)), "42");
         assert_eq!(value_to_json(&PgValue::<Postgres>::Float(1.5)), "1.5");
+        // Non-finite floats become JSON strings, matching agg_value_to_json.
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Float(f64::INFINITY)),
+            "\"inf\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Float(f64::NEG_INFINITY)),
+            "\"-inf\"",
+        );
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Float(f64::NAN)),
+            "\"NaN\"",
+        );
 
         // Text is a JSON string.
         assert_eq!(

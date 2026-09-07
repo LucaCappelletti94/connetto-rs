@@ -28,6 +28,11 @@ pub enum ProcessError<E: std::error::Error + Send + Sync + 'static> {
 ///
 /// `R: MaybeSend` is required so callers on multi-threaded native runtimes can
 /// hold this future across `spawn` boundaries. On wasm the bound is vacuous.
+///
+/// # Errors
+///
+/// Returns [`ProcessError::Read`] on I/O failure reading from `reader`, and
+/// [`ProcessError::Store`] when a chunk-store write fails.
 pub async fn process_file_from_reader<R, S>(
     mut reader: R,
     mime: MimeClass,
@@ -80,6 +85,11 @@ where
 ///
 /// Thin wrapper over [`process_file_from_reader`]: `&[u8]` implements [`Read`]
 /// with no allocation.
+///
+/// # Errors
+///
+/// Returns [`ProcessError::Read`] on I/O failure or [`ProcessError::Store`]
+/// when a chunk-store write fails, forwarded from [`process_file_from_reader`].
 pub async fn process_file<S: ChunkStore>(
     data: &[u8],
     mime: MimeClass,
@@ -90,6 +100,10 @@ pub async fn process_file<S: ChunkStore>(
 
 /// Reassembles the original file bytes from `manifest` by reading chunks from
 /// `store` in order.
+///
+/// # Errors
+///
+/// Returns the chunk-store's error type when any [`ChunkStore::read_chunk`] call fails.
 pub async fn reassemble<S: ChunkStore>(
     manifest: &Manifest,
     store: &S,
@@ -105,10 +119,6 @@ pub async fn reassemble<S: ChunkStore>(
     }
     Ok(result)
 }
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
 
 /// Reads up to `limit` bytes from `reader`, stopping at EOF.
 fn read_prefix<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, std::io::Error> {

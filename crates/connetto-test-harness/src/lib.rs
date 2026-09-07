@@ -439,6 +439,10 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 }
 
 /// Set up the publication, slot, and oplog table for logical replication.
+///
+/// # Panics
+///
+/// When slot removal, DDL execution, or oplog provisioning fails.
 pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str]) {
     drop_slot(pool).await;
     exec(pool, &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}")).await;
@@ -998,11 +1002,19 @@ pub async fn spawn_server(
         "nothing else installs a withdrawal source"
     );
 
-    let ingest_manager = Arc::clone(&manager);
-    let ddl = pg_ddl;
-    let ingest = tokio::spawn(async move {
+    let ingest = spawn_ingest_task(admin_url, pg_ddl, Arc::clone(&manager));
+
+    Server { manager, ingest }
+}
+/// Spawn the CDC ingest loop that drives `manager` from the replication stream.
+fn spawn_ingest_task(
+    admin_url: String,
+    pg_ddl: String,
+    manager: Arc<HarnessManager>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let connect = || {
-            let (url, ddl) = (admin_url.clone(), ddl.clone());
+            let (url, ddl) = (admin_url.clone(), pg_ddl.clone());
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
@@ -1012,12 +1024,10 @@ pub async fn spawn_server(
                     .map_err(|err| format!("opening CDC stream: {err}"))
             }
         };
-        let _ = ingest_manager
+        let _ = manager
             .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |_event| {})
             .await;
-    });
-
-    Server { manager, ingest }
+    })
 }
 
 /// An in-process client over a loopback transport, with the drive helpers the

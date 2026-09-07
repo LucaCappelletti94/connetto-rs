@@ -527,7 +527,7 @@ impl Translated {
         let model = outputs.json_model();
         let tuples = outputs.tuple_queries().to_vec();
         let policy_tables = policy_tables(&outputs);
-        // Borrowed into enumerations below; outputs lives until Shapes::new returns.
+        // Borrowed into enumerations below. `outputs` lives until `Shapes::new` returns.
         let enumerations: Vec<Enumeration<'_>> = outputs
             .tuple_queries()
             .iter()
@@ -613,7 +613,7 @@ impl Translated {
     /// one already there when it is the same description.
     ///
     /// An unchanged description means the model was previously written to this
-    /// store; the caller reconciles the whole-shape facts on every adopted boot.
+    /// store. The caller reconciles the whole-shape facts on every adopted boot.
     /// Comparison is structural, over the same conversion the write call itself
     /// uses, so a description that differs in any field the server stores is a
     /// new one.
@@ -686,8 +686,8 @@ impl Translated {
             .get()
             .await
             .map_err(|err| SetupError::Store(err.to_string()))?;
-        // Whole-shape queries are loaded through OpenFgaPolicy::materialise at boot;
-        // running them here too would duplicate the work with no correctness gain.
+        // Whole-shape queries are loaded through OpenFgaPolicy::materialise at boot.
+        // Running them here too would duplicate the work with no correctness gain.
         let whole_shape_sqls: std::collections::HashSet<&str> = self
             .shapes
             .materialisations()
@@ -804,7 +804,7 @@ impl Translated {
 }
 /// Run the whole-shape materialise pass for the boot sequence.
 ///
-/// Keyed facts are gathered first inside [`Translated::load_into`]; this
+/// Keyed facts are gathered first inside [`Translated::load_into`]. This
 /// covers the regions whose producers require a full-group replay.
 ///
 /// # Errors
@@ -1715,7 +1715,9 @@ mod tests {
         let type_name = translated
             .shapes
             .naming(item_id)
-            .map_or("item", |n| n.type_name.as_str());
+            .expect("item is in the catalog and must have a naming entry")
+            .type_name
+            .as_str();
         for m in mats {
             for mem in m.members() {
                 assert!(

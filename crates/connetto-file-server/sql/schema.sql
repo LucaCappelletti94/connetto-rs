@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS _cfs_chunk_registry (
                CHECK (state IN ('pending', 'stored', 'deleting'))
 );
 
+-- The sweep resumes stranded deletions by listing rows in 'deleting' state.
+-- Without this index the resume scan reads the full registry on every startup.
+CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
+    ON _cfs_chunk_registry (chunk_hash)
+    WHERE state = 'deleting';
+
 -- Deployment contract (1): visibility function.
 --
 -- The deployment implements a SQL function named exactly

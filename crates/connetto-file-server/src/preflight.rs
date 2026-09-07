@@ -213,10 +213,6 @@ impl<E: std::error::Error + 'static> From<bb8::RunError<E>> for PreflightError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Column specifications for each own table
-// ---------------------------------------------------------------------------
-
 const MANIFESTS_COLS: &[(&str, &str)] = &[
     ("file_id", "bytea"),
     ("total_len", "bigint"),
@@ -236,12 +232,13 @@ const CHUNKS_COLS: &[(&str, &str)] = &[
 
 const REGISTRY_COLS: &[(&str, &str)] = &[("chunk_hash", "bytea"), ("state", "text")];
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 /// Verifies all deployment artifacts.  Returns `Err` naming the first missing
 /// or misconfigured artifact.
+///
+/// # Errors
+///
+/// Returns [`PreflightError::Db`] on any database query failure, or the
+/// specific variant naming the missing or misconfigured artifact.
 pub async fn preflight<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
 ) -> Result<(), PreflightError> {
@@ -302,10 +299,6 @@ async fn check_reader_role<S: ConnettoFileSchema>(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Own-table checks
-// ---------------------------------------------------------------------------
 
 async fn check_own_tables<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
@@ -464,10 +457,6 @@ async fn check_column_types(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Function-signature checks
-// ---------------------------------------------------------------------------
-
 /// Checks `connetto_visible_files`:
 /// - argument: `bytea[]`
 /// - return: `bytea[]`
@@ -476,7 +465,7 @@ async fn check_column_types(
 /// A DEFINER function evaluates RLS as the function owner, not as the caller,
 /// so it leaks every file regardless of the caller's identity.
 async fn check_visible_files_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightError> {
-    let row = fn_meta(conn, "connetto_visible_files").await?;
+    let row = fn_meta(conn, "connetto_visible_files", 1).await?;
     let Some(row) = row else {
         return Err(PreflightError::MissingVisibleFiles);
     };
@@ -502,7 +491,7 @@ async fn check_visible_files_fn(conn: &mut AsyncPgConnection) -> Result<(), Pref
 /// - security: SECURITY DEFINER (prosecdef = true)
 /// - `search_path`: must be pinned in proconfig
 async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightError> {
-    let row = fn_meta(conn, "connetto_set_content_state").await?;
+    let row = fn_meta(conn, "connetto_set_content_state", 3).await?;
     let Some(row) = row else {
         return Err(PreflightError::MissingSetterFunction);
     };
@@ -527,6 +516,9 @@ async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightEr
 /// Queries `pg_proc` for the function's signature, security mode, and
 /// whether `search_path` is pinned in `proconfig`.
 ///
+/// `nargs` pins the exact argument count so the query picks the correct
+/// overload when multiple functions with the same name exist in the schema.
+///
 /// Stays SQL text: `proargtypes` is `oidvector`, which has no diesel
 /// `SqlType`, and every projected column is a `format_type` call on a
 /// subscript of it.  `proconfig` is `text[]`; the `has_search_path` column
@@ -534,8 +526,10 @@ async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightEr
 async fn fn_meta(
     conn: &mut AsyncPgConnection,
     fn_name: &str,
+    nargs: i16,
 ) -> Result<Option<FnMetaRow>, diesel::result::Error> {
     // pg_catalog.pg_proc has no diesel table! entry; sql_query is required.
+    // proargtypes is oidvector and proconfig is text[], both lacking diesel SqlType.
     let mut rows: Vec<FnMetaRow> = diesel::sql_query(
         "SELECT p.prosecdef, \
                 pg_catalog.format_type(p.prorettype, NULL) AS ret_type, \
@@ -549,9 +543,11 @@ async fn fn_meta(
          JOIN   pg_namespace n ON n.oid = p.pronamespace \
          WHERE  n.nspname = current_schema() \
            AND  p.proname = $1 \
+           AND  p.pronargs = $2 \
          LIMIT  1",
     )
     .bind::<diesel::sql_types::Text, _>(fn_name)
+    .bind::<diesel::sql_types::SmallInt, _>(nargs)
     .load(conn)
     .await?;
     Ok(rows.pop())
@@ -600,10 +596,6 @@ fn check_return_type(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Query result types
-// ---------------------------------------------------------------------------
 
 #[derive(QueryableByName)]
 struct FnMetaRow {

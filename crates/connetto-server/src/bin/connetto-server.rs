@@ -885,11 +885,9 @@ async fn build_authorization(
         }
         ModelState::Adopted(_) => {
             // Reconcile the whole-shape materialisation regions on every
-            // adopted boot. A previous boot may have written keyed facts then
-            // failed before materialise_groups completed, leaving the store
-            // with keyed facts and no whole-shape facts. A region already
-            // correct costs a read round-trip to both sides with zero writes;
-            // a missing region is filled.
+            // adopted boot. A region already correct costs a read round-trip
+            // with zero writes; a missing region is filled in case the
+            // previous boot failed before materialise_groups completed.
             translated
                 .reconcile_materialised(reader_pool, &loader)
                 .await

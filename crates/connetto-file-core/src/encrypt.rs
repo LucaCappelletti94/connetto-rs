@@ -121,10 +121,6 @@ impl<S: ChunkStore + Sync> ChunkStore for EncryptingStore<S> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure-sync crypto helpers (no I/O, called from async fn bodies)
-// ---------------------------------------------------------------------------
-
 fn encrypt_chunk<E: std::error::Error + Send + Sync + 'static>(
     hash: &ChunkHash,
     data: &[u8],
