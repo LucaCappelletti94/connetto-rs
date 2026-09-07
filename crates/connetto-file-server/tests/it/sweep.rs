@@ -1273,16 +1273,18 @@ async fn sweep_ignores_a_held_lock_on_a_committed_hash() {
 
 /// Proves: sweep returns `SweepError::GracePeriodOutOfRange` rather than silently
 /// substituting a one-hour cutoff when the grace Duration overflows chrono's range.
+/// The grace conversion fires before `pool.get()`, so no database connection is needed.
 #[tokio::test]
 async fn sweep_out_of_range_grace_period_returns_error() {
     use connetto_file_server::{AnyStore, DefaultFileSchema, FsStore, SweepError};
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8::Pool};
 
-    let pg = Pg::start().await;
     let dir = tempfile::TempDir::new().unwrap();
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&pg.url_admin);
-    let pool = Pool::builder().max_size(1).build(manager).await.unwrap();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        "postgresql://unused:unused@127.0.0.1:1/unused",
+    );
+    let pool = Pool::builder().max_size(1).build_unchecked(manager);
     let store = AnyStore::Fs(FsStore::new(dir.path()).unwrap());
 
     let result =

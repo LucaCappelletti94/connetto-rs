@@ -221,11 +221,19 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     admin_conn
         .transaction::<StatusCode, ServerError, _>(move |conn| {
             async move {
-                let manifest = match db::load_manifest_locked::<S>(conn, &file_id).await? {
-                    None => return Err(ServerError::NotFound),
-                    Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
-                    Some(db::ManifestState::Uncommitted(manifest)) => manifest,
-                };
+                let (manifest, uploaded_by) =
+                    match db::load_manifest_locked::<S>(conn, &file_id).await? {
+                        None => return Err(ServerError::NotFound),
+                        Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
+                        Some(db::ManifestState::Uncommitted(manifest, uploaded_by)) => {
+                            (manifest, uploaded_by)
+                        }
+                    };
+                // Refuse when a different caller tries to commit a manifest they did not declare.
+                // Uses CommitRefused so no status distinction reopens the existence oracle.
+                if uploaded_by != caller {
+                    return Err(ServerError::CommitRefused);
+                }
                 verify_file_identity(store, &manifest).await?;
                 db::commit_manifest_atomic::<S>(conn, &file_id).await?;
                 Ok(StatusCode::OK)

@@ -1351,58 +1351,153 @@ async fn intent_duplicate_hash_conflicting_lengths_refused() {
 ///
 /// The refusal must be indistinguishable from committing a manifest whose chunk
 /// was never uploaded anywhere, closing the existence oracle.
+///
+/// Bob's file id equals `chunk_a.hash` so a broken visibility gate (one that
+/// grants every file) lets identity pass and the commit succeeds with 200,
+/// proving the test actually exercises the visibility gate and not a vacuous
+/// identity refusal.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn commit_without_put_refused_same_as_chunk_never_stored() {
+    use connetto_file_core::ChunkStore;
     let pg = Pg::start().await;
     let dir = tempfile::TempDir::new().unwrap();
     let (app, signer) = build_router(&pg, fs_store(&dir)).await;
 
-    let data = b"bytes uploaded by caller a for cross-caller attack test";
-    // Caller A completes a full upload so the chunk hash exists in the store.
-    do_upload(&app, &signer, data).await;
-
-    let mem = MemStore::new();
-    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
-    let chunks_json: Vec<serde_json::Value> = manifest
-        .chunks()
-        .iter()
-        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
-        .collect();
-    let intent_body = serde_json::json!({
-        "total_len": u64::try_from(data.len()).unwrap(),
-        "chunks": chunks_json,
+    // Alice uploads file X = [A, B] so file_x_id = BLAKE3(stored_A || stored_B)
+    // differs from chunk_a.hash = BLAKE3(stored_A). Bob can then declare file Y
+    // with file_id = chunk_a.hash and skip PUT, expecting a free-ride on chunk A.
+    let data_a = b"cross-caller-attack chunk A payload";
+    let data_b = b"cross-caller-attack chunk B payload";
+    let mem_a = MemStore::new();
+    let mem_b = MemStore::new();
+    let mf_a = process_file(data_a, MimeClass::Generic, &mem_a)
+        .await
+        .unwrap();
+    let mf_b = process_file(data_b, MimeClass::Generic, &mem_b)
+        .await
+        .unwrap();
+    let chunk_a = &mf_a.chunks()[0];
+    let chunk_b = &mf_b.chunks()[0];
+    let stored_a = mem_a.read_chunk(&chunk_a.hash).await.unwrap();
+    let stored_b = mem_b.read_chunk(&chunk_b.hash).await.unwrap();
+    let file_x_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(&stored_a);
+        h.update(&stored_b);
+        FileId::from_bytes(*h.finalize().as_bytes())
+    };
+    let file_x_hex = format!("{file_x_id}");
+    let ticket_alice = signer
+        .mint(&TicketPayload {
+            file_id: *file_x_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: chunk_a.len + chunk_b.len + 256,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let body_x = serde_json::json!({
+        "total_len": chunk_a.len + chunk_b.len,
+        "chunks": [
+            { "hash": format!("{}", chunk_a.hash), "len": chunk_a.len },
+            { "hash": format!("{}", chunk_b.hash), "len": chunk_b.len },
+        ],
     });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_x_hex}/intent?t={ticket_alice}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body_x).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "alice's intent must succeed");
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{}?t={ticket_alice}", chunk_a.hash))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(stored_a))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{}?t={ticket_alice}", chunk_b.hash))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(stored_b))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_x_hex}/commit?t={ticket_alice}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    // Caller B declares a different file id but the same chunk hash.
+    // Bob declares file Y = [chunk A] with file_id = chunk_a.hash. That id is
+    // what verify_file_identity would compute for a one-chunk file of chunk A
+    // bytes, so if the visibility gate were broken the commit would succeed (200).
+    // Alice's file X is NOT registered in test_file_metadata, so Bob cannot see
+    // it and the visibility check must refuse.
+    let bob_file_id = FileId::from_bytes(*chunk_a.hash.as_bytes());
+    let bob_file_hex = format!("{bob_file_id}");
     let ticket_b = signer
         .mint(&TicketPayload {
-            file_id: [0x02u8; 32],
+            file_id: *chunk_a.hash.as_bytes(),
             verb: Verb::Write,
-            ceiling: 1024 * 1024,
+            ceiling: chunk_a.len + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: "bob".into(),
         })
         .unwrap();
-    let bob_hex = "02".repeat(32);
-
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/files/{bob_hex}/intent?t={ticket_b}"))
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::to_vec(&intent_body).unwrap(),
-        ))
+    let body_b = serde_json::json!({
+        "total_len": chunk_a.len,
+        "chunks": [{ "hash": format!("{}", chunk_a.hash), "len": chunk_a.len }],
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/intent?t={ticket_b}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body_b).unwrap()))
+                .unwrap(),
+        )
+        .await
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "intent must succeed");
+    assert_eq!(resp.status(), StatusCode::OK, "bob's intent must succeed");
 
-    // Caller B commits without PUTting anything.
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/files/{bob_hex}/commit?t={ticket_b}"))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let cross_caller_status = app.clone().oneshot(req).await.unwrap().status();
+    // Bob commits without PUTting. The ownership check passes (bob == bob).
+    // The visibility gate must refuse because Alice's file X is not visible to bob.
+    let cross_caller_status = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{bob_file_hex}/commit?t={ticket_b}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
     assert_eq!(
         cross_caller_status,
         StatusCode::CONFLICT,
@@ -1410,7 +1505,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
     );
 
     // Caller C declares a file whose chunk was never uploaded anywhere, then
-    // commits without PUTting. The status must be identical to caller B's refusal
+    // commits without PUTting. The status must be identical to B's refusal
     // so neither case leaks which condition was tripped.
     let other_data = b"bytes that will never be uploaded anywhere at all";
     let mem2 = MemStore::new();
@@ -1426,7 +1521,6 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
         "total_len": u64::try_from(other_data.len()).unwrap(),
         "chunks": chunks_json2,
     });
-
     let ticket_c = signer
         .mint(&TicketPayload {
             file_id: [0x03u8; 32],
@@ -1437,24 +1531,33 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
         })
         .unwrap();
     let carol_hex = "03".repeat(32);
-
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/files/{carol_hex}/intent?t={ticket_c}"))
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::to_vec(&intent_body2).unwrap(),
-        ))
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{carol_hex}/intent?t={ticket_c}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_body2).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "intent for C must succeed");
-
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/files/{carol_hex}/commit?t={ticket_c}"))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let never_stored_status = app.clone().oneshot(req).await.unwrap().status();
+    let never_stored_status = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{carol_hex}/commit?t={ticket_c}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
     assert_eq!(
         never_stored_status, cross_caller_status,
         "chunk-never-stored refusal must be indistinguishable from cross-caller refusal"
@@ -1476,6 +1579,100 @@ async fn commit_after_full_put_still_succeeds() {
         b"full upload must still commit after stored-flag check",
     )
     .await;
+}
+
+/// Proves: a second caller holding a valid write ticket for the same file id
+/// cannot commit a manifest they did not declare.
+///
+/// Alice declares and fully PUTs file X without committing. Dave, with a valid
+/// ticket for the same file id but caller="dave", posts commit. Because every
+/// chunk is stored the unstored set is empty and `all_chunks_satisfied`
+/// short-circuits to true without reaching the visibility gate; the ownership
+/// check is the only barrier between Dave and committing Alice's manifest.
+#[tokio::test]
+async fn commit_by_non_declarer_refused() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"victim payload for ownership binding test";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let alice_ticket = write_payload(&signer, &file_id, u64::try_from(data.len()).unwrap() + 256);
+
+    // Alice declares intent.
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body = serde_json::json!({
+        "total_len": u64::try_from(data.len()).unwrap(),
+        "chunks": chunks_json,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={alice_ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_body).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "alice's intent must succeed");
+
+    // Alice PUTs all chunks but does not commit.
+    for c in manifest.chunks() {
+        use connetto_file_core::ChunkStore;
+        let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={alice_ticket}", c.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(chunk_data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "PUT must succeed");
+    }
+
+    // Dave holds a valid write ticket for the same file id but caller="dave".
+    let dave_ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 256,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "dave".into(),
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/commit?t={dave_ticket}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a non-declarer must not be able to commit another caller's manifest"
+    );
 }
 
 // ---------------------------------------------------------------------------

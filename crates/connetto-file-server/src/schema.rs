@@ -348,10 +348,10 @@ where
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
-    /// Lock one manifest row and return its committed state.
+    /// Lock one manifest row and return its committed state and declarer.
     fn lock_manifest_row_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool)> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool, String)> + Send + 'static;
 
     // ================================================================
     // FACTORY METHODS — typed diesel statements (return-position impl Trait
@@ -580,13 +580,18 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn lock_manifest_row_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool)> + Send + 'static {
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool, String)> + Send + 'static
+    {
         diesel::QueryDsl::select(
             diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
                 _cfs_manifests::table,
                 _cfs_manifests::file_id.eq(file_id),
             )),
-            (_cfs_manifests::file_id, _cfs_manifests::committed),
+            (
+                _cfs_manifests::file_id,
+                _cfs_manifests::committed,
+                _cfs_manifests::uploaded_by,
+            ),
         )
     }
 
@@ -956,7 +961,7 @@ macro_rules! connetto_file_tables {
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
                 diesel_async::AsyncPgConnection,
-                (Vec<u8>, bool),
+                (Vec<u8>, bool, String),
             > + Send
             + 'static {
                 diesel::QueryDsl::select(
@@ -964,7 +969,11 @@ macro_rules! connetto_file_tables {
                         $manifests::table,
                         $manifests::file_id.eq(file_id),
                     )),
-                    ($manifests::file_id, $manifests::committed),
+                    (
+                        $manifests::file_id,
+                        $manifests::committed,
+                        $manifests::uploaded_by,
+                    ),
                 )
             }
             fn mark_chunk_stored_stmt(

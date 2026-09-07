@@ -50,12 +50,12 @@ pub(crate) enum CommitOutcome {
     AlreadyCommitted,
 }
 
-/// Manifest existence and committed state, returned by [`load_manifest`].
+/// Manifest existence and committed state, returned by [`load_manifest_locked`].
 pub(crate) enum ManifestState {
     /// The manifest exists and has been committed; no further action needed.
     Committed,
     /// The manifest exists but has not yet been committed.
-    Uncommitted(Manifest),
+    Uncommitted(Manifest, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -206,17 +206,18 @@ pub(crate) async fn load_manifest_locked<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
 ) -> Result<Option<ManifestState>, diesel::result::Error> {
-    let mut rows: Vec<(Vec<u8>, bool)> = S::lock_manifest_row_stmt(file_id.as_bytes().to_vec())
-        .load(conn)
-        .await?;
-    let Some((file_id, committed)) = rows.pop() else {
+    let mut rows: Vec<(Vec<u8>, bool, String)> =
+        S::lock_manifest_row_stmt(file_id.as_bytes().to_vec())
+            .load(conn)
+            .await?;
+    let Some((file_id, committed, uploaded_by)) = rows.pop() else {
         return Ok(None);
     };
     if committed {
         return Ok(Some(ManifestState::Committed));
     }
     let manifest = load_chunk_rows::<S>(conn, file_id).await?;
-    Ok(Some(ManifestState::Uncommitted(manifest)))
+    Ok(Some(ManifestState::Uncommitted(manifest, uploaded_by)))
 }
 
 /// Returns the declared chunk length for `chunk_hash` in this upload, or
