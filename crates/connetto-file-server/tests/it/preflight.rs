@@ -478,3 +478,247 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         other => panic!("expected MissingIndex, got {other}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Finding: reader pool connected as a privileged role must be refused at startup
+// ---------------------------------------------------------------------------
+
+/// Proves: serve refuses when the reader pool connects as a superuser.
+///
+/// A superuser silently bypasses row level security, making the visibility
+/// checks the server relies on meaningless.
+#[tokio::test]
+async fn serve_refuses_superuser_reader_role() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.admin_pool().await,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let err = serve(cfg)
+        .await
+        .expect_err("serve must refuse a superuser reader");
+    assert!(
+        matches!(err, PreflightError::ReaderIsSuperuser),
+        "expected ReaderIsSuperuser, got {err}"
+    );
+}
+
+/// Proves: serve refuses when the reader pool connects as a role with BYPASSRLS.
+///
+/// A BYPASSRLS role silently skips every row level security policy, making
+/// the visibility checks this server relies on meaningless.
+#[tokio::test]
+async fn serve_refuses_bypassrls_reader_role() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8::Pool};
+
+    let pg = Pg::start().await;
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    diesel::sql_query(
+        "DO $$ BEGIN \
+             CREATE ROLE cfs_bypassrls_test LOGIN PASSWORD 'test' \
+             NOSUPERUSER BYPASSRLS NOINHERIT; \
+         EXCEPTION WHEN duplicate_object THEN NULL; \
+         END $$",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .expect("create bypassrls role");
+    diesel::sql_query("GRANT CONNECT ON DATABASE test TO cfs_bypassrls_test")
+        .execute(&mut admin_conn)
+        .await
+        .expect("grant connect");
+    drop(admin_conn);
+
+    let url = pg.url_for("cfs_bypassrls_test", "test");
+    let mgr = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let bypassrls_pool = Pool::builder()
+        .max_size(1)
+        .build(mgr)
+        .await
+        .expect("bypassrls pool");
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: bypassrls_pool,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let err = serve(cfg)
+        .await
+        .expect_err("serve must refuse a BYPASSRLS reader");
+    assert!(
+        matches!(err, PreflightError::ReaderBypassesRls),
+        "expected ReaderBypassesRls, got {err}"
+    );
+}
+
+/// Proves: serve refuses when the reader pool connects as the owner of a file-server table.
+///
+/// Postgres bypasses row level security for a table owner, so a reader that
+/// owns any of the file-server tables bypasses the constraints it must enforce.
+#[tokio::test]
+async fn serve_refuses_table_owner_reader_role() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8::Pool};
+
+    let pg = Pg::start().await;
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    diesel::sql_query(
+        "DO $$ BEGIN \
+             CREATE ROLE cfs_owner_test LOGIN PASSWORD 'test' \
+             NOSUPERUSER NOINHERIT; \
+         EXCEPTION WHEN duplicate_object THEN NULL; \
+         END $$",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .expect("create owner role");
+    diesel::sql_query("GRANT CONNECT ON DATABASE test TO cfs_owner_test")
+        .execute(&mut admin_conn)
+        .await
+        .expect("grant connect");
+    diesel::sql_query("ALTER TABLE _cfs_manifests OWNER TO cfs_owner_test")
+        .execute(&mut admin_conn)
+        .await
+        .expect("transfer table ownership");
+    drop(admin_conn);
+
+    let url = pg.url_for("cfs_owner_test", "test");
+    let mgr = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let owner_pool = Pool::builder()
+        .max_size(1)
+        .build(mgr)
+        .await
+        .expect("owner pool");
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: owner_pool,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let err = serve(cfg)
+        .await
+        .expect_err("serve must refuse a reader that owns _cfs_manifests");
+    assert!(
+        matches!(err, PreflightError::ReaderOwnsTable { ref table } if table == "_cfs_manifests"),
+        "expected ReaderOwnsTable(_cfs_manifests), got {err}"
+    );
+}
+
+/// Proves: serve accepts a correctly configured reader role.
+///
+/// The standard `connetto_file_server` role is non-privileged and subject to
+/// row level security, so the check must not refuse it.
+#[tokio::test]
+async fn serve_accepts_correctly_configured_reader_role() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.reader_pool().await,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let _router = serve(cfg)
+        .await
+        .expect("serve must accept the standard non-privileged reader role");
+}
+
+/// Pins that each refusal test reaches its own branch, since `cfs_bypassrls_test` is not a superuser and `cfs_owner_test` holds neither privilege.
+#[tokio::test]
+async fn reader_refusal_test_roles_have_distinct_attributes() {
+    #[derive(diesel::QueryableByName)]
+    struct RoleRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        rolname: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        rolsuper: bool,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        rolbypassrls: bool,
+    }
+
+    let pg = Pg::start().await;
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+
+    diesel::sql_query(
+        "DO $$ BEGIN CREATE ROLE cfs_bypassrls_test LOGIN PASSWORD 'test' \
+         NOSUPERUSER BYPASSRLS NOINHERIT; \
+         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .expect("create bypassrls role");
+
+    diesel::sql_query(
+        "DO $$ BEGIN CREATE ROLE cfs_owner_test LOGIN PASSWORD 'test' \
+         NOSUPERUSER NOINHERIT; \
+         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .expect("create owner role");
+
+    let rows: Vec<RoleRow> = diesel::sql_query(
+        "SELECT rolname::text, rolsuper, rolbypassrls \
+         FROM pg_catalog.pg_roles \
+         WHERE rolname IN ('cfs_bypassrls_test', 'cfs_owner_test') \
+         ORDER BY rolname",
+    )
+    .load(&mut admin_conn)
+    .await
+    .expect("query roles");
+
+    assert_eq!(rows.len(), 2, "both test roles must exist");
+    let bypassrls_row = rows
+        .iter()
+        .find(|r| r.rolname == "cfs_bypassrls_test")
+        .unwrap();
+    assert!(
+        !bypassrls_row.rolsuper,
+        "cfs_bypassrls_test must not be a superuser"
+    );
+    assert!(
+        bypassrls_row.rolbypassrls,
+        "cfs_bypassrls_test must have BYPASSRLS"
+    );
+    let owner_row = rows.iter().find(|r| r.rolname == "cfs_owner_test").unwrap();
+    assert!(
+        !owner_row.rolsuper,
+        "cfs_owner_test must not be a superuser"
+    );
+    assert!(
+        !owner_row.rolbypassrls,
+        "cfs_owner_test must not have BYPASSRLS"
+    );
+}

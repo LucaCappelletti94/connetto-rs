@@ -14,7 +14,7 @@ pub mod ticket;
 mod upload;
 
 pub use error::ServerError;
-pub use preflight::{PreflightError, preflight};
+pub use preflight::{PreflightError, preflight, preflight_reader};
 pub use router::{AppPools, Config, DbPool, serve};
 pub use schema::{ConnettoFileSchema, DefaultFileSchema};
 pub use store::{AnyStore, CustomStore, FsStore, ObjectStoreBackend, StoreError};

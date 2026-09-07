@@ -3101,3 +3101,56 @@ async fn refused_intent_leaves_no_registry_rows() {
         "refused (AlreadyPresent) intent must not leave orphan registry rows"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding: ticket ceiling above i64::MAX must not produce HTTP 500
+// ---------------------------------------------------------------------------
+
+/// Proves: a PUT carrying a ticket with ceiling = `u64::MAX` is accepted as 204.
+///
+/// Before the fix the database layer's `i64::try_from(u64::MAX)` fails and the
+/// handler propagates a `DeserializationError` as HTTP 500. The ceiling is
+/// clamped to `i64::MAX` at the handler so any physically unreachable ceiling
+/// preserves the ticket intent without reaching the conversion.
+#[tokio::test]
+async fn put_chunk_with_u64_max_ceiling_succeeds() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"hello ceiling";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let chunks: Vec<ChunkMeta> = manifest.chunks().to_vec();
+
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    drop(admin_conn);
+
+    let ticket = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: connetto_file_server::ticket::Verb::Write,
+            ceiling: u64::MAX,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+
+    let chunk = &chunks[0];
+    let hash_hex = format!("{}", chunk.hash);
+    let chunk_data = mem.read_chunk(&chunk.hash).await.unwrap();
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/chunks/{hash_hex}?t={ticket}"))
+        .header("content-type", "application/octet-stream")
+        .body(axum::body::Body::from(chunk_data))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "PUT with u64::MAX ceiling must succeed (204), not 500"
+    );
+}

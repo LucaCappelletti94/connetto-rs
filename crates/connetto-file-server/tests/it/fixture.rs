@@ -197,6 +197,13 @@ impl Pg {
     pub async fn reader_pool(&self) -> Pool<AsyncPgConnection> {
         make_pool(&self.url_reader).await
     }
+
+    /// Builds a connection URL for `user`/`password` on this container's host and port.
+    pub fn url_for(&self, user: &str, password: &str) -> String {
+        let at = self.url_admin.find('@').expect("@ in url_admin");
+        let suffix = &self.url_admin[at + 1..];
+        format!("postgresql://{user}:{password}@{suffix}")
+    }
 }
 
 pub async fn connect_admin(url: &str) -> AsyncPgConnection {
@@ -431,6 +438,55 @@ impl CustomStore for GatedReadStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
         Box::pin(async move { self.inner.delete(hash).await })
     }
+}
+
+struct ShortReadStore {
+    inner: AnyStore,
+    truncate_to: usize,
+}
+
+impl CustomStore for ShortReadStore {
+    fn write<'a>(
+        &'a self,
+        hash: &'a ChunkHash,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move { self.inner.write(hash, data).await })
+    }
+
+    fn read<'a>(
+        &'a self,
+        hash: &'a ChunkHash,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes, StoreError>> + Send + 'a>> {
+        let truncate_to = self.truncate_to;
+        Box::pin(async move {
+            let data = self.inner.read(hash).await?;
+            Ok(data.slice(0..data.len().min(truncate_to)))
+        })
+    }
+
+    fn exists<'a>(
+        &'a self,
+        hash: &'a ChunkHash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
+        Box::pin(async move { self.inner.exists(hash).await })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hash: &'a ChunkHash,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move { self.inner.delete(hash).await })
+    }
+}
+
+/// Returns an `AnyStore` whose reads return at most `truncate_to` bytes,
+/// simulating a truncated object or a third-party backend under-delivering.
+pub fn short_read_store(inner: FsStore, truncate_to: usize) -> AnyStore {
+    AnyStore::Custom(Box::new(ShortReadStore {
+        inner: AnyStore::Fs(inner),
+        truncate_to,
+    }))
 }
 
 // ---------------------------------------------------------------------------

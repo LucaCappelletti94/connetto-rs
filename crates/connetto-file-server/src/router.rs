@@ -79,6 +79,14 @@ pub async fn serve<S: ConnettoFileSchema>(config: Config<S>) -> Result<Router, P
         .map_err(|e| PreflightError::Pool(e.to_string()))?;
     preflight::preflight::<S>(&mut conn).await?;
     drop(conn);
+    let mut reader_conn = config
+        .pools
+        .reader
+        .get()
+        .await
+        .map_err(|e| PreflightError::Pool(e.to_string()))?;
+    preflight::preflight_reader::<S>(&mut reader_conn).await?;
+    drop(reader_conn);
     Ok(router(config))
 }
 

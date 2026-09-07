@@ -531,3 +531,137 @@ async fn content_length_present_on_empty_file_response() {
         "Accept-Ranges must be 'bytes' on empty file response"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding 1: suffix byte ranges
+// ---------------------------------------------------------------------------
+
+/// A suffix range bytes=-N delivers the last N bytes with 206.
+#[tokio::test]
+async fn suffix_byte_range_serves_206() {
+    use crate::fixture::{Pg, build_router, connect_admin, fs_store, insert_committed_manifest};
+    use connetto_file_core::{ChunkStore, MemStore, MimeClass, process_file};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"0123456789abcdef";
+    let mem = MemStore::new();
+    let manifest = process_file(data.as_ref(), MimeClass::Generic, &mem)
+        .await
+        .unwrap();
+    let file_id = manifest.file_id();
+    let total: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+
+    let fs = FsStore::new(dir.path()).unwrap();
+    for c in manifest.chunks() {
+        let bytes = mem.read_chunk(&c.hash).await.unwrap();
+        fs.write_chunk(&c.hash, &bytes).await.unwrap();
+    }
+    let mut conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: total,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    // Request the last 4 bytes via suffix range.
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .header("range", "bytes=-4")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "suffix range must answer 206"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 16).await.unwrap();
+    assert_eq!(
+        &body[..],
+        &data[data.len() - 4..],
+        "suffix range must deliver the last 4 bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 2: short store read
+// ---------------------------------------------------------------------------
+
+/// A store that under-delivers terminates the stream with an error, not a panic.
+#[tokio::test]
+async fn short_store_read_terminates_stream_with_error() {
+    use crate::fixture::{
+        Pg, connect_admin, insert_committed_manifest, make_signer, short_read_store,
+    };
+    use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
+    use connetto_file_server::{AppPools, Config, DefaultFileSchema, FsStore, serve};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let chunk_data = vec![0xCCu8; 64];
+    let hash = ChunkHash::from_bytes(*blake3::hash(&chunk_data).as_bytes());
+
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        fs.write_chunk(&hash, &chunk_data).await.unwrap();
+    }
+
+    // Store returns only 32 bytes but the manifest declares 64.
+    let store = short_read_store(FsStore::new(dir.path()).unwrap(), 32);
+
+    let (signer, verifier) = make_signer();
+    let app = serve::<DefaultFileSchema>(Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.reader_pool().await,
+        },
+        store,
+        verifier,
+        content_state_fn: "connetto_set_content_state".into(),
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    })
+    .await
+    .expect("preflight passed");
+
+    let file_id = FileId::from_bytes([0xEEu8; 32]);
+    let chunks = vec![ChunkMeta { hash, len: 64 }];
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    drop(admin_conn);
+
+    let token = signer
+        .mint(&connetto_file_server::ticket::TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 64,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{}?t={token}", hex(file_id.as_bytes())))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "status is decided before store reads"
+    );
+    // Body collection must fail, not panic: the stream returns a store error.
+    let result = axum::body::to_bytes(resp.into_body(), 128).await;
+    assert!(result.is_err(), "body must fail on short store read");
+}

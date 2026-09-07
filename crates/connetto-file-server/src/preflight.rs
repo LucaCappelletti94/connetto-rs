@@ -66,10 +66,26 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Subset of `pg_catalog.pg_class` the table-existence check reads.
+    /// Subset of `pg_catalog.pg_class` the table-existence and ownership checks read.
     pg_catalog.pg_class (oid) {
         /// Relation OID.
         oid -> diesel::sql_types::Oid,
+        /// OID of the role that owns this relation.
+        relowner -> diesel::sql_types::Oid,
+    }
+}
+
+diesel::table! {
+    /// Subset of `pg_catalog.pg_roles` the reader-role privilege check reads.
+    pg_catalog.pg_roles (oid) {
+        /// Role OID.
+        oid -> diesel::sql_types::Oid,
+        /// Role name.
+        rolname -> diesel::sql_types::Text,
+        /// Whether the role is a superuser.
+        rolsuper -> diesel::sql_types::Bool,
+        /// Whether the role bypasses row level security.
+        rolbypassrls -> diesel::sql_types::Bool,
     }
 }
 
@@ -162,6 +178,27 @@ pub enum PreflightError {
         /// SQL function name.
         function: &'static str,
     },
+    /// The reader pool connects as a superuser.
+    ///
+    /// Postgres bypasses row level security for superusers silently, so a
+    /// superuser reader makes every RLS-gated visibility check meaningless.
+    #[error("reader role is a superuser and bypasses row level security")]
+    ReaderIsSuperuser,
+    /// The reader pool connects as a role with BYPASSRLS.
+    ///
+    /// Postgres bypasses row level security for roles with this attribute, so
+    /// the visibility checks this server relies on would not be enforced.
+    #[error("reader role has BYPASSRLS set and bypasses row level security")]
+    ReaderBypassesRls,
+    /// The reader pool connects as the owner of one of the file-server tables.
+    ///
+    /// Postgres bypasses row level security for the table owner, so an owner
+    /// reader makes every RLS-gated visibility check on that table meaningless.
+    #[error("reader role owns {table} and row level security is bypassed for table owners")]
+    ReaderOwnsTable {
+        /// Name of the table the reader role owns.
+        table: String,
+    },
     /// Database query error.
     #[error("database: {0}")]
     Db(#[from] diesel::result::Error),
@@ -211,6 +248,58 @@ pub async fn preflight<S: ConnettoFileSchema>(
     check_own_tables::<S>(conn).await?;
     check_visible_files_fn(conn).await?;
     check_setter_fn(conn).await?;
+    Ok(())
+}
+
+/// Checks that the reader connection's role is subject to row level security.
+///
+/// Refuses if the role is a superuser, has `BYPASSRLS`, or owns any of the
+/// file-server tables.  Postgres bypasses row level security for all three
+/// conditions silently, so a reader pool wired to a privileged role makes the
+/// visibility checks this server relies on meaningless.
+pub async fn preflight_reader<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+) -> Result<(), PreflightError> {
+    check_reader_role::<S>(conn).await
+}
+
+/// Checks `rolsuper`, `rolbypassrls`, and table ownership for the current role.
+async fn check_reader_role<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+) -> Result<(), PreflightError> {
+    // `current_user` is a SQL keyword expression; there is no typed-DSL form for it.
+    let current_user_expr = diesel::dsl::sql::<diesel::sql_types::Text>("current_user");
+    let rows: Vec<(bool, bool, u32)> = pg_roles::table
+        .filter(pg_roles::rolname.eq(current_user_expr))
+        .select((pg_roles::rolsuper, pg_roles::rolbypassrls, pg_roles::oid))
+        .load(conn)
+        .await?;
+    if let Some(&(rolsuper, rolbypassrls, current_oid)) = rows.as_slice().first() {
+        if rolsuper {
+            return Err(PreflightError::ReaderIsSuperuser);
+        }
+        if rolbypassrls {
+            return Err(PreflightError::ReaderBypassesRls);
+        }
+        for table in [
+            S::MANIFESTS_SQL,
+            S::MANIFEST_CHUNKS_SQL,
+            S::CHUNK_REGISTRY_SQL,
+        ] {
+            let owns: bool = diesel::select(diesel::dsl::exists(
+                pg_class::table
+                    .filter(pg_class::oid.nullable().eq(to_regclass(table)))
+                    .filter(pg_class::relowner.eq(current_oid)),
+            ))
+            .get_result(conn)
+            .await?;
+            if owns {
+                return Err(PreflightError::ReaderOwnsTable {
+                    table: table.to_owned(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 

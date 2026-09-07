@@ -176,13 +176,19 @@ fn serving_stream<S: ConnettoFileSchema>(
                 Err(e) => return Some((Err(StreamError::Store(e)), s)),
             };
 
+            // Defence against a truncated object or a third-party backend under-delivering.
+            let fetched = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if fetched != chunk.len {
+                let e = std::io::Error::other("store returned wrong byte count for chunk");
+                return Some((Err(StreamError::Store(crate::store::StoreError::Io(e))), s));
+            }
+
             // Compute the slice within this chunk that falls inside [lo, hi].
             let slice_lo = s.lo.saturating_sub(chunk_start);
             // hi >= chunk_start is guaranteed by the loop above.
             let slice_hi = (s.hi - chunk_start).min(chunk.len - 1);
 
-            // slice_lo and slice_hi are bounded by chunk.len, which fits usize
-            // on all 64-bit targets; both are also < data.len() by construction.
+            // slice_lo and slice_hi are bounded by chunk.len which equals data.len().
             let lo_usize = usize::try_from(slice_lo).unwrap_or(0);
             let hi_usize = usize::try_from(slice_hi).unwrap_or(data.len().saturating_sub(1));
 
@@ -206,6 +212,17 @@ fn parse_range(
     let s = val.to_str().unwrap_or("");
     let s = s.strip_prefix("bytes=").unwrap_or("");
     let (lo_s, hi_s) = s.split_once('-').ok_or(ServerError::RangeNotSatisfiable)?;
+    if lo_s.trim().is_empty() {
+        // Suffix range bytes=-N: the last N bytes of the representation.
+        let n: u64 = hi_s
+            .trim()
+            .parse()
+            .map_err(|_| ServerError::RangeNotSatisfiable)?;
+        if total == 0 || n == 0 {
+            return Err(ServerError::RangeNotSatisfiable);
+        }
+        return Ok(Some((total.saturating_sub(n), total - 1)));
+    }
     let lo: u64 = lo_s
         .trim()
         .parse()
