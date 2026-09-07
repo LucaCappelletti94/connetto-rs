@@ -328,7 +328,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sqlite-diff-rs 0.11.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlparser",
  "subql",
@@ -370,7 +370,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sqlite-diff-rs 0.11.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "thiserror",
@@ -2054,17 +2054,6 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f707a9b4d539874cf40e623ba7638339d20d6b89b0188cf4aecd8d55e7edb257"
-dependencies = [
- "hashbrown 0.17.1",
- "indexmap",
- "thiserror",
-]
-
-[[package]]
-name = "sqlite-diff-rs"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d40ee145c9c72b4140851c9bb19474f38f4ad163e12e344a4868c5088fc10093"
@@ -2108,7 +2097,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#eb6142261b4ecfab9d1c5da03e4fc9615e3aab13"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#16cd393479caba03ed8752dc0c3dd0f394394d74"
 dependencies = [
  "log",
  "recursive",
@@ -2129,7 +2118,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#eb6142261b4ecfab9d1c5da03e4fc9615e3aab13"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#16cd393479caba03ed8752dc0c3dd0f394394d74"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2170,7 +2159,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#dc0d0ae4ad805c1425cb8955b06c10e4b9db17ae"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#0f7a589a1255fe9d97bd109c6a67e9530f1fc75c"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -2193,7 +2182,7 @@ dependencies = [
  "slab",
  "sql-scalar-text",
  "sql-traits",
- "sqlite-diff-rs 0.12.0",
+ "sqlite-diff-rs",
  "sqlparser",
  "sqlparser-canonicalize",
  "thiserror",

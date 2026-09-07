@@ -526,7 +526,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#61f2c5e5ac4d909a019b7d9fd0371dbcf7d0f446"
+source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#e5a5ce7f34dc7a41fd6350e32f19c7ea3593f43b"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#16cd393479caba03ed8752dc0c3dd0f394394d74"
 dependencies = [
  "log",
  "recursive",
@@ -1725,7 +1725,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#dc0d0ae4ad805c1425cb8955b06c10e4b9db17ae"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#0f7a589a1255fe9d97bd109c6a67e9530f1fc75c"
 dependencies = [
  "arc-swap",
  "async-lock",
