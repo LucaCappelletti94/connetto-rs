@@ -38,10 +38,6 @@ pub enum ServerError {
     #[error("registry conflict: hash is being deleted")]
     RegistryConflict,
 
-    /// A second intent for the same file id declares a different manifest.
-    #[error("manifest conflict: re-declaration does not match stored manifest")]
-    ManifestConflict,
-
     /// Intent declares more chunks than the ceiling permits.
     #[error("too many chunks declared")]
     TooManyChunks,
@@ -89,7 +85,7 @@ impl IntoResponse for ServerError {
                 StatusCode::PAYLOAD_TOO_LARGE
             }
             Self::HashMismatch => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::CommitRefused | Self::ManifestConflict => StatusCode::CONFLICT,
+            Self::CommitRefused => StatusCode::CONFLICT,
             // 503: transient condition; the client should retry after a delay.
             Self::RegistryConflict => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadParam(_) => StatusCode::BAD_REQUEST,

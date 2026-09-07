@@ -33,6 +33,13 @@ use crate::{db, error::ServerError, ticket::Verb, upload::parse_file_id};
 ///
 /// Per-request ceiling: `ticket.ceiling` must be at least as large as the
 /// bytes this specific response will serve.
+///
+/// Manifest selection: only the committed manifest row for `(file_id,
+/// ticket.caller)` is loaded.  Every committed manifest for the same file id
+/// carries identical content (BLAKE3 identity is verified at commit), so the
+/// caller's own row yields the correct bytes.  The admin connection bypasses
+/// RLS, but the `uploaded_by` filter is applied explicitly, so no cross-caller
+/// manifest is ever reachable.
 pub(crate) async fn get_file<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -45,7 +52,7 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
         return Err(ServerError::NotFound);
     }
     let mut admin_conn = state.pools.admin.get().await?;
-    let manifest = db::load_committed_manifest::<S>(&mut admin_conn, &file_id)
+    let manifest = db::load_committed_manifest::<S>(&mut admin_conn, &file_id, &ticket.caller)
         .await?
         .ok_or(ServerError::NotFound)?;
     let etag = etag_value(&file_id);
@@ -174,9 +181,8 @@ fn serving_stream<S: ConnettoFileSchema>(
             // hi >= chunk_start is guaranteed by the loop above.
             let slice_hi = (s.hi - chunk_start).min(chunk.len - 1);
 
-            // Casts: slice_lo and slice_hi are bounded by chunk.len which is a
-            // u64 that fits usize on all supported 64-bit targets; both values
-            // are also < data.len() by construction.
+            // slice_lo and slice_hi are bounded by chunk.len, which fits usize
+            // on all 64-bit targets; both are also < data.len() by construction.
             let lo_usize = usize::try_from(slice_lo).unwrap_or(0);
             let hi_usize = usize::try_from(slice_hi).unwrap_or(data.len().saturating_sub(1));
 

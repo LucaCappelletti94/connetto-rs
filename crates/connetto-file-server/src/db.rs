@@ -19,7 +19,7 @@ use crate::schema::ConnettoFileSchema;
 // Public outcome types
 // ---------------------------------------------------------------------------
 
-/// Outcome of [`try_account_chunk_put`].
+/// Outcome of [`account_chunk_put`].
 pub(crate) enum ChunkPutResult {
     /// Chunk newly accounted for; stored flag set, tally incremented, registry advanced to `stored`.
     Accepted,
@@ -33,10 +33,12 @@ pub(crate) enum ChunkPutResult {
 pub(crate) enum InsertManifestOutcome {
     /// New manifest declared; chunk rows inserted.
     Inserted,
-    /// Manifest already exists and the re-declaration matches it exactly.
+    /// Manifest already exists for this (`file_id`, `caller`) pair.
+    ///
+    /// A re-declaration from the same caller always collapses onto this variant
+    /// whether or not the chunks match.  The transaction is rolled back so no
+    /// orphan registry rows are committed for the incoming chunks.
     AlreadyPresent,
-    /// Manifest already exists but the re-declaration differs from it.
-    ManifestConflict,
     /// A declared chunk hash is in `deleting` state; the intent must be retried.
     RegistryConflict,
 }
@@ -55,7 +57,7 @@ pub(crate) enum ManifestState {
     /// The manifest exists and has been committed; no further action needed.
     Committed,
     /// The manifest exists but has not yet been committed.
-    Uncommitted(Manifest, String),
+    Uncommitted(Manifest),
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,22 @@ enum CommitTxError {
     Setter(diesel::result::Error),
 }
 
+/// Internal signal for rolling back an intent transaction while returning a
+/// non-error outcome.  Every non-Inserted path rolls back so no orphan registry
+/// rows are committed for a declined declaration.
+#[derive(Debug)]
+enum IntentTxErr {
+    Db(diesel::result::Error),
+    AlreadyPresent,
+    RegistryConflict,
+}
+
+impl From<diesel::result::Error> for IntentTxErr {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Intent operations
 // ---------------------------------------------------------------------------
@@ -77,9 +95,12 @@ enum CommitTxError {
 /// Inserts registry rows, locks them, then inserts the manifest and chunk references atomically.
 ///
 /// Returns [`InsertManifestOutcome::RegistryConflict`] when a hash is in `deleting` state,
-/// [`InsertManifestOutcome::ManifestConflict`] when the file id already has a different manifest,
-/// [`InsertManifestOutcome::AlreadyPresent`] when the re-declaration matches exactly, and
+/// [`InsertManifestOutcome::AlreadyPresent`] when the (`file_id`, `caller`) pair already has a
+/// manifest regardless of whether the re-declaration matches, and
 /// [`InsertManifestOutcome::Inserted`] on success.
+///
+/// Every non-Inserted path rolls back the transaction so no orphan registry rows
+/// are left over for a declined declaration.
 ///
 /// Registry and chunk inserts are batched into one SQL statement each so intent for
 /// a large manifest does not issue O(n) sequential round trips.
@@ -95,7 +116,7 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     let chunks_owned: Vec<ChunkMeta> = chunks.to_vec();
     let now = Utc::now();
 
-    conn.transaction::<InsertManifestOutcome, diesel::result::Error, _>(move |c| {
+    conn.transaction::<InsertManifestOutcome, IntentTxErr, _>(move |c| {
         async move {
             // Collect unique hashes in sorted order for deterministic locking.
             let mut unique_hashes: Vec<Vec<u8>> = chunks_owned
@@ -118,29 +139,24 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
             let locked: Vec<(Vec<u8>, String)> =
                 S::lock_registry_rows_stmt(unique_hashes).load(c).await?;
             if locked.iter().any(|(_, state)| state == "deleting") {
-                return Err(diesel::result::Error::RollbackTransaction);
+                // Roll back: no registry rows should be committed for a refused declaration.
+                return Err(IntentTxErr::RegistryConflict);
             }
 
-            // Try to insert the manifest header.
+            // Try to insert the manifest header keyed by (file_id, caller).
             let inserted = c
                 .execute_returning_count(S::insert_manifest_stmt(
                     file_id_bytes.clone(),
                     total_len,
-                    caller_owned,
+                    caller_owned.clone(),
                     now,
                 ))
                 .await?;
 
             if inserted == 0 {
-                // Manifest already exists; compare with stored chunk rows.
-                let existing = load_chunk_rows::<S>(c, file_id_bytes).await?;
-                return Ok(
-                    if declared_matches_stored(&chunks_owned, existing.chunks()) {
-                        InsertManifestOutcome::AlreadyPresent
-                    } else {
-                        InsertManifestOutcome::ManifestConflict
-                    },
-                );
+                // (file_id, caller) already has a manifest.  Roll back registry
+                // inserts for the incoming chunks so no orphan rows are left over.
+                return Err(IntentTxErr::AlreadyPresent);
             }
 
             // Batch-insert chunk rows (one SQL statement, not one per chunk).
@@ -150,20 +166,24 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
                     .enumerate()
                     .map(|(i, ch)| {
                         let pos = i32::try_from(i).map_err(|_| {
-                            diesel::result::Error::DeserializationError(
+                            IntentTxErr::Db(diesel::result::Error::DeserializationError(
                                 "chunk count overflows i32".into(),
-                            )
+                            ))
                         })?;
                         let len = i64::try_from(ch.len).map_err(|_| {
-                            diesel::result::Error::DeserializationError(
+                            IntentTxErr::Db(diesel::result::Error::DeserializationError(
                                 "chunk len overflows i64".into(),
-                            )
+                            ))
                         })?;
                         Ok((pos, ch.hash.as_bytes().to_vec(), len))
                     })
-                    .collect::<Result<Vec<_>, diesel::result::Error>>()?;
-                c.execute_returning_count(S::insert_chunk_rows_batch_stmt(file_id_bytes, rows))
-                    .await?;
+                    .collect::<Result<Vec<_>, IntentTxErr>>()?;
+                c.execute_returning_count(S::insert_chunk_rows_batch_stmt(
+                    file_id_bytes,
+                    caller_owned,
+                    rows,
+                ))
+                .await?;
             }
 
             Ok(InsertManifestOutcome::Inserted)
@@ -172,8 +192,9 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     })
     .await
     .or_else(|e| match e {
-        diesel::result::Error::RollbackTransaction => Ok(InsertManifestOutcome::RegistryConflict),
-        other => Err(other),
+        IntentTxErr::AlreadyPresent => Ok(InsertManifestOutcome::AlreadyPresent),
+        IntentTxErr::RegistryConflict => Ok(InsertManifestOutcome::RegistryConflict),
+        IntentTxErr::Db(e) => Err(e),
     })
 }
 
@@ -181,14 +202,18 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
 // Load helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the manifest for `file_id` only if it is committed.
+/// Returns the manifest for `(file_id, caller)` only if it is committed.
+///
+/// Scoped to the caller's own row: the admin role bypasses RLS but we apply
+/// the `uploaded_by` filter explicitly so no cross-caller row is ever returned.
 pub(crate) async fn load_committed_manifest<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
 ) -> Result<Option<Manifest>, diesel::result::Error> {
     let filtered = FilterDsl::filter(
         S::ManifestsQuery::default(),
-        S::manifest_pk_eq(file_id.as_bytes().to_vec()),
+        S::manifest_pk_eq(file_id.as_bytes().to_vec(), caller.to_owned()),
     );
     let query = SelectDsl::select(
         filtered,
@@ -196,40 +221,48 @@ pub(crate) async fn load_committed_manifest<S: ConnettoFileSchema>(
     );
     let mut rows: Vec<(Vec<u8>, bool)> = LimitDsl::limit(query, 1).load(conn).await?;
     match rows.pop() {
-        Some((fid, true)) => load_chunk_rows::<S>(conn, fid).await.map(Some),
+        Some((fid, true)) => load_chunk_rows::<S>(conn, fid, caller.to_owned())
+            .await
+            .map(Some),
         _ => Ok(None),
     }
 }
 
-/// Locks and returns the manifest for `file_id` in any state.
+/// Locks and returns the manifest for `(file_id, caller)` in any state.
+///
+/// The caller is passed through so the FOR UPDATE lock is scoped to the
+/// specific (`file_id`, `uploaded_by`) row; a different caller's uncommitted
+/// manifest is invisible here.
 pub(crate) async fn load_manifest_locked<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
 ) -> Result<Option<ManifestState>, diesel::result::Error> {
-    let mut rows: Vec<(Vec<u8>, bool, String)> =
-        S::lock_manifest_row_stmt(file_id.as_bytes().to_vec())
-            .load(conn)
-            .await?;
-    let Some((file_id, committed, uploaded_by)) = rows.pop() else {
+    let file_id_bytes = file_id.as_bytes().to_vec();
+    let mut rows: Vec<bool> = S::lock_manifest_row_stmt(file_id_bytes.clone(), caller.to_owned())
+        .load(conn)
+        .await?;
+    let Some(committed) = rows.pop() else {
         return Ok(None);
     };
     if committed {
         return Ok(Some(ManifestState::Committed));
     }
-    let manifest = load_chunk_rows::<S>(conn, file_id).await?;
-    Ok(Some(ManifestState::Uncommitted(manifest, uploaded_by)))
+    let manifest = load_chunk_rows::<S>(conn, file_id_bytes, caller.to_owned()).await?;
+    Ok(Some(ManifestState::Uncommitted(manifest)))
 }
 
-/// Returns the declared chunk length for `chunk_hash` in this upload, or
+/// Returns the declared chunk length for `chunk_hash` in this caller's manifest, or
 /// `None` if the hash is not in the manifest.
 pub(crate) async fn declared_chunk_len<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
     chunk_hash: &ChunkHash,
 ) -> Result<Option<u64>, diesel::result::Error> {
     let filtered1 = FilterDsl::filter(
         S::ManifestChunksQuery::default(),
-        S::mc_file_id_eq(file_id.as_bytes().to_vec()),
+        S::mc_pk_eq(file_id.as_bytes().to_vec(), caller.to_owned()),
     );
     let filtered2 = FilterDsl::filter(
         filtered1,
@@ -254,11 +287,13 @@ pub(crate) async fn declared_chunk_len<S: ConnettoFileSchema>(
 pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
     chunk_hash: &ChunkHash,
     chunk_len: u64,
     ceiling: u64,
 ) -> Result<ChunkPutResult, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
+    let caller_owned = caller.to_owned();
     let hash_bytes = chunk_hash.as_bytes().to_vec();
     let chunk_len_i64 = i64::try_from(chunk_len).map_err(|_| {
         diesel::result::Error::DeserializationError("chunk_len overflows i64".into())
@@ -267,13 +302,17 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
         .map_err(|_| diesel::result::Error::DeserializationError("ceiling overflows i64".into()))?;
     let allowed = ceiling_i64.checked_sub(chunk_len_i64).unwrap_or(-1);
 
-    let mark_stored =
-        S::mark_chunk_stored_stmt(file_id_bytes.clone(), hash_bytes.clone(), chunk_len_i64);
+    let mark_stored = S::mark_chunk_stored_stmt(
+        file_id_bytes.clone(),
+        caller_owned.clone(),
+        hash_bytes.clone(),
+        chunk_len_i64,
+    );
     if conn.execute_returning_count(mark_stored).await? == 0 {
         return Ok(ChunkPutResult::AlreadyStored);
     }
 
-    let tally = S::tally_bytes_stmt(file_id_bytes, chunk_len_i64, allowed);
+    let tally = S::tally_bytes_stmt(file_id_bytes, caller_owned, chunk_len_i64, allowed);
     if conn.execute_returning_count(tally).await? == 0 {
         return Ok(ChunkPutResult::WouldExceedCeiling);
     }
@@ -287,7 +326,7 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
 // Commit operations
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when every chunk for `file_id` is either stored through this
+/// Returns `true` when every chunk for `(file_id, caller)` is either stored through this
 /// manifest OR is present in a committed manifest visible to `caller`.
 ///
 /// Runs on the reader connection so the deployment's row-level security applies
@@ -305,10 +344,12 @@ pub(crate) async fn all_chunks_satisfied<S: ConnettoFileSchema>(
     reader_conn
         .transaction::<bool, diesel::result::Error, _>(|conn| {
             async move {
-                // Step 1: collect hashes of chunk rows with stored = FALSE.
-                let unstored: Vec<Vec<u8>> = S::all_unstored_chunk_hashes_stmt(file_id_bytes)
-                    .load(conn)
-                    .await?;
+                // Step 1: collect hashes of chunk rows with stored = FALSE for
+                // this specific (file_id, caller) manifest.
+                let unstored: Vec<Vec<u8>> =
+                    S::all_unstored_chunk_hashes_stmt(file_id_bytes, caller.clone())
+                        .load(conn)
+                        .await?;
                 if unstored.is_empty() {
                     return Ok(true);
                 }
@@ -374,11 +415,11 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
 ) -> Result<CommitOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
-    // Pre-build the commit statement; the setter argument is a separate
-    // owned copy since both are consumed inside the transaction body.
-    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone());
+    let caller_owned = caller.to_owned();
+    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), caller_owned.clone());
     let setter_arg = file_id_bytes;
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(move |c| {
@@ -394,6 +435,7 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
             diesel::select(crate::functions::connetto_set_content_state(
                 setter_arg.as_slice(),
                 "available",
+                caller_owned.as_str(),
             ))
             .get_result::<Option<Vec<u8>>>(c)
             .await
@@ -414,6 +456,15 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
 // ---------------------------------------------------------------------------
 
 /// Locks the sweep set, deletes stale manifests, then marks still-unreferenced hashes.
+///
+/// Bounded lock set argument: registry rows are locked in `chunk_hash` ASC order,
+/// the same order upload transactions use, preventing deadlocks.  With the
+/// composite FK the liveness subquery joins manifests by (`file_id`, `uploaded_by`)
+/// so an uncommitted manifest from one caller does not keep a hash live when a
+/// different caller's manifest is the only surviving reference.  Deletion order
+/// is preserved: orphaned manifests (and their `manifest_chunks` via CASCADE) are
+/// deleted inside the same transaction that holds the registry locks, so
+/// `mark_unreferenced_deleting` sees the post-CASCADE reference count.
 pub(crate) async fn prepare_sweep<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     cutoff: DateTime<Utc>,
@@ -462,16 +513,17 @@ pub(crate) async fn delete_registry_row<S: ConnettoFileSchema>(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Loads chunk rows for `file_id_bytes` ordered by position, then builds a
+/// Loads chunk rows for `(file_id_bytes, caller)` ordered by position, then builds a
 /// [`Manifest`].
 async fn load_chunk_rows<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id_bytes: Vec<u8>,
+    caller: String,
 ) -> Result<Manifest, diesel::result::Error> {
     use diesel::query_dsl::methods::OrderDsl;
     let filtered = FilterDsl::filter(
         S::ManifestChunksQuery::default(),
-        S::mc_file_id_eq(file_id_bytes.clone()),
+        S::mc_pk_eq(file_id_bytes.clone(), caller),
     );
     let ordered = OrderDsl::order(filtered, S::MCColPosition::default());
     let query = SelectDsl::select(
@@ -506,15 +558,4 @@ fn manifest_from_rows(
         })
         .collect();
     Ok(Manifest::new(file_id, metas?))
-}
-
-/// Returns `true` when the declared chunks match the stored manifest exactly.
-///
-/// Checks count, hash, and length at each position in order.
-fn declared_matches_stored(declared: &[ChunkMeta], stored: &[ChunkMeta]) -> bool {
-    declared.len() == stored.len()
-        && declared
-            .iter()
-            .zip(stored.iter())
-            .all(|(d, s)| d.hash == s.hash && d.len == s.len)
 }

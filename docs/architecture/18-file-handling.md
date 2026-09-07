@@ -54,7 +54,7 @@ What rides the websocket is the ticket request (file id, verb, and for the write
 
 ## The abuse surface
 
-**Decided (R24 position 7, R65).** The content channel meters bytes per identity per window in both directions, enforced against the ticket's ceiling, because R19 deliberately meters occurrences and file upload is the system's first genuinely bulk write path. Refusals answer 404 whether a file is absent or forbidden, R38's principle on HTTP. The dedup negotiation's needed-hashes answer is scoped to the caller's own visibility domain, closing the existence oracle cross-user dedup would open, while storage dedups globally and silently. Convergent encryption is rejected outright.
+**Decided (R24 position 7, R65).** The content channel's read ceiling caps one response and the write ceiling caps one upload, enforced against the ticket's ceiling, because R19 deliberately meters occurrences and file upload is the system's first genuinely bulk write path. Windowed per-identity metering in both directions is not implemented here. Refusals answer 404 whether a file is absent or forbidden, R38's principle on HTTP. The dedup negotiation's needed-hashes answer is scoped to the caller's own visibility domain, closing the existence oracle cross-user dedup would open, while storage dedups globally and silently. Convergent encryption is rejected outright.
 
 ## Phases
 

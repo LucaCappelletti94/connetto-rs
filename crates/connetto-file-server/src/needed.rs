@@ -78,6 +78,9 @@ pub(crate) async fn needed_hashes<S: ConnettoFileSchema>(
 ///
 /// Uses `sql_query` because a generic `INNER JOIN` over two laundered table
 /// types is not expressible through the trait's where clauses.
+///
+/// The JOIN uses both columns of the composite FK so only `manifest_chunks` rows
+/// belonging to committed manifests are considered.
 pub(crate) async fn committed_file_ids_for<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     declared_hashes: &[Vec<u8>],
@@ -90,7 +93,7 @@ pub(crate) async fn committed_file_ids_for<S: ConnettoFileSchema>(
     let rows: Vec<FileIdRow> = diesel::sql_query(format!(
         "SELECT DISTINCT m.file_id \
          FROM {manifests} m \
-         JOIN {chunks} mc ON mc.file_id = m.file_id \
+         JOIN {chunks} mc ON mc.file_id = m.file_id AND mc.uploaded_by = m.uploaded_by \
          WHERE m.committed = TRUE \
          AND mc.chunk_hash = ANY($1)",
         manifests = S::MANIFESTS_SQL,
@@ -107,6 +110,10 @@ pub(crate) async fn committed_file_ids_for<S: ConnettoFileSchema>(
 ///
 /// Uses `sql_query` because `eq_any` over a generic laundered column type is
 /// not covered by the trait's where clauses.
+///
+/// The JOIN uses both columns of the composite FK to restrict to committed
+/// manifests only, preventing uncommitted chunk rows from satisfying the dedup
+/// check.
 pub(crate) async fn present_chunk_hashes<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     visible_file_ids: &[Vec<u8>],
@@ -118,11 +125,14 @@ pub(crate) async fn present_chunk_hashes<S: ConnettoFileSchema>(
         chunk_hash: Vec<u8>,
     }
     let rows: Vec<HashRow> = diesel::sql_query(format!(
-        "SELECT DISTINCT chunk_hash \
-         FROM {chunks} \
-         WHERE file_id = ANY($1) \
-         AND chunk_hash = ANY($2)",
+        "SELECT DISTINCT mc.chunk_hash \
+         FROM {chunks} mc \
+         JOIN {manifests} m ON m.file_id = mc.file_id AND m.uploaded_by = mc.uploaded_by \
+         WHERE m.file_id = ANY($1) \
+         AND mc.chunk_hash = ANY($2) \
+         AND m.committed = TRUE",
         chunks = S::MANIFEST_CHUNKS_SQL,
+        manifests = S::MANIFESTS_SQL,
     ))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Bytea>, _>(visible_file_ids)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Bytea>, _>(declared_hashes)

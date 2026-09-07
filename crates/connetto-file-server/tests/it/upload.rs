@@ -453,7 +453,7 @@ async fn mid_stream_ceiling_crossing_refused() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
 
     let ticket = signer
         .mint(&TicketPayload {
@@ -537,7 +537,7 @@ async fn re_put_does_not_double_count() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
 
     // ceiling = 200 = sum(100, 100). Double-counting A would make PUT B fail.
     let ticket = signer
@@ -1097,8 +1097,10 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
     // Replace the setter with one that raises.
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     diesel::sql_query(
-        "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT)
-         RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+        "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+             p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+         ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+             SET search_path TO '' AS $$
          BEGIN RAISE EXCEPTION 'injected setter failure'; END; $$",
     )
     .execute(&mut admin_conn)
@@ -1120,8 +1122,11 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
 
     // The manifest must still be uncommitted (committed = FALSE).
     let committed: bool = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query("SELECT committed FROM _cfs_manifests WHERE file_id = $1")
-            .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref()),
+        diesel::sql_query(
+            "SELECT committed FROM _cfs_manifests \
+             WHERE file_id = $1 AND uploaded_by = 'alice'",
+        )
+        .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref()),
         &mut admin_conn,
     )
     .await
@@ -1134,10 +1139,14 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
 
     // Restore the good setter and retry — must succeed.
     diesel::sql_query(
-        "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT)
-         RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+        "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+             p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+         ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+             SET search_path TO '' AS $$
          BEGIN
-             UPDATE test_file_metadata SET uploaded_by = uploaded_by WHERE file_id = p_file_id;
+             UPDATE public.test_file_metadata
+             SET    uploaded_by = uploaded_by
+             WHERE  file_id = p_file_id;
              RETURN p_file_id;
          END; $$",
     )
@@ -1670,8 +1679,8 @@ async fn commit_by_non_declarer_refused() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::CONFLICT,
-        "a non-declarer must not be able to commit another caller's manifest"
+        StatusCode::NOT_FOUND,
+        "a non-declarer gets 404: no manifest exists for (file_id, dave) with composite PK"
     );
 }
 
@@ -2028,7 +2037,9 @@ async fn dedup_commit_rejected_for_invisible_file() {
 // Finding 2: manifest immutability
 // ---------------------------------------------------------------------------
 
-/// Proves that a second intent for the same file id with different chunks is refused.
+/// Proves that a second intent for the same (`file_id`, `caller`) pair with different chunks
+/// returns 200 (AlreadyPresent): the stored manifest is unchanged and a subsequent commit
+/// fails because the stored manifest does not match the re-declared chunks.
 #[tokio::test]
 async fn second_intent_with_different_chunks_refused() {
     let pg = Pg::start().await;
@@ -2097,8 +2108,8 @@ async fn second_intent_with_different_chunks_refused() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::CONFLICT,
-        "second intent with different chunks must be refused"
+        StatusCode::OK,
+        "second intent with different chunks returns 200 (AlreadyPresent collapses ManifestConflict)"
     );
 }
 
@@ -2576,5 +2587,517 @@ async fn dedup_commit_with_lying_chunk_length_refused() {
         resp.status(),
         StatusCode::CONFLICT,
         "commit must be refused: chunk B declared {lying_len} bytes but stored object is {stored_b_len} bytes",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 1: composite-key fix
+// ---------------------------------------------------------------------------
+
+/// Proves Finding 1: the squatter scenario.
+///
+/// Alice declares intent and uploads all chunks for content X but does not commit.
+/// With the old `file_id`-only PK alice's uncommitted row squats the content:
+/// bob's intent returns `AlreadyPresent`, his PUTs are `AlreadyStored`, and his
+/// commit is refused 409 because `uploaded_by="alice"` != `"bob"`.
+///
+/// With the composite (`file_id`, `uploaded_by`) PK bob gets his own independent
+/// row, his PUTs mark his own chunk rows stored, and his commit succeeds (200).
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn two_callers_identical_content_both_commit() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"content uploaded by two independent callers finding one";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+
+    let alice_ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let bob_ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body =
+        serde_json::to_vec(&serde_json::json!({ "total_len": data.len(), "chunks": chunks_json }))
+            .unwrap();
+
+    // Alice declares intent but will NOT commit yet.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={alice_ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(intent_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "alice intent must succeed");
+
+    // Alice PUTs all chunks.
+    for c in manifest.chunks() {
+        let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+        let hash_hex = format!("{}", c.hash);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{hash_hex}?t={alice_ticket}"))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(chunk_data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "alice PUT must succeed"
+        );
+    }
+    // Alice does NOT commit here — she squats the content.
+
+    // Bob declares intent for the same content (alice's uncommitted row squats it
+    // in the old single-key schema).
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={bob_ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(intent_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "bob intent must succeed");
+
+    // Bob PUTs all chunks (store writes are idempotent; alice already wrote the bytes).
+    for c in manifest.chunks() {
+        let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+        let hash_hex = format!("{}", c.hash);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{hash_hex}?t={bob_ticket}"))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(chunk_data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "bob PUT must succeed"
+        );
+    }
+
+    // Bob commits while alice's manifest is still uncommitted.
+    // Old code (file_id-only PK): loads alice's uncommitted manifest,
+    // uploaded_by="alice" != caller="bob" -> 409 CommitRefused.
+    // New code (composite PK): loads bob's own uncommitted manifest -> 200.
+    let bob_status = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/commit?t={bob_ticket}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        bob_status,
+        StatusCode::OK,
+        "bob must commit independently (before fix: 409 ownership mismatch)"
+    );
+
+    // Alice commits independently after bob.
+    let alice_status = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/commit?t={alice_ticket}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        alice_status,
+        StatusCode::OK,
+        "alice commit must also succeed"
+    );
+}
+
+/// Proves Finding 1 property 2: a non-declarer still cannot commit under the
+/// composite PK.  Dave holds a valid write ticket but never declared intent,
+/// so no (`file_id`, `dave`) manifest exists.  He gets 404, not 200.
+#[tokio::test]
+async fn non_declarer_cannot_commit_after_composite_key_fix() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"ownership binding test for composite key";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let alice_ticket = write_payload(&signer, &file_id, u64::try_from(data.len()).unwrap() + 256);
+
+    // Alice declares intent and PUTs all chunks.
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body = serde_json::to_vec(&serde_json::json!({
+        "total_len": u64::try_from(data.len()).unwrap(),
+        "chunks": chunks_json,
+    }))
+    .unwrap();
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={alice_ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(intent_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    for c in manifest.chunks() {
+        use connetto_file_core::ChunkStore;
+        let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={alice_ticket}", c.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(chunk_data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Dave holds a valid write ticket but never declared intent.
+    let dave_ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 256,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "dave".into(),
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/commit?t={dave_ticket}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dave has no manifest row so commit returns 404"
+    );
+}
+
+/// Proves Finding 1 property 3: GET with two committed manifests from different
+/// callers serves the right bytes to each and denies a caller without a manifest.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn get_file_scoped_to_committed_caller() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"same bytes committed by two independent callers";
+    let alice_file_id = do_upload(&app, &signer, data).await;
+    let file_hex = format!("{alice_file_id}");
+
+    // Mint alice and bob write tickets for the same file id (same BLAKE3 content).
+    let bob_write = signer
+        .mint(&TicketPayload {
+            file_id: *alice_file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+
+    // Bob also uploads (independent, same content).
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body =
+        serde_json::to_vec(&serde_json::json!({ "total_len": data.len(), "chunks": chunks_json }))
+            .unwrap();
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={bob_write}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(intent_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    for c in manifest.chunks() {
+        use connetto_file_core::ChunkStore;
+        let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/chunks/{}?t={bob_write}", c.hash))
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(chunk_data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let bob_commit = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/commit?t={bob_write}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_commit.status(),
+        StatusCode::OK,
+        "bob commit must succeed"
+    );
+
+    // Alice can GET her own committed manifest.
+    let alice_read = signer
+        .mint(&TicketPayload {
+            file_id: *alice_file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "alice".into(),
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/files/{file_hex}?t={alice_read}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "alice must serve her own manifest"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), data.len() + 64)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), data, "alice gets the right bytes");
+
+    // Bob can GET his own committed manifest.
+    let bob_read = signer
+        .mint(&TicketPayload {
+            file_id: *alice_file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "bob".into(),
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/files/{file_hex}?t={bob_read}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "bob must serve his own manifest"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), data.len() + 64)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), data, "bob gets the right bytes");
+
+    // Charlie (no manifest) cannot serve.
+    let charlie_read = signer
+        .mint(&TicketPayload {
+            file_id: *alice_file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: "charlie".into(),
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/files/{file_hex}?t={charlie_read}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "charlie has no committed manifest so GET returns 404"
+    );
+}
+
+/// Proves Finding 6: a refused intent (`AlreadyPresent`) leaves no orphan
+/// registry rows for the incoming chunks.
+#[tokio::test]
+async fn refused_intent_leaves_no_registry_rows() {
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"registry orphan test payload";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let ticket = write_payload(&signer, &file_id, u64::try_from(data.len()).unwrap() + 1024);
+
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let intent_body = serde_json::json!({ "total_len": data.len(), "chunks": chunks_json });
+
+    // First declaration: inserts the manifest.
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_body).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Count registry rows after the first declaration.
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    let count_before: i64 = {
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let rows: Vec<CountRow> =
+            diesel::sql_query("SELECT COUNT(*)::bigint AS n FROM _cfs_chunk_registry")
+                .load(&mut admin_conn)
+                .await
+                .unwrap();
+        rows.into_iter().next().unwrap().n
+    };
+
+    // Re-declare with the same (file_id, caller): AlreadyPresent, transaction rolled back.
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&intent_body).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Registry row count must be unchanged: the rollback left no new rows.
+    let count_after: i64 = {
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let rows: Vec<CountRow> =
+            diesel::sql_query("SELECT COUNT(*)::bigint AS n FROM _cfs_chunk_registry")
+                .load(&mut admin_conn)
+                .await
+                .unwrap();
+        rows.into_iter().next().unwrap().n
+    };
+    assert_eq!(
+        count_after, count_before,
+        "refused (AlreadyPresent) intent must not leave orphan registry rows"
     );
 }

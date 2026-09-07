@@ -45,24 +45,29 @@ pub const FIXTURE_STMTS: &[&str] = &[
     "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
     // Predicate-based variant: connetto_visible_files filters on current_setting directly.
     // Works even when called as a role that bypasses RLS.
+    // SET search_path TO '' pins the path to prevent privilege escalation.
     "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
-     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER AS $$
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
          SELECT ARRAY(
              SELECT f FROM UNNEST(p_file_ids) AS f
              WHERE EXISTS (
-                 SELECT 1 FROM test_file_metadata m
+                 SELECT 1 FROM public.test_file_metadata m
                  WHERE m.file_id = f
                    AND m.uploaded_by = current_setting('app.user_id', TRUE)
              )
          )
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
+    // SET search_path TO '' pins the path; p_caller carries the uploader identity.
     "CREATE OR REPLACE FUNCTION connetto_set_content_state(
          p_file_id   BYTEA,
-         p_new_state TEXT
-     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+         p_new_state TEXT,
+         p_caller    TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+         SET search_path TO '' AS $$
      BEGIN
-         UPDATE test_file_metadata
+         UPDATE public.test_file_metadata
          SET    uploaded_by = uploaded_by
          WHERE  file_id = p_file_id;
          RETURN p_file_id;
@@ -97,12 +102,14 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
     "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
     // RLS-only variant: no current_setting predicate in the function body.
     // Visibility is enforced entirely by the RLS policy on test_file_metadata.
+    // SET search_path TO '' pins the path to prevent privilege escalation.
     "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
-     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER AS $$
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
          SELECT ARRAY(
              SELECT f FROM UNNEST(p_file_ids) AS f
              WHERE EXISTS (
-                 SELECT 1 FROM test_file_metadata m
+                 SELECT 1 FROM public.test_file_metadata m
                  WHERE m.file_id = f
              )
          )
@@ -110,10 +117,12 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
     "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
     "CREATE OR REPLACE FUNCTION connetto_set_content_state(
          p_file_id   BYTEA,
-         p_new_state TEXT
-     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+         p_new_state TEXT,
+         p_caller    TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+         SET search_path TO '' AS $$
      BEGIN
-         UPDATE test_file_metadata
+         UPDATE public.test_file_metadata
          SET    uploaded_by = uploaded_by
          WHERE  file_id = p_file_id;
          RETURN p_file_id;
@@ -469,6 +478,7 @@ pub fn make_signer() -> (TicketSigner, TicketVerifier) {
 pub async fn insert_manifest_bypassing_intent(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
     chunks: &[ChunkMeta],
 ) {
     let total_len: i64 = chunks
@@ -480,11 +490,12 @@ pub async fn insert_manifest_bypassing_intent(
     diesel::sql_query(
         "INSERT INTO _cfs_manifests
              (file_id, total_len, accepted_bytes, committed, uploaded_by, created_at)
-         VALUES ($1, $2, 0, FALSE, 'test', NOW())
+         VALUES ($1, $2, 0, FALSE, $3, NOW())
          ON CONFLICT DO NOTHING",
     )
     .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
     .bind::<diesel::sql_types::BigInt, _>(total_len)
+    .bind::<diesel::sql_types::Text, _>(caller)
     .execute(conn)
     .await
     .expect("insert manifest header");
@@ -494,11 +505,12 @@ pub async fn insert_manifest_bypassing_intent(
         let chunk_len = i64::try_from(chunk.len).expect("chunk len fits i64");
         diesel::sql_query(
             "INSERT INTO _cfs_manifest_chunks
-                 (file_id, position, chunk_hash, chunk_len, stored)
-             VALUES ($1, $2, $3, $4, FALSE)
+                 (file_id, uploaded_by, position, chunk_hash, chunk_len, stored)
+             VALUES ($1, $2, $3, $4, $5, FALSE)
              ON CONFLICT DO NOTHING",
         )
         .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
+        .bind::<diesel::sql_types::Text, _>(caller)
         .bind::<diesel::sql_types::Integer, _>(position)
         .bind::<diesel::sql_types::Bytea, _>(chunk.hash.as_bytes().as_ref())
         .bind::<diesel::sql_types::BigInt, _>(chunk_len)
@@ -517,31 +529,40 @@ pub async fn insert_manifest_bypassing_intent(
     }
 }
 
-/// Inserts a committed manifest with refcounts initialized to 1.
+/// Inserts a committed manifest keyed to `caller`.
 ///
 /// Use when a test needs a file that can be served without going through the
-/// full upload flow (e.g., streaming behaviour tests).  The caller is
+/// full upload flow (e.g. streaming behaviour tests).  The caller is
 /// responsible for writing the chunk bytes to the store first.
 pub async fn insert_committed_manifest(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
+    caller: &str,
     chunks: &[ChunkMeta],
 ) {
-    insert_manifest_bypassing_intent(conn, file_id, chunks).await;
+    insert_manifest_bypassing_intent(conn, file_id, caller, chunks).await;
 
-    // Mark all chunk rows stored.
-    diesel::sql_query("UPDATE _cfs_manifest_chunks SET stored = TRUE WHERE file_id = $1")
-        .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
-        .execute(conn)
-        .await
-        .expect("mark chunks stored");
+    // Mark all chunk rows stored for this (file_id, caller) pair.
+    diesel::sql_query(
+        "UPDATE _cfs_manifest_chunks SET stored = TRUE \
+         WHERE file_id = $1 AND uploaded_by = $2",
+    )
+    .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
+    .bind::<diesel::sql_types::Text, _>(caller)
+    .execute(conn)
+    .await
+    .expect("mark chunks stored");
 
-    // Mark manifest committed.
-    diesel::sql_query("UPDATE _cfs_manifests SET committed = TRUE WHERE file_id = $1")
-        .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
-        .execute(conn)
-        .await
-        .expect("mark manifest committed");
+    // Mark manifest committed for this (file_id, caller) pair.
+    diesel::sql_query(
+        "UPDATE _cfs_manifests SET committed = TRUE \
+         WHERE file_id = $1 AND uploaded_by = $2",
+    )
+    .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref())
+    .bind::<diesel::sql_types::Text, _>(caller)
+    .execute(conn)
+    .await
+    .expect("mark manifest committed");
 
     // Upsert registry rows in `stored` state.
     // The library schema is private; sql_query is the only path from integration-test code.

@@ -32,9 +32,10 @@ diesel::define_sql_function! {
     /// Deployment contract: writes `content_state` on the deployment's metadata
     /// table after a successful commit. Runs as the function owner
     /// (SECURITY DEFINER) so no direct UPDATE grant on the application table
-    /// is required.
+    /// is required.  The `caller` argument carries the uploader identity so
+    /// the deployment can attribute the commit.
     ///
     /// Returns the `file_id` echo so the call is fully typed through diesel's DSL.
     /// The return value is always discarded by the caller.
-    fn connetto_set_content_state(file_id: Bytea, new_state: Text) -> Nullable<Bytea>;
+    fn connetto_set_content_state(file_id: Bytea, new_state: Text, caller: Text) -> Nullable<Bytea>;
 }

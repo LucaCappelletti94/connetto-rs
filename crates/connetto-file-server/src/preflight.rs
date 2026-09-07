@@ -106,8 +106,8 @@ pub enum PreflightError {
     /// `connetto_visible_files(bytea[]) RETURNS bytea[]` is absent.
     #[error("function connetto_visible_files(bytea[]) is missing")]
     MissingVisibleFiles,
-    /// `connetto_set_content_state(bytea, text)` is absent.
-    #[error("function connetto_set_content_state(bytea, text) is missing")]
+    /// `connetto_set_content_state(bytea, text, text)` is absent.
+    #[error("function connetto_set_content_state(bytea, text, text) is missing")]
     MissingSetterFunction,
     /// An index the sweep's anti-join depends on is absent.
     #[error("table {table}: no index leads with column {column}")]
@@ -151,6 +151,16 @@ pub enum PreflightError {
         function: &'static str,
         /// Required mode string (`"SECURITY INVOKER"` or `"SECURITY DEFINER"`).
         expected_mode: &'static str,
+    },
+    /// A SECURITY DEFINER or INVOKER function has no pinned `search_path`.
+    ///
+    /// A missing `SET search_path` allows privilege escalation through a
+    /// crafted search-path replacement for schema-qualified names inside the
+    /// function body.
+    #[error("function {function} must have SET search_path in proconfig")]
+    UnpinnedSearchPath {
+        /// SQL function name.
+        function: &'static str,
     },
     /// Database query error.
     #[error("database: {0}")]
@@ -389,13 +399,19 @@ async fn check_visible_files_fn(conn: &mut AsyncPgConnection) -> Result<(), Pref
     }
     check_arg_type(&row, "connetto_visible_files", 0, "bytea[]")?;
     check_return_type(&row, "connetto_visible_files", "bytea[]")?;
+    if !row.has_search_path {
+        return Err(PreflightError::UnpinnedSearchPath {
+            function: "connetto_visible_files",
+        });
+    }
     Ok(())
 }
 
 /// Checks `connetto_set_content_state`:
-/// - arguments: `bytea`, `text`
+/// - arguments: `bytea`, `text`, `text`
 /// - return: `bytea`
 /// - security: SECURITY DEFINER (prosecdef = true)
+/// - `search_path`: must be pinned in proconfig
 async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightError> {
     let row = fn_meta(conn, "connetto_set_content_state").await?;
     let Some(row) = row else {
@@ -409,15 +425,23 @@ async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightEr
     }
     check_arg_type(&row, "connetto_set_content_state", 0, "bytea")?;
     check_arg_type(&row, "connetto_set_content_state", 1, "text")?;
+    check_arg_type(&row, "connetto_set_content_state", 2, "text")?;
     check_return_type(&row, "connetto_set_content_state", "bytea")?;
+    if !row.has_search_path {
+        return Err(PreflightError::UnpinnedSearchPath {
+            function: "connetto_set_content_state",
+        });
+    }
     Ok(())
 }
 
-/// Queries `pg_proc` for the function's signature and security mode.
+/// Queries `pg_proc` for the function's signature, security mode, and
+/// whether `search_path` is pinned in `proconfig`.
 ///
 /// Stays SQL text: `proargtypes` is `oidvector`, which has no diesel
 /// `SqlType`, and every projected column is a `format_type` call on a
-/// subscript of it.
+/// subscript of it.  `proconfig` is `text[]`; the `has_search_path` column
+/// is a boolean derived from an `EXISTS(unnest(...))` expression.
 async fn fn_meta(
     conn: &mut AsyncPgConnection,
     fn_name: &str,
@@ -427,7 +451,11 @@ async fn fn_meta(
         "SELECT p.prosecdef, \
                 pg_catalog.format_type(p.prorettype, NULL) AS ret_type, \
                 pg_catalog.format_type(p.proargtypes[0], NULL) AS arg0_type, \
-                pg_catalog.format_type(p.proargtypes[1], NULL) AS arg1_type \
+                pg_catalog.format_type(p.proargtypes[1], NULL) AS arg1_type, \
+                pg_catalog.format_type(p.proargtypes[2], NULL) AS arg2_type, \
+                COALESCE((SELECT TRUE FROM unnest(p.proconfig) AS cfg \
+                          WHERE cfg LIKE 'search_path=%' LIMIT 1), FALSE) \
+                    AS has_search_path \
          FROM   pg_proc p \
          JOIN   pg_namespace n ON n.oid = p.pronamespace \
          WHERE  n.nspname = current_schema() \
@@ -449,6 +477,7 @@ fn check_arg_type(
     let actual = match pos {
         0 => row.arg0_type.as_deref(),
         1 => row.arg1_type.as_deref(),
+        2 => row.arg2_type.as_deref(),
         _ => None,
     };
     match actual {
@@ -497,4 +526,8 @@ struct FnMetaRow {
     arg0_type: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     arg1_type: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    arg2_type: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    has_search_path: bool,
 }

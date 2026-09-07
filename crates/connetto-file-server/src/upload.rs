@@ -58,9 +58,11 @@ pub(crate) struct IntentResponse {
 /// Declares the manifest for a new upload and answers which chunks are needed.
 ///
 /// Refuses when:
-/// - any declared chunk hash is in `deleting` state (509 retry later)
-/// - a re-declaration for the same file id does not match the stored manifest (409)
+/// - any declared chunk hash is in `deleting` state (503 retry later)
 /// - the chunk count exceeds the ceiling-derived cap (413)
+///
+/// A re-declaration for the same (`file_id`, `caller`) pair returns 200 with
+/// needed hashes computed from the declared chunks.
 pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -111,7 +113,6 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     .await?
     {
         db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
-        db::InsertManifestOutcome::ManifestConflict => return Err(ServerError::ManifestConflict),
         db::InsertManifestOutcome::Inserted | db::InsertManifestOutcome::AlreadyPresent => {}
     }
     let mut reader_conn = state.pools.reader.get().await?;
@@ -131,6 +132,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
+    let caller = ticket.caller;
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
     verify_blake3(&body, &chunk_hash)?;
@@ -147,9 +149,10 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
                     return Err(ServerError::RegistryConflict);
                 }
 
-                let declared_len = db::declared_chunk_len::<S>(conn, &file_id, &chunk_hash)
-                    .await?
-                    .ok_or(ServerError::NotFound)?;
+                let declared_len =
+                    db::declared_chunk_len::<S>(conn, &file_id, &caller, &chunk_hash)
+                        .await?
+                        .ok_or(ServerError::NotFound)?;
                 if body_len != declared_len {
                     return Err(ServerError::HashMismatch);
                 }
@@ -158,6 +161,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
                 match db::account_chunk_put::<S>(
                     conn,
                     &file_id,
+                    &caller,
                     &chunk_hash,
                     declared_len,
                     ticket.ceiling,
@@ -178,11 +182,12 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
 /// Verifies declared chunks were supplied by this upload, checks file identity,
 /// marks the manifest committed, and calls the state setter atomically.
 ///
-/// Three outcomes by manifest state:
-/// - Absent file id: 404.
+/// Four outcomes by manifest state:
+/// - Absent (`file_id`, `caller`) row: 404.
 /// - Already committed (sequential retry after a lost response): idempotent 200.
 /// - Uncommitted: verify all chunks are satisfied (stored through this upload OR deduped
-///   from a committed manifest visible to the caller), verify identity, commit, return 200.
+///   from a committed manifest visible to the caller), then verify identity, then commit.
+///   The caller must have declared the manifest (ownership is implicit in the composite key).
 ///   A concurrent commit races inside the transaction; the loser returns 200.
 pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     State(state): State<AppState<S>>,
@@ -221,21 +226,13 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     admin_conn
         .transaction::<StatusCode, ServerError, _>(move |conn| {
             async move {
-                let (manifest, uploaded_by) =
-                    match db::load_manifest_locked::<S>(conn, &file_id).await? {
-                        None => return Err(ServerError::NotFound),
-                        Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
-                        Some(db::ManifestState::Uncommitted(manifest, uploaded_by)) => {
-                            (manifest, uploaded_by)
-                        }
-                    };
-                // Refuse when a different caller tries to commit a manifest they did not declare.
-                // Uses CommitRefused so no status distinction reopens the existence oracle.
-                if uploaded_by != caller {
-                    return Err(ServerError::CommitRefused);
-                }
+                let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &caller).await? {
+                    None => return Err(ServerError::NotFound),
+                    Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
+                    Some(db::ManifestState::Uncommitted(manifest)) => manifest,
+                };
                 verify_file_identity(store, &manifest).await?;
-                db::commit_manifest_atomic::<S>(conn, &file_id).await?;
+                db::commit_manifest_atomic::<S>(conn, &file_id, &caller).await?;
                 Ok(StatusCode::OK)
             }
             .scope_boxed()

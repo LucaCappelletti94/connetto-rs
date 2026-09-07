@@ -24,8 +24,8 @@ use diesel_async::methods::LoadQuery as AsyncLoadQuery;
 // ---------------------------------------------------------------------------
 
 diesel::table! {
-    /// File manifests: one row per upload.
-    _cfs_manifests (file_id) {
+    /// File manifests: one row per (upload, uploader) pair.
+    _cfs_manifests (file_id, uploaded_by) {
         /// 32-byte BLAKE3 file identity.
         file_id -> Bytea,
         /// Declared byte total (must equal the sum of chunk lengths).
@@ -43,9 +43,11 @@ diesel::table! {
 
 diesel::table! {
     /// Per-chunk rows for each manifest.
-    _cfs_manifest_chunks (file_id, position) {
-        /// Foreign key to `_cfs_manifests`.
+    _cfs_manifest_chunks (file_id, uploaded_by, position) {
+        /// Part of the composite foreign key to `_cfs_manifests`.
         file_id -> Bytea,
+        /// Part of the composite foreign key to `_cfs_manifests`.
+        uploaded_by -> Text,
         /// 0-based position in the chunk sequence.
         position -> Integer,
         /// BLAKE3 hash of the chunk bytes.
@@ -122,7 +124,8 @@ impl<C, Tab, St> FileSchemaColumn<Tab, St> for C where
 pub trait ConnettoFileSchema: Send + Sync + 'static
 where
     // ---------------------------------------------------------------
-    // Shape M1: SELECT file_id, committed FROM manifests WHERE file_id = ?
+    // Shape M1: SELECT file_id, committed FROM manifests
+    //            WHERE file_id = ? AND uploaded_by = ?
     // ---------------------------------------------------------------
     Self::ManifestsQuery: FilterDsl<Self::ManifestPkEq>,
     helper_types::Filter<Self::ManifestsQuery, Self::ManifestPkEq>:
@@ -139,34 +142,33 @@ where
     >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool)> + Send,
     // ---------------------------------------------------------------
     // Shape MC1: SELECT chunk_hash, chunk_len FROM manifest_chunks
-    //            WHERE file_id = ? ORDER BY position
+    //            WHERE file_id = ? AND uploaded_by = ? ORDER BY position
     // ---------------------------------------------------------------
-    Self::ManifestChunksQuery: FilterDsl<Self::MCFileIdEq>,
-    helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>:
-        OrderDsl<Self::MCColPosition>,
+    Self::ManifestChunksQuery: FilterDsl<Self::MCPkEq>,
+    helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>: OrderDsl<Self::MCColPosition>,
     helper_types::Order<
-        helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>,
+        helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>,
         Self::MCColPosition,
     >: SelectDsl<(Self::MCColChunkHash, Self::MCColChunkLen)>,
     for<'q> helper_types::Select<
         helper_types::Order<
-            helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>,
+            helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>,
             Self::MCColPosition,
         >,
         (Self::MCColChunkHash, Self::MCColChunkLen),
     >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, i64)> + Send,
     // ---------------------------------------------------------------
-    // Shape MC2: SELECT chunk_len WHERE file_id = ? AND chunk_hash = ?
+    // Shape MC2: SELECT chunk_len WHERE file_id = ? AND uploaded_by = ?
+    //            AND chunk_hash = ?
     // ---------------------------------------------------------------
-    helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>:
-        FilterDsl<Self::MCChunkHashEq>,
+    helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>: FilterDsl<Self::MCChunkHashEq>,
     helper_types::Filter<
-        helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>,
+        helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>,
         Self::MCChunkHashEq,
     >: SelectDsl<Self::MCColChunkLen>,
     helper_types::Select<
         helper_types::Filter<
-            helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>,
+            helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>,
             Self::MCChunkHashEq,
         >,
         Self::MCColChunkLen,
@@ -174,7 +176,7 @@ where
     for<'q> helper_types::Limit<
         helper_types::Select<
             helper_types::Filter<
-                helper_types::Filter<Self::ManifestChunksQuery, Self::MCFileIdEq>,
+                helper_types::Filter<Self::ManifestChunksQuery, Self::MCPkEq>,
                 Self::MCChunkHashEq,
             >,
             Self::MCColChunkLen,
@@ -275,10 +277,10 @@ where
     // OPAQUE WHERE PREDICATE TYPES
     // ================================================================
 
-    /// Opaque `manifests.file_id = ?` predicate.
+    /// Opaque `manifests.file_id = ? AND manifests.uploaded_by = ?` predicate.
     type ManifestPkEq: Send;
-    /// Opaque `manifest_chunks.file_id = ?` predicate.
-    type MCFileIdEq: Send;
+    /// Opaque `manifest_chunks.file_id = ? AND manifest_chunks.uploaded_by = ?` predicate.
+    type MCPkEq: Send;
     /// Opaque `manifest_chunks.chunk_hash = ?` predicate.
     type MCChunkHashEq: Send;
     /// Opaque `chunk_registry.chunk_hash = ?` predicate.
@@ -302,10 +304,10 @@ where
     // FACTORY METHODS — WHERE predicates
     // ================================================================
 
-    /// Build `manifests.file_id = file_id`.
-    fn manifest_pk_eq(file_id: Vec<u8>) -> Self::ManifestPkEq;
-    /// Build `manifest_chunks.file_id = file_id`.
-    fn mc_file_id_eq(file_id: Vec<u8>) -> Self::MCFileIdEq;
+    /// Build `manifests.file_id = file_id AND manifests.uploaded_by = caller`.
+    fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq;
+    /// Build `manifest_chunks.file_id = file_id AND manifest_chunks.uploaded_by = caller`.
+    fn mc_pk_eq(file_id: Vec<u8>, caller: String) -> Self::MCPkEq;
     /// Build `manifest_chunks.chunk_hash = hash`.
     fn mc_chunk_hash_eq(hash: Vec<u8>) -> Self::MCChunkHashEq;
     /// Build `chunk_registry.chunk_hash = hash`.
@@ -348,29 +350,38 @@ where
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
-    /// Lock one manifest row and return its committed state and declarer.
+    /// Lock one manifest row and return its committed state.
+    ///
+    /// Filters by both `file_id` and `uploaded_by` so the lock is scoped to
+    /// exactly the caller's row.  Returns an empty result if no row exists for
+    /// this (`file_id`, `caller`) pair.
     fn lock_manifest_row_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool, String)> + Send + 'static;
+        caller: String,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + Send + 'static;
 
     // ================================================================
     // FACTORY METHODS — typed diesel statements (return-position impl Trait
     // so the internal UPDATE / DELETE type hierarchy never surfaces here)
     // ================================================================
 
-    /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND chunk_hash=? AND chunk_len=? AND stored=FALSE`.
+    /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND uploaded_by=?
+    /// AND chunk_hash=? AND chunk_len=? AND stored=FALSE`.
     ///
-    /// Binding the declared length ties the stored mark to the same row the PUT length
-    /// check was derived from, preventing a row with a different length from being marked.
+    /// Binding both the composite FK and the declared length ties the stored
+    /// mark to the exact row the PUT length check was derived from.
     fn mark_chunk_stored_stmt(
         file_id: Vec<u8>,
+        caller: String,
         hash: Vec<u8>,
         chunk_len: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `UPDATE manifests SET accepted_bytes = accepted_bytes + chunk_len WHERE file_id=? AND accepted_bytes <= allowed`.
+    /// Build `UPDATE manifests SET accepted_bytes = accepted_bytes + chunk_len
+    /// WHERE file_id=? AND uploaded_by=? AND accepted_bytes <= allowed`.
     fn tally_bytes_stmt(
         file_id: Vec<u8>,
+        caller: String,
         chunk_len: i64,
         allowed: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
@@ -380,9 +391,11 @@ where
         hash: Vec<u8>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `UPDATE manifests SET committed=TRUE WHERE file_id=? AND committed=FALSE`.
+    /// Build `UPDATE manifests SET committed=TRUE WHERE file_id=? AND uploaded_by=?
+    /// AND committed=FALSE`.
     fn mark_manifest_committed_stmt(
         file_id: Vec<u8>,
+        caller: String,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Mark locked, still-unreferenced registry rows `deleting` and return their hashes.
@@ -397,6 +410,7 @@ where
     /// Calling with an empty `rows` slice is a no-op.
     fn insert_chunk_rows_batch_stmt(
         file_id: Vec<u8>,
+        caller: String,
         rows: Vec<(i32, Vec<u8>, i64)>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
@@ -413,12 +427,14 @@ where
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
-    /// Build `SELECT chunk_hash FROM manifest_chunks WHERE file_id = ? AND stored = FALSE`.
+    /// Build `SELECT chunk_hash FROM manifest_chunks
+    /// WHERE file_id = ? AND uploaded_by = ? AND stored = FALSE`.
     ///
     /// Returns one row per unsatisfied chunk for this manifest.  Used by the commit
     /// dedup check to find which chunk hashes still need store evidence.
     fn all_unstored_chunk_hashes_stmt(
         file_id: Vec<u8>,
+        caller: String,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 }
 
@@ -457,8 +473,14 @@ impl ConnettoFileSchema for DefaultFileSchema {
     type CRColChunkHash = _cfs_chunk_registry::columns::chunk_hash;
     type CRColState = _cfs_chunk_registry::columns::state;
 
-    type ManifestPkEq = helper_types::Eq<_cfs_manifests::columns::file_id, Vec<u8>>;
-    type MCFileIdEq = helper_types::Eq<_cfs_manifest_chunks::columns::file_id, Vec<u8>>;
+    type ManifestPkEq = helper_types::And<
+        helper_types::Eq<_cfs_manifests::columns::file_id, Vec<u8>>,
+        helper_types::Eq<_cfs_manifests::columns::uploaded_by, String>,
+    >;
+    type MCPkEq = helper_types::And<
+        helper_types::Eq<_cfs_manifest_chunks::columns::file_id, Vec<u8>>,
+        helper_types::Eq<_cfs_manifest_chunks::columns::uploaded_by, String>,
+    >;
     type MCChunkHashEq = helper_types::Eq<_cfs_manifest_chunks::columns::chunk_hash, Vec<u8>>;
     type CRChunkHashEq = helper_types::Eq<_cfs_chunk_registry::columns::chunk_hash, Vec<u8>>;
     type CRStateEq = helper_types::Eq<_cfs_chunk_registry::columns::state, &'static str>;
@@ -467,12 +489,16 @@ impl ConnettoFileSchema for DefaultFileSchema {
     const MANIFEST_CHUNKS_SQL: &'static str = "_cfs_manifest_chunks";
     const CHUNK_REGISTRY_SQL: &'static str = "_cfs_chunk_registry";
 
-    fn manifest_pk_eq(file_id: Vec<u8>) -> Self::ManifestPkEq {
-        _cfs_manifests::file_id.eq(file_id)
+    fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq {
+        _cfs_manifests::file_id
+            .eq(file_id)
+            .and(_cfs_manifests::uploaded_by.eq(caller))
     }
 
-    fn mc_file_id_eq(file_id: Vec<u8>) -> Self::MCFileIdEq {
-        _cfs_manifest_chunks::file_id.eq(file_id)
+    fn mc_pk_eq(file_id: Vec<u8>, caller: String) -> Self::MCPkEq {
+        _cfs_manifest_chunks::file_id
+            .eq(file_id)
+            .and(_cfs_manifest_chunks::uploaded_by.eq(caller))
     }
 
     fn mc_chunk_hash_eq(hash: Vec<u8>) -> Self::MCChunkHashEq {
@@ -542,6 +568,11 @@ impl ConnettoFileSchema for DefaultFileSchema {
     fn lock_sweep_rows_stmt(
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
+        // A hash is live while any manifest_chunks row references it through a
+        // committed or graced (created_at >= cutoff) manifest.  The join uses
+        // both columns of the composite FK so uncommitted chunks from one caller
+        // do not keep a hash live when a different caller's manifest is the only
+        // graced reference.
         let surviving = diesel::dsl::exists(SelectDsl::select(
             diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
@@ -551,8 +582,11 @@ impl ConnettoFileSchema for DefaultFileSchema {
                 diesel::dsl::exists(SelectDsl::select(
                     diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
-                            _cfs_manifests::table,
-                            _cfs_manifests::file_id.eq(_cfs_manifest_chunks::file_id),
+                            diesel::QueryDsl::filter(
+                                _cfs_manifests::table,
+                                _cfs_manifests::file_id.eq(_cfs_manifest_chunks::file_id),
+                            ),
+                            _cfs_manifests::uploaded_by.eq(_cfs_manifest_chunks::uploaded_by),
                         ),
                         _cfs_manifests::committed
                             .eq(true)
@@ -580,23 +614,23 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn lock_manifest_row_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool, String)> + Send + 'static
-    {
+        caller: String,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + Send + 'static {
         diesel::QueryDsl::select(
             diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
-                _cfs_manifests::table,
-                _cfs_manifests::file_id.eq(file_id),
+                diesel::QueryDsl::filter(
+                    _cfs_manifests::table,
+                    _cfs_manifests::file_id.eq(file_id),
+                ),
+                _cfs_manifests::uploaded_by.eq(caller),
             )),
-            (
-                _cfs_manifests::file_id,
-                _cfs_manifests::committed,
-                _cfs_manifests::uploaded_by,
-            ),
+            _cfs_manifests::committed,
         )
     }
 
     fn mark_chunk_stored_stmt(
         file_id: Vec<u8>,
+        caller: String,
         hash: Vec<u8>,
         chunk_len: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
@@ -604,8 +638,11 @@ impl ConnettoFileSchema for DefaultFileSchema {
             diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
-                        _cfs_manifest_chunks::table,
-                        _cfs_manifest_chunks::file_id.eq(file_id),
+                        diesel::QueryDsl::filter(
+                            _cfs_manifest_chunks::table,
+                            _cfs_manifest_chunks::file_id.eq(file_id),
+                        ),
+                        _cfs_manifest_chunks::uploaded_by.eq(caller),
                     ),
                     _cfs_manifest_chunks::chunk_hash.eq(hash),
                 ),
@@ -618,11 +655,18 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn tally_bytes_stmt(
         file_id: Vec<u8>,
+        caller: String,
         chunk_len: i64,
         allowed: i64,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(_cfs_manifests::table, _cfs_manifests::file_id.eq(file_id)),
+            diesel::QueryDsl::filter(
+                diesel::QueryDsl::filter(
+                    _cfs_manifests::table,
+                    _cfs_manifests::file_id.eq(file_id),
+                ),
+                _cfs_manifests::uploaded_by.eq(caller),
+            ),
             _cfs_manifests::accepted_bytes.le(allowed),
         ))
         .set(_cfs_manifests::accepted_bytes.eq(_cfs_manifests::accepted_bytes + chunk_len))
@@ -643,9 +687,16 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn mark_manifest_committed_stmt(
         file_id: Vec<u8>,
+        caller: String,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(_cfs_manifests::table, _cfs_manifests::file_id.eq(file_id)),
+            diesel::QueryDsl::filter(
+                diesel::QueryDsl::filter(
+                    _cfs_manifests::table,
+                    _cfs_manifests::file_id.eq(file_id),
+                ),
+                _cfs_manifests::uploaded_by.eq(caller),
+            ),
             _cfs_manifests::committed.eq(false),
         ))
         .set(_cfs_manifests::committed.eq(true))
@@ -676,6 +727,7 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn insert_chunk_rows_batch_stmt(
         file_id: Vec<u8>,
+        caller: String,
         rows: Vec<(i32, Vec<u8>, i64)>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
         diesel::insert_into(_cfs_manifest_chunks::table)
@@ -684,6 +736,7 @@ impl ConnettoFileSchema for DefaultFileSchema {
                     .map(|(pos, hash, len)| {
                         (
                             _cfs_manifest_chunks::file_id.eq(file_id.clone()),
+                            _cfs_manifest_chunks::uploaded_by.eq(caller.clone()),
                             _cfs_manifest_chunks::position.eq(pos),
                             _cfs_manifest_chunks::chunk_hash.eq(hash),
                             _cfs_manifest_chunks::chunk_len.eq(len),
@@ -716,12 +769,16 @@ impl ConnettoFileSchema for DefaultFileSchema {
 
     fn all_unstored_chunk_hashes_stmt(
         file_id: Vec<u8>,
+        caller: String,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
         diesel::QueryDsl::select(
             diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
-                    _cfs_manifest_chunks::table,
-                    _cfs_manifest_chunks::file_id.eq(file_id),
+                    diesel::QueryDsl::filter(
+                        _cfs_manifest_chunks::table,
+                        _cfs_manifest_chunks::file_id.eq(file_id),
+                    ),
+                    _cfs_manifest_chunks::uploaded_by.eq(caller),
                 ),
                 _cfs_manifest_chunks::stored.eq(false),
             ),
@@ -752,7 +809,7 @@ macro_rules! connetto_file_tables {
     ($manifests:ident, $manifest_chunks:ident, $chunk_registry:ident) => {
         diesel::table! {
             /// File manifests table generated by `connetto_file_tables!`.
-            $manifests (file_id) {
+            $manifests (file_id, uploaded_by) {
                 /// 32-byte BLAKE3 file identity.
                 file_id -> diesel::sql_types::Bytea,
                 /// Declared byte total.
@@ -770,9 +827,11 @@ macro_rules! connetto_file_tables {
 
         diesel::table! {
             /// Per-chunk manifest rows generated by `connetto_file_tables!`.
-            $manifest_chunks (file_id, position) {
-                /// Foreign key to manifests.
+            $manifest_chunks (file_id, uploaded_by, position) {
+                /// Part of the composite foreign key to manifests.
                 file_id -> diesel::sql_types::Bytea,
+                /// Part of the composite foreign key to manifests.
+                uploaded_by -> diesel::sql_types::Text,
                 /// 0-based ordinal position.
                 position -> diesel::sql_types::Integer,
                 /// BLAKE3 hash of the chunk bytes.
@@ -826,8 +885,14 @@ macro_rules! connetto_file_tables {
             type CRColChunkHash = $chunk_registry::columns::chunk_hash;
             type CRColState = $chunk_registry::columns::state;
 
-            type ManifestPkEq = diesel::helper_types::Eq<$manifests::columns::file_id, Vec<u8>>;
-            type MCFileIdEq = diesel::helper_types::Eq<$manifest_chunks::columns::file_id, Vec<u8>>;
+            type ManifestPkEq = diesel::helper_types::And<
+                diesel::helper_types::Eq<$manifests::columns::file_id, Vec<u8>>,
+                diesel::helper_types::Eq<$manifests::columns::uploaded_by, String>,
+            >;
+            type MCPkEq = diesel::helper_types::And<
+                diesel::helper_types::Eq<$manifest_chunks::columns::file_id, Vec<u8>>,
+                diesel::helper_types::Eq<$manifest_chunks::columns::uploaded_by, String>,
+            >;
             type MCChunkHashEq =
                 diesel::helper_types::Eq<$manifest_chunks::columns::chunk_hash, Vec<u8>>;
             type CRChunkHashEq =
@@ -839,11 +904,15 @@ macro_rules! connetto_file_tables {
             const MANIFEST_CHUNKS_SQL: &'static str = stringify!($manifest_chunks);
             const CHUNK_REGISTRY_SQL: &'static str = stringify!($chunk_registry);
 
-            fn manifest_pk_eq(file_id: Vec<u8>) -> Self::ManifestPkEq {
-                $manifests::file_id.eq(file_id)
+            fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq {
+                $manifests::file_id
+                    .eq(file_id)
+                    .and($manifests::uploaded_by.eq(caller))
             }
-            fn mc_file_id_eq(file_id: Vec<u8>) -> Self::MCFileIdEq {
-                $manifest_chunks::file_id.eq(file_id)
+            fn mc_pk_eq(file_id: Vec<u8>, caller: String) -> Self::MCPkEq {
+                $manifest_chunks::file_id
+                    .eq(file_id)
+                    .and($manifest_chunks::uploaded_by.eq(caller))
             }
             fn mc_chunk_hash_eq(hash: Vec<u8>) -> Self::MCChunkHashEq {
                 $manifest_chunks::chunk_hash.eq(hash)
@@ -930,8 +999,11 @@ macro_rules! connetto_file_tables {
                         diesel::dsl::exists(diesel::query_dsl::methods::SelectDsl::select(
                             diesel::QueryDsl::filter(
                                 diesel::QueryDsl::filter(
-                                    $manifests::table,
-                                    $manifests::file_id.eq($manifest_chunks::file_id),
+                                    diesel::QueryDsl::filter(
+                                        $manifests::table,
+                                        $manifests::file_id.eq($manifest_chunks::file_id),
+                                    ),
+                                    $manifests::uploaded_by.eq($manifest_chunks::uploaded_by),
                                 ),
                                 $manifests::committed
                                     .eq(true)
@@ -958,26 +1030,27 @@ macro_rules! connetto_file_tables {
             }
             fn lock_manifest_row_stmt(
                 file_id: Vec<u8>,
+                caller: String,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
                 diesel_async::AsyncPgConnection,
-                (Vec<u8>, bool, String),
+                bool,
             > + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
-                        $manifests::table,
-                        $manifests::file_id.eq(file_id),
+                        diesel::QueryDsl::filter(
+                            $manifests::table,
+                            $manifests::file_id.eq(file_id),
+                        ),
+                        $manifests::uploaded_by.eq(caller),
                     )),
-                    (
-                        $manifests::file_id,
-                        $manifests::committed,
-                        $manifests::uploaded_by,
-                    ),
+                    $manifests::committed,
                 )
             }
             fn mark_chunk_stored_stmt(
                 file_id: Vec<u8>,
+                caller: String,
                 hash: Vec<u8>,
                 chunk_len: i64,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
@@ -987,6 +1060,7 @@ macro_rules! connetto_file_tables {
                 diesel::update(
                     $manifest_chunks::table
                         .filter($manifest_chunks::file_id.eq(file_id))
+                        .filter($manifest_chunks::uploaded_by.eq(caller))
                         .filter($manifest_chunks::chunk_hash.eq(hash))
                         .filter($manifest_chunks::chunk_len.eq(chunk_len))
                         .filter($manifest_chunks::stored.eq(false)),
@@ -995,6 +1069,7 @@ macro_rules! connetto_file_tables {
             }
             fn tally_bytes_stmt(
                 file_id: Vec<u8>,
+                caller: String,
                 chunk_len: i64,
                 allowed: i64,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
@@ -1004,6 +1079,7 @@ macro_rules! connetto_file_tables {
                 diesel::update(
                     $manifests::table
                         .filter($manifests::file_id.eq(file_id))
+                        .filter($manifests::uploaded_by.eq(caller))
                         .filter($manifests::accepted_bytes.le(allowed)),
                 )
                 .set($manifests::accepted_bytes.eq($manifests::accepted_bytes + chunk_len))
@@ -1023,6 +1099,7 @@ macro_rules! connetto_file_tables {
             }
             fn mark_manifest_committed_stmt(
                 file_id: Vec<u8>,
+                caller: String,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
@@ -1030,6 +1107,7 @@ macro_rules! connetto_file_tables {
                 diesel::update(
                     $manifests::table
                         .filter($manifests::file_id.eq(file_id))
+                        .filter($manifests::uploaded_by.eq(caller))
                         .filter($manifests::committed.eq(false)),
                 )
                 .set($manifests::committed.eq(true))
@@ -1065,6 +1143,7 @@ macro_rules! connetto_file_tables {
             }
             fn insert_chunk_rows_batch_stmt(
                 file_id: Vec<u8>,
+                caller: String,
                 rows: Vec<(i32, Vec<u8>, i64)>,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
@@ -1076,6 +1155,7 @@ macro_rules! connetto_file_tables {
                             .map(|(pos, hash, len)| {
                                 (
                                     $manifest_chunks::file_id.eq(file_id.clone()),
+                                    $manifest_chunks::uploaded_by.eq(caller.clone()),
                                     $manifest_chunks::position.eq(pos),
                                     $manifest_chunks::chunk_hash.eq(hash),
                                     $manifest_chunks::chunk_len.eq(len),
@@ -1111,6 +1191,7 @@ macro_rules! connetto_file_tables {
             }
             fn all_unstored_chunk_hashes_stmt(
                 file_id: Vec<u8>,
+                caller: String,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
                 diesel_async::AsyncPgConnection,
@@ -1120,8 +1201,11 @@ macro_rules! connetto_file_tables {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
-                            $manifest_chunks::table,
-                            $manifest_chunks::file_id.eq(file_id),
+                            diesel::QueryDsl::filter(
+                                $manifest_chunks::table,
+                                $manifest_chunks::file_id.eq(file_id),
+                            ),
+                            $manifest_chunks::uploaded_by.eq(caller),
                         ),
                         $manifest_chunks::stored.eq(false),
                     ),

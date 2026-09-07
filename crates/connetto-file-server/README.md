@@ -12,14 +12,15 @@ are gated by compact Ed25519-signed tickets.
 The server relies on two SQL artifacts the deployment provisions before startup.
 
 `connetto_visible_files(file_ids BYTEA[]) RETURNS BYTEA[]` runs with caller
-rights (SECURITY INVOKER) so the deployment's own row-level security applies.
-It answers which of the supplied file ids the current caller may see and drives
-the upload dedup oracle prevention.
+rights (SECURITY INVOKER) and requires `SET search_path` so the deployment's own
+row-level security applies. It answers which of the supplied file ids the
+current caller may see and drives the upload dedup oracle prevention.
 
-`connetto_set_content_state(file_id BYTEA, new_state TEXT)` is a
+`connetto_set_content_state(file_id BYTEA, new_state TEXT, caller TEXT)` is a
 SECURITY DEFINER setter that writes `content_state` on the deployment's
-metadata table after a successful commit, triggering the CDC availability
-signal without requiring a direct UPDATE grant for the file server role.
+metadata table after a successful commit, requires `SET search_path`, and triggers
+the CDC availability signal without requiring a direct UPDATE grant for the
+file server role.
 
 `preflight()` verifies both functions exist with the correct signatures before
 the server accepts any request, and names exactly what is missing when one is
@@ -30,7 +31,7 @@ absent.
 ```
 POST /files/{id}/intent?t=<ticket>   // declare manifest, receive needed hashes
 PUT  /chunks/{hash}?t=<ticket>       // upload one chunk, BLAKE3 verified
-POST /files/{id}/commit?t=<ticket>   // verify all chunks, flip content_state
+POST /files/{id}/commit?t=<ticket>   // verify all chunks, flip content_state, caller must be declarer
 ```
 
 ```

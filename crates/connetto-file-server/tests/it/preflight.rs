@@ -135,10 +135,15 @@ async fn preflight_refuses_setter_security_invoker() {
     let mut conn = connect_admin(&pg.url_admin).await;
     setup_with(
         &mut conn,
-        &["CREATE OR REPLACE FUNCTION connetto_set_content_state(
-             p_file_id BYTEA, p_new_state TEXT
-         ) RETURNS BYTEA LANGUAGE plpgsql SECURITY INVOKER AS $$
-         BEGIN RETURN p_file_id; END; $$"],
+        &[
+            // Replace the 3-arg DEFINER from FIXTURE_STMTS with a 3-arg INVOKER so the
+            // security-mode check fires on the same signature (CREATE OR REPLACE matches).
+            "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+                 p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+             ) RETURNS BYTEA LANGUAGE plpgsql SECURITY INVOKER
+                 SET search_path TO '' AS $$
+             BEGIN RETURN p_file_id; END; $$",
+        ],
     )
     .await;
 
@@ -157,6 +162,66 @@ async fn preflight_refuses_setter_security_invoker() {
             );
         }
         other => panic!("expected WrongSecurityMode, got {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: search_path checks
+// ---------------------------------------------------------------------------
+
+/// Startup refuses a SECURITY DEFINER function with no pinned `search_path`.
+#[tokio::test]
+async fn preflight_refuses_definer_without_search_path() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &[
+            // Same 3-arg DEFINER signature but without SET search_path.
+            "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+                 p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+             ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER AS $$
+             BEGIN RETURN p_file_id; END; $$",
+        ],
+    )
+    .await;
+
+    let err = preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect_err("DEFINER without search_path must be refused");
+    match err {
+        PreflightError::UnpinnedSearchPath { function } => {
+            assert_eq!(function, "connetto_set_content_state");
+        }
+        other => panic!("expected UnpinnedSearchPath, got {other}"),
+    }
+}
+
+/// Startup refuses a SECURITY INVOKER function with no pinned `search_path`.
+#[tokio::test]
+async fn preflight_refuses_invoker_without_search_path() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &[
+            // visible_files without SET search_path.
+            "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
+             RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER AS $$
+                 SELECT p_file_ids
+             $$",
+        ],
+    )
+    .await;
+
+    let err = preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect_err("INVOKER without search_path must be refused");
+    match err {
+        PreflightError::UnpinnedSearchPath { function } => {
+            assert_eq!(function, "connetto_visible_files");
+        }
+        other => panic!("expected UnpinnedSearchPath, got {other}"),
     }
 }
 

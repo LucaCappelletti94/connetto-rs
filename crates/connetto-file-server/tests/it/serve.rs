@@ -160,7 +160,7 @@ async fn empty_file_serves_200_with_empty_body() {
     }
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, manifest.chunks()).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -207,7 +207,7 @@ async fn empty_file_range_request_answers_416() {
     }
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, manifest.chunks()).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -294,7 +294,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
     drop(admin_conn);
 
     let file_hex = hex(file_id.as_bytes());
@@ -371,7 +371,7 @@ async fn content_length_present_on_full_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -429,7 +429,7 @@ async fn content_length_present_on_partial_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
@@ -496,7 +496,7 @@ async fn content_length_present_on_empty_file_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
 
     let token = signer
         .mint(&connetto_file_server::ticket::TicketPayload {
