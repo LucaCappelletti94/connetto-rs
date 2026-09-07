@@ -47,8 +47,6 @@ pub struct Config<S: ConnettoFileSchema> {
     pub store: AnyStore,
     /// Verifies upload and download tickets.
     pub verifier: TicketVerifier,
-    /// SQL function name the server calls after a successful commit.
-    pub content_state_fn: String,
     /// Grace window for the GC sweep.
     pub grace: Duration,
     /// Carries the schema type without a runtime value.

@@ -312,7 +312,6 @@ async fn serve_refuses_when_chunk_registry_absent() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -353,7 +352,6 @@ async fn serve_refuses_when_sweep_index_absent() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -392,7 +390,6 @@ async fn serve_refuses_when_grace_index_absent() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -438,7 +435,6 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -471,7 +467,6 @@ async fn serve_refuses_superuser_reader_role() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -528,7 +523,6 @@ async fn serve_refuses_bypassrls_reader_role() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -589,7 +583,6 @@ async fn serve_refuses_table_owner_reader_role() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
@@ -619,11 +612,73 @@ async fn serve_accepts_correctly_configured_reader_role() {
         },
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
-        content_state_fn: "connetto_set_content_state".into(),
         grace: std::time::Duration::from_secs(3600),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)
         .await
         .expect("serve must accept the standard non-privileged reader role");
+}
+
+/// Proves: `serve()` refuses when `connetto_set_content_state` is absent.
+///
+/// The setter is validated once at startup via preflight, not per-request.
+/// A deployment that has not installed the function must be refused before
+/// it can accept any traffic.
+#[tokio::test]
+async fn serve_refuses_when_content_state_fn_absent() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &["DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)"],
+    )
+    .await;
+    drop(conn);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.reader_pool().await,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let err = serve(cfg)
+        .await
+        .expect_err("serve must refuse when connetto_set_content_state is absent");
+    assert!(
+        matches!(err, PreflightError::MissingSetterFunction),
+        "expected MissingSetterFunction, got {err}"
+    );
+}
+
+/// Proves: `serve()` accepts a correctly installed `connetto_set_content_state`.
+///
+/// The positive counterpart to the absence test: the startup check must not
+/// refuse a valid function, so the check cannot pass by refusing everything.
+#[tokio::test]
+async fn serve_accepts_when_content_state_fn_valid() {
+    use connetto_file_server::{AnyStore, AppPools, Config, DefaultFileSchema, FsStore, serve};
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg: Config<DefaultFileSchema> = Config {
+        pools: AppPools {
+            admin: pg.admin_pool().await,
+            reader: pg.reader_pool().await,
+        },
+        store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
+        verifier: crate::fixture::make_signer().1,
+        grace: std::time::Duration::from_secs(3600),
+        _schema: std::marker::PhantomData,
+    };
+    let _router = serve(cfg)
+        .await
+        .expect("serve must accept a correctly installed content-state function");
 }

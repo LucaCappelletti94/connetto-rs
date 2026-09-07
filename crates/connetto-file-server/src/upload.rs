@@ -196,12 +196,6 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
-    if state.content_state_fn != "connetto_set_content_state" {
-        return Err(ServerError::BadParam(format!(
-            "content_state_fn must be 'connetto_set_content_state', got '{}'",
-            state.content_state_fn
-        )));
-    }
     let caller = ticket.caller;
     let store = &state.store;
     // Ordering: acquire reader before admin so a saturated reader pool never
