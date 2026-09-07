@@ -15,7 +15,6 @@ use std::collections::HashSet;
 
 use connetto_file_core::{ChunkHash, ChunkMeta};
 use diesel::prelude::*;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::functions;
@@ -36,39 +35,36 @@ pub(crate) async fn needed_hashes<S: ConnettoFileSchema>(
     let declared: Vec<Vec<u8>> = chunks.iter().map(|m| m.hash.as_bytes().to_vec()).collect();
     let caller = caller.to_owned();
     let chunks_snap: Vec<ChunkMeta> = chunks.to_vec();
-    conn.transaction::<Vec<ChunkHash>, diesel::result::Error, _>(|c| {
-        async move {
-            // Step 1: set caller identity so RLS fires inside connetto_visible_files.
-            diesel::select(functions::set_config("app.user_id", &caller, true))
-                .get_result::<String>(c)
-                .await?;
+    conn.transaction::<Vec<ChunkHash>, diesel::result::Error, _>(async move |c| {
+        // Step 1: set caller identity so RLS fires inside connetto_visible_files.
+        diesel::select(functions::set_config("app.user_id", &caller, true))
+            .get_result::<String>(c)
+            .await?;
 
-            // Step 2: map declared chunk hashes to committed file ids.
-            let candidate_ids = committed_file_ids_for::<S>(c, &declared).await?;
-            if candidate_ids.is_empty() {
-                return Ok(chunks_snap.iter().map(|m| m.hash).collect());
-            }
-
-            // Step 3: ask the deployment which of those file ids the caller may see.
-            let visible_ids: Vec<Vec<u8>> =
-                diesel::select(functions::connetto_visible_files(candidate_ids))
-                    .get_result(c)
-                    .await?;
-            if visible_ids.is_empty() {
-                return Ok(chunks_snap.iter().map(|m| m.hash).collect());
-            }
-
-            // Step 4: collect chunk hashes from visible committed manifests that
-            // overlap with the declared set.
-            let present = present_chunk_hashes::<S>(c, &visible_ids, &declared).await?;
-            let needed = chunks_snap
-                .iter()
-                .filter(|m| !present.contains(m.hash.as_bytes()))
-                .map(|m| m.hash)
-                .collect();
-            Ok(needed)
+        // Step 2: map declared chunk hashes to committed file ids.
+        let candidate_ids = committed_file_ids_for::<S>(c, &declared).await?;
+        if candidate_ids.is_empty() {
+            return Ok(chunks_snap.iter().map(|m| m.hash).collect());
         }
-        .scope_boxed()
+
+        // Step 3: ask the deployment which of those file ids the caller may see.
+        let visible_ids: Vec<Vec<u8>> =
+            diesel::select(functions::connetto_visible_files(candidate_ids))
+                .get_result(c)
+                .await?;
+        if visible_ids.is_empty() {
+            return Ok(chunks_snap.iter().map(|m| m.hash).collect());
+        }
+
+        // Step 4: collect chunk hashes from visible committed manifests that
+        // overlap with the declared set.
+        let present = present_chunk_hashes::<S>(c, &visible_ids, &declared).await?;
+        let needed = chunks_snap
+            .iter()
+            .filter(|m| !present.contains(m.hash.as_bytes()))
+            .map(|m| m.hash)
+            .collect();
+        Ok(needed)
     })
     .await
 }

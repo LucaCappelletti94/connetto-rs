@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId, Manifest};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
 
 use crate::functions;
@@ -116,79 +115,74 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     let chunks_owned: Vec<ChunkMeta> = chunks.to_vec();
     let now = Utc::now();
 
-    conn.transaction::<InsertManifestOutcome, IntentTxErr, _>(move |c| {
-        async move {
-            // Collect unique hashes in sorted order for deterministic locking.
-            let mut unique_hashes: Vec<Vec<u8>> = chunks_owned
-                .iter()
-                .map(|ch| ch.hash.as_bytes().to_vec())
-                .collect();
-            unique_hashes.sort_unstable();
-            unique_hashes.dedup();
+    conn.transaction::<InsertManifestOutcome, IntentTxErr, _>(async move |c| {
+        // Collect unique hashes in sorted order for deterministic locking.
+        let mut unique_hashes: Vec<Vec<u8>> = chunks_owned
+            .iter()
+            .map(|ch| ch.hash.as_bytes().to_vec())
+            .collect();
+        unique_hashes.sort_unstable();
+        unique_hashes.dedup();
 
-            // Batch-insert registry rows; clone the hashes because INSERT and the subsequent
-            // lock both consume an owned Vec and the INSERT must run first.
-            if !unique_hashes.is_empty() {
-                c.execute_returning_count(S::insert_registry_pending_batch_stmt(
-                    unique_hashes.clone(),
-                ))
+        // Batch-insert registry rows; clone the hashes because INSERT and the subsequent
+        // lock both consume an owned Vec and the INSERT must run first.
+        if !unique_hashes.is_empty() {
+            c.execute_returning_count(S::insert_registry_pending_batch_stmt(unique_hashes.clone()))
                 .await?;
-            }
-
-            // Lock registry rows in hash order to prevent deadlocks with other uploads.
-            let locked: Vec<(Vec<u8>, String)> =
-                S::lock_registry_rows_stmt(unique_hashes).load(c).await?;
-            if locked.iter().any(|(_, state)| state == "deleting") {
-                // Roll back: no registry rows should be committed for a refused declaration.
-                return Err(IntentTxErr::RegistryConflict);
-            }
-
-            // Try to insert the manifest header keyed by (file_id, caller).
-            let inserted = c
-                .execute_returning_count(S::insert_manifest_stmt(
-                    file_id_bytes.clone(),
-                    total_len,
-                    caller_owned.clone(),
-                    now,
-                ))
-                .await?;
-
-            if inserted == 0 {
-                // (file_id, caller) already has a manifest.  Roll back registry
-                // inserts for the incoming chunks so no orphan rows are left over.
-                return Err(IntentTxErr::AlreadyPresent);
-            }
-
-            // Batch-insert chunk rows (one SQL statement, not one per chunk).
-            if !chunks_owned.is_empty() {
-                let rows: Vec<(i32, Vec<u8>, i64)> = chunks_owned
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ch)| {
-                        let pos = i32::try_from(i).map_err(|_| {
-                            IntentTxErr::Db(diesel::result::Error::DeserializationError(
-                                "chunk count overflows i32".into(),
-                            ))
-                        })?;
-                        let len = i64::try_from(ch.len).map_err(|_| {
-                            IntentTxErr::Db(diesel::result::Error::DeserializationError(
-                                "chunk len overflows i64".into(),
-                            ))
-                        })?;
-                        Ok((pos, ch.hash.as_bytes().to_vec(), len))
-                    })
-                    .collect::<Result<Vec<_>, IntentTxErr>>()?;
-                c.execute_returning_count(S::insert_chunk_rows_batch_stmt(
-                    file_id_bytes,
-                    caller_owned,
-                    rows,
-                ))
-                .await?;
-            }
-
-            Ok(InsertManifestOutcome::Inserted)
         }
-        .scope_boxed()
+
+        // Lock registry rows in hash order to prevent deadlocks with other uploads.
+        let locked: Vec<(Vec<u8>, String)> =
+            S::lock_registry_rows_stmt(unique_hashes).load(c).await?;
+        if locked.iter().any(|(_, state)| state == "deleting") {
+            // Roll back: no registry rows should be committed for a refused declaration.
+            return Err(IntentTxErr::RegistryConflict);
+        }
+
+        // Try to insert the manifest header keyed by (file_id, caller).
+        let inserted = c
+            .execute_returning_count(S::insert_manifest_stmt(
+                file_id_bytes.clone(),
+                total_len,
+                caller_owned.clone(),
+                now,
+            ))
+            .await?;
+
+        if inserted == 0 {
+            // (file_id, caller) already has a manifest.  Roll back registry
+            // inserts for the incoming chunks so no orphan rows are left over.
+            return Err(IntentTxErr::AlreadyPresent);
+        }
+
+        // Batch-insert chunk rows (one SQL statement, not one per chunk).
+        if !chunks_owned.is_empty() {
+            let rows: Vec<(i32, Vec<u8>, i64)> = chunks_owned
+                .iter()
+                .enumerate()
+                .map(|(i, ch)| {
+                    let pos = i32::try_from(i).map_err(|_| {
+                        IntentTxErr::Db(diesel::result::Error::DeserializationError(
+                            "chunk count overflows i32".into(),
+                        ))
+                    })?;
+                    let len = i64::try_from(ch.len).map_err(|_| {
+                        IntentTxErr::Db(diesel::result::Error::DeserializationError(
+                            "chunk len overflows i64".into(),
+                        ))
+                    })?;
+                    Ok((pos, ch.hash.as_bytes().to_vec(), len))
+                })
+                .collect::<Result<Vec<_>, IntentTxErr>>()?;
+            c.execute_returning_count(S::insert_chunk_rows_batch_stmt(
+                file_id_bytes,
+                caller_owned,
+                rows,
+            ))
+            .await?;
+        }
+
+        Ok(InsertManifestOutcome::Inserted)
     })
     .await
     .or_else(|e| match e {
@@ -290,7 +284,7 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     caller: &str,
     chunk_hash: &ChunkHash,
     chunk_len: u64,
-    ceiling: u64,
+    ceiling: i64,
 ) -> Result<ChunkPutResult, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
     let caller_owned = caller.to_owned();
@@ -298,9 +292,7 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     let chunk_len_i64 = i64::try_from(chunk_len).map_err(|_| {
         diesel::result::Error::DeserializationError("chunk_len overflows i64".into())
     })?;
-    let ceiling_i64 = i64::try_from(ceiling)
-        .map_err(|_| diesel::result::Error::DeserializationError("ceiling overflows i64".into()))?;
-    let allowed = ceiling_i64.checked_sub(chunk_len_i64).unwrap_or(-1);
+    let allowed = ceiling.checked_sub(chunk_len_i64).unwrap_or(-1);
 
     let mark_stored = S::mark_chunk_stored_stmt(
         file_id_bytes.clone(),
@@ -342,52 +334,46 @@ pub(crate) async fn all_chunks_satisfied<S: ConnettoFileSchema>(
     let caller = caller.to_owned();
     let file_id_bytes = file_id.as_bytes().to_vec();
     reader_conn
-        .transaction::<bool, diesel::result::Error, _>(|conn| {
-            async move {
-                // Step 1: collect hashes of chunk rows with stored = FALSE for
-                // this specific (file_id, caller) manifest.
-                let unstored: Vec<Vec<u8>> =
-                    S::all_unstored_chunk_hashes_stmt(file_id_bytes, caller.clone())
-                        .load(conn)
-                        .await?;
-                if unstored.is_empty() {
-                    return Ok(true);
-                }
-
-                // Step 2: thread caller identity so RLS fires for this transaction.
-                diesel::select(functions::set_config("app.user_id", &caller, true))
-                    .get_result::<String>(conn)
+        .transaction::<bool, diesel::result::Error, _>(async move |conn| {
+            // Step 1: collect hashes of chunk rows with stored = FALSE for
+            // this specific (file_id, caller) manifest.
+            let unstored: Vec<Vec<u8>> =
+                S::all_unstored_chunk_hashes_stmt(file_id_bytes, caller.clone())
+                    .load(conn)
                     .await?;
-
-                // Steps 3-5: reuse needed.rs's three-step visibility machinery.
-                let candidate_ids = needed::committed_file_ids_for::<S>(conn, &unstored).await?;
-                if candidate_ids.is_empty() {
-                    return Ok(false);
-                }
-                let visible_ids: Vec<Vec<u8>> =
-                    diesel::select(functions::connetto_visible_files(candidate_ids))
-                        .get_result(conn)
-                        .await?;
-                if visible_ids.is_empty() {
-                    return Ok(false);
-                }
-                let present =
-                    needed::present_chunk_hashes::<S>(conn, &visible_ids, &unstored).await?;
-
-                // Every unstored hash must be covered by a visible committed manifest.
-                for h in &unstored {
-                    let arr: [u8; 32] = h.as_slice().try_into().map_err(|_| {
-                        diesel::result::Error::DeserializationError(
-                            "unstored hash not 32 bytes".into(),
-                        )
-                    })?;
-                    if !present.contains(&arr) {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+            if unstored.is_empty() {
+                return Ok(true);
             }
-            .scope_boxed()
+
+            // Step 2: thread caller identity so RLS fires for this transaction.
+            diesel::select(functions::set_config("app.user_id", &caller, true))
+                .get_result::<String>(conn)
+                .await?;
+
+            // Steps 3-5: reuse needed.rs's three-step visibility machinery.
+            let candidate_ids = needed::committed_file_ids_for::<S>(conn, &unstored).await?;
+            if candidate_ids.is_empty() {
+                return Ok(false);
+            }
+            let visible_ids: Vec<Vec<u8>> =
+                diesel::select(functions::connetto_visible_files(candidate_ids))
+                    .get_result(conn)
+                    .await?;
+            if visible_ids.is_empty() {
+                return Ok(false);
+            }
+            let present = needed::present_chunk_hashes::<S>(conn, &visible_ids, &unstored).await?;
+
+            // Every unstored hash must be covered by a visible committed manifest.
+            for h in &unstored {
+                let arr: [u8; 32] = h.as_slice().try_into().map_err(|_| {
+                    diesel::result::Error::DeserializationError("unstored hash not 32 bytes".into())
+                })?;
+                if !present.contains(&arr) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         })
         .await
 }
@@ -422,28 +408,25 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), caller_owned.clone());
     let setter_arg = file_id_bytes;
 
-    conn.transaction::<CommitOutcome, CommitTxError, _>(move |c| {
-        async move {
-            let rows = c.execute_returning_count(commit_stmt).await?;
+    conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
+        let rows = c.execute_returning_count(commit_stmt).await?;
 
-            if rows == 0 {
-                return Ok(CommitOutcome::AlreadyCommitted);
-            }
-
-            // Call the deployment setter inside the transaction.  A raise rolls
-            // back the committed flag so the client can retry.
-            diesel::select(crate::functions::connetto_set_content_state(
-                setter_arg.as_slice(),
-                "available",
-                caller_owned.as_str(),
-            ))
-            .get_result::<Option<Vec<u8>>>(c)
-            .await
-            .map_err(CommitTxError::Setter)?;
-
-            Ok(CommitOutcome::Committed)
+        if rows == 0 {
+            return Ok(CommitOutcome::AlreadyCommitted);
         }
-        .scope_boxed()
+
+        // Call the deployment setter inside the transaction.  A raise rolls
+        // back the committed flag so the client can retry.
+        diesel::select(crate::functions::connetto_set_content_state(
+            setter_arg.as_slice(),
+            "available",
+            caller_owned.as_str(),
+        ))
+        .get_result::<Option<Vec<u8>>>(c)
+        .await
+        .map_err(CommitTxError::Setter)?;
+
+        Ok(CommitOutcome::Committed)
     })
     .await
     .map_err(|e| match e {
@@ -469,18 +452,15 @@ pub(crate) async fn prepare_sweep<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     cutoff: DateTime<Utc>,
 ) -> Result<usize, diesel::result::Error> {
-    conn.transaction::<usize, diesel::result::Error, _>(move |c| {
-        async move {
-            let candidates = S::lock_sweep_rows_stmt(cutoff).load(c).await?;
-            let orphan_ids = S::delete_orphaned_stmt(cutoff).load(c).await?;
-            if !candidates.is_empty() {
-                S::mark_unreferenced_deleting_stmt(candidates)
-                    .load(c)
-                    .await?;
-            }
-            Ok(orphan_ids.len())
+    conn.transaction::<usize, diesel::result::Error, _>(async move |c| {
+        let candidates = S::lock_sweep_rows_stmt(cutoff).load(c).await?;
+        let orphan_ids = S::delete_orphaned_stmt(cutoff).load(c).await?;
+        if !candidates.is_empty() {
+            S::mark_unreferenced_deleting_stmt(candidates)
+                .load(c)
+                .await?;
         }
-        .scope_boxed()
+        Ok(orphan_ids.len())
     })
     .await
 }

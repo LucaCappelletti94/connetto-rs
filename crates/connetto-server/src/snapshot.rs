@@ -214,7 +214,6 @@ mod pg {
     use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
     use diesel::{ExpressionMethods, QueryDsl, QueryableByName, sql_query};
     use diesel_async::pooled_connection::bb8::Pool;
-    use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
     use sqlite_diff_rs::PatchsetOp;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -601,13 +600,10 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let read = conn
-                .transaction::<BinaryRows, diesel::result::Error, _>(|c| {
-                    async move {
-                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
-                        binding.apply(c).await?;
-                        BinaryRows::load(c, query).await
-                    }
-                    .scope_boxed()
+                .transaction::<BinaryRows, diesel::result::Error, _>(async move |c| {
+                    sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                    binding.apply(c).await?;
+                    BinaryRows::load(c, query).await
                 })
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
@@ -690,23 +686,17 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let plan = conn
-                .transaction::<PlanRow, diesel::result::Error, _>(|c| {
-                    async move {
-                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
-                        binding.apply(c).await?;
-                        query.get_result(c).await
-                    }
-                    .scope_boxed()
+                .transaction::<PlanRow, diesel::result::Error, _>(async move |c| {
+                    sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                    binding.apply(c).await?;
+                    query.get_result(c).await
                 })
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let physical = conn
-                .transaction::<WidthRow, diesel::result::Error, _>(|c| {
-                    async move {
-                        sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
-                        physical.get_result(c).await
-                    }
-                    .scope_boxed()
+                .transaction::<WidthRow, diesel::result::Error, _>(async move |c| {
+                    sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
+                    physical.get_result(c).await
                 })
                 .await;
             let mut estimate = plan_estimate(&plan.plan)?;
@@ -754,33 +744,30 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let (read, lsn) = conn
-                .transaction::<(BinaryRows, String), diesel::result::Error, _>(|c| {
-                    async move {
-                        // Pin one MVCC snapshot so this page's rows and its LSN
-                        // agree. Successive pages are separate moments by
-                        // design (R58 decision 9): a page is read after every
-                        // frame already sent, so it can never carry a value
-                        // older than one the client has applied.
-                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                            .execute(c)
-                            .await?;
-                        // The row cap bounds connetto's memory and the wire and
-                        // not Postgres's work: a sort on an unindexed column
-                        // reads the whole table to return a capped page, so the
-                        // dimension the cap leaves open is bounded here.
-                        sql_query(format!("SET LOCAL statement_timeout = {timeout_ms}"))
-                            .execute(c)
-                            .await?;
-                        // Establish the requesting caller's RLS context so the
-                        // read returns only rows it may see.
-                        binding.apply(c).await?;
-                        let read = BinaryRows::load(c, query).await?;
-                        let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
-                            .get_result(c)
-                            .await?;
-                        Ok((read, lsn.lsn))
-                    }
-                    .scope_boxed()
+                .transaction::<(BinaryRows, String), diesel::result::Error, _>(async move |c| {
+                    // Pin one MVCC snapshot so this page's rows and its LSN
+                    // agree. Successive pages are separate moments by
+                    // design (R58 decision 9): a page is read after every
+                    // frame already sent, so it can never carry a value
+                    // older than one the client has applied.
+                    sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+                        .execute(c)
+                        .await?;
+                    // The row cap bounds connetto's memory and the wire and
+                    // not Postgres's work: a sort on an unindexed column
+                    // reads the whole table to return a capped page, so the
+                    // dimension the cap leaves open is bounded here.
+                    sql_query(format!("SET LOCAL statement_timeout = {timeout_ms}"))
+                        .execute(c)
+                        .await?;
+                    // Establish the requesting caller's RLS context so the
+                    // read returns only rows it may see.
+                    binding.apply(c).await?;
+                    let read = BinaryRows::load(c, query).await?;
+                    let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+                        .get_result(c)
+                        .await?;
+                    Ok((read, lsn.lsn))
                 })
                 .await
                 .map_err(|err| {
@@ -868,8 +855,8 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let (read, published) = conn
-                .transaction::<(BinaryRows, Option<bool>), diesel::result::Error, _>(|c| {
-                    async move {
+                .transaction::<(BinaryRows, Option<bool>), diesel::result::Error, _>(
+                    async move |c| {
                         sql_query("SET TRANSACTION READ ONLY").execute(c).await?;
                         // The caller's own binding, so the seed and the
                         // snapshot answer from the same identity by
@@ -900,9 +887,8 @@ mod pg {
                             None => None,
                         };
                         Ok((read, published))
-                    }
-                    .scope_boxed()
-                })
+                    },
+                )
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             // Lower through the same encoder the snapshot uses, so a seed

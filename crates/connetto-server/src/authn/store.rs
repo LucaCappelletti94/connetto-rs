@@ -461,7 +461,6 @@ mod db {
     use diesel::prelude::*;
     use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
     use diesel_async::pooled_connection::bb8::Pool;
-    use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
@@ -593,44 +592,41 @@ mod db {
             let new_hash = hash_secret(&new_secret).to_vec();
             let mut conn = self.pool.get().await.map_err(backend)?;
             let outcome = {
-                conn.transaction::<_, AuthStoreError, _>(|conn| {
-                    async move {
-                        // Lock the row so two concurrent refreshers cannot both
-                        // rotate and trip the reuse defense.
-                        let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
-                            .get_result(conn)
-                            .await
-                            .optional()
-                            .map_err(backend)?;
-                        let (user_id, current_hash, idle_deadline, absolute_deadline, revoked) =
-                            row.ok_or(AuthStoreError::NotFound)?;
-                        if revoked {
-                            return Err(AuthStoreError::NotFound);
-                        }
-                        if now > absolute_deadline || now > idle_deadline {
-                            return Err(AuthStoreError::Expired);
-                        }
-                        if !hashes_match(&presented_hash, &current_hash) {
-                            // Reuse of a rotated-out token. Signal theft, but do
-                            // not revoke inside the transaction: returning an
-                            // error rolls it back, so the revoke lands below in
-                            // its own committed statement.
-                            return Err(AuthStoreError::Reuse { session_id });
-                        }
-                        let capped_idle = idle.min(absolute_deadline);
-                        S::rotation_update(session_id, new_hash, capped_idle)
-                            .execute(conn)
-                            .await
-                            .map_err(backend)?;
-                        let context = AuthContext { user_id };
-                        Ok(RefreshOutcome {
-                            session_id,
-                            context,
-                            refresh_token: format_refresh(session_id, &new_secret),
-                            session_expires_at: from_instant(capped_idle),
-                        })
+                conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                    // Lock the row so two concurrent refreshers cannot both
+                    // rotate and trip the reuse defense.
+                    let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
+                        .get_result(conn)
+                        .await
+                        .optional()
+                        .map_err(backend)?;
+                    let (user_id, current_hash, idle_deadline, absolute_deadline, revoked) =
+                        row.ok_or(AuthStoreError::NotFound)?;
+                    if revoked {
+                        return Err(AuthStoreError::NotFound);
                     }
-                    .scope_boxed()
+                    if now > absolute_deadline || now > idle_deadline {
+                        return Err(AuthStoreError::Expired);
+                    }
+                    if !hashes_match(&presented_hash, &current_hash) {
+                        // Reuse of a rotated-out token. Signal theft, but do
+                        // not revoke inside the transaction: returning an
+                        // error rolls it back, so the revoke lands below in
+                        // its own committed statement.
+                        return Err(AuthStoreError::Reuse { session_id });
+                    }
+                    let capped_idle = idle.min(absolute_deadline);
+                    S::rotation_update(session_id, new_hash, capped_idle)
+                        .execute(conn)
+                        .await
+                        .map_err(backend)?;
+                    let context = AuthContext { user_id };
+                    Ok(RefreshOutcome {
+                        session_id,
+                        context,
+                        refresh_token: format_refresh(session_id, &new_secret),
+                        session_expires_at: from_instant(capped_idle),
+                    })
                 })
                 .await
             };

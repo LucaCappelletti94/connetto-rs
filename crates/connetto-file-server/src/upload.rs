@@ -7,7 +7,7 @@ use axum::{
 };
 use bytes::Bytes;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
-use diesel_async::{AsyncConnection, scoped_futures::ScopedFutureExt};
+use diesel_async::AsyncConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -135,46 +135,45 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let caller = ticket.caller;
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
+    // A ceiling above i64::MAX cannot be exceeded by any real upload; clamp once
+    // here so the database layer receives an i64 and no conversion fails at PUT time.
+    let ceiling_i64: i64 = i64::try_from(ticket.ceiling).unwrap_or(i64::MAX);
     verify_blake3(&body, &chunk_hash)?;
     let store = &state.store;
     let mut admin_conn = state.pools.admin.get().await?;
 
     admin_conn
-        .transaction::<StatusCode, ServerError, _>(move |conn| {
-            async move {
-                let registry_state = db::lock_registry_state::<S>(conn, &chunk_hash)
-                    .await?
-                    .ok_or(ServerError::NotFound)?;
-                if registry_state == "deleting" {
-                    return Err(ServerError::RegistryConflict);
-                }
-
-                let declared_len =
-                    db::declared_chunk_len::<S>(conn, &file_id, &caller, &chunk_hash)
-                        .await?
-                        .ok_or(ServerError::NotFound)?;
-                if body_len != declared_len {
-                    return Err(ServerError::HashMismatch);
-                }
-
-                store.write(&chunk_hash, body).await?;
-                match db::account_chunk_put::<S>(
-                    conn,
-                    &file_id,
-                    &caller,
-                    &chunk_hash,
-                    declared_len,
-                    ticket.ceiling,
-                )
+        .transaction::<StatusCode, ServerError, _>(async move |conn| {
+            let registry_state = db::lock_registry_state::<S>(conn, &chunk_hash)
                 .await?
-                {
-                    db::ChunkPutResult::WouldExceedCeiling => Err(ServerError::CeilingExceeded),
-                    db::ChunkPutResult::Accepted | db::ChunkPutResult::AlreadyStored => {
-                        Ok(StatusCode::NO_CONTENT)
-                    }
+                .ok_or(ServerError::NotFound)?;
+            if registry_state == "deleting" {
+                return Err(ServerError::RegistryConflict);
+            }
+
+            let declared_len = db::declared_chunk_len::<S>(conn, &file_id, &caller, &chunk_hash)
+                .await?
+                .ok_or(ServerError::NotFound)?;
+            if body_len != declared_len {
+                return Err(ServerError::HashMismatch);
+            }
+
+            store.write(&chunk_hash, body).await?;
+            match db::account_chunk_put::<S>(
+                conn,
+                &file_id,
+                &caller,
+                &chunk_hash,
+                declared_len,
+                ceiling_i64,
+            )
+            .await?
+            {
+                db::ChunkPutResult::WouldExceedCeiling => Err(ServerError::CeilingExceeded),
+                db::ChunkPutResult::Accepted | db::ChunkPutResult::AlreadyStored => {
+                    Ok(StatusCode::NO_CONTENT)
                 }
             }
-            .scope_boxed()
         })
         .await
 }
@@ -224,18 +223,15 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     }
     let mut admin_conn = state.pools.admin.get().await?;
     admin_conn
-        .transaction::<StatusCode, ServerError, _>(move |conn| {
-            async move {
-                let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &caller).await? {
-                    None => return Err(ServerError::NotFound),
-                    Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
-                    Some(db::ManifestState::Uncommitted(manifest)) => manifest,
-                };
-                verify_file_identity(store, &manifest).await?;
-                db::commit_manifest_atomic::<S>(conn, &file_id, &caller).await?;
-                Ok(StatusCode::OK)
-            }
-            .scope_boxed()
+        .transaction::<StatusCode, ServerError, _>(async move |conn| {
+            let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &caller).await? {
+                None => return Err(ServerError::NotFound),
+                Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
+                Some(db::ManifestState::Uncommitted(manifest)) => manifest,
+            };
+            verify_file_identity(store, &manifest).await?;
+            db::commit_manifest_atomic::<S>(conn, &file_id, &caller).await?;
+            Ok(StatusCode::OK)
         })
         .await
 }
