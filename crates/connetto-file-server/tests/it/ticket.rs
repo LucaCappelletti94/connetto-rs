@@ -1,6 +1,8 @@
 //! Ticket property tests: expired, forged, and wrong-verb tokens all fail
 //! identically, and a valid token verifies against its declared payload.
 
+use connetto_core::messages::ContentVerb;
+use connetto_core::traits::ContentTicketSigner;
 use connetto_file_server::ticket::{TicketPayload, TicketVerifier, Verb};
 
 use crate::fixture::make_signer;
@@ -128,4 +130,118 @@ async fn garbage_token_is_refused() {
     assert!(verifier.verify("not.a.valid.token").is_err());
     assert!(verifier.verify("").is_err());
     assert!(verifier.verify("nodot").is_err());
+}
+
+/// Extracts the ticket token from the URL the trait mint returns.
+///
+/// The URL ends with `?t=<token>` or `.../intent?t=<token>`.
+fn token_from_url(url: &str) -> &str {
+    url.split("?t=").nth(1).expect("URL must contain ?t=")
+}
+
+/// Proves: a read ticket minted via [`ContentTicketSigner`] verifies against
+/// [`TicketVerifier`] and carries the correct verb, file id, caller, and the
+/// configured read ceiling rather than an uncapped sentinel.
+#[tokio::test]
+async fn content_signer_read_ticket_verifies() {
+    let (signer, verifier) = make_signer();
+    let file_id = [7u8; 32];
+    let url = ContentTicketSigner::mint(&signer, "bob", file_id, ContentVerb::Read)
+        .await
+        .expect("mint must succeed");
+    assert!(
+        url.contains("/files/"),
+        "URL must contain the files path segment"
+    );
+    let token = token_from_url(&url);
+    let payload = verifier
+        .verify_verb(token, Verb::Read)
+        .expect("read ticket must verify");
+    assert_eq!(payload.file_id, file_id);
+    assert_eq!(payload.caller, "bob");
+    assert_eq!(payload.verb, Verb::Read);
+    assert_eq!(
+        payload.ceiling,
+        10 * 1024 * 1024,
+        "read ceiling must match the configured value, not u64::MAX"
+    );
+}
+
+/// Proves: the read ceiling is the value supplied at construction time, not
+/// an uncapped sentinel. A signer built with a small ceiling mints a ticket
+/// whose ceiling equals that value.
+#[tokio::test]
+async fn content_signer_read_ceiling_is_configured_value() {
+    use std::time::Duration;
+    let configured: u64 = 512 * 1024;
+    let (signer, verifier) = {
+        let (s, pk) = connetto_file_server::TicketSigner::generate(
+            "http://localhost".to_owned(),
+            Duration::from_secs(3600),
+            configured,
+        )
+        .expect("signer");
+        (s, connetto_file_server::TicketVerifier::new(pk))
+    };
+    let url = ContentTicketSigner::mint(&signer, "eve", [2u8; 32], ContentVerb::Read)
+        .await
+        .expect("mint must succeed");
+    let token = token_from_url(&url);
+    let payload = verifier.verify(token).expect("token must verify");
+    assert_eq!(
+        payload.ceiling, configured,
+        "ceiling must equal the value set at construction"
+    );
+    assert_ne!(
+        payload.ceiling,
+        u64::MAX,
+        "ceiling must not be the uncapped sentinel"
+    );
+}
+
+/// Proves: a write ticket minted via [`ContentTicketSigner`] verifies and
+/// carries `Verb::Write` with `ceiling` equal to the declared upload size.
+#[tokio::test]
+async fn content_signer_write_ticket_verifies() {
+    let (signer, verifier) = make_signer();
+    let file_id = [9u8; 32];
+    let declared_len: u64 = 4096;
+    let url = ContentTicketSigner::mint(
+        &signer,
+        "carol",
+        file_id,
+        ContentVerb::Write { declared_len },
+    )
+    .await
+    .expect("mint must succeed");
+    assert!(
+        url.contains("/intent"),
+        "write URL must point at the intent endpoint"
+    );
+    let token = token_from_url(&url);
+    let payload = verifier
+        .verify_verb(token, Verb::Write)
+        .expect("write ticket must verify");
+    assert_eq!(payload.file_id, file_id);
+    assert_eq!(payload.caller, "carol");
+    assert_eq!(payload.ceiling, declared_len);
+}
+
+/// Proves: a read ticket minted via the trait is refused when presented as a
+/// write ticket, so the verb mapping survives the round-trip.
+#[tokio::test]
+async fn content_signer_read_token_refused_as_write() {
+    let (signer, verifier) = make_signer();
+    let file_id = [3u8; 32];
+    let url = ContentTicketSigner::mint(&signer, "dave", file_id, ContentVerb::Read)
+        .await
+        .expect("mint must succeed");
+    let token = token_from_url(&url);
+    assert!(
+        matches!(
+            verifier.verify_verb(token, Verb::Write),
+            Err(connetto_file_server::ticket::TicketError::WrongVerb)
+        ),
+        "read ticket must be refused when presented as write"
+    );
 }

@@ -11,6 +11,20 @@
 
 use core::marker::PhantomData;
 
+/// Diesel SQL function declarations for the file visibility check.
+///
+/// `connetto_visible_files` is a deployment contract: a SECURITY INVOKER
+/// function that filters a bytea array to the subset the current caller may
+/// see, so RLS policies evaluate under the caller's identity rather than the
+/// admin's. `set_config` threads that identity in just before the call, inside
+/// the same transaction so the setting stays in scope.
+mod visibility {
+    use diesel::sql_types::{Array, Bytea};
+    diesel::define_sql_function! {
+        fn connetto_visible_files(file_ids: Array<Bytea>) -> Array<Bytea>;
+    }
+}
+
 use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::messages::ConflictRow;
@@ -30,6 +44,7 @@ use crate::materializer::{
 };
 
 /// The outcome of committing one mutation upload.
+#[derive(Debug)]
 pub(crate) enum WriteOutcome {
     /// The whole changeset applied.
     Applied,
@@ -44,6 +59,7 @@ pub(crate) enum WriteOutcome {
 }
 
 /// A failure while committing a mutation.
+#[derive(Debug)]
 pub(crate) enum WriteError {
     /// Row-Level Security refused the write, or fewer rows changed than the
     /// upload carried (rows the user cannot see).
@@ -249,5 +265,43 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             .optional()
             .map_err(|err| WriteError::Backend(err.to_string()))?;
         Ok(last_seq.and_then(|seq| u64::try_from(seq).ok()))
+    }
+
+    /// Whether `caller` may see `file_id` per the deployment's
+    /// `connetto_visible_files` function.
+    ///
+    /// Runs inside a transaction on the pool so the `set_config` call that
+    /// threads the caller identity in stays in scope for the duration. The pool
+    /// must be the reader (non-owner) role: the admin role bypasses RLS, so
+    /// running this check as admin makes it decorative.
+    pub(crate) async fn file_visible_to_caller(
+        &self,
+        file_id: [u8; 32],
+        caller: &str,
+    ) -> Result<bool, WriteError> {
+        use crate::capability::set_config;
+        use visibility::connetto_visible_files;
+        let caller = caller.to_owned();
+        let user_setting = std::sync::Arc::clone(&self.user_setting);
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| WriteError::Backend(err.to_string()))?;
+        // file_id is [u8; 32] (Copy): derive bytes twice inside the async
+        // block so no clone is needed across the await.
+        conn.transaction::<bool, diesel::result::Error, _>(async move |c| {
+            diesel::select(set_config(&*user_setting, &caller, true))
+                .get_result::<String>(c)
+                .await?;
+            let visible: Vec<Vec<u8>> =
+                diesel::select(connetto_visible_files(vec![file_id.to_vec()]))
+                    .get_result(c)
+                    .await?;
+            let expected = file_id.to_vec();
+            Ok(visible.into_iter().any(|v| v == expected))
+        })
+        .await
+        .map_err(|err| WriteError::Backend(err.to_string()))
     }
 }

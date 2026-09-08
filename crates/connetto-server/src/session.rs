@@ -26,13 +26,14 @@ use std::time::{Duration, Instant};
 
 use connetto_core::auth::{Principal, Subject};
 use connetto_core::messages::{
-    AggregateUpdate, BindValue, BulkMessage, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch, MembershipOpened,
-    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited, SUBSCRIPTION_REFUSED,
-    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AggregateUpdate, BindValue, BulkMessage, CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, FatalError,
+    FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
+    MembershipOpened, MutationApplied, MutationConflict, MutationHeader, MutationPatch,
+    MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited,
+    SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
-use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
@@ -579,6 +580,37 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
 
+/// A [`ContentTicketSigner`] for deployments without file handling.
+///
+/// `mint` always fails rather than panicking, since any client can send a
+/// `ContentTicketRequest`.
+pub struct NoSigner;
+
+/// Nothing was wired to mint with.
+#[derive(Debug)]
+pub struct NoSignerConfigured;
+
+impl core::fmt::Display for NoSignerConfigured {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("this deployment wired no content ticket signer")
+    }
+}
+
+impl core::error::Error for NoSignerConfigured {}
+
+impl ContentTicketSigner for NoSigner {
+    type Error = NoSignerConfigured;
+
+    fn mint(
+        &self,
+        _caller: &str,
+        _file_id: [u8; 32],
+        _verb: ContentVerb,
+    ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
+        core::future::ready(Err(NoSignerConfigured))
+    }
+}
+
 /// A refusal's wait as the wire's milliseconds, saturating.
 fn retry_ms(wait: Duration) -> u64 {
     u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
@@ -972,12 +1004,14 @@ pub struct SessionManager<
     O = InMemoryOplog,
     Id = String,
     Key = String,
+    S = NoSigner,
 > where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     C: ReadConnector,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = Id>,
+    S: ContentTicketSigner,
 {
     materializer: Arc<Mutex<Materializer<ParserDB, RuntimeWritableCatalog, C>>>,
     /// The parsed catalog, cloned out of the materializer at construction.
@@ -1036,6 +1070,17 @@ pub struct SessionManager<
     /// Optional like the upkeep. Without one, a move-out escalates to the R7
     /// replace instead of withdrawing incrementally.
     withdrawal_source: OnceLock<Snap>,
+    /// The deployment's content ticket signer, called after a successful
+    /// visibility check to mint a signed URL the caller may use at the file
+    /// server. Generic rather than boxed so a deployment wires it at compile
+    /// time without a vtable allocation on the hot ticket path.
+    signer: S,
+    /// Per-identity rolling bandwidth budget for the write verb.
+    ///
+    /// Charged once at the mint, before the signer is called, against the
+    /// declared upload size. Stays in memory: this is abuse prevention, not
+    /// accounting, and a restart forgiving recent history is not a vector.
+    content_throttle: crate::throttle::ContentThrottle,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -1074,6 +1119,8 @@ where
             guard,
             config,
             None,
+            NoSigner,
+            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
@@ -1112,11 +1159,13 @@ where
             guard,
             config,
             upkeep,
+            NoSigner,
+            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
 
-impl<Snap, Auth, C, O, W> SessionManager<Snap, Auth, W, C, O>
+impl<Snap, Auth, C, O, W, S> SessionManager<Snap, Auth, W, C, O, String, String, S>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
@@ -1124,6 +1173,7 @@ where
     C::Error: TimedOutRead,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = String>,
+    S: ContentTicketSigner,
 {
     /// Build a manager with an explicit re-execution connector and oplog.
     // Every collaborator the manager owns arrives here explicitly. The other
@@ -1143,6 +1193,8 @@ where
         guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
         upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
+        signer: S,
+        content_config: crate::throttle::ThrottleConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
@@ -1164,11 +1216,13 @@ where
             upkeep,
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
+            signer,
+            content_throttle: crate::throttle::ContentThrottle::new(&content_config),
         })
     }
 }
 
-impl<Snap, Auth, C, O, Id, Key, W> SessionManager<Snap, Auth, W, C, O, Id, Key>
+impl<Snap, Auth, C, O, Id, Key, W, S> SessionManager<Snap, Auth, W, C, O, Id, Key, S>
 where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
@@ -1179,6 +1233,7 @@ where
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
     W: ConnettoWatermarkSchema<Id = Id>,
+    S: ContentTicketSigner,
 {
     /// Ask a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
@@ -2128,14 +2183,14 @@ where
     /// # Errors
     ///
     /// [`SessionError`] when a non-auth dispatch fails or the source errors.
-    pub async fn ingest<S>(
+    pub async fn ingest<Src>(
         &self,
-        source: &mut S,
+        source: &mut Src,
         on_event: &mut impl FnMut(ReconnectEvent<'_>),
     ) -> Result<(), SessionError>
     where
-        S: CdcSource<Event = ChangeEvent>,
-        S::Error: core::fmt::Display,
+        Src: CdcSource<Event = ChangeEvent>,
+        Src::Error: core::fmt::Display,
     {
         loop {
             match source.next_event().await {
@@ -2218,17 +2273,17 @@ where
     ///
     /// [`SessionError`] when the reconnect policy gives up, or when a dispatch
     /// fails.
-    pub async fn ingest_with_reconnect<S, Connect, F, E>(
+    pub async fn ingest_with_reconnect<Src, Connect, F, E>(
         &self,
         mut connect: Connect,
         policy: &ReconnectPolicy,
         mut on_event: impl FnMut(ReconnectEvent<'_>),
     ) -> Result<(), SessionError>
     where
-        S: CdcSource<Event = ChangeEvent>,
-        S::Error: core::fmt::Display,
+        Src: CdcSource<Event = ChangeEvent>,
+        Src::Error: core::fmt::Display,
         Connect: FnMut() -> F,
-        F: core::future::Future<Output = Result<S, E>>,
+        F: core::future::Future<Output = Result<Src, E>>,
         E: core::fmt::Display,
     {
         let mut attempt: u32 = 0;
@@ -2645,6 +2700,39 @@ where
         }
     }
 
+    /// Take the content ticket's reader-share permit (R39), or defer the
+    /// request in R19's nonfatal shape and report [`None`].
+    ///
+    /// Visibility runs on the reader pool, so the same gate that protects
+    /// subscription and mutation reads protects the ticket path. The refusal
+    /// is correlated by the request id.
+    async fn ticket_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        request_id: &str,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<ReaderPermit>, SessionError> {
+        match self.guard.reader_permit(Tier::of(&state.principal)).await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    request_id,
+                    retry_after_ms,
+                    "content ticket deferred, the unreserved reader share is full"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(request_id.to_owned()),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Whether the caller is banned, checked one frame after the grant that
     /// named them because nothing identifies a caller earlier and a browser
     /// cannot read the status of a refused upgrade anyway.
@@ -2942,6 +3030,105 @@ where
         }
     }
 
+    /// Answer one content ticket request: check visibility, call the signer,
+    /// charge the write budget after a successful mint, and send the grant.
+    ///
+    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// permit that subscription and mutation reads hold (R39), so an anonymous
+    /// caller cannot starve identified callers. Invisibility and a budget
+    /// refusal carry the same byte-identical detail so a caller cannot learn
+    /// that a file it cannot see exists. A signer fault carries a distinct
+    /// detail because it discloses nothing about data and a retry is
+    /// meaningful. The budget is charged after a successful mint, so a signer
+    /// failure never consumes the caller's upload window.
+    async fn handle_content_ticket<T: Transport>(
+        &self,
+        transport: &mut T,
+        req: ContentTicketRequest,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let request_id = req.request_id;
+        let caller = state.principal.identity().map(|id| id.user_id.to_string());
+        let caller_str = caller.as_deref().unwrap_or("");
+
+        // Reader permit: visibility checks out a reader-pool connection, so
+        // the same gate that protects subscriptions and mutations applies here.
+        let Some(_reader_permit) = self
+            .ticket_reader_permit(transport, &request_id, state)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // Visibility check: reader pool only, so RLS fires inside the
+        // SECURITY INVOKER function body.
+        let visible = self
+            .target
+            .file_visible_to_caller(req.file_id, caller_str)
+            .await;
+        let visible = match visible {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(request_id, ?err, "content ticket visibility check failed");
+                return transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(request_id),
+                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err);
+            }
+        };
+        if !visible {
+            return transport
+                .send_control(ControlMessage::NonFatalError(NonFatalError {
+                    related_to: Some(request_id),
+                    detail: CONTENT_TICKET_REFUSED.to_owned(),
+                }))
+                .await
+                .map_err(transport_err);
+        }
+
+        // Mint before charging so a signer failure costs the caller nothing.
+        let url = match self.signer.mint(caller_str, req.file_id, req.verb).await {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(request_id, %err, "content ticket signing failed");
+                return transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(request_id),
+                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err);
+            }
+        };
+
+        // Charge after a successful mint: reads cost no upload bandwidth, and
+        // a write that was never authorized costs nothing.
+        if let ContentVerb::Write { declared_len } = req.verb
+            && !self
+                .content_throttle
+                .allow_content_bytes(caller_str, declared_len)
+        {
+            return transport
+                .send_control(ControlMessage::NonFatalError(NonFatalError {
+                    related_to: Some(request_id),
+                    detail: CONTENT_TICKET_REFUSED.to_owned(),
+                }))
+                .await
+                .map_err(transport_err);
+        }
+
+        transport
+            .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+                request_id,
+                url,
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
@@ -3009,6 +3196,9 @@ where
             ControlMessage::MutationHeader(header) => {
                 state.pending_header = Some(header);
                 Ok(())
+            }
+            ControlMessage::ContentTicketRequest(req) => {
+                self.handle_content_ticket(transport, req, state).await
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),

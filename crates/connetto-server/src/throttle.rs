@@ -12,13 +12,15 @@
 //! upgrade and allocated a session, which is the whole cost an attacker wanted
 //! to impose. That belongs to the edge.
 //!
-//! Windows are fixed rather than sliding. An event over the limit is refused and
-//! not counted, so hammering does not extend the wait, and the refusal states
-//! how long is left so a caller waits once instead of probing.
+//! Occurrence counters use fixed windows: an event over the limit is refused
+//! and not counted, so hammering does not extend the wait, and the refusal
+//! states how long is left so a caller waits once instead of probing.
+//! The upload byte meter is a token bucket: allowance accrues continuously so
+//! straddling a window edge cannot authorize two full limits.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use connetto_core::SessionId;
@@ -201,6 +203,8 @@ pub struct ThrottleConfig {
     refresh_failures_per_account: Limit,
     reexec_timeout: Duration,
     max_tracked: usize,
+    content_bytes_per_identity: u64,
+    content_bytes_window: Duration,
 }
 
 /// How many distinct keys one signal tracks before it starts evicting.
@@ -217,6 +221,10 @@ const DEFAULT_MAX_TRACKED: usize = 100_000;
 /// caller who subscribed (R81 decision 2). Matches the anonymous tier's five
 /// seconds, which is the shortest number already in this file.
 const DEFAULT_REEXEC_TIMEOUT: Duration = Duration::from_secs(5);
+/// One gibibyte per minute per identity: generous enough that honest uploading
+/// never reaches it in a sustained burst and tight enough that declaring a
+/// thousand max-size tickets in one minute is refused.
+const DEFAULT_CONTENT_BYTES: u64 = 1024 * MIB;
 
 impl Default for ThrottleConfig {
     fn default() -> Self {
@@ -227,6 +235,8 @@ impl Default for ThrottleConfig {
             refresh_failures_per_account: Limit::new(30, FIVE_MINUTES),
             reexec_timeout: DEFAULT_REEXEC_TIMEOUT,
             max_tracked: DEFAULT_MAX_TRACKED,
+            content_bytes_per_identity: DEFAULT_CONTENT_BYTES,
+            content_bytes_window: MINUTE,
         }
     }
 }
@@ -295,6 +305,22 @@ impl ThrottleConfig {
     #[must_use]
     pub const fn with_max_tracked(mut self, keys: usize) -> Self {
         self.max_tracked = keys;
+        self
+    }
+
+    /// How many bytes of declared upload size one identity may authorize per window.
+    ///
+    /// Zero means unlimited, so a deployer who set no ceiling does not find
+    /// every upload refused. Charging the declared size caps authorized rather
+    /// than measured bandwidth.
+    #[must_use]
+    pub const fn with_content_bytes_per_identity(
+        mut self,
+        max_bytes: u64,
+        window: Duration,
+    ) -> Self {
+        self.content_bytes_per_identity = max_bytes;
+        self.content_bytes_window = window;
         self
     }
 
@@ -452,7 +478,7 @@ impl<K: Eq + Hash + Clone> Counters<K> {
         cap: usize,
         now: Instant,
     ) -> Option<Duration> {
-        let mut state = self.state.lock().expect("throttle counters poisoned");
+        let mut state = self.state.lock();
         if now.saturating_duration_since(state.last_sweep) >= retain {
             state.sweep(retain, now);
         }
@@ -473,7 +499,7 @@ impl<K: Eq + Hash + Clone> Counters<K> {
     /// as a touch: asking whether you are blocked must not buy you a longer
     /// place in the map than asking for something does.
     fn peek(&self, key: &K, limit: Limit, now: Instant) -> Option<Duration> {
-        let state = self.state.lock().expect("throttle counters poisoned");
+        let state = self.state.lock();
         let tracked = state.windows.get(key)?;
         let elapsed = now.saturating_duration_since(tracked.window.started);
         if elapsed < limit.window && tracked.window.count >= limit.max {
@@ -496,7 +522,7 @@ impl<K: Eq + Hash + Clone> Counters<K> {
         cap: usize,
         now: Instant,
     ) -> u32 {
-        let mut state = self.state.lock().expect("throttle counters poisoned");
+        let mut state = self.state.lock();
         if now.saturating_duration_since(state.last_sweep) >= retain {
             state.sweep(retain, now);
         }
@@ -511,7 +537,7 @@ impl<K: Eq + Hash + Clone> Counters<K> {
 
     /// Stop tracking `key`.
     pub(crate) fn forget(&self, key: &K) {
-        let mut state = self.state.lock().expect("throttle counters poisoned");
+        let mut state = self.state.lock();
         if let Some(tracked) = state.windows.remove(key) {
             state.order.remove(&tracked.touched);
         }
@@ -558,6 +584,150 @@ impl<K: Eq + Hash + Clone> CounterState<K> {
             touched: 0,
         };
         self.touch(key, &mut tracked);
+    }
+}
+
+/// Token bucket for declared bytes: available allowance refills continuously
+/// at `limit_bytes / window` per second, capped at `limit_bytes`.
+#[derive(Debug, Clone, Copy)]
+struct BucketWindow {
+    /// When `available` was last updated.
+    last_update: Instant,
+    /// Bytes available to spend right now.
+    available: u64,
+}
+
+impl BucketWindow {
+    /// Deduct `declared` bytes, refilling from elapsed time first.
+    ///
+    /// A refused request is not charged: hammering cannot drain a partial refill.
+    fn take(&mut self, limit_bytes: u64, window: Duration, declared: u64, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_update);
+        let refill = {
+            let limit_u128 = u128::from(limit_bytes); // lossless: u64 fits u128
+            let refill_u128 = (elapsed.as_nanos().saturating_mul(limit_u128)
+                / window.as_nanos().max(1))
+            .min(limit_u128);
+            u64::try_from(refill_u128).unwrap_or(limit_bytes)
+        };
+        self.available = self.available.saturating_add(refill).min(limit_bytes);
+        self.last_update = now;
+        if declared > self.available {
+            return false;
+        }
+        self.available -= declared;
+        true
+    }
+
+    /// A full bucket opened at `now`: a new caller starts with their whole allowance.
+    const fn full(limit_bytes: u64, now: Instant) -> Self {
+        Self {
+            last_update: now,
+            available: limit_bytes,
+        }
+    }
+}
+
+/// One tracked identity: its byte window and where it sits in touch order.
+#[derive(Debug, Clone, Copy)]
+struct ByteTracked {
+    window: BucketWindow,
+    touched: u64,
+}
+
+/// The identities the content meter is tracking, in touch order, with when
+/// they were last swept.
+#[derive(Debug)]
+struct ByteCounterState<K> {
+    windows: HashMap<K, ByteTracked>,
+    order: BTreeMap<u64, K>,
+    next_touch: u64,
+    last_sweep: Instant,
+}
+
+impl<K: Eq + Hash + Clone> ByteCounterState<K> {
+    fn sweep(&mut self, retain: Duration, now: Instant) {
+        let expired: Vec<(K, u64)> = self
+            .windows
+            .iter()
+            .filter(|(_, t)| now.saturating_duration_since(t.window.last_update) >= retain)
+            .map(|(key, t)| (key.clone(), t.touched))
+            .collect();
+        for (key, touched) in expired {
+            self.windows.remove(&key);
+            self.order.remove(&touched);
+        }
+        self.last_sweep = now;
+    }
+
+    fn touch(&mut self, key: &K, tracked: &mut ByteTracked) {
+        self.order.remove(&tracked.touched);
+        tracked.touched = self.next_touch;
+        self.next_touch = self.next_touch.wrapping_add(1);
+        self.order.insert(tracked.touched, key.clone());
+        self.windows.insert(key.clone(), *tracked);
+    }
+
+    fn admit(&mut self, key: &K, cap: usize, window: BucketWindow) {
+        while self.windows.len() >= cap.max(1) {
+            let Some((_, evicted)) = self.order.pop_first() else {
+                break;
+            };
+            self.windows.remove(&evicted);
+        }
+        let mut tracked = ByteTracked { window, touched: 0 };
+        self.touch(key, &mut tracked);
+    }
+}
+
+/// The policy half of a byte-window decision, kept together because it comes
+/// from configuration while the rest of `allow`'s inputs describe one request.
+#[derive(Debug, Clone, Copy)]
+struct BytePolicy {
+    limit_bytes: u64,
+    window: Duration,
+    retain: Duration,
+    cap: usize,
+}
+
+/// Token-bucket byte accumulators for the upload direction, keyed by identity.
+#[derive(Debug)]
+struct ByteCounters<K> {
+    state: Mutex<ByteCounterState<K>>,
+}
+
+impl<K: Eq + Hash + Clone> ByteCounters<K> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ByteCounterState {
+                windows: HashMap::new(),
+                order: BTreeMap::new(),
+                next_touch: 0,
+                last_sweep: Instant::now(),
+            }),
+        }
+    }
+
+    /// Accumulate `declared` bytes for `key` under `policy`, returning whether
+    /// the request is allowed.
+    fn allow(&self, key: &K, policy: BytePolicy, declared: u64, now: Instant) -> bool {
+        let (limit_bytes, window, retain, cap) =
+            (policy.limit_bytes, policy.window, policy.retain, policy.cap);
+        let mut state = self.state.lock();
+        if now.saturating_duration_since(state.last_sweep) >= retain {
+            state.sweep(retain, now);
+        }
+        if let Some(mut tracked) = state.windows.get(key).copied() {
+            let ok = tracked.window.take(limit_bytes, window, declared, now);
+            state.touch(key, &mut tracked);
+            return ok;
+        }
+        let mut fresh = BucketWindow::full(limit_bytes, now);
+        let ok = fresh.take(limit_bytes, window, declared, now);
+        if ok {
+            state.admit(key, cap, fresh);
+        }
+        ok
     }
 }
 
@@ -734,6 +904,45 @@ impl AuthThrottle {
     }
 }
 
+/// The per-identity upload bandwidth meter.
+///
+/// Charges each ticket request its declared size, so minting many tickets
+/// cannot authorize unlimited upload. In memory only, because this bounds abuse
+/// rather than accounting for usage.
+#[derive(Debug)]
+pub(crate) struct ContentThrottle {
+    config: ThrottleConfig,
+    per_identity: ByteCounters<String>,
+}
+
+impl ContentThrottle {
+    /// Build the counters for `config`.
+    pub(crate) fn new(config: &ThrottleConfig) -> Self {
+        Self {
+            config: *config,
+            per_identity: ByteCounters::new(),
+        }
+    }
+
+    /// Whether `identity` may be authorized to upload `declared_len` more bytes now.
+    ///
+    /// A zero configured limit means unlimited: a deployer who has not set a
+    /// ceiling should not find all uploads refused.
+    pub fn allow_content_bytes(&self, identity: &str, declared_len: u64) -> bool {
+        if self.config.content_bytes_per_identity == 0 {
+            return true;
+        }
+        let policy = BytePolicy {
+            limit_bytes: self.config.content_bytes_per_identity,
+            window: self.config.content_bytes_window,
+            retain: self.config.content_bytes_window,
+            cap: self.config.max_tracked,
+        };
+        self.per_identity
+            .allow(&identity.to_owned(), policy, declared_len, Instant::now())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,13 +983,7 @@ mod tests {
             let _ = throttle.subscription(hot, Tier::Anonymous);
         }
 
-        let tracked = throttle
-            .subscriptions
-            .state
-            .lock()
-            .expect("counters poisoned")
-            .windows
-            .len();
+        let tracked = throttle.subscriptions.state.lock().windows.len();
         assert!(tracked <= CAP, "the map is capped: {tracked} tracked");
         assert!(
             throttle.subscription(hot, Tier::Anonymous).is_some(),
@@ -820,13 +1023,7 @@ mod tests {
 
         // One more call sweeps, and every earlier key is long past its window.
         let _ = throttle.subscription(handle(), Tier::Anonymous);
-        let live = throttle
-            .subscriptions
-            .state
-            .lock()
-            .expect("counters poisoned")
-            .windows
-            .len();
+        let live = throttle.subscriptions.state.lock().windows.len();
         assert_eq!(
             live, 1,
             "the eight abandoned handles outlived every window that could use them"
@@ -928,5 +1125,121 @@ mod tests {
             throttle.refresh_failed(guessed, None).is_some(),
             "a session naming nobody still spends its own allowance"
         );
+    }
+
+    /// A single request within the configured ceiling is allowed.
+    #[test]
+    fn a_single_request_under_the_limit_is_allowed() {
+        let throttle = ContentThrottle::new(
+            &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
+        );
+        assert!(
+            throttle.allow_content_bytes("alice", 50 * MIB),
+            "50 MiB is within a 100 MiB per-minute window"
+        );
+    }
+
+    /// Consecutive requests whose declared bytes sum past the ceiling are refused.
+    #[test]
+    fn requests_summing_past_the_limit_are_refused() {
+        let throttle = ContentThrottle::new(
+            &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
+        );
+        assert!(throttle.allow_content_bytes("alice", 60 * MIB));
+        assert!(
+            !throttle.allow_content_bytes("alice", 60 * MIB),
+            "60 + 60 = 120 MiB exceeds the 100 MiB window"
+        );
+    }
+
+    /// Once enough time passes a previously over-budget caller is allowed again.
+    ///
+    /// With a token bucket, 1 byte refills in microseconds; the meaningful check
+    /// is whether the full limit is refused, which cannot have refilled yet.
+    #[test]
+    fn the_window_rolls_over_so_a_refused_caller_is_allowed_later() {
+        let brief = Duration::from_millis(50);
+        let throttle = ContentThrottle::new(
+            &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, brief),
+        );
+        assert!(throttle.allow_content_bytes("alice", 100 * MIB));
+        assert!(
+            !throttle.allow_content_bytes("alice", 100 * MIB),
+            "the full limit cannot have refilled in microseconds"
+        );
+        std::thread::sleep(brief * 2);
+        assert!(
+            throttle.allow_content_bytes("alice", 100 * MIB),
+            "the window rolled over and alice has a fresh budget"
+        );
+    }
+
+    /// Each identity carries its own independent byte budget.
+    ///
+    /// This is the whole point of keying by identity: alice exhausting her
+    /// budget must not spend bob's.
+    #[test]
+    fn two_identities_do_not_share_a_budget() {
+        let throttle = ContentThrottle::new(
+            &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
+        );
+        assert!(throttle.allow_content_bytes("alice", 100 * MIB));
+        assert!(
+            throttle.allow_content_bytes("bob", 100 * MIB),
+            "bob's budget is independent of alice's"
+        );
+        assert!(
+            !throttle.allow_content_bytes("alice", 100 * MIB),
+            "alice is still over budget while bob is not"
+        );
+    }
+
+    /// Straddling a window edge must not authorize two full limits.
+    ///
+    /// The boundary attack: drain the budget just before the window edge, then
+    /// request the full limit again just after. A fixed window resets at the
+    /// edge so the second request sees a fresh counter; a rolling bucket only
+    /// refills by the small elapsed fraction, so the second request is refused.
+    #[test]
+    fn straddling_a_window_edge_does_not_authorize_two_full_limits() {
+        let window = Duration::from_millis(100);
+        let limit = 100 * MIB;
+        let t0 = Instant::now();
+        // Just before the window boundary: window - 1 ms.
+        let t_before = (t0 + window)
+            .checked_sub(Duration::from_millis(1))
+            .expect("a window longer than a millisecond");
+        // Just after the boundary: window + 1 ms. Two full requests span 2 ms.
+        let t_after = t0 + window + Duration::from_millis(1);
+        let mut bucket = BucketWindow::full(limit, t0);
+        assert!(
+            bucket.take(limit, window, limit, t_before),
+            "first: full budget drains just before the boundary"
+        );
+        assert!(
+            !bucket.take(limit, window, limit, t_after),
+            "second: only 2 ms of refill have accrued (~2 MiB of 100 MiB), \
+             so a full-limit request must be refused"
+        );
+    }
+
+    /// The content meter stays within the configured key cap under many identities.
+    ///
+    /// Memory is bounded because tracked state is capped at `max_tracked` entries
+    /// and excess keys are evicted in least-recently-touched order, same as the
+    /// occurrence counters.
+    #[test]
+    fn content_meter_is_capped_under_many_identities() {
+        const CAP: usize = 4;
+        let throttle = ContentThrottle::new(
+            &ThrottleConfig::new()
+                .with_content_bytes_per_identity(100 * MIB, MINUTE)
+                .with_max_tracked(CAP),
+        );
+        for i in 0..50u64 {
+            let _ = throttle.allow_content_bytes(&format!("identity-{i}"), MIB);
+        }
+        let tracked = throttle.per_identity.state.lock().windows.len();
+        assert!(tracked <= CAP, "the map is capped: {tracked} tracked");
     }
 }

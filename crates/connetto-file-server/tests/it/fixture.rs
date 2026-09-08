@@ -493,7 +493,12 @@ pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
 }
 
 pub fn make_signer() -> (TicketSigner, TicketVerifier) {
-    let (signer, pub_key) = TicketSigner::generate().expect("signer");
+    let (signer, pub_key) = TicketSigner::generate(
+        "http://localhost".to_owned(),
+        std::time::Duration::from_secs(3600),
+        10 * 1024 * 1024,
+    )
+    .expect("signer");
     let verifier = TicketVerifier::new(pub_key);
     (signer, verifier)
 }

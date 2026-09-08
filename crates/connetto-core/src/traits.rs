@@ -16,7 +16,7 @@ use crate::{
     ReplicaKey, SessionId,
     auth::Subject,
     cursor::Cursor,
-    messages::{BulkMessage, ControlMessage, Grant},
+    messages::{BulkMessage, ContentVerb, ControlMessage, Grant},
 };
 
 /// `Send` on native targets, nothing on wasm.
@@ -261,24 +261,27 @@ pub trait ReplicaKeyStore {
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
-/// Content-addressed file chunk store (see `docs/architecture/07-file-sync.md`).
+/// Mints the signed address a content ticket carries.
 ///
-/// File sync is out of scope for v1 per Q7 and Q1.2, but the trait shape belongs
-/// in `connetto-core` so both server and client can compile against the same
-/// signature when file sync lands.
-#[allow(async_fn_in_trait)]
-pub trait FileStore {
-    /// Chunk-store error.
+/// Runs only after the caller's right to the file has been established, so an
+/// implementation MUST still verify the ticket at fetch time.
+pub trait ContentTicketSigner {
+    /// Signer-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
-    /// Persist a chunk keyed by its content hash.
-    async fn write_chunk(&mut self, hash: &[u8], data: &[u8]) -> Result<(), Self::Error>;
-
-    /// Load a chunk by its content hash.
-    async fn read_chunk(&self, hash: &[u8]) -> Result<Vec<u8>, Self::Error>;
-
-    /// Whether a chunk is present locally.
-    async fn has_chunk(&self, hash: &[u8]) -> Result<bool, Self::Error>;
+    /// The address `caller` may use for `verb` on `file_id`, ticket included.
+    ///
+    /// `caller` is the identity the ticket binds to, not whoever presents it.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::Error`] when no address can be minted, for instance a missing key.
+    fn mint(
+        &self,
+        caller: &str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> impl core::future::Future<Output = Result<String, Self::Error>> + MaybeSend;
 }
 
 /// Why one grant was refused at the handshake.

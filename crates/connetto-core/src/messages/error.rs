@@ -15,6 +15,19 @@ use serde::{Deserialize, Serialize};
 /// structured log instead.
 pub const SUBSCRIPTION_REFUSED: &str = "subscription refused";
 
+/// The one detail text a refused content ticket carries.
+///
+/// An invisible file and an over-budget write read identically here, so a
+/// caller cannot learn that a file it cannot see exists. The cause goes to the
+/// structured log instead.
+pub const CONTENT_TICKET_REFUSED: &str = "content ticket refused";
+
+/// The detail a ticket refusal carries when the signer itself failed.
+///
+/// Distinct from [`CONTENT_TICKET_REFUSED`] because it discloses nothing about
+/// visibility and a retry may work.
+pub const CONTENT_TICKET_SIGNER_ERROR: &str = "content ticket error";
+
 /// Non-fatal error attached to a specific client request.
 ///
 /// The server keeps the session alive after sending this. Typical uses:
