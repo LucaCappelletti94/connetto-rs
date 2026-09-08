@@ -7,7 +7,11 @@
 
 mod abuse;
 
-mod content_ticket;
+mod ticket_shared;
+
+mod ticket_budget;
+
+mod ticket_mint;
 
 mod audit_producers;
 
