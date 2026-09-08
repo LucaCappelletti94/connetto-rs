@@ -6,16 +6,14 @@ use std::time::Duration;
 use connetto_core::messages::{
     CONTENT_TICKET_SIGNER_ERROR, ContentVerb, ControlMessage, NonFatalError, RateLimited,
 };
-use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::Transport;
 use connetto_server::{
-    AbuseConfig, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, ReaderReserve,
-    RequestGuard, SessionConfig, SessionManager, ThrottleConfig, loopback, pg_write_target,
+    AbuseConfig, LoopbackTransport, ReaderReserve, RequestGuard, ThrottleConfig, loopback,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID};
 
 use super::ticket_shared::{
-    FILE_ID, FlakyFirstSigner, NeverSnapshot, OkSigner, PG_DDL, TicketManager, WINDOW,
+    FILE_ID, FlakyFirstSigner, OkSigner, TicketManager, WINDOW, build_manager_with_guard,
     build_standard_manager, do_handshake, do_handshake_anon, drain_to_control,
     open_session_with_handshake, request_ticket, send_ticket_request, setup_reader,
     setup_slow_reader,
@@ -112,21 +110,14 @@ async fn ticket_path_holds_reader_permit() {
             .with_reader_gate(ReaderReserve::new().with_total(10).with_reserved(9).gate()),
     );
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
-        NeverSnapshot,
+    let manager = build_manager_with_guard(
+        reader_pool,
         RosterAuth::granting("alice")
             .and_the_unnamed_caller()
             .withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        NoConnector,
-        InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
         guard,
-        SessionConfig::default(),
-        None,
         OkSigner,
-        ThrottleConfig::default(),
+        &ThrottleConfig::default(),
     );
 
     // Both sessions handshake while the anonymous share is free: the watermark

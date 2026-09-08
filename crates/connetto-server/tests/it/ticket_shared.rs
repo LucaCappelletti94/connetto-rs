@@ -280,10 +280,11 @@ pub(crate) type TicketManager<S> = SessionManager<
     S,
 >;
 
-/// Build a standard session manager with the default guard and oplog.
-pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
+/// Build a session manager whose reader gate the caller chooses.
+pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
+    guard: Arc<RequestGuard<String>>,
     signer: S,
     throttle: &ThrottleConfig,
 ) -> Arc<TicketManager<S>> {
@@ -295,11 +296,27 @@ pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
         NoConnector,
         InMemoryOplog::default(),
         pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
+        guard,
         SessionConfig::default(),
         None,
         signer,
         *throttle,
+    )
+}
+
+/// Build a session manager with the default guard and oplog.
+pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    signer: S,
+    throttle: &ThrottleConfig,
+) -> Arc<TicketManager<S>> {
+    build_manager_with_guard(
+        reader_pool,
+        roster,
+        Arc::new(RequestGuard::default()),
+        signer,
+        throttle,
     )
 }
 
