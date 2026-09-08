@@ -4,8 +4,12 @@
 //! URL-safe base64 (no padding) and `payload_b64` is a postcard-serialized
 //! [`TicketPayload`].
 
+use std::time::Duration;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::messages::ContentVerb;
+use connetto_core::traits::ContentTicketSigner;
 use postcard;
 use ring::{
     rand::SystemRandom,
@@ -65,28 +69,69 @@ pub enum TicketError {
 }
 
 /// Holds the Ed25519 private key and mints ticket tokens.
+///
+/// `base_url` is the scheme-and-authority prefix the file server answers on,
+/// without a trailing slash (for example `https://files.example.com`). It is
+/// embedded in every URL returned by [`ContentTicketSigner::mint`].
+///
+/// `read_ceiling` is the byte cap placed on every read ticket minted through
+/// the trait. The file server refuses a response whose byte count exceeds the
+/// ticket's ceiling, so this value bounds what one read ticket can serve.
+/// Deployments set it to the largest single-response download they permit.
 pub struct TicketSigner {
     key_pair: Ed25519KeyPair,
+    base_url: String,
+    ticket_ttl: Duration,
+    read_ceiling: u64,
 }
 
 impl TicketSigner {
-    /// Generates a fresh keypair.  Returns the signer plus the raw public-key
-    /// bytes needed to construct the matching [`TicketVerifier`].
-    pub fn generate() -> Result<(Self, Vec<u8>), TicketError> {
+    /// Generates a fresh keypair.
+    ///
+    /// Returns the signer plus the raw public-key bytes needed to construct the
+    /// matching [`TicketVerifier`].  `base_url` is the file server's base address
+    /// without a trailing slash; `ticket_ttl` is how long each minted ticket
+    /// remains valid; `read_ceiling` is the byte cap on every read ticket.
+    pub fn generate(
+        base_url: String,
+        ticket_ttl: Duration,
+        read_ceiling: u64,
+    ) -> Result<(Self, Vec<u8>), TicketError> {
         let rng = SystemRandom::new();
         let doc = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|e| TicketError::Ring(format!("{e:?}")))?;
         let kp = Ed25519KeyPair::from_pkcs8(doc.as_ref())
             .map_err(|e| TicketError::Ring(format!("{e:?}")))?;
         let public = kp.public_key().as_ref().to_vec();
-        Ok((Self { key_pair: kp }, public))
+        Ok((
+            Self {
+                key_pair: kp,
+                base_url,
+                ticket_ttl,
+                read_ceiling,
+            },
+            public,
+        ))
     }
 
     /// Loads from a PKCS8 DER document.
-    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, TicketError> {
+    ///
+    /// `base_url`, `ticket_ttl`, and `read_ceiling` carry the same meaning as
+    /// in [`Self::generate`].
+    pub fn from_pkcs8_der(
+        der: &[u8],
+        base_url: String,
+        ticket_ttl: Duration,
+        read_ceiling: u64,
+    ) -> Result<Self, TicketError> {
         let kp =
             Ed25519KeyPair::from_pkcs8(der).map_err(|e| TicketError::Ring(format!("{e:?}")))?;
-        Ok(Self { key_pair: kp })
+        Ok(Self {
+            key_pair: kp,
+            base_url,
+            ticket_ttl,
+            read_ceiling,
+        })
     }
 
     /// Returns the raw public-key bytes for constructing a [`TicketVerifier`].
@@ -101,6 +146,49 @@ impl TicketSigner {
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_bytes);
         let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
         Ok(format!("{payload_b64}.{sig_b64}"))
+    }
+}
+
+impl ContentTicketSigner for TicketSigner {
+    type Error = TicketError;
+
+    fn mint(
+        &self,
+        caller: &str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
+        let result: Result<String, TicketError> = (|| {
+            let ttl_secs = i64::try_from(self.ticket_ttl.as_secs())
+                .map_err(|_| TicketError::Ring("ticket TTL exceeds i64 seconds".into()))?;
+            let expiry = chrono::Utc::now()
+                .timestamp()
+                .checked_add(ttl_secs)
+                .ok_or_else(|| TicketError::Ring("ticket expiry overflow".into()))?;
+            let (local_verb, ceiling) = match verb {
+                ContentVerb::Read => (Verb::Read, self.read_ceiling),
+                ContentVerb::Write { declared_len } => (Verb::Write, declared_len),
+            };
+            let payload = TicketPayload {
+                file_id,
+                verb: local_verb,
+                ceiling,
+                expiry,
+                caller: caller.into(),
+            };
+            let token = TicketSigner::mint(self, &payload)?;
+            let hex_id = crate::hex_32(&file_id);
+            let url = match verb {
+                ContentVerb::Read => {
+                    format!("{}/files/{}?t={}", self.base_url, hex_id, token)
+                }
+                ContentVerb::Write { .. } => {
+                    format!("{}/files/{}/intent?t={}", self.base_url, hex_id, token)
+                }
+            };
+            Ok(url)
+        })();
+        core::future::ready(result)
     }
 }
 
