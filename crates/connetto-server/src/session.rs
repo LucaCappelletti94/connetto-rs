@@ -2471,7 +2471,7 @@ where
         )
         .await;
 
-        transport
+        if let Err(err) = transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 connection_id: format!("connection-{connection_num}"),
                 session_token: session_id.to_string(),
@@ -2482,7 +2482,12 @@ where
                 last_applied_seq: applied_watermark,
             }))
             .await
-            .map_err(transport_err)?;
+        {
+            // Registering before the ack means an ack that never leaves would
+            // otherwise strand the entry, since no run loop follows to drop it.
+            self.unregister_connection(session_id, connection_num).await;
+            return Err(transport_err(err));
+        }
         Ok(Some(HandshakeOutcome {
             connection_num,
             principal: Arc::new(principal),
