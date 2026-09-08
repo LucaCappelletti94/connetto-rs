@@ -2700,6 +2700,39 @@ where
         }
     }
 
+    /// Take the content ticket's reader-share permit (R39), or defer the
+    /// request in R19's nonfatal shape and report [`None`].
+    ///
+    /// Visibility runs on the reader pool, so the same gate that protects
+    /// subscription and mutation reads protects the ticket path. The refusal
+    /// is correlated by the request id.
+    async fn ticket_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        request_id: &str,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<ReaderPermit>, SessionError> {
+        match self.guard.reader_permit(Tier::of(&state.principal)).await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    request_id,
+                    retry_after_ms,
+                    "content ticket deferred, the unreserved reader share is full"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(request_id.to_owned()),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Whether the caller is banned, checked one frame after the grant that
     /// named them because nothing identifies a caller earlier and a browser
     /// cannot read the status of a refused upgrade anyway.
@@ -2997,15 +3030,17 @@ where
         }
     }
 
-    /// Answer one content ticket request: check visibility, check the write
-    /// budget if the verb is Write, call the signer, and send the grant.
+    /// Answer one content ticket request: check visibility, call the signer,
+    /// charge the write budget after a successful mint, and send the grant.
     ///
-    /// Visibility runs first, on the reader pool, so RLS and the deployment's
-    /// `connetto_visible_files` function make the same decision the file server
-    /// makes when serving. Invisibility and a budget refusal produce the same
-    /// byte-identical detail so a caller cannot learn that a file it cannot see
-    /// exists. A signer fault produces a distinct detail because it discloses
-    /// nothing about data and a retry is meaningful.
+    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// permit that subscription and mutation reads hold (R39), so an anonymous
+    /// caller cannot starve identified callers. Invisibility and a budget
+    /// refusal carry the same byte-identical detail so a caller cannot learn
+    /// that a file it cannot see exists. A signer fault carries a distinct
+    /// detail because it discloses nothing about data and a retry is
+    /// meaningful. The budget is charged after a successful mint, so a signer
+    /// failure never consumes the caller's upload window.
     async fn handle_content_ticket<T: Transport>(
         &self,
         transport: &mut T,
@@ -3015,6 +3050,15 @@ where
         let request_id = req.request_id;
         let caller = state.principal.identity().map(|id| id.user_id.to_string());
         let caller_str = caller.as_deref().unwrap_or("");
+
+        // Reader permit: visibility checks out a reader-pool connection, so
+        // the same gate that protects subscriptions and mutations applies here.
+        let Some(_reader_permit) = self
+            .ticket_reader_permit(transport, &request_id, state)
+            .await?
+        else {
+            return Ok(());
+        };
 
         // Visibility check: reader pool only, so RLS fires inside the
         // SECURITY INVOKER function body.
@@ -3045,7 +3089,23 @@ where
                 .map_err(transport_err);
         }
 
-        // Reads cost no upload bandwidth, so only a write is charged.
+        // Mint before charging so a signer failure costs the caller nothing.
+        let url = match self.signer.mint(caller_str, req.file_id, req.verb).await {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(request_id, %err, "content ticket signing failed");
+                return transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(request_id),
+                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err);
+            }
+        };
+
+        // Charge after a successful mint: reads cost no upload bandwidth, and
+        // a write that was never authorized costs nothing.
         if let ContentVerb::Write { declared_len } = req.verb
             && !self
                 .content_throttle
@@ -3060,20 +3120,6 @@ where
                 .map_err(transport_err);
         }
 
-        // Mint the ticket.
-        let url = match self.signer.mint(caller_str, req.file_id, req.verb).await {
-            Ok(url) => url,
-            Err(err) => {
-                tracing::warn!(request_id, %err, "content ticket signing failed");
-                return transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(request_id),
-                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err);
-            }
-        };
         transport
             .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
                 request_id,
