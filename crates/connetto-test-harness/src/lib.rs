@@ -143,6 +143,11 @@ const STARTED_LABEL: &str = "io.connetto.harness.started";
 /// containers this process must not touch.
 const STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How long a container has to pass its health probe.
+///
+/// A cold CI runner pulls the image first, which overruns the default.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Seconds since the epoch, or zero if the clock is behind it.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -276,6 +281,7 @@ impl MockOauth {
             ))
             .with_env_var("JSON_CONFIG", MOCK_OAUTH_CONFIG)
             .with_labels(container_labels("oauth"))
+            .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
             .await
             .expect(
@@ -509,6 +515,7 @@ impl Fixture {
             // nothing.
             .with_cmd(["-c", "wal_level=logical", "-c", "fsync=off"])
             .with_labels(container_labels("postgres"))
+            .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
             .await
             .expect("this test starts its own postgres, so it needs a reachable Docker daemon");
@@ -610,6 +617,7 @@ impl Fixture {
                     ))
                     .with_cmd(["run"])
                     .with_labels(container_labels("openfga"))
+                    .with_startup_timeout(STARTUP_TIMEOUT)
                     .start()
                     .await
                     .expect(
