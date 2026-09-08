@@ -82,23 +82,24 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
     fixture
         .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
         .await;
-    fixture.start_replication(&["notes"]).await;
-
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let snapshot =
         PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
     let server = spawn_server(
-        ServerConfig::new(PG_DDL, fixture.admin_url()).with_writable(
-            RuntimeWritableCatalog::builder()
-                .versioned("notes", "edited_at")
-                .build(),
-        ),
+        ServerConfig::new(PG_DDL, fixture.admin_url())
+            .with_writable(
+                RuntimeWritableCatalog::builder()
+                    .versioned("notes", "edited_at")
+                    .build(),
+            )
+            .with_replication(["notes"]),
         snapshot,
         auth,
         writer_pool,
         fixture.admin().clone(),
-    );
+    )
+    .await;
 
     // Client A subscribes to alice's notes and drains the initial snapshot of
     // the empty table (an empty snapshot may still carry an empty patch frame).

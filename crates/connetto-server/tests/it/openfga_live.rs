@@ -117,27 +117,23 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
         "a fresh store holds no rules, so they are written rather than adopted"
     );
 
-    let records = translated
-        .load_records(&pool)
-        .await
-        .expect("the generated queries ran and their rows spell facts");
-    assert!(
-        !records.is_empty(),
-        "two owned rows must produce at least the facts naming their owners"
-    );
-
-    let shapes = translated.shapes();
+    let shapes = translated.shapes_arc();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts loaded");
+    .authorization_model_id(model.id().to_owned());
+    let n = translated
+        .load_into(&pool, &loader)
+        .await
+        .expect("the generated queries ran and their rows spell facts");
+    assert!(
+        n > 0,
+        "two owned rows must produce at least the facts naming their owners"
+    );
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -299,24 +295,20 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         .install_model(&mut setup, &store)
         .await
         .expect("the rules are written");
-    let records = translated
-        .load_records(&pool)
-        .await
-        .expect("the facts load");
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        Arc::clone(&shapes),
+        translated.shapes_arc(),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
-    loader
-        .write_records(&records)
+    translated
+        .load_into(&pool, &loader)
         .await
         .expect("the facts load");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -429,20 +421,20 @@ async fn cross_executor(
         .install_model(&mut setup, &store)
         .await
         .expect("the rules are written");
-    let records = translated.load_records(pool).await.expect("the facts load");
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        Arc::clone(&shapes),
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts load");
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(pool, &loader)
+        .await
+        .expect("the facts load");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -619,23 +611,19 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         .install_model(&mut setup, &store)
         .await
         .expect("the rules are written");
-    let records = translated
-        .load_records(&pool)
-        .await
-        .expect("the generated queries ran and their rows spell facts");
-
-    let shapes = translated.shapes();
+    let shapes = translated.shapes_arc();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts load");
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(&pool, &loader)
+        .await
+        .expect("the generated queries ran and the facts loaded");
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -742,20 +730,20 @@ async fn replay_executor(
         .install_model(&mut setup, &store)
         .await
         .expect("the rules are written");
-    let records = translated.load_records(pool).await.expect("the facts load");
-
-    let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        Arc::clone(&shapes),
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
         setup,
         store.clone(),
     )
     .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts load");
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(pool, &loader)
+        .await
+        .expect("the facts load");
+
+    let (shapes, translator, reach) = translated.into_parts();
+    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -1157,25 +1145,22 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         .expect("the composite model installs");
 
     // (c) Seeding. rls2fga 98bda106 emits a comment-only query for unqualified
-    // table names, so load_records returns zero facts. The store stays empty
-    // and the verdict assertions below fail here.
-    let records = translated
-        .load_records(&pool)
+    // table names, so the keyed pass in load_into returns zero facts. The store
+    // stays empty and the verdict assertions below fail here.
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(&pool, &loader)
         .await
         .expect("the facts load");
 
     let (shapes, translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        Arc::clone(&shapes),
-        setup,
-        store.clone(),
-    )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned())
-    .write_records(&records)
-    .await
-    .expect("the facts are written");
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),

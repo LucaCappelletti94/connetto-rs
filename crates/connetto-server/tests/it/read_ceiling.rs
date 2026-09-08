@@ -521,6 +521,7 @@ mod aggregates {
             pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
             guard,
             SessionConfig::default(),
+            None,
         )
     }
 

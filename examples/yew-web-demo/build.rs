@@ -10,8 +10,7 @@
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{
-    Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, TranslationOptions, UuidRepresentation,
-    WrapperKind,
+    Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation, WrapperKind,
 };
 
 /// The replica's local name for the caller identity a policy compares against.

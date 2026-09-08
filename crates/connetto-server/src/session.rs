@@ -716,6 +716,10 @@ struct HandshakeOutcome<Id, Key> {
     /// The logging context, opened as soon as the run has a handle so that a
     /// refused grant is recorded inside it.
     span: tracing::Span,
+    /// The sending half of the outbound channel, held by `SessionState`. Created here rather than in the run loop so the session is registered before the handshake ack leaves, since a revocation crossing that gap would otherwise find no session to close.
+    outbound_tx: mpsc::UnboundedSender<Outbound>,
+    /// The receiving half of the outbound channel, drained by the run loop.
+    outbound_rx: mpsc::UnboundedReceiver<Outbound>,
 }
 
 /// One item waiting on the outbound queue.
@@ -1017,7 +1021,7 @@ pub struct SessionManager<
     /// waits for it, because a patch delivered before the store catches up is
     /// answered from facts the change already invalidated, and in the allow
     /// direction no later correction takes the row back.
-    upkeep: OnceLock<Arc<dyn crate::openfga::StoreUpkeep>>,
+    upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     /// A second executor asked about the row as it is now, alongside the one
     /// that delivers, so a divergence between them fails a run.
     ///
@@ -1069,6 +1073,7 @@ where
             target,
             guard,
             config,
+            None,
         )
     }
 }
@@ -1094,6 +1099,7 @@ where
         target: PgWriteTarget<W>,
         guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
+        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     ) -> Arc<Self> {
         Self::with_oplog(
             materializer,
@@ -1105,6 +1111,7 @@ where
             target,
             guard,
             config,
+            upkeep,
         )
     }
 }
@@ -1135,6 +1142,7 @@ where
         target: PgWriteTarget<W>,
         guard: Arc<RequestGuard<String>>,
         config: SessionConfig,
+        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
@@ -1153,7 +1161,7 @@ where
             config,
             guard,
             auth_retry: RetryPolicy::new(),
-            upkeep: OnceLock::new(),
+            upkeep,
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
         })
@@ -1172,24 +1180,6 @@ where
     Key: CapabilityKey,
     W: ConnettoWatermarkSchema<Id = Id>,
 {
-    /// Maintain the authorization store from the change stream.
-    ///
-    /// Set once, after construction, because the upkeep is built from the
-    /// executor this manager already holds and so cannot be assembled before
-    /// it. A second call is refused rather than allowed to replace a live
-    /// collaborator, which would leave events either side of the swap
-    /// answered against two different stores.
-    ///
-    /// # Errors
-    ///
-    /// The upkeep handed over, when one is already installed.
-    pub fn install_store_upkeep(
-        &self,
-        upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
-    ) -> Result<(), Arc<dyn crate::openfga::StoreUpkeep>> {
-        self.upkeep.set(upkeep)
-    }
-
     /// Ask a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
     ///
@@ -2034,7 +2024,7 @@ where
         &self,
         event: &ChangeEvent,
     ) -> Result<Vec<GrantMove>, SessionError> {
-        match self.upkeep.get() {
+        match &self.upkeep {
             Some(upkeep) => upkeep
                 .keep_current(event)
                 .await
@@ -2347,6 +2337,10 @@ where
     ///
     /// Returns the session identity, or `None` when the peer closed before
     /// sending a handshake.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "registration must sit between the grant checks and the ack, so splitting it would let a revocation cross the gap again"
+    )]
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
@@ -2462,8 +2456,22 @@ where
             .authority
             .mint_handle(session_id)
             .map_err(|err| SessionError::Handle(err.to_string()))?;
+        // Register BEFORE sending the ack. The ack is the client's signal that
+        // this session handle is addressable: close_session and revocation hooks
+        // fire as soon as the ack arrives. Without the entry already in the map
+        // those calls see None and the fatal frame is never delivered.
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        self.register_connection(
+            session_id,
+            connection_num,
+            principal
+                .identity()
+                .map(|identity| identity.user_id.to_string()),
+            &outbound_tx,
+        )
+        .await;
 
-        transport
+        if let Err(err) = transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
                 connection_id: format!("connection-{connection_num}"),
                 session_token: session_id.to_string(),
@@ -2474,7 +2482,12 @@ where
                 last_applied_seq: applied_watermark,
             }))
             .await
-            .map_err(transport_err)?;
+        {
+            // Registering before the ack means an ack that never leaves would
+            // otherwise strand the entry, since no run loop follows to drop it.
+            self.unregister_connection(session_id, connection_num).await;
+            return Err(transport_err(err));
+        }
         Ok(Some(HandshakeOutcome {
             connection_num,
             principal: Arc::new(principal),
@@ -2482,6 +2495,8 @@ where
             applied_watermark,
             refused_grants,
             span,
+            outbound_tx,
+            outbound_rx,
         }))
     }
     /// Refuse a caller that is over a rate limit, reporting whether it was.
@@ -2781,23 +2796,16 @@ where
             applied_watermark,
             refused_grants,
             span: _,
+            outbound_tx,
+            mut outbound_rx,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(resume_lsn, "connection established");
 
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
-        self.register_connection(
-            session_id,
-            connection_num,
-            principal
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
-            &outbound_tx,
-        )
-        .await;
         // The refusals the handshake collected are tallied here rather than as
-        // they happened, because only now is the caller resolved, and only now
-        // is the connection registered so a ban can close it.
+        // they happened, because the caller may not be fully resolved until all
+        // grants are checked. The connection is already registered (in
+        // run_handshake, before the ack) so a crossing ban can close it.
         let refused = self
             .guard
             .refused_grants(Self::caller(&principal), refused_grants);

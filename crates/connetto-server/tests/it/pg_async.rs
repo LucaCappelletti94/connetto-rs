@@ -393,6 +393,7 @@ async fn async_pg_reexec_bootstraps_min() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_transport, mut client) = loopback();
@@ -724,6 +725,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_transport, mut client) = loopback();
@@ -745,15 +747,16 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
         bootstrap_agg(&mut client, "count", "SELECT COUNT(*) FROM agg_family").await,
         "3",
     );
-    // SUM(amount) over BIGINT arrives from PG as NUMERIC and decodes to a double.
+    // SUM(amount) over BIGINT arrives from PG as NUMERIC; the fold path now
+    // renders it as a JSON string to preserve exactness, matching value_to_json.
     assert_eq!(
         bootstrap_agg(&mut client, "sum", "SELECT SUM(amount) FROM agg_family").await,
-        "60.0",
+        "\"60\"",
     );
-    // AVG exercises the two-column (SUM, COUNT) seed.
+    // AVG exercises the two-column (SUM, COUNT) seed; renders as a decimal string.
     assert_eq!(
         bootstrap_agg(&mut client, "avg", "SELECT AVG(amount) FROM agg_family").await,
-        "20.0",
+        "\"20.0000000000000000\"",
     );
     // VAR_POP exercises the three-column (SUM, SUM(x*x), COUNT) seed. Assert with
     // a tolerance since the value is not exactly representable.

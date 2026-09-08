@@ -456,6 +456,7 @@ pub(crate) struct PlannedRow {
 /// Nothing has been written when this exists: every refusal happened while it
 /// was built, and the collisions are reported before anything is overwritten,
 /// which is the shape the logout protocol already has (R56 decision 3).
+#[must_use = "pass this plan and an ImportChoices to apply_import. Dropping it leaves the import incomplete"]
 #[derive(Debug)]
 pub struct ImportPlan {
     pub(crate) archive: Incoming,

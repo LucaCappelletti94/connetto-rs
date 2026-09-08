@@ -9,18 +9,21 @@
 //! goes to the structured log for the operator.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use connetto_core::codec::encode_control;
 use connetto_core::messages::{
-    ControlMessage, Handshake, Ping, SUBSCRIPTION_REFUSED, Subscribe, SubscriptionSpec,
+    AckCredits, ControlMessage, FullResyncReason, Handshake, Ping, SUBSCRIPTION_REFUSED, Subscribe,
+    SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, OplogConfig, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    InMemoryOplog, Materializer, NoConnector, OplogConfig, PageKey, PageSpec, RequestGuard,
+    SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
@@ -37,7 +40,10 @@ struct BrokenSnapshot;
 impl SnapshotSource for BrokenSnapshot {
     type Error = String;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -50,7 +56,10 @@ impl SnapshotSource for BrokenSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -282,6 +291,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
             .expect("build write target"),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -349,6 +359,194 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         .await
         .expect("serve task")
         .expect("session ends cleanly after resumed refusals");
+}
+/// A snapshot source that succeeds on the first page of a read up to a fixed
+/// number of times and always fails on subsequent pages, exposing the
+/// `restart_or_refuse` once-only guard.
+struct PagedThenBrokenSnapshot {
+    first_page_calls: Arc<AtomicUsize>,
+    first_page_limit: usize,
+}
+
+impl PagedThenBrokenSnapshot {
+    fn new(limit: usize) -> Self {
+        Self {
+            first_page_calls: Arc::new(AtomicUsize::new(0)),
+            first_page_limit: limit,
+        }
+    }
+}
+
+impl SnapshotSource for PagedThenBrokenSnapshot {
+    type Error = String;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 1.0,
+            width: 100,
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "test double has no async work to do"
+    )]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &connetto_core::Principal,
+        page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        if page.after.is_some() {
+            return Err("second page always fails".to_owned());
+        }
+        let prev = self.first_page_calls.fetch_add(1, Ordering::Relaxed);
+        if prev < self.first_page_limit {
+            Ok(SnapshotPage {
+                patchset: vec![],
+                cursor: connetto_core::Cursor::new(vec![]),
+                next: Some(PageKey { values: vec![] }),
+                filled: false,
+                widest_row: 0,
+                rows: 0,
+                bytes: 0,
+            })
+        } else {
+            Err("first-page limit reached".to_owned())
+        }
+    }
+}
+
+/// Outcome of reading past the snapshot phase of a subscription.
+enum RestartOrRefusal {
+    Restart(FullResyncReason),
+    Refused,
+}
+
+/// Skip control frames that are not a restart notice or refusal, returning the
+/// first one that is. Bulk frames are consumed silently.
+async fn next_restart_or_refusal<T: Transport>(client: &mut T) -> RestartOrRefusal {
+    loop {
+        match next_control(client).await {
+            ControlMessage::FullResyncRequired(r) => {
+                return RestartOrRefusal::Restart(r.reason);
+            }
+            ControlMessage::NonFatalError(err) => {
+                assert_eq!(
+                    err.detail, SUBSCRIPTION_REFUSED,
+                    "refusal must carry the fixed phrase"
+                );
+                return RestartOrRefusal::Refused;
+            }
+            _ => {}
+        }
+    }
+}
+/// Complete the opening handshake for `user`, blocking until the server acks.
+async fn client_handshake<T: Transport>(client: &mut T, user: &str) {
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, user)
+                .with_grant(connetto_core::messages::Grant::new(format!("user:{user}"))),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(client).await else {
+        panic!("expected handshake ack");
+    };
+}
+
+/// Drive credits until the subscription refuses, counting restarts along the way.
+async fn count_restart_attempts<T: Transport>(client: &mut T) -> usize {
+    let mut count = 0;
+    loop {
+        client
+            .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
+            .await
+            .expect("send AckCredits");
+        match next_restart_or_refusal(client).await {
+            RestartOrRefusal::Restart(reason) => {
+                assert_eq!(
+                    reason,
+                    FullResyncReason::SnapshotInterrupted,
+                    "restart reason must be SnapshotInterrupted"
+                );
+                count += 1;
+            }
+            RestartOrRefusal::Refused => return count,
+        }
+    }
+}
+
+/// Drain frames until a pong with `nonce` arrives, consuming any bulk frames.
+async fn drain_until_pong<T: Transport>(client: &mut T, nonce: u64) {
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce }))
+        .await
+        .expect("send ping");
+    loop {
+        match client.recv().await.expect("recv") {
+            Some(connetto_core::traits::IncomingFrame::Control(ControlMessage::Pong(pong))) => {
+                assert_eq!(pong.nonce, nonce);
+                return;
+            }
+            Some(_) => {}
+            None => panic!("connection closed before pong"),
+        }
+    }
+}
+
+/// A page failing part way through a read triggers exactly one restart attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mid_read_page_failure_causes_exactly_one_restart_then_refuses() {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let manager = SessionManager::new(
+        materializer,
+        PagedThenBrokenSnapshot::new(3),
+        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
+        Arc::new(TestGrantChecker),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    );
+    let (server_end, mut client) = loopback();
+    let server = Arc::clone(&manager);
+    let serve = tokio::spawn(async move { server.serve(server_end).await });
+
+    client_handshake(&mut client, "restart-probe").await;
+    let ControlMessage::SnapshotBegin(_) = first_reply(&mut client, "paged", QUERY).await else {
+        panic!("expected SnapshotBegin from initial read");
+    };
+
+    // Each AckCredits triggers pump_page; pump_page fails on the second
+    // page; restart_or_refuse attempts one replacement read then refuses.
+    let restart_count = count_restart_attempts(&mut client).await;
+
+    // The once-only guard sets restarted=true so the replacement read cannot
+    // restart a second time. restart_count > 1 means the guard never fired,
+    // which is exactly what the delete-field mutant produces.
+    assert_eq!(
+        restart_count, 1,
+        "a mid-read page failure must cause exactly one restart"
+    );
+    drain_until_pong(&mut client, 99).await;
+    client.close().await.expect("close");
+    serve
+        .await
+        .expect("serve task")
+        .expect("session ends cleanly after a refused restart");
 }
 
 /// The process-global log destination, installed once and read back.

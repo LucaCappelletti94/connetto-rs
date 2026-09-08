@@ -12,11 +12,13 @@ use connetto_file_core::{
     MimeClass, MemStore, EncryptingStore, process_file, reassemble,
 };
 
+# futures_executor::block_on(async {
 let data: Vec<u8> = b"ATGCATGCATGCATGCATGC".iter().copied().cycle().take(512).collect();
 let root_key = [0u8; 32];
 let store = EncryptingStore::new(MemStore::new(), &root_key);
 
-let manifest = process_file(&data, MimeClass::Fasta, &store).unwrap();
-let recovered = reassemble(&manifest, &store).unwrap();
+let manifest = process_file(&data, MimeClass::Fasta, &store).await.unwrap();
+let recovered = reassemble(&manifest, &store).await.unwrap();
 assert_eq!(data, recovered);
+# });
 ```

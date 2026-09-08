@@ -1,0 +1,57 @@
+[package]
+name = "connetto-file-server"
+description = "File server for connetto-rs: storage backends, upload protocol, ticket-gated serving, and GC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[test]]
+name = "it"
+path = "tests/it/mod.rs"
+
+[dependencies]
+connetto-file-core = { path = "../connetto-file-core" }
+axum = "0.8"
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+thiserror.workspace = true
+# Typed diesel queries for manifest and refcount state.
+diesel = { workspace = true, features = ["postgres_backend", "chrono"] }
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
+bb8 = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Hash verification on PUT /chunks/{hash} (the client encrypts; we verify BLAKE3 of opaque bytes).
+blake3 = "1"
+# Ed25519 ticket signing and verification, same crate family as the auth stack.
+ring = "0.17"
+# S3-compatible object store backend.
+object_store = { version = "0.11", features = ["aws"] }
+# Compact binary serialization for ticket payloads.
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde = { workspace = true }
+# URL-safe base64 for ticket token encoding.
+base64 = "0.22"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+# Container-backed Postgres for DB integration tests.
+testcontainers = { version = "0.28", features = ["http_wait_plain", "watchdog"] }
+# object_store local filesystem is always available without a feature flag.
+object_store = { version = "0.11" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+axum = { version = "0.8", features = [] }
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

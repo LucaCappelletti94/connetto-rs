@@ -47,12 +47,12 @@ tokio = { workspace = true, features = ["process"] }
 # The admin and role pools that reset the fixture and back the write, snapshot,
 # and connector paths.
 diesel = { workspace = true, features = ["postgres_backend"] }
-diesel-async = { version = "0.7", default-features = false, features = [
+diesel-async = { version = "0.9", default-features = false, features = [
   "postgres",
   "bb8",
 ] }
 # Building the mutation changeset a client uploads.
-sqlite-diff-rs = { version = "0.10.0", default-features = false }
+sqlite-diff-rs = { version = "0.12", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
-sqlite-diff-rs = { version = "0.10.0", default-features = false }
+sqlite-diff-rs = { version = "0.12", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Joining a fresh anonymous session keyring in-process, replacing the external

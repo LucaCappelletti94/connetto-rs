@@ -403,6 +403,7 @@ jobs:
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-file-core
+              -p connetto-file-server
             bins: ''
     steps:
       - uses: actions/checkout@v7

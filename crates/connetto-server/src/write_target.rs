@@ -17,7 +17,6 @@ use connetto_core::messages::ConflictRow;
 use diesel::OptionalExtension;
 use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
 use diesel_async::pooled_connection::bb8::Pool;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::ParserDB;
@@ -189,37 +188,34 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
-            .transaction::<WriteOutcome, CommitError, _>(|c| {
-                async move {
-                    binding.apply(c).await?;
-                    for op in &plan.ops {
-                        let Some(conflict) = &op.conflict else {
-                            continue;
-                        };
-                        if let ConflictProbe::Stale(row) = probe_conflict_pg(conflict, c)
-                            .await
-                            .map_err(CommitError::Probe)?
-                        {
-                            return Ok(conflict_outcome(conflict, row));
-                        }
+            .transaction::<WriteOutcome, CommitError, _>(async move |c| {
+                binding.apply(c).await?;
+                for op in &plan.ops {
+                    let Some(conflict) = &op.conflict else {
+                        continue;
+                    };
+                    if let ConflictProbe::Stale(row) = probe_conflict_pg(conflict, c)
+                        .await
+                        .map_err(CommitError::Probe)?
+                    {
+                        return Ok(conflict_outcome(conflict, row));
                     }
-                    let adapter = PgAdapter::new(catalog);
-                    let affected =
-                        apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter)
-                            .await?;
-                    if affected < expected {
-                        return Err(CommitError::Denied);
-                    }
-                    // Advance the durable watermark in the SAME transaction: the
-                    // apply and its dedupe record are one atomic step. The
-                    // deployment owns the table; connetto keeps the monotone
-                    // GREATEST advance inside `watermark_upsert`.
-                    W::watermark_upsert(watermark_session, seq)
-                        .execute(c)
-                        .await?;
-                    Ok(WriteOutcome::Applied)
                 }
-                .scope_boxed()
+                let adapter = PgAdapter::new(catalog)
+                    .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
+                let affected =
+                    apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter).await?;
+                if affected < expected {
+                    return Err(CommitError::Denied);
+                }
+                // Advance the durable watermark in the SAME transaction: the
+                // apply and its dedupe record are one atomic step. The
+                // deployment owns the table; connetto keeps the monotone
+                // GREATEST advance inside `watermark_upsert`.
+                W::watermark_upsert(watermark_session, seq)
+                    .execute(c)
+                    .await?;
+                Ok(WriteOutcome::Applied)
             })
             .await;
         match outcome {

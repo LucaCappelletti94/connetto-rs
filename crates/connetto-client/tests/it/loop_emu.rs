@@ -34,7 +34,7 @@ use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID}
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::backend::{BuiltinKind, Postgres, Value as PgValue};
+use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
@@ -1524,7 +1524,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
@@ -1554,7 +1554,7 @@ impl AsyncConnector for QueuedConnector {
     fn execute_scalar_row(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kinds: &[BuiltinKind],
+        _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
@@ -1611,6 +1611,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1843,6 +1844,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1877,7 +1879,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     let subs = ["count", "sum", "avg"];
     let seeded = collect_aggregates(&mut client, &subs).await;
     assert_eq!(seeded["count"], "0", "COUNT(*) seed over empty table");
-    assert_eq!(seeded["sum"], "0.0", "SUM seed over empty table");
+    assert_eq!(seeded["sum"], "null", "SUM seed over empty table");
     assert_eq!(
         seeded["avg"], "null",
         "AVG seed over empty table is undefined"
@@ -1892,8 +1894,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_first = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_first["count"], "1");
-    assert_eq!(after_first["sum"], "10.0");
-    assert_eq!(after_first["avg"], "10.0");
+    assert_eq!(after_first["sum"], "10");
+    assert_eq!(after_first["avg"], "\"10.0000000000000000\"");
 
     // Insert quantity 20: COUNT 2, SUM 30, AVG 15.
     source
@@ -1902,8 +1904,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_second = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_second["count"], "2");
-    assert_eq!(after_second["sum"], "30.0");
-    assert_eq!(after_second["avg"], "15.0");
+    assert_eq!(after_second["sum"], "30");
+    assert_eq!(after_second["avg"], "\"15.0000000000000000\"");
 
     // Delete quantity 10: COUNT 1, SUM 20, AVG 20.
     source
@@ -1912,8 +1914,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
     drain_events(&manager, &mut source).await;
     let after_delete = collect_aggregates(&mut client, &subs).await;
     assert_eq!(after_delete["count"], "1");
-    assert_eq!(after_delete["sum"], "20.0");
-    assert_eq!(after_delete["avg"], "20.0");
+    assert_eq!(after_delete["sum"], "20");
+    assert_eq!(after_delete["avg"], "\"20.0000000000000000\"");
 
     client.close().await.expect("close");
     server.await.expect("join server");
@@ -1940,7 +1942,7 @@ impl AsyncConnector for GatedSeed {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
@@ -1962,7 +1964,7 @@ impl AsyncConnector for GatedSeed {
     fn execute_scalar_row(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kinds: &[BuiltinKind],
+        _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
@@ -2024,6 +2026,7 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2115,6 +2118,7 @@ async fn an_aggregates_first_frame_is_its_full_result() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2308,6 +2312,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2434,6 +2439,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2685,6 +2691,7 @@ async fn live_value_tracks_a_server_aggregate() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2818,6 +2825,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3150,6 +3158,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -4056,6 +4065,7 @@ fn status_manager<O: Oplog>(
         server_write_target(fixture),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     )
 }
 
@@ -4324,6 +4334,7 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
         target,
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

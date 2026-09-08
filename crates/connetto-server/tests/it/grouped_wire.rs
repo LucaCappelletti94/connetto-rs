@@ -49,6 +49,7 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
         pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
         guard,
         SessionConfig::default(),
+        None,
     )
 }
 

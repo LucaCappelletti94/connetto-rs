@@ -20,7 +20,6 @@ mod rls {
     use diesel::sql_query;
     use diesel::sql_types::Bool;
     use diesel_async::pooled_connection::bb8::Pool;
-    use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::Postgres;
@@ -220,14 +219,11 @@ mod rls {
                 .await
                 .map_err(|err| RlsAuthError::Pool(err.to_string()))?;
             let present = conn
-                .transaction::<bool, diesel::result::Error, _>(|c| {
-                    async move {
-                        binding.apply(c).await?;
-                        crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
-                        let row: Present = query.get_result(c).await?;
-                        Ok(row.present)
-                    }
-                    .scope_boxed()
+                .transaction::<bool, diesel::result::Error, _>(async move |c| {
+                    binding.apply(c).await?;
+                    crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
+                    let row: Present = query.get_result(c).await?;
+                    Ok(row.present)
                 })
                 .await?;
             Ok(present)
@@ -262,16 +258,13 @@ mod rls {
                 .await
                 .map_err(|err| RlsAuthError::Pool(err.to_string()))?;
             let present = conn
-                .transaction::<Option<Present>, diesel::result::Error, _>(|c| {
-                    async move {
-                        sql_query(format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
-                            .execute(c)
-                            .await?;
-                        binding.apply(c).await?;
-                        crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
-                        query.get_result(c).await.optional()
-                    }
-                    .scope_boxed()
+                .transaction::<Option<Present>, diesel::result::Error, _>(async move |c| {
+                    sql_query(format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
+                        .execute(c)
+                        .await?;
+                    binding.apply(c).await?;
+                    crate::counters::add(&crate::counters::AUTHORIZATION_CALLS, 1);
+                    query.get_result(c).await.optional()
                 })
                 .await?;
             Ok(present.is_some())

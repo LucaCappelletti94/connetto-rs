@@ -694,16 +694,8 @@ async fn main() -> Result<()> {
         write,
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
+        Some(upkeep),
     );
-
-    // The store follows the change stream from here: every changed row's
-    // difference is written before the row reaches anybody.
-    if manager.install_store_upkeep(upkeep).is_err() {
-        return Err(anyhow!(
-            "the authorization store upkeep was installed twice, which would answer \
-             events either side of the swap against two different stores"
-        ));
-    }
     install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing
     // its next handshake. The hook fires synchronously inside the revoke, so
@@ -869,37 +861,46 @@ async fn build_authorization(
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated.install_model(&mut setup, &store_id).await?;
-    // The rules being new means nothing on the service stands behind them yet.
-    // An unchanged description means the facts were loaded on the boot that
-    // wrote it, and the change stream has kept them current since. Read before
-    // the index is built, because both come out of the one translation and the
-    // index consumes it.
-    let load = match &model {
-        ModelState::Written(_) => Some(translated.load_records(reader_pool).await?),
-        ModelState::Adopted(_) => None,
-    };
+    // Build the loader once: both the Written and Adopted paths use it, though
+    // for different passes. The uncounted client keeps boot writes out of the
+    // authorization-call counter.
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
+        setup,
+        store_id.clone(),
+    )
+    .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
+    .authorization_model_id(model.id().to_owned());
+    match &model {
+        ModelState::Written(_) => {
+            let n = translated
+                .load_into(reader_pool, &loader)
+                .await
+                .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
+            tracing::info!(
+                model = model.id(),
+                facts = n,
+                "authorization rules are new, loading the facts behind them"
+            );
+        }
+        ModelState::Adopted(_) => {
+            // Reconcile the whole-shape materialisation regions on every
+            // adopted boot. A region already correct costs a read round-trip
+            // with zero writes; a missing region is filled in case the
+            // previous boot failed before materialise_groups completed.
+            translated
+                .reconcile_materialised(reader_pool, &loader)
+                .await
+                .map_err(|err| anyhow!("reconciling the authorization store: {err}"))?;
+            tracing::info!(
+                model = model.id(),
+                "authorization rules already installed, reconciling whole-shape regions"
+            );
+        }
+    }
 
     let (shapes, translator, reach) = translated.into_parts();
     let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
-    if let Some(records) = load {
-        tracing::info!(
-            model = model.id(),
-            facts = records.len(),
-            "authorization rules are new, loading the facts behind them"
-        );
-        // The same writer the per-row upkeep uses, over the same index, on the
-        // uncounted client so a load does not read as change-path questions.
-        OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-            Arc::clone(&shapes),
-            setup,
-            store_id.clone(),
-        )
-        .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
-        .authorization_model_id(model.id().to_owned())
-        .write_records(&records)
-        .await
-        .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
-    }
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),

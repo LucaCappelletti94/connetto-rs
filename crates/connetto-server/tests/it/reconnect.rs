@@ -383,6 +383,7 @@ async fn cursor_outside_window_forces_full_resync() {
             .expect("build write target"),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

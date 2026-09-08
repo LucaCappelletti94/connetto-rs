@@ -31,15 +31,16 @@ async fn serve(fixture: &Fixture) -> Server {
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
         .await;
-    fixture.start_replication(&["notes"]).await;
     let snapshot =
         PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source");
     spawn_server(
-        ServerConfig::new(PG_DDL, fixture.admin_url()).with_writable(
-            RuntimeWritableCatalog::builder()
-                .versioned("notes", "edited_at")
-                .build(),
-        ),
+        ServerConfig::new(PG_DDL, fixture.admin_url())
+            .with_writable(
+                RuntimeWritableCatalog::builder()
+                    .versioned("notes", "edited_at")
+                    .build(),
+            )
+            .with_replication(["notes"]),
         snapshot,
         HarnessAuth::roster(
             RosterAuth::granting("alice")
@@ -50,6 +51,7 @@ async fn serve(fixture: &Fixture) -> Server {
         fixture.admin().clone(),
         fixture.admin().clone(),
     )
+    .await
 }
 
 /// Wait until the registry holds `expected` connections.

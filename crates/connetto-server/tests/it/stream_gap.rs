@@ -267,6 +267,7 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
         pg_write_target::<ConnettoWatermark>(admin.clone(), PG_DDL).expect("build write target"),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
+        None,
     );
 
     let (server_end, mut client) = loopback();

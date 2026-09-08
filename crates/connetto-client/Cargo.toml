@@ -66,7 +66,7 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.10.0", default-features = false }
+sqlite-diff-rs = { version = "0.12", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
@@ -173,7 +173,7 @@ connetto-server = { path = "../connetto-server" }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The write-path loop tests read the server's Postgres target back through a
 # typed diesel-async query, so the async DSL must be nameable directly.
-diesel-async = { version = "0.7", default-features = false, features = [
+diesel-async = { version = "0.9", default-features = false, features = [
   "postgres",
   "bb8",
 ] }

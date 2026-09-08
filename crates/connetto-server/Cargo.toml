@@ -58,7 +58,7 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.10.0", default-features = false }
+sqlite-diff-rs = { version = "0.12", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # The page budget's row-cost measure. subql prices a RowPage row as its
@@ -70,7 +70,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 parking_lot = "0.12"
 # Async Postgres write path: the diesel-async apply and re-exec connector over a
 # bb8-pooled AsyncPgConnection. tokio-postgres backed, no libpq.
-diesel-async = { version = "0.7", default-features = false, features = ["postgres", "bb8"] }
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
 # Walking a result set row by row, so a page reads its column names once
 # instead of once per row (R58 review). diesel-async's own row stream is the
 # only place those names are available without deserializing per row.
@@ -121,9 +121,8 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 [dev-dependencies]
 # Building a change event by hand, so the store upkeep can be driven without
 # standing up a replication stream. subql re-exports `ChangeEvent` and not the
-# types its fields are made of. Routed to the same fork the root `[patch]` uses,
-# so one node resolves.
-pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+# types its fields are made of.
+pg_walstream = "0.8"
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
 connetto-core = { workspace = true, features = ["test-support"] }

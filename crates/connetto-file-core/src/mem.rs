@@ -1,5 +1,6 @@
 //! In-memory chunk store backed by a mutex-held hash map.
 
+use core::future::{self, Future};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
@@ -27,29 +28,38 @@ impl MemStore {
 impl ChunkStore for MemStore {
     type Error = Infallible;
 
-    fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Infallible> {
+    fn write_chunk(
+        &self,
+        hash: &ChunkHash,
+        data: &[u8],
+    ) -> impl Future<Output = Result<(), Infallible>> + Send {
         self.chunks
             .lock()
             .expect("MemStore lock is not poisoned")
             .insert(*hash, data.to_vec());
-        Ok(())
+        future::ready(Ok(()))
     }
 
-    fn read_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Infallible> {
-        Ok(self
+    fn read_chunk(
+        &self,
+        hash: &ChunkHash,
+    ) -> impl Future<Output = Result<Vec<u8>, Infallible>> + Send {
+        let val = self
             .chunks
             .lock()
             .expect("MemStore lock is not poisoned")
             .get(hash)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        future::ready(Ok(val))
     }
 
-    fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, Infallible> {
-        Ok(self
+    fn has_chunk(&self, hash: &ChunkHash) -> impl Future<Output = Result<bool, Infallible>> + Send {
+        let present = self
             .chunks
             .lock()
             .expect("MemStore lock is not poisoned")
-            .contains_key(hash))
+            .contains_key(hash);
+        future::ready(Ok(present))
     }
 }

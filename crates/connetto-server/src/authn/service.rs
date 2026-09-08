@@ -405,6 +405,12 @@ impl<S: AuthStore> AuthService<S> {
     fn notify_revoked(&self, session_id: SessionId) {
         if let Some(hook) = self.revocation_hook.get() {
             hook(session_id);
+        } else {
+            tracing::warn!(
+                session = %session_id,
+                "revocation hook not set: the session's live socket will keep receiving patches \
+                 until its next handshake is refused"
+            );
         }
     }
 

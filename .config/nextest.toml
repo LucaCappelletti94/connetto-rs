@@ -52,3 +52,9 @@ test-group = 'docker'
 # runtimes, so the wedge kill waits longer here.
 threads-required = 2
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(connetto-file-server) & (test(serve::) | test(sweep::) | test(upload::) | test(preflight::))'
+test-group = 'docker'
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 5 }
