@@ -18,13 +18,14 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
 use connetto_server::{
     AbuseConfig, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, PageSpec,
-    ReaderReserve, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, loopback, pg_write_target,
+    ReaderReserve, RequestGuard, SessionConfig, SessionError, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID, with_user};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
+use tokio::task::JoinHandle;
 
 /// No application tables; tickets do not subscribe or mutate.
 const PG_DDL: &str = "CREATE TABLE _placeholder (id INT PRIMARY KEY);";
@@ -272,16 +273,29 @@ async fn request_ticket(
     }
 }
 
-/// A visible file yields a `ContentTicketGrant` carrying the signer's URL.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn visible_file_yields_grant() {
-    let fixture = Fixture::acquire().await;
-    let reader_pool = setup_reader(&fixture).await;
+/// The manager shape every test in this file builds.
+type TicketManager<S> = SessionManager<
+    NeverSnapshot,
+    RosterAuth,
+    ConnettoWatermark,
+    NoConnector,
+    InMemoryOplog,
+    String,
+    String,
+    S,
+>;
 
-    let manager = SessionManager::with_oplog(
+/// Build a standard session manager with the default guard and oplog.
+fn build_standard_manager<S: ContentTicketSigner>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    signer: S,
+    throttle: &ThrottleConfig,
+) -> Arc<TicketManager<S>> {
+    SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
         NeverSnapshot,
-        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        roster,
         Arc::new(TestGrantChecker),
         NoConnector,
         InMemoryOplog::default(),
@@ -289,14 +303,67 @@ async fn visible_file_yields_grant() {
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
         None,
-        OkSigner,
-        ThrottleConfig::default(),
-    );
+        signer,
+        *throttle,
+    )
+}
 
+/// Open one session against a standard manager, completing the handshake for `identity`.
+async fn open_session_with_handshake<S: ContentTicketSigner + Send + Sync + 'static>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    signer: S,
+    throttle: &ThrottleConfig,
+    identity: &str,
+) -> (LoopbackTransport, JoinHandle<Result<(), SessionError>>) {
+    let manager = build_standard_manager(reader_pool, roster, signer, throttle);
     let (server_end, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_end));
+    do_handshake(&mut client, identity).await;
+    (client, server)
+}
 
-    do_handshake(&mut client, "alice").await;
+/// Queue a `ContentTicketRequest` on `client` without reading the response.
+async fn send_ticket_request(
+    client: &mut LoopbackTransport,
+    request_id: &str,
+    file_id: [u8; 32],
+    verb: ContentVerb,
+) {
+    client
+        .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+            request_id: request_id.to_owned(),
+            file_id,
+            verb,
+        }))
+        .await
+        .expect("send ticket request");
+}
+
+/// Drain bulk frames from `client` until a control frame or clean close arrives.
+async fn drain_to_control(client: &mut LoopbackTransport) {
+    loop {
+        match client.recv().await.expect("recv frame") {
+            Some(IncomingFrame::Control(_)) | None => break,
+            Some(IncomingFrame::Bulk(_)) => {}
+        }
+    }
+}
+
+/// A visible file yields a `ContentTicketGrant` carrying the signer's URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_file_yields_grant() {
+    let fixture = Fixture::acquire().await;
+    let reader_pool = setup_reader(&fixture).await;
+
+    let (mut client, server) = open_session_with_handshake(
+        reader_pool,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        OkSigner,
+        &ThrottleConfig::default(),
+        "alice",
+    )
+    .await;
 
     // Before: alice requests a read ticket.
     let resp = request_ticket(&mut client, "req-1", FILE_ID, ContentVerb::Read).await;
@@ -322,25 +389,14 @@ async fn invisible_file_is_refused() {
     let fixture = Fixture::acquire().await;
     let reader_pool = setup_reader(&fixture).await;
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
-        NeverSnapshot,
+    let (mut client, server) = open_session_with_handshake(
+        reader_pool,
         RosterAuth::granting("bob").withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        NoConnector,
-        InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
         OkSigner,
-        ThrottleConfig::default(),
-    );
-
-    let (server_end, mut client) = loopback();
-    let server = tokio::spawn(manager.serve(server_end));
-
-    do_handshake(&mut client, "bob").await;
+        &ThrottleConfig::default(),
+        "bob",
+    )
+    .await;
 
     // Before: bob requests a ticket for a file the visibility function does not return.
     let resp = request_ticket(&mut client, "req-2", FILE_ID, ContentVerb::Read).await;
@@ -368,21 +424,12 @@ async fn over_budget_write_refused_with_same_detail_as_invisible() {
     // 1-byte limit: the first 1-byte write ticket uses the whole budget.
     let content_config = ThrottleConfig::new().with_content_bytes_per_identity(1, WINDOW);
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
-        NeverSnapshot,
-        // Granting alice lets her open a session; bob is not withheld either
-        // (only WITHHELD_ID is withheld) so bob can open a session too.
+    // alice is granted; WITHHELD_ID is the only withheld principal, so bob can also open a session.
+    let manager = build_standard_manager(
+        reader_pool,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        NoConnector,
-        InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
         OkSigner,
-        content_config,
+        &content_config,
     );
 
     let (alice_end, mut alice) = loopback();
@@ -462,25 +509,14 @@ async fn signer_failure_yields_distinct_detail() {
     let fixture = Fixture::acquire().await;
     let reader_pool = setup_reader(&fixture).await;
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
-        NeverSnapshot,
+    let (mut client, server) = open_session_with_handshake(
+        reader_pool,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        NoConnector,
-        InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
         BrokenSigner,
-        ThrottleConfig::default(),
-    );
-
-    let (server_end, mut client) = loopback();
-    let server = tokio::spawn(manager.serve(server_end));
-
-    do_handshake(&mut client, "alice").await;
+        &ThrottleConfig::default(),
+        "alice",
+    )
+    .await;
 
     // Before: alice requests a ticket; file is visible but signer is broken.
     let resp = request_ticket(&mut client, "req-4", FILE_ID, ContentVerb::Read).await;
@@ -519,9 +555,9 @@ async fn ticket_path_holds_reader_permit() {
 
     // One anonymous slot: the pool has capacity for many connections, so only
     // the semaphore separates old behavior from new.
-    let gate = ReaderReserve::new().with_total(10).with_reserved(9).gate();
     let guard = Arc::new(
-        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default()).with_reader_gate(gate),
+        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+            .with_reader_gate(ReaderReserve::new().with_total(10).with_reserved(9).gate()),
     );
 
     let manager = SessionManager::with_oplog(
@@ -545,25 +581,16 @@ async fn ticket_path_holds_reader_permit() {
     // read is fast so each permit is taken and released before the next session
     // starts its handshake.
     let (srv_a, mut anon_a) = loopback();
-    let mgr_a = Arc::clone(&manager);
-    let task_a = tokio::spawn(async move { mgr_a.serve(srv_a).await });
+    let task_a = tokio::spawn(Arc::clone(&manager).serve(srv_a));
     do_handshake_anon(&mut anon_a, "anon-a").await;
 
     let (srv_b, mut anon_b) = loopback();
-    let mgr_b = Arc::clone(&manager);
-    let task_b = tokio::spawn(async move { mgr_b.serve(srv_b).await });
+    let task_b = tokio::spawn(Arc::clone(&manager).serve(srv_b));
     do_handshake_anon(&mut anon_b, "anon-b").await;
 
     // Session A sends a ticket request. After the fix the server acquires the
     // one anonymous permit before entering the 2-second Postgres function.
-    anon_a
-        .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
-            request_id: "req-a".to_owned(),
-            file_id: FILE_ID,
-            verb: ContentVerb::Read,
-        }))
-        .await
-        .expect("send session-A ticket request");
+    send_ticket_request(&mut anon_a, "req-a", FILE_ID, ContentVerb::Read).await;
 
     // Give session A time to enter the slow visibility function and hold the permit.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -589,12 +616,7 @@ async fn ticket_path_holds_reader_permit() {
 
     // Drain session A; it will complete the slow function then receive
     // CONTENT_TICKET_REFUSED (anonymous caller is not in the alice-only set).
-    loop {
-        match anon_a.recv().await.expect("recv session-A frame") {
-            Some(IncomingFrame::Control(_)) | None => break,
-            Some(IncomingFrame::Bulk(_)) => {}
-        }
-    }
+    drain_to_control(&mut anon_a).await;
 
     anon_b.close().await.expect("close session B");
     anon_a.close().await.expect("close session A");
@@ -612,24 +634,14 @@ async fn signer_failure_costs_no_budget() {
     let reader_pool = setup_reader(&fixture).await;
     let content_config = ThrottleConfig::new().with_content_bytes_per_identity(DECLARED, WINDOW);
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
-        NeverSnapshot,
+    let (mut client, server) = open_session_with_handshake(
+        reader_pool,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        NoConnector,
-        InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
         FlakyFirstSigner::new(),
-        content_config,
-    );
-
-    let (server_end, mut client) = loopback();
-    let server = tokio::spawn(manager.serve(server_end));
-    do_handshake(&mut client, "alice").await;
+        &content_config,
+        "alice",
+    )
+    .await;
 
     // Before (charge then mint): charges DECLARED bytes from the budget, signer
     // fails; budget is exhausted with nothing authorized.
