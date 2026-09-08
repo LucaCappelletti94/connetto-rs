@@ -5,7 +5,7 @@
 //! * [`messages`] holds every control-plane and bulk-plane wire type.
 //! * [`codec`] serialises those types to `MessagePack` and wraps them in the
 //!   length-prefixed framing documented in `docs/architecture/02-protocol.md`.
-//! * [`traits`] defines the [`Transport`], [`Store`], [`FileStore`],
+//! * [`traits`] defines the [`Transport`], [`Store`],
 //!   [`RefreshTokenStore`], and [`ReplicaKeyStore`] seams the server, native
 //!   client, and `WASM` client each fill with a platform-specific
 //!   implementation.
@@ -69,7 +69,7 @@ pub use schema::{SchemaVersion, schema_hash};
 pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;
 pub use traits::{
-    FileStore, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority, IncomingFrame,
+    GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority, IncomingFrame,
     PendingMutation, RefreshTokenStore, ReplicaKeyStore, Store, Transport,
 };
 #[cfg(feature = "loopback")]

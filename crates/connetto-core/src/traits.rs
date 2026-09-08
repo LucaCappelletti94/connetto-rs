@@ -261,26 +261,6 @@ pub trait ReplicaKeyStore {
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
-/// Content-addressed file chunk store (see `docs/architecture/07-file-sync.md`).
-///
-/// File sync is out of scope for v1 per Q7 and Q1.2, but the trait shape belongs
-/// in `connetto-core` so both server and client can compile against the same
-/// signature when file sync lands.
-#[allow(async_fn_in_trait)]
-pub trait FileStore {
-    /// Chunk-store error.
-    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
-
-    /// Persist a chunk keyed by its content hash.
-    async fn write_chunk(&mut self, hash: &[u8], data: &[u8]) -> Result<(), Self::Error>;
-
-    /// Load a chunk by its content hash.
-    async fn read_chunk(&self, hash: &[u8]) -> Result<Vec<u8>, Self::Error>;
-
-    /// Whether a chunk is present locally.
-    async fn has_chunk(&self, hash: &[u8]) -> Result<bool, Self::Error>;
-}
-
 /// Why one grant was refused at the handshake.
 ///
 /// A refusal never reaches the client: the connection stays open, the session

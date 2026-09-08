@@ -140,15 +140,9 @@ trait Store {
     async fn pending_mutations(&mut self) -> Result<Vec<PendingMutation>, Self::Error>;
     async fn discard_mutation(&mut self, client_seq: u64) -> Result<(), Self::Error>;
 }
-
-trait FileStore: Send {
-    async fn write_chunk(&self, hash: Hash, data: &[u8]) -> Result<()>;
-    async fn read_chunk(&self, hash: Hash) -> Result<Vec<u8>>;
-    async fn has_chunk(&self, hash: Hash) -> Result<bool>;
-}
 ```
 
-Native implementations use `tokio-tungstenite`, `diesel` (with SQLite backend), and `std::fs`. WASM implementations use `web-sys::WebSocket`, `sqlite-wasm-rs` over OPFS, and OPFS file APIs.
+Native implementations use `tokio-tungstenite` and `diesel` with the SQLite backend. WASM implementations use `web-sys::WebSocket` and `sqlite-wasm-rs` over OPFS. Chunk storage is not among these seams: the file crates own it, per chapter 18.
 
 The sync engine crate depends only on these traits: it has no direct dependency on native or WASM I/O primitives.
 
