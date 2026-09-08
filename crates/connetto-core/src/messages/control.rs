@@ -46,6 +46,7 @@ pub enum PauseCause {
 
 use super::{
     aggregate::AggregateUpdate,
+    content::{ContentTicketGrant, ContentTicketRequest},
     error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
@@ -95,6 +96,11 @@ pub enum ControlMessage {
     /// Server announces a membership subscription it opened on the client's
     /// behalf (R27). Precedes that subscription's `SnapshotBegin`.
     MembershipOpened(MembershipOpened),
+
+    /// Client asks for a content ticket naming one file and one verb.
+    ContentTicketRequest(ContentTicketRequest),
+    /// Server hands back the address that ticket authorizes.
+    ContentTicketGrant(ContentTicketGrant),
 
     /// Client heartbeat probe.
     Ping(Ping),
