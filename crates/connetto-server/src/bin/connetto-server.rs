@@ -79,12 +79,13 @@ use connetto_server::reach::GrantReach;
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, ProviderRegistry,
-    ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
-    RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig,
-    SessionError, SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    NoSigner, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
+    ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
+    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
+    SessionConfig, SessionError, SessionManager, ThrottleConfig, TokenAuthority,
+    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
+    connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
+    preflight,
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
@@ -695,6 +696,8 @@ async fn main() -> Result<()> {
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
         Some(upkeep),
+        NoSigner,
+        ThrottleConfig::default(),
     );
     install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing

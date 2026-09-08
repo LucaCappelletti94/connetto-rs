@@ -7,6 +7,8 @@
 
 mod abuse;
 
+mod content_ticket;
+
 mod audit_producers;
 
 mod audit_table;

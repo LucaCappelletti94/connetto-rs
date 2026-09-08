@@ -89,7 +89,7 @@ pub use reexec::{ConnettoReadSetup, NoConnector, PgReadConnector, ReadBudget, Ti
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
-    PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
+    NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
 };
 pub use slot::{SlotError, SlotLag};

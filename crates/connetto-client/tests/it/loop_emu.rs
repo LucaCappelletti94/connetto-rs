@@ -26,9 +26,10 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    ConnettoReadSetup, InMemoryOplog, Materializer, NoConnector, Oplog, OplogConfig, PageSpec,
-    PgOplog, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
+    ConnettoReadSetup, InMemoryOplog, Materializer, NoConnector, NoSigner, Oplog, OplogConfig,
+    PageSpec, PgOplog, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig, WebSocketTransport,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -4066,6 +4067,8 @@ fn status_manager<O: Oplog>(
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
         None,
+        NoSigner,
+        ThrottleConfig::default(),
     )
 }
 
