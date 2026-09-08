@@ -20,7 +20,10 @@ pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, PauseCause, SyncStatus};
-pub use error::{FatalError, FatalErrorReason, NonFatalError, RateLimited, SUBSCRIPTION_REFUSED};
+pub use error::{
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,
+    NonFatalError, RateLimited, SUBSCRIPTION_REFUSED,
+};
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};
 pub use mutation::{
