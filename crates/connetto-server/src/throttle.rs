@@ -308,10 +308,9 @@ impl ThrottleConfig {
 
     /// How many bytes of declared upload size one identity may authorize per window.
     ///
-    /// Zero means unlimited: a deployer who has not set a ceiling should not
-    /// find all uploads refused. This charges declared size so it caps
-    /// authorized bandwidth at the mint rather than requiring the file server
-    /// to report actuals back (R66).
+    /// Zero means unlimited, so a deployer who set no ceiling does not find
+    /// every upload refused. Charging the declared size caps authorized rather
+    /// than measured bandwidth.
     #[must_use]
     pub const fn with_content_bytes_per_identity(
         mut self,
@@ -898,10 +897,9 @@ impl AuthThrottle {
 
 /// The per-identity upload bandwidth meter.
 ///
-/// Charges each ticket request at the declared byte size so a caller cannot
-/// authorize unlimited upload by minting many tickets at once. Stays in memory
-/// with no schema: this is abuse prevention not accounting, and a restart
-/// forgiving a few minutes of history is not an abuse vector (R66).
+/// Charges each ticket request its declared size, so minting many tickets
+/// cannot authorize unlimited upload. In memory only, because this bounds abuse
+/// rather than accounting for usage.
 #[derive(Debug)]
 pub(crate) struct ContentThrottle {
     config: ThrottleConfig,

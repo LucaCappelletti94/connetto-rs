@@ -580,17 +580,13 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
 
-/// A [`ContentTicketSigner`] stand-in for deployments that do not wire file
-/// handling.
+/// A [`ContentTicketSigner`] for deployments without file handling.
 ///
-/// Used as the default `S` type on [`SessionManager`] so constructors that do
-/// not need content tickets compile without naming the signer type. `mint`
-/// always fails, and deliberately does not panic: any client can send a
-/// `ContentTicketRequest`, so panicking here would hand every caller a way to
-/// kill its own session task on a deployment that simply has no file server.
+/// `mint` always fails rather than panicking, since any client can send a
+/// `ContentTicketRequest`.
 pub struct NoSigner;
 
-/// The only failure [`NoSigner`] has: nothing was wired to mint with.
+/// Nothing was wired to mint with.
 #[derive(Debug)]
 pub struct NoSignerConfigured;
 
@@ -3049,7 +3045,7 @@ where
                 .map_err(transport_err);
         }
 
-        // Budget check for the write verb only (R66).
+        // Reads cost no upload bandwidth, so only a write is charged.
         if let ContentVerb::Write { declared_len } = req.verb
             && !self
                 .content_throttle

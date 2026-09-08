@@ -1,20 +1,8 @@
-//! Content ticket mint tests (R66).
+//! Content ticket mint tests.
 //!
-//! Covers the four cases from the R66 decision:
-//! 1. A visible file yields a `ContentTicketGrant`.
-//! 2. An invisible file is refused with `CONTENT_TICKET_REFUSED`.
-//! 3. An over-budget write is refused with the SAME detail as case 2,
-//!    asserted by comparing the two refusals rather than by matching a
-//!    literal string twice.
-//! 4. A signer fault yields a distinct detail so a retry is distinguishable
-//!    from a permanent refusal.
-//!
-//! Needs Docker: the fixture starts its own Postgres. The visibility check
-//! runs on a non-superuser reader pool so RLS fires inside the deployment's
-//! `connetto_visible_files` function body; using the admin pool would bypass
-//! RLS and make the check decorative.
-
-#![allow(clippy::too_many_lines)]
+//! Needs Docker. The visibility check runs on a non-superuser pool, because the
+//! admin role owns the tables and would bypass RLS inside the deployment's
+//! `connetto_visible_files` body.
 
 use std::convert::Infallible;
 use std::sync::Arc;

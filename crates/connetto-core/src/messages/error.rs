@@ -17,17 +17,15 @@ pub const SUBSCRIPTION_REFUSED: &str = "subscription refused";
 
 /// The one detail text a refused content ticket carries.
 ///
-/// An invisible file and an over-budget write both carry this detail, so a
-/// caller cannot learn that a file it cannot see exists. The cause goes to
-/// the structured log. This matches the `SUBSCRIPTION_REFUSED` principle
-/// from chapter 18: identical detail across causes.
+/// An invisible file and an over-budget write read identically here, so a
+/// caller cannot learn that a file it cannot see exists. The cause goes to the
+/// structured log instead.
 pub const CONTENT_TICKET_REFUSED: &str = "content ticket refused";
 
-/// Detail for a ticket refusal caused by a signer fault.
+/// The detail a ticket refusal carries when the signer itself failed.
 ///
-/// Distinct from [`CONTENT_TICKET_REFUSED`] because a signer fault discloses
-/// nothing about data visibility and a retry is meaningful, unlike an
-/// invisibility or an over-budget request where retrying changes nothing.
+/// Distinct from [`CONTENT_TICKET_REFUSED`] because it discloses nothing about
+/// visibility and a retry may work.
 pub const CONTENT_TICKET_SIGNER_ERROR: &str = "content ticket error";
 
 /// Non-fatal error attached to a specific client request.

@@ -1,18 +1,14 @@
 //! The content ticket request and its grant.
 //!
-//! A content ticket carries an already-made authorization decision from the
-//! websocket to HTTP, so an `img` tag can fetch bytes without presenting a
-//! grant. It is deliberately not a capability: see `docs/architecture/18-file-handling.md`
-//! and chapter 12's "A content ticket is not a capability".
+//! A content ticket moves an authorization decision from the websocket to HTTP
+//! so a plain URL can fetch bytes. It is not a capability: see
+//! `docs/architecture/18-file-handling.md`.
 
 use serde::{Deserialize, Serialize};
 
 /// What a caller intends to do with the file it names.
 ///
-/// The write verb carries the declared size because the mint charges a
-/// bandwidth rate against it and the ticket's ceiling is cut from it. Holding
-/// the number inside the variant makes a write without a declared size
-/// unrepresentable rather than merely invalid.
+/// The declared size sits inside `Write` so a write without one cannot be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentVerb {
     /// Download the named file.
@@ -27,10 +23,9 @@ pub enum ContentVerb {
 /// Client asks for a ticket naming one file and one verb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentTicketRequest {
-    /// Client-chosen correlation token, echoed by the grant and by any
-    /// refusal, the same role `sub_id` plays for subscriptions.
+    /// Client-chosen correlation token, echoed by the grant and by any refusal.
     pub request_id: String,
-    /// BLAKE3 identity of the file, the same 32 bytes the file crates key on.
+    /// BLAKE3 identity of the file.
     pub file_id: [u8; 32],
     /// What the caller intends to do.
     pub verb: ContentVerb,
@@ -38,9 +33,7 @@ pub struct ContentTicketRequest {
 
 /// Server hands back an address the caller may fetch or upload to.
 ///
-/// The token rides inside `url` because the whole point is that a URL alone
-/// proves the right to fetch. Its format belongs to the file crate that signed
-/// it, so nothing here parses it.
+/// The token rides inside `url`, in a format only the signing crate parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentTicketGrant {
     /// Correlation token from the request this answers.

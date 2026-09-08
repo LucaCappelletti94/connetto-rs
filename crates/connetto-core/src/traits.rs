@@ -263,31 +263,19 @@ pub trait ReplicaKeyStore {
 
 /// Mints the signed address a content ticket carries.
 ///
-/// The one seam `connetto-core` gains for file handling, replacing the deleted
-/// chunk-store trait. Connetto never learns the token format, the key or the
-/// verifying endpoint: it decides whether the caller may act on the file, then
-/// asks the implementation for an address. A file crate implements this and a
-/// deployment wires it the way it wires its write target.
-///
-/// The mint runs after connetto has answered visibility, so an implementation
-/// MUST NOT treat being called as permission to skip its own verification at
-/// fetch time. The ticket's lifetime is its revocation lag.
+/// Runs only after the caller's right to the file has been established, so an
+/// implementation MUST still verify the ticket at fetch time.
 pub trait ContentTicketSigner {
     /// Signer-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
     /// The address `caller` may use for `verb` on `file_id`, ticket included.
     ///
-    /// `caller` is the viewer identity connetto authorized, the same string its
-    /// visibility check ran under, so a signer binds the ticket to the identity
-    /// that earned it rather than to whoever presents it.
+    /// `caller` is the identity the ticket binds to, not whoever presents it.
     ///
     /// # Errors
     ///
-    /// [`Self::Error`] when the address cannot be minted, for instance a
-    /// missing key. A failure here is the server's fault rather than the
-    /// caller's, and reaches the client as its own detail so a retry is
-    /// distinguishable from a refusal.
+    /// [`Self::Error`] when no address can be minted, for instance a missing key.
     fn mint(
         &self,
         caller: &str,
