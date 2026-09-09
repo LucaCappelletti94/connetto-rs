@@ -1671,7 +1671,6 @@ where
 
         let pk_columns = schema
             .primary_key_columns()
-            .into_iter()
             .map(|idx| column_name_at(db, table_id, idx))
             .collect::<Result<Vec<_>, _>>()?;
 
