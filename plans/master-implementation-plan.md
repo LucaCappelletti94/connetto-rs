@@ -133,9 +133,9 @@ Execution order. The early steps depend on nothing outside this repository and c
 | any | R31 | Application schema majors: the drain gate, the resync boundary, and the local-tier migration trait. Deadline is the first deployment intending to survive a schema change |
 | done | ~~R32~~ **DONE** | Landed 2026-08-09. The reconnect log is durable and a server that cannot prove a client current now resyncs it (a defect found and demonstrated while grounding, folded in as step 0). Startup refuses a missing slot, publication or log table naming which. The slot's retained log, remaining headroom and reservation status are logged on a cadence. And a feed that resumes past what it delivered trims the log to the resume point and closes every connection, detected by comparing positions because nothing reports an invalidation |
 | done | ~~R40~~ **DONE** | Replica policy enforcement wired into sync. Landed 2026-08-15, completed 2026-08-19. The rename is on the client at both sync boundaries, the map a build artifact the client is refused without, and the demo table carries a real policy. The completing session type-directed the pk codec (a blob-shaped UUID key lifts to `Value::Uuid`), taught the relay hub to read and apply split tables through the worker's map, separated the tests' same-user logins, and all twenty browser binaries pass |
-| any | R64 | The file core, first of the six phases R24's design derived on 2026-08-21. Off the critical path, and its tests run under wasm from the start |
-| any | R65 | The file server: storage backends, upload protocol, ticket serving, GC, byte metering. Needs R64 |
-| any | R66 | The connetto seam: `FileStore` deleted, the ticket message pair and signer seam, plus the per-identity upload bandwidth rate. Independent, may run beside R64 |
+| done | ~~R64~~ **DONE** | The file core, done 2026-09-08. Content-defined chunking, BLAKE3 identity, per-write AEAD with the chunk hash as AAD, and the `ChunkStore` trait, tested under wasm from the start |
+| done | ~~R65~~ **DONE** | The file server, done 2026-09-08. Storage backends, the two-phase upload, ticket serving, mark-and-sweep GC and byte metering |
+| done | ~~R66~~ **DONE** | The connetto seam, done 2026-09-08. `FileStore` deleted, the ticket request and grant on the control plane, the signer trait, and the per-identity upload bandwidth rate |
 | done | ~~R67~~ **DONE** | The native file client, done 2026-09-08. Manifests and outbox in the replica, the `std::fs` encrypted store, the outbox walk and boot integrity pass, the resolver and the pin surface |
 | any | R68 | The browser file client, its archive step coordinated with R56's format. Needs R64, R65 and R66 |
 | any | R69 | Every demo carries the photo entry end to end, R54's rule applied to files. Needs R67 and R68 |
@@ -326,10 +326,10 @@ graph TD
   R24[R24 file-sync integration]
   R25[R25 device-to-device sync]
   R30[R30 grouped aggregates, DONE as a design]
-  R24 --> R64[R64 file core]
-  R64 --> R65[R65 file server]
-  R66[R66 file seam in connetto]
-  R64 --> R67[R67 native file client]
+  R24 --> R64[R64 file core, DONE]
+  R64 --> R65[R65 file server, DONE]
+  R66[R66 file seam in connetto, DONE]
+  R64 --> R67[R67 native file client, DONE]
   R65 --> R67
   R66 --> R67
   R64 --> R68[R68 browser file client]
@@ -4644,7 +4644,7 @@ A commit is refused when the uploader is over quota and when the deployment is o
 
 ## R67: the native file client
 
-**Status.** DONE (2026-09-08). The starting prompt was `docs/prompt-r67-native-file-client.md`. Thirteen design points were settled with the maintainer, all on 2026-09-08, and are recorded under Decisions below. R68 and R69 are unblocked, and R68 inherits the resolver seam, the `LocalContentSource` list and the `ChunkStore` delete this phase added.
+**Status.** DONE (2026-09-08), merged as `034f7b2` from PR #7. The starting prompt was `docs/prompt-r67-native-file-client.md`. Seventeen design points were settled with the maintainer, thirteen before any code and four in the pull request round, and are recorded under Decisions below. R68 and R69 are unblocked, and R68 inherits `crates/connetto-file-client` whole: the resolver, the `LocalContentSource` list, `ContentHttp`, and both storage traits, `ChunkStore` with its delete and `ChunkInventory` with its enumeration. What R68 adds is the OPFS implementations of those two and a browser `ContentHttp`.
 
 **Blocked on** R64, R65 and R66.
 
@@ -4689,7 +4689,7 @@ The offline photo case runs end to end natively: entry and bytes written offline
 
 ## R68: the browser file client
 
-**Status.** NOT STARTED.
+**Status.** NEXT, prompt written 2026-09-09 in `docs/prompt-r68-browser-file-client.md`. Nothing blocks it: R64 to R67 are all done and merged, and R67 left the phase three implementations to write and no policy, since `ContentClient` is generic over its chunk store and its HTTP transport and everything above them is platform-neutral and already exercised natively.
 
 **Blocked on** R64, R65 and R66. Its archive step coordinates with R56's format.
 

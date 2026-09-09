@@ -26,7 +26,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming |
 | `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers |
 | `17-fan-out.md` | How one change event reaches many subscribers: the unit of computation, what stays proportional to subscriber count, catchup, and what adopting the shape costs. **Decided, not built** |
-| `18-file-handling.md` | File handling as decided: identity, chunking, the encrypted stores, tickets, the availability convention, and the abuse surface. **Decided, not built**, phases R64 to R69 |
+| `18-file-handling.md` | File handling: identity, chunking, the encrypted stores, tickets, the availability convention, and the abuse surface. **Built through R67** (the core, the file server, the connetto seam and the native client), with R68 the browser client and R69 the demos remaining |
 | `19-device-to-device.md` | Offline collaboration between devices: certificates, the per-device frontier, the LAN link, the exchange, the provisional tier, and courier recovery. **Decided, not built**, phases R74 to R80 |
 
 ## Not chapters

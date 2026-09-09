@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     viewBox="0 0 1680 1550" width="1680" height="1550"
+     viewBox="0 0 1680 1790" width="1680" height="1790"
      font-family="system-ui, -apple-system, 'Segoe UI', sans-serif"
      role="img" aria-labelledby="diagram-title diagram-desc" focusable="false">
   <title id="diagram-title">connetto-rs architecture</title>
@@ -208,7 +208,7 @@
       <rect width="3" height="54" rx="1" fill="#4CAF50" />
       <text x="142" y="15" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
       <text x="142" y="29" text-anchor="middle" font-size="8.5" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
-      <text x="142" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer, R85</text>
+      <text x="142" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer</text>
     </g>
 
     <g transform="translate(558, 724)">
@@ -275,6 +275,8 @@
     <rect x="880" y="60" width="90" height="1080" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1" stroke-dasharray="6 3" />
     <text x="925" y="82" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">Transport</text>
     <text x="925" y="96" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">wss://</text>
+    <text x="925" y="1108" text-anchor="middle" font-size="8" fill="#4CAF50">content ticket</text>
+    <text x="925" y="1120" text-anchor="middle" font-size="8" fill="#4CAF50">request and grant</text>
     <text x="925" y="410" text-anchor="middle" font-size="8" fill="#4CAF50">bulk plane</text>
     <text x="925" y="422" text-anchor="middle" font-size="8" fill="#4CAF50">PatchSet + Zstd</text>
     <text x="925" y="450" text-anchor="middle" font-size="8" fill="#4CAF50">control plane</text>
@@ -339,7 +341,7 @@
       <rect width="3" height="60" rx="1" fill="#4CAF50" />
       <text x="148" y="14" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Aggregate live values</text>
       <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">server-pushed LiveValue&lt;V&gt;</text>
-      <text x="148" y="40" text-anchor="middle" font-size="8.5" fill="#4CAF50">keyed LiveGroups&lt;K, V&gt; map delivered, R84</text>
+      <text x="148" y="40" text-anchor="middle" font-size="8.5" fill="#4CAF50">keyed LiveGroups&lt;K, V&gt; map delivered</text>
       <text x="148" y="51" text-anchor="middle" font-size="8.5" fill="#4CAF50">LiveRows&lt;R&gt; + grouped typed live() + generic hooks delivered</text>
     </g>
     <g transform="translate(1320, 120)">
@@ -544,17 +546,9 @@
 
   <!-- ==================== BEYOND-THE-CORE STRIP ==================== -->
   <g id="exploratory-strip">
-    <rect x="20" y="1360" width="1140" height="150" rx="8" fill="#FFF8E1" fill-opacity="0.6" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="8 4" />
-    <text x="40" y="1384" font-size="12" font-weight="600" fill="#E65100">Beyond the core: committed file programme, designed peer sync</text>
+    <rect x="20" y="1360" width="580" height="150" rx="8" fill="#FFF8E1" fill-opacity="0.6" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="8 4" />
+    <text x="40" y="1384" font-size="12" font-weight="600" fill="#E65100">Beyond the core: designed peer sync</text>
     <g transform="translate(40, 1396)">
-      <rect width="540" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">File handling programme</text>
-      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#C62828">committed, not started: R64 to R69 (design concluded as R24)</text>
-      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">chunked content store: blake3 identity, zstd then XChaCha20-Poly1305</text>
-      <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">fs or object-store server, signed-URL tickets, metadata as ordinary rows</text>
-      <text x="270" y="90" text-anchor="middle" font-size="9" fill="#555">display is a URL, local sync only for pinned, processed, or unsent content</text>
-    </g>
-    <g transform="translate(600, 1396)">
       <rect width="540" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Device-to-device sync</text>
       <text x="270" y="40" text-anchor="middle" font-size="9" fill="#C62828">committed, not started: R74 to R80 (design concluded as R25, chapter 19)</text>
@@ -562,6 +556,56 @@
       <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">server still adjudicates, courier recovery of a lost device's signed queue</text>
       <text x="270" y="90" text-anchor="middle" font-size="9" fill="#555">one dedup domain, the (device key, sequence) frontier. BLE beacon bootstrap later</text>
     </g>
+  </g>
+
+  <!-- ==================== FILE CRATES ZONE ==================== -->
+  <g id="file-crates-zone">
+    <rect x="20" y="1530" width="1620" height="216" rx="10" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+    <text x="830" y="1556" text-anchor="middle" font-size="15" font-weight="700" fill="#555">File crates</text>
+    <text x="830" y="1572" text-anchor="middle" font-size="10" fill="#4CAF50">in this repo, beside the demos: they depend on connetto and never the reverse. Metadata travels as ordinary synced rows, content travels here</text>
+
+    <g transform="translate(40, 1586)">
+      <rect width="490" height="140" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="140" rx="1" fill="#4CAF50" />
+      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-core</text>
+      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo, tested under wasm too</text>
+      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">identity is blake3 of the bytes, computed in the chunking pass</text>
+      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">FastCDC per mime class, zstd then XChaCha20-Poly1305</text>
+      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">the chunk's plaintext hash is the store key and the AEAD aad</text>
+      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkStore (write, read, has, delete) by content hash</text>
+      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkInventory, for the stores that can list what they hold</text>
+      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
+    </g>
+
+    <g transform="translate(585, 1586)">
+      <rect width="490" height="140" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="140" rx="1" fill="#4CAF50" />
+      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-server</text>
+      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: chunk storage, upload, serving, collection</text>
+      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">chunks in a filesystem directory or an object store, never in Postgres</text>
+      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">two-phase upload: intent, needed hashes, chunk PUTs, commit</text>
+      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">ranged GET with a strong ETag, immutable caching, 404 for absent or forbidden</text>
+      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">mark and sweep from the chunk registry, grace equal to the ticket lifetime</text>
+      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ContentTicketSigner, the one trait connetto-core gained</text>
+      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#C62828">storage quotas and deployment ceilings: not started, R87</text>
+    </g>
+
+    <g transform="translate(1130, 1586)">
+      <rect width="490" height="140" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="140" rx="1" fill="#4CAF50" />
+      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-client</text>
+      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: the store, the outbox, the resolver, the pins</text>
+      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the entry row</text>
+      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">bytes land before that commit, so a crash orphans a chunk and never a row</text>
+      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass that reads every unsent chunk</text>
+      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
+      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">query-shaped content pins, and a sweep that asks the store what it holds</text>
+      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#C62828">OPFS store and browser resolver: not started, R68. Demos: not started, R69</text>
+    </g>
+
+    <path d="M 1130 1660 L 1075 1660" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <text x="1102" y="1636" text-anchor="middle" font-size="8" fill="#2E7D32">HTTP under</text>
+    <text x="1102" y="1648" text-anchor="middle" font-size="8" fill="#2E7D32">one ticket</text>
   </g>
 
   <!-- ==================== STATUS LEGEND ==================== -->
@@ -593,5 +637,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1538" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-08-26 to the plan's current state.</text>
+  <text x="20" y="1774" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-09 to the plan's current state.</text>
 </svg>
