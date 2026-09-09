@@ -2310,6 +2310,31 @@ where
         state.conn.ping(nonce).await
     }
 
+    /// Ask the server for a content ticket naming one file and one verb.
+    ///
+    /// The answer arrives on [`events`](Self::events) as
+    /// [`ClientEvent::ContentTicket`] carrying `request_id`, or as a refusal
+    /// carrying it in `related_to`. Subscribe before calling: the pump can
+    /// deliver the answer before this returns.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the request cannot be sent, including
+    /// when there is no transport: a ticket is the server's to grant, so
+    /// there is nothing to queue offline.
+    pub async fn request_content_ticket(
+        &self,
+        request_id: String,
+        file_id: [u8; 32],
+        verb: connetto_core::messages::ContentVerb,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state
+            .conn
+            .request_content_ticket(request_id, file_id, verb)
+            .await
+    }
+
     /// Subscribe to the raw [`ClientEvent`] stream the pump produces
     /// (rejections, conflicts, aggregate values, non-fatal errors). Lagging
     /// receivers drop the oldest events.
