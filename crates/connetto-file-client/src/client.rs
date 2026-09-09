@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use connetto_client::live::ConnettoClient;
+use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
 use connetto_client::{ClientEvent, SyncStatus};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
@@ -97,6 +98,15 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     http: H,
     sources: Vec<BoxedSource>,
     events: broadcast::Sender<ContentEvent>,
+    /// Held across every pairing of a chunk-file write with the manifest
+    /// commit that references it, and across the sweep's mirror of that pair.
+    ///
+    /// Without it the sweep and a staging call interleave: the sweep decides a
+    /// hash is unreferenced, commits, and then deletes the file a staging call
+    /// wrote and committed a manifest for in between, so an outbox entry loses
+    /// bytes it had. One store belongs to one process, the same assumption the
+    /// store's temporary names rest on, so one mutex closes it.
+    content_writes: tokio::sync::Mutex<()>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -136,6 +146,7 @@ where
             http,
             sources: vec![Box::new(local)],
             events,
+            content_writes: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -190,6 +201,7 @@ where
         R: Read + MaybeSend,
         F: FnOnce(&mut SqliteConnection, FileId) -> Result<O, diesel::result::Error>,
     {
+        let _writing = self.content_writes.lock().await;
         let store = self.store_for(mime);
         let manifest = process_file_from_reader(reader, mime, &store)
             .await
@@ -322,28 +334,54 @@ where
         upload::upload(&self.http, &url, &manifest, &store).await
     }
 
-    /// The outbox driver: the boot integrity pass, one walk now, and one walk
-    /// on every reconnect.
+    /// The outbox driver: the boot integrity pass, then a walk whenever one
+    /// could get further than the last.
     ///
     /// Returned as a future rather than spawned, the same shape
     /// [`ConnettoClient::with_pump`] uses, so the caller decides which
     /// executor drives it. It ends when the client's event stream ends, which
     /// is when the last client clone drops.
-    pub async fn drive_outbox(&self) {
+    ///
+    /// A reconnect is not the only thing that unblocks a walk, and treating it
+    /// as the only one leaves offline content pending forever. The ordinary
+    /// case says so: a write ticket is refused for a file the deployment
+    /// cannot see yet, and what makes it visible is the entry row landing, on
+    /// a connection that never dropped. A saturated upload window clears the
+    /// same way. So while anything is still queued this backs off and walks
+    /// again under `sleeper`, and while the outbox is empty it costs nothing,
+    /// waiting on the event stream instead.
+    pub async fn drive_outbox<S: Sleeper>(&self, mut sleeper: S) {
+        let policy = ReconnectPolicy::default();
         let mut events = self.client.events();
         if let Err(err) = self.verify_unsent().await {
             let _ = self.events.send(ContentEvent::IntegrityPassFailed {
                 detail: err.to_string(),
             });
         }
-        let _ = self.flush_outbox().await;
+        let mut attempt: u32 = 0;
         loop {
-            match events.recv().await {
-                Ok(ClientEvent::Reconnected | ClientEvent::SyncStatus(SyncStatus::Connected)) => {
-                    let _ = self.flush_outbox().await;
+            let _ = self.flush_outbox().await;
+            let queued = self
+                .client
+                .with_conn(|conn| db::outbox(conn.conn()))
+                .await
+                .is_ok_and(|waiting| !waiting.is_empty());
+            if queued {
+                attempt = attempt.saturating_add(1);
+                sleeper.sleep(policy.backoff(attempt)).await;
+                continue;
+            }
+            attempt = 0;
+            loop {
+                match events.recv().await {
+                    Ok(
+                        ClientEvent::Reconnected
+                        | ClientEvent::SyncStatus(SyncStatus::Connected)
+                        | ClientEvent::MutationApplied { .. },
+                    ) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     }
@@ -540,6 +578,7 @@ where
     /// [`ContentError::Store`] when a chunk file cannot be removed.
     pub async fn tidy_content(&self) -> Result<usize, ContentError> {
         let pinned = self.pinned().await?;
+        let _writing = self.content_writes.lock().await;
         let (evicted, orphans) = self
             .client
             .with_conn(|conn| {
@@ -613,6 +652,7 @@ where
             }
             let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
             let bytes = upload::download(&self.http, &url).await?;
+            let _writing = self.content_writes.lock().await;
             let store = self.store_for(FETCHED_CLASS);
             let manifest = process_file_from_reader(bytes.as_slice(), FETCHED_CLASS, &store)
                 .await

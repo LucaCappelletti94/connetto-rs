@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use connetto_file_core::{ChunkHash, ChunkStore};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 /// Errors produced by [`FsStore`].
 #[derive(Debug, Error)]
@@ -91,13 +92,33 @@ impl ChunkStore for FsStore {
         tokio::fs::create_dir_all(dir).await.map_err(at(dir))?;
         let ticket = self.inner.next_temp.fetch_add(1, Ordering::Relaxed);
         let temp_path = dir.join(format!("{hash}.{ticket}.tmp"));
-        tokio::fs::write(&temp_path, data)
-            .await
-            .map_err(at(&temp_path))?;
+        // Written, flushed to stable storage, and only then renamed, because
+        // this call returning is what lets a manifest naming the chunk commit.
+        // Without the flush a host crash can recover the row, the manifest and
+        // the outbox entry beside a chunk file that is absent or short, which
+        // is exactly the loss the same-transaction rule exists to prevent, and
+        // the bytes are the half that cannot be fetched again.
+        {
+            let mut file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(at(&temp_path))?;
+            file.write_all(data).await.map_err(at(&temp_path))?;
+            file.sync_all().await.map_err(at(&temp_path))?;
+        }
         tokio::fs::rename(&temp_path, &final_path)
             .await
-            .map_err(at(&final_path))
+            .map_err(at(&final_path))?;
+        // The rename itself is a directory change, so the entry needs its own
+        // flush: a synced file under an unsynced directory entry is still a
+        // chunk a reader cannot find.
+        tokio::fs::File::open(dir)
+            .await
+            .map_err(at(dir))?
+            .sync_all()
+            .await
+            .map_err(at(dir))
     }
+
     async fn read_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Self::Error> {
         let path = self.path_of(hash);
         tokio::fs::read(&path).await.map_err(at(&path))

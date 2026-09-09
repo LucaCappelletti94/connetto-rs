@@ -6,7 +6,9 @@ use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
 use tempfile::tempdir;
 
-use crate::support::{RecordingHttp, attach_content, offline_client, photos};
+use crate::support::{
+    RecordingHttp, Scripted, attach_content, connected_client, offline_client, photos,
+};
 
 /// The photo bytes every case here stages.
 const PHOTO: &[u8] = b"the bytes of one photograph, authored on this device";
@@ -277,4 +279,65 @@ pub fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     found.sort();
     found
+}
+
+/// A deferred upload is retried without waiting for a reconnect.
+///
+/// The ordinary case makes this load-bearing: a write ticket is refused for a
+/// file the deployment cannot see yet, and what makes it visible is the entry
+/// row landing on a connection that never dropped. A driver that walks only on
+/// reconnect leaves that content pending forever.
+#[tokio::test]
+async fn the_driver_retries_a_deferred_upload_with_no_reconnect() {
+    let dir = tempdir().expect("temp dir");
+    // The first intent is refused as transient, the second is accepted.
+    let http = RecordingHttp::new(vec![
+        (503, Vec::new()),
+        (200, br#"{"needed":[]}"#.to_vec()),
+        (200, Vec::new()),
+    ]);
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting("http://files.test/files/ab/intent?t=TOKEN"),
+    )
+    .await;
+    let content = attach_content(client, &dir.path().join("chunks"), http).await;
+    let mut events = content.events();
+
+    let (file_id, ()) = content
+        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
+            diesel::insert_into(photos::table)
+                .values((
+                    photos::id.eq(1),
+                    photos::content_id.eq(file_id.as_bytes().to_vec()),
+                ))
+                .execute(conn)
+                .map(|_| ())
+        })
+        .await
+        .expect("stage the photo");
+
+    // No reconnect happens here: the transport stays exactly as it was.
+    let landed = async {
+        loop {
+            match events.recv().await {
+                Ok(ContentEvent::Uploaded { file_id }) => return file_id,
+                Ok(_) => {}
+                Err(err) => panic!("the content event stream ended: {err}"),
+            }
+        }
+    };
+    let uploaded = tokio::select! {
+        () = content.drive_outbox(|_| core::future::ready(())) => {
+            panic!("the driver ended without uploading")
+        }
+        id = landed => id,
+        () = tokio::time::sleep(core::time::Duration::from_secs(10)) => {
+            panic!("the deferred upload was never retried")
+        }
+    };
+    assert_eq!(
+        uploaded, file_id,
+        "the file the driver sent is the one that was waiting"
+    );
 }
