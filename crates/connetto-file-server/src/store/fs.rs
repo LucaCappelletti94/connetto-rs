@@ -61,15 +61,14 @@ impl ChunkStore for FsStore {
     fn has_chunk(&self, hash: &ChunkHash) -> impl Future<Output = Result<bool, StoreError>> + Send {
         future::ready(Ok(self.chunk_path(hash).exists()))
     }
-}
 
-/// Deletes the chunk file.  A missing file is not an error.
-pub(super) async fn delete_chunk(store: &FsStore, hash: &ChunkHash) -> Result<(), StoreError> {
-    let path = store.chunk_path(hash);
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::Io(e)),
+    async fn delete_chunk(&self, hash: &ChunkHash) -> Result<(), StoreError> {
+        let path = self.chunk_path(hash);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 }
 
