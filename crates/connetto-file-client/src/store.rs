@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use connetto_file_core::{ChunkHash, ChunkStore};
+use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
@@ -143,4 +143,59 @@ impl ChunkStore for FsStore {
             Err(err) => Err(at(&path)(err)),
         }
     }
+}
+
+impl ChunkInventory for FsStore {
+    async fn stored_hashes(&self) -> Result<Vec<ChunkHash>, Self::Error> {
+        let root = &self.inner.root;
+        let mut fan_out = match tokio::fs::read_dir(root).await {
+            Ok(entries) => entries,
+            // A store nothing has written to yet holds nothing.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(at(root)(err)),
+        };
+        let mut hashes = Vec::new();
+        while let Some(entry) = fan_out.next_entry().await.map_err(at(root))? {
+            let dir = entry.path();
+            if entry.file_type().await.map_err(at(&dir))?.is_dir() {
+                hashes.extend(hashes_in(&dir).await?);
+            }
+        }
+        Ok(hashes)
+    }
+}
+
+/// Every chunk one fan-out directory holds.
+///
+/// A temporary file is a write that has not landed and its name is not a
+/// hash, so it is skipped: reporting one would offer a caller a chunk to
+/// collect while it was still being written.
+async fn hashes_in(dir: &Path) -> Result<Vec<ChunkHash>, FsStoreError> {
+    let mut chunks = tokio::fs::read_dir(dir).await.map_err(at(dir))?;
+    let mut hashes = Vec::new();
+    while let Some(chunk) = chunks.next_entry().await.map_err(at(dir))? {
+        if let Some(hash) = chunk.file_name().to_str().and_then(parse_hash) {
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+/// Reads a chunk file name back into the hash it encodes.
+///
+/// Anything that is not exactly sixty-four lower-hex characters is not a
+/// chunk this store wrote, which covers both a temporary file and whatever
+/// else happens to be in the directory.
+fn parse_hash(name: &str) -> Option<ChunkHash> {
+    let digits = name.as_bytes();
+    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let (pairs, _) = digits.as_chunks::<2>();
+    let mut bytes = [0u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(pairs) {
+        let text = core::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(ChunkHash::from_bytes(bytes))
 }

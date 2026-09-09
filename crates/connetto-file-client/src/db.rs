@@ -11,6 +11,8 @@
 //! tables out of capture, out of the tier's application-table listing and off
 //! the wire, exactly as it does for `_connetto_pending`.
 
+use std::collections::HashSet;
+
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId, Manifest};
 use diesel::prelude::*;
 
@@ -154,22 +156,22 @@ pub(crate) fn all_manifests(conn: &mut SqliteConnection) -> Result<Vec<FileId>, 
         .collect()
 }
 
-/// Which of `hashes` no manifest references any more.
-pub(crate) fn unreferenced(
+/// Every chunk hash some manifest still names.
+///
+/// The set a sweep keeps. Asking the replica what is referenced, rather than
+/// asking which of a candidate list is not, is what lets the sweep also see
+/// chunks no manifest ever named: a staging call whose transaction failed
+/// leaves files on disk that no released-hash list would ever mention.
+pub(crate) fn referenced_hashes(
     conn: &mut SqliteConnection,
-    hashes: &[ChunkHash],
-) -> Result<Vec<ChunkHash>, ContentError> {
-    let mut orphans = Vec::new();
-    for hash in hashes {
-        let live: i64 = _connetto_content_chunks::table
-            .filter(_connetto_content_chunks::hash.eq(hash.as_bytes().to_vec()))
-            .count()
-            .get_result(conn)?;
-        if live == 0 {
-            orphans.push(*hash);
-        }
-    }
-    Ok(orphans)
+) -> Result<HashSet<ChunkHash>, ContentError> {
+    let rows: Vec<Vec<u8>> = _connetto_content_chunks::table
+        .select(_connetto_content_chunks::hash)
+        .distinct()
+        .load(conn)?;
+    rows.into_iter()
+        .map(|hash| Ok(ChunkHash::from_bytes(exactly_32(&hash)?)))
+        .collect()
 }
 
 /// Records that a file is authored here and not yet uploaded.

@@ -53,3 +53,25 @@ pub trait ChunkStore {
         hash: &ChunkHash,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
+
+/// A chunk store that can say everything it holds.
+///
+/// Separate from [`ChunkStore`] because enumeration is not something every
+/// store should be asked for. A device's own store holds that device's
+/// content and can list it, and so can an in-memory one, but a deployment's
+/// object store holds every file every caller ever uploaded, and answering
+/// "all of it" as one list is the wrong shape at that size. A server sweeps
+/// from its registry instead, which is the index it already keeps.
+///
+/// Deletion is not like this and stays on `ChunkStore`: a store that can be
+/// written and not pruned is a store whose disk only grows.
+pub trait ChunkInventory: ChunkStore {
+    /// Every chunk hash this store currently holds, in no particular order.
+    ///
+    /// Bytes a write did not finish are not held: an implementation must not
+    /// report a partial or temporary file, because a caller uses this to
+    /// decide what nothing references and may then delete it.
+    fn stored_hashes(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Vec<ChunkHash>, Self::Error>> + MaybeSend;
+}

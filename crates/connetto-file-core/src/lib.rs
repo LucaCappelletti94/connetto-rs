@@ -16,7 +16,7 @@ pub use maybe_send::MaybeSend;
 pub use mem::{MemStore, MemStoreError};
 pub use params::{ChunkParams, MEDIA_PARAMS, MimeClass, TEXT_PARAMS};
 pub use process::{ProcessError, process_file, process_file_from_reader, reassemble};
-pub use store::ChunkStore;
+pub use store::{ChunkInventory, ChunkStore};
 
 #[cfg(test)]
 mod tests {

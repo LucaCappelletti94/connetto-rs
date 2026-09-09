@@ -10,7 +10,8 @@ use connetto_client::{ClientEvent, SyncStatus};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
-    ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass, process_file_from_reader,
+    ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
+    process_file_from_reader,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -574,54 +575,6 @@ where
             .await
     }
 
-    /// Reclaims the disk every cached file that nothing wants is holding.
-    ///
-    /// The byte-level mirror of R15's `tidy`, and application-callable for the
-    /// same reason: only the application knows why it holds data. A manifest
-    /// survives when the file is unsent, because those bytes cannot be
-    /// fetched again, or when a pin names it. Everything else is cache and
-    /// goes.
-    ///
-    /// The order is what makes a crash safe. The manifest rows go first and
-    /// commit, then the chunk files no surviving manifest references are
-    /// deleted, so an interruption leaves chunk files nothing points at,
-    /// which the next pass collects, rather than a manifest pointing at bytes
-    /// that are gone. Two manifests may name the same chunk, so a chunk is
-    /// deleted only once no manifest at all references it.
-    ///
-    /// Returns how many files were evicted.
-    ///
-    /// # Errors
-    ///
-    /// [`ContentError::Replica`] on a bookkeeping failure and
-    /// [`ContentError::Store`] when a chunk file cannot be removed.
-    pub async fn tidy_content(&self) -> Result<usize, ContentError> {
-        let pinned = self.pinned().await?;
-        let _writing = self.content_writes.lock().await;
-        let (evicted, orphans) = self
-            .client
-            .with_conn(|conn| {
-                conn.transact_with_bookkeeping(
-                    |c| evict_uncovered(c, &pinned),
-                    |_| Ok::<(), ContentError>(()),
-                )
-                // The application half writes nothing here: eviction is
-                // entirely connetto's own bookkeeping, and using the same
-                // primitive keeps one transaction shape for every content
-                // write.
-                .map(|(counted, ())| counted)
-            })
-            .await?;
-        let store = self.store_for(FETCHED_CLASS);
-        for hash in orphans {
-            store
-                .delete_chunk(&hash)
-                .await
-                .map_err(|err| ContentError::Store(err.to_string()))?;
-        }
-        Ok(evicted)
-    }
-
     /// Fetches every pinned file this device does not hold, returning the ones
     /// that arrived.
     ///
@@ -693,6 +646,89 @@ where
     }
 }
 
+impl<T, B, H> ContentClient<T, B, H>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+    B: ChunkInventory + Clone + Sync + MaybeSend + 'static,
+    H: ContentHttp,
+{
+    /// Reclaims the disk every byte nothing wants is holding.
+    ///
+    /// The byte-level mirror of R15's `tidy`, and application-callable for the
+    /// same reason: only the application knows why it holds data. A manifest
+    /// survives when the file is unsent, because those bytes cannot be fetched
+    /// again, or when a pin names it. Everything else is cache and goes.
+    ///
+    /// Then every chunk file the store holds that no surviving manifest names
+    /// is deleted. Enumerating the store rather than the hashes an eviction
+    /// released is what makes the second half possible: a staging call whose
+    /// transaction failed leaves chunk files no manifest ever mentioned, and
+    /// nothing derived from manifests could ever name them. Two manifests may
+    /// share a chunk, so a chunk goes only when the whole surviving set is
+    /// silent about it.
+    ///
+    /// The order is what makes a crash safe. The manifest rows go first and
+    /// commit, then the files, so an interruption leaves chunk files nothing
+    /// points at, which the next pass collects, rather than a manifest
+    /// pointing at bytes that are gone. This pass is why that is safe.
+    ///
+    /// Returns how many files were evicted, which counts manifests rather than
+    /// chunk files: an orphan that never had a manifest was never a file this
+    /// device could name.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] on a bookkeeping failure and
+    /// [`ContentError::Store`] when the store cannot be listed or a chunk file
+    /// cannot be removed.
+    pub async fn tidy_content(&self) -> Result<usize, ContentError> {
+        let pinned = self.pinned().await?;
+        let _writing = self.content_writes.lock().await;
+        let (evicted, referenced) = self
+            .client
+            .with_conn(|conn| {
+                conn.transact_with_bookkeeping(
+                    |c| {
+                        let evicted = evict_uncovered(c, &pinned)?;
+                        Ok((evicted, db::referenced_hashes(c)?))
+                    },
+                    |_| Ok::<(), ContentError>(()),
+                )
+                // The application half writes nothing here: eviction is
+                // entirely connetto's own bookkeeping, and using the same
+                // primitive keeps one transaction shape for every content
+                // write.
+                .map(|(counted, ())| counted)
+            })
+            .await?;
+        self.delete_unreferenced(&referenced).await?;
+        Ok(evicted)
+    }
+
+    /// Deletes every chunk the store holds that `referenced` does not name.
+    async fn delete_unreferenced(
+        &self,
+        referenced: &HashSet<connetto_file_core::ChunkHash>,
+    ) -> Result<(), ContentError> {
+        let store = self.store_for(FETCHED_CLASS);
+        let held = store
+            .stored_hashes()
+            .await
+            .map_err(|err| ContentError::Store(err.to_string()))?;
+        for hash in held {
+            if referenced.contains(&hash) {
+                continue;
+            }
+            store
+                .delete_chunk(&hash)
+                .await
+                .map_err(|err| ContentError::Store(err.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 /// One file identity out of a pin query.
 #[derive(diesel::QueryableByName)]
 struct PinnedId {
@@ -701,28 +737,24 @@ struct PinnedId {
     file_id: Vec<u8>,
 }
 
-/// Drops every manifest nothing covers and answers what that released.
+/// Drops every manifest nothing covers and answers how many went.
 ///
-/// A manifest survives when its file is unsent, because those bytes cannot be
-/// fetched again, or when a pin names it. The chunk hashes come back rather
-/// than being deleted here, because the rows have to commit before any file
-/// goes: the reverse order leaves a manifest pointing at bytes that are gone.
+/// The chunk files are not touched here. The rows have to commit before any
+/// file goes, because the reverse order leaves a manifest pointing at bytes
+/// that are gone.
 fn evict_uncovered(
     conn: &mut SqliteConnection,
     pinned: &HashSet<FileId>,
-) -> Result<(usize, Vec<connetto_file_core::ChunkHash>), ContentError> {
+) -> Result<usize, ContentError> {
     let mut evicted = 0;
-    let mut released = Vec::new();
     for file_id in db::all_manifests(conn)? {
-        let Some(manifest) = evictable(conn, pinned, file_id)? else {
+        if evictable(conn, pinned, file_id)?.is_none() {
             continue;
-        };
-        released.extend(manifest.chunks().iter().map(|chunk| chunk.hash));
+        }
         db::drop_manifest(conn, file_id)?;
         evicted += 1;
     }
-    let orphans = db::unreferenced(conn, &released)?;
-    Ok((evicted, orphans))
+    Ok(evicted)
 }
 
 /// The manifest to evict, or `None` when something still wants this file.

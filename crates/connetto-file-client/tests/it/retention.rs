@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use crate::staging::walk_files;
 use crate::support::{
     RecordingHttp, Scripted, assert_local, assert_remote, attach_content, connected_client,
-    stage_photo,
+    offline_content, stage_photo,
 };
 
 /// The granted write address every upload in this module runs under.
@@ -229,4 +229,44 @@ fn pseudorandom(seed: u32, len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// Chunk files that no manifest ever named are collected.
+///
+/// The case a sweep driven by manifests cannot reach: a staging call whose row
+/// write fails rolls the manifest back and leaves the chunk files, because
+/// they are written before the transaction opens. Nothing derived from
+/// manifests would ever mention those hashes, so the sweep has to ask the
+/// store what it holds.
+#[tokio::test]
+async fn tidy_collects_chunks_no_manifest_ever_named() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let (_client, content) = offline_content(dir.path()).await;
+
+    let refused = content
+        .stage(
+            b"a photo whose row never lands".as_slice(),
+            MimeClass::Jpeg,
+            |_, _| Err::<(), diesel::result::Error>(diesel::result::Error::NotFound),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the row write failed, so the staging call reports it"
+    );
+    assert!(
+        !walk_files(&chunks).is_empty(),
+        "the chunk files are written ahead of the transaction and outlive its rollback"
+    );
+
+    assert_eq!(
+        content.tidy_content().await.expect("tidy"),
+        0,
+        "no manifest was evicted, because the rollback left none to evict"
+    );
+    assert!(
+        walk_files(&chunks).is_empty(),
+        "the sweep collects a chunk file that no manifest ever named"
+    );
 }

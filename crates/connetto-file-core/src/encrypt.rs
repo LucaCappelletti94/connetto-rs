@@ -15,7 +15,7 @@ use chacha20poly1305::{
 use thiserror::Error;
 
 use crate::identity::ChunkHash;
-use crate::store::ChunkStore;
+use crate::store::{ChunkInventory, ChunkStore};
 
 /// Context string for BLAKE3 key derivation.
 ///
@@ -123,6 +123,17 @@ impl<S: ChunkStore + Sync> ChunkStore for EncryptingStore<S> {
     async fn delete_chunk(&self, hash: &ChunkHash) -> Result<(), Self::Error> {
         self.inner
             .delete_chunk(hash)
+            .await
+            .map_err(EncryptStoreError::Inner)
+    }
+}
+
+/// The keys are plaintext chunk hashes on both sides of the decorator, so
+/// what the inner store holds is what this one holds.
+impl<S: ChunkInventory + Sync> ChunkInventory for EncryptingStore<S> {
+    async fn stored_hashes(&self) -> Result<Vec<ChunkHash>, Self::Error> {
+        self.inner
+            .stored_hashes()
             .await
             .map_err(EncryptStoreError::Inner)
     }

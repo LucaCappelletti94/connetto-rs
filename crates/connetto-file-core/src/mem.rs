@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 use crate::identity::ChunkHash;
-use crate::store::ChunkStore;
+use crate::store::{ChunkInventory, ChunkStore};
 
 /// The one thing an in-memory store can fail at.
 #[derive(Debug, Error)]
@@ -92,5 +92,18 @@ impl ChunkStore for MemStore {
             .expect("MemStore lock is not poisoned")
             .remove(hash);
         future::ready(Ok(()))
+    }
+}
+
+impl ChunkInventory for MemStore {
+    fn stored_hashes(&self) -> impl Future<Output = Result<Vec<ChunkHash>, MemStoreError>> + Send {
+        let hashes = self
+            .chunks
+            .lock()
+            .expect("MemStore lock is not poisoned")
+            .keys()
+            .copied()
+            .collect();
+        future::ready(Ok(hashes))
     }
 }
