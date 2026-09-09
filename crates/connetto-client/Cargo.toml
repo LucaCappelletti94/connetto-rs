@@ -66,13 +66,13 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.12", default-features = false }
+sqlite-diff-rs = { version = "0.13", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
-sqlparser = { version = "0.62", default-features = false, features = [
+sqlparser = { version = "0.63", default-features = false, features = [
   "visitor",
 ] }
 # Rendering typed diesel queries to placeholder SQL plus bind values through

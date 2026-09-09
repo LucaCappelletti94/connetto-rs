@@ -52,11 +52,11 @@ diesel-async = { version = "0.9", default-features = false, features = [
   "bb8",
 ] }
 # Building the mutation changeset a client uploads.
-sqlite-diff-rs = { version = "0.12", default-features = false }
+sqlite-diff-rs = { version = "0.13", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
-sqlparser = { version = "0.62", default-features = false }
+sqlparser = { version = "0.63", default-features = false }
 # The fixture owns the services it needs, so a test provisions nothing by hand.
 # `GenericImage` for both Postgres and OpenFGA rather than `testcontainers-modules`:
 # that crate pins testcontainers 0.27, and neither image is served better by a
@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
-sqlite-diff-rs = { version = "0.12", default-features = false }
+sqlite-diff-rs = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Joining a fresh anonymous session keyring in-process, replacing the external

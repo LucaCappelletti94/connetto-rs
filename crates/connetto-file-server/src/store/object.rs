@@ -55,16 +55,12 @@ impl ChunkStore for ObjectStoreBackend {
             Err(e) => Err(StoreError::from(e)),
         }
     }
-}
 
-/// Deletes the chunk at `hash`.  A missing chunk is not an error.
-pub(super) async fn delete_chunk(
-    store: &ObjectStoreBackend,
-    hash: &ChunkHash,
-) -> Result<(), StoreError> {
-    let path = ObjectStoreBackend::chunk_path(hash);
-    match store.store.delete(&path).await {
-        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(StoreError::from(e)),
+    async fn delete_chunk(&self, hash: &ChunkHash) -> Result<(), StoreError> {
+        let path = Self::chunk_path(hash);
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StoreError::from(e)),
+        }
     }
 }

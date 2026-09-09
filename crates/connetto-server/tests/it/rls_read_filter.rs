@@ -50,7 +50,8 @@ async fn ask(
     }));
     let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(CATALOG_DDL)
         .expect("the catalog parses");
-    let table_id = catalog_helpers::table_id(&catalog, table).expect("the table is in the catalog");
+    let table_id = catalog_helpers::table_id::<Postgres, _>(&catalog, table)
+        .expect("the table is in the catalog");
     let row = ValuesRow::new(table_id, key);
     let watchers = [Arc::new(principal)];
     let mut verdicts = Vec::new();

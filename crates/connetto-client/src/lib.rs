@@ -31,8 +31,9 @@ pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatu
 pub use connetto_core::{Custody, NoGate};
 
 use connetto_core::messages::{
-    AckCredits, BindValue, BulkMessage, ConflictRow, ControlMessage, FatalErrorReason, Handshake,
-    MutationHeader, MutationPatch, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
+    AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
+    ControlMessage, FatalErrorReason, Handshake, MutationHeader, MutationPatch, Ping, Subscribe,
+    SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, quote_ident};
@@ -920,6 +921,17 @@ pub enum ClientEvent {
     Pong {
         /// Echoed nonce.
         nonce: u64,
+    },
+    /// The server granted a content ticket: an address to fetch or upload the
+    /// named file's bytes at, the ticket already inside it. Correlated to the
+    /// request by `request_id`, and a refusal of the same request arrives as
+    /// [`NonFatal`](Self::NonFatal) or [`RateLimited`](Self::RateLimited)
+    /// carrying that id in `related_to`.
+    ContentTicket {
+        /// The correlation token the request chose.
+        request_id: String,
+        /// Where to send the request, ticket included.
+        url: String,
     },
     /// The reconnect driver lost the transport and is about to try again.
     Reconnecting {
@@ -3270,6 +3282,83 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
+    /// Ask the server for a content ticket naming one file and one verb.
+    ///
+    /// The answer arrives on a later [`pump_one`](Self::pump_one) as
+    /// [`ClientEvent::ContentTicket`] carrying `request_id`, or as a refusal
+    /// ([`ClientEvent::NonFatal`], [`ClientEvent::RateLimited`]) carrying it
+    /// in `related_to`. The caller owns the id and its uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the request cannot be sent, which
+    /// includes having no transport at all: a ticket is the server's to grant
+    /// and there is nothing to queue offline.
+    pub async fn request_content_ticket(
+        &mut self,
+        request_id: String,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> Result<(), ClientError> {
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+                request_id,
+                file_id,
+                verb,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// Commit connetto's own bookkeeping and the application's writes as one
+    /// transaction, where only the second is uploaded.
+    ///
+    /// `bookkeeping` runs with capture suspended, so its writes to the
+    /// `_connetto_` tables never enter a changeset, and `app` runs with
+    /// capture live, so its writes upload as an ordinary mutation. Both are
+    /// inside one SQLite transaction on one file, which is what makes a
+    /// bookkeeping record and the row that depends on it survive or vanish
+    /// together rather than by convention. Suspension is orthogonal to the
+    /// transaction: switching the session off does not end it.
+    ///
+    /// The pair exists because the alternative cannot be enforced. A caller
+    /// writing its own record and then the row, or handed a recorder to call
+    /// inside a transaction it opens itself, has a happy path that works and
+    /// a crash that leaves a row pointing at a record that was never written.
+    ///
+    /// Both closures return a value, so a pass whose whole result is
+    /// bookkeeping (a sweep counting what it evicted) uses the same primitive
+    /// as a write whose result is the application's, with `()` on the side it
+    /// does not use.
+    ///
+    /// # Errors
+    ///
+    /// Whatever either closure returns, with the transaction rolled back, and
+    /// [`ClientError::Session`] when the transaction itself fails.
+    pub fn transact_with_bookkeeping<B, A, P, O, E>(
+        &mut self,
+        bookkeeping: B,
+        app: A,
+    ) -> Result<(P, O), E>
+    where
+        B: FnOnce(&mut SqliteConnection) -> Result<P, E>,
+        A: FnOnce(&mut SqliteConnection) -> Result<O, E>,
+        E: From<diesel::result::Error>,
+    {
+        // Prepared here so the closure below captures these two fields rather
+        // than all of `self`, which `db` is borrowed out of for the duration.
+        let session = &mut self.session;
+        let exempt = &self.write_exempt;
+        self.db.transaction(|conn| {
+            let private = {
+                let _suspended = SuspendedCapture::new(session, exempt);
+                bookkeeping(conn)?
+            };
+            Ok((private, app(conn)?))
+        })
+    }
+
     /// Re-run the key check for a schema whose DDL moved since the last look.
     ///
     /// The capture session covers tables created after it exists, so a table
@@ -3579,6 +3668,10 @@ where
                 })
             }
             ControlMessage::Pong(pong) => Ok(ClientEvent::Pong { nonce: pong.nonce }),
+            ControlMessage::ContentTicketGrant(grant) => Ok(ClientEvent::ContentTicket {
+                request_id: grant.request_id,
+                url: grant.url,
+            }),
             ControlMessage::NonFatalError(err) => Ok(ClientEvent::NonFatal {
                 related_to: err.related_to,
                 detail: err.detail,

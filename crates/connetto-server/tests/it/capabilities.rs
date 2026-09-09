@@ -154,7 +154,8 @@ const PAPERS: [(i32, &str, &str); 3] = [(1, "alice", "a"), (2, "bob", "b"), (3, 
 /// as the fan-out does, through the same row view a replication event carries.
 async fn visible_on_change_path(auth: &RlsAuth, caller: &Principal) -> Vec<i32> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).expect("the catalog parses");
-    let table = catalog_helpers::table_id(&catalog, "papers").expect("papers is in the catalog");
+    let table = catalog_helpers::table_id::<PgValues, _>(&catalog, "papers")
+        .expect("papers is in the catalog");
     let watchers = [Arc::new(caller.clone())];
     let mut verdicts = Vec::new();
     let mut seen = Vec::new();

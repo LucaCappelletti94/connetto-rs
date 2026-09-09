@@ -126,8 +126,14 @@ impl AnyStore {
     /// Deletes the chunk at `hash`.  A missing chunk is not an error.
     pub async fn delete(&self, hash: &ChunkHash) -> Result<(), StoreError> {
         match self {
-            Self::Fs(s) => fs::delete_chunk(s, hash).await,
-            Self::Object(s) => object::delete_chunk(s, hash).await,
+            Self::Fs(s) => {
+                use connetto_file_core::ChunkStore;
+                s.delete_chunk(hash).await
+            }
+            Self::Object(s) => {
+                use connetto_file_core::ChunkStore;
+                s.delete_chunk(hash).await
+            }
             Self::Custom(s) => s.delete(hash).await,
         }
     }

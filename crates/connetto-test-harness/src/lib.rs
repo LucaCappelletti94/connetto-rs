@@ -28,17 +28,17 @@ use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, FullResyncReason, Grant, Handshake, HandshakeAck,
-    LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe, SubscriptionSpec,
-    Unsubscribe,
+    AckCredits, BulkMessage, ContentVerb, ControlMessage, FullResyncReason, Grant, Handshake,
+    HandshakeAck, LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe,
+    SubscriptionSpec, Unsubscribe,
 };
-use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::traits::{ContentTicketSigner, IncomingFrame, MaybeSend, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    LoopbackTransport, Materializer, OidcProviderConfig, PgReadConnector, PgSnapshotSource,
-    ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, loopback, pg_write_target,
+    InMemoryOplog, LoopbackTransport, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
+    PgSnapshotSource, ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, ThrottleConfig, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -783,10 +783,91 @@ fn unreachable_service() -> HarnessAuthError {
     })
 }
 
+/// Error produced by a boxed content-ticket signer.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct BoxSignerError(String);
+
+/// Object-safe shim for [`ContentTicketSigner`] implementations, allowing
+/// type erasure inside [`BoxSigner`].
+trait SignerInner: Send + Sync {
+    fn mint_boxed<'a>(
+        &'a self,
+        caller: &'a str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>>;
+}
+
+struct ErasedWrapper<S>(S);
+
+impl<S> SignerInner for ErasedWrapper<S>
+where
+    S: ContentTicketSigner + Send + Sync,
+{
+    fn mint_boxed<'a>(
+        &'a self,
+        caller: &'a str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0
+                .mint(caller, file_id, verb)
+                .await
+                .map_err(|e| BoxSignerError(format!("{e}")))
+        })
+    }
+}
+
+/// A type-erased content-ticket signer backed by an `Arc`-shared inner
+/// implementation.
+///
+/// This is the concrete [`ContentTicketSigner`] the harness server holds. Tests
+/// supply any signer they need via [`ServerConfig::with_content_signer`]; the
+/// harness default delegates to [`NoSigner`], which always fails gracefully.
+pub struct BoxSigner(Arc<dyn SignerInner>);
+
+impl BoxSigner {
+    fn noop() -> Self {
+        Self(Arc::new(ErasedWrapper(NoSigner)))
+    }
+
+    fn wrap<S>(signer: S) -> Self
+    where
+        S: ContentTicketSigner + Send + Sync + 'static,
+    {
+        Self(Arc::new(ErasedWrapper(signer)))
+    }
+}
+
+impl ContentTicketSigner for BoxSigner {
+    type Error = BoxSignerError;
+
+    fn mint(
+        &self,
+        caller: &str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> impl Future<Output = Result<String, Self::Error>> + MaybeSend {
+        let inner = Arc::clone(&self.0);
+        let caller = caller.to_owned();
+        async move { inner.mint_boxed(&caller, file_id, verb).await }
+    }
+}
+
 /// The concrete manager type the harness serves: real snapshot, the harness auth
 /// policy, and the async re-execution connector.
-type HarnessManager =
-    SessionManager<PgSnapshotSource, HarnessAuth, ConnettoWatermark, PgReadConnector>;
+type HarnessManager = SessionManager<
+    PgSnapshotSource,
+    HarnessAuth,
+    ConnettoWatermark,
+    PgReadConnector,
+    InMemoryOplog,
+    String,
+    String,
+    BoxSigner,
+>;
 
 /// How to wire a harness server.
 pub struct ServerConfig {
@@ -813,6 +894,8 @@ pub struct ServerConfig {
     /// non-empty, `spawn_server` calls `start_replication` using the admin URL
     /// so the slot and publication exist before the ingest loop connects.
     replication_tables: Vec<String>,
+    /// The signer the session loop calls when a client requests a content ticket.
+    signer: BoxSigner,
 }
 
 impl ServerConfig {
@@ -828,6 +911,7 @@ impl ServerConfig {
             translator: None,
             caller: None,
             replication_tables: Vec::new(),
+            signer: BoxSigner::noop(),
         }
     }
 
@@ -870,6 +954,20 @@ impl ServerConfig {
     #[must_use]
     pub fn with_replication(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.replication_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The signer the session loop calls when a client requests a content ticket.
+    ///
+    /// Supply any type that implements [`ContentTicketSigner`]. The harness
+    /// default is a no-op signer that always fails gracefully, so tests that do
+    /// not need signed URLs need not call this.
+    #[must_use]
+    pub fn with_content_signer<S>(mut self, signer: S) -> Self
+    where
+        S: ContentTicketSigner + Send + Sync + 'static,
+    {
+        self.signer = BoxSigner::wrap(signer);
         self
     }
 }
@@ -967,6 +1065,7 @@ pub async fn spawn_server(
         translator,
         caller,
         replication_tables,
+        signer,
     } = config;
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
@@ -989,16 +1088,19 @@ pub async fn spawn_server(
     // build.
     let authority: Arc<dyn connetto_core::traits::HandshakeAuthority> =
         Arc::new(connetto_core::test_support::TestGrantChecker);
-    let manager = SessionManager::with_connector(
+    let manager = SessionManager::with_oplog(
         materializer,
         snapshot,
         auth,
         authority,
         connector,
+        InMemoryOplog::default(),
         write,
         guard,
         session,
         upkeep,
+        signer,
+        ThrottleConfig::default(),
     );
     // R27 decision 6: move-out withdrawals are read on the admin pool, as the
     // binary reads them on DATABASE_URL's, because the caller can no longer

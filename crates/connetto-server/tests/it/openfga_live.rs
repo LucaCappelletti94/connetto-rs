@@ -144,7 +144,8 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
-    let notes = catalog_helpers::table_id(shapes.catalog(), "r5b_notes").expect("in the catalog");
+    let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
+        .expect("in the catalog");
     let row = [Value::Int(1), Value::String("alice".to_owned())];
     let view = ValuesRow::new(notes, &row);
     let watchers = [caller("alice"), caller("bob")];
@@ -239,7 +240,8 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
-    let notes = catalog_helpers::table_id(shapes.catalog(), "r5b_notes").expect("in the catalog");
+    let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
+        .expect("in the catalog");
     let row = [Value::Int(1), Value::String("alice".to_owned())];
     let view = ValuesRow::new(notes, &row);
     let watchers = [caller("alice")];
@@ -323,7 +325,8 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     // Row 1 moves from alice to carol. This is the event the change stream
     // would carry, with both images, which is what `REPLICA IDENTITY FULL`
     // gives an update.
-    let notes = catalog_helpers::table_id(shapes.catalog(), "r5b_notes").expect("in the catalog");
+    let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
+        .expect("in the catalog");
     let after: [Value<Postgres>; 2] = [Value::Int(1), Value::String("carol".to_owned())];
     let event = ChangeEvent::update(
         "public",
@@ -467,7 +470,8 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
     let pool = fixture.admin().clone();
     provision_cross(&pool).await;
     let (auth, upkeep, shapes) = cross_executor(&fixture, &pool).await;
-    let docs = catalog_helpers::table_id(shapes.catalog(), "r7_docs").expect("in the catalog");
+    let docs = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r7_docs")
+        .expect("in the catalog");
     let row: [Value<Postgres>; 2] = [Value::Int(1), Value::Int(1)];
     let view = ValuesRow::new(docs, &row);
     let alice = [caller("alice")];
@@ -634,7 +638,8 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
-    let orders = catalog_helpers::table_id(shapes.catalog(), "r40_orders").expect("in the catalog");
+    let orders = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r40_orders")
+        .expect("in the catalog");
     let id = uuid::Uuid::from_u128(0xab4a_f609_f3d2_5ebd_b482_fbe8_b7db_00c6);
     let alice = caller("alice");
 
@@ -775,7 +780,8 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
     provision_replay(&pool).await;
     let (auth, upkeep, shapes) = replay_executor(&fixture, &pool).await;
 
-    let papers = catalog_helpers::table_id(shapes.catalog(), "r86_papers").expect("in the catalog");
+    let papers = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r86_papers")
+        .expect("in the catalog");
     let row: [Value<Postgres>; 2] = [Value::Int(1), Value::String("zoe".to_owned())];
     let view = ValuesRow::new(papers, &row);
     let alice = [caller("alice")];
@@ -1175,7 +1181,8 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     // (d) Two tenants sharing id=1 each grant their own viewer. The compound
     // key (tenant_id, paper_id) binds both join columns, so the grants are
     // independent facts that a first-column-only key would have merged.
-    let papers = catalog_helpers::table_id(shapes.catalog(), "ck_papers").expect("in the catalog");
+    let papers = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "ck_papers")
+        .expect("in the catalog");
     let t1_p1 = ck_paper_row(1, 1, "owner1");
     let t2_p1 = ck_paper_row(2, 1, "owner2");
     let view1 = ValuesRow::new(papers, &t1_p1);
