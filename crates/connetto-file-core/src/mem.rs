@@ -2,11 +2,28 @@
 
 use core::future::{self, Future};
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Mutex;
+
+use thiserror::Error;
 
 use crate::identity::ChunkHash;
 use crate::store::ChunkStore;
+
+/// The one thing an in-memory store can fail at.
+#[derive(Debug, Error)]
+pub enum MemStoreError {
+    /// A read named a chunk the store does not hold.
+    ///
+    /// Reporting it is the whole reason this error type exists rather than
+    /// `Infallible`: a store that answers an absent chunk with empty bytes
+    /// makes [`reassemble`](crate::reassemble) return the wrong file and call
+    /// it success.
+    #[error("no chunk stored at {hash}")]
+    Absent {
+        /// The hash that is not there.
+        hash: ChunkHash,
+    },
+}
 
 /// In-memory chunk store.
 ///
@@ -26,13 +43,13 @@ impl MemStore {
 }
 
 impl ChunkStore for MemStore {
-    type Error = Infallible;
+    type Error = MemStoreError;
 
     fn write_chunk(
         &self,
         hash: &ChunkHash,
         data: &[u8],
-    ) -> impl Future<Output = Result<(), Infallible>> + Send {
+    ) -> impl Future<Output = Result<(), MemStoreError>> + Send {
         self.chunks
             .lock()
             .expect("MemStore lock is not poisoned")
@@ -43,23 +60,37 @@ impl ChunkStore for MemStore {
     fn read_chunk(
         &self,
         hash: &ChunkHash,
-    ) -> impl Future<Output = Result<Vec<u8>, Infallible>> + Send {
+    ) -> impl Future<Output = Result<Vec<u8>, MemStoreError>> + Send {
         let val = self
             .chunks
             .lock()
             .expect("MemStore lock is not poisoned")
             .get(hash)
             .cloned()
-            .unwrap_or_default();
-        future::ready(Ok(val))
+            .ok_or(MemStoreError::Absent { hash: *hash });
+        future::ready(val)
     }
 
-    fn has_chunk(&self, hash: &ChunkHash) -> impl Future<Output = Result<bool, Infallible>> + Send {
+    fn has_chunk(
+        &self,
+        hash: &ChunkHash,
+    ) -> impl Future<Output = Result<bool, MemStoreError>> + Send {
         let present = self
             .chunks
             .lock()
             .expect("MemStore lock is not poisoned")
             .contains_key(hash);
         future::ready(Ok(present))
+    }
+
+    fn delete_chunk(
+        &self,
+        hash: &ChunkHash,
+    ) -> impl Future<Output = Result<(), MemStoreError>> + Send {
+        self.chunks
+            .lock()
+            .expect("MemStore lock is not poisoned")
+            .remove(hash);
+        future::ready(Ok(()))
     }
 }

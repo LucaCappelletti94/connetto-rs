@@ -38,4 +38,18 @@ pub trait ChunkStore {
         &self,
         hash: &ChunkHash,
     ) -> impl core::future::Future<Output = Result<bool, Self::Error>> + MaybeSend;
+
+    /// Removes the chunk stored at `hash`.
+    ///
+    /// Removing a hash the store does not hold succeeds: the caller wanted
+    /// the chunk gone and it is, and a sweep re-running over a list it
+    /// already collected is the ordinary case rather than an error.
+    ///
+    /// A store never decides on its own that a chunk is unreferenced. That
+    /// judgement belongs to whoever holds the manifests, because two of them
+    /// can name the same chunk.
+    fn delete_chunk(
+        &self,
+        hash: &ChunkHash,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
 }

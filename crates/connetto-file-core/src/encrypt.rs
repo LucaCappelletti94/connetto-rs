@@ -119,6 +119,13 @@ impl<S: ChunkStore + Sync> ChunkStore for EncryptingStore<S> {
             .await
             .map_err(EncryptStoreError::Inner)
     }
+
+    async fn delete_chunk(&self, hash: &ChunkHash) -> Result<(), Self::Error> {
+        self.inner
+            .delete_chunk(hash)
+            .await
+            .map_err(EncryptStoreError::Inner)
+    }
 }
 
 fn encrypt_chunk<E: std::error::Error + Send + Sync + 'static>(
