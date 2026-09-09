@@ -14,6 +14,8 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpReply};
+use connetto_file_core::{FileId, MimeClass};
+use diesel::prelude::*;
 
 /// The application's own table: a photo entry naming its content.
 pub const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, \
@@ -277,4 +279,142 @@ pub async fn attach_content(
     ContentClient::attach(client, FsStore::new(chunks), ROOT_KEY, http)
         .await
         .expect("attach content handling")
+}
+
+/// Stages `bytes` as photo row `id` and returns the file identity.
+///
+/// Inserts into the `photos` table from [`DDL`]: `id` and `content_id` only.
+/// Every test module that uses the standard two-column photo table can call
+/// this instead of writing the stage closure inline.
+pub async fn stage_photo(
+    content: &ContentClient<Scripted, FsStore, RecordingHttp>,
+    id: i32,
+    bytes: &[u8],
+    mime: MimeClass,
+) -> FileId {
+    let (file_id, ()) = content
+        .stage(bytes, mime, |conn, file_id| {
+            diesel::insert_into(photos::table)
+                .values((
+                    photos::id.eq(id),
+                    photos::content_id.eq(file_id.as_bytes().to_vec()),
+                ))
+                .execute(conn)
+                .map(|_| ())
+        })
+        .await
+        .expect("stage a photo");
+    file_id
+}
+
+/// Opens an offline replica and attaches a content client backed by
+/// `RecordingHttp::default()`.
+///
+/// Returns both the raw client and the content client so tests that need to
+/// inspect the replica directly can call `with_conn` on the client.
+pub async fn offline_content(
+    dir: &std::path::Path,
+) -> (
+    ConnettoClient<Scripted>,
+    ContentClient<Scripted, FsStore, RecordingHttp>,
+) {
+    let client = offline_client(&dir.join("replica.sqlite"));
+    let content = attach_content(
+        client.clone(),
+        &dir.join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+    (client, content)
+}
+
+/// Derives the content identity of `bytes` without committing anything to a
+/// persistent replica.
+///
+/// Creates a throwaway replica that is discarded when this call returns; the
+/// returned `FileId` is the BLAKE3-based identity that any replica would
+/// assign to the same bytes.
+pub async fn learn_file_id(bytes: &[u8]) -> FileId {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let probe = attach_content(
+        offline_client(&dir.path().join("replica.sqlite")),
+        &dir.path().join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+    let (file_id, ()) = probe
+        .stage(bytes, MimeClass::Jpeg, |_, _| Ok(()))
+        .await
+        .expect("stage against a throwaway replica");
+    file_id
+}
+
+/// Inserts a photo row naming `file_id` into the client's replica, then pins
+/// all `content_id` values from the photos table under the name "album".
+///
+/// Captures the shared `with_conn` + `pin_content` setup that both
+/// `fetch_pinned` tests perform before exercising the download path.
+pub async fn insert_row_and_pin_album(
+    client: &ConnettoClient<Scripted>,
+    content: &ContentClient<Scripted, FsStore, RecordingHttp>,
+    file_id: FileId,
+) {
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(photos::table)
+                .values((
+                    photos::id.eq(1),
+                    photos::content_id.eq(file_id.as_bytes().to_vec()),
+                ))
+                .execute(conn.conn())
+                .expect("record the row the pin reads")
+        })
+        .await;
+    content
+        .pin_content("album", "SELECT content_id FROM photos", "content_id")
+        .await
+        .expect("pin the album");
+}
+
+/// Asserts the file resolves from a local source, carrying `why` on failure.
+pub async fn assert_local<H: ContentHttp>(
+    content: &ContentClient<Scripted, FsStore, H>,
+    file_id: FileId,
+    why: &str,
+) {
+    let resolved = content.resolve(file_id).await.expect("resolve");
+    assert!(
+        matches!(resolved, connetto_file_client::Resolved::Local { .. }),
+        "{why}, got {resolved:?}"
+    );
+}
+
+/// Asserts the file resolves to a signed URL, carrying `why` on failure.
+pub async fn assert_remote<H: ContentHttp>(
+    content: &ContentClient<Scripted, FsStore, H>,
+    file_id: FileId,
+    why: &str,
+) {
+    let resolved = content.resolve(file_id).await.expect("resolve");
+    assert!(
+        matches!(resolved, connetto_file_client::Resolved::Remote { .. }),
+        "{why}, got {resolved:?}"
+    );
+}
+
+/// Opens a replica with `transport` attached and a content client over it.
+///
+/// The pairing every connected case needs: the client for replica reads and
+/// writes, and the content client for everything about bytes.
+pub async fn connected_content(
+    root: &std::path::Path,
+    transport: Scripted,
+    http: RecordingHttp,
+) -> (
+    ConnettoClient<Scripted>,
+    ContentClient<Scripted, FsStore, RecordingHttp>,
+) {
+    let client = connected_client(&root.join("replica.sqlite"), transport).await;
+    let content = attach_content(client.clone(), &root.join("chunks"), http).await;
+    (client, content)
 }

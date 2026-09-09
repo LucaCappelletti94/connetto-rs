@@ -1,13 +1,15 @@
 //! The reclaim half of the pin surface: what `tidy_content` spares and what
 //! it sweeps.
 
-use connetto_file_client::Resolved;
+use connetto_file_client::{ContentClient, FsStore};
 use connetto_file_core::{FileId, MimeClass};
-use diesel::prelude::*;
 use tempfile::tempdir;
 
 use crate::staging::walk_files;
-use crate::support::{RecordingHttp, Scripted, attach_content, connected_client, photos};
+use crate::support::{
+    RecordingHttp, Scripted, assert_local, assert_remote, attach_content, connected_client,
+    stage_photo,
+};
 
 /// The granted write address every upload in this module runs under.
 const INTENT_URL: &str = "http://files.test/files/aa/intent?t=TOKEN";
@@ -18,30 +20,82 @@ fn one_chunk_upload() -> Vec<(u16, Vec<u8>)> {
     vec![(200, br#"{"needed":[]}"#.to_vec()), (200, Vec::new())]
 }
 
-/// Stages `bytes` as photo `id` and returns its identity.
-async fn stage_photo(
-    content: &connetto_file_client::ContentClient<
-        Scripted,
-        connetto_file_client::FsStore,
-        RecordingHttp,
-    >,
-    id: i32,
-    bytes: &[u8],
-    mime: MimeClass,
-) -> FileId {
-    let (file_id, ()) = content
-        .stage(bytes, mime, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(id),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
+/// The three file identities the tidy scenario stages.
+struct TidyArrangement {
+    /// A file that was uploaded but not pinned, so tidy evicts it.
+    cached: FileId,
+    /// A file that was uploaded and pinned under "one-photo", so tidy spares it.
+    pinned: FileId,
+    /// A file that was never uploaded, so tidy always spares it.
+    unsent: FileId,
+}
+
+/// Stages a cached photo, a pinned photo, and an unsent photo; flushes the
+/// outbox after the first two uploads and pins the second photo.
+///
+/// Returns the three identities so the tidy test can assert on each outcome
+/// without rebuilding the arrangement inline.
+async fn arrange_tidy_scenario(
+    content: &ContentClient<Scripted, FsStore, RecordingHttp>,
+) -> TidyArrangement {
+    let cached = stage_photo(content, 1, b"a cached photo", MimeClass::Jpeg).await;
+    let pinned = stage_photo(content, 2, b"a pinned photo", MimeClass::Jpeg).await;
+    assert_eq!(
+        content.flush_outbox().await.expect("walk the outbox"),
+        2,
+        "both uploads land, so both files are cache from here"
+    );
+    let unsent = stage_photo(content, 3, b"a photo still waiting", MimeClass::Jpeg).await;
+    content
+        .pin_content(
+            "one-photo",
+            "SELECT content_id FROM photos WHERE id = 2",
+            "content_id",
+        )
         .await
-        .expect("stage a photo");
-    file_id
+        .expect("pin the second photo");
+    TidyArrangement {
+        cached,
+        pinned,
+        unsent,
+    }
+}
+
+/// The file identities used to prove that chunk sharing survives eviction.
+struct SharedChunkScenario {
+    /// The shorter file whose chunks overlap with `kept`, evicted by tidy.
+    evicted: FileId,
+    /// The longer file that survives the tidy pass.
+    kept: FileId,
+    /// The bytes of `kept`, for the post-reassembly assertion.
+    kept_bytes: Vec<u8>,
+}
+
+/// Stages two files where the shorter is a prefix of the longer, so they share
+/// at least one chunk, then returns both identities and the longer file's bytes.
+///
+/// Also asserts that both files are multi-chunk and have different identities,
+/// so the sharing is structural rather than incidental.
+async fn arrange_shared_chunk_scenario(
+    content: &ContentClient<Scripted, FsStore, RecordingHttp>,
+    chunks: &std::path::Path,
+) -> SharedChunkScenario {
+    let shared = pseudorandom(0x5EED, 12 * 1024 * 1024);
+    let mut extended = shared.clone();
+    extended.extend_from_slice(&pseudorandom(0xFEED, 64 * 1024));
+    let evicted = stage_photo(content, 1, &shared, MimeClass::Generic).await;
+    let kept = stage_photo(content, 2, &extended, MimeClass::Generic).await;
+    assert_ne!(evicted, kept, "the two files have different identities");
+    let before = crate::staging::walk_files(chunks).len();
+    assert!(
+        before > 2,
+        "both files are multi-chunk, so the sharing is real rather than incidental, got {before}"
+    );
+    SharedChunkScenario {
+        evicted,
+        kept,
+        kept_bytes: extended,
+    }
 }
 
 /// A pin and an unsent entry each keep their bytes, and a cached file that
@@ -61,68 +115,33 @@ async fn tidy_spares_unsent_and_pinned_and_evicts_the_rest() {
     )
     .await;
     let content = attach_content(client.clone(), &chunks, http).await;
-
-    let cached = stage_photo(&content, 1, b"a cached photo", MimeClass::Jpeg).await;
-    let pinned = stage_photo(&content, 2, b"a pinned photo", MimeClass::Jpeg).await;
-    assert_eq!(
-        content.flush_outbox().await.expect("walk the outbox"),
-        2,
-        "both uploads land, so both files are cache from here"
-    );
-    let unsent = stage_photo(&content, 3, b"a photo still waiting", MimeClass::Jpeg).await;
-
-    content
-        .pin_content(
-            "one-photo",
-            "SELECT content_id FROM photos WHERE id = 2",
-            "content_id",
-        )
-        .await
-        .expect("pin the second photo");
+    let arr = arrange_tidy_scenario(&content).await;
 
     assert_eq!(
         content.tidy_content().await.expect("tidy"),
         1,
         "only the cached file nothing covers is evicted"
     );
-
     assert_eq!(
         walk_files(&chunks).len(),
         2,
         "the pinned file's chunk and the unsent file's chunk are both still on disk"
     );
-    assert!(
-        matches!(
-            content
-                .resolve(pinned)
-                .await
-                .expect("resolve the pinned file"),
-            Resolved::Local { .. }
-        ),
-        "the pin kept its bytes local"
-    );
-    assert!(
-        matches!(
-            content
-                .resolve(unsent)
-                .await
-                .expect("resolve the unsent file"),
-            Resolved::Local { .. }
-        ),
-        "unsent bytes cannot be refetched, so they are never swept"
-    );
+    assert_local(&content, arr.pinned, "the pin kept its bytes local").await;
+    assert_local(
+        &content,
+        arr.unsent,
+        "unsent bytes cannot be refetched, so they are never swept",
+    )
+    .await;
     // The evicted one has no manifest here any more, so the only answer left
     // is the server's.
-    assert!(
-        matches!(
-            content
-                .resolve(cached)
-                .await
-                .expect("resolve the evicted file"),
-            Resolved::Remote { .. }
-        ),
-        "the evicted file is cache, refetchable by construction"
-    );
+    assert_remote(
+        &content,
+        arr.cached,
+        "the evicted file is cache, refetchable by construction",
+    )
+    .await;
 }
 
 /// A chunk two files share survives the eviction of one of them.
@@ -145,29 +164,13 @@ async fn tidy_keeps_a_chunk_two_files_share() {
     )
     .await;
     let content = attach_content(client.clone(), &chunks, http).await;
-
-    // Above the 4 MiB maximum chunk of the text class, so the files are
-    // chunked rather than stored whole.
-    let shared = pseudorandom(0x5EED, 12 * 1024 * 1024);
-    let mut extended = shared.clone();
-    extended.extend_from_slice(&pseudorandom(0xFEED, 64 * 1024));
-
-    let evicted = stage_photo(&content, 1, &shared, MimeClass::Generic).await;
-    let kept = stage_photo(&content, 2, &extended, MimeClass::Generic).await;
-    assert_ne!(evicted, kept, "the two files have different identities");
-
-    let before = walk_files(&chunks).len();
-    assert!(
-        before > 2,
-        "both files are multi-chunk, so the sharing is real rather than incidental, got {before}"
-    );
+    let scenario = arrange_shared_chunk_scenario(&content, &chunks).await;
 
     assert_eq!(
         content.flush_outbox().await.expect("walk the outbox"),
         0,
         "both are refused rather than sent, so neither is unsent any more"
     );
-
     content
         .pin_content(
             "longer",
@@ -176,31 +179,41 @@ async fn tidy_keeps_a_chunk_two_files_share() {
         )
         .await
         .expect("pin the longer file");
-
     assert_eq!(
         content.tidy_content().await.expect("tidy"),
         1,
         "the uncovered file is evicted"
     );
+    assert_survivor_intact(&content, &scenario).await;
+}
 
-    let resolved = content.resolve(kept).await.expect("resolve the survivor");
-    assert!(
-        matches!(resolved, Resolved::Local { .. }),
-        "the survivor still reads from the chunk store, so the chunks it shared were spared, got {resolved:?}"
-    );
+/// Asserts the pinned file still reads whole from the chunk store and the
+/// evicted one no longer has a manifest here.
+async fn assert_survivor_intact(
+    content: &ContentClient<Scripted, FsStore, RecordingHttp>,
+    scenario: &SharedChunkScenario,
+) {
+    assert_local(
+        content,
+        scenario.kept,
+        "the survivor still reads from the chunk store, so the chunks it shared were spared",
+    )
+    .await;
     let bytes = content
-        .bytes(kept)
+        .bytes(scenario.kept)
         .await
         .expect("read the surviving file")
         .expect("its bytes are local");
     assert_eq!(
-        bytes, extended,
+        bytes, scenario.kept_bytes,
         "the surviving file reads back whole, so the chunks it shared with the evicted one are still there"
     );
-    assert!(
-        matches!(content.resolve(evicted).await, Ok(Resolved::Remote { .. })),
-        "the evicted file has no manifest here any more"
-    );
+    assert_remote(
+        content,
+        scenario.evicted,
+        "the evicted file has no manifest here any more",
+    )
+    .await;
 }
 
 /// A deterministic pseudorandom buffer, so chunk boundaries are reproducible

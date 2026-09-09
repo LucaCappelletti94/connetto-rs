@@ -126,6 +126,67 @@ const FAKE_INTENT: &str = "http://files.test/files/\
 const MALFORMED_INTENT: &str = "http://files.test/files/\
     0000000000000000000000000000000000000000000000000000000000000000/intent";
 
+/// Creates a connected content client in `dir` with `http` and stages a
+/// generic payload, so the outbox has one entry ready for the next flush.
+async fn staged_outbox_entry(
+    dir: &std::path::Path,
+    http: RecordingHttp,
+) -> ContentClient<Scripted, FsStore, RecordingHttp> {
+    let client =
+        connected_client(&dir.join("replica.sqlite"), Scripted::granting(FAKE_INTENT)).await;
+    let cc = ContentClient::attach(client, FsStore::new(dir.join("chunks")), ROOT_KEY, http)
+        .await
+        .expect("attach");
+    cc.stage(
+        io::Cursor::new(b"payload"),
+        MimeClass::Generic,
+        |_conn, _id| Ok(()),
+    )
+    .await
+    .expect("stage");
+    cc
+}
+
+/// Asserts that `sent` starts with the intent `POST` at `intent_url`, contains
+/// chunk `PUT`s at the correct base URL with the same token, and ends with a
+/// commit `POST` naming `file_id`.
+fn assert_upload_request_shapes(
+    sent: &[Sent],
+    file_id: connetto_file_core::FileId,
+    intent_url: &str,
+) {
+    assert!(!sent.is_empty(), "at least one request must have been sent");
+    assert_eq!(
+        sent[0].method, "POST",
+        "first request must be the intent POST"
+    );
+    assert_eq!(
+        sent[0].url, intent_url,
+        "intent POST must use the granted URL verbatim, token and all"
+    );
+    let puts: Vec<&Sent> = sent.iter().filter(|s| s.method == "PUT").collect();
+    assert!(!puts.is_empty(), "at least one chunk PUT must be sent");
+    for put in &puts {
+        assert!(
+            put.url.starts_with("http://files.test/chunks/"),
+            "chunk PUT must be at <base>/chunks/<hex>, got {}",
+            put.url
+        );
+        assert!(
+            put.url.ends_with("?t=TOKEN"),
+            "chunk PUT must carry the same token as the grant, got {}",
+            put.url
+        );
+    }
+    let last = sent.last().expect("commit must exist");
+    assert_eq!(last.method, "POST", "last request must be the commit POST");
+    assert_eq!(
+        last.url,
+        format!("http://files.test/files/{file_id}/commit?t=TOKEN"),
+        "commit POST must name the actual file identity and carry the same token"
+    );
+}
+
 /// The three upload addresses are derived correctly from one granted intent URL.
 ///
 /// The intent `POST` carries the granted URL verbatim. The chunk `PUT`
@@ -155,39 +216,7 @@ async fn three_upload_addresses_derived_from_granted_intent_url() {
     cc.flush_outbox().await.expect("flush");
 
     let sent = http_ref.sent();
-    assert!(!sent.is_empty(), "at least one request must have been sent");
-
-    assert_eq!(
-        sent[0].method, "POST",
-        "first request must be the intent POST"
-    );
-    assert_eq!(
-        sent[0].url, FAKE_INTENT,
-        "intent POST must use the granted URL verbatim, token and all"
-    );
-
-    let puts: Vec<&Sent> = sent.iter().filter(|s| s.method == "PUT").collect();
-    assert!(!puts.is_empty(), "at least one chunk PUT must be sent");
-    for put in &puts {
-        assert!(
-            put.url.starts_with("http://files.test/chunks/"),
-            "chunk PUT must be at <base>/chunks/<hex>, got {}",
-            put.url
-        );
-        assert!(
-            put.url.ends_with("?t=TOKEN"),
-            "chunk PUT must carry the same token as the grant, got {}",
-            put.url
-        );
-    }
-
-    let last = sent.last().expect("commit must exist");
-    assert_eq!(last.method, "POST", "last request must be the commit POST");
-    assert_eq!(
-        last.url,
-        format!("http://files.test/files/{file_id}/commit?t=TOKEN"),
-        "commit POST must name the actual file identity and carry the same token"
-    );
+    assert_upload_request_shapes(&sent, file_id, FAKE_INTENT);
 }
 
 /// A chunk the intent answer does not declare needed is not sent; the commit still happens.
@@ -278,78 +307,46 @@ async fn put_bodies_are_plaintext_not_ciphertext() {
 /// and defers again (503).
 #[tokio::test]
 async fn http_413_retires_entry_and_503_keeps_it_for_retry() {
-    // Part: 413 at intent retires the outbox entry immediately.
-    {
-        let dir = tempdir().expect("temp dir");
-        let replica = dir.path().join("replica.sqlite");
-        let chunks = dir.path().join("chunks");
-        let http = RecordingHttp::new([(413_u16, vec![])]);
-        let client = connected_client(&replica, Scripted::granting(FAKE_INTENT)).await;
-        let cc = ContentClient::attach(client, FsStore::new(&chunks), ROOT_KEY, http)
-            .await
-            .expect("attach");
-        cc.stage(
-            io::Cursor::new(b"payload"),
-            MimeClass::Generic,
-            |_conn, _id| Ok(()),
-        )
-        .await
-        .expect("stage");
-        let mut events = cc.events();
+    let permanent = tempdir().expect("temp dir");
+    let cc = staged_outbox_entry(permanent.path(), RecordingHttp::new([(413_u16, vec![])])).await;
+    let mut events = cc.events();
+    cc.flush_outbox().await.expect("first flush");
+    let ev = events
+        .try_recv()
+        .expect("UploadRefused must arrive after 413");
+    assert!(
+        matches!(ev, ContentEvent::UploadRefused { .. }),
+        "413 must produce UploadRefused; got {ev:?}"
+    );
+    cc.flush_outbox().await.expect("second flush");
+    assert!(
+        events.try_recv().is_err(),
+        "outbox is empty after 413 retires the entry; second flush must produce no event"
+    );
 
-        cc.flush_outbox().await.expect("first flush");
-        let ev = events
-            .try_recv()
-            .expect("UploadRefused must arrive after 413");
-        assert!(
-            matches!(ev, ContentEvent::UploadRefused { .. }),
-            "413 must produce UploadRefused; got {ev:?}"
-        );
+    let transient = tempdir().expect("temp dir");
+    let cc = staged_outbox_entry(
+        transient.path(),
+        RecordingHttp::new([(503_u16, vec![]), (503_u16, vec![])]),
+    )
+    .await;
+    let mut events = cc.events();
+    cc.flush_outbox().await.expect("first flush");
+    assert_deferred(&mut events, "UploadDeferred must arrive after first 503");
+    cc.flush_outbox().await.expect("second flush");
+    assert_deferred(
+        &mut events,
+        "503 on second flush must produce UploadDeferred again (entry stayed)",
+    );
+}
 
-        cc.flush_outbox().await.expect("second flush");
-        assert!(
-            events.try_recv().is_err(),
-            "outbox is empty after 413 retires the entry; second flush must produce no event"
-        );
-    }
-
-    // Part: 503 at intent keeps the outbox entry for the next attempt.
-    {
-        let dir = tempdir().expect("temp dir");
-        let replica = dir.path().join("replica.sqlite");
-        let chunks = dir.path().join("chunks");
-        let http = RecordingHttp::new([(503_u16, vec![]), (503_u16, vec![])]);
-        let client = connected_client(&replica, Scripted::granting(FAKE_INTENT)).await;
-        let cc = ContentClient::attach(client, FsStore::new(&chunks), ROOT_KEY, http)
-            .await
-            .expect("attach");
-        cc.stage(
-            io::Cursor::new(b"payload"),
-            MimeClass::Generic,
-            |_conn, _id| Ok(()),
-        )
-        .await
-        .expect("stage");
-        let mut events = cc.events();
-
-        cc.flush_outbox().await.expect("first flush");
-        let ev1 = events
-            .try_recv()
-            .expect("UploadDeferred must arrive after first 503");
-        assert!(
-            matches!(ev1, ContentEvent::UploadDeferred { .. }),
-            "503 must produce UploadDeferred; got {ev1:?}"
-        );
-
-        cc.flush_outbox().await.expect("second flush");
-        let ev2 = events
-            .try_recv()
-            .expect("UploadDeferred must arrive after second 503");
-        assert!(
-            matches!(ev2, ContentEvent::UploadDeferred { .. }),
-            "503 on second flush must produce UploadDeferred again (entry stayed); got {ev2:?}"
-        );
-    }
+/// Asserts the next content event defers an upload, carrying `why` on failure.
+fn assert_deferred(events: &mut tokio::sync::broadcast::Receiver<ContentEvent>, why: &str) {
+    let event = events.try_recv().expect(why);
+    assert!(
+        matches!(event, ContentEvent::UploadDeferred { .. }),
+        "{why}, got {event:?}"
+    );
 }
 
 /// A granted URL without a `?t=` query is refused before any HTTP request is sent.

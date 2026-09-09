@@ -240,28 +240,11 @@ where
             .client
             .with_conn(|conn| db::outbox(conn.conn()))
             .await?;
-        let store = self.store_for(FETCHED_CLASS);
         let mut lost = Vec::new();
         for file_id in waiting {
-            let manifest = self
-                .client
-                .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-                .await?;
-            let unreadable = match &manifest {
-                None => 0,
-                Some(manifest) => {
-                    let mut count = 0;
-                    for chunk in manifest.chunks() {
-                        if store.read_chunk(&chunk.hash).await.is_err() {
-                            count += 1;
-                        }
-                    }
-                    count
-                }
-            };
-            if manifest.is_some() && unreadable == 0 {
+            let Some(unreadable) = self.unreadable_chunks(file_id).await? else {
                 continue;
-            }
+            };
             self.client
                 .with_conn(|conn| db::dequeue(conn.conn(), file_id))
                 .await?;
@@ -272,6 +255,29 @@ where
             });
         }
         Ok(lost)
+    }
+
+    /// How many of one unsent file's chunks cannot be read, or `None` when all
+    /// of them can.
+    ///
+    /// An outbox entry with no manifest at all counts as lost with a count of
+    /// zero: nothing here can name its chunks, so nothing can upload it.
+    async fn unreadable_chunks(&self, file_id: FileId) -> Result<Option<usize>, ContentError> {
+        let manifest = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await?;
+        let Some(manifest) = manifest else {
+            return Ok(Some(0));
+        };
+        let store = self.store_for(FETCHED_CLASS);
+        let mut count = 0;
+        for chunk in manifest.chunks() {
+            if store.read_chunk(&chunk.hash).await.is_err() {
+                count += 1;
+            }
+        }
+        Ok((count > 0).then_some(count))
     }
 
     /// Uploads every file waiting in the outbox, returning how many landed.
@@ -399,32 +405,45 @@ where
     /// [`ContentError::TicketRefused`] when the server will not grant a read,
     /// and [`ContentError::Replica`] on a bookkeeping read failure.
     pub async fn resolve(&self, file_id: FileId) -> Result<Resolved, ContentError> {
-        let manifest = self
-            .client
-            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await?;
-        if let Some(manifest) = &manifest {
-            let unsent = self
-                .client
-                .with_conn(|conn| db::is_unsent(conn.conn(), file_id))
-                .await?;
-            if unsent {
-                return Ok(self
-                    .local_bytes(manifest)
-                    .await?
-                    .unwrap_or(Resolved::Unavailable));
-            }
-            if self.pinned().await?.contains(&file_id)
-                && let Some(local) = self.local_bytes(manifest).await?
-            {
-                return Ok(local);
-            }
+        if let Some(answer) = self.local_answer(file_id).await? {
+            return Ok(answer);
         }
         if !self.client.with_conn(|conn| conn.is_connected()).await {
             return Ok(Resolved::Unavailable);
         }
         let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
         Ok(Resolved::Remote { url })
+    }
+
+    /// The answer the device can give on its own, or `None` to ask a server.
+    ///
+    /// Unsent content answers here or nowhere, because the server has never
+    /// held it. Pinned content prefers what the pin paid to keep. Anything
+    /// else falls through, which is the common case chapter 18 describes as
+    /// never touching the chunk store at all.
+    async fn local_answer(&self, file_id: FileId) -> Result<Option<Resolved>, ContentError> {
+        let Some(manifest) = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if self
+            .client
+            .with_conn(|conn| db::is_unsent(conn.conn(), file_id))
+            .await?
+        {
+            return Ok(Some(
+                self.local_bytes(&manifest)
+                    .await?
+                    .unwrap_or(Resolved::Unavailable),
+            ));
+        }
+        if !self.pinned().await?.contains(&file_id) {
+            return Ok(None);
+        }
+        self.local_bytes(&manifest).await
     }
 
     /// This file's bytes, from a local source or from the server.
@@ -583,23 +602,7 @@ where
             .client
             .with_conn(|conn| {
                 conn.transact_with_bookkeeping(
-                    |c| {
-                        let mut evicted = 0;
-                        let mut released = Vec::new();
-                        for file_id in db::all_manifests(c)? {
-                            if pinned.contains(&file_id) || db::is_unsent(c, file_id)? {
-                                continue;
-                            }
-                            let Some(manifest) = db::load_manifest(c, file_id)? else {
-                                continue;
-                            };
-                            released.extend(manifest.chunks().iter().map(|chunk| chunk.hash));
-                            db::drop_manifest(c, file_id)?;
-                            evicted += 1;
-                        }
-                        let orphans = db::unreferenced(c, &released)?;
-                        Ok((evicted, orphans))
-                    },
+                    |c| evict_uncovered(c, &pinned),
                     |_| Ok::<(), ContentError>(()),
                 )
                 // The application half writes nothing here: eviction is
@@ -635,47 +638,58 @@ where
     /// file that was asked for, plus the ticket and transport failures
     /// [`resolve`](Self::resolve) reports.
     pub async fn fetch_pinned(&self) -> Result<Vec<FileId>, ContentError> {
-        let wanted = self.pinned().await?;
         let mut arrived = Vec::new();
-        for file_id in wanted {
-            let held = self
-                .client
-                .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-                .await?;
-            if let Some(manifest) = &held
-                && self.local_bytes(manifest).await?.is_some()
+        for file_id in self.pinned().await? {
+            if self.already_local(file_id).await?
+                || !self.client.with_conn(|conn| conn.is_connected()).await
             {
                 continue;
             }
-            if !self.client.with_conn(|conn| conn.is_connected()).await {
-                continue;
-            }
-            let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
-            let bytes = upload::download(&self.http, &url).await?;
-            let _writing = self.content_writes.lock().await;
-            let store = self.store_for(FETCHED_CLASS);
-            let manifest = process_file_from_reader(bytes.as_slice(), FETCHED_CLASS, &store)
-                .await
-                .map_err(|err| ContentError::Store(err.to_string()))?;
-            if manifest.file_id() != file_id {
-                return Err(ContentError::IdentityMismatch {
-                    expected: file_id,
-                    actual: manifest.file_id(),
-                });
-            }
-            self.client
-                .with_conn(|conn| {
-                    conn.transact_with_bookkeeping(
-                        |c| db::put_manifest(c, &manifest),
-                        |_| Ok::<(), diesel::result::Error>(()),
-                    )
-                })
-                .await
-                .map_err(ContentError::Replica)?;
+            self.fetch_one(file_id).await?;
             arrived.push(file_id);
             let _ = self.events.send(ContentEvent::Fetched { file_id });
         }
         Ok(arrived)
+    }
+
+    /// Whether a local source already serves this file's bytes.
+    async fn already_local(&self, file_id: FileId) -> Result<bool, ContentError> {
+        let Some(manifest) = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(self.local_bytes(&manifest).await?.is_some())
+    }
+
+    /// Downloads one file whole, proves it is the file that was asked for, and
+    /// re-chunks it into the store under its own manifest.
+    async fn fetch_one(&self, file_id: FileId) -> Result<(), ContentError> {
+        let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
+        let bytes = upload::download(&self.http, &url).await?;
+        let _writing = self.content_writes.lock().await;
+        let store = self.store_for(FETCHED_CLASS);
+        let manifest = process_file_from_reader(bytes.as_slice(), FETCHED_CLASS, &store)
+            .await
+            .map_err(|err| ContentError::Store(err.to_string()))?;
+        if manifest.file_id() != file_id {
+            return Err(ContentError::IdentityMismatch {
+                expected: file_id,
+                actual: manifest.file_id(),
+            });
+        }
+        self.client
+            .with_conn(|conn| {
+                conn.transact_with_bookkeeping(
+                    |c| db::put_manifest(c, &manifest),
+                    |_| Ok::<(), diesel::result::Error>(()),
+                )
+            })
+            .await
+            .map_err(ContentError::Replica)
+            .map(|_| ())
     }
 }
 
@@ -685,6 +699,42 @@ struct PinnedId {
     /// The identity bytes the pin's named column carried.
     #[diesel(sql_type = diesel::sql_types::Binary)]
     file_id: Vec<u8>,
+}
+
+/// Drops every manifest nothing covers and answers what that released.
+///
+/// A manifest survives when its file is unsent, because those bytes cannot be
+/// fetched again, or when a pin names it. The chunk hashes come back rather
+/// than being deleted here, because the rows have to commit before any file
+/// goes: the reverse order leaves a manifest pointing at bytes that are gone.
+fn evict_uncovered(
+    conn: &mut SqliteConnection,
+    pinned: &HashSet<FileId>,
+) -> Result<(usize, Vec<connetto_file_core::ChunkHash>), ContentError> {
+    let mut evicted = 0;
+    let mut released = Vec::new();
+    for file_id in db::all_manifests(conn)? {
+        let Some(manifest) = evictable(conn, pinned, file_id)? else {
+            continue;
+        };
+        released.extend(manifest.chunks().iter().map(|chunk| chunk.hash));
+        db::drop_manifest(conn, file_id)?;
+        evicted += 1;
+    }
+    let orphans = db::unreferenced(conn, &released)?;
+    Ok((evicted, orphans))
+}
+
+/// The manifest to evict, or `None` when something still wants this file.
+fn evictable(
+    conn: &mut SqliteConnection,
+    pinned: &HashSet<FileId>,
+    file_id: FileId,
+) -> Result<Option<Manifest>, ContentError> {
+    if pinned.contains(&file_id) || db::is_unsent(conn, file_id)? {
+        return Ok(None);
+    }
+    db::load_manifest(conn, file_id)
 }
 
 /// Wraps a pin's query so one fixed column name comes back.

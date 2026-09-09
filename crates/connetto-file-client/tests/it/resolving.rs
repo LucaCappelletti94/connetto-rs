@@ -2,11 +2,11 @@
 
 use connetto_file_client::{ContentError, Resolved};
 use connetto_file_core::MimeClass;
-use diesel::prelude::*;
 use tempfile::tempdir;
 
 use crate::support::{
-    RecordingHttp, Scripted, TicketAnswer, attach_content, connected_client, offline_client, photos,
+    RecordingHttp, Scripted, TicketAnswer, attach_content, connected_client, connected_content,
+    insert_row_and_pin_album, learn_file_id, offline_client, stage_photo,
 };
 
 /// A granted read address, the shape the file server mints for a download.
@@ -68,19 +68,7 @@ async fn an_unsent_file_never_answers_a_url() {
     .await;
     let content =
         attach_content(client, &dir.path().join("chunks"), RecordingHttp::default()).await;
-
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     let resolved = content.resolve(file_id).await.expect("resolve");
     assert!(
@@ -101,19 +89,8 @@ async fn a_pinned_file_prefers_local_bytes_to_a_url() {
     )
     .await;
     let content = attach_content(client, &dir.path().join("chunks"), http).await;
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
     assert_eq!(
         content.flush_outbox().await.expect("walk the outbox"),
         1,
@@ -141,35 +118,14 @@ async fn a_pinned_file_prefers_local_bytes_to_a_url() {
 #[tokio::test]
 async fn a_pin_names_the_files_its_query_returns() {
     let dir = tempdir().expect("temp dir");
-    let client = connected_client(
-        &dir.path().join("replica.sqlite"),
+    let (_client, content) = connected_content(
+        dir.path(),
         Scripted::granting(INTENT_URL),
-    )
-    .await;
-    let content = attach_content(
-        client.clone(),
-        &dir.path().join("chunks"),
         RecordingHttp::default(),
     )
     .await;
 
-    let (first, ()) = content
-        .stage(
-            b"first photo".as_slice(),
-            MimeClass::Jpeg,
-            |conn, file_id| {
-                diesel::insert_into(photos::table)
-                    .values((
-                        photos::id.eq(1),
-                        photos::content_id.eq(file_id.as_bytes().to_vec()),
-                    ))
-                    .execute(conn)
-                    .map(|_| ())
-            },
-        )
-        .await
-        .expect("stage the first photo");
-
+    let first = stage_photo(&content, 1, b"first photo", MimeClass::Jpeg).await;
     content
         .pin_content("album", "SELECT content_id FROM photos", "content_id")
         .await
@@ -180,22 +136,7 @@ async fn a_pin_names_the_files_its_query_returns() {
         "the pin names the one row there is"
     );
 
-    let (second, ()) = content
-        .stage(
-            b"second photo".as_slice(),
-            MimeClass::Jpeg,
-            |conn, file_id| {
-                diesel::insert_into(photos::table)
-                    .values((
-                        photos::id.eq(2),
-                        photos::content_id.eq(file_id.as_bytes().to_vec()),
-                    ))
-                    .execute(conn)
-                    .map(|_| ())
-            },
-        )
-        .await
-        .expect("stage the second photo");
+    let second = stage_photo(&content, 2, b"second photo", MimeClass::Jpeg).await;
     assert_eq!(
         content.pinned().await.expect("evaluate the pins"),
         [first, second].into_iter().collect(),
@@ -260,16 +201,7 @@ async fn fetch_pinned_downloads_verifies_and_rechunks() {
     let chunks = dir.path().join("chunks");
     // The staging client learns the identity, then a second, empty client
     // fetches it: the first is only how the test knows what to ask for.
-    let learner = attach_content(
-        offline_client(&dir.path().join("learn.sqlite")),
-        &dir.path().join("learn-chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
-    let (file_id, ()) = learner
-        .stage(PHOTO, MimeClass::Jpeg, |_, _| Ok(()))
-        .await
-        .expect("learn the identity");
+    let file_id = learn_file_id(PHOTO).await;
 
     let http = RecordingHttp::new(vec![(200, PHOTO.to_vec())]);
     let client = connected_client(
@@ -278,22 +210,7 @@ async fn fetch_pinned_downloads_verifies_and_rechunks() {
     )
     .await;
     let content = attach_content(client.clone(), &chunks, http.clone()).await;
-
-    client
-        .with_conn(|conn| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn.conn())
-                .expect("record the row the pin reads")
-        })
-        .await;
-    content
-        .pin_content("album", "SELECT content_id FROM photos", "content_id")
-        .await
-        .expect("pin the album");
+    insert_row_and_pin_album(&client, &content, file_id).await;
 
     assert_eq!(
         content.fetch_pinned().await.expect("fetch the pinned file"),
@@ -327,16 +244,9 @@ async fn fetch_pinned_downloads_verifies_and_rechunks() {
 #[tokio::test]
 async fn fetch_pinned_refuses_bytes_that_are_not_the_file() {
     let dir = tempdir().expect("temp dir");
-    let learner = attach_content(
-        offline_client(&dir.path().join("learn.sqlite")),
-        &dir.path().join("learn-chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
-    let (file_id, ()) = learner
-        .stage(PHOTO, MimeClass::Jpeg, |_, _| Ok(()))
-        .await
-        .expect("learn the identity");
+    // The staging client learns the identity, then a second, empty client
+    // fetches it: the first is only how the test knows what to ask for.
+    let file_id = learn_file_id(PHOTO).await;
 
     let http = RecordingHttp::new(vec![(200, b"somebody else's bytes entirely".to_vec())]);
     let client = connected_client(
@@ -345,28 +255,11 @@ async fn fetch_pinned_refuses_bytes_that_are_not_the_file() {
     )
     .await;
     let content = attach_content(client.clone(), &dir.path().join("chunks"), http).await;
-    client
-        .with_conn(|conn| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn.conn())
-                .expect("record the row the pin reads")
-        })
-        .await;
-    content
-        .pin_content("album", "SELECT content_id FROM photos", "content_id")
-        .await
-        .expect("pin the album");
+    insert_row_and_pin_album(&client, &content, file_id).await;
 
     let refused = content.fetch_pinned().await;
     assert!(
-        matches!(
-            refused,
-            Err(ContentError::IdentityMismatch { expected, .. }) if expected == file_id
-        ),
+        matches!(refused, Err(ContentError::IdentityMismatch { expected, .. }) if expected == file_id),
         "the download proves itself or it is refused, got {refused:?}"
     );
     assert!(

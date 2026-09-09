@@ -54,24 +54,19 @@ struct WriteEndpoints {
 impl WriteEndpoints {
     /// Splits a granted write URL of the shape `<base>/files/<hex>/intent?t=<token>`.
     fn parse(grant_url: &str) -> Result<Self, ContentError> {
-        let malformed = |why: &str| ContentError::MalformedGrant(format!("{why}: {grant_url}"));
-        let (address, token) = grant_url
-            .split_once("?t=")
-            .ok_or_else(|| malformed("no ticket query"))?;
-        if token.is_empty() {
-            return Err(malformed("empty ticket"));
+        Self::split(grant_url).ok_or_else(|| ContentError::MalformedGrant(grant_url.to_owned()))
+    }
+
+    /// The three parts, or nothing when the address is not the shape the file
+    /// server mints. Which part is wrong is visible in the URL itself, so the
+    /// refusal names the URL rather than guessing at the caller's intent.
+    fn split(grant_url: &str) -> Option<Self> {
+        let (address, token) = grant_url.split_once("?t=")?;
+        let base = address.strip_suffix("/intent")?.rsplit_once("/files/")?.0;
+        if token.is_empty() || base.is_empty() {
+            return None;
         }
-        let path = address
-            .strip_suffix("/intent")
-            .ok_or_else(|| malformed("not an upload intent address"))?;
-        let base = path
-            .rsplit_once("/files/")
-            .ok_or_else(|| malformed("no file path segment"))?
-            .0;
-        if base.is_empty() {
-            return Err(malformed("no server base"));
-        }
-        Ok(Self {
+        Some(Self {
             base: base.to_owned(),
             token: token.to_owned(),
         })
@@ -101,9 +96,24 @@ pub(crate) async fn upload<H: ContentHttp, S: ChunkStore>(
     store: &S,
 ) -> Result<(), ContentError> {
     let endpoints = WriteEndpoints::parse(grant_url)?;
-    let total_len: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+    let needed = declare(http, grant_url, manifest).await?;
+    send_chunks(http, &endpoints, manifest, store, &needed).await?;
+    let reply = send(
+        http.post(&endpoints.commit(manifest.file_id()), None),
+        "commit",
+    )
+    .await?;
+    expect(reply, 200, "commit").map(|_| ())
+}
+
+/// Declares the whole manifest and returns the hashes the server asks for.
+async fn declare<H: ContentHttp>(
+    http: &H,
+    intent_url: &str,
+    manifest: &Manifest,
+) -> Result<Vec<String>, ContentError> {
     let intent = IntentRequest {
-        total_len,
+        total_len: manifest.chunks().iter().map(|chunk| chunk.len).sum(),
         chunks: manifest
             .chunks()
             .iter()
@@ -117,17 +127,30 @@ pub(crate) async fn upload<H: ContentHttp, S: ChunkStore>(
         stage: "intent request",
         source,
     })?;
-    let reply = send(http.post(grant_url, Some(body)), "intent").await?;
+    let reply = send(http.post(intent_url, Some(body)), "intent").await?;
     let reply = expect(reply, 200, "intent")?;
     let answer: IntentResponse =
         serde_json::from_slice(&reply.body).map_err(|source| ContentError::Decode {
             stage: "intent",
             source,
         })?;
+    Ok(answer.needed)
+}
 
+/// Sends the plaintext of every chunk the server asked for, and no other.
+///
+/// A hash absent from the answer deduped against bytes the server already
+/// holds, so sending it would be payload for nothing.
+async fn send_chunks<H: ContentHttp, S: ChunkStore>(
+    http: &H,
+    endpoints: &WriteEndpoints,
+    manifest: &Manifest,
+    store: &S,
+    needed: &[String],
+) -> Result<(), ContentError> {
     for chunk in manifest.chunks() {
         let hex = chunk.hash.to_string();
-        if !answer.needed.iter().any(|needed| needed == &hex) {
+        if !needed.iter().any(|wanted| wanted == &hex) {
             continue;
         }
         let bytes = store
@@ -137,13 +160,7 @@ pub(crate) async fn upload<H: ContentHttp, S: ChunkStore>(
         let reply = send(http.put(&endpoints.chunk(&hex), bytes), "chunk").await?;
         expect(reply, 204, "chunk")?;
     }
-
-    let reply = send(
-        http.post(&endpoints.commit(manifest.file_id()), None),
-        "commit",
-    )
-    .await?;
-    expect(reply, 200, "commit").map(|_| ())
+    Ok(())
 }
 
 /// Downloads a whole file under a granted read URL.

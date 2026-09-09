@@ -19,7 +19,7 @@ use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
 use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
 use connetto_core::transport::LoopbackTransport;
 use connetto_file_client::{ContentClient, FsStore, ReqwestHttp, Resolved};
-use connetto_file_core::MimeClass;
+use connetto_file_core::{FileId, MimeClass};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
 };
@@ -106,19 +106,68 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
     // The sync server, with that signer wired into its session loop.
     let server = Arc::new(spawn_sync_server(&fixture, signer).await);
 
-    // Device A, with nothing listening: the entry and its bytes are written
-    // while offline.
+    // Device A: replica opened with no transport, so the entry and its bytes
+    // are written while the gate is closed.
     let replica_dir = tempdir().expect("temp dir");
     let (a, gate) = offline_device_a(replica_dir.path(), &server);
-    let a_content = ContentClient::attach(
-        a.clone(),
-        FsStore::new(chunk_dir.path().join("device-a")),
+    let a_content = attach_device_a_content(a, chunk_dir.path()).await;
+    let file_id = stage_offline_photo(&a_content).await;
+
+    // Reconnect: the row goes up as an ordinary mutation, the bytes go up
+    // through the outbox walk, and the walk has to wait for the row: a write
+    // ticket is refused for a file the deployment cannot yet see, and what
+    // makes it visible is the mutation landing.
+    gate.store(true, Ordering::Relaxed);
+    let uploaded = wait_for_upload(&a_content).await;
+    assert_eq!(uploaded, 1, "the outbox walk sent the one file waiting");
+
+    // Postgres now holds the row, the manifest, and the flipped state.
+    let state = wait_for_state(&fixture, file_id.as_bytes()).await;
+    assert_eq!(
+        state.as_deref(),
+        Some("available"),
+        "the commit called the deployment's setter, which is the availability signal"
+    );
+
+    // Device B, a second device, sees the row and the flipped state on its
+    // own replica through an ordinary subscription.
+    let (b, b_content) = setup_device_b(replica_dir.path(), &server, chunk_dir.path()).await;
+    b.pin("photos", "SELECT * FROM photos")
+        .await
+        .expect("device B declares a durable interest in the photos");
+    let seen = wait_for_replica_state(&b, file_id.as_bytes()).await;
+    assert_eq!(
+        seen.as_deref(),
+        Some("available"),
+        "device B learns the bytes are fetchable from the row, not from the content channel"
+    );
+    assert_device_b_fetches_photo(&b_content, &base_url, file_id).await;
+
+    files.abort();
+}
+
+/// Attaches a content client to device A's dedicated chunk directory.
+async fn attach_device_a_content(
+    a: ConnettoClient<LoopbackTransport>,
+    chunk_dir: &std::path::Path,
+) -> ContentClient<LoopbackTransport, FsStore, ReqwestHttp> {
+    ContentClient::attach(
+        a,
+        FsStore::new(chunk_dir.join("device-a")),
         [3; 32],
         ReqwestHttp::new(),
     )
     .await
-    .expect("attach content handling to device A");
+    .expect("attach content handling to device A")
+}
 
+/// Stages the test photograph on device A as photo row 1 and asserts the
+/// bytes resolve from the local chunk store.
+///
+/// Returns the file identity so the reconnect path can reference it.
+async fn stage_offline_photo(
+    a_content: &ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
+) -> FileId {
     let (file_id, ()) = a_content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
             diesel::insert_into(photos::table)
@@ -140,45 +189,41 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
         ),
         "the bytes are readable on the device that authored them, with no server"
     );
+    file_id
+}
 
-    // Reconnect. The row goes up as an ordinary mutation, the bytes go up
-    // through the outbox walk, and the walk has to wait for the row: a write
-    // ticket is refused for a file the deployment cannot yet see, and what
-    // makes it visible is the mutation landing.
-    gate.store(true, Ordering::Relaxed);
-    let uploaded = wait_for_upload(&a_content).await;
-    assert_eq!(uploaded, 1, "the outbox walk sent the one file waiting");
-
-    // Postgres now holds the row, the manifest, and the flipped state.
-    let state = wait_for_state(&fixture, file_id.as_bytes()).await;
-    assert_eq!(
-        state.as_deref(),
-        Some("available"),
-        "the commit called the deployment's setter, which is the availability signal"
-    );
-
-    // Device B, a second device, sees the row and the flipped state on its own
-    // replica through an ordinary subscription.
-    let b = connect_device_b(replica_dir.path(), &server).await;
+/// Connects device B to the sync server and attaches a fresh content client.
+///
+/// Returns both so the test can pin a subscription and then poll replica state.
+async fn setup_device_b(
+    replica_root: &std::path::Path,
+    server: &Arc<Server>,
+    chunk_dir: &std::path::Path,
+) -> (
+    ConnettoClient<LoopbackTransport>,
+    ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
+) {
+    let b = connect_device_b(replica_root, server).await;
     let b_content = ContentClient::attach(
         b.clone(),
-        FsStore::new(chunk_dir.path().join("device-b")),
+        FsStore::new(chunk_dir.join("device-b")),
         [4; 32],
         ReqwestHttp::new(),
     )
     .await
     .expect("attach content handling to device B");
-    b.pin("photos", "SELECT * FROM photos")
-        .await
-        .expect("device B declares a durable interest in the photos");
-    let seen = wait_for_replica_state(&b, file_id.as_bytes()).await;
-    assert_eq!(
-        seen.as_deref(),
-        Some("available"),
-        "device B learns the bytes are fetchable from the row, not from the content channel"
-    );
+    (b, b_content)
+}
 
-    // And it fetches them by ranged GET under a read ticket it asks for.
+/// Resolves the photograph on device B via a signed URL, performs a ranged
+/// GET and checks the partial-content status and the first sixteen bytes,
+/// then downloads the whole file and checks it is byte-identical to the
+/// original.
+async fn assert_device_b_fetches_photo(
+    b_content: &ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
+    base_url: &str,
+    file_id: FileId,
+) {
     let resolved = b_content
         .resolve(file_id)
         .await
@@ -187,7 +232,7 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
         panic!("device B holds no local bytes, so the answer is a signed URL, got {resolved:?}");
     };
     assert!(
-        url.starts_with(&base_url),
+        url.starts_with(base_url),
         "the granted URL addresses the file server, got {url}"
     );
     let ranged = reqwest::Client::new()
@@ -207,16 +252,12 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
         &PHOTO[..16],
         "the range is the first sixteen bytes of the photograph"
     );
-
-    // The whole file too, through the same URL the resolver answered.
     let whole = b_content
         .bytes(file_id)
         .await
         .expect("download the whole file")
         .expect("the server holds it");
     assert_eq!(whole, PHOTO, "device B reads the photograph device A wrote");
-
-    files.abort();
 }
 
 /// Opens device A's replica with no transport at all and drives it with the

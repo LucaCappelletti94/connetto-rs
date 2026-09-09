@@ -7,7 +7,8 @@ use diesel::prelude::*;
 use tempfile::tempdir;
 
 use crate::support::{
-    RecordingHttp, Scripted, attach_content, connected_client, offline_client, photos,
+    RecordingHttp, Scripted, attach_content, connected_client, learn_file_id, offline_content,
+    photos, stage_photo,
 };
 
 /// The photo bytes every case here stages.
@@ -18,26 +19,8 @@ const PHOTO: &[u8] = b"the bytes of one photograph, authored on this device";
 #[tokio::test]
 async fn a_staged_file_commits_its_manifest_with_its_row() {
     let dir = tempdir().expect("temp dir");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
-    let content = attach_content(
-        client.clone(),
-        &dir.path().join("chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
-
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let (client, content) = offline_content(dir.path()).await;
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     let rows: Vec<Vec<u8>> = client
         .with_conn(|conn| {
@@ -66,19 +49,18 @@ async fn a_staged_file_commits_its_manifest_with_its_row() {
     );
 }
 
-/// The invariant step 1 exists for: a failure between the bookkeeping writes
-/// and the row write leaves no row, no manifest and no outbox entry.
+/// Stages a photo with a deliberate row-write error and asserts the staging
+/// call surfaces that error.
 ///
-/// Injected rather than asserted on a happy path, because a happy path passes
-/// under a broken implementation that writes the manifest outside the
-/// transaction.
-#[tokio::test]
-async fn an_entry_row_never_outlives_its_manifest() {
-    let dir = tempdir().expect("temp dir");
-    let chunks = dir.path().join("chunks");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
-    let content = attach_content(client.clone(), &chunks, RecordingHttp::default()).await;
-
+/// The manifest and outbox entry are already written at the point the closure
+/// runs, inside the same transaction, so the rollback retracts all of them.
+async fn assert_stage_rollback(
+    content: &connetto_file_client::ContentClient<
+        Scripted,
+        connetto_file_client::FsStore,
+        RecordingHttp,
+    >,
+) {
     let refused = content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
             // The manifest and the outbox entry are already written at this
@@ -96,6 +78,21 @@ async fn an_entry_row_never_outlives_its_manifest() {
         matches!(refused, Err(ContentError::Replica(_))),
         "the staging call reports the row write's failure, got {refused:?}"
     );
+}
+
+/// The invariant step 1 exists for: a failure between the bookkeeping writes
+/// and the row write leaves no row, no manifest and no outbox entry.
+///
+/// Injected rather than asserted on a happy path, because a happy path passes
+/// under a broken implementation that writes the manifest outside the
+/// transaction.
+#[tokio::test]
+async fn an_entry_row_never_outlives_its_manifest() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let (client, content) = offline_content(dir.path()).await;
+
+    assert_stage_rollback(&content).await;
 
     let rows: i64 = client
         .with_conn(|conn| {
@@ -114,17 +111,7 @@ async fn an_entry_row_never_outlives_its_manifest() {
     // The identity is the bytes alone, so staging the same bytes against a
     // throwaway replica names the same file, and asking this one about it
     // proves no manifest survived the rollback.
-    let probe_dir = tempdir().expect("temp dir");
-    let probe = attach_content(
-        offline_client(&probe_dir.path().join("replica.sqlite")),
-        &probe_dir.path().join("chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
-    let (file_id, ()) = probe
-        .stage(PHOTO, MimeClass::Jpeg, |_, _| Ok(()))
-        .await
-        .expect("stage against a throwaway replica");
+    let file_id = learn_file_id(PHOTO).await;
     assert!(
         matches!(content.resolve(file_id).await, Ok(Resolved::Unavailable)),
         "no manifest survived the rollback"
@@ -146,22 +133,9 @@ async fn an_entry_row_never_outlives_its_manifest() {
 async fn the_boot_pass_retires_an_unsent_file_whose_bytes_are_gone() {
     let dir = tempdir().expect("temp dir");
     let chunks = dir.path().join("chunks");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
-    let content = attach_content(client.clone(), &chunks, RecordingHttp::default()).await;
+    let (_, content) = offline_content(dir.path()).await;
     let mut events = content.events();
-
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     for path in walk_files(&chunks) {
         std::fs::remove_file(&path).expect("remove a chunk file");
@@ -199,21 +173,8 @@ async fn the_boot_pass_retires_an_unsent_file_whose_bytes_are_gone() {
 async fn the_boot_pass_counts_a_corrupt_chunk_as_lost() {
     let dir = tempdir().expect("temp dir");
     let chunks = dir.path().join("chunks");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
-    let content = attach_content(client.clone(), &chunks, RecordingHttp::default()).await;
-
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let (_, content) = offline_content(dir.path()).await;
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     let files = walk_files(&chunks);
     assert_eq!(files.len(), 1, "this photo is one chunk");
@@ -233,22 +194,8 @@ async fn the_boot_pass_counts_a_corrupt_chunk_as_lost() {
 #[tokio::test]
 async fn the_boot_pass_keeps_an_unsent_file_it_can_read() {
     let dir = tempdir().expect("temp dir");
-    let chunks = dir.path().join("chunks");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
-    let content = attach_content(client.clone(), &chunks, RecordingHttp::default()).await;
-
-    content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let (_, content) = offline_content(dir.path()).await;
+    stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     assert_eq!(
         content.verify_unsent().await.expect("the boot pass runs"),
@@ -303,19 +250,7 @@ async fn the_driver_retries_a_deferred_upload_with_no_reconnect() {
     .await;
     let content = attach_content(client, &dir.path().join("chunks"), http).await;
     let mut events = content.events();
-
-    let (file_id, ()) = content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
 
     // No reconnect happens here: the transport stays exactly as it was.
     let landed = async {
