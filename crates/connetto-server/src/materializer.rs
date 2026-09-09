@@ -1544,7 +1544,7 @@ where
 
     /// Resolve `table` in the catalog, or report the schema mismatch.
     fn table_id(&self, table: &str) -> Result<TableId, MaterializerError> {
-        catalog_helpers::table_id(&self.catalog, table)
+        catalog_helpers::table_id::<Postgres, _>(&self.catalog, table)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))
     }
 
@@ -1661,7 +1661,7 @@ where
             return Ok(None);
         };
         let db = &self.catalog;
-        let table_id = catalog_helpers::table_id(db, table)
+        let table_id = catalog_helpers::table_id::<Postgres, _>(db, table)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
         let version_column = version.name().to_owned();
         let version_idx = catalog_helpers::column_id(db, table_id, &version_column)

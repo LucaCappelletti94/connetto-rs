@@ -56,7 +56,7 @@ sqlite-diff-rs = { version = "0.13", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
-sqlparser = { version = "0.62", default-features = false }
+sqlparser = { version = "0.63", default-features = false }
 # The fixture owns the services it needs, so a test provisions nothing by hand.
 # `GenericImage` for both Postgres and OpenFGA rather than `testcontainers-modules`:
 # that crate pins testcontainers 0.27, and neither image is served better by a

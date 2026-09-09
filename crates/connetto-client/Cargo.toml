@@ -72,7 +72,7 @@ zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
-sqlparser = { version = "0.62", default-features = false, features = [
+sqlparser = { version = "0.63", default-features = false, features = [
   "visitor",
 ] }
 # Rendering typed diesel queries to placeholder SQL plus bind values through

@@ -49,7 +49,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Naming the Postgres dialect when building subql's catalog and engine, and the
 # visitor pass that substitutes subscription bind placeholders in the parsed
 # statement. Version and rev follow subql via the root [patch] blocks.
-sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5). The
 # materializer compresses outbound patchsets and decompresses inbound ones.
 zstd = "0.13"

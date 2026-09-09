@@ -1439,6 +1439,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
 #[cfg(test)]
 mod tests {
     use rls2fga::types::ActionStatement;
+    use subql::backend::Postgres;
     use subql::catalog_helpers;
 
     use super::{SubjectNaming, Translated};
@@ -1488,8 +1489,8 @@ mod tests {
     #[test]
     fn connettos_own_policy_shape_is_answered_without_a_round_trip() {
         let shapes = translated(OWN_SHAPE).shapes();
-        let notes =
-            catalog_helpers::table_id(shapes.catalog(), "notes").expect("notes is in the catalog");
+        let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "notes")
+            .expect("notes is in the catalog");
         assert!(
             shapes.answers_locally(notes, ActionStatement::Select),
             "the identity arm and the held-key arm are both read from the row, \
@@ -1504,8 +1505,8 @@ mod tests {
     #[test]
     fn a_policy_reading_another_table_is_not_answered_locally() {
         let shapes = translated(CROSS_TABLE).shapes();
-        let docs =
-            catalog_helpers::table_id(shapes.catalog(), "docs").expect("docs is in the catalog");
+        let docs = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "docs")
+            .expect("docs is in the catalog");
         assert!(
             !shapes.answers_locally(docs, ActionStatement::Select),
             "whether the caller is a member of the row's team is not in the row"
@@ -1548,7 +1549,7 @@ mod tests {
         )
         .expect("a schema with no policy has nothing to refuse")
         .shapes();
-        let orders = catalog_helpers::table_id(shapes.catalog(), "orders")
+        let orders = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "orders")
             .expect("orders is in the catalog");
         assert!(
             shapes.answers_locally(orders, ActionStatement::Select),
@@ -1710,7 +1711,7 @@ mod tests {
             "a residual-predicate share must materialise its whole-shape region \
              so that reconcile_materialised fills it when the previous boot failed"
         );
-        let item_id = catalog_helpers::table_id(translated.shapes.catalog(), "item")
+        let item_id = catalog_helpers::table_id::<Postgres, _>(translated.shapes.catalog(), "item")
             .expect("item is in the catalog");
         let type_name = translated
             .shapes

@@ -327,9 +327,10 @@ mod pg {
             page: &PageSpec,
         ) -> Result<PagePlan<'a>, SnapshotError> {
             let table = table_from_select(select_sql)?;
-            let table_id = catalog_helpers::table_id(&self.catalog, &table).ok_or_else(|| {
-                SnapshotError::Backend(format!("the catalog does not know table {table}"))
-            })?;
+            let table_id = catalog_helpers::table_id::<Postgres, _>(&self.catalog, &table)
+                .ok_or_else(|| {
+                    SnapshotError::Backend(format!("the catalog does not know table {table}"))
+                })?;
             let key =
                 catalog_helpers::primary_key_columns(&self.catalog, table_id).unwrap_or_default();
             let names: Vec<String> = key
@@ -558,7 +559,8 @@ mod pg {
             table: &str,
             key: &[Value<Postgres>],
         ) -> Result<Option<SourceRow>, SnapshotError> {
-            let Some(table_id) = catalog_helpers::table_id(&self.catalog, table) else {
+            let Some(table_id) = catalog_helpers::table_id::<Postgres, _>(&self.catalog, table)
+            else {
                 return Ok(None);
             };
             let filter = KeyFilter::build(&self.catalog, table_id, table, |position, _| {
@@ -615,7 +617,7 @@ mod pg {
             // here and the same value delivered to a client are one value. The
             // builder's ops are the encoder's own, so nothing is serialized and
             // parsed back to reach them.
-            let built = subql::emit::pgbinary_patchset_builder(
+            let built = subql::emit::pgbinary_patchset_builder::<Postgres, _>(
                 &self.catalog,
                 table,
                 &read.column_names(),
@@ -797,7 +799,7 @@ mod pg {
                 .iter()
                 .map(|row| row.iter().map(|cell| cell.as_deref()).collect())
                 .collect();
-            let built = subql::emit::pgbinary_patchset_builder(
+            let built = subql::emit::pgbinary_patchset_builder::<Postgres, _>(
                 &self.catalog,
                 &table,
                 &read.column_names(),
@@ -901,12 +903,13 @@ mod pg {
             let cells = read.cells();
             let mut rows = Vec::with_capacity(cells.len());
             if !cells.is_empty() {
-                let member_table_id = catalog_helpers::table_id(&self.catalog, member_table)
-                    .ok_or_else(|| {
-                        SnapshotError::Encode(format!(
-                            "the membership table {member_table} is not in the catalog"
-                        ))
-                    })?;
+                let member_table_id =
+                    catalog_helpers::table_id::<Postgres, _>(&self.catalog, member_table)
+                        .ok_or_else(|| {
+                            SnapshotError::Encode(format!(
+                                "the membership table {member_table} is not in the catalog"
+                            ))
+                        })?;
                 let mut key_ordinals = Vec::with_capacity(member_keys.len());
                 for member_key in member_keys {
                     let ordinal =
@@ -919,7 +922,7 @@ mod pg {
                             })?;
                     key_ordinals.push(usize::from(ordinal));
                 }
-                let built = subql::emit::pgbinary_patchset_builder(
+                let built = subql::emit::pgbinary_patchset_builder::<Postgres, _>(
                     &self.catalog,
                     member_table,
                     &column_names,

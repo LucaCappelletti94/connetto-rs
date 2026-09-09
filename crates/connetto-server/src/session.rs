@@ -1989,9 +1989,10 @@ where
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
             return false;
         };
-        let Some(table_id) =
-            subql::catalog_helpers::table_id(self.catalog.as_ref(), &term_move.table)
-        else {
+        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
+            self.catalog.as_ref(),
+            &term_move.table,
+        ) else {
             return false;
         };
         let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();

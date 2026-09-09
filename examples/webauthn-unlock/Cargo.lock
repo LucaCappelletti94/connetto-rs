@@ -328,7 +328,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sqlite-diff-rs 0.13.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlparser",
  "subql",
@@ -370,7 +370,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sqlite-diff-rs 0.13.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "thiserror",
@@ -1741,7 +1741,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#abbec9448e45d87c69e6b00b86bf51b3c820bfe2"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#01c688536a601106a9596fc2098523f503580a46"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -1754,7 +1754,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#abbec9448e45d87c69e6b00b86bf51b3c820bfe2"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#01c688536a601106a9596fc2098523f503580a46"
 dependencies = [
  "serde",
  "thiserror",
@@ -2034,9 +2034,10 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#b09a5cd5941035ac4ac5698dbbc69f5efd56b4af"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#77dd3147d08b6acf99f101660092a4d6e03339b6"
 dependencies = [
  "geometric-traits",
+ "serde",
  "sha2",
  "sql_docs",
  "sqlparser",
@@ -2047,23 +2048,9 @@ dependencies = [
 [[package]]
 name = "sql_docs"
 version = "1.3.2"
-source = "git+https://github.com/LucaCappelletti94/sql-docs?branch=main#3726103d08c1b213872fdaff274a5e52ff80c843"
+source = "git+https://github.com/LucaCappelletti94/sql-docs?branch=main#1f3170175b0860ba586c73f655e914bdfde7d4a1"
 dependencies = [
  "sqlparser",
-]
-
-[[package]]
-name = "sqlite-diff-rs"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d40ee145c9c72b4140851c9bb19474f38f4ad163e12e344a4868c5088fc10093"
-dependencies = [
- "hashbrown 0.17.1",
- "indexmap",
- "maxwell-cdc",
- "serde_json",
- "thiserror",
- "wal2json-events",
 ]
 
 [[package]]
@@ -2074,7 +2061,10 @@ checksum = "9492ba2237745ec8d2c2475b23097ceb916d1175d264d7aeb1e44399face303f"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
+ "maxwell-cdc",
+ "serde_json",
  "thiserror",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -2107,8 +2097,8 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#16cd393479caba03ed8752dc0c3dd0f394394d74"
+version = "0.63.0"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#85b1a6f2223bf95d98cf1bc504971abd191dc869"
 dependencies = [
  "log",
  "recursive",
@@ -2119,7 +2109,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#8c566a957a807122c481e6387b22a095054440ec"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#56b12d922e3c38c23ddae889fc5668e8edd16009"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -2128,12 +2118,12 @@ dependencies = [
 
 [[package]]
 name = "sqlparser_derive"
-version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#16cd393479caba03ed8752dc0c3dd0f394394d74"
+version = "0.6.0"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#85b1a6f2223bf95d98cf1bc504971abd191dc869"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -2170,7 +2160,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#0f7a589a1255fe9d97bd109c6a67e9530f1fc75c"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#eda75bbb079b21c343e949d20ac3d00942d17351"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -2193,7 +2183,7 @@ dependencies = [
  "slab",
  "sql-scalar-text",
  "sql-traits",
- "sqlite-diff-rs 0.12.0",
+ "sqlite-diff-rs",
  "sqlparser",
  "sqlparser-canonicalize",
  "thiserror",

@@ -66,7 +66,7 @@ use crate::{ClientError, ClientEvent, ConnettoConnection};
 pub fn render_query<Q: QueryFragment<Sqlite>>(
     query: &Q,
 ) -> Result<(String, Vec<BindValue>), ClientError> {
-    let (sql, values) = subql::diesel_api::render_typed::<Sqlite, _>(query)
+    let (sql, values) = subql::diesel_api::render_typed::<subql::backend::SQLite, Sqlite, _>(query)
         .map_err(|e| ClientError::Session(e.to_string()))?;
     let binds = values
         .into_iter()
