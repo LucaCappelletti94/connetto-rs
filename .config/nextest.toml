@@ -44,6 +44,7 @@ package(connetto-test-harness)
 | test(slot_watch::) | test(snapshot_nonfatal::)
 | test(snapshot_order::) | test(stream_gap::) | test(throttle::) | test(write_path::)
 | test(local_tier::) | test(mutation_replay::) | test(reconnect_live::) | test(loop_emu::)
+| test(offline_photo::)
 '''
 test-group = 'docker'
 # A fixture test owns a container plus an in-process server loop, so it

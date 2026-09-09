@@ -9,6 +9,7 @@ members = [
   "crates/connetto-test-harness",
   "crates/connetto-file-core",
   "crates/connetto-file-server",
+  "crates/connetto-file-client",
 ]
 exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 

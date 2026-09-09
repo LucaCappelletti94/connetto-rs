@@ -135,10 +135,11 @@ Execution order. The early steps depend on nothing outside this repository and c
 | done | ~~R40~~ **DONE** | Replica policy enforcement wired into sync. Landed 2026-08-15, completed 2026-08-19. The rename is on the client at both sync boundaries, the map a build artifact the client is refused without, and the demo table carries a real policy. The completing session type-directed the pk codec (a blob-shaped UUID key lifts to `Value::Uuid`), taught the relay hub to read and apply split tables through the worker's map, separated the tests' same-user logins, and all twenty browser binaries pass |
 | any | R64 | The file core, first of the six phases R24's design derived on 2026-08-21. Off the critical path, and its tests run under wasm from the start |
 | any | R65 | The file server: storage backends, upload protocol, ticket serving, GC, byte metering. Needs R64 |
-| any | R66 | The connetto seam: `FileStore` deleted, the ticket message pair and signer seam. Independent, may run beside R64 |
-| any | R67 | The native file client. Needs R64, R65 and R66 |
+| any | R66 | The connetto seam: `FileStore` deleted, the ticket message pair and signer seam, plus the per-identity upload bandwidth rate. Independent, may run beside R64 |
+| done | ~~R67~~ **DONE** | The native file client, done 2026-09-08. Manifests and outbox in the replica, the `std::fs` encrypted store, the outbox walk and boot integrity pass, the resolver and the pin surface |
 | any | R68 | The browser file client, its archive step coordinated with R56's format. Needs R64, R65 and R66 |
 | any | R69 | Every demo carries the photo entry end to end, R54's rule applied to files. Needs R67 and R68 |
+| any | R87 | Storage quotas and the deployment-wide ceilings a downhill developer sets, raised 2026-09-08 while scoping R66: the numbers live in the file server's tables, so the mechanism does too. Needs R65 |
 | any | R70 | The deployment backup and restore story, minted 2026-08-21 by the full review: no chapter states what a deployment backs up or what a restore to an earlier point does to cursors, watermarks and the slot |
 | any | R71 | Linux replica-key custody survives a reboot, minted 2026-08-21: today a reboot loses the session-keyring key and destroys the device tier |
 | any | R72 | Clock discipline, X6 given an owner 2026-08-21: monotonic versus wall time decided per timer, suspend and resume stated |
@@ -232,11 +233,12 @@ Execution order. The early steps depend on nothing outside this repository and c
 | R32 replication slot lifecycle | **DONE** (2026-08-09) | nothing | no |
 | R40 replica policy enforcement wired into sync | **DONE** (2026-08-19) | nothing. The pk codec is type-directed, the relay hub reads and applies split tables through the worker's map, and all twenty browser binaries pass | landed |
 | R24 file-sync integration | **DONE** (2026-08-21, as a design) | nothing. Ten positions recorded, R64 to R69 derived | no |
-| R64 file core | NOT STARTED | nothing | no |
-| R65 file server | NOT STARTED | R64 | no |
+| R64 file core | **DONE** (2026-09-08) | nothing. Content-defined chunking, BLAKE3 identity, and per-write AEAD with the chunk hash as AAD, agreeing byte for byte between the native and wasm paths | landed on `feat/r65-file-server` |
+| R65 file server | **DONE** (2026-09-08) | nothing. Storage backends, the two-phase upload, ticket serving, sweep, and byte metering. Reads are authorized by the deployment's own visibility function on the reader role, so row level security decides them | landed on `feat/r65-file-server` |
 | R81 aggregate read time bound | **DONE** (2026-08-22) | nothing | no. Confirmed: the upstream request assigns read ceilings to the caller, and this phase makes true a sentence it already states |
-| R66 file seam in connetto | NOT STARTED | nothing | no |
-| R67 native file client | NOT STARTED | R64, R65 and R66 | no |
+| R66 file seam in connetto | **DONE** (2026-09-08) | nothing. `FileStore` deleted, the ticket request and grant on the control plane, `ContentTicketSigner` as the only trait core gained and implemented by the file server's real signer, the mint answering visibility through the deployment's own function on the non-owning reader role, and a per-identity upload token bucket | landed on `feat/r66-connetto-seam` |
+| R87 storage quotas and deployment ceilings | NOT STARTED, raised 2026-09-08 | R65, which is done | no |
+| R67 native file client | **DONE** (2026-09-08) | nothing. `connetto-file-client`: the `std::fs` encrypted chunk store, the manifests and outbox in the replica committed with the entry row, the outbox walk with a boot integrity pass, the resolver over a `LocalContentSource` list, the query-shaped pin surface with a whole-file fetch, and `tidy_content`. Thirteen decisions recorded above, three of them defects found by grounding: the tier cannot be atomic with the replica, `MemStore` answered empty bytes for an absent chunk, and a double-quoted pin column silently became a string literal. 28 tests, the offline photo case among them, end to end against a real Postgres, a real file server on a socket and two real devices | no |
 | R68 browser file client | NOT STARTED | R64, R65 and R66. The archive step coordinates with R56's format | no |
 | R69 files in every demo | NOT STARTED | R67 and R68 | no |
 | R70 backup and restore story | NOT STARTED | nothing | no |
@@ -4585,7 +4587,7 @@ A crashed upload never serves and its orphans are collected, ranged download is 
 
 ## R66: the connetto seam
 
-**Status.** NOT STARTED.
+**Status.** DONE (2026-09-08), merged as `190a128`. R67 and R68 are unblocked.
 
 **Blocked on nothing**, and may run in parallel with R64.
 
@@ -4598,27 +4600,76 @@ Everything connetto itself changes, deliberately small, per R24 positions 6 and 
 1. Delete `FileStore` from `connetto-core`.
 2. The wire message pair: ticket request (file id, verb, and for the write verb the declared byte size) and grant. Free per the bump doctrine.
 3. The signer seam trait in `connetto-core`, implemented by the file crates, wired on the server config the way `WriteTarget` is. Per the review, this is the ONLY trait `connetto-core` gains: the two-verb authorization answer stays internal to `connetto-server`'s session loop, having no external consumer.
-4. The session loop answers visibility from the metadata row through the existing machinery before calling the signer, and charges the byte budget once, at the mint, with the file server enforcing the ticket's ceiling.
-5. ~~The ticket-versus-capability distinction written where chapter 12's amendment will draw from.~~ Closed by the review: chapter 12 gained "A content ticket is not a capability" and was committed 2026-08-21 (`826e041`) before this phase began.
+4. The session loop answers visibility before calling the signer, by asking the same deployment function the file server asks, `connetto_visible_files` on the reader role, so row level security and FGA decide the mint exactly as they decide the serving check and the two can never disagree. Rejected 2026-09-08: re-deriving the answer from the application's metadata row inside connetto, which needs a file-id-to-row mapping and lets the mint and the serving check drift apart.
+5. The upload bandwidth rate, per identity, charged once at the mint against the DECLARED size, as a rolling window in `throttle.rs` beside the subscription, connection and credential limits. Decided 2026-09-08. This is abuse prevention, not a quota: a restart forgiving a few minutes of history is not an abuse vector, so the counter stays in memory and needs no schema. R65 already bounds any single upload by the ticket's ceiling, so the only gap this closes is a caller requesting many tickets in a row. Charging declared bytes caps AUTHORIZED bandwidth rather than measured bandwidth, and closing that gap would need the file server reporting actuals back, which R24 position 9 rejected.
+6. Refusals, decided 2026-09-08. An invisible file and an over-budget request answer one byte-identical `NonFatalError` detail, the way `SUBSCRIPTION_REFUSED` stays identical across causes, so a caller cannot learn that a file it cannot see exists. A signer failure answers a distinct detail, because it discloses nothing about any user's data and a retry is meaningful where retrying an invisibility is not. `RateLimited` is deliberately NOT reused for over-budget: being over an upload budget is a refusal of the file that was named, and `retry_after_ms` would tell a caller the request would have succeeded later, which is the same oracle.
+7. ~~The ticket-versus-capability distinction written where chapter 12's amendment will draw from.~~ Closed by the review: chapter 12 gained "A content ticket is not a capability" and was committed 2026-08-21 (`826e041`) before this phase began.
 
 ### Done when
 
-A session obtains a ticket for a visible file and is refused, R38-shaped, for an invisible one, proven with a test signer, and `FileStore` no longer exists.
+A session obtains a ticket for a visible file and is refused, R38-shaped, for an invisible one, proven with a test signer, `FileStore` no longer exists, and a caller that requests tickets past its bandwidth rate is refused with the same byte-identical detail an invisible file produces.
+
+Storage quotas and the deployment-wide ceilings are NOT in this phase. They are R87, because they belong in the file server where the byte counts live.
+
+---
+
+## R87: storage quotas and the deployment ceilings
+
+**Status.** NOT STARTED. Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto.
+
+**Blocked on** R65, which is done. R67 and R68 do NOT depend on this phase.
+
+### Purpose
+
+A per-identity storage quota and the deployment-wide ceilings a downhill developer sets, so an operator can say "we store at most 1 TB" or "we serve at most 1 TB a month" and see saturation coming.
+
+Why here and not in R66: the numbers already exist in the file server's own tables. `_cfs_manifests` carries `total_len` and `accepted_bytes` per declaration and `_cfs_manifest_chunks` carries `chunk_len` per chunk, so stored bytes are knowable per uploader and deployment-wide, measured rather than declared, at the moment a commit makes them true. Connetto cannot see any of it. This does not reopen R24 position 9's rejection of a second counter in the file server, which was about re-counting the ticket's BANDWIDTH ceiling. Storage is a different quantity.
+
+### Steps
+
+1. The per-identity storage quota, checked at commit, summed over that uploader's committed manifests.
+2. The deployment-wide storage ceiling, the same sum without the identity predicate.
+3. The deployment-wide bandwidth ceiling over a window, measured from bytes actually served and accepted rather than from bytes authorized.
+4. Saturation logging. A refusal caused by a deployment ceiling is an operator event, so the caller sees the same byte-identical refusal while the structured log names which ceiling saturated, letting an operator see it coming instead of learning from a support ticket.
+
+### Decided
+
+**Deduplication accounting, decided 2026-09-08.** Every declarer is charged the full size, and the deployment-wide ceiling is measured separately from real usage rather than by summing quotas. So the quotas may sum to more than the disk holds, which is intended: a user's usage never moves because a stranger uploaded or deleted the same content. Rejected: charging the deduplicated share, which makes one user's reported usage depend on what other users store and is a weak cross-user signal about their content, and charging the first uploader only, which is unfair and makes deletion awkward.
+
+### Done when
+
+A commit is refused when the uploader is over quota and when the deployment is over its storage ceiling, each refusal indistinguishable from the others on the wire and each naming its cause in the log, with the deployment-wide numbers measured from the file server's own tables.
 
 ---
 
 ## R67: the native file client
 
-**Status.** NOT STARTED.
+**Status.** DONE (2026-09-08). The starting prompt was `docs/prompt-r67-native-file-client.md`. Thirteen design points were settled with the maintainer, all on 2026-09-08, and are recorded under Decisions below. R68 and R69 are unblocked, and R68 inherits the resolver seam, the `LocalContentSource` list and the `ChunkStore` delete this phase added.
 
 **Blocked on** R64, R65 and R66.
 
 ### Steps
 
-1. Manifests and the outbox in the device-private tier, committed in the same transaction as the entry row, so a crash orphans a chunk file but never a row.
+1. Manifests and the outbox in the replica, committed in the same transaction as the entry row, so a crash orphans a chunk file but never a row. The tier was where this step originally put them, and it cannot be: see decision 1.
 2. The `std::fs` encrypted chunk store.
 3. The outbox walk on reconnect, intent through commit, and the boot integrity pass over unsent manifests.
 4. The resolver (signed URL online, local bytes for unsent or pinned content, and an extension point for further local sources, which R25's design already names: peer-fetched cache chunks and present-peer pull) and the pin surface.
+
+### Decisions
+
+1. **The manifests and the outbox live in the replica, not in the device-private tier.** Found while grounding step 1: the replica is WAL and the tier is a separate attached file, so SQLite's cross-file atomic commit does not apply and a transaction over both commits with no error while a host crash may update one file and not the other. Measured before deciding. Chapter 18's "Client storage" section carries the amendment and both rejected options. This is R20's correction to R15's subscription set applied to the same problem, and the tier's optionality is the same second reason.
+2. **The native file client is one new crate, `connetto-file-client`, with target-gated stores.** The neutral resolver, manifest store, outbox and pin surface sit in the crate root, the `std::fs` store under `cfg(not(wasm))`, and R68 adds the OPFS store to the same crate. Rejected: a neutral crate plus per-platform crates, which adds workspaces to gate and leaves the seam crate with no test against a real store; and putting it inside `connetto-client`, which contradicts chapter 18's crate boundary and drags file-core and an HTTP client into the crate every demo depends on.
+3. **The same-transaction invariant is structural: the file client owns the transaction and takes the row write as a closure.** Chunks are written to the store first, then one transaction writes the manifest rows, the outbox row and runs the caller's closure. Rejected: the application owning the transaction and calling a recorder inside it, where nothing enforces the invariant and a forgotten transaction gives a working happy path and an orphaned row on a crash.
+4. **An unsent manifest whose chunk files are missing at boot drops its outbox entry, keeps its manifest, and surfaces an event naming the file id.** There is nothing to retry against, since unsent content cannot be refetched. Rejected: dropping both silently, which leaves the application's row pointing at content that will never arrive with no signal; and retrying, which spins forever against bytes that cannot come back.
+5. **A content pin is per query, mirroring R15, with the file-id column named at pin time.** The pin set is the union of that column over the current result, re-evaluated as the replica changes. Per-file pinning is a one-row query. Rejected: a per-file-id surface, which makes the application re-pin as the set changes, the loop R15's query pins exist to avoid.
+6. **A pinned file's bytes arrive by whole-file `GET`, verified against the identity, then re-chunked into the local store.** Chunking is deterministic and `FileId` is `blake3` over the whole bytes, so both the identity and the chunk keys are reproducible from the download. Rejected: ranged `GET`s driven by a local manifest, which a device that has never seen the file does not have and the server exposes no way to fetch; and recording pins without fetching, which declares one of chapter 18's three local-sync cases and does not build it.
+7. **The resolver answers `Unavailable` from local knowledge only and never reads the application's metadata row.** `content_state` lives on the application's own table, which the client does not know and the file server reaches only through `connetto_set_content_state`. The application reads that column for its placeholder and the resolver for local bytes. Rejected: teaching the resolver the deployment's metadata table and column, duplicating what the setter function exists to avoid.
+8. **The extension point is a `LocalContentSource` trait with the local chunk store as its one implementation.** The resolver asks an ordered list of sources, so R79 registers a peer source and touches no resolver logic. Rejected: a concrete branch R79 would have to edit, and a peer-source scaffold with no transport under it.
+9. **Content eviction lands here, and `ChunkStore` gains `delete_chunk`.** Raised while writing the pin surface: `unpin_content` removed a record and freed no bytes, because nothing else ever removes a cached chunk and the store had no delete. `tidy_content` is the byte-level mirror of R15's `tidy`, application-callable for the same reason, sparing unsent and pinned manifests and sweeping only chunk files no surviving manifest references. Manifest rows commit before any file is deleted, so an interruption leaves collectable orphans rather than a manifest pointing at deleted bytes. Rejected: a second `PrunableStore` trait beside the one chapter 18 names, which makes a written-but-unprunable store expressible; and deferring eviction to a later phase, which ships a pin surface that reads complete and reclaims nothing.
+10. **`MemStore` reports an absent chunk instead of answering empty bytes.** A defect in R64 found while writing the boot integrity pass: `read_chunk` did `get(hash).cloned().unwrap_or_default()` under `type Error = Infallible`, so `reassemble` over a manifest with a missing chunk returned `Ok` with the wrong bytes. Every current use goes through `EncryptingStore`, whose 41-byte minimum turns the empty read into `BadFormat`, which is why R64's suite passed. `MemStore::Error` is now `MemStoreError::Absent`. Rejected: writing it up and leaving it, which keeps a silent-wrong-bytes path live for R68 and the demos and leaves the boot pass depending on a decorator's incidental behaviour.
+11. **A pin's file-id column is bracket-quoted, not double-quoted.** Caught by the test that a pin naming a column its query does not return is refused. SQLite resolves a double-quoted identifier that names no column as a string literal rather than refusing it, so `SELECT "content_id" AS file_id FROM (SELECT id FROM photos) t` succeeds and answers the six-character text `content_id` for every row, as a file identity. Measured with the `sqlite3` shell before deciding: the bracket form reports `no such column` on the same query. `pin_sql` therefore uses `[column]`, and a column name containing a bracket is refused at pin time. This makes `connetto_core::quote_ident` the wrong tool wherever a SQLite identifier may not exist, which is a narrow case: everywhere else in the tree the identifiers come from the catalog and always resolve.
+12. **The workspace moved to `sqlite-diff-rs 0.13`, at the maintainer's instruction.** The working tree's lockfile had already advanced `subql` from `8e2cba95` to `7e6a65c9`, and the newer `subql` wants `0.13` while all five connetto crates pinned `0.12`, so two versions sat in the graph and `connetto-server` did not compile at all, with 16 errors naming the version split. The pin moved in `connetto-client`, `connetto-dioxus`, `connetto-server`, `connetto-test-harness` and `connetto-web`. One API adaptation followed: `SchemaWithPK::primary_key_columns` returns an iterator rather than a `Vec`, so `materializer.rs` dropped an `into_iter`. Rejected: restoring the committed lockfile, since the `subql` advance was deliberate.
+13. **`implicit-clone` was re-resolved onto `indexmap 2`, which is what unbroke `connetto-yew`.** Found in the same pass and unrelated to R67: `connetto-yew` did not build on `190a128` either, with `IMap<_, _>: From<IndexMap<K, V>>` unsatisfied inside `yew 0.21`. The mechanism took two wrong guesses before it came out right, so it is worth stating exactly. `implicit-clone 0.4.9` declares `indexmap = ">= 1, <= 2"`, a range spanning two majors, and cargo's partial upper bound admits the whole `2` series. `serde_with 3.22.0`, reached through `openidconnect` from `connetto-client`, requires `indexmap = "^1"`, so `indexmap 1.9.3` is genuinely in the root graph, and the lockfile had unified `implicit-clone` onto it. `yew 0.21` requires `indexmap = "2"` and hands an `indexmap 2` map to `IMap::from`, so the two `IndexMap` types were unrelated. `examples/yew-web-demo` builds the same `yew` and the same `implicit-clone` because its graph has no `openidconnect` and therefore no `indexmap 1` to unify onto, which is the observation that disproved the first diagnosis. `cargo update -p implicit-clone` re-resolves that one edge to `indexmap 2.14.2`, a one-line lockfile change, and both majors stay in the graph because `serde_with` still needs the first. An earlier draft of this entry called it an upstream packaging defect and wrote it to `upstream/`, which was wrong twice over: the range does admit `indexmap 2`, and the repository's own lockfile is the lever, so there is nothing for an upstream to fix and nothing to work around.
 
 ### Done when
 
