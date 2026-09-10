@@ -1118,7 +1118,7 @@ where
                 )
             };
             let persistent = store.is_persistent();
-            let wipe_namespace = persistent.then_some(namespace);
+            let wipe_namespace = identified.then_some(namespace);
             (
                 Some(ContentArchive::new(store, root_key)),
                 Some(persistent),
@@ -1507,10 +1507,6 @@ type ImportReply = Result<(ImportOutcome, usize), String>;
 /// Where the import channel listener leaves the reply for the awaiting caller.
 type ImportSlot = Rc<RefCell<Option<ImportReply>>>;
 
-/// How long [`request_export`] waits for a worker to answer before giving up.
-/// Generous, because the wait covers reading the whole replica, and the only
-/// thing it catches is a worker that is not there.
-const EXPORT_TIMEOUT_MS: i32 = 30_000;
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
 
@@ -1530,8 +1526,7 @@ const POLL_MS: i32 = 25;
 ///
 /// # Errors
 ///
-/// [`ExportRefused::Gone`](crate::relay::ExportRefused::Gone) when no worker
-/// answered in time,
+/// [`ExportRefused::Gone`](crate::relay::ExportRefused::Gone) when no DB worker is running,
 /// [`ExportRefused::Failed`](crate::relay::ExportRefused::Failed) when one
 /// answered without an archive.
 pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay::ExportRefused> {
@@ -1549,10 +1544,11 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let request = build_export_request(scope);
     let posted = channel.post_message(&request);
-    let mut waited = 0;
-    while posted.is_ok() && result.borrow().is_none() && waited < EXPORT_TIMEOUT_MS {
+    while posted.is_ok()
+        && result.borrow().is_none()
+        && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
+    {
         sleep_ms(POLL_MS).await;
-        waited += POLL_MS;
     }
     channel.set_onmessage(None);
     channel.close();

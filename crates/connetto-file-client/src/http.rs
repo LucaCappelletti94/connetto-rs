@@ -172,9 +172,9 @@ mod browser {
         ) -> Result<HttpReply, BrowserHttpError> {
             let scope: DedicatedWorkerGlobalScope = js_sys::global()
                 .dyn_into()
-                .map_err(|value: js_sys::Object| error("acquire worker scope", value.into()))?;
+                .map_err(|value: js_sys::Object| error("acquire worker scope", &value.into()))?;
             let controller =
-                AbortController::new().map_err(|value| error("create request deadline", value))?;
+                AbortController::new().map_err(|value| error("create request deadline", &value))?;
             let request = build_request(method, url, body, range, &controller.signal())?;
             let abort = controller.clone();
             let deadline = Closure::<dyn FnMut()>::once(move || abort.abort());
@@ -183,7 +183,7 @@ mod browser {
                     deadline.as_ref().unchecked_ref(),
                     self.timeout_ms,
                 )
-                .map_err(|value| error("set request deadline", value))?;
+                .map_err(|value| error("set request deadline", &value))?;
             let result = async {
                 let response = fetch(&scope, request).await?;
                 read_response(response).await
@@ -206,24 +206,24 @@ mod browser {
         let init = RequestInit::new();
         init.set_signal(Some(signal));
         init.set_method(method);
-        let headers = Headers::new().map_err(|value| error("create headers", value))?;
+        let headers = Headers::new().map_err(|value| error("create headers", &value))?;
         if let Some((bytes, content_type)) = body {
             headers
                 .set("content-type", content_type)
-                .map_err(|value| error("set content type", value))?;
+                .map_err(|value| error("set content type", &value))?;
             init.set_body_opt_u8_array(Some(&Uint8Array::from(bytes.as_slice())));
         }
         if let Some((first, last)) = range {
             headers
                 .set("range", &format!("bytes={first}-{last}"))
-                .map_err(|value| error("set byte range", value))?;
+                .map_err(|value| error("set byte range", &value))?;
         }
         init.set_headers_headers(&headers);
-        Request::new_with_str_and_init(url, &init).map_err(|value| error("create request", value))
+        Request::new_with_str_and_init(url, &init).map_err(|value| error("create request", &value))
     }
 
     fn validate_url(value: &str) -> Result<(), BrowserHttpError> {
-        let url = Url::new(value).map_err(|value| error("validate request URL", value))?;
+        let url = Url::new(value).map_err(|value| error("validate request URL", &value))?;
         let loopback = matches!(url.hostname().as_str(), "localhost" | "127.0.0.1" | "[::1]");
         if url.protocol() == "https:" || (url.protocol() == "http:" && loopback) {
             Ok(())
@@ -241,9 +241,9 @@ mod browser {
     ) -> Result<Response, BrowserHttpError> {
         JsFuture::from(scope.fetch_with_request(&request))
             .await
-            .map_err(|value| error("fetch", value))?
+            .map_err(|value| error("fetch", &value))?
             .dyn_into::<Response>()
-            .map_err(|value| error("decode response", value))
+            .map_err(|value| error("decode response", &value))
     }
 
     async fn read_response(response: Response) -> Result<HttpReply, BrowserHttpError> {
@@ -251,10 +251,10 @@ mod browser {
         let buffer = JsFuture::from(
             response
                 .array_buffer()
-                .map_err(|value| error("begin response read", value))?,
+                .map_err(|value| error("begin response read", &value))?,
         )
         .await
-        .map_err(|value| error("read response", value))?;
+        .map_err(|value| error("read response", &value))?;
         Ok(HttpReply {
             status,
             body: Uint8Array::new(&buffer).to_vec(),
@@ -288,7 +288,7 @@ mod browser {
         }
     }
 
-    fn error(operation: &'static str, value: JsValue) -> BrowserHttpError {
+    fn error(operation: &'static str, value: &JsValue) -> BrowserHttpError {
         let message = value
             .dyn_ref::<DomException>()
             .map(|exception| format!("{}: {}", exception.name(), exception.message()))

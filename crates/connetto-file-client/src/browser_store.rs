@@ -4,14 +4,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore, MemStore, MemStoreError};
-use js_sys::{AsyncIterator, Function, Promise, Reflect, Uint8Array};
+use js_sys::{Reflect, Uint8Array};
 use thiserror::Error;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    DedicatedWorkerGlobalScope, DomException, File, FileSystemDirectoryHandle,
-    FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions,
-    FileSystemRemoveOptions, FileSystemWritableFileStream,
+    DedicatedWorkerGlobalScope, File, FileSystemDirectoryHandle, FileSystemFileHandle,
+    FileSystemRemoveOptions,
+};
+
+mod opfs_api;
+
+use opfs_api::{
+    browser_error, directory_handle, file_handle, is_not_found, move_file, next_key, type_error,
+    write_file,
 };
 
 const ROOT: &str = "connetto-content";
@@ -37,6 +43,14 @@ pub enum BrowserStoreError {
         /// The operation that failed.
         operation: &'static str,
         /// The browser exception text.
+        message: String,
+    },
+    /// A browser filesystem API returned a value of the wrong type.
+    #[error("browser filesystem {operation} returned an unexpected value: {message}")]
+    UnexpectedType {
+        /// The operation whose result had the wrong type.
+        operation: &'static str,
+        /// The unexpected value's diagnostic text.
         message: String,
     },
     /// The in-memory fallback failed.
@@ -101,12 +115,12 @@ impl OpfsStore {
     ) -> Result<FileSystemDirectoryHandle, BrowserStoreError> {
         let scope: DedicatedWorkerGlobalScope = js_sys::global()
             .dyn_into()
-            .map_err(|value| browser_error("acquire worker scope", value.into()))?;
+            .map_err(|value| type_error("decode worker scope", &value.into()))?;
         let root = JsFuture::from(scope.navigator().storage().get_directory())
             .await
-            .map_err(|value| browser_error("open OPFS root", value))?
+            .map_err(|value| browser_error("open OPFS root", &value))?
             .dyn_into::<FileSystemDirectoryHandle>()
-            .map_err(|value| browser_error("decode OPFS root", value))?;
+            .map_err(|value| type_error("decode OPFS root", &value))?;
         let app = directory_handle(&root, ROOT, true)
             .await?
             .expect("create=true always returns a directory");
@@ -199,15 +213,15 @@ impl ChunkStore for OpfsStore {
         let handle = self
             .file(hash, false)
             .await?
-            .ok_or_else(|| BrowserStoreError::Absent { hash: *hash })?;
+            .ok_or(BrowserStoreError::Absent { hash: *hash })?;
         let file = JsFuture::from(handle.get_file())
             .await
-            .map_err(|value| browser_error("open chunk file", value))?
+            .map_err(|value| browser_error("open chunk file", &value))?
             .dyn_into::<File>()
-            .map_err(|value| browser_error("decode chunk file", value))?;
+            .map_err(|value| type_error("decode chunk file", &value))?;
         let buffer = JsFuture::from(file.array_buffer())
             .await
-            .map_err(|value| browser_error("read chunk file", value))?;
+            .map_err(|value| browser_error("read chunk file", &value))?;
         Ok(Uint8Array::new(&buffer).to_vec())
     }
 
@@ -222,7 +236,7 @@ impl ChunkStore for OpfsStore {
         match JsFuture::from(dir.remove_entry(&hash.to_string())).await {
             Ok(_) => Ok(()),
             Err(value) if is_not_found(&value) => Ok(()),
-            Err(value) => Err(browser_error("delete chunk", value)),
+            Err(value) => Err(browser_error("delete chunk", &value)),
         }
     }
 }
@@ -290,7 +304,7 @@ async fn remove_temporary_entry(
     match JsFuture::from(directory.remove_entry(name)).await {
         Ok(_) => Ok(()),
         Err(value) if is_not_found(&value) => Ok(()),
-        Err(value) => Err(browser_error("remove temporary chunk", value)),
+        Err(value) => Err(browser_error("remove temporary chunk", &value)),
     }
 }
 
@@ -309,6 +323,7 @@ fn temporary_name(name: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct BrowserStore {
     inner: BrowserStoreInner,
+    fallback_memory: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -329,11 +344,14 @@ impl BrowserStore {
     ) -> Result<Self, BrowserStoreError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
-        let inner = match OpfsStore::open(worker, namespace).await {
-            Ok(store) => BrowserStoreInner::Opfs(store),
-            Err(_) => BrowserStoreInner::Memory(Arc::new(MemStore::new())),
+        let (inner, fallback_memory) = match OpfsStore::open(worker, namespace).await {
+            Ok(store) => (BrowserStoreInner::Opfs(store), false),
+            Err(_) => (BrowserStoreInner::Memory(Arc::new(MemStore::new())), true),
         };
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            fallback_memory,
+        })
     }
 
     /// Removes one persistent namespace and all of its chunks.
@@ -354,6 +372,7 @@ impl BrowserStore {
     pub fn ephemeral() -> Self {
         Self {
             inner: BrowserStoreInner::Memory(Arc::new(MemStore::new())),
+            fallback_memory: false,
         }
     }
 
@@ -366,6 +385,15 @@ impl BrowserStore {
 
 impl ChunkStore for BrowserStore {
     type Error = BrowserStoreError;
+
+    fn read_failure_is_ambiguous(&self, error: &Self::Error) -> bool {
+        matches!(error, BrowserStoreError::Browser { .. })
+            || (self.fallback_memory
+                && matches!(
+                    error,
+                    BrowserStoreError::Memory(MemStoreError::Absent { .. })
+                ))
+    }
 
     async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
         match &self.inner {
@@ -413,9 +441,9 @@ async fn remove_namespace(
 ) -> Result<(), BrowserStoreError> {
     let root = JsFuture::from(worker.navigator().storage().get_directory())
         .await
-        .map_err(|value| browser_error("open OPFS root", value))?
+        .map_err(|value| browser_error("open OPFS root", &value))?
         .dyn_into::<FileSystemDirectoryHandle>()
-        .map_err(|value| browser_error("decode OPFS root", value))?;
+        .map_err(|value| type_error("decode OPFS root", &value))?;
     let Some(app) = directory_handle(&root, ROOT, false).await? else {
         return Ok(());
     };
@@ -424,52 +452,8 @@ async fn remove_namespace(
     match JsFuture::from(app.remove_entry_with_options(namespace, &options)).await {
         Ok(_) => Ok(()),
         Err(value) if is_not_found(&value) => Ok(()),
-        Err(value) => Err(browser_error("remove store namespace", value)),
+        Err(value) => Err(browser_error("remove store namespace", &value)),
     }
-}
-
-async fn write_file(handle: &FileSystemFileHandle, data: &[u8]) -> Result<(), BrowserStoreError> {
-    let writable = JsFuture::from(handle.create_writable())
-        .await
-        .map_err(|value| browser_error("create writable chunk", value))?
-        .dyn_into::<FileSystemWritableFileStream>()
-        .map_err(|value| browser_error("decode writable chunk", value))?;
-    let write = writable
-        .write_with_u8_array(data)
-        .map_err(|value| browser_error("begin chunk write", value))?;
-    if let Err(value) = JsFuture::from(write).await {
-        let _ = JsFuture::from(writable.abort()).await;
-        return Err(browser_error("write chunk", value));
-    }
-    JsFuture::from(writable.close())
-        .await
-        .map_err(|value| browser_error("commit chunk write", value))?;
-    Ok(())
-}
-
-async fn move_file(
-    handle: &FileSystemFileHandle,
-    directory: &FileSystemDirectoryHandle,
-    name: &str,
-) -> Result<(), BrowserStoreError> {
-    let function = Reflect::get(handle.as_ref(), &JsValue::from_str("move"))
-        .map_err(|value| browser_error("find atomic move", value))?
-        .dyn_into::<Function>()
-        .map_err(|value| browser_error("decode atomic move", value))?;
-    let value = function
-        .call2(
-            handle.as_ref(),
-            directory.as_ref(),
-            &JsValue::from_str(name),
-        )
-        .map_err(|value| browser_error("begin atomic move", value))?;
-    let promise = value
-        .dyn_into::<Promise>()
-        .map_err(|value| browser_error("decode atomic move result", value))?;
-    JsFuture::from(promise)
-        .await
-        .map_err(|value| browser_error("land chunk", value))?;
-    Ok(())
 }
 
 fn validate_namespace(namespace: &str) -> Result<(), BrowserStoreError> {
@@ -483,80 +467,6 @@ fn validate_namespace(namespace: &str) -> Result<(), BrowserStoreError> {
         });
     }
     Ok(())
-}
-
-async fn directory_handle(
-    parent: &FileSystemDirectoryHandle,
-    name: &str,
-    create: bool,
-) -> Result<Option<FileSystemDirectoryHandle>, BrowserStoreError> {
-    let options = FileSystemGetDirectoryOptions::new();
-    options.set_create(create);
-    match JsFuture::from(parent.get_directory_handle_with_options(name, &options)).await {
-        Ok(value) => value
-            .dyn_into::<FileSystemDirectoryHandle>()
-            .map(Some)
-            .map_err(|value| browser_error("decode directory handle", value)),
-        Err(value) if !create && (is_not_found(&value) || is_type_mismatch(&value)) => Ok(None),
-        Err(value) => Err(browser_error("open directory", value)),
-    }
-}
-
-async fn file_handle(
-    parent: &FileSystemDirectoryHandle,
-    name: &str,
-    create: bool,
-) -> Result<Option<FileSystemFileHandle>, BrowserStoreError> {
-    let options = FileSystemGetFileOptions::new();
-    options.set_create(create);
-    match JsFuture::from(parent.get_file_handle_with_options(name, &options)).await {
-        Ok(value) => value
-            .dyn_into::<FileSystemFileHandle>()
-            .map(Some)
-            .map_err(|value| browser_error("decode file handle", value)),
-        Err(value) if !create && is_not_found(&value) => Ok(None),
-        Err(value) => Err(browser_error("open chunk", value)),
-    }
-}
-
-async fn next_key(iterator: &AsyncIterator) -> Result<Option<String>, BrowserStoreError> {
-    let promise = iterator
-        .next()
-        .map_err(|value| browser_error("list directory", value))?;
-    let result = JsFuture::from(promise)
-        .await
-        .map_err(|value| browser_error("list directory", value))?;
-    let done = Reflect::get(&result, &JsValue::from_str("done"))
-        .map_err(|value| browser_error("read directory iterator state", value))?
-        .as_bool()
-        .unwrap_or(false);
-    if done {
-        return Ok(None);
-    }
-    Ok(Reflect::get(&result, &JsValue::from_str("value"))
-        .map_err(|value| browser_error("read directory entry", value))?
-        .as_string())
-}
-
-fn is_not_found(value: &JsValue) -> bool {
-    value
-        .dyn_ref::<DomException>()
-        .is_some_and(|exception| exception.name() == "NotFoundError")
-}
-
-fn is_type_mismatch(value: &JsValue) -> bool {
-    value
-        .dyn_ref::<DomException>()
-        .is_some_and(|exception| exception.name() == "TypeMismatchError")
-}
-
-fn browser_error(operation: &'static str, value: JsValue) -> BrowserStoreError {
-    let message = value
-        .dyn_ref::<DomException>()
-        .map(|exception| format!("{}: {}", exception.name(), exception.message()))
-        .or_else(|| value.as_string())
-        .unwrap_or_else(|| format!("{value:?}"));
-    BrowserStoreError::Browser { operation, message }
 }
 
 fn parse_hash(name: &str) -> Option<ChunkHash> {

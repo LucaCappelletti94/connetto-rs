@@ -1,11 +1,24 @@
 use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore};
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::DedicatedWorkerGlobalScope;
 
-use super::OpfsStore;
+use super::opfs_api::type_error;
+use super::{BrowserStore, BrowserStoreError, OpfsStore};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
+#[wasm_bindgen_test]
+fn unexpected_browser_types_are_definitive_read_failures() {
+    let store = BrowserStore::ephemeral();
+    assert!(
+        store.read_failure_is_ambiguous(&BrowserStoreError::Browser {
+            operation: "read chunk file",
+            message: "temporarily unavailable".to_owned(),
+        })
+    );
+    let unexpected = type_error("decode chunk file", &JsValue::NULL);
+    assert!(!store.read_failure_is_ambiguous(&unexpected));
+}
 
 #[wasm_bindgen_test]
 async fn inventory_excludes_a_closed_chunk_until_atomic_landing() {

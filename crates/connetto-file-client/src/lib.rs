@@ -15,7 +15,9 @@ mod upload;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use browser_store::{BrowserStore, BrowserStoreError};
 
-pub use client::{ContentArchive, ContentClient, ContentEvent, ContentImportPlan};
+pub use client::{
+    ContentArchive, ContentClient, ContentEvent, ContentFlush, ContentFlushState, ContentImportPlan,
+};
 pub use error::ContentError;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

@@ -13,8 +13,8 @@ use connetto_client::{
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
-    ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
-    process_file_from_reader,
+    ChunkInventory, ChunkStore, EncryptStoreError, EncryptingStore, FileId, Manifest, MaybeSend,
+    MimeClass, process_file_from_reader,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -109,6 +109,30 @@ impl ContentImportPlan {
         self.manifests.len()
     }
 }
+/// Result of one worker-owned outbox attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentFlush {
+    /// One outbox entry was uploaded or permanently retired.
+    Progressed,
+    /// The entry remains queued for a later retry.
+    Deferred,
+    /// No entry was queued.
+    Empty,
+    /// The ticket wait yielded so the worker can serve local work.
+    Interrupted,
+}
+/// Resumable state for worker-owned outbox attempts.
+#[derive(Default)]
+pub struct ContentFlushState {
+    pending_ticket: Option<ticket::PendingTicket>,
+}
+impl ContentFlushState {
+    /// Whether an interrupted ticket request still awaits its answer.
+    #[must_use]
+    pub fn is_waiting(&self) -> bool {
+        self.pending_ticket.is_some()
+    }
+}
 
 /// Content archive policy for an owner of a raw sync connection.
 pub struct ContentArchive<B> {
@@ -151,6 +175,134 @@ where
         connection: &mut ConnettoConnection<T>,
     ) -> Result<u64, ContentError> {
         db::outbox_count(connection.conn())
+    }
+
+    /// Retires outbox entries whose bytes are conclusively unreadable.
+    pub async fn verify_unsent<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<FileId>, ContentError> {
+        let waiting = db::outbox(connection.conn())?;
+        let mut lost = Vec::new();
+        for file_id in waiting {
+            let unreadable = match db::load_manifest(connection.conn(), file_id)? {
+                Some(manifest) => {
+                    unreadable_chunk_count(&self.store, &self.root_key, &manifest).await
+                }
+                None => Some(0),
+            };
+            if unreadable.is_some() {
+                db::dequeue(connection.conn(), file_id)?;
+                lost.push(file_id);
+            }
+        }
+        Ok(lost)
+    }
+
+    /// Attempts one raw-connection outbox entry.
+    ///
+    /// `cancel` interrupts only the cancel-safe ticket wait. Once an HTTP
+    /// upload starts, the attempt and its local dequeue bookkeeping finish
+    /// together.
+    pub async fn flush_next_or<T, H, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        http: &H,
+        state: &mut ContentFlushState,
+        cancel: C,
+    ) -> (Result<ContentFlush, ContentError>, Vec<ClientEvent>)
+    where
+        T: Transport,
+        T::Error: Display,
+        H: ContentHttp,
+        C: core::future::Future<Output = ()>,
+    {
+        let mut observed = Vec::new();
+        let result = self
+            .flush_connection_next_or(connection, http, &mut observed, state, cancel)
+            .await;
+        (result, observed)
+    }
+
+    async fn flush_connection_next_or<T, H, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        http: &H,
+        observed: &mut Vec<ClientEvent>,
+        state: &mut ContentFlushState,
+        cancel: C,
+    ) -> Result<ContentFlush, ContentError>
+    where
+        T: Transport,
+        T::Error: Display,
+        H: ContentHttp,
+        C: core::future::Future<Output = ()>,
+    {
+        let waiting = db::outbox(connection.conn())?;
+        let file_id = match state.pending_ticket.as_ref().map(|ticket| ticket.file_id) {
+            Some(file_id) if waiting.contains(&file_id) => file_id,
+            _ => {
+                state.pending_ticket = None;
+                let Some(file_id) = waiting.first().copied() else {
+                    return Ok(ContentFlush::Empty);
+                };
+                file_id
+            }
+        };
+        match self
+            .upload_from_connection_or(
+                connection,
+                http,
+                file_id,
+                observed,
+                cancel,
+                &mut state.pending_ticket,
+            )
+            .await
+        {
+            Ok(None) => Ok(ContentFlush::Interrupted),
+            Err(err) if err.is_retryable() => Ok(ContentFlush::Deferred),
+            Ok(Some(())) | Err(_) => {
+                db::dequeue(connection.conn(), file_id)?;
+                Ok(ContentFlush::Progressed)
+            }
+        }
+    }
+
+    async fn upload_from_connection_or<T, H, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        http: &H,
+        file_id: FileId,
+        observed: &mut Vec<ClientEvent>,
+        cancel: C,
+        pending_ticket: &mut Option<ticket::PendingTicket>,
+    ) -> Result<Option<()>, ContentError>
+    where
+        T: Transport,
+        T::Error: Display,
+        H: ContentHttp,
+        C: core::future::Future<Output = ()>,
+    {
+        let manifest = db::load_manifest(connection.conn(), file_id)?
+            .ok_or(ContentError::NoManifest { file_id })?;
+        let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        let Some(url) = ticket::request_connection_or(
+            connection,
+            file_id,
+            ContentVerb::Write { declared_len },
+            observed,
+            cancel,
+            pending_ticket,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let store = EncryptingStore::new(self.store.clone(), &self.root_key);
+        upload::upload(http, &url, &manifest, &store)
+            .await
+            .map(Some)
     }
 
     /// Exports unsent content and replica data.
@@ -224,6 +376,29 @@ where
         }
     }
     crate::archive::encode(manifests, chunks)
+}
+
+async fn unreadable_chunk_count<B>(
+    store: &B,
+    root_key: &[u8; 32],
+    manifest: &Manifest,
+) -> Option<usize>
+where
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+{
+    let encrypted = EncryptingStore::new(store.clone(), root_key);
+    let mut count = 0;
+    let mut ambiguous = false;
+    for chunk in manifest.chunks() {
+        match encrypted.read_chunk(&chunk.hash).await {
+            Ok(_) => {}
+            Err(EncryptStoreError::Inner(err)) if store.read_failure_is_ambiguous(&err) => {
+                ambiguous = true;
+            }
+            Err(_) => count += 1,
+        }
+    }
+    (!ambiguous && count > 0).then_some(count)
 }
 
 fn prepare_content_import<T: Transport>(
@@ -505,14 +680,7 @@ where
         let Some(manifest) = manifest else {
             return Ok(Some(0));
         };
-        let store = self.store_for(FETCHED_CLASS);
-        let mut count = 0;
-        for chunk in manifest.chunks() {
-            if store.read_chunk(&chunk.hash).await.is_err() {
-                count += 1;
-            }
-        }
-        Ok((count > 0).then_some(count))
+        Ok(unreadable_chunk_count(&self.store, &self.root_key, &manifest).await)
     }
 
     /// Uploads every file waiting in the outbox, returning how many landed.

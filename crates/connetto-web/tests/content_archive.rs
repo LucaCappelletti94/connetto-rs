@@ -208,6 +208,35 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
     assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
 }
 
+/// A relay import uploads restored content without a tab-owned client.
+#[wasm_bindgen_test]
+async fn a_relay_import_drives_the_worker_outbox() {
+    let (archive, _) = stage_source().await;
+    let worker =
+        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
+            .expect("open relay replica");
+    let scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .expect("dedicated worker");
+    let store = BrowserStore::install(&scope, "r68-archive-uploader")
+        .await
+        .expect("install content store");
+    let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [3; 32]));
+    let uploaded = Rc::new(RefCell::new(Vec::new()));
+    let fetch = install_content_fetch(&uploaded);
+    hub.import_local_data(archive).await.expect("relay import");
+    for _ in 0..100 {
+        if !uploaded.borrow().is_empty() {
+            break;
+        }
+        JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
+            .await
+            .expect("yield to uploader");
+    }
+    drop(fetch);
+    assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+}
+
 async fn stage_source() -> (Vec<u8>, FileId) {
     let source = attach_browser_content(offline_client(), "r68-archive-source", [1; 32])
         .await
