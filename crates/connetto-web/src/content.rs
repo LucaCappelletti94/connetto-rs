@@ -29,7 +29,11 @@ pub enum BrowserContentError {
 /// A content client using the browser worker's storage and transport.
 pub type BrowserContentClient<T> = ContentClient<T, BrowserStore, BrowserHttp>;
 
-/// Attaches worker-owned browser content or returns a scope or content failure.
+/// Attaches worker-owned browser content.
+///
+/// # Errors
+///
+/// [`BrowserContentError`] when called outside a worker or when storage or content setup fails.
 pub async fn attach_browser_content<T>(
     client: ConnettoClient<T>,
     namespace: impl Into<String>,
@@ -51,10 +55,10 @@ use web_sys::{Blob, BlobPropertyBag, Url};
 
 /// Failure to expose local bytes as a browser URL.
 #[derive(Debug, Error)]
-#[error("create browser object URL: {message}")]
-pub struct ObjectUrlError {
-    /// The browser exception text.
-    message: String,
+pub enum ObjectUrlError {
+    /// The browser rejected blob or object URL creation.
+    #[error("create browser object URL: {0}")]
+    Browser(String),
 }
 
 /// A reference-counted browser object URL revoked with its last owner.
@@ -70,6 +74,10 @@ struct ObjectUrlInner {
 
 impl ObjectUrl {
     /// Creates an object URL for `bytes` with the given media type.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectUrlError`] when the browser rejects blob or URL creation.
     pub fn new(bytes: &[u8], media_type: &str) -> Result<Self, ObjectUrlError> {
         let parts = Array::of1(&Uint8Array::from(bytes));
         let options = BlobPropertyBag::new();
@@ -122,7 +130,11 @@ pub enum BrowserResolved {
 }
 
 impl BrowserResolved {
-    /// Converts the platform-neutral resolution into a browser display handle.
+    /// Converts a platform-neutral resolution into a browser display handle.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectUrlError`] when local bytes cannot become an object URL.
     pub fn from_resolved(resolved: Resolved, media_type: &str) -> Result<Self, ObjectUrlError> {
         match resolved {
             Resolved::Local { source, bytes } => Ok(Self::Local {
@@ -136,7 +148,5 @@ impl BrowserResolved {
 }
 
 fn object_url_error(value: &wasm_bindgen::JsValue) -> ObjectUrlError {
-    ObjectUrlError {
-        message: value.as_string().unwrap_or_else(|| format!("{value:?}")),
-    }
+    ObjectUrlError::Browser(value.as_string().unwrap_or_else(|| format!("{value:?}")))
 }

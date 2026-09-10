@@ -207,6 +207,14 @@ pub(crate) fn outbox(conn: &mut SqliteConnection) -> Result<Vec<FileId>, Content
         .collect()
 }
 
+/// Number of files waiting for upload.
+pub(crate) fn outbox_count(conn: &mut SqliteConnection) -> Result<u64, ContentError> {
+    let count = _connetto_content_outbox::table
+        .count()
+        .get_result::<i64>(conn)?;
+    Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))
+}
+
 /// Whether this file is still awaiting upload.
 pub(crate) fn is_unsent(
     conn: &mut SqliteConnection,

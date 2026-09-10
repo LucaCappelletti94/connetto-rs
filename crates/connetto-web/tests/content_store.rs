@@ -109,6 +109,37 @@ async fn an_invalid_store_namespace_is_not_downgraded_to_memory() {
 }
 
 #[wasm_bindgen_test]
+async fn removing_a_store_namespace_deletes_its_chunks() {
+    let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    let namespace = "r68-content-store-removal";
+    let hash = ChunkHash::from_bytes([0x72; 32]);
+    let store = BrowserStore::install(&worker, namespace)
+        .await
+        .expect("install content store");
+    store
+        .write_chunk(&hash, b"doomed browser chunk")
+        .await
+        .expect("write chunk");
+
+    BrowserStore::remove(&worker, namespace)
+        .await
+        .expect("remove content store");
+    store
+        .write_chunk(&hash, b"replacement browser chunk")
+        .await
+        .expect("recreate removed namespace");
+
+    let reopened = BrowserStore::install(&worker, namespace)
+        .await
+        .expect("reopen removed store");
+    assert_eq!(
+        reopened.read_chunk(&hash).await.expect("read chunk"),
+        b"replacement browser chunk",
+        "the first write after removal must recreate the namespace without old ciphertext"
+    );
+}
+
+#[wasm_bindgen_test]
 async fn opfs_holds_ciphertext_while_the_encrypting_view_returns_plaintext() {
     let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     let hash = ChunkHash::from_bytes([0x42; 32]);

@@ -625,6 +625,7 @@ fn app() -> Element {
                     session_expires_at,
                     lead,
                     unsynced,
+                    0,
                 ) {
                     let remaining = w
                         .session_expires_at
@@ -632,9 +633,9 @@ fn app() -> Element {
                         .unwrap_or_default();
                     let days = remaining.as_secs() / 86400;
                     expiry_warn.set(Some(format!(
-                        "Session expires in {days} day(s): {} unsynced write(s) at risk. \
+                        "Session expires in {days} day(s): {} pending local item(s) at risk. \
                          Stay connected to extend the deadline automatically.",
-                        w.unsynced.len()
+                        w.pending_count()
                     )));
                 } else {
                     expiry_warn.set(None);

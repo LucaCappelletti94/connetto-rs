@@ -126,7 +126,11 @@ where
         Self { store, root_key }
     }
 
-    /// Installs content bookkeeping or returns the replica schema failure.
+    /// Installs content bookkeeping.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the bookkeeping schema cannot be applied.
     pub fn install<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
@@ -137,7 +141,23 @@ where
             .map_err(Into::into)
     }
 
-    /// Exports unsent content and replica data or returns an archive, store, or replica failure.
+    /// Counts content files that have not reached the server.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox cannot be read.
+    pub fn pending_files<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<u64, ContentError> {
+        db::outbox_count(connection.conn())
+    }
+
+    /// Exports unsent content and replica data.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the outbox, chunk store, or replica export fails.
     pub async fn export_local_data<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
@@ -150,7 +170,11 @@ where
             .map_err(Into::into)
     }
 
-    /// Validates and applies content under this device key or returns the archive, store, or replica failure.
+    /// Validates and applies content under this device key.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when validation, chunk storage, or replica import fails.
     pub async fn import_local_data<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
@@ -315,7 +339,11 @@ where
         })
     }
 
-    /// Exports unsent content and replica data or returns an archive, store, or replica failure.
+    /// Exports unsent content and replica data.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the outbox, chunk store, or replica export fails.
     pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ContentError> {
         let _writing = self.content_writes.lock().await;
         let manifests = self.client.with_conn(outbox_manifests).await?;
@@ -326,7 +354,11 @@ where
             .map_err(ContentError::Client)
     }
 
-    /// Verifies replica data and content identities without mutation or returns the validation failure.
+    /// Verifies replica data and content identities without mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the archive or its content does not validate.
     pub async fn prepare_local_data_import(
         &self,
         bytes: &[u8],
@@ -336,7 +368,11 @@ where
             .await
     }
 
-    /// Restores content under this device key or returns the store or replica failure.
+    /// Restores content under this device key.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when chunk storage or replica import fails.
     pub async fn apply_local_data_import(
         &self,
         plan: &ContentImportPlan,

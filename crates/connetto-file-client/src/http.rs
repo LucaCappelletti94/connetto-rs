@@ -117,10 +117,12 @@ impl ContentHttp for ReqwestHttp {
 mod browser {
     use js_sys::Uint8Array;
     use thiserror::Error;
+    use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{
-        DedicatedWorkerGlobalScope, DomException, Headers, Request, RequestInit, Response,
+        AbortController, AbortSignal, DedicatedWorkerGlobalScope, DomException, Headers, Request,
+        RequestInit, Response, Url,
     };
 
     use super::{ContentHttp, HttpReply};
@@ -136,24 +138,60 @@ mod browser {
     }
 
     /// Content transport through the current worker's `fetch`.
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct BrowserHttp;
+    #[derive(Clone, Copy, Debug)]
+    pub struct BrowserHttp {
+        timeout_ms: i32,
+    }
+
+    impl Default for BrowserHttp {
+        fn default() -> Self {
+            Self { timeout_ms: 30_000 }
+        }
+    }
 
     impl BrowserHttp {
-        /// Creates a browser content transport.
+        /// Creates a browser content transport with a 30-second deadline.
         #[must_use]
         pub fn new() -> Self {
-            Self
+            Self::default()
+        }
+
+        /// Sets the deadline covering request and response-body transfer.
+        #[must_use]
+        pub fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
+            self.timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+            self
         }
 
         async fn request(
+            &self,
             method: &str,
             url: &str,
             body: Option<(Vec<u8>, &'static str)>,
             range: Option<(u64, u64)>,
         ) -> Result<HttpReply, BrowserHttpError> {
-            let request = build_request(method, url, body, range)?;
-            read_response(fetch(request).await?).await
+            let scope: DedicatedWorkerGlobalScope = js_sys::global()
+                .dyn_into()
+                .map_err(|value: js_sys::Object| error("acquire worker scope", value.into()))?;
+            let controller =
+                AbortController::new().map_err(|value| error("create request deadline", value))?;
+            let request = build_request(method, url, body, range, &controller.signal())?;
+            let abort = controller.clone();
+            let deadline = Closure::<dyn FnMut()>::once(move || abort.abort());
+            let timeout = scope
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    deadline.as_ref().unchecked_ref(),
+                    self.timeout_ms,
+                )
+                .map_err(|value| error("set request deadline", value))?;
+            let result = async {
+                let response = fetch(&scope, request).await?;
+                read_response(response).await
+            }
+            .await;
+            scope.clear_timeout_with_handle(timeout);
+            drop(deadline);
+            result
         }
     }
 
@@ -162,8 +200,11 @@ mod browser {
         url: &str,
         body: Option<(Vec<u8>, &'static str)>,
         range: Option<(u64, u64)>,
+        signal: &AbortSignal,
     ) -> Result<Request, BrowserHttpError> {
+        validate_url(url)?;
         let init = RequestInit::new();
+        init.set_signal(Some(signal));
         init.set_method(method);
         let headers = Headers::new().map_err(|value| error("create headers", value))?;
         if let Some((bytes, content_type)) = body {
@@ -181,10 +222,23 @@ mod browser {
         Request::new_with_str_and_init(url, &init).map_err(|value| error("create request", value))
     }
 
-    async fn fetch(request: Request) -> Result<Response, BrowserHttpError> {
-        let scope: DedicatedWorkerGlobalScope = js_sys::global()
-            .dyn_into()
-            .map_err(|value: js_sys::Object| error("acquire worker scope", value.into()))?;
+    fn validate_url(value: &str) -> Result<(), BrowserHttpError> {
+        let url = Url::new(value).map_err(|value| error("validate request URL", value))?;
+        let loopback = matches!(url.hostname().as_str(), "localhost" | "127.0.0.1" | "[::1]");
+        if url.protocol() == "https:" || (url.protocol() == "http:" && loopback) {
+            Ok(())
+        } else {
+            Err(BrowserHttpError {
+                operation: "validate request URL",
+                message: "ticket URL must use HTTPS or loopback HTTP".to_owned(),
+            })
+        }
+    }
+
+    async fn fetch(
+        scope: &DedicatedWorkerGlobalScope,
+        request: Request,
+    ) -> Result<Response, BrowserHttpError> {
         JsFuture::from(scope.fetch_with_request(&request))
             .await
             .map_err(|value| error("fetch", value))?
@@ -211,7 +265,7 @@ mod browser {
         type Error = BrowserHttpError;
 
         async fn post(&self, url: &str, json: Option<Vec<u8>>) -> Result<HttpReply, Self::Error> {
-            Self::request(
+            self.request(
                 "POST",
                 url,
                 json.map(|body| (body, "application/json")),
@@ -221,7 +275,8 @@ mod browser {
         }
 
         async fn put(&self, url: &str, body: Vec<u8>) -> Result<HttpReply, Self::Error> {
-            Self::request("PUT", url, Some((body, "application/octet-stream")), None).await
+            self.request("PUT", url, Some((body, "application/octet-stream")), None)
+                .await
         }
 
         async fn get(
@@ -229,7 +284,7 @@ mod browser {
             url: &str,
             range: Option<(u64, u64)>,
         ) -> Result<HttpReply, Self::Error> {
-            Self::request("GET", url, None, range).await
+            self.request("GET", url, None, range).await
         }
     }
 

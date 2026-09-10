@@ -39,6 +39,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # The filesystem chunk store and the reqwest transport are native only. R68
 # adds the OPFS store and a worker transport for wasm behind the same seams.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+connetto-client = { path = "../connetto-client", default-features = false, features = ["native-transport"] }
 tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
@@ -47,6 +48,8 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+  "AbortController",
+  "AbortSignal",
   "Blob",
   "DedicatedWorkerGlobalScope",
   "DomException",
@@ -55,6 +58,7 @@ web-sys = { version = "0.3", features = [
   "FileSystemFileHandle",
   "FileSystemGetDirectoryOptions",
   "FileSystemGetFileOptions",
+  "FileSystemRemoveOptions",
   "FileSystemWritableFileStream",
   "Headers",
   "Request",
@@ -63,6 +67,7 @@ web-sys = { version = "0.3", features = [
   "StorageManager",
   "WorkerGlobalScope",
   "WorkerNavigator",
+  "Url",
   "WritableStream",
 ] }
 

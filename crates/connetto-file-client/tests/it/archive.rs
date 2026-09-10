@@ -145,6 +145,46 @@ async fn fetched_cache_is_absent_from_the_archive() {
 }
 
 #[tokio::test]
+async fn independently_pending_content_restores_without_replica_rows_or_writes() {
+    let source_dir = tempdir().expect("source directory");
+    let source_client = offline_client(&source_dir.path().join("replica.sqlite"));
+    let file_id = FileId::from_chunks([PHOTO]);
+    let archive = raw_archive(
+        &source_client,
+        content_attachments(file_id, ChunkHash::from_data(PHOTO), PHOTO.len(), PHOTO),
+    )
+    .await;
+
+    let target_dir = tempdir().expect("target directory");
+    let target = attach_content(
+        offline_client(&target_dir.path().join("replica.sqlite")),
+        &target_dir.path().join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+    let plan = target
+        .prepare_local_data_import(&archive)
+        .await
+        .expect("prepare import");
+    assert_eq!(plan.replica_plan().device_only_rows(), 0);
+    assert_eq!(plan.replica_plan().queued_writes(), 0);
+    target
+        .apply_local_data_import(&plan, &ImportChoices::keeping_the_file())
+        .await
+        .expect("restore pending content");
+
+    let exported = target
+        .export_local_data(ExportScope::Unsynced)
+        .await
+        .expect("re-export restored outbox");
+    let exported_plan = target
+        .prepare_local_data_import(&exported)
+        .await
+        .expect("verify re-export");
+    assert_eq!(exported_plan.content_files(), 1);
+}
+
+#[tokio::test]
 async fn corrupt_lengths_hashes_and_file_identities_are_refused_before_apply() {
     let dir = tempdir().expect("directory");
     let client = offline_client(&dir.path().join("replica.sqlite"));

@@ -102,6 +102,9 @@ impl Transport for TicketTransport {
     ) -> impl Future<Output = Result<(), Self::Error>> {
         let subscribe = matches!(&message, ControlMessage::Subscribe(_));
         let stall = self.stall_subscribe && subscribe;
+        if stall {
+            self.stall_subscribe = false;
+        }
         let completed_subscribes = Rc::clone(&self.completed_subscribes);
         if let ControlMessage::ContentTicketRequest(request) = message {
             let file_id = FileId::from_bytes(request.file_id);
@@ -243,7 +246,7 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
         .await
         .expect("install content store");
     let content = ContentArchive::new(store, [3; 32]);
-    let (hub, completed_subscribes) = start_recovering_relay(worker, content);
+    let (hub, completed_subscribes, attempts) = start_recovering_relay(worker, content);
     serve_export_requests(hub.clone()).expect("export service");
     serve_import_requests(hub).expect("import service");
     let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
@@ -255,6 +258,11 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
     let (_, collisions) = request_import(file).await.expect("relay import");
     assert_eq!(collisions, 0);
     wait_for_reconnect(&completed_subscribes).await;
+    assert_eq!(
+        attempts.get(),
+        1,
+        "local archive work must not discard a transport that completed its handshake"
+    );
     request_export(ExportScope::Unsynced)
         .await
         .expect("relay export")
@@ -263,7 +271,7 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
 fn start_recovering_relay(
     worker: ConnettoConnection<TicketTransport>,
     content: ContentArchive<BrowserStore>,
-) -> (RelayHub, Rc<Cell<u32>>) {
+) -> (RelayHub, Rc<Cell<u32>>, Rc<Cell<u32>>) {
     let attempts = Rc::new(Cell::new(0));
     let completed_subscribes = Rc::new(Cell::new(0));
     let reconnect = HubReconnect {
@@ -291,7 +299,7 @@ fn start_recovering_relay(
     spawn_local(async move {
         pump.await.expect("content relay pump");
     });
-    (hub, completed_subscribes)
+    (hub, completed_subscribes, attempts)
 }
 
 async fn wait_for_reconnect(completed_subscribes: &Cell<u32>) {

@@ -30,6 +30,31 @@ async fn fetch_transport_builds_every_content_request_shape() {
     assert_eq!(*seen.borrow(), expected_requests());
 }
 
+#[wasm_bindgen_test]
+async fn fetch_transport_rejects_cleartext_non_loopback_tickets() {
+    let Err(error) = BrowserHttp::new()
+        .get("http://content.invalid/file", None)
+        .await
+    else {
+        panic!("cleartext ticket must be refused");
+    };
+    assert!(error.to_string().contains("must use HTTPS"));
+}
+
+#[wasm_bindgen_test]
+async fn fetch_transport_aborts_at_its_deadline() {
+    let fetch = install_hanging_fetch();
+    let Err(error) = BrowserHttp::new()
+        .with_timeout(std::time::Duration::from_millis(1))
+        .get("https://content.invalid/file", None)
+        .await
+    else {
+        panic!("request must reach its deadline");
+    };
+    drop(fetch);
+    assert!(error.to_string().contains("aborted"));
+}
+
 struct FetchReplacement {
     global: js_sys::Object,
     key: JsValue,
@@ -78,6 +103,37 @@ fn install_recording_fetch() -> (Rc<RefCell<Vec<SeenRequest>>>, FetchReplacement
     )
 }
 
+fn install_hanging_fetch() -> FetchReplacement {
+    let closure = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
+        let request = value
+            .dyn_into::<Request>()
+            .expect("fetch receives a request");
+        Promise::new(&mut move |_resolve, reject| {
+            let reject = reject.clone();
+            let abort = Closure::<dyn FnMut()>::once(move || {
+                let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("aborted"));
+            });
+            Reflect::set(
+                request.signal().as_ref(),
+                &JsValue::from_str("onabort"),
+                abort.as_ref(),
+            )
+            .expect("observe abort");
+            abort.forget();
+        })
+    });
+    let global = js_sys::global();
+    let key = JsValue::from_str("fetch");
+    let previous = Reflect::get(&global, &key).expect("read fetch");
+    Reflect::set(&global, &key, closure.as_ref()).expect("replace fetch");
+    FetchReplacement {
+        global,
+        key,
+        previous,
+        _closure: closure,
+    }
+}
+
 async fn exercise_http() {
     let http = BrowserHttp::new();
     let replies = [
@@ -92,6 +148,7 @@ async fn exercise_http() {
         http.get("https://content.invalid/file", None).await,
         http.get("https://content.invalid/file", Some((11, 29)))
             .await,
+        http.get("http://127.0.0.1/file", None).await,
     ];
     for reply in replies {
         let reply = reply.expect("fetch request succeeds");
@@ -135,6 +192,13 @@ fn expected_requests() -> Vec<SeenRequest> {
             url: "https://content.invalid/file".to_owned(),
             content_type: None,
             range: Some("bytes=11-29".to_owned()),
+            body: Vec::new(),
+        },
+        SeenRequest {
+            method: "GET".to_owned(),
+            url: "http://127.0.0.1/file".to_owned(),
+            content_type: None,
+            range: None,
             body: Vec::new(),
         },
     ]

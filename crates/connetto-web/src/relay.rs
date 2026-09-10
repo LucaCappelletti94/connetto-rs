@@ -60,6 +60,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::auth::PendingWork;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
@@ -188,9 +189,8 @@ enum HubEvent {
     Gone(TabId),
     /// The owner wants this tab disconnected (a liveness watcher fired).
     Kill(TabId),
-    /// Report the worker's queued, unacknowledged mutations. The core owns the
-    /// connection, so a caller outside it can only ask and be answered.
-    Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
+    /// Report local work that has not reached the server.
+    Unsynced(futures_channel::oneshot::Sender<PendingWork>),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
     Export(
@@ -536,7 +536,11 @@ impl RelayHub {
         Self::build(worker, hub_meta, Some(reconnect), None)
     }
 
-    /// Builds a content-aware reconnecting hub or returns its installation failure.
+    /// Builds a content-aware reconnecting hub.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Content`] when content setup fails or [`RelayError::Replica`] when hub metadata cannot attach.
     #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
@@ -682,18 +686,12 @@ impl RelayHub {
         let _ = self.events.send(HubEvent::Kill(tab));
     }
 
-    /// The seqs of mutations applied locally and queued for the server but not
-    /// yet acknowledged, which is what a logout has to warn about before
-    /// destroying a replica.
-    ///
-    /// The count is a snapshot. The core may acknowledge or accept writes right
-    /// after answering, so a caller showing it to a user is describing the past,
-    /// not promising the present.
+    /// Returns a snapshot of mutations and content files not yet acknowledged.
     ///
     /// # Errors
     ///
     /// [`HubGone`] when the core has ended, so no answer will come.
-    pub async fn unsynced(&self) -> Result<Vec<u64>, HubGone> {
+    pub async fn unsynced(&self) -> Result<PendingWork, HubGone> {
         let (reply, answer) = futures_channel::oneshot::channel();
         self.events
             .send(HubEvent::Unsynced(reply))
@@ -883,7 +881,14 @@ where
             handle_tab_frame(worker, state, notices, id, frame).await?;
         }
         HubEvent::Unsynced(reply) => {
-            let _ = reply.send(worker.unsynced());
+            let pending = PendingWork {
+                mutation_seqs: worker.unsynced(),
+                content_files: match content {
+                    Some(content) => content.pending_files(worker)?,
+                    None => 0,
+                },
+            };
+            let _ = reply.send(pending);
         }
         HubEvent::Export(scope, reply) => {
             let _ = reply.send(export_archive(worker, content, scope).await);
@@ -1064,8 +1069,9 @@ where
     U::Error: core::fmt::Display,
     F: TransportFactory<Transport = U>,
 {
+    let mut attempt = recovery_attempt(context, factory, upstream).await?;
     loop {
-        match recovery_attempt(context, factory, upstream).await? {
+        match attempt {
             RecoveryAttempt::Connected => {
                 handle_deferred_events(context).await?;
                 return Ok(RecoveryCycle::Connected);
@@ -1075,7 +1081,9 @@ where
                 return Ok(RecoveryCycle::Failed);
             }
             RecoveryAttempt::Interrupted(event) => {
-                context.worker.disconnect();
+                if !context.worker.is_connected() {
+                    context.worker.disconnect();
+                }
                 handle_hub_event(
                     context.worker,
                     context.state,
@@ -1084,8 +1092,50 @@ where
                     event,
                 )
                 .await?;
+                attempt = if context.worker.is_connected() {
+                    finish_attached_during_recovery(context, upstream).await
+                } else {
+                    recovery_attempt(context, factory, upstream).await?
+                };
             }
             RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
+        }
+    }
+}
+
+async fn finish_attached_during_recovery<U>(
+    context: &mut RecoveryContext<'_, U>,
+    upstream: &[(String, SubscriptionSpec)],
+) -> RecoveryAttempt
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+{
+    let worker = &mut *context.worker;
+    let state = &*context.state;
+    let events = &mut *context.events;
+    let deferred = &mut *context.deferred;
+    let recovery = async {
+        worker.resume_attach().await?;
+        restore_recovery_subscriptions(worker, state, upstream).await
+    };
+    tokio::pin!(recovery);
+    loop {
+        tokio::select! {
+            result = &mut recovery => {
+                return match result {
+                    Ok(()) => RecoveryAttempt::Connected,
+                    Err(_) => RecoveryAttempt::Failed,
+                };
+            }
+            event = events.recv() => match event {
+                Some(event) => {
+                    if let Some(local) = schedule_recovery_event(deferred, event) {
+                        return RecoveryAttempt::Interrupted(local);
+                    }
+                }
+                None => return RecoveryAttempt::Closed,
+            },
         }
     }
 }
@@ -1174,15 +1224,7 @@ where
     let deferred = &mut *context.deferred;
     let recovery = async {
         worker.attach(transport).await?;
-        for (sub_id, spec) in upstream {
-            worker.subscribe_spec(sub_id, spec.clone()).await?;
-        }
-        for (upstream_id, route) in &state.agg_routes {
-            worker
-                .subscribe_spec(upstream_id, route.spec.clone())
-                .await?;
-        }
-        Ok::<(), ClientError>(())
+        restore_recovery_subscriptions(worker, state, upstream).await
     };
     tokio::pin!(recovery);
     loop {
@@ -1194,14 +1236,35 @@ where
                 };
             }
             event = events.recv() => match event {
-                Some(event) if recovery_local(&event) => {
-                    return RecoveryAttempt::Interrupted(event);
+                Some(event) => {
+                    if let Some(local) = schedule_recovery_event(deferred, event) {
+                        return RecoveryAttempt::Interrupted(local);
+                    }
                 }
-                Some(event) => deferred.push_back(event),
                 None => return RecoveryAttempt::Closed,
             },
         }
     }
+}
+
+async fn restore_recovery_subscriptions<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Result<(), ClientError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    for (sub_id, spec) in upstream {
+        worker.subscribe_spec(sub_id, spec.clone()).await?;
+    }
+    for (upstream_id, route) in &state.agg_routes {
+        worker
+            .subscribe_spec(upstream_id, route.spec.clone())
+            .await?;
+    }
+    Ok(())
 }
 
 async fn handle_recovery_event<U>(
@@ -1212,18 +1275,24 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    if recovery_local(&event) {
-        handle_hub_event(
-            context.worker,
-            context.state,
-            context.notices,
-            context.content,
-            event,
-        )
-        .await
+    let Some(local) = schedule_recovery_event(context.deferred, event) else {
+        return Ok(());
+    };
+    handle_hub_event(
+        context.worker,
+        context.state,
+        context.notices,
+        context.content,
+        local,
+    )
+    .await
+}
+fn schedule_recovery_event(deferred: &mut VecDeque<HubEvent>, event: HubEvent) -> Option<HubEvent> {
+    if deferred.is_empty() && recovery_local(&event) {
+        Some(event)
     } else {
-        context.deferred.push_back(event);
-        Ok(())
+        deferred.push_back(event);
+        None
     }
 }
 
@@ -2767,7 +2836,7 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabApplyError, apply_local_changeset};
+    use super::{HubEvent, TabApplyError, apply_local_changeset, schedule_recovery_event};
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
     use diesel_sqlite_session::SqliteSessionExt;
@@ -2776,6 +2845,29 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+
+    #[wasm_bindgen_test]
+    fn a_local_recovery_request_cannot_overtake_an_ordinary_event() {
+        let mut deferred = std::collections::VecDeque::new();
+        deferred.push_back(HubEvent::Kill(7));
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(schedule_recovery_event(&mut deferred, HubEvent::Unsynced(reply)).is_none());
+        assert!(matches!(deferred.pop_front(), Some(HubEvent::Kill(7))));
+        assert!(matches!(deferred.pop_front(), Some(HubEvent::Unsynced(_))));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_local_recovery_request_is_serviceable_at_the_queue_head() {
+        let mut deferred = std::collections::VecDeque::new();
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::Unsynced(reply)),
+            Some(HubEvent::Unsynced(_))
+        ));
+        assert!(deferred.is_empty());
+    }
 
     /// A database holding `drafts` with one row, in memory.
     fn seeded(body: &str) -> SqliteConnection {

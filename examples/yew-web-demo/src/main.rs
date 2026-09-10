@@ -37,7 +37,7 @@ use connetto_client::{
     Replica,
 };
 use connetto_core::custody::Custody;
-use connetto_web::auth::WorkerAuthConfig;
+use connetto_web::auth::{PendingWork, WorkerAuthConfig};
 use connetto_web::unlock::{AccountChoice, serve_account_choice};
 use connetto_web::{MessageTransport, deliver_login_code, leader, locks, workers};
 use connetto_yew::use_live;
@@ -585,8 +585,8 @@ fn app() -> Html {
     let login_url = use_state(|| None::<String>);
 
     // Confirmation state for the delete-data logout flow.
-    let confirm_seqs = use_state(|| None::<Vec<u64>>);
-    let refused_seqs = use_state(|| None::<Vec<u64>>);
+    let confirm_seqs = use_state(|| None::<PendingWork>);
+    let refused_seqs = use_state(|| None::<PendingWork>);
 
     // Account chooser: the list of accounts the worker offered during the
     // last account question, shown as a picker while the chooser awaits.
@@ -630,7 +630,6 @@ fn app() -> Html {
         let booted_account = booted_account.clone();
         let session_expires_at = session_expires_at.clone();
         let expiry_warn = expiry_warn.clone();
-        let client = client.clone();
         use_effect_with((), move |()| {
             let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
             let on_msg = {
@@ -638,7 +637,6 @@ fn app() -> Html {
                 let booted_account = booted_account.clone();
                 let session_expires_at = session_expires_at.clone();
                 let expiry_warn = expiry_warn.clone();
-                let client = client.clone();
                 Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                     let Some(data) = event.data().as_string() else {
                         return;
@@ -669,11 +667,12 @@ fn app() -> Html {
                     }
 
                     // Compute the expiry warning when we have all the inputs.
-                    if let (Some(exp_secs), Some(handle)) = (expires_at, (*client).clone()) {
-                        let client_inner = (*handle.0).clone();
+                    if let Some(exp_secs) = expires_at {
                         let expiry_warn = expiry_warn.clone();
                         spawn_local(async move {
-                            let unsynced = client_inner.with_conn(|conn| conn.unsynced()).await;
+                            let pending = connetto_web::auth::request_unsynced()
+                                .await
+                                .unwrap_or_default();
                             let now_ms = js_sys::Date::now();
                             // Date.now() is always finite and non-negative (ms since epoch).
                             debug_assert!(now_ms.is_finite() && now_ms >= 0.0);
@@ -684,7 +683,13 @@ fn app() -> Html {
                             let expires = std::time::SystemTime::UNIX_EPOCH
                                 + std::time::Duration::from_secs(exp_secs);
                             let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-                            expiry_warn.set(expiry_warning(now, expires, lead, unsynced));
+                            expiry_warn.set(expiry_warning(
+                                now,
+                                expires,
+                                lead,
+                                pending.mutation_seqs,
+                                pending.content_files,
+                            ));
                         });
                     }
                 })
@@ -821,16 +826,16 @@ fn app() -> Html {
             let refused_seqs = refused_seqs.clone();
             spawn_local(async move {
                 match connetto_web::auth::request_unsynced().await {
-                    Ok(seqs) if seqs.is_empty() => {
+                    Ok(pending) if pending.is_empty() => {
                         match connetto_web::auth::request_logout(true, false).await {
-                            Ok(connetto_web::auth::LogoutOutcome::Refused { seqs }) => {
-                                refused_seqs.set(Some(seqs));
+                            Ok(connetto_web::auth::LogoutOutcome::Refused { pending }) => {
+                                refused_seqs.set(Some(pending));
                             }
                             Ok(_) => reload_page(),
                             Err(err) => status.set(format!("logout failed: {err}")),
                         }
                     }
-                    Ok(seqs) => confirm_seqs.set(Some(seqs)),
+                    Ok(pending) => confirm_seqs.set(Some(pending)),
                     Err(err) => status.set(format!("checking unsynced failed: {err}")),
                 }
             });
@@ -1034,11 +1039,11 @@ fn app() -> Html {
             }
         };
 
-        let confirm_html = if let Some(seqs) = &*confirm_seqs {
-            let count = seqs.len();
+        let confirm_html = if let Some(pending) = &*confirm_seqs {
+            let count = pending.len();
             html! {
                 <span>
-                    { format!("{count} unsynced write(s) will be lost. ") }
+                    { format!("{count} local item(s) will be lost. ") }
                     <button onclick={confirm_delete}>{ "Delete anyway" }</button>
                     { " " }
                     <button onclick={cancel_confirm.clone()}>{ "Cancel" }</button>
@@ -1048,11 +1053,11 @@ fn app() -> Html {
             html! {}
         };
 
-        let refused_html = if let Some(seqs) = &*refused_seqs {
-            let count = seqs.len();
+        let refused_html = if let Some(pending) = &*refused_seqs {
+            let count = pending.len();
             html! {
                 <span>
-                    { format!("Refused: {count} write(s) still pending. ") }
+                    { format!("Refused: {count} local item(s) still pending. ") }
                     <button onclick={force_delete}>{ "Force delete" }</button>
                     { " " }
                     <button onclick={cancel_confirm}>{ "Cancel" }</button>

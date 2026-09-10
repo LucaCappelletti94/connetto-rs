@@ -56,8 +56,8 @@ use js_sys::{ArrayBuffer, Uint8Array};
 pub use leader::{Membership, join};
 pub use relay::{ExportRefused, HubGone, HubNotice, RelayError, RelayHub, TabId};
 pub use storage::{
-    ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
-    wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
+    take_pending_wipes, wipe_replica,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;

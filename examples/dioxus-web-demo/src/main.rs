@@ -850,7 +850,7 @@ fn AuthBanner() -> Element {
                 expiry_warn.set(None);
                 return;
             };
-            let unsynced = request_unsynced().await.unwrap_or_default();
+            let pending = request_unsynced().await.unwrap_or_default();
             let now_f64 = js_sys::Date::now();
             // Deliberate truncation: milliseconds since epoch, always finite and non-negative.
             debug_assert!(
@@ -863,7 +863,8 @@ fn AuthBanner() -> Element {
                 now,
                 expires_at,
                 Duration::from_secs(7 * 24 * 3600),
-                unsynced,
+                pending.mutation_seqs,
+                pending.content_files,
             ));
         });
     });
@@ -909,7 +910,7 @@ fn AuthBanner() -> Element {
 
         // Session expiry warning text, computed outside RSX to keep the template flat.
         let expiry_line = expiry_warn.read().clone().map(|warn| {
-            let n = warn.unsynced.len();
+            let n = warn.pending_count();
             let secs = warn
                 .session_expires_at
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1097,8 +1098,9 @@ fn AuthBanner() -> Element {
 enum LogoutState {
     /// Showing the two logout buttons.
     Idle,
-    /// Awaiting user confirmation: delete would lose this many unsynced writes.
-    ConfirmDelete { unsynced_count: usize },
+    ConfirmDelete {
+        unsynced_count: u64,
+    },
     /// A logout or unsynced-count request is in flight.
     Working,
     /// The request failed.
@@ -1131,25 +1133,20 @@ fn LogoutControls() -> Element {
         spawn(async move {
             state.set(LogoutState::Working);
             match request_unsynced().await {
-                Ok(seqs) if seqs.is_empty() => {
-                    // Nothing would be lost: proceed without a confirmation prompt.
-                    match request_logout(true, false).await {
-                        Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => {
-                            reload_page();
-                        }
-                        Ok(LogoutOutcome::Refused { seqs }) => {
-                            // A write landed between our check and the request.
-                            // Show the count and let the user confirm.
-                            state.set(LogoutState::ConfirmDelete {
-                                unsynced_count: seqs.len(),
-                            });
-                        }
-                        Err(err) => state.set(LogoutState::Error(err.to_string())),
+                Ok(pending) if pending.is_empty() => match request_logout(true, false).await {
+                    Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => {
+                        reload_page();
                     }
-                }
-                Ok(seqs) => {
+                    Ok(LogoutOutcome::Refused { pending }) => {
+                        state.set(LogoutState::ConfirmDelete {
+                            unsynced_count: pending.len(),
+                        });
+                    }
+                    Err(err) => state.set(LogoutState::Error(err.to_string())),
+                },
+                Ok(pending) => {
                     state.set(LogoutState::ConfirmDelete {
-                        unsynced_count: seqs.len(),
+                        unsynced_count: pending.len(),
                     });
                 }
                 Err(err) => state.set(LogoutState::Error(err.to_string())),

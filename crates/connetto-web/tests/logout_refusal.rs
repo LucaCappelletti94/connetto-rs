@@ -17,11 +17,19 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
+use core::convert::Infallible;
+use core::future::ready;
+
+use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::test_support::{FakeTransport, replica_key};
+use connetto_file_client::{BrowserStore, ContentArchive};
 use connetto_web::RelayHub;
-use connetto_web::auth::{LogoutOutcome, WorkerAuthConfig, request_logout, request_unsynced};
-use connetto_web::storage::{ReplicaStorage, take_pending_wipes};
+use connetto_web::auth::{
+    LogoutOutcome, PendingWork, WorkerAuthConfig, request_logout, request_unsynced,
+};
+use connetto_web::relay::HubReconnect;
+use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
 use connetto_web::workers::serve_logout_requests;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -88,25 +96,45 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
         .expect("write locally");
     worker.push().await.expect("upload the captured mutation");
     let stranded = worker.unsynced();
-    assert!(
-        !stranded.is_empty(),
-        "the fake upstream acknowledges nothing, so the write stays queued"
-    );
+    assert!(!stranded.is_empty(), "the mutation must remain queued");
+    let content = ContentArchive::new(BrowserStore::ephemeral(), [0x71; 32]);
+    content
+        .install(&mut worker)
+        .expect("install content tables");
+    diesel::sql_query("INSERT INTO _connetto_content_outbox (file_id) VALUES (zeroblob(32))")
+        .execute(worker.conn())
+        .expect("queue content");
 
-    // The hub takes the connection, so from here the count is only reachable by
-    // asking the pump, which is exactly what the logout service does.
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
+    let reconnect = HubReconnect {
+        factory: || ready(Ok::<_, Infallible>(FakeTransport::accepting_but_silent())),
+        sleeper: |_| ready(()),
+        policy: ReconnectPolicy::default(),
+        upstream: Vec::new(),
+    };
+    let (hub, pump, _notices) =
+        RelayHub::with_reconnect_and_content(worker, ":memory:", reconnect, content)
+            .expect("hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("hub pump");
     });
-    serve_logout_requests(unused_auth(), AUTH_DB, REPLICA, None, hub.clone())
-        .expect("install the logout service");
+    serve_logout_requests(
+        unused_auth(),
+        AUTH_DB,
+        REPLICA,
+        Some("content-wipe-namespace".to_owned()),
+        None,
+        hub.clone(),
+    )
+    .expect("install the logout service");
 
-    // The query reports the stranded work, so a prompt can name it.
+    let pending = PendingWork {
+        mutation_seqs: stranded.clone(),
+        content_files: 1,
+    };
     assert_eq!(
         request_unsynced().await.expect("the worker answers"),
-        stranded,
-        "the query reports exactly what is queued"
+        pending,
+        "the query reports both queues"
     );
 
     // The delete is refused, and refused without destroying anything, so the write
@@ -116,7 +144,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
             .await
             .expect("the worker answers"),
         LogoutOutcome::Refused {
-            seqs: stranded.clone()
+            pending: pending.clone()
         },
         "a delete that would lose queued work is refused"
     );
@@ -136,7 +164,10 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     );
     assert_eq!(
         take_pending_wipes().await.expect("drain"),
-        vec![REPLICA.to_owned()],
-        "the forced delete marks this replica"
+        vec![PendingWipe::new(
+            REPLICA,
+            Some("content-wipe-namespace".to_owned())
+        )],
+        "the forced delete names both stores"
     );
 }

@@ -1980,6 +1980,12 @@ struct Wire<T> {
     connection_id: String,
 }
 
+#[derive(Clone, Copy)]
+enum AttachReplay {
+    Idle,
+    Pending { watermark: Option<u64> },
+}
+
 /// A sync client bound to one local SQLite database, with or without a server.
 ///
 /// It exists before any transport does. Opening the replica, serving reads from
@@ -1992,6 +1998,8 @@ pub struct ConnettoConnection<T: Transport> {
     /// The run this caller's work belongs to, absent until a first handshake
     /// and kept across every later drop.
     run: Option<Run>,
+    /// Post-handshake replay progress retained across a local interruption.
+    attach_replay: AttachReplay,
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
@@ -2262,6 +2270,7 @@ where
         let mut conn = Self {
             wire: None,
             run: None,
+            attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
             session,
             db,
@@ -2397,12 +2406,29 @@ where
             transport,
             connection_id: ack.connection_id,
         });
+        self.attach_replay = AttachReplay::Pending { watermark };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
+        self.resume_attach().await
+    }
+
+    /// Finishes post-handshake replay after an outer operation temporarily
+    /// yielded the connection for local work.
+    ///
+    /// Calling this after a completed attach is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when pending mutation or subscription replay fails.
+    pub async fn resume_attach(&mut self) -> Result<(), ClientError> {
+        let AttachReplay::Pending { watermark } = self.attach_replay else {
+            return Ok(());
+        };
         self.reconcile_pending(watermark).await?;
         self.replay_subscriptions().await?;
+        self.attach_replay = AttachReplay::Idle;
         Ok(())
     }
 
@@ -2460,6 +2486,7 @@ where
 
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
+        self.attach_replay = AttachReplay::Idle;
         if self.wire.take().is_some() {
             self.notices
                 .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));

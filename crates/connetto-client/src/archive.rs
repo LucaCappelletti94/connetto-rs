@@ -47,7 +47,9 @@ const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
 const PENDING: &str = "pending.changesets";
 /// Human-readable description of the entry encodings.
-const NOTE: &str = "rows are zstd SQLite change records; attachments declare their encoding";
+const NOTE: &str = "rows are zstd SQLite change records. Attachments declare their encoding";
+const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ATTACHMENTS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// An opaque file another client layer carries in the device archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +59,11 @@ pub struct ArchiveAttachment {
 }
 
 impl ArchiveAttachment {
-    /// Creates a safe raw archive entry or returns an unsafe or reserved path error.
+    /// Creates a safe raw archive entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when `path` is unsafe or reserved by the archive format.
     pub fn new(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, ClientError> {
         let path = path.into();
         validate_attachment_path(&path, ClientError::Export)?;
@@ -446,11 +452,37 @@ fn read_attachments(
     entries: &[Entry],
 ) -> Result<Vec<ArchiveAttachment>, ClientError> {
     let mut attachments = Vec::new();
+    let mut total = 0_u64;
     for entry in entries.iter().filter(|entry| entry.kind == "attachment") {
-        let mut file = zip
-            .by_name(&entry.path)
-            .expect("archive layout was validated");
-        let mut bytes = Vec::new();
+        let mut file = zip.by_name(&entry.path).map_err(read_error)?;
+        if file.compression() != zip::CompressionMethod::Stored {
+            return Err(ClientError::Import(format!(
+                "archive attachment {} must use ZIP Stored compression",
+                entry.path
+            )));
+        }
+        let size = file.size();
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err(ClientError::Import(format!(
+                "archive attachment {} is {size} bytes, above the {MAX_ATTACHMENT_BYTES}-byte limit",
+                entry.path
+            )));
+        }
+        total = total
+            .checked_add(size)
+            .filter(|total| *total <= MAX_ATTACHMENTS_BYTES)
+            .ok_or_else(|| {
+                ClientError::Import(format!(
+                    "archive attachments exceed the {MAX_ATTACHMENTS_BYTES}-byte aggregate limit"
+                ))
+            })?;
+        let capacity = usize::try_from(size).map_err(|_| {
+            ClientError::Import(format!(
+                "archive attachment {} does not fit this platform",
+                entry.path
+            ))
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
         file.read_to_end(&mut bytes).map_err(read_error)?;
         attachments.push(ArchiveAttachment {
             path: entry.path.clone(),
@@ -973,6 +1005,59 @@ mod tests {
         let records = vec![vec![0u8, 1, 2], Vec::new(), vec![255u8; 300]];
         let encoded = encode_pending(&records);
         assert_eq!(decode_pending(&encoded).expect("decode"), records);
+    }
+
+    #[test]
+    fn compressed_attachments_are_refused_before_their_body_is_read() {
+        let manifest = json!({
+            "format": "connetto-local-data",
+            "version": 3,
+            "scope": "unsynced",
+            "schema_fingerprint": "abc123",
+            "account": null,
+            "compression": "per-entry",
+            "note": "test",
+            "entries": [
+                {"kind": "attachment", "path": "content/chunks/abc", "encoding": "identity"}
+            ],
+        });
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("manifest.json", stored)
+            .expect("start manifest");
+        zip.write_all(&serde_json::to_vec(&manifest).expect("encode manifest"))
+            .expect("write manifest");
+        zip.start_file("content/chunks/abc", stored)
+            .expect("start attachment");
+        zip.write_all(&vec![0_u8; 64 * 1024])
+            .expect("write attachment");
+        let mut bytes = zip.finish().expect("finish archive").into_inner();
+        set_zip_compression(&mut bytes, b"content/chunks/abc", 8);
+
+        let error = read(&bytes).expect_err("compressed attachment");
+        assert!(
+            error
+                .to_string()
+                .contains("Compression method not supported")
+        );
+    }
+
+    fn set_zip_compression(bytes: &mut [u8], path: &[u8], method: u16) {
+        let method = method.to_le_bytes();
+        let positions: Vec<_> = bytes
+            .windows(path.len())
+            .enumerate()
+            .filter_map(|(at, value)| (value == path).then_some(at))
+            .collect();
+        for at in positions {
+            if at >= 30 && &bytes[at - 30..at - 26] == b"PK\x03\x04" {
+                bytes[at - 22..at - 20].copy_from_slice(&method);
+            } else if at >= 46 && &bytes[at - 46..at - 42] == b"PK\x01\x02" {
+                bytes[at - 36..at - 34].copy_from_slice(&method);
+            }
+        }
     }
 
     /// A truncated queue entry is refused rather than read as a shorter one.

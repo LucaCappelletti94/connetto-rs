@@ -11,7 +11,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     DedicatedWorkerGlobalScope, DomException, File, FileSystemDirectoryHandle,
     FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions,
-    FileSystemWritableFileStream,
+    FileSystemRemoveOptions, FileSystemWritableFileStream,
 };
 
 const ROOT: &str = "connetto-content";
@@ -186,6 +186,7 @@ impl ChunkStore for OpfsStore {
     type Error = BrowserStoreError;
 
     async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
+        self.directory(true).await?;
         // `createWritable` keeps changes in a swap file until `close`, preserving the old chunk on interruption.
         if let Some(handle) = self.file(hash, false).await? {
             return write_file(&handle, data).await;
@@ -335,6 +336,19 @@ impl BrowserStore {
         Ok(Self { inner })
     }
 
+    /// Removes one persistent namespace and all of its chunks.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserStoreError`] when the namespace is invalid or OPFS removal fails.
+    pub async fn remove(
+        worker: &DedicatedWorkerGlobalScope,
+        namespace: &str,
+    ) -> Result<(), BrowserStoreError> {
+        validate_namespace(namespace)?;
+        remove_namespace(worker, namespace).await
+    }
+
     /// Creates a worker-lifetime memory store.
     #[must_use]
     pub fn ephemeral() -> Self {
@@ -390,6 +404,27 @@ impl ChunkInventory for BrowserStore {
             BrowserStoreInner::Opfs(store) => store.stored_hashes().await,
             BrowserStoreInner::Memory(store) => store.stored_hashes().await.map_err(Into::into),
         }
+    }
+}
+
+async fn remove_namespace(
+    worker: &DedicatedWorkerGlobalScope,
+    namespace: &str,
+) -> Result<(), BrowserStoreError> {
+    let root = JsFuture::from(worker.navigator().storage().get_directory())
+        .await
+        .map_err(|value| browser_error("open OPFS root", value))?
+        .dyn_into::<FileSystemDirectoryHandle>()
+        .map_err(|value| browser_error("decode OPFS root", value))?;
+    let Some(app) = directory_handle(&root, ROOT, false).await? else {
+        return Ok(());
+    };
+    let options = FileSystemRemoveOptions::new();
+    options.set_recursive(true);
+    match JsFuture::from(app.remove_entry_with_options(namespace, &options)).await {
+        Ok(_) => Ok(()),
+        Err(value) if is_not_found(&value) => Ok(()),
+        Err(value) => Err(browser_error("remove store namespace", value)),
     }
 }
 

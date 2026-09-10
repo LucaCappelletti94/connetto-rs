@@ -691,6 +691,39 @@ pub struct BootedSession<Id> {
     pub content_persistent: Option<bool>,
 }
 
+async fn apply_pending_wipes(
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+) -> Result<(), JsValue> {
+    for pending in crate::storage::pending_wipes().await.map_err(to_js)? {
+        if let Some(namespace) = &pending.content_namespace {
+            let scope: web_sys::DedicatedWorkerGlobalScope =
+                js_sys::global()
+                    .dyn_into()
+                    .map_err(|value: js_sys::Object| {
+                        JsValue::from_str(&format!("db worker scope: {value:?}"))
+                    })?;
+            BrowserStore::remove(&scope, namespace)
+                .await
+                .map_err(to_js)?;
+        }
+        crate::storage::wipe_replica(
+            storage,
+            key_store,
+            &pending.replica,
+            &crate::auth::PendingWork::default(),
+            true,
+        )
+        .await
+        .map_err(to_js)?;
+        crate::storage::clear_pending_wipe(&pending.replica)
+            .await
+            .map_err(to_js)?;
+        tracing::info!(replica = %pending.replica, "db worker: carried out a pending data wipe");
+    }
+    Ok(())
+}
+
 /// DB worker context: install the OPFS VFS, acquire connetto's session, open
 /// the replica that identity owns (resuming an existing one from its persisted
 /// cursor), connect upstream, wait for the subscription to be fully served,
@@ -819,29 +852,7 @@ where
         }
     }
 
-    // Every wipe the application asked for is carried out here, before the login
-    // and before anything is opened.
-    //
-    // Two reasons for this position, both learned the hard way. Nothing holds the
-    // replica yet: once the hub's pump owns the connection it holds it for this
-    // worker's whole life, and the OPFS delete cannot run against a live one. And
-    // it is ahead of acquisition, because acquisition blocks on an interactive
-    // login when the credential was cleared, which is exactly what logging out
-    // does. A wipe behind that wait would only happen once somebody logged in
-    // again, and only if it were the same somebody, so a user who asked to have
-    // their data deleted and never came back would keep it.
-    //
-    // Each record names its own replica, so no identity is needed to act on it.
-    // The unsynced guard ran when the record was written, which is the one moment
-    // the queued writes could still have been uploaded, so this is unconditional.
-    // A failure is fatal to the boot rather than logged past: the record is already
-    // taken, so continuing would open a replica the user asked to destroy.
-    for name in crate::storage::take_pending_wipes().await.map_err(to_js)? {
-        crate::storage::wipe_replica(&storage, &*key_store, &name, &[], true)
-            .await
-            .map_err(to_js)?;
-        tracing::info!(replica = %name, "db worker: carried out a pending data wipe");
-    }
+    apply_pending_wipes(&storage, &key_store).await?;
 
     // Here rather than earlier, because the wipes above are what free slots, and
     // before the login, because acquisition opens the refresh store. Slots this
@@ -1085,22 +1096,18 @@ where
             SubscriptionSpec::new(config.upstream_query),
         )],
     };
-    let (content, content_persistent) = match config.content_namespace {
+    let (content, content_persistent, content_wipe_namespace) = match config.content_namespace {
         Some(seed) => {
+            let namespace = content_store_namespace(seed, &replica_db_name);
             let (store, root_key) = if identified {
                 let root_key = content_root_key
                     .ok_or_else(|| JsValue::from_str("browser content key is unavailable"))?;
-                let mut digest = Sha256::new();
-                digest.update(seed.as_bytes());
-                digest.update([0]);
-                digest.update(replica_db_name.as_bytes());
-                let namespace = format!("{:x}", digest.finalize());
                 let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
                     .dyn_into()
                     .map_err(|value: js_sys::Object| {
                         JsValue::from_str(&format!("db worker scope: {value:?}"))
                     })?;
-                let store = BrowserStore::install(&scope, namespace)
+                let store = BrowserStore::install(&scope, &namespace)
                     .await
                     .map_err(|err| JsValue::from_str(&format!("browser content store: {err}")))?;
                 (store, root_key)
@@ -1111,10 +1118,16 @@ where
                 )
             };
             let persistent = store.is_persistent();
-            (Some(ContentArchive::new(store, root_key)), Some(persistent))
+            let wipe_namespace = persistent.then_some(namespace);
+            (
+                Some(ContentArchive::new(store, root_key)),
+                Some(persistent),
+                wipe_namespace,
+            )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
+
     let (hub, pump, mut notices) =
         RelayHub::with_reconnect_archive(worker, config.hub_meta_name, reconnect, content)
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
@@ -1153,6 +1166,7 @@ where
             auth_config.clone(),
             config.auth_db_name,
             &replica_db_name,
+            content_wipe_namespace,
             active_account.clone(),
             hub.clone(),
         )?;
@@ -1222,6 +1236,7 @@ pub fn serve_logout_requests(
     auth: crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     replica_db_name: &str,
+    content_namespace: Option<String>,
     account: Option<String>,
     hub: crate::relay::RelayHub,
 ) -> Result<(), JsValue> {
@@ -1243,6 +1258,7 @@ pub fn serve_logout_requests(
             let auth = auth.clone();
             let auth_db_name = auth_db_name.clone();
             let replica_db_name = replica_db_name.clone();
+            let content_namespace = content_namespace.clone();
             let account = account.clone();
             spawn_local(async move {
                 if let Some(reply) = serve_logout(
@@ -1251,6 +1267,7 @@ pub fn serve_logout_requests(
                     &auth,
                     &auth_db_name,
                     &replica_db_name,
+                    content_namespace.as_deref(),
                     account.as_deref(),
                 )
                 .await
@@ -1711,16 +1728,10 @@ fn decode_import_reply(data: &JsValue) -> Option<ImportReply> {
     }
 }
 
-/// The queued mutation seqs, or `None` when the hub core cannot answer.
-///
-/// An unanswerable count is never reported as zero. Zero is a licence to destroy
-/// the replica, so a dead core answering "nothing queued" would be the one lie in
-/// this protocol that loses data. Saying nothing instead leaves the asking tab with
-/// [`AuthError::Cancelled`](crate::auth::AuthError::Cancelled), which is already
-/// what it shows for a worker that cannot answer.
-async fn ask_unsynced(hub: &crate::relay::RelayHub) -> Option<Vec<u64>> {
+/// Asks the hub for local work at risk, returning `None` when it cannot answer.
+async fn ask_unsynced(hub: &crate::relay::RelayHub) -> Option<crate::auth::PendingWork> {
     match hub.unsynced().await {
-        Ok(seqs) => Some(seqs),
+        Ok(pending) => Some(pending),
         Err(err) => {
             tracing::error!(error = %err, "db worker: the hub cannot report unsynced work");
             None
@@ -1736,14 +1747,15 @@ async fn serve_logout(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     replica_db_name: &str,
+    content_namespace: Option<&str>,
     account: Option<&str>,
 ) -> Option<crate::auth::LogoutMessage> {
     use crate::auth::LogoutMessage;
 
     let (delete, force) = match request {
         LogoutMessage::Unsynced => {
-            let seqs = ask_unsynced(hub).await?;
-            return Some(LogoutMessage::Pending { seqs });
+            let pending = ask_unsynced(hub).await?;
+            return Some(LogoutMessage::Pending { pending });
         }
         LogoutMessage::Logout { delete, force } => (*delete, *force),
         LogoutMessage::Pending { .. }
@@ -1762,11 +1774,16 @@ async fn serve_logout(
     // because this worker holds it open for its whole life and OPFS cannot
     // delete a live file.
     if delete {
-        let unsynced = ask_unsynced(hub).await?;
-        if let Err(err) = crate::storage::mark_wipe_pending(replica_db_name, &unsynced, force).await
-        {
+        let pending = ask_unsynced(hub).await?;
+        let wipe = crate::storage::PendingWipe::new(
+            replica_db_name,
+            content_namespace.map(ToOwned::to_owned),
+        );
+        if let Err(err) = crate::storage::mark_wipe_pending(&wipe, &pending, force).await {
             return match err {
-                crate::storage::WipeError::Unsynced(seqs) => Some(LogoutMessage::Refused { seqs }),
+                crate::storage::WipeError::Unsynced(pending) => {
+                    Some(LogoutMessage::Refused { pending })
+                }
                 other => {
                     tracing::error!(error = %other, "db worker: marking the replica for deletion failed");
                     None
@@ -1876,6 +1893,13 @@ async fn sleep_ms(ms: i32) {
 /// could not: the browser's storage pool gives two connections to one file a
 /// single underlying handle and two page caches. Both tiers therefore share
 /// one key and one salt, which is what an attached database inherits anyway.
+fn content_store_namespace(seed: &str, replica_db_name: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(seed.as_bytes());
+    digest.update([0]);
+    digest.update(replica_db_name.as_bytes());
+    format!("{:x}", digest.finalize())
+}
 async fn open_replica<S: StorageKind>(
     transport: Option<BrowserSocket>,
     replica: &Replica<'_, S>,
@@ -1983,3 +2007,6 @@ pub async fn request_custody() -> Custody {
     drop(on_message);
     answered.unwrap_or(Custody::Ephemeral)
 }
+
+#[cfg(test)]
+mod tests;
