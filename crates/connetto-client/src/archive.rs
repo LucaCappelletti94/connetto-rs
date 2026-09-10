@@ -1,21 +1,6 @@
-//! The device archive: what an export writes and an import reads.
+//! Device archives carry zstd-compressed SQLite change records plus optional opaque attachments.
 //!
-//! Every entry is connetto's own binary format, a SQLite change record rather
-//! than a database (R56 decision 10). The rows of a tier travel as the session
-//! patchset the export already had to build, so nothing is replayed into a
-//! second database and serialized back out, and an import is the exact inverse
-//! of an export. That costs the readability the first format promised, which
-//! only ever paid when connetto was absent: handing a person their data is
-//! `R61`'s job and reads from queries the application supplies.
-//!
-//! The manifest carries what an import has to check before it applies anything:
-//! the schema the archive was made under, the account it belongs to, and which
-//! entries are present.
-//!
-//! **The file is not encrypted.** It holds every row the device can read, in
-//! the clear, so it is a bearer document. That is a decision rather than an
-//! oversight (`R26`), and the method that writes it says so where the person
-//! chooses to write one.
+//! The archive is unencrypted and must be protected like the data itself.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -53,23 +38,48 @@ impl ExportScope {
     }
 }
 
-/// The archive format's own name, unchanged from `R26` so an older file is
-/// recognised and refused by version rather than mistaken for something else.
+/// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Raised by `R56`: version 1 was a zip of plain SQLite databases.
-const VERSION: u32 = 2;
+/// Version 3 requires attachment-aware readers.
+const VERSION: u32 = 3;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
 const PENDING: &str = "pending.changesets";
-/// What the manifest says about its own entries, so a person opening the file
-/// is not left guessing why SQLite will not open one.
-const NOTE: &str =
-    "every entry is a SQLite change record, connetto's own binary format, not a database";
+/// Human-readable description of the entry encodings.
+const NOTE: &str = "rows are zstd SQLite change records; attachments declare their encoding";
+
+/// An opaque file another client layer carries in the device archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveAttachment {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+impl ArchiveAttachment {
+    /// Creates a safe raw archive entry or returns an unsafe or reserved path error.
+    pub fn new(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, ClientError> {
+        let path = path.into();
+        validate_attachment_path(&path, ClientError::Export)?;
+        Ok(Self { path, bytes })
+    }
+
+    /// The entry's relative archive path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The raw entry bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 
 /// One archive about to be written.
 #[derive(Debug)]
-pub(crate) struct Archive {
+pub(crate) struct Archive<'a> {
     /// How much of the device it carries.
     pub(crate) scope: ExportScope,
     /// The schema it was made under.
@@ -88,9 +98,12 @@ pub(crate) struct Archive {
     /// restored under a different one, so an import stacks them above the
     /// receiving replica's own (R56 decision 12).
     pub(crate) pending: Vec<Vec<u8>>,
+    /// Opaque files supplied by an optional client layer.
+    pub(crate) attachments: &'a [ArchiveAttachment],
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     format: String,
     version: u32,
@@ -104,9 +117,12 @@ struct Manifest {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
     kind: String,
     path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
 }
 
 fn zip_error(error: impl core::fmt::Display) -> ClientError {
@@ -117,29 +133,35 @@ fn read_error(error: impl core::fmt::Display) -> ClientError {
     ClientError::Import(format!("reading the archive: {error}"))
 }
 
-/// Write `archive` as a zip of compressed change records.
-///
-/// Entries are compressed (`R26`'s leftover): `zstd` is an unconditional
-/// dependency of this crate on every target, and the whole wire protocol
-/// already compresses with it.
-pub(crate) fn write(archive: &Archive) -> Result<Vec<u8>, ClientError> {
+/// Writes one archive with per-entry encodings.
+pub(crate) fn write(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
     let mut entries = Vec::new();
     if archive.synced_rows.is_some() {
         entries.push(Entry {
             kind: "rows".to_owned(),
             path: SYNCED_ROWS.to_owned(),
+            encoding: Some("zstd".to_owned()),
         });
     }
     if archive.local_rows.is_some() {
         entries.push(Entry {
             kind: "rows".to_owned(),
             path: LOCAL_ROWS.to_owned(),
+            encoding: Some("zstd".to_owned()),
         });
     }
     if !archive.pending.is_empty() {
         entries.push(Entry {
             kind: "pending".to_owned(),
             path: PENDING.to_owned(),
+            encoding: Some("zstd".to_owned()),
+        });
+    }
+    for attachment in archive.attachments {
+        entries.push(Entry {
+            kind: "attachment".to_owned(),
+            path: attachment.path.clone(),
+            encoding: Some("identity".to_owned()),
         });
     }
     let manifest = serde_json::to_vec_pretty(&Manifest {
@@ -148,7 +170,7 @@ pub(crate) fn write(archive: &Archive) -> Result<Vec<u8>, ClientError> {
         scope: archive.scope.as_str().to_owned(),
         schema_fingerprint: archive.fingerprint.clone(),
         account: archive.account.clone(),
-        compression: "zstd".to_owned(),
+        compression: "per-entry".to_owned(),
         note: NOTE.to_owned(),
         entries,
     })
@@ -157,8 +179,7 @@ pub(crate) fn write(archive: &Archive) -> Result<Vec<u8>, ClientError> {
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    // The manifest stays uncompressed: it is small, and a reader deciding
-    // whether to accept the file at all should not have to decompress first.
+    // Readers validate the manifest before decompressing payloads.
     zip.start_file(MANIFEST, options).map_err(zip_error)?;
     zip.write_all(&manifest).map_err(zip_error)?;
     if let Some(rows) = &archive.synced_rows {
@@ -174,6 +195,19 @@ pub(crate) fn write(archive: &Archive) -> Result<Vec<u8>, ClientError> {
             &encode_pending(&archive.pending),
             options,
         )?;
+    }
+    let mut paths = HashSet::new();
+    for attachment in archive.attachments {
+        validate_attachment_path(&attachment.path, ClientError::Export)?;
+        if !paths.insert(attachment.path.as_str()) {
+            return Err(ClientError::Export(format!(
+                "the archive attachment path {} is repeated",
+                attachment.path
+            )));
+        }
+        zip.start_file(&attachment.path, options)
+            .map_err(zip_error)?;
+        zip.write_all(&attachment.bytes).map_err(zip_error)?;
     }
     zip.finish()
         .map(std::io::Cursor::into_inner)
@@ -211,6 +245,8 @@ pub(crate) struct Incoming {
     pub(crate) local_rows: Option<Vec<u8>>,
     /// The writes that never reached the server, in order.
     pub(crate) pending: Vec<Vec<u8>>,
+    /// Opaque files supplied by optional client layers.
+    pub(crate) attachments: Vec<ArchiveAttachment>,
 }
 
 /// Read an archive back, refusing a format or version this build does not
@@ -249,12 +285,14 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Incoming, ClientError> {
             )));
         }
     };
-    let synced_present = zip.by_name(SYNCED_ROWS).is_ok();
+    let declared = validate_archive_layout(&mut zip, &manifest, scope)?;
+    let synced_present = declared.contains(SYNCED_ROWS);
     let local_rows = read_entry(&mut zip, LOCAL_ROWS)?;
     let pending = match read_entry(&mut zip, PENDING)? {
         Some(bytes) => decode_pending(&bytes)?,
         None => Vec::new(),
     };
+    let attachments = read_attachments(&mut zip, &manifest.entries)?;
     Ok(Incoming {
         scope,
         fingerprint: manifest.schema_fingerprint,
@@ -262,7 +300,95 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Incoming, ClientError> {
         synced_present,
         local_rows,
         pending,
+        attachments,
     })
+}
+
+fn validate_archive_layout(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    manifest: &Manifest,
+    scope: ExportScope,
+) -> Result<HashSet<String>, ClientError> {
+    if manifest.compression != "per-entry" {
+        return Err(ClientError::Import(format!(
+            "the archive names unsupported compression {}",
+            manifest.compression
+        )));
+    }
+    let mut declared = HashSet::new();
+    for entry in &manifest.entries {
+        validate_entry_declaration(entry)?;
+        if !declared.insert(entry.path.clone()) {
+            return Err(ClientError::Import(format!(
+                "the archive manifest repeats {}",
+                entry.path
+            )));
+        }
+    }
+    let mut stored = HashSet::new();
+    for name in zip.file_names() {
+        let path = name.to_owned();
+        if !stored.insert(path.clone()) {
+            return Err(ClientError::Import(format!(
+                "the archive repeats entry {path}"
+            )));
+        }
+    }
+    if !stored.remove(MANIFEST) {
+        return Err(ClientError::Import(
+            "the archive carries no manifest".to_owned(),
+        ));
+    }
+    for path in &declared {
+        if !stored.remove(path) {
+            return Err(ClientError::Import(format!(
+                "the archive manifest names {path}, but the entry is absent"
+            )));
+        }
+    }
+    if let Some(path) = stored.into_iter().next() {
+        return Err(ClientError::Import(format!(
+            "the archive entry {path} is not declared by its manifest"
+        )));
+    }
+    let synced = declared.contains(SYNCED_ROWS);
+    if synced != matches!(scope, ExportScope::Everything) {
+        return Err(ClientError::Import(
+            "the archive scope contradicts its synced rows entry".to_owned(),
+        ));
+    }
+    Ok(declared)
+}
+
+fn validate_entry_declaration(entry: &Entry) -> Result<(), ClientError> {
+    match entry.kind.as_str() {
+        "rows" if matches!(entry.path.as_str(), SYNCED_ROWS | LOCAL_ROWS) => {
+            require_encoding(entry, "zstd")
+        }
+        "pending" if entry.path == PENDING => require_encoding(entry, "zstd"),
+        "attachment" => {
+            validate_attachment_path(&entry.path, ClientError::Import)?;
+            require_encoding(entry, "identity")
+        }
+        "rows" | "pending" => Err(ClientError::Import(format!(
+            "archive entry {} contradicts kind {}",
+            entry.path, entry.kind
+        ))),
+        kind => Err(ClientError::Import(format!(
+            "unknown archive entry kind {kind}"
+        ))),
+    }
+}
+
+fn require_encoding(entry: &Entry, expected: &str) -> Result<(), ClientError> {
+    if entry.encoding.as_deref() == Some(expected) {
+        Ok(())
+    } else {
+        Err(ClientError::Import(format!(
+            "archive entry {} must use {expected} encoding",
+            entry.path
+        )))
+    }
 }
 
 fn read_entry(
@@ -275,6 +401,46 @@ fn read_entry(
     let mut packed = Vec::new();
     entry.read_to_end(&mut packed).map_err(read_error)?;
     Ok(Some(zstd::decode_all(packed.as_slice())?))
+}
+
+fn read_attachments(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    entries: &[Entry],
+) -> Result<Vec<ArchiveAttachment>, ClientError> {
+    let mut attachments = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.kind == "attachment") {
+        let mut file = zip
+            .by_name(&entry.path)
+            .expect("archive layout was validated");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(read_error)?;
+        attachments.push(ArchiveAttachment {
+            path: entry.path.clone(),
+            bytes,
+        });
+    }
+    Ok(attachments)
+}
+
+fn validate_attachment_path(
+    path: &str,
+    error: fn(String) -> ClientError,
+) -> Result<(), ClientError> {
+    let reserved = [MANIFEST, SYNCED_ROWS, LOCAL_ROWS, PENDING];
+    let valid = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !reserved.contains(&path)
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."));
+    if valid {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "the archive attachment path {path:?} is not a safe relative path"
+        )))
+    }
 }
 
 /// The queue as one entry: a count, then each changeset behind its length.
@@ -481,6 +647,12 @@ impl ImportPlan {
     #[must_use]
     pub fn queued_writes(&self) -> usize {
         self.archive.pending.len()
+    }
+
+    /// Opaque files supplied by optional client layers.
+    #[must_use]
+    pub fn attachments(&self) -> &[ArchiveAttachment] {
+        &self.archive.attachments
     }
 
     /// How much of the device the file was written with.
@@ -751,7 +923,10 @@ pub(crate) fn fingerprint(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::{Archive, ExportScope, decode_pending, encode_pending, read, write};
+    use serde_json::json;
 
     /// The queue's framing carries every record, in order, whatever the bytes
     /// inside one look like.
@@ -779,6 +954,7 @@ mod tests {
             synced_rows: None,
             local_rows: Some(vec![7u8; 64]),
             pending: vec![vec![9u8; 16]],
+            attachments: &[],
         };
         let bytes = write(&archive).expect("write");
         let read_back = read(&bytes).expect("read");
@@ -788,6 +964,56 @@ mod tests {
         assert!(!read_back.synced_present);
         assert_eq!(read_back.local_rows, Some(vec![7u8; 64]));
         assert_eq!(read_back.pending, vec![vec![9u8; 16]]);
+    }
+
+    /// Entry declarations must exactly describe the archive payload.
+    #[test]
+    fn malformed_entry_declarations_are_refused() {
+        assert_invalid_entries(
+            &json!([{"kind": "unknown", "path": "mystery", "encoding": "identity"}]),
+            &[("mystery", b"")],
+            "unknown archive entry kind",
+        );
+        assert_invalid_entries(
+            &json!([{"kind": "pending", "path": "pending.changesets", "encoding": "identity"}]),
+            &[("pending.changesets", b"")],
+            "must use zstd",
+        );
+        assert_invalid_entries(&json!([]), &[("undeclared", b"")], "not declared");
+    }
+
+    fn assert_invalid_entries(
+        entries: &serde_json::Value,
+        files: &[(&str, &[u8])],
+        expected: &str,
+    ) {
+        let manifest = json!({
+            "format": "connetto-local-data",
+            "version": 3,
+            "scope": "unsynced",
+            "schema_fingerprint": "abc123",
+            "account": null,
+            "compression": "per-entry",
+            "note": "test",
+            "entries": entries,
+        });
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("manifest.json", options)
+            .expect("start manifest");
+        zip.write_all(&serde_json::to_vec(&manifest).expect("encode manifest"))
+            .expect("write manifest");
+        for (path, bytes) in files {
+            zip.start_file(path, options).expect("start entry");
+            zip.write_all(bytes).expect("write entry");
+        }
+        let bytes = zip.finish().expect("finish archive").into_inner();
+        let error = read(&bytes).expect_err("malformed entries must be refused");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
     }
 
     /// A file that is not one of ours is refused by name rather than parsed.

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 use crate::identity::ChunkHash;
+use crate::maybe_send::MaybeSend;
 use crate::store::{ChunkInventory, ChunkStore};
 
 /// The one thing an in-memory store can fail at.
@@ -49,7 +50,7 @@ impl ChunkStore for MemStore {
         &self,
         hash: &ChunkHash,
         data: &[u8],
-    ) -> impl Future<Output = Result<(), MemStoreError>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         self.chunks
             .lock()
             .expect("MemStore lock is not poisoned")
@@ -60,21 +61,21 @@ impl ChunkStore for MemStore {
     fn read_chunk(
         &self,
         hash: &ChunkHash,
-    ) -> impl Future<Output = Result<Vec<u8>, MemStoreError>> + Send {
-        let val = self
+    ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend {
+        let value = self
             .chunks
             .lock()
             .expect("MemStore lock is not poisoned")
             .get(hash)
             .cloned()
             .ok_or(MemStoreError::Absent { hash: *hash });
-        future::ready(val)
+        future::ready(value)
     }
 
     fn has_chunk(
         &self,
         hash: &ChunkHash,
-    ) -> impl Future<Output = Result<bool, MemStoreError>> + Send {
+    ) -> impl Future<Output = Result<bool, Self::Error>> + MaybeSend {
         let present = self
             .chunks
             .lock()
@@ -86,7 +87,7 @@ impl ChunkStore for MemStore {
     fn delete_chunk(
         &self,
         hash: &ChunkHash,
-    ) -> impl Future<Output = Result<(), MemStoreError>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         self.chunks
             .lock()
             .expect("MemStore lock is not poisoned")
@@ -96,7 +97,9 @@ impl ChunkStore for MemStore {
 }
 
 impl ChunkInventory for MemStore {
-    fn stored_hashes(&self) -> impl Future<Output = Result<Vec<ChunkHash>, MemStoreError>> + Send {
+    fn stored_hashes(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ChunkHash>, Self::Error>> + MaybeSend {
         let hashes = self
             .chunks
             .lock()

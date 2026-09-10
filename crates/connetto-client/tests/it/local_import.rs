@@ -11,7 +11,8 @@
 //! than the replica holds, and a table this build does not have.
 
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, ExportScope, ImportChoices, Keep, Replica,
+    ArchiveAttachment, ClientConfig, ClientError, ConnettoConnection, ExportScope, ImportChoices,
+    Keep, Replica,
 };
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -419,6 +420,49 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
         .load(target.conn.conn())
         .expect("count children");
     assert_eq!(children[0].rows, 1, "the child row survived the restore");
+}
+
+#[tokio::test]
+async fn attachments_round_trip_and_bookkeeping_failure_rolls_back_the_import() {
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    write_offline(
+        &mut source,
+        "INSERT INTO items (id, label) VALUES (17, 'with attachment')",
+    )
+    .await;
+    let attachment =
+        ArchiveAttachment::new("content/chunks/abc", b"plain chunk".to_vec()).expect("attachment");
+    let archive = source
+        .conn
+        .export_local_data_with_attachments(ExportScope::Unsynced, &[attachment])
+        .expect("export");
+
+    let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
+    let plan = target.conn.import_local_data(&archive).expect("plan");
+    assert_eq!(plan.attachments().len(), 1);
+    assert_eq!(plan.attachments()[0].path(), "content/chunks/abc");
+    assert_eq!(plan.attachments()[0].bytes(), b"plain chunk");
+
+    let plain_error = target
+        .conn
+        .apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect_err("plain importer must not discard attachments");
+    assert!(
+        plain_error
+            .to_string()
+            .contains("attachment-aware importer")
+    );
+    assert_eq!(items(&mut target.conn), Vec::<ItemRow>::new());
+
+    let error = target
+        .conn
+        .apply_import_with_bookkeeping(&plan, &ImportChoices::keeping_the_file(), |_| {
+            Err(ClientError::Import("bookkeeping refused".to_owned()))
+        })
+        .expect_err("bookkeeping failure refuses the whole import");
+    assert!(error.to_string().contains("bookkeeping refused"));
+    assert_eq!(items(&mut target.conn), Vec::<ItemRow>::new());
+    assert!(queued(&mut target.conn).is_empty());
 }
 
 #[derive(diesel::QueryableByName)]

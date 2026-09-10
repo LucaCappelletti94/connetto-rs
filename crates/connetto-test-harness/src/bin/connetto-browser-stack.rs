@@ -389,13 +389,23 @@ async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -
     // sessions (measured 2026-08-31 as a mid-suite 404 under four-way
     // parallelism). Their bodies cost seconds each, so serial order costs
     // little beyond the per-invocation overhead.
-    let mut suite_args = vec![strings(&[
-        "test",
-        "--headless",
-        "--chrome",
-        "crates/connetto-web",
-        "--lib",
-    ])];
+    let mut suite_args = vec![
+        strings(&[
+            "test",
+            "--headless",
+            "--chrome",
+            "crates/connetto-file-client",
+            "--lib",
+            "--no-default-features",
+        ]),
+        strings(&[
+            "test",
+            "--headless",
+            "--chrome",
+            "crates/connetto-web",
+            "--lib",
+        ]),
+    ];
     for test in test_files(&["crates", "connetto-web", "tests"])? {
         suite_args.push(per_test_args("crates/connetto-web", test));
     }

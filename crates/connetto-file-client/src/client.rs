@@ -6,7 +6,10 @@ use std::io::Read;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
-use connetto_client::{ClientEvent, SyncStatus};
+use connetto_client::{
+    ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome,
+    ImportPlan, SyncStatus,
+};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
@@ -85,6 +88,168 @@ pub enum ContentEvent {
     },
 }
 
+/// A checked device archive ready to restore with its content.
+#[must_use = "pass this plan and import choices to apply_local_data_import"]
+#[derive(Debug)]
+pub struct ContentImportPlan {
+    replica: ImportPlan,
+    manifests: Vec<Manifest>,
+    chunks: Vec<(connetto_file_core::ChunkHash, Vec<u8>)>,
+}
+
+impl ContentImportPlan {
+    /// The replica plan, including collisions the application must present.
+    #[must_use]
+    pub fn replica_plan(&self) -> &ImportPlan {
+        &self.replica
+    }
+
+    /// How many unsent content files the archive restores.
+    #[must_use]
+    pub fn content_files(&self) -> usize {
+        self.manifests.len()
+    }
+}
+
+/// Content archive policy for an owner of a raw sync connection.
+pub struct ContentArchive<B> {
+    store: B,
+    root_key: [u8; 32],
+}
+
+impl<B> ContentArchive<B>
+where
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+{
+    /// Creates archive policy over one encrypted chunk store.
+    #[must_use]
+    pub const fn new(store: B, root_key: [u8; 32]) -> Self {
+        Self { store, root_key }
+    }
+
+    /// Installs content bookkeeping or returns the replica schema failure.
+    pub fn install<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<(), ContentError> {
+        connection
+            .conn()
+            .batch_execute(db::CONTENT_DDL)
+            .map_err(Into::into)
+    }
+
+    /// Exports unsent content and replica data or returns an archive, store, or replica failure.
+    pub async fn export_local_data<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        scope: ExportScope,
+    ) -> Result<Vec<u8>, ContentError> {
+        let manifests = outbox_manifests(connection)?;
+        let attachments = content_attachments(&self.store, &self.root_key, &manifests).await?;
+        connection
+            .export_local_data_with_attachments(scope, &attachments)
+            .map_err(Into::into)
+    }
+
+    /// Validates and applies content under this device key or returns the archive, store, or replica failure.
+    pub async fn import_local_data<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        bytes: &[u8],
+    ) -> Result<(ImportOutcome, usize), ContentError> {
+        let plan = prepare_content_import(connection, bytes)?;
+        let collisions = plan.replica_plan().collisions().len();
+        write_import_chunks(&self.store, &self.root_key, &plan).await?;
+        let outcome = apply_content_import(connection, &plan, &ImportChoices::keeping_the_file())?;
+        Ok((outcome, collisions))
+    }
+}
+
+fn outbox_manifests<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+) -> Result<Vec<Manifest>, ContentError> {
+    db::outbox(connection.conn())?
+        .into_iter()
+        .map(|file_id| {
+            db::load_manifest(connection.conn(), file_id)?
+                .ok_or(ContentError::NoManifest { file_id })
+        })
+        .collect()
+}
+
+async fn content_attachments<B>(
+    store: &B,
+    root_key: &[u8; 32],
+    manifests: &[Manifest],
+) -> Result<Vec<connetto_client::ArchiveAttachment>, ContentError>
+where
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+{
+    let store = EncryptingStore::new(store.clone(), root_key);
+    let mut seen = HashSet::new();
+    let mut chunks = Vec::new();
+    for manifest in manifests {
+        for chunk in manifest.chunks() {
+            if !seen.insert(chunk.hash) {
+                continue;
+            }
+            let bytes = store
+                .read_chunk(&chunk.hash)
+                .await
+                .map_err(|error| ContentError::Store(error.to_string()))?;
+            chunks.push((chunk.hash, bytes));
+        }
+    }
+    crate::archive::encode(manifests, chunks)
+}
+
+fn prepare_content_import<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+    bytes: &[u8],
+) -> Result<ContentImportPlan, ContentError> {
+    let replica = connection.import_local_data(bytes)?;
+    let content = crate::archive::decode(replica.attachments())?;
+    Ok(ContentImportPlan {
+        replica,
+        manifests: content.manifests,
+        chunks: content.chunks,
+    })
+}
+
+async fn write_import_chunks<B>(
+    store: &B,
+    root_key: &[u8; 32],
+    plan: &ContentImportPlan,
+) -> Result<(), ContentError>
+where
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+{
+    let store = EncryptingStore::new(store.clone(), root_key);
+    for (hash, bytes) in &plan.chunks {
+        store
+            .write_chunk(hash, bytes)
+            .await
+            .map_err(|error| ContentError::Store(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn apply_content_import<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+    plan: &ContentImportPlan,
+    choices: &ImportChoices,
+) -> Result<ImportOutcome, ContentError> {
+    connection
+        .apply_import_with_bookkeeping(&plan.replica, choices, |database| {
+            for manifest in &plan.manifests {
+                db::put_manifest(database, manifest)?;
+                db::enqueue(database, manifest.file_id())?;
+            }
+            Ok::<(), ClientError>(())
+        })
+        .map_err(Into::into)
+}
+
 /// Files, on top of a running [`ConnettoClient`].
 ///
 /// Metadata travels as ordinary synced rows and content travels here. The
@@ -149,6 +314,40 @@ where
             events,
             content_writes: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Exports unsent content and replica data or returns an archive, store, or replica failure.
+    pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ContentError> {
+        let _writing = self.content_writes.lock().await;
+        let manifests = self.client.with_conn(outbox_manifests).await?;
+        let attachments = content_attachments(&self.store, &self.root_key, &manifests).await?;
+        self.client
+            .with_conn(|conn| conn.export_local_data_with_attachments(scope, &attachments))
+            .await
+            .map_err(ContentError::Client)
+    }
+
+    /// Verifies replica data and content identities without mutation or returns the validation failure.
+    pub async fn prepare_local_data_import(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ContentImportPlan, ContentError> {
+        self.client
+            .with_conn(|connection| prepare_content_import(connection, bytes))
+            .await
+    }
+
+    /// Restores content under this device key or returns the store or replica failure.
+    pub async fn apply_local_data_import(
+        &self,
+        plan: &ContentImportPlan,
+        choices: &ImportChoices,
+    ) -> Result<ImportOutcome, ContentError> {
+        let _writing = self.content_writes.lock().await;
+        write_import_chunks(&self.store, &self.root_key, plan).await?;
+        self.client
+            .with_conn(|connection| apply_content_import(connection, plan, choices))
+            .await
     }
 
     /// Registers a further local source, asked after the ones already there.
@@ -514,14 +713,17 @@ where
         let column = file_id_column.to_owned();
         self.client
             .with_conn(move |conn| {
-                let c = conn.conn();
                 if diesel::sql_query(format!("{probe} LIMIT 0"))
-                    .execute(c)
+                    .execute(conn.conn())
                     .is_err()
                 {
                     return Err(ContentError::PinColumnMissing { name, column });
                 }
-                db::put_pin(c, &name, &query, &column).map_err(ContentError::Replica)
+                conn.transact_with_bookkeeping(
+                    |c| db::put_pin(c, &name, &query, &column).map_err(ContentError::Replica),
+                    |_| Ok::<(), ContentError>(()),
+                )
+                .map(|_| ())
             })
             .await
     }
@@ -534,7 +736,13 @@ where
     pub async fn unpin_content(&self, name: &str) -> Result<(), ContentError> {
         let name = name.to_owned();
         self.client
-            .with_conn(move |conn| db::drop_pin(conn.conn(), &name))
+            .with_conn(move |conn| {
+                conn.transact_with_bookkeeping(
+                    |c| db::drop_pin(c, &name),
+                    |_| Ok::<(), diesel::result::Error>(()),
+                )
+                .map(|_| ())
+            })
             .await
             .map_err(ContentError::Replica)
     }

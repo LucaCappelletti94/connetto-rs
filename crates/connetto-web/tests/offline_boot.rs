@@ -12,8 +12,9 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
+use connetto_client::ExportScope;
 use connetto_web::storage::ReplicaStorage;
-use connetto_web::workers::{DbWorkerConfig, boot_db_worker};
+use connetto_web::workers::{DbWorkerConfig, boot_db_worker, request_export};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -34,6 +35,7 @@ fn config() -> DbWorkerConfig {
         .with_upstream_sub_id("r20-upstream")
         .with_upstream_query("SELECT * FROM items")
         .with_hub_meta_name("r20-offline-boot-hub.sqlite")
+        .with_content_namespace("r68-offline-content")
         .with_auth_db_name("r20-offline-boot-auth.sqlite")
 }
 
@@ -55,4 +57,11 @@ async fn the_worker_starts_with_no_server_reachable() {
     );
     assert_eq!(booted.session_expires_at, None);
     assert_eq!(booted.account, None);
+    assert_eq!(booted.content_persistent, Some(false));
+    let archive = request_export(ExportScope::Unsynced)
+        .await
+        .expect("content-aware worker export");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("archive");
+    let has_content = zip.by_name("content/manifests.json").is_ok();
+    assert!(has_content);
 }

@@ -16,28 +16,57 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["native-tests"]
+native-tests = []
+
 [[test]]
 name = "it"
 path = "tests/it/mod.rs"
+required-features = ["native-tests"]
 
 [dependencies]
 connetto-file-core = { path = "../connetto-file-core" }
-connetto-client = { path = "../connetto-client" }
+connetto-client = { path = "../connetto-client", default-features = false }
 connetto-core = { workspace = true }
 # Typed replica tables for the manifests, the outbox and the content pins.
 diesel = { workspace = true }
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json = "1"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # The filesystem chunk store and the reqwest transport are native only. R68
 # adds the OPFS store and a worker transport for wasm behind the same seams.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
-[dev-dependencies]
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "Blob",
+  "DedicatedWorkerGlobalScope",
+  "DomException",
+  "File",
+  "FileSystemDirectoryHandle",
+  "FileSystemFileHandle",
+  "FileSystemGetDirectoryOptions",
+  "FileSystemGetFileOptions",
+  "FileSystemWritableFileStream",
+  "Headers",
+  "Request",
+  "RequestInit",
+  "Response",
+  "StorageManager",
+  "WorkerGlobalScope",
+  "WorkerNavigator",
+  "WritableStream",
+] }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 connetto-test-harness = { path = "../connetto-test-harness" }
 connetto-file-server = { path = "../connetto-file-server" }
 connetto-server = { path = "../connetto-server" }
@@ -46,3 +75,6 @@ tempfile = "3"
 axum = "0.8"
 diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
 bb8 = "0.9"
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"

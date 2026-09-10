@@ -80,7 +80,8 @@ pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
 pub use archive::{
-    Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome, ImportPlan, Keep,
+    ArchiveAttachment, Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome,
+    ImportPlan, Keep,
 };
 #[cfg(feature = "native-auth")]
 pub use auth::{
@@ -2465,6 +2466,11 @@ where
         }
     }
 
+    /// Drop the current transport while preserving the resumable session.
+    pub fn disconnect(&mut self) {
+        self.disconnected();
+    }
+
     /// Whether a handshake currently stands.
     ///
     /// False before the first [`attach`](Self::attach) and after a transport
@@ -2601,11 +2607,7 @@ where
     /// the device-private tier and the writes that never reached the server.
     /// Authentication state and sync cursors are never exported.
     ///
-    /// Every entry is a SQLite change record, connetto's own binary format
-    /// rather than a database, so the file is read back by connetto and not by
-    /// an ordinary SQLite tool. Handing a person a readable copy of their data
-    /// is a different job with a different scope, which only the application
-    /// knows.
+    /// Rows use connetto's SQLite change-record format, while optional client layers may add declared attachments.
     ///
     /// **The archive is not encrypted.** It holds every row this device can
     /// read, in the clear, so it is a bearer document: whoever holds the file
@@ -2619,6 +2621,20 @@ where
     /// records no changes for one and its rows would be silently absent. A
     /// named one is skipped, which is what the declaration means.
     pub fn export_local_data(&mut self, scope: ExportScope) -> Result<Vec<u8>, ClientError> {
+        self.export_local_data_with_attachments(scope, &[])
+    }
+
+    /// Writes a local-data archive with uninterpreted attachments at their declared relative paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Self::export_local_data`] and refuses unsafe
+    /// or repeated attachment paths.
+    pub fn export_local_data_with_attachments(
+        &mut self,
+        scope: ExportScope,
+        attachments: &[ArchiveAttachment],
+    ) -> Result<Vec<u8>, ClientError> {
         let synced_rows = match scope {
             ExportScope::Everything => Some(export_rows(
                 &mut self.db,
@@ -2647,6 +2663,7 @@ where
             synced_rows,
             local_rows,
             pending: self.pending.values().cloned().collect(),
+            attachments,
         })
     }
 
@@ -2725,12 +2742,16 @@ where
                 self.pending.len()
             )));
         }
-        let local_columns = archive::schema_columns(
-            &mut self.db,
-            LOCAL_SCHEMA,
-            Some(&self.local_tables),
-            &HashSet::new(),
-        )?;
+        let local_columns = if self.local_tables.is_empty() {
+            HashMap::new()
+        } else {
+            archive::schema_columns(
+                &mut self.db,
+                LOCAL_SCHEMA,
+                Some(&self.local_tables),
+                &HashSet::new(),
+            )?
+        };
         let main_columns =
             archive::schema_columns(&mut self.db, "main", None, &self.hidden_tables)?;
         // The queue's tables are checked here too, on the same terms: a
@@ -2806,13 +2827,35 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Import`] when a row or a queued write cannot be applied,
-    /// and [`ClientError::Db`] on a local database failure.
+    /// [`ClientError::Import`] when rows, queued writes, or attachment handling fail, and [`ClientError::Db`] on a local database failure.
     pub fn apply_import(
         &mut self,
         plan: &ImportPlan,
         choices: &ImportChoices,
     ) -> Result<ImportOutcome, ClientError> {
+        if !plan.attachments().is_empty() {
+            return Err(ClientError::Import(
+                "the archive carries attachments that require an attachment-aware importer"
+                    .to_owned(),
+            ));
+        }
+        self.apply_import_with_bookkeeping(plan, choices, |_| Ok(()))
+    }
+
+    /// Applies imported rows and writes before running `bookkeeping` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Self::apply_import`] or `bookkeeping`.
+    pub fn apply_import_with_bookkeeping<F>(
+        &mut self,
+        plan: &ImportPlan,
+        choices: &ImportChoices,
+        bookkeeping: F,
+    ) -> Result<ImportOutcome, ClientError>
+    where
+        F: FnOnce(&mut SqliteConnection) -> Result<(), ClientError>,
+    {
         let mut outcome = ImportOutcome::default();
         let mut restored: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut next_seq = self.next_seq;
@@ -2850,6 +2893,7 @@ where
                     next_seq += 1;
                     outcome.writes_restored += 1;
                 }
+                bookkeeping(db)?;
                 Ok(())
             })?;
         }
@@ -4471,6 +4515,7 @@ mod tests {
             synced_rows: None,
             local_rows: Some(rows),
             pending: Vec::new(),
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {
@@ -4503,6 +4548,7 @@ mod tests {
             synced_rows: None,
             local_rows: None,
             pending: vec![Vec::new()],
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {
@@ -4536,6 +4582,7 @@ mod tests {
             synced_rows: None,
             local_rows: None,
             pending: vec![Vec::new(); PENDING_CAP + 1],
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {

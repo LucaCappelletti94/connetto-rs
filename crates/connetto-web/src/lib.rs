@@ -22,6 +22,7 @@
 
 pub mod auth;
 pub mod broadcast;
+pub mod content;
 pub mod frames;
 pub mod leader;
 pub mod locks;
@@ -44,6 +45,10 @@ use connetto_core::codec::{
 use connetto_core::error::CodecError;
 use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::{IncomingFrame, Transport};
+pub use content::{
+    BrowserContentClient, BrowserContentError, BrowserResolved, ObjectUrl, ObjectUrlError,
+    attach_browser_content,
+};
 pub use frames::{MessageSink, MessageTransport, MessageTransportError};
 use futures_channel::mpsc;
 use futures_util::StreamExt;

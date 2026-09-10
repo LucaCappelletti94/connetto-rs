@@ -11,9 +11,24 @@
 use futures_channel::oneshot;
 use js_sys::Promise;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{LockManager, LockOptions, WorkerGlobalScope};
+
+#[wasm_bindgen]
+extern "C" {
+    type RawLockManager;
+    #[wasm_bindgen(method, js_name = request)]
+    fn request_lock(this: &RawLockManager, name: &str, callback: &js_sys::Function) -> Promise;
+
+    #[wasm_bindgen(method, js_name = request)]
+    fn request_lock_with_options(
+        this: &RawLockManager,
+        name: &str,
+        options: &LockOptions,
+        callback: &js_sys::Function,
+    ) -> Promise;
+}
 
 /// The web lock name liveness uses for a given client id.
 #[must_use]
@@ -53,8 +68,7 @@ impl HeldLock {
 pub async fn hold_lock(name: &str) -> HeldLock {
     let (tx, rx) = oneshot::channel::<js_sys::Function>();
     let callback = Closure::once_into_js(move |_lock: JsValue| -> JsValue {
-        // The lock is held for as long as the returned promise stays
-        // pending. Its resolve function is the release handle.
+        // The browser holds the lock while this promise is pending.
         let mut release = None;
         let held = Promise::new(&mut |resolve, _reject| release = Some(resolve));
         if let Some(release) = release {
@@ -62,7 +76,10 @@ pub async fn hold_lock(name: &str) -> HeldLock {
         }
         held.into()
     });
-    let _pending = lock_manager().request_with_callback(name, callback.unchecked_ref());
+    let manager = lock_manager();
+    let _pending = manager
+        .unchecked_ref::<RawLockManager>()
+        .request_lock(name, callback.unchecked_ref());
     let release = rx
         .await
         .expect("the lock grant callback always sends the release function");
@@ -73,24 +90,26 @@ pub async fn hold_lock(name: &str) -> HeldLock {
 pub async fn lock_is_held(name: &str) -> bool {
     let (tx, rx) = oneshot::channel::<bool>();
     let callback = Closure::once_into_js(move |lock: JsValue| -> JsValue {
-        // With ifAvailable the callback receives null when the lock is
-        // already held elsewhere, and the grant when it is free.
+        // `ifAvailable` returns `null` while another context holds the lock.
         let _ = tx.send(lock.is_null());
         JsValue::UNDEFINED
     });
     let options = LockOptions::new();
     options.set_if_available(true);
-    let promise =
-        lock_manager().request_with_options_and_callback(name, &options, callback.unchecked_ref());
+    let manager = lock_manager();
+    let promise = manager
+        .unchecked_ref::<RawLockManager>()
+        .request_lock_with_options(name, &options, callback.unchecked_ref());
     let _ = JsFuture::from(promise).await;
     rx.await.unwrap_or(false)
 }
 
-/// Block until the lock `name` can be acquired, then release it at once.
-/// With the holder-owns-the-lock protocol this resolves when the holder is
-/// gone.
+/// Waits until `name` is free.
 pub async fn wait_until_free(name: &str) {
     let callback = Closure::once_into_js(|_lock: JsValue| -> JsValue { JsValue::UNDEFINED });
-    let promise = lock_manager().request_with_callback(name, callback.unchecked_ref());
+    let manager = lock_manager();
+    let promise = manager
+        .unchecked_ref::<RawLockManager>()
+        .request_lock(name, callback.unchecked_ref());
     let _ = JsFuture::from(promise).await;
 }

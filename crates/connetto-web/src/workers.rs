@@ -27,10 +27,14 @@
 //! specific: the consumer's `#[wasm_bindgen]` entry point calls
 //! [`boot_db_worker`] with its own config.
 
+use core::fmt::Display;
+use core::future::Future;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use connetto_file_client::{BrowserStore, ContentArchive};
 use js_sys::Promise;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -104,6 +108,8 @@ pub struct DbWorkerConfig {
     upstream_query: &'static str,
     /// The attached database file holding the hub's own durable state.
     hub_meta_name: &'static str,
+    /// Seed for account-isolated browser content storage and archive handling.
+    content_namespace: Option<&'static str>,
     // The tab's own id is not configurable: it is a fresh UUID per worker,
     // because the hub keys a durable write counter and a lock on it.
     /// The schema version this app build was compiled against. The worker
@@ -169,6 +175,7 @@ impl DbWorkerConfig {
             upstream_sub_id: "",
             upstream_query: "",
             hub_meta_name: "",
+            content_namespace: None,
             schema_version,
             sql_functions: connetto_client::SqlFunctions::default(),
             policy_tables: connetto_client::PolicyTables::new(),
@@ -228,6 +235,13 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_hub_meta_name(mut self, hub_meta_name: &'static str) -> Self {
         self.hub_meta_name = hub_meta_name;
+        self
+    }
+
+    /// Enables worker-owned browser content storage and attachment-aware archives.
+    #[must_use]
+    pub fn with_content_namespace(mut self, namespace: &'static str) -> Self {
+        self.content_namespace = Some(namespace);
         self
     }
 
@@ -673,6 +687,8 @@ pub struct BootedSession<Id> {
     /// one, and it is already computed here, so recomputing it in the application
     /// would be a second encoding of one fact.
     pub account: Option<String>,
+    /// Whether configured content storage is durable, or `None` when content is disabled.
+    pub content_persistent: Option<bool>,
 }
 
 /// DB worker context: install the OPFS VFS, acquire connetto's session, open
@@ -955,6 +971,7 @@ where
                 .map_err(to_js)?,
         )
     };
+    let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
 
     // The login grant, when somebody signed in. Nobody signed in is a caller
     // with no identity, which the server accepts and which keeps everything in
@@ -1068,8 +1085,35 @@ where
             SubscriptionSpec::new(config.upstream_query),
         )],
     };
+    let (content, content_persistent) = match config.content_namespace {
+        Some(seed) => {
+            let (store, root_key) = if identified {
+                let root_key = content_root_key
+                    .ok_or_else(|| JsValue::from_str("browser content key is unavailable"))?;
+                let mut digest = Sha256::new();
+                digest.update(seed.as_bytes());
+                digest.update([0]);
+                digest.update(replica_db_name.as_bytes());
+                let namespace = format!("{:x}", digest.finalize());
+                let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
+                    .dyn_into()
+                    .map_err(|value: js_sys::Object| {
+                        JsValue::from_str(&format!("db worker scope: {value:?}"))
+                    })?;
+                (BrowserStore::install(&scope, namespace).await, root_key)
+            } else {
+                (
+                    BrowserStore::ephemeral(),
+                    content_root_key.unwrap_or([0; 32]),
+                )
+            };
+            let persistent = store.is_persistent();
+            (Some(ContentArchive::new(store, root_key)), Some(persistent))
+        }
+        None => (None, None),
+    };
     let (hub, pump, mut notices) =
-        RelayHub::with_reconnect(worker, config.hub_meta_name, reconnect)
+        RelayHub::with_reconnect_archive(worker, config.hub_meta_name, reconnect, content)
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
     spawn_local(async move {
         if let Err(err) = pump.await {
@@ -1151,6 +1195,7 @@ where
         identity,
         session_expires_at,
         account: active_account,
+        content_persistent,
     })
 }
 
@@ -1239,22 +1284,31 @@ pub fn serve_logout_requests(
 ///
 /// The `BroadcastChannel` error when the channel cannot be opened.
 pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue> {
+    serve_exports(move |scope| {
+        let hub = hub.clone();
+        async move { hub.export_local_data(scope).await }
+    })
+}
+
+fn serve_exports<F, Fut, E>(export: F) -> Result<(), JsValue>
+where
+    F: Fn(ExportScope) -> Fut + 'static,
+    Fut: Future<Output = Result<Vec<u8>, E>> + 'static,
+    E: Display + 'static,
+{
     let channel = BroadcastChannel::new(EXPORT_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("export channel: {err:?}")))?;
+    let export = Rc::new(export);
     let listener = {
         let channel = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            // The request is an object with { kind: "export?", scope: "..." }.
-            // This worker's own replies are objects too, but BroadcastChannel
-            // never echoes to its sender, so the only objects arriving here are
-            // from other contexts, which is exactly the shape we want to answer.
             let Some(scope) = decode_export_request(&event.data()) else {
                 return;
             };
             let channel = channel.clone();
-            let hub = hub.clone();
+            let export = Rc::clone(&export);
             spawn_local(async move {
-                let reply = match hub.export_local_data(scope).await {
+                let reply = match export(scope).await {
                     Ok(bytes) => export_reply_ok(&bytes),
                     Err(err) => export_reply_failed(&err.to_string()),
                 };
@@ -1270,7 +1324,6 @@ pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue>
         })
     };
     channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
-    // The listener lives for the worker's whole life, like the hello intake.
     listener.forget();
     Ok(())
 }
@@ -1289,28 +1342,39 @@ pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue>
 ///
 /// The `BroadcastChannel` error when the channel cannot be opened.
 pub fn serve_import_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue> {
+    serve_imports(move |bytes| {
+        let hub = hub.clone();
+        async move { hub.import_local_data(bytes).await }
+    })
+}
+
+fn serve_imports<F, Fut, E>(import: F) -> Result<(), JsValue>
+where
+    F: Fn(Vec<u8>) -> Fut + 'static,
+    Fut: Future<Output = Result<(ImportOutcome, usize), E>> + 'static,
+    E: Display + 'static,
+{
     let channel = BroadcastChannel::new(IMPORT_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("import channel: {err:?}")))?;
+    let import = Rc::new(import);
     let listener = {
         let channel = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            // The request is a File object posted by the page. This worker's
-            // own replies are plain objects, and a reply that is not a File is skipped.
             let Ok(file) = event.data().dyn_into::<File>() else {
                 return;
             };
             let channel = channel.clone();
-            let hub = hub.clone();
+            let import = Rc::clone(&import);
             spawn_local(async move {
                 let buffer = match JsFuture::from(file.array_buffer()).await {
-                    Ok(buf) => buf,
+                    Ok(buffer) => buffer,
                     Err(err) => {
                         tracing::error!(error = ?err, "db worker: reading import file failed");
                         return;
                     }
                 };
                 let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                let reply = match hub.import_local_data(bytes).await {
+                let reply = match import(bytes).await {
                     Ok((outcome, collisions)) => import_reply_ok(&outcome, collisions),
                     Err(err) => import_reply_failed(&err.to_string()),
                 };

@@ -1,6 +1,6 @@
 # 18: File handling
 
-**Status**: normative for the decisions it records. R64 the file core, R65 the file server, R66 the connetto seam and R67 the native client are built, so most of this chapter is now a description rather than a plan, and R68 the browser client, R69 the demos, R79 the peer link and R87 the quotas are not built. Every statement carries **Decided (RN)** or an **Amended (RN)** beside it, where `RN` is the phase in `plans/master-implementation-plan.md` that owns it, and that phase's section records each decision with its rejected alternatives. Chapter 07 is the historical record of the thinking that preceded these decisions and defers to this chapter wherever the two disagree.
+**Status**: normative for the decisions it records. R64 the file core, R65 the file server, R66 the connetto seam, R67 the native client and R68 the browser client are built. R69 the demos, R79 the peer link and R87 the quotas are not built. Every statement carries **Decided (RN)** or an **Amended (RN)** beside it, where `RN` is the phase in `plans/master-implementation-plan.md` that owns it, and that phase's section records each decision with its rejected alternatives. Chapter 07 is the historical record of the thinking that preceded these decisions and defers to this chapter wherever the two disagree.
 
 ---
 
@@ -36,9 +36,15 @@ The tier cannot hold them, because the invariant and the tier are incompatible a
 
 Client content divides into two classes. Unsent content, authored here and not yet uploaded, is data: its chunk files travel in the R26/R56 archive by manifest walk, because an unsent write cannot be refetched. Fetched content is cache: evictable under pin rules, never exported, refetchable by construction. The rejected alternatives (all chunks as encrypted-tier blobs, all chunks in plaintext OPFS, and a provenance split routing unsent bulk into SQLite) are recorded in the plan's R24 section.
 
+**Amended (R68, 2026-09-10):** the browser store belongs to the dedicated database worker and reacquires its `OPFS` root for each operation. A new chunk closes under an unreportable temporary name before an atomic move exposes its hash, while an existing hash is replaced through `createWritable` and `close`. Missing `OPFS` or atomic move support selects worker-lifetime memory, and an anonymous run always selects memory so the bare replica name never leaves durable content. An authenticated namespace is the lowercase SHA-256 of the configured seed and replica identity, preventing account switches from opening ciphertext under the wrong key.
+
+**Amended (R68, 2026-09-10):** version 3 device archives declare every entry and its per-entry encoding. Unsent content travels as plaintext `content/manifests.json` plus one `content/chunks/<hash>` entry per distinct chunk, while fetched and pinned cache stays behind. Import validates the exact ZIP layout, lengths, hashes and reconstructed file identities before writing through the receiving `EncryptingStore`, then commits application changes, manifests and outbox entries in one SQLite transaction. A generic importer refuses nonempty attachments rather than silently discarding required content.
+
 ## Display is not sync
 
 **Decided (R24 position 2).** The common case renders a short-lived signed URL and never touches client chunk storage: the file server assembles from chunks and serves plain HTTP with `Range` mapped through the manifest, a strong `ETag` equal to the content hash, and immutable caching, so the browser's own cache, progressive rendering and video seeking do their jobs. Local content sync happens in exactly three cases: pinned files (the byte-level mirror of R15's row pins), locally processed inputs (a FASTA or MGF parsed in wasm needs bytes or ranges), and content this device authored but has not uploaded.
+
+**Amended (R68, 2026-09-10):** browser HTTP uses worker `fetch` for the same request shapes as the native transport. Local bytes become an `ObjectUrl` owned by a reference-counted handle, and the browser URL is revoked when its last owner drops. Remote resolution remains the signed server URL.
 
 A file reference row is an intent. Metadata can arrive before content is fetchable, offline authorship makes that unavoidable rather than a bug, and readers show a placeholder until the availability signal below flips. Thumbnails are ordinary derived files behind a `thumb_hash` column, one pipeline with everything else.
 

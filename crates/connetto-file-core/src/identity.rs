@@ -17,6 +17,29 @@ pub struct FileId([u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkHash([u8; 32]);
 
+/// Incremental computation of a file identity.
+#[derive(Debug, Default)]
+pub struct FileIdHasher(blake3::Hasher);
+
+impl FileIdHasher {
+    /// Starts an empty file identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    /// Adds the next bytes in file order.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Finishes the identity.
+    #[must_use]
+    pub fn finalize(self) -> FileId {
+        FileId(*self.0.finalize().as_bytes())
+    }
+}
+
 impl FileId {
     /// Wraps raw bytes as a `FileId`.
     #[must_use]
@@ -28,6 +51,16 @@ impl FileId {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Computes a file identity from ordered byte slices without joining them.
+    #[must_use]
+    pub fn from_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut hasher = FileIdHasher::new();
+        for chunk in chunks {
+            hasher.update(chunk);
+        }
+        hasher.finalize()
     }
 }
 
@@ -42,6 +75,12 @@ impl ChunkHash {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Computes the identity of one plaintext chunk.
+    #[must_use]
+    pub fn from_data(data: &[u8]) -> Self {
+        Self(*blake3::hash(data).as_bytes())
     }
 }
 
