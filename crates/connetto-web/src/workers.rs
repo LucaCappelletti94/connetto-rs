@@ -1100,7 +1100,10 @@ where
                     .map_err(|value: js_sys::Object| {
                         JsValue::from_str(&format!("db worker scope: {value:?}"))
                     })?;
-                (BrowserStore::install(&scope, namespace).await, root_key)
+                let store = BrowserStore::install(&scope, namespace)
+                    .await
+                    .map_err(|err| JsValue::from_str(&format!("browser content store: {err}")))?;
+                (store, root_key)
             } else {
                 (
                     BrowserStore::ephemeral(),

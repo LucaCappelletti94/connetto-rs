@@ -1,6 +1,6 @@
 //! Browser chunk storage contracts.
 
-use connetto_file_client::BrowserStore;
+use connetto_file_client::{BrowserStore, BrowserStoreError};
 use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore, EncryptingStore};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -18,7 +18,9 @@ const STORE: &str = "r68-content-store";
 async fn an_opfs_chunk_survives_reopening_and_inventory_names_it() {
     let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     let hash = ChunkHash::from_bytes([0x31; 32]);
-    let store = BrowserStore::install(&worker, STORE).await;
+    let store = BrowserStore::install(&worker, STORE)
+        .await
+        .expect("install content store");
     assert!(store.is_persistent(), "headless Chrome must provide OPFS");
     store.delete_chunk(&hash).await.expect("clear old chunk");
     store
@@ -27,7 +29,9 @@ async fn an_opfs_chunk_survives_reopening_and_inventory_names_it() {
         .expect("write chunk");
     drop(store);
 
-    let reopened = BrowserStore::install(&worker, STORE).await;
+    let reopened = BrowserStore::install(&worker, STORE)
+        .await
+        .expect("reopen content store");
     assert_eq!(
         reopened.read_chunk(&hash).await.expect("read chunk"),
         b"browser chunk"
@@ -56,7 +60,9 @@ async fn opening_an_opfs_store_removes_an_interrupted_temporary_chunk() {
         .await
         .expect("create interrupted temporary chunk");
 
-    let store = BrowserStore::install(&worker, "r68-temp-content-store").await;
+    let store = BrowserStore::install(&worker, "r68-temp-content-store")
+        .await
+        .expect("reopen content store");
 
     assert!(store.is_persistent(), "headless Chrome must provide OPFS");
     assert!(
@@ -93,10 +99,22 @@ async fn raw_fanout(
 }
 
 #[wasm_bindgen_test]
+async fn an_invalid_store_namespace_is_not_downgraded_to_memory() {
+    let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    let error = BrowserStore::install(&worker, "../shared")
+        .await
+        .expect_err("invalid namespace");
+
+    assert!(matches!(error, BrowserStoreError::InvalidNamespace { .. }));
+}
+
+#[wasm_bindgen_test]
 async fn opfs_holds_ciphertext_while_the_encrypting_view_returns_plaintext() {
     let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     let hash = ChunkHash::from_bytes([0x42; 32]);
-    let raw = BrowserStore::install(&worker, "r68-encrypted-content-store").await;
+    let raw = BrowserStore::install(&worker, "r68-encrypted-content-store")
+        .await
+        .expect("install encrypted content store");
     raw.delete_chunk(&hash).await.expect("clear old chunk");
     let encrypted = EncryptingStore::new(raw.clone(), &[0x17; 32]);
 

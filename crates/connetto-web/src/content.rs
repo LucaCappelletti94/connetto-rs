@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use connetto_client::live::ConnettoClient;
 use connetto_core::traits::{MaybeSend, Transport};
-use connetto_file_client::{BrowserHttp, BrowserStore, ContentClient, ContentError, Resolved};
+use connetto_file_client::{
+    BrowserHttp, BrowserStore, BrowserStoreError, ContentClient, ContentError, Resolved,
+};
 use js_sys::{Array, Uint8Array};
 use thiserror::Error;
 use wasm_bindgen::JsCast;
@@ -16,6 +18,9 @@ pub enum BrowserContentError {
     /// Persistent browser content belongs to a dedicated worker.
     #[error("browser content must be attached from a dedicated worker")]
     NotWorker,
+    /// The persistent store namespace is invalid.
+    #[error(transparent)]
+    Store(#[from] BrowserStoreError),
     /// The shared content client could not attach.
     #[error(transparent)]
     Content(#[from] ContentError),
@@ -37,7 +42,7 @@ where
     let worker = js_sys::global()
         .dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
         .map_err(|_value: js_sys::Object| BrowserContentError::NotWorker)?;
-    let store = BrowserStore::install(&worker, namespace).await;
+    let store = BrowserStore::install(&worker, namespace).await?;
     ContentClient::attach(client, store, root_key, BrowserHttp::new())
         .await
         .map_err(Into::into)

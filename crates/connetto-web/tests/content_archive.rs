@@ -239,7 +239,9 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
     let scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .expect("dedicated worker");
-    let store = BrowserStore::install(&scope, "r68-archive-relay").await;
+    let store = BrowserStore::install(&scope, "r68-archive-relay")
+        .await
+        .expect("install content store");
     let content = ContentArchive::new(store, [3; 32]);
     let (hub, completed_subscribes) = start_recovering_relay(worker, content);
     serve_export_requests(hub.clone()).expect("export service");

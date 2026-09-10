@@ -318,15 +318,21 @@ enum BrowserStoreInner {
 
 impl BrowserStore {
     /// Installs OPFS for `worker` and otherwise creates a fresh memory store.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserStoreError::InvalidNamespace`] when `namespace` cannot name one directory.
     pub async fn install(
         worker: &DedicatedWorkerGlobalScope,
         namespace: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self, BrowserStoreError> {
+        let namespace = namespace.into();
+        validate_namespace(&namespace)?;
         let inner = match OpfsStore::open(worker, namespace).await {
             Ok(store) => BrowserStoreInner::Opfs(store),
             Err(_) => BrowserStoreInner::Memory(Arc::new(MemStore::new())),
         };
-        Self { inner }
+        Ok(Self { inner })
     }
 
     /// Creates a worker-lifetime memory store.
