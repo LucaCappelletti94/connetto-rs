@@ -280,7 +280,7 @@ fn start_recovering_relay(
             }
         },
         sleeper: |_| ready(()),
-        policy: ReconnectPolicy::default(),
+        policy: ReconnectPolicy::new().with_max_attempts(Some(1)),
         upstream: Vec::new(),
     };
     let (hub, pump, _notices) =

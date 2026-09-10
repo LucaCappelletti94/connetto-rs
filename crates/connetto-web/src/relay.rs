@@ -878,22 +878,7 @@ where
     U::Error: core::fmt::Display,
 {
     match event {
-        HubEvent::Attached(id, out) => {
-            state.tabs.insert(
-                id,
-                TabState {
-                    out,
-                    handshaken: false,
-                    subs: Vec::new(),
-                    pending_write: None,
-                    client_id: None,
-                    applied_watermark: None,
-                    local_watermark: None,
-                    credits: INITIAL_CREDITS,
-                    pending: VecDeque::new(),
-                },
-            );
-        }
+        HubEvent::Attached(id, out) => attach_tab(state, id, out),
         HubEvent::Frame(id, frame) => {
             handle_tab_frame(worker, state, notices, id, frame).await?;
         }
@@ -901,51 +886,127 @@ where
             let _ = reply.send(worker.unsynced());
         }
         HubEvent::Export(scope, reply) => {
-            let result = match content {
-                Some(content) => content
-                    .export_local_data(worker, scope)
-                    .await
-                    .map_err(Into::into),
-                None => worker.export_local_data(scope).map_err(Into::into),
-            };
-            let _ = reply.send(result);
+            let _ = reply.send(export_archive(worker, content, scope).await);
         }
         HubEvent::Import(bytes, reply) => {
-            let result = match content {
-                Some(content) => content
-                    .import_local_data(worker, &bytes)
-                    .await
-                    .map_err(Into::into),
-                None => worker
-                    .import_local_data(&bytes)
-                    .and_then(|plan| {
-                        let collisions = plan.collisions().len();
-                        worker
-                            .apply_import(&plan, &ImportChoices::keeping_the_file())
-                            .map(|outcome| (outcome, collisions))
-                    })
-                    .map_err(Into::into),
-            };
-            let _ = reply.send(result);
+            let _ = reply.send(import_archive(worker, content, &bytes).await);
         }
-        HubEvent::Gone(id) | HubEvent::Kill(id) => {
-            state.tabs.remove(&id);
-            let upstreams: Vec<String> = state
-                .agg_routes
-                .iter()
-                .filter(|(_, route)| route.tab == id)
-                .map(|(upstream_id, _)| upstream_id.clone())
-                .collect();
-            for upstream_id in upstreams {
-                state.agg_routes.remove(&upstream_id);
-                let _ = worker.unsubscribe(&upstream_id).await;
-            }
-        }
+        HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
     Ok(())
 }
 
+fn attach_tab(state: &mut HubState, id: TabId, out: UnboundedSender<TabOut>) {
+    state.tabs.insert(
+        id,
+        TabState {
+            out,
+            handshaken: false,
+            subs: Vec::new(),
+            pending_write: None,
+            client_id: None,
+            applied_watermark: None,
+            local_watermark: None,
+            credits: INITIAL_CREDITS,
+            pending: VecDeque::new(),
+        },
+    );
+}
+
+async fn export_archive<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    scope: ExportScope,
+) -> Result<Vec<u8>, ArchiveServiceError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match content {
+        Some(content) => content
+            .export_local_data(worker, scope)
+            .await
+            .map_err(Into::into),
+        None => worker.export_local_data(scope).map_err(Into::into),
+    }
+}
+
+async fn import_archive<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    bytes: &[u8],
+) -> Result<(ImportOutcome, usize), ArchiveServiceError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match content {
+        Some(content) => content
+            .import_local_data(worker, bytes)
+            .await
+            .map_err(Into::into),
+        None => worker
+            .import_local_data(bytes)
+            .and_then(|plan| {
+                let collisions = plan.collisions().len();
+                worker
+                    .apply_import(&plan, &ImportChoices::keeping_the_file())
+                    .map(|outcome| (outcome, collisions))
+            })
+            .map_err(Into::into),
+    }
+}
+
+async fn remove_tab<U>(worker: &mut ConnettoConnection<U>, state: &mut HubState, id: TabId)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    state.tabs.remove(&id);
+    let upstreams: Vec<String> = state
+        .agg_routes
+        .iter()
+        .filter(|(_, route)| route.tab == id)
+        .map(|(upstream_id, _)| upstream_id.clone())
+        .collect();
+    for upstream_id in upstreams {
+        state.agg_routes.remove(&upstream_id);
+        let _ = worker.unsubscribe(&upstream_id).await;
+    }
+}
+
 /// Reconnects upstream while continuing to serve replica-only commands.
+enum RecoveryAttempt {
+    Connected,
+    Failed,
+    Interrupted(HubEvent),
+    Closed,
+}
+
+enum RecoveryCycle {
+    Connected,
+    Failed,
+    Closed,
+}
+
+enum ConnectAttempt<U> {
+    Connected(U),
+    Failed,
+    Closed,
+}
+
+struct RecoveryContext<'a, U>
+where
+    U: Transport,
+{
+    worker: &'a mut ConnettoConnection<U>,
+    state: &'a mut HubState,
+    notices: &'a UnboundedSender<HubNotice>,
+    content: Option<&'a ContentArchive<BrowserStore>>,
+    events: &'a mut UnboundedReceiver<HubEvent>,
+    deferred: &'a mut VecDeque<HubEvent>,
+}
+
 async fn hub_recover<U, F, S>(
     worker: &mut ConnettoConnection<U>,
     driver: &mut HubReconnect<F, S>,
@@ -962,6 +1023,15 @@ where
 {
     let mut backoff = driver.policy.initial_backoff();
     let mut attempt: u32 = 0;
+    let mut deferred = VecDeque::new();
+    let mut recovery_io = RecoveryContext {
+        worker,
+        state,
+        notices,
+        content,
+        events,
+        deferred: &mut deferred,
+    };
     loop {
         attempt = attempt.saturating_add(1);
         if driver
@@ -972,66 +1042,214 @@ where
             return Ok(false);
         }
         tracing::warn!(attempt, "relay hub upstream reconnecting");
-        let sleep = driver.sleeper.sleep(backoff);
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                () = &mut sleep => break,
-                event = events.recv() => match event {
-                    Some(event) => {
-                        handle_hub_event(worker, state, notices, content, event).await?;
-                    }
-                    None => return Ok(false),
-                },
-            }
+        if !wait_recovery_backoff(&mut recovery_io, &mut driver.sleeper, backoff).await? {
+            return Ok(false);
         }
         backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff());
-
-        let connect = driver.factory.connect();
-        tokio::pin!(connect);
-        let transport = loop {
-            tokio::select! {
-                result = &mut connect => break result,
-                event = events.recv() => match event {
-                    Some(event) => {
-                        handle_hub_event(worker, state, notices, content, event).await?;
-                    }
-                    None => return Ok(false),
-                },
-            }
-        };
-        let Ok(transport) = transport else {
-            continue;
-        };
-        let outcome = {
-            let recovery = async {
-                worker.attach(transport).await?;
-                for (sub_id, spec) in &driver.upstream {
-                    worker.subscribe_spec(sub_id, spec.clone()).await?;
-                }
-                for (upstream_id, route) in &state.agg_routes {
-                    worker
-                        .subscribe_spec(upstream_id, route.spec.clone())
-                        .await?;
-                }
-                Ok::<(), ClientError>(())
-            };
-            tokio::pin!(recovery);
-            tokio::select! {
-                result = &mut recovery => Ok(result),
-                event = events.recv() => Err(event),
-            }
-        };
-        match outcome {
-            Ok(Ok(())) => return Ok(true),
-            Ok(Err(_)) => {}
-            Err(Some(event)) => {
-                worker.disconnect();
-                handle_hub_event(worker, state, notices, content, event).await?;
-            }
-            Err(None) => return Ok(false),
+        match finish_recovery(&mut recovery_io, &mut driver.factory, &driver.upstream).await? {
+            RecoveryCycle::Connected => return Ok(true),
+            RecoveryCycle::Failed => {}
+            RecoveryCycle::Closed => return Ok(false),
         }
     }
+}
+
+async fn finish_recovery<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Result<RecoveryCycle, RelayError>
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    loop {
+        match recovery_attempt(context, factory, upstream).await? {
+            RecoveryAttempt::Connected => {
+                handle_deferred_events(context).await?;
+                return Ok(RecoveryCycle::Connected);
+            }
+            RecoveryAttempt::Failed => {
+                context.worker.disconnect();
+                return Ok(RecoveryCycle::Failed);
+            }
+            RecoveryAttempt::Interrupted(event) => {
+                context.worker.disconnect();
+                handle_hub_event(
+                    context.worker,
+                    context.state,
+                    context.notices,
+                    context.content,
+                    event,
+                )
+                .await?;
+            }
+            RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
+        }
+    }
+}
+
+async fn wait_recovery_backoff<U, S>(
+    context: &mut RecoveryContext<'_, U>,
+    sleeper: &mut S,
+    backoff: core::time::Duration,
+) -> Result<bool, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+    S: Sleeper,
+{
+    let sleep = sleeper.sleep(backoff);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return Ok(true),
+            event = context.events.recv() => match event {
+                Some(event) => handle_recovery_event(context, event).await?,
+                None => return Ok(false),
+            },
+        }
+    }
+}
+
+async fn recovery_attempt<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Result<RecoveryAttempt, RelayError>
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    match connect_during_recovery(context, factory).await? {
+        ConnectAttempt::Connected(transport) => {
+            Ok(resume_during_recovery(context, transport, upstream).await)
+        }
+        ConnectAttempt::Failed => Ok(RecoveryAttempt::Failed),
+        ConnectAttempt::Closed => Ok(RecoveryAttempt::Closed),
+    }
+}
+
+async fn connect_during_recovery<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+) -> Result<ConnectAttempt<U>, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    let connect = factory.connect();
+    tokio::pin!(connect);
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                return Ok(match result {
+                    Ok(transport) => ConnectAttempt::Connected(transport),
+                    Err(_) => ConnectAttempt::Failed,
+                });
+            }
+            event = context.events.recv() => match event {
+                Some(event) => handle_recovery_event(context, event).await?,
+                None => return Ok(ConnectAttempt::Closed),
+            },
+        }
+    }
+}
+
+async fn resume_during_recovery<U>(
+    context: &mut RecoveryContext<'_, U>,
+    transport: U,
+    upstream: &[(String, SubscriptionSpec)],
+) -> RecoveryAttempt
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+{
+    let worker = &mut *context.worker;
+    let state = &*context.state;
+    let events = &mut *context.events;
+    let deferred = &mut *context.deferred;
+    let recovery = async {
+        worker.attach(transport).await?;
+        for (sub_id, spec) in upstream {
+            worker.subscribe_spec(sub_id, spec.clone()).await?;
+        }
+        for (upstream_id, route) in &state.agg_routes {
+            worker
+                .subscribe_spec(upstream_id, route.spec.clone())
+                .await?;
+        }
+        Ok::<(), ClientError>(())
+    };
+    tokio::pin!(recovery);
+    loop {
+        tokio::select! {
+            result = &mut recovery => {
+                return match result {
+                    Ok(()) => RecoveryAttempt::Connected,
+                    Err(_) => RecoveryAttempt::Failed,
+                };
+            }
+            event = events.recv() => match event {
+                Some(event) if recovery_local(&event) => {
+                    return RecoveryAttempt::Interrupted(event);
+                }
+                Some(event) => deferred.push_back(event),
+                None => return RecoveryAttempt::Closed,
+            },
+        }
+    }
+}
+
+async fn handle_recovery_event<U>(
+    context: &mut RecoveryContext<'_, U>,
+    event: HubEvent,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    if recovery_local(&event) {
+        handle_hub_event(
+            context.worker,
+            context.state,
+            context.notices,
+            context.content,
+            event,
+        )
+        .await
+    } else {
+        context.deferred.push_back(event);
+        Ok(())
+    }
+}
+
+fn recovery_local(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Unsynced(_) | HubEvent::Export(_, _) | HubEvent::Import(_, _)
+    )
+}
+
+async fn handle_deferred_events<U>(context: &mut RecoveryContext<'_, U>) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    while let Some(event) = context.deferred.pop_front() {
+        handle_hub_event(
+            context.worker,
+            context.state,
+            context.notices,
+            context.content,
+            event,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Handle one frame from a tab, downgrading tab-level faults to closing

@@ -135,36 +135,22 @@ fn read_error(error: impl core::fmt::Display) -> ClientError {
 
 /// Writes one archive with per-entry encodings.
 pub(crate) fn write(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
-    let mut entries = Vec::new();
-    if archive.synced_rows.is_some() {
-        entries.push(Entry {
-            kind: "rows".to_owned(),
-            path: SYNCED_ROWS.to_owned(),
-            encoding: Some("zstd".to_owned()),
-        });
-    }
-    if archive.local_rows.is_some() {
-        entries.push(Entry {
-            kind: "rows".to_owned(),
-            path: LOCAL_ROWS.to_owned(),
-            encoding: Some("zstd".to_owned()),
-        });
-    }
-    if !archive.pending.is_empty() {
-        entries.push(Entry {
-            kind: "pending".to_owned(),
-            path: PENDING.to_owned(),
-            encoding: Some("zstd".to_owned()),
-        });
-    }
-    for attachment in archive.attachments {
-        entries.push(Entry {
-            kind: "attachment".to_owned(),
-            path: attachment.path.clone(),
-            encoding: Some("identity".to_owned()),
-        });
-    }
-    let manifest = serde_json::to_vec_pretty(&Manifest {
+    let manifest = encode_manifest(archive)?;
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    // Readers validate the manifest before decompressing payloads.
+    zip.start_file(MANIFEST, options).map_err(zip_error)?;
+    zip.write_all(&manifest).map_err(zip_error)?;
+    write_payloads(&mut zip, archive, options)?;
+    write_attachments(&mut zip, archive.attachments, options)?;
+    zip.finish()
+        .map(std::io::Cursor::into_inner)
+        .map_err(zip_error)
+}
+
+fn encode_manifest(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
+    serde_json::to_vec_pretty(&Manifest {
         format: FORMAT.to_owned(),
         version: VERSION,
         scope: archive.scope.as_str().to_owned(),
@@ -172,32 +158,63 @@ pub(crate) fn write(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
         account: archive.account.clone(),
         compression: "per-entry".to_owned(),
         note: NOTE.to_owned(),
-        entries,
+        entries: manifest_entries(archive),
     })
-    .map_err(|err| ClientError::Export(format!("encoding the manifest: {err}")))?;
+    .map_err(|err| ClientError::Export(format!("encoding the manifest: {err}")))
+}
 
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    // Readers validate the manifest before decompressing payloads.
-    zip.start_file(MANIFEST, options).map_err(zip_error)?;
-    zip.write_all(&manifest).map_err(zip_error)?;
-    if let Some(rows) = &archive.synced_rows {
-        write_entry(&mut zip, SYNCED_ROWS, rows, options)?;
+fn manifest_entries(archive: &Archive<'_>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    if archive.synced_rows.is_some() {
+        entries.push(encoded_entry("rows", SYNCED_ROWS, "zstd"));
     }
-    if let Some(rows) = &archive.local_rows {
-        write_entry(&mut zip, LOCAL_ROWS, rows, options)?;
+    if archive.local_rows.is_some() {
+        entries.push(encoded_entry("rows", LOCAL_ROWS, "zstd"));
     }
     if !archive.pending.is_empty() {
-        write_entry(
-            &mut zip,
-            PENDING,
-            &encode_pending(&archive.pending),
-            options,
-        )?;
+        entries.push(encoded_entry("pending", PENDING, "zstd"));
     }
+    entries.extend(
+        archive
+            .attachments
+            .iter()
+            .map(|attachment| encoded_entry("attachment", &attachment.path, "identity")),
+    );
+    entries
+}
+
+fn encoded_entry(kind: &str, path: &str, encoding: &str) -> Entry {
+    Entry {
+        kind: kind.to_owned(),
+        path: path.to_owned(),
+        encoding: Some(encoding.to_owned()),
+    }
+}
+
+fn write_payloads(
+    zip: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    archive: &Archive<'_>,
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), ClientError> {
+    if let Some(rows) = &archive.synced_rows {
+        write_entry(zip, SYNCED_ROWS, rows, options)?;
+    }
+    if let Some(rows) = &archive.local_rows {
+        write_entry(zip, LOCAL_ROWS, rows, options)?;
+    }
+    if !archive.pending.is_empty() {
+        write_entry(zip, PENDING, &encode_pending(&archive.pending), options)?;
+    }
+    Ok(())
+}
+
+fn write_attachments(
+    zip: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    attachments: &[ArchiveAttachment],
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), ClientError> {
     let mut paths = HashSet::new();
-    for attachment in archive.attachments {
+    for attachment in attachments {
         validate_attachment_path(&attachment.path, ClientError::Export)?;
         if !paths.insert(attachment.path.as_str()) {
             return Err(ClientError::Export(format!(
@@ -209,9 +226,7 @@ pub(crate) fn write(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
             .map_err(zip_error)?;
         zip.write_all(&attachment.bytes).map_err(zip_error)?;
     }
-    zip.finish()
-        .map(std::io::Cursor::into_inner)
-        .map_err(zip_error)
+    Ok(())
 }
 
 fn write_entry(
@@ -315,8 +330,15 @@ fn validate_archive_layout(
             manifest.compression
         )));
     }
+    let declared = declared_paths(&manifest.entries)?;
+    validate_physical_layout(stored_paths(zip)?, &declared)?;
+    validate_scope(&declared, scope)?;
+    Ok(declared)
+}
+
+fn declared_paths(entries: &[Entry]) -> Result<HashSet<String>, ClientError> {
     let mut declared = HashSet::new();
-    for entry in &manifest.entries {
+    for entry in entries {
         validate_entry_declaration(entry)?;
         if !declared.insert(entry.path.clone()) {
             return Err(ClientError::Import(format!(
@@ -325,6 +347,12 @@ fn validate_archive_layout(
             )));
         }
     }
+    Ok(declared)
+}
+
+fn stored_paths(
+    zip: &zip::ZipArchive<std::io::Cursor<&[u8]>>,
+) -> Result<HashSet<String>, ClientError> {
     let mut stored = HashSet::new();
     for name in zip.file_names() {
         let path = name.to_owned();
@@ -334,12 +362,19 @@ fn validate_archive_layout(
             )));
         }
     }
+    Ok(stored)
+}
+
+fn validate_physical_layout(
+    mut stored: HashSet<String>,
+    declared: &HashSet<String>,
+) -> Result<(), ClientError> {
     if !stored.remove(MANIFEST) {
         return Err(ClientError::Import(
             "the archive carries no manifest".to_owned(),
         ));
     }
-    for path in &declared {
+    for path in declared {
         if !stored.remove(path) {
             return Err(ClientError::Import(format!(
                 "the archive manifest names {path}, but the entry is absent"
@@ -351,13 +386,16 @@ fn validate_archive_layout(
             "the archive entry {path} is not declared by its manifest"
         )));
     }
-    let synced = declared.contains(SYNCED_ROWS);
-    if synced != matches!(scope, ExportScope::Everything) {
+    Ok(())
+}
+
+fn validate_scope(declared: &HashSet<String>, scope: ExportScope) -> Result<(), ClientError> {
+    if declared.contains(SYNCED_ROWS) != matches!(scope, ExportScope::Everything) {
         return Err(ClientError::Import(
             "the archive scope contradicts its synced rows entry".to_owned(),
         ));
     }
-    Ok(declared)
+    Ok(())
 }
 
 fn validate_entry_declaration(entry: &Entry) -> Result<(), ClientError> {

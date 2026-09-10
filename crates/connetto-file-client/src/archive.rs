@@ -74,16 +74,22 @@ pub(crate) fn encode(
 }
 
 pub(crate) fn decode(attachments: &[ArchiveAttachment]) -> Result<DecodedContent, ContentError> {
-    let content: Vec<_> = attachments
+    if let Some(attachment) = attachments
         .iter()
-        .filter(|attachment| attachment.path().starts_with("content/"))
-        .collect();
-    if content.is_empty() {
+        .find(|attachment| !attachment.path().starts_with("content/"))
+    {
+        return Err(archive_error(format!(
+            "archive attachment {} is not handled by the content importer",
+            attachment.path()
+        )));
+    }
+    if attachments.is_empty() {
         return Ok(DecodedContent {
             manifests: Vec::new(),
             chunks: Vec::new(),
         });
     }
+    let content: Vec<_> = attachments.iter().collect();
     let index = decode_index(&content)?;
     let chunks = decode_chunks(&content)?;
     let manifests = decode_manifests(&index.files, &chunks)?;

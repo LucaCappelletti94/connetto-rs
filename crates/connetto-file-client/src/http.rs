@@ -152,51 +152,59 @@ mod browser {
             body: Option<(Vec<u8>, &'static str)>,
             range: Option<(u64, u64)>,
         ) -> Result<HttpReply, BrowserHttpError> {
-            let init = RequestInit::new();
-            init.set_method(method);
-            let headers = Headers::new().map_err(|value| error("create headers", value))?;
-            let body = body.map(|(bytes, content_type)| {
-                headers
-                    .set("content-type", content_type)
-                    .map_err(|value| error("set content type", value))?;
-                Ok::<_, BrowserHttpError>(Uint8Array::from(bytes.as_slice()))
-            });
-            let body = match body {
-                Some(body) => Some(body?),
-                None => None,
-            };
-            if let Some(body) = body.as_ref() {
-                init.set_body_opt_u8_array(Some(body));
-            }
-            if let Some((first, last)) = range {
-                headers
-                    .set("range", &format!("bytes={first}-{last}"))
-                    .map_err(|value| error("set byte range", value))?;
-            }
-            init.set_headers_headers(&headers);
-            let request = Request::new_with_str_and_init(url, &init)
-                .map_err(|value| error("create request", value))?;
-            let scope: DedicatedWorkerGlobalScope = js_sys::global()
-                .dyn_into()
-                .map_err(|value: js_sys::Object| error("acquire worker scope", value.into()))?;
-            let response = JsFuture::from(scope.fetch_with_request(&request))
-                .await
-                .map_err(|value| error("fetch", value))?
-                .dyn_into::<Response>()
-                .map_err(|value| error("decode response", value))?;
-            let status = response.status();
-            let buffer = JsFuture::from(
-                response
-                    .array_buffer()
-                    .map_err(|value| error("begin response read", value))?,
-            )
-            .await
-            .map_err(|value| error("read response", value))?;
-            Ok(HttpReply {
-                status,
-                body: Uint8Array::new(&buffer).to_vec(),
-            })
+            let request = build_request(method, url, body, range)?;
+            read_response(fetch(request).await?).await
         }
+    }
+
+    fn build_request(
+        method: &str,
+        url: &str,
+        body: Option<(Vec<u8>, &'static str)>,
+        range: Option<(u64, u64)>,
+    ) -> Result<Request, BrowserHttpError> {
+        let init = RequestInit::new();
+        init.set_method(method);
+        let headers = Headers::new().map_err(|value| error("create headers", value))?;
+        if let Some((bytes, content_type)) = body {
+            headers
+                .set("content-type", content_type)
+                .map_err(|value| error("set content type", value))?;
+            init.set_body_opt_u8_array(Some(&Uint8Array::from(bytes.as_slice())));
+        }
+        if let Some((first, last)) = range {
+            headers
+                .set("range", &format!("bytes={first}-{last}"))
+                .map_err(|value| error("set byte range", value))?;
+        }
+        init.set_headers_headers(&headers);
+        Request::new_with_str_and_init(url, &init).map_err(|value| error("create request", value))
+    }
+
+    async fn fetch(request: Request) -> Result<Response, BrowserHttpError> {
+        let scope: DedicatedWorkerGlobalScope = js_sys::global()
+            .dyn_into()
+            .map_err(|value: js_sys::Object| error("acquire worker scope", value.into()))?;
+        JsFuture::from(scope.fetch_with_request(&request))
+            .await
+            .map_err(|value| error("fetch", value))?
+            .dyn_into::<Response>()
+            .map_err(|value| error("decode response", value))
+    }
+
+    async fn read_response(response: Response) -> Result<HttpReply, BrowserHttpError> {
+        let status = response.status();
+        let buffer = JsFuture::from(
+            response
+                .array_buffer()
+                .map_err(|value| error("begin response read", value))?,
+        )
+        .await
+        .map_err(|value| error("read response", value))?;
+        Ok(HttpReply {
+            status,
+            body: Uint8Array::new(&buffer).to_vec(),
+        })
     }
 
     impl ContentHttp for BrowserHttp {

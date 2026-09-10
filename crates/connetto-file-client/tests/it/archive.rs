@@ -181,6 +181,30 @@ async fn corrupt_lengths_hashes_and_file_identities_are_refused_before_apply() {
     assert_archive_error(&content, &wrong_identity, "reconstructs as").await;
 }
 
+#[tokio::test]
+async fn attachments_owned_by_another_layer_are_refused() {
+    let dir = tempdir().expect("directory");
+    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let content = attach_content(
+        client.clone(),
+        &dir.path().join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+    let mut attachments = content_attachments(
+        FileId::from_chunks([PHOTO]),
+        ChunkHash::from_data(PHOTO),
+        PHOTO.len(),
+        PHOTO,
+    );
+    attachments.push(
+        ArchiveAttachment::new("search/index.json", b"{}".to_vec()).expect("foreign attachment"),
+    );
+    let archive = raw_archive(&client, attachments).await;
+
+    assert_archive_error(&content, &archive, "search/index.json is not handled").await;
+}
+
 fn content_attachments(
     file_id: FileId,
     hash: ChunkHash,

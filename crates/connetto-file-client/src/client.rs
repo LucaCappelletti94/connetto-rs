@@ -99,7 +99,6 @@ pub struct ContentImportPlan {
 
 impl ContentImportPlan {
     /// The replica plan, including collisions the application must present.
-    #[must_use]
     pub fn replica_plan(&self) -> &ImportPlan {
         &self.replica
     }

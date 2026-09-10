@@ -85,6 +85,7 @@ impl OpfsStore {
         let move_supported = Reflect::get(probe.as_ref(), &JsValue::from_str("move"))
             .is_ok_and(|value| value.is_function());
         let _ = JsFuture::from(directory.remove_entry(probe_name)).await;
+        remove_temporary_entries(&directory).await?;
         if !move_supported {
             return Err(BrowserStoreError::Browser {
                 operation: "install OPFS store",
@@ -258,6 +259,49 @@ async fn collect_hashes(
         }
     }
     Ok(())
+}
+
+async fn remove_temporary_entries(
+    root: &FileSystemDirectoryHandle,
+) -> Result<(), BrowserStoreError> {
+    let fanouts = root.keys();
+    while let Some(name) = next_key(&fanouts).await? {
+        if !valid_fanout(&name) {
+            continue;
+        }
+        let Some(directory) = directory_handle(root, &name, false).await? else {
+            continue;
+        };
+        let entries = directory.keys();
+        while let Some(entry) = next_key(&entries).await? {
+            if temporary_name(&entry) {
+                remove_temporary_entry(&directory, &entry).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn remove_temporary_entry(
+    directory: &FileSystemDirectoryHandle,
+    name: &str,
+) -> Result<(), BrowserStoreError> {
+    match JsFuture::from(directory.remove_entry(name)).await {
+        Ok(_) => Ok(()),
+        Err(value) if is_not_found(&value) => Ok(()),
+        Err(value) => Err(browser_error("remove temporary chunk", value)),
+    }
+}
+
+fn temporary_name(name: &str) -> bool {
+    let Some((hash, ticket)) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .and_then(|name| name.split_once('.'))
+    else {
+        return false;
+    };
+    parse_hash(hash).is_some() && ticket.parse::<u64>().is_ok()
 }
 
 /// Browser chunk storage with an ephemeral fallback when OPFS is unavailable.
