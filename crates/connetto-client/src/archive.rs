@@ -141,6 +141,7 @@ fn read_error(error: impl core::fmt::Display) -> ClientError {
 
 /// Writes one archive with per-entry encodings.
 pub(crate) fn write(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
+    validate_export_attachments(archive.attachments)?;
     let manifest = encode_manifest(archive)?;
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -214,12 +215,9 @@ fn write_payloads(
     Ok(())
 }
 
-fn write_attachments(
-    zip: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
-    attachments: &[ArchiveAttachment],
-    options: zip::write::SimpleFileOptions,
-) -> Result<(), ClientError> {
+fn validate_export_attachments(attachments: &[ArchiveAttachment]) -> Result<(), ClientError> {
     let mut paths = HashSet::new();
+    let mut total = 0_u64;
     for attachment in attachments {
         validate_attachment_path(&attachment.path, ClientError::Export)?;
         if !paths.insert(attachment.path.as_str()) {
@@ -228,6 +226,23 @@ fn write_attachments(
                 attachment.path
             )));
         }
+        let size = u64::try_from(attachment.bytes.len()).map_err(|_| {
+            ClientError::Export(format!(
+                "archive attachment {} does not fit archive size accounting",
+                attachment.path
+            ))
+        })?;
+        total = checked_attachment_total(&attachment.path, size, total, ClientError::Export)?;
+    }
+    Ok(())
+}
+
+fn write_attachments(
+    zip: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    attachments: &[ArchiveAttachment],
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), ClientError> {
+    for attachment in attachments {
         zip.start_file(&attachment.path, options)
             .map_err(zip_error)?;
         zip.write_all(&attachment.bytes).map_err(zip_error)?;
@@ -462,20 +477,7 @@ fn read_attachments(
             )));
         }
         let size = file.size();
-        if size > MAX_ATTACHMENT_BYTES {
-            return Err(ClientError::Import(format!(
-                "archive attachment {} is {size} bytes, above the {MAX_ATTACHMENT_BYTES}-byte limit",
-                entry.path
-            )));
-        }
-        total = total
-            .checked_add(size)
-            .filter(|total| *total <= MAX_ATTACHMENTS_BYTES)
-            .ok_or_else(|| {
-                ClientError::Import(format!(
-                    "archive attachments exceed the {MAX_ATTACHMENTS_BYTES}-byte aggregate limit"
-                ))
-            })?;
+        total = checked_attachment_total(&entry.path, size, total, ClientError::Import)?;
         let capacity = usize::try_from(size).map_err(|_| {
             ClientError::Import(format!(
                 "archive attachment {} does not fit this platform",
@@ -490,6 +492,27 @@ fn read_attachments(
         });
     }
     Ok(attachments)
+}
+
+fn checked_attachment_total(
+    path: &str,
+    size: u64,
+    total: u64,
+    error: fn(String) -> ClientError,
+) -> Result<u64, ClientError> {
+    if size > MAX_ATTACHMENT_BYTES {
+        return Err(error(format!(
+            "archive attachment {path} is {size} bytes, above the {MAX_ATTACHMENT_BYTES}-byte limit"
+        )));
+    }
+    total
+        .checked_add(size)
+        .filter(|total| *total <= MAX_ATTACHMENTS_BYTES)
+        .ok_or_else(|| {
+            error(format!(
+                "archive attachments exceed the {MAX_ATTACHMENTS_BYTES}-byte aggregate limit"
+            ))
+        })
 }
 
 fn validate_attachment_path(
@@ -995,7 +1018,11 @@ pub(crate) fn fingerprint(
 mod tests {
     use std::io::Write as _;
 
-    use super::{Archive, ExportScope, decode_pending, encode_pending, read, write};
+    use super::{
+        Archive, ExportScope, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES,
+        checked_attachment_total, decode_pending, encode_pending, read, write,
+    };
+    use crate::ClientError;
     use serde_json::json;
 
     /// The queue's framing carries every record, in order, whatever the bytes
@@ -1042,6 +1069,27 @@ mod tests {
                 .to_string()
                 .contains("Compression method not supported")
         );
+    }
+
+    #[test]
+    fn attachment_size_limits_apply_to_export_and_import() {
+        let oversized = checked_attachment_total(
+            "content/chunks/oversized",
+            MAX_ATTACHMENT_BYTES + 1,
+            0,
+            ClientError::Export,
+        )
+        .expect_err("oversized export attachment");
+        assert!(oversized.to_string().contains("above"));
+
+        let aggregate = checked_attachment_total(
+            "content/chunks/last",
+            1,
+            MAX_ATTACHMENTS_BYTES,
+            ClientError::Import,
+        )
+        .expect_err("oversized import aggregate");
+        assert!(aggregate.to_string().contains("aggregate"));
     }
 
     fn set_zip_compression(bytes: &mut [u8], path: &[u8], method: u16) {
