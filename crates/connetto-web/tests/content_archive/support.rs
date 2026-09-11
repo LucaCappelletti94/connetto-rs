@@ -141,3 +141,20 @@ pub(super) async fn timeout_ms(ms: i32) {
     });
     JsFuture::from(promise).await.expect("timeout");
 }
+
+/// Polls per task turn rather than per microtask, because the worker's stored
+/// bytes and its timers only advance on the macrotask queue.
+const POLL_MS: i32 = 10;
+/// Three seconds of turns, enough for a loaded CI machine.
+const POLLS: usize = 300;
+
+/// Wait for `ready`, yielding a task turn between attempts.
+pub(super) async fn until(mut ready: impl AsyncFnMut() -> bool) -> bool {
+    for _ in 0..POLLS {
+        if ready().await {
+            return true;
+        }
+        timeout_ms(POLL_MS).await;
+    }
+    ready().await
+}

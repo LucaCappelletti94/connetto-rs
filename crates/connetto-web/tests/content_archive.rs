@@ -28,16 +28,18 @@ use diesel::prelude::*;
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
-use js_sys::{Array, Promise, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use js_sys::{Array, Uint8Array};
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{DedicatedWorkerGlobalScope, File};
 
-#[path = "content_archive/fetch.rs"]
-mod fetch;
+#[path = "content_archive/support.rs"]
+mod support;
 
-use fetch::{fetch_bytes, install_blocked_content_fetch, install_content_fetch, timeout_ms};
+use support::{
+    fetch_bytes, install_blocked_content_fetch, install_content_fetch, timeout_ms, until,
+};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -241,14 +243,10 @@ async fn a_relay_import_drives_the_worker_outbox() {
     let uploaded = Rc::new(RefCell::new(Vec::new()));
     let fetch = install_content_fetch(&uploaded);
     hub.import_local_data(archive).await.expect("relay import");
-    for _ in 0..100 {
-        if !uploaded.borrow().is_empty() {
-            break;
-        }
-        JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
-            .await
-            .expect("yield to uploader");
-    }
+    assert!(
+        until(async || !uploaded.borrow().is_empty()).await,
+        "the relay import must upload the restored photo"
+    );
     drop(fetch);
     assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
     serial.release();
@@ -271,13 +269,10 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     let uploaded = Rc::new(RefCell::new(Vec::new()));
     let fetch = install_blocked_content_fetch(&uploaded);
     hub.import_local_data(archive).await.expect("relay import");
-    for _ in 0..100 {
-        if fetch.started.get() {
-            break;
-        }
-        timeout_ms(10).await;
-    }
-    assert!(fetch.started.get(), "the content transfer must start");
+    assert!(
+        until(async || fetch.started.get()).await,
+        "the content transfer must start"
+    );
 
     let answer = select(Box::pin(hub.unsynced()), Box::pin(timeout_ms(1_000))).await;
     fetch.release();
@@ -286,22 +281,22 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
         Either::Right(_) => panic!("the hub did not service local work during content transfer"),
     };
     assert_eq!(pending.content_files, 1);
-    for _ in 0..100 {
-        if !uploaded.borrow().is_empty() {
-            break;
-        }
-        timeout_ms(10).await;
-    }
+    assert!(
+        until(async || !uploaded.borrow().is_empty()).await,
+        "the released transfer must reach the server"
+    );
     assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
-    let mut after = hub.unsynced().await.expect("post-upload pending work");
-    for _ in 0..100 {
-        if after.content_files == 0 {
-            break;
-        }
-        timeout_ms(10).await;
-        after = hub.unsynced().await.expect("retry pending-work query");
-    }
-    assert_eq!(after.content_files, 0);
+    assert!(
+        until(async || {
+            hub.unsynced()
+                .await
+                .expect("pending-work reply")
+                .content_files
+                == 0
+        })
+        .await,
+        "the content outbox must drain once the upload lands"
+    );
     serial.release();
 }
 
@@ -400,17 +395,8 @@ fn start_recovering_relay(
 }
 
 async fn wait_for_reconnect(completed_subscribes: &Cell<u32>) {
-    for _ in 0..100 {
-        if completed_subscribes.get() == 1 {
-            return;
-        }
-        JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
-            .await
-            .expect("yield to relay");
-    }
-    assert_eq!(
-        completed_subscribes.get(),
-        1,
+    assert!(
+        until(async || completed_subscribes.get() == 1).await,
         "the replacement transport completes one subscription replay"
     );
 }
