@@ -14,7 +14,7 @@ pub use boot::{BootedSession, DbWorkerConfig, WorkerBootstrap, boot_db_worker, s
 pub use intake::{
     TabWire, announce_tab, await_db_worker_ready, request_custody, sleep, tab_wire_factory,
 };
-pub use logout::serve_logout_requests;
+pub use logout::{LogoutConfig, serve_logout_requests};
 
 /// The shared rendezvous channel for worker readiness and tab announcements.
 pub const HELLO_CHANNEL: &str = "connetto-hello";

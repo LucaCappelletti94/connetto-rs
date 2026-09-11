@@ -16,24 +16,47 @@ use super::helpers::sleep_ms;
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
 
+enum HelloReady {
+    Waiting,
+    Up,
+    Failed(String),
+}
+
+async fn poll_hello_channel(
+    channel: &BroadcastChannel,
+    state: &Rc<RefCell<HelloReady>>,
+) -> Result<(), JsValue> {
+    const POLL_MS: i32 = 50;
+    const TIMEOUT_MS: f64 = 15_000.0;
+    let started = js_sys::Date::now();
+    loop {
+        match &*state.borrow() {
+            HelloReady::Up => return Ok(()),
+            HelloReady::Failed(detail) => {
+                let detail = detail.clone();
+                return Err(JsValue::from_str(&format!(
+                    "db worker boot failed: {detail}"
+                )));
+            }
+            HelloReady::Waiting => {}
+        }
+        if js_sys::Date::now() - started >= TIMEOUT_MS {
+            return Err(JsValue::from_str("db worker did not answer readiness"));
+        }
+        let _ = channel.post_message(&JsValue::from_str("ask"));
+        sleep_ms(POLL_MS).await;
+    }
+}
+
 /// Page side: resolve once the DB worker's intake answers on the hello channel.
 ///
 /// # Errors
 ///
 /// A boot-failure string if the worker reported one, or a timeout string.
 pub async fn await_db_worker_ready() -> Result<(), JsValue> {
-    const POLL_MS: i32 = 50;
-    const TIMEOUT_MS: f64 = 15_000.0;
-
-    enum Ready {
-        Waiting,
-        Up,
-        Failed(String),
-    }
-
     let channel = BroadcastChannel::new(super::HELLO_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
-    let state = Rc::new(RefCell::new(Ready::Waiting));
+    let state = Rc::new(RefCell::new(HelloReady::Waiting));
     let on_message = {
         let state = Rc::clone(&state);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -41,38 +64,17 @@ pub async fn await_db_worker_ready() -> Result<(), JsValue> {
                 return;
             };
             if message == "ready" {
-                *state.borrow_mut() = Ready::Up;
+                *state.borrow_mut() = HelloReady::Up;
             } else if let Some(detail) = message.strip_prefix("failed:") {
-                *state.borrow_mut() = Ready::Failed(detail.to_owned());
+                *state.borrow_mut() = HelloReady::Failed(detail.to_owned());
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let started = js_sys::Date::now();
-    loop {
-        match &*state.borrow() {
-            Ready::Up => break,
-            Ready::Failed(detail) => {
-                let detail = detail.clone();
-                channel.set_onmessage(None);
-                channel.close();
-                return Err(JsValue::from_str(&format!(
-                    "db worker boot failed: {detail}"
-                )));
-            }
-            Ready::Waiting => {}
-        }
-        if js_sys::Date::now() - started >= TIMEOUT_MS {
-            channel.set_onmessage(None);
-            channel.close();
-            return Err(JsValue::from_str("db worker did not answer readiness"));
-        }
-        let _ = channel.post_message(&JsValue::from_str("ask"));
-        sleep_ms(POLL_MS).await;
-    }
+    let result = poll_hello_channel(&channel, &state).await;
     channel.set_onmessage(None);
     channel.close();
-    Ok(())
+    result
 }
 
 /// Page side: announce a tab's wire channel and wait for the worker's attachment ack.
@@ -126,6 +128,12 @@ pub async fn sleep(duration: core::time::Duration) {
     sleep_ms(ms).await;
 }
 
+fn decode_custody_reply(data: &JsValue) -> Option<Custody> {
+    let text = data.as_string()?;
+    let encoded = text.strip_prefix("custody:")?;
+    decode_custody(encoded)
+}
+
 /// Page side: ask the worker for the current custody level over the hello channel.
 pub async fn request_custody() -> Custody {
     let channel = BroadcastChannel::new(super::HELLO_CHANNEL).expect("hello channel");
@@ -133,10 +141,7 @@ pub async fn request_custody() -> Custody {
     let on_message = {
         let result = Rc::clone(&result);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(text) = event.data().as_string()
-                && let Some(encoded) = text.strip_prefix("custody:")
-                && let Some(custody) = decode_custody(encoded)
-            {
+            if let Some(custody) = decode_custody_reply(&event.data()) {
                 result.set(Some(custody));
             }
         })

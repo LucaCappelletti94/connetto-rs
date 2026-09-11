@@ -63,10 +63,7 @@ pub(super) async fn directory_handle(
     let options = FileSystemGetDirectoryOptions::new();
     options.set_create(create);
     match JsFuture::from(parent.get_directory_handle_with_options(name, &options)).await {
-        Ok(value) => value
-            .dyn_into::<FileSystemDirectoryHandle>()
-            .map(Some)
-            .map_err(|value| type_error("decode directory handle", &value)),
+        Ok(value) => cast_optional(value, "decode directory handle"),
         Err(value) if !create && (is_not_found(&value) || is_type_mismatch(&value)) => Ok(None),
         Err(value) => Err(browser_error("open directory", &value)),
     }
@@ -80,10 +77,7 @@ pub(super) async fn file_handle(
     let options = FileSystemGetFileOptions::new();
     options.set_create(create);
     match JsFuture::from(parent.get_file_handle_with_options(name, &options)).await {
-        Ok(value) => value
-            .dyn_into::<FileSystemFileHandle>()
-            .map(Some)
-            .map_err(|value| type_error("decode file handle", &value)),
+        Ok(value) => cast_optional(value, "decode file handle"),
         Err(value) if !create && is_not_found(&value) => Ok(None),
         Err(value) if !create && is_type_mismatch(&value) => Err(type_error("open chunk", &value)),
         Err(value) => Err(browser_error("open chunk", &value)),
@@ -109,6 +103,16 @@ pub(super) async fn next_key(
     Ok(Reflect::get(&result, &JsValue::from_str("value"))
         .map_err(|value| browser_error("read directory entry", &value))?
         .as_string())
+}
+
+fn cast_optional<T: JsCast>(
+    value: JsValue,
+    label: &'static str,
+) -> Result<Option<T>, BrowserStoreError> {
+    value
+        .dyn_into::<T>()
+        .map(Some)
+        .map_err(|v| type_error(label, &v))
 }
 
 fn is_dom_exception(value: &JsValue, name: &str) -> bool {

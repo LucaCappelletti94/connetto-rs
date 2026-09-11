@@ -4,17 +4,22 @@ use connetto_core::traits::RefreshTokenStore;
 
 use super::helpers::to_js;
 
+/// Bundled storage context for session acquisition and token persistence.
+pub(crate) struct RefreshStoreHandle<'a> {
+    pub(crate) db_name: &'a str,
+    pub(crate) storage: &'a crate::storage::ReplicaStorage,
+    pub(crate) key_store: &'a crate::auth::IdbKeyStore,
+}
+
 /// Acquire a session, refreshing silently or driving an interactive login.
-pub(super) async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
+pub(crate) async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Serialize>(
     auth: &crate::auth::WorkerAuthConfig,
-    auth_db_name: &str,
-    storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::IdbKeyStore,
+    store: &RefreshStoreHandle<'_>,
     pick_account: bool,
 ) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
-    let store = open_refresh_store(auth_db_name, storage, key_store).await?;
-    let account = choose_account(&store, pick_account).await?;
-    drive_acquisition(auth, &store, account).await
+    let refresh = open_refresh_store(store).await?;
+    let account = choose_account(&refresh, pick_account).await?;
+    drive_acquisition(auth, &refresh, account).await
 }
 
 /// Select which account to sign in as, or `None` for an interactive login.
@@ -49,7 +54,7 @@ async fn choose_account(
 }
 
 /// Acquire without persisting anything, for a first run whose gate has not settled yet.
-pub(super) async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Serialize>(
+pub(crate) async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Serialize>(
     auth: &crate::auth::WorkerAuthConfig,
 ) -> Result<
     (
@@ -64,27 +69,25 @@ pub(super) async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Se
 }
 
 /// Write a deferred acquisition through to the real store once the gate has settled.
-pub(super) async fn persist_deferred(
+pub(crate) async fn persist_deferred(
     deferred: &crate::auth::DeferredRefreshStore,
-    auth_db_name: &str,
-    storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::IdbKeyStore,
+    store: &RefreshStoreHandle<'_>,
 ) -> Result<(), JsValue> {
-    let store = open_refresh_store(auth_db_name, storage, key_store).await?;
+    let refresh = open_refresh_store(store).await?;
     for (account, token) in deferred.take() {
-        RefreshTokenStore::store(&store, &account, &token).map_err(to_js)?;
+        RefreshTokenStore::store(&refresh, &account, &token).map_err(to_js)?;
     }
     Ok(())
 }
 
 /// Open the refresh store under this device's own key.
 async fn open_refresh_store(
-    auth_db_name: &str,
-    storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::IdbKeyStore,
+    ctx: &RefreshStoreHandle<'_>,
 ) -> Result<crate::auth::RefreshStore, JsValue> {
-    let device_key = crate::storage::device_key(key_store).await.map_err(to_js)?;
-    let auth_db_url = storage.db_url(auth_db_name);
+    let device_key = crate::storage::device_key(ctx.key_store)
+        .await
+        .map_err(to_js)?;
+    let auth_db_url = ctx.storage.db_url(ctx.db_name);
     match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
         Ok(store) => Ok(store),
         Err(crate::auth::AuthError::Undecryptable(detail)) => {
@@ -93,7 +96,7 @@ async fn open_refresh_store(
                 "db worker: the refresh store does not decrypt, discarding it and requiring a \
                  fresh login"
             );
-            storage.delete_db(auth_db_name).map_err(to_js)?;
+            ctx.storage.delete_db(ctx.db_name).map_err(to_js)?;
             crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)
         }
         Err(err) => Err(to_js(err)),

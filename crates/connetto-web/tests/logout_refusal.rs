@@ -35,7 +35,7 @@ use connetto_web::auth::{
 };
 use connetto_web::relay::HubReconnect;
 use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
-use connetto_web::workers::serve_logout_requests;
+use connetto_web::workers::{LogoutConfig, serve_logout_requests};
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary};
 use tokio::sync::Notify;
@@ -214,11 +214,13 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
         pump.await.expect("hub pump");
     });
     serve_logout_requests(
-        unused_auth(),
-        AUTH_DB,
-        REPLICA,
-        Some("content-wipe-namespace".to_owned()),
-        None,
+        LogoutConfig {
+            auth: unused_auth(),
+            auth_db_name: AUTH_DB.to_owned(),
+            replica_db_name: REPLICA.to_owned(),
+            content_namespace: Some("content-wipe-namespace".to_owned()),
+            account: None,
+        },
         hub.clone(),
     )
     .expect("install the logout service");

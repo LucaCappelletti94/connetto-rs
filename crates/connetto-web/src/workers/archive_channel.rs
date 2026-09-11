@@ -333,6 +333,26 @@ pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue>
     })
 }
 
+fn post_channel_reply(
+    channel: &BroadcastChannel,
+    reply: Result<JsValue, JsValue>,
+    label: &'static str,
+) {
+    match reply {
+        Ok(msg) => {
+            let _ = channel.post_message(&msg);
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, "db worker: building a {label} reply failed");
+        }
+    }
+}
+
+fn install_worker_listener(channel: &BroadcastChannel, listener: Closure<dyn FnMut(MessageEvent)>) {
+    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+    listener.forget();
+}
+
 fn serve_exports<F, Fut, E>(export: F) -> Result<(), JsValue>
 where
     F: Fn(ExportScope) -> Fut + 'static,
@@ -366,19 +386,11 @@ where
                     Ok(bytes) => export_reply_ok(&tag, &bytes),
                     Err(err) => export_reply_failed(&tag, &err.to_string()),
                 };
-                match reply {
-                    Ok(reply) => {
-                        let _ = channel.post_message(&reply);
-                    }
-                    Err(err) => {
-                        tracing::error!(error = ?err, "db worker: building an export reply failed");
-                    }
-                }
+                post_channel_reply(&channel, reply, "export");
             });
         })
     };
-    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
-    listener.forget();
+    install_worker_listener(&channel, listener);
     Ok(())
 }
 
@@ -426,20 +438,52 @@ where
                     Ok((outcome, collisions)) => import_reply_ok(&outcome, collisions),
                     Err(err) => import_reply_failed(&err.to_string()),
                 };
-                match reply {
-                    Ok(reply) => {
-                        let _ = channel.post_message(&reply);
-                    }
-                    Err(err) => {
-                        tracing::error!(error = ?err, "db worker: building an import reply failed");
-                    }
-                }
+                post_channel_reply(&channel, reply, "import");
             });
         })
     };
-    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
-    listener.forget();
+    install_worker_listener(&channel, listener);
     Ok(())
+}
+
+fn export_message_handler(
+    state: Rc<RefCell<ExportWait>>,
+    request: String,
+) -> Closure<dyn FnMut(MessageEvent)> {
+    Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        if let Some(generation) = decode_export_generation(&event.data()) {
+            let mut state = state.borrow_mut();
+            match &state.generation {
+                Some(expected) if expected != &generation => state.replaced = true,
+                None => state.generation = Some(generation),
+                Some(_) => {}
+            }
+            return;
+        }
+        let Some((tag, reply)) = decode_export_reply(&event.data()) else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        if tag.request == request && state.generation.as_deref() == Some(tag.generation.as_str()) {
+            state.result.get_or_insert(reply);
+        }
+    })
+}
+
+fn collect_export_result(
+    channel: &BroadcastChannel,
+    on_message: Closure<dyn FnMut(MessageEvent)>,
+    state: &ExportSlot,
+) -> Result<Vec<u8>, crate::relay::ExportRefused> {
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    let mut state = state.borrow_mut();
+    match state.result.take() {
+        Some(Ok(bytes)) if !state.replaced => Ok(bytes),
+        Some(Err(err)) if !state.replaced => Err(crate::relay::ExportRefused::Failed(err)),
+        _ => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
+    }
 }
 
 /// Page side: ask the DB worker for a zip archive of this device's local data.
@@ -453,30 +497,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
         .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
     let state: ExportSlot = Rc::new(RefCell::new(ExportWait::default()));
     let request = rosetta_uuid::Uuid::new_v4().to_string();
-    let on_message = {
-        let state = Rc::clone(&state);
-        let request = request.clone();
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(generation) = decode_export_generation(&event.data()) {
-                let mut state = state.borrow_mut();
-                match &state.generation {
-                    Some(expected) if expected != &generation => state.replaced = true,
-                    None => state.generation = Some(generation),
-                    Some(_) => {}
-                }
-                return;
-            }
-            let Some((tag, reply)) = decode_export_reply(&event.data()) else {
-                return;
-            };
-            let mut state = state.borrow_mut();
-            if tag.request == request
-                && state.generation.as_deref() == Some(tag.generation.as_str())
-            {
-                state.result.get_or_insert(reply);
-            }
-        })
-    };
+    let on_message = export_message_handler(Rc::clone(&state), request.clone());
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let generation_request = build_export_generation_request();
     let generation = poll_for_export_generation(&channel, &state, &generation_request).await;
@@ -489,15 +510,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
         };
         poll_for_export_reply(&channel, &state, &generation_request, scope, tag).await;
     }
-    channel.set_onmessage(None);
-    channel.close();
-    drop(on_message);
-    let mut state = state.borrow_mut();
-    match state.result.take() {
-        Some(Ok(bytes)) if !state.replaced => Ok(bytes),
-        Some(Err(err)) if !state.replaced => Err(crate::relay::ExportRefused::Failed(err)),
-        _ => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
-    }
+    collect_export_result(&channel, on_message, &state)
 }
 
 /// Page side: hand the DB worker a `File` to import and wait for the outcome.

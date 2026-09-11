@@ -626,6 +626,26 @@ fn register_account_chooser(
     });
 }
 
+/// Decodes the JSON broadcast payload from the identity channel.
+/// Returns `None` when the event carries no parseable JSON object.
+fn decode_boot_message(
+    event: &MessageEvent,
+) -> Option<(Option<String>, Option<u64>, Option<String>)> {
+    let data = event.data().as_string()?;
+    let obj = js_sys::JSON::parse(&data).ok()?;
+    let identity = js_sys::Reflect::get(&obj, &"identity".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    let expires_at = js_sys::Reflect::get(&obj, &"expiresAt".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .and_then(|s| s.parse::<u64>().ok());
+    let account = js_sys::Reflect::get(&obj, &"account".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    Some((identity, expires_at, account))
+}
+
 /// Custom hook: listens on the identity broadcast channel and updates the
 /// identity, account, session expiry, and expiry warning state.
 #[hook]
@@ -644,22 +664,9 @@ fn use_boot_session_listener(
             let session_expires_at = session_expires_at.clone();
             let expiry_warn = expiry_warn.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                let Some(data) = event.data().as_string() else {
+                let Some((id, expires_at, account)) = decode_boot_message(&event) else {
                     return;
                 };
-                let Ok(obj) = js_sys::JSON::parse(&data) else {
-                    return;
-                };
-                let id = js_sys::Reflect::get(&obj, &"identity".into())
-                    .ok()
-                    .and_then(|v| v.as_string());
-                let expires_at = js_sys::Reflect::get(&obj, &"expiresAt".into())
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .and_then(|s| s.parse::<u64>().ok());
-                let account = js_sys::Reflect::get(&obj, &"account".into())
-                    .ok()
-                    .and_then(|v| v.as_string());
                 if let Some(id) = id {
                     identity.set(Some(id));
                 }

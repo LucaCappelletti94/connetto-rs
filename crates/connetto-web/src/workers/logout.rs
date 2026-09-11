@@ -3,6 +3,21 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, MessageEvent};
 
+/// Configuration bundle for the logout request handler.
+#[derive(Clone)]
+pub struct LogoutConfig {
+    /// Authentication service configuration.
+    pub auth: crate::auth::WorkerAuthConfig,
+    /// Name of the authentication database.
+    pub auth_db_name: String,
+    /// Name of the replica database.
+    pub replica_db_name: String,
+    /// Content-file wipe namespace, if any.
+    pub content_namespace: Option<String>,
+    /// Authenticated account identifier, if any.
+    pub account: Option<String>,
+}
+
 /// Serve [`crate::auth::LOGOUT_CHANNEL`] for this worker's life.
 ///
 /// [`super::boot_db_worker`] calls this itself; call directly when assembling a worker by hand.
@@ -11,15 +26,9 @@ use web_sys::{BroadcastChannel, MessageEvent};
 ///
 /// The `BroadcastChannel` error when the channel cannot be opened.
 pub fn serve_logout_requests(
-    auth: crate::auth::WorkerAuthConfig,
-    auth_db_name: &str,
-    replica_db_name: &str,
-    content_namespace: Option<String>,
-    account: Option<String>,
+    config: LogoutConfig,
     hub: crate::relay::RelayHub,
 ) -> Result<(), JsValue> {
-    let auth_db_name = auth_db_name.to_owned();
-    let replica_db_name = replica_db_name.to_owned();
     let channel = BroadcastChannel::new(crate::auth::LOGOUT_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("logout channel: {err:?}")))?;
     let listener = {
@@ -33,31 +42,10 @@ pub fn serve_logout_requests(
             };
             let channel = channel.clone();
             let hub = hub.clone();
-            let auth = auth.clone();
-            let auth_db_name = auth_db_name.clone();
-            let replica_db_name = replica_db_name.clone();
-            let content_namespace = content_namespace.clone();
-            let account = account.clone();
+            let config = config.clone();
             spawn_local(async move {
-                if let Some(reply) = serve_logout(
-                    &request,
-                    &hub,
-                    &auth,
-                    &auth_db_name,
-                    &replica_db_name,
-                    content_namespace.as_deref(),
-                    account.as_deref(),
-                )
-                .await
-                {
-                    match serde_json::to_string(&reply) {
-                        Ok(encoded) => {
-                            let _ = channel.post_message(&JsValue::from_str(&encoded));
-                        }
-                        Err(err) => {
-                            tracing::error!(error = %err, "db worker: encoding a logout reply failed");
-                        }
-                    }
+                if let Some(reply) = serve_logout(&request, &hub, &config).await {
+                    post_logout_reply(&channel, &reply);
                 }
             });
         })
@@ -139,15 +127,22 @@ async fn guard_replica_deletion(
         })
 }
 
+fn post_logout_reply(channel: &BroadcastChannel, reply: &crate::auth::LogoutMessage) {
+    match serde_json::to_string(reply) {
+        Ok(encoded) => {
+            let _ = channel.post_message(&JsValue::from_str(&encoded));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "db worker: encoding a logout reply failed");
+        }
+    }
+}
+
 /// Handle one logout-channel request, returning the reply or `None` for non-request traffic.
 async fn serve_logout(
     request: &crate::auth::LogoutMessage,
     hub: &crate::relay::RelayHub,
-    auth: &crate::auth::WorkerAuthConfig,
-    auth_db_name: &str,
-    replica_db_name: &str,
-    content_namespace: Option<&str>,
-    account: Option<&str>,
+    config: &LogoutConfig,
 ) -> Option<crate::auth::LogoutMessage> {
     use crate::auth::LogoutMessage;
     let (delete, force) = match request {
@@ -169,12 +164,23 @@ async fn serve_logout(
     };
     // Guard before revoke: a refused delete must leave the session intact.
     if delete
-        && let Err(reply) =
-            guard_replica_deletion(replica_db_name, content_namespace, hub, force).await
+        && let Err(reply) = guard_replica_deletion(
+            &config.replica_db_name,
+            config.content_namespace.as_deref(),
+            hub,
+            force,
+        )
+        .await
     {
         return reply;
     }
-    match logout_locally(auth, auth_db_name, account).await {
+    match logout_locally(
+        &config.auth,
+        &config.auth_db_name,
+        config.account.as_deref(),
+    )
+    .await
+    {
         Ok(()) => {}
         Err(err) => tracing::warn!(
             error = %err,

@@ -266,17 +266,15 @@ where
         C: core::future::Future<Output = ()>,
     {
         let mut observed = Vec::new();
-        let result = self
-            .begin_attempt(connection, &mut observed, state, cancel)
-            .await;
+        let mut cursor = FlushCursor { connection, state };
+        let result = self.begin_attempt(&mut cursor, &mut observed, cancel).await;
         (result, observed)
     }
 
     async fn begin_attempt<T, C>(
         &self,
-        connection: &mut ConnettoConnection<T>,
+        cursor: &mut FlushCursor<'_, T>,
         observed: &mut Vec<ClientEvent>,
-        state: &mut ContentFlushState,
         cancel: C,
     ) -> Result<ContentFlushStart<B>, ContentError>
     where
@@ -284,28 +282,28 @@ where
         T::Error: Display,
         C: core::future::Future<Output = ()>,
     {
-        let Some(file_id) = Self::next_outbox_file(connection, state)? else {
+        let Some(file_id) = Self::next_outbox_file(cursor.connection, cursor.state)? else {
             return Ok(ContentFlushStart::Complete(ContentFlush::Empty));
         };
-        let manifest = match Self::load_outbox_manifest(connection, file_id)? {
+        let manifest = match Self::load_outbox_manifest(cursor.connection, file_id)? {
             ManifestStart::Ready(manifest) => manifest,
             ManifestStart::Complete(flush) => return Ok(ContentFlushStart::Complete(flush)),
         };
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
         let upload_url = match ticket::request_connection_or(
-            connection,
+            cursor.connection,
             file_id,
             ContentVerb::Write { declared_len },
             observed,
             cancel,
-            &mut state.pending_ticket,
+            &mut cursor.state.pending_ticket,
         )
         .await
         {
             Ok(Some(url)) => url,
             Ok(None) => return Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)),
             Err(error) => {
-                return Self::finish_attempt(connection, file_id, Err(error))
+                return Self::finish_attempt(cursor.connection, file_id, Err(error))
                     .map(ContentFlushStart::Complete);
             }
         };
