@@ -12,10 +12,10 @@ use connetto_file_core::{
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
-use crate::client::{apply_content_import, prepare_content_import, write_import_chunks};
 use crate::db;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
+use crate::import::{apply_content_import, prepare_content_import, write_import_chunks};
 use crate::{ticket, upload};
 
 /// Result of one worker-owned outbox attempt.
@@ -44,6 +44,14 @@ impl ContentFlushState {
     pub fn is_waiting(&self) -> bool {
         self.pending_ticket.is_some()
     }
+}
+
+/// Coupled mutable state for one raw-connection outbox walk.
+pub struct FlushCursor<'a, T: Transport> {
+    /// The live sync connection.
+    pub connection: &'a mut ConnettoConnection<T>,
+    /// Ongoing attempt state.
+    pub state: &'a mut ContentFlushState,
 }
 
 /// The entry to attempt next: one past `last`, wrapping.
@@ -217,9 +225,8 @@ where
     /// together.
     pub async fn flush_next_or<T, H, C>(
         &self,
-        connection: &mut ConnettoConnection<T>,
+        cursor: &mut FlushCursor<'_, T>,
         http: &H,
-        state: &mut ContentFlushState,
         cancel: C,
     ) -> (Result<ContentFlush, ContentError>, Vec<ClientEvent>)
     where
@@ -228,12 +235,14 @@ where
         H: ContentHttp,
         C: core::future::Future<Output = ()>,
     {
-        let (start, observed) = self.begin_flush_next_or(connection, state, cancel).await;
+        let (start, observed) = self
+            .begin_flush_next_or(cursor.connection, cursor.state, cancel)
+            .await;
         let result = match start {
             Ok(ContentFlushStart::Complete(flush)) => Ok(flush),
             Ok(ContentFlushStart::Upload(upload)) => {
                 let result = upload.transfer(http).await;
-                self.finish_upload(connection, &upload, result)
+                self.finish_upload(cursor.connection, &upload, result)
             }
             Err(error) => Err(error),
         };

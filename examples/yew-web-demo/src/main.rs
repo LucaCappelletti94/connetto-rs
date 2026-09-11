@@ -28,7 +28,7 @@
 //! `CONNETTO_PG_DDL_FILE`, then `trunk serve` from this directory and open
 //! the served URL in several windows.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
@@ -562,6 +562,222 @@ impl PartialEq for ClientHandle {
     }
 }
 
+/// Async helper: queries unsynced work and updates the expiry warning.
+/// Exits early if `exp_secs` is no longer the latest session.
+async fn compute_expiry_for_session(
+    exp_secs: u64,
+    latest: Rc<Cell<u64>>,
+    expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
+) {
+    let expires = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(exp_secs);
+    let pending = connetto_web::auth::request_unsynced().await;
+    if latest.get() != exp_secs {
+        return;
+    }
+    let Ok(pending) = pending else {
+        if expiry_warn
+            .as_ref()
+            .is_some_and(|warn| warn.session_expires_at != expires)
+        {
+            expiry_warn.set(None);
+        }
+        return;
+    };
+    let now_ms = js_sys::Date::now();
+    // Date.now() is always finite and non-negative (ms since epoch).
+    debug_assert!(now_ms.is_finite() && now_ms >= 0.0);
+    // Deliberate truncation to whole seconds for SystemTime arithmetic.
+    let now_secs = (now_ms / 1000.0) as u64;
+    let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs);
+    let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    expiry_warn.set(expiry_warning(
+        now,
+        expires,
+        lead,
+        pending.mutation_seqs,
+        pending.content_files,
+    ));
+}
+
+/// Registers the account chooser callback that the worker calls when it needs
+/// the user to pick an account. Called on every render so the closure captures
+/// the current render's state handles.
+fn register_account_chooser(
+    account_picker: UseStateHandle<Option<Vec<String>>>,
+    known_accounts: UseStateHandle<Vec<String>>,
+    pending_choice: Rc<RefCell<Option<AccountChoice>>>,
+) {
+    serve_account_choice(move |accounts| {
+        let account_picker = account_picker.clone();
+        let known_accounts = known_accounts.clone();
+        let pending_choice = pending_choice.clone();
+        async move {
+            *pending_choice.borrow_mut() = None;
+            known_accounts.set(accounts.clone());
+            account_picker.set(Some(accounts));
+            loop {
+                workers::sleep(core::time::Duration::from_millis(30)).await;
+                if let Some(choice) = pending_choice.borrow().clone() {
+                    account_picker.set(None);
+                    return choice;
+                }
+            }
+        }
+    });
+}
+
+/// Custom hook: listens on the identity broadcast channel and updates the
+/// identity, account, session expiry, and expiry warning state.
+#[hook]
+fn use_boot_session_listener(
+    identity: UseStateHandle<Option<String>>,
+    booted_account: UseStateHandle<Option<String>>,
+    session_expires_at: UseStateHandle<Option<u64>>,
+    expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
+) {
+    use_effect_with((), move |()| {
+        let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
+        let latest_session = Rc::new(Cell::new(0u64));
+        let on_msg = {
+            let identity = identity.clone();
+            let booted_account = booted_account.clone();
+            let session_expires_at = session_expires_at.clone();
+            let expiry_warn = expiry_warn.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let Some(data) = event.data().as_string() else {
+                    return;
+                };
+                let Ok(obj) = js_sys::JSON::parse(&data) else {
+                    return;
+                };
+                let id = js_sys::Reflect::get(&obj, &"identity".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                let expires_at = js_sys::Reflect::get(&obj, &"expiresAt".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let account = js_sys::Reflect::get(&obj, &"account".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if let Some(id) = id {
+                    identity.set(Some(id));
+                }
+                if let Some(acc) = account {
+                    booted_account.set(Some(acc));
+                }
+                if let Some(exp) = expires_at {
+                    session_expires_at.set(Some(exp));
+                }
+                if let Some(exp_secs) = expires_at {
+                    latest_session.set(exp_secs);
+                    let ls = Rc::clone(&latest_session);
+                    spawn_local(compute_expiry_for_session(
+                        exp_secs,
+                        ls,
+                        expiry_warn.clone(),
+                    ));
+                }
+            })
+        };
+        channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+        move || {
+            channel.set_onmessage(None);
+            channel.close();
+            drop(on_msg);
+        }
+    });
+}
+
+/// Custom hook: listens on the login channel and records the URL the worker
+/// wants opened for interactive authentication.
+#[hook]
+fn use_login_url_listener(login_url: UseStateHandle<Option<String>>) {
+    use_effect_with((), move |()| {
+        let channel = BroadcastChannel::new(connetto_web::LOGIN_CHANNEL).expect("login channel");
+        let on_msg = {
+            let login_url = login_url.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let Some(text) = event.data().as_string() else {
+                    return;
+                };
+                let Ok(obj) = js_sys::JSON::parse(&text) else {
+                    return;
+                };
+                let kind = js_sys::Reflect::get(&obj, &"kind".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if kind.as_deref() != Some("request") {
+                    return;
+                }
+                if let Some(url) = js_sys::Reflect::get(&obj, &"url".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                {
+                    login_url.set(Some(url));
+                }
+            })
+        };
+        channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+        move || {
+            channel.set_onmessage(None);
+            channel.close();
+            drop(on_msg);
+        }
+    });
+}
+
+/// Custom hook: listens for the worker's provider query and replies with the
+/// configured provider name so the worker knows which OIDC flow to start.
+#[hook]
+fn use_provider_listener() {
+    use_effect_with((), move |()| {
+        let ch_recv = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL).expect("provider channel");
+        let ch_send = ch_recv.clone();
+        let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            if e.data().as_string().as_deref() == Some("provider?") {
+                let _ = ch_send.post_message(&JsValue::from_str(AUTH_PROVIDER));
+            }
+        });
+        ch_recv.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+        move || {
+            ch_recv.set_onmessage(None);
+            ch_recv.close();
+            drop(on_msg);
+        }
+    });
+}
+
+/// Custom hook: boots the DB worker connection and forwards status events.
+#[hook]
+fn use_boot_window_effect(
+    client: UseStateHandle<Option<ClientHandle>>,
+    status: UseStateHandle<String>,
+    boot_hold: Rc<RefCell<Option<Boot>>>,
+    custody: UseStateHandle<Custody>,
+) {
+    use_effect_with((), move |()| {
+        spawn_local(async move {
+            match boot_window().await {
+                Ok(boot) => {
+                    custody.set(boot.custody);
+                    let mut events = boot.client.events();
+                    client.set(Some(ClientHandle(Rc::new(boot.client.clone()))));
+                    status.set("connected".to_owned());
+                    *boot_hold.borrow_mut() = Some(boot);
+                    while let Ok(event) = events.recv().await {
+                        if let Some(label) = status_label(&event) {
+                            status.set(label);
+                        }
+                    }
+                }
+                Err(err) => status.set(format!("boot failed: {err:?}")),
+            }
+        });
+        || ()
+    });
+}
+
 #[function_component(App)]
 fn app() -> Html {
     let client = use_state(|| None::<ClientHandle>);
@@ -600,216 +816,29 @@ fn app() -> Html {
 
     // Register the account chooser. Called on every render (just updates a
     // thread-local), so the captures always point at the current render's state.
-    {
-        let account_picker = account_picker.clone();
-        let known_accounts = known_accounts.clone();
-        let pending_choice = pending_choice.clone();
-        serve_account_choice(move |accounts| {
-            let account_picker = account_picker.clone();
-            let known_accounts = known_accounts.clone();
-            let pending_choice = pending_choice.clone();
-            async move {
-                // Clear any stale answer from a previous chooser call.
-                *pending_choice.borrow_mut() = None;
-                known_accounts.set(accounts.clone());
-                account_picker.set(Some(accounts));
-                // Poll until the user makes a choice through the picker UI.
-                loop {
-                    workers::sleep(core::time::Duration::from_millis(30)).await;
-                    if let Some(choice) = pending_choice.borrow().clone() {
-                        account_picker.set(None);
-                        return choice;
-                    }
-                }
-            }
-        });
-    }
+    register_account_chooser(
+        account_picker.clone(),
+        known_accounts.clone(),
+        pending_choice.clone(),
+    );
 
-    // Listen for the worker broadcasting the boot session (identity, expiry, account).
-    {
-        let identity = identity.clone();
-        let booted_account = booted_account.clone();
-        let session_expires_at = session_expires_at.clone();
-        let expiry_warn = expiry_warn.clone();
-        use_effect_with((), move |()| {
-            let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
-            // The newest boot session this listener has seen, so a slow query
-            // cannot answer for a session that has already been replaced.
-            let latest_session = Rc::new(Cell::new(0u64));
-            let on_msg = {
-                let identity = identity.clone();
-                let booted_account = booted_account.clone();
-                let session_expires_at = session_expires_at.clone();
-                let expiry_warn = expiry_warn.clone();
-                Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                    let Some(data) = event.data().as_string() else {
-                        return;
-                    };
-                    let Ok(obj) = js_sys::JSON::parse(&data) else {
-                        return;
-                    };
+    use_boot_session_listener(
+        identity.clone(),
+        booted_account.clone(),
+        session_expires_at.clone(),
+        expiry_warn.clone(),
+    );
 
-                    let id = js_sys::Reflect::get(&obj, &"identity".into())
-                        .ok()
-                        .and_then(|v| v.as_string());
-                    let expires_at = js_sys::Reflect::get(&obj, &"expiresAt".into())
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .and_then(|s| s.parse::<u64>().ok());
-                    let account = js_sys::Reflect::get(&obj, &"account".into())
-                        .ok()
-                        .and_then(|v| v.as_string());
+    use_login_url_listener(login_url.clone());
 
-                    if let Some(id) = id {
-                        identity.set(Some(id));
-                    }
-                    if let Some(acc) = account {
-                        booted_account.set(Some(acc));
-                    }
-                    if let Some(exp) = expires_at {
-                        session_expires_at.set(Some(exp));
-                    }
+    use_provider_listener();
 
-                    // Compute the expiry warning when we have all the inputs.
-                    if let Some(exp_secs) = expires_at {
-                        let expiry_warn = expiry_warn.clone();
-                        latest_session.set(exp_secs);
-                        let latest_session = Rc::clone(&latest_session);
-                        spawn_local(async move {
-                            let expires = std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(exp_secs);
-                            let pending = connetto_web::auth::request_unsynced().await;
-                            if latest_session.get() != exp_secs {
-                                // A newer boot session arrived while this query
-                                // ran, and it owns the warning now.
-                                return;
-                            }
-                            let Ok(pending) = pending else {
-                                // Local work is unknown, so the last warning is
-                                // the best answer for this session, and no
-                                // answer at all for another.
-                                if expiry_warn
-                                    .as_ref()
-                                    .is_some_and(|warn| warn.session_expires_at != expires)
-                                {
-                                    expiry_warn.set(None);
-                                }
-                                return;
-                            };
-                            let now_ms = js_sys::Date::now();
-                            // Date.now() is always finite and non-negative (ms since epoch).
-                            debug_assert!(now_ms.is_finite() && now_ms >= 0.0);
-                            // Deliberate truncation to whole seconds for SystemTime arithmetic.
-                            let now_secs = (now_ms / 1000.0) as u64;
-                            let now = std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(now_secs);
-                            let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-                            expiry_warn.set(expiry_warning(
-                                now,
-                                expires,
-                                lead,
-                                pending.mutation_seqs,
-                                pending.content_files,
-                            ));
-                        });
-                    }
-                })
-            };
-            channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-            move || {
-                channel.set_onmessage(None);
-                channel.close();
-                drop(on_msg);
-            }
-        });
-    }
-
-    // Listen for the worker requesting an interactive login popup.
-    {
-        let login_url = login_url.clone();
-        use_effect_with((), move |()| {
-            let channel =
-                BroadcastChannel::new(connetto_web::LOGIN_CHANNEL).expect("login channel");
-            let on_msg = {
-                let login_url = login_url.clone();
-                Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                    let Some(text) = event.data().as_string() else {
-                        return;
-                    };
-                    let Ok(obj) = js_sys::JSON::parse(&text) else {
-                        return;
-                    };
-                    let kind = js_sys::Reflect::get(&obj, &"kind".into())
-                        .ok()
-                        .and_then(|v| v.as_string());
-                    if kind.as_deref() != Some("request") {
-                        return;
-                    }
-                    if let Some(url) = js_sys::Reflect::get(&obj, &"url".into())
-                        .ok()
-                        .and_then(|v| v.as_string())
-                    {
-                        login_url.set(Some(url));
-                    }
-                })
-            };
-            channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-            move || {
-                channel.set_onmessage(None);
-                channel.close();
-                drop(on_msg);
-            }
-        });
-    }
-
-    // Respond to the worker's provider query at each boot. The worker sends
-    // "provider?" on DEMO_PROVIDER_CHANNEL and this page always replies with
-    // the one provider the dev stack registers.
-    {
-        use_effect_with((), move |()| {
-            let ch_recv = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL).expect("provider channel");
-            let ch_send = ch_recv.clone();
-            let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-                if e.data().as_string().as_deref() == Some("provider?") {
-                    let _ = ch_send.post_message(&JsValue::from_str(AUTH_PROVIDER));
-                }
-            });
-            ch_recv.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-            move || {
-                ch_recv.set_onmessage(None);
-                ch_recv.close();
-                drop(on_msg);
-            }
-        });
-    }
-
-    // Connect to the DB worker and forward status events.
-    {
-        let client = client.clone();
-        let status = status.clone();
-        let boot_hold = boot_hold.clone();
-        let custody = custody.clone();
-        use_effect_with((), move |()| {
-            spawn_local(async move {
-                match boot_window().await {
-                    Ok(boot) => {
-                        custody.set(boot.custody);
-                        let mut events = boot.client.events();
-                        client.set(Some(ClientHandle(Rc::new(boot.client.clone()))));
-                        status.set("connected".to_owned());
-                        *boot_hold.borrow_mut() = Some(boot);
-                        while let Ok(event) = events.recv().await {
-                            if let Some(label) = status_label(&event) {
-                                status.set(label);
-                            }
-                        }
-                    }
-                    Err(err) => status.set(format!("boot failed: {err:?}")),
-                }
-            });
-            || ()
-        });
-    }
+    use_boot_window_effect(
+        client.clone(),
+        status.clone(),
+        boot_hold.clone(),
+        custody.clone(),
+    );
 
     let open_login = {
         let login_url = login_url.clone();

@@ -283,22 +283,29 @@ async fn collect_hashes(
     Ok(())
 }
 
+async fn remove_temps_in_fanout(
+    root: &FileSystemDirectoryHandle,
+    name: &str,
+) -> Result<(), BrowserStoreError> {
+    let Some(directory) = directory_handle(root, name, false).await? else {
+        return Ok(());
+    };
+    let entries = directory.keys();
+    while let Some(entry) = next_key(&entries).await? {
+        if temporary_name(&entry) {
+            remove_temporary_entry(&directory, &entry).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn remove_temporary_entries(
     root: &FileSystemDirectoryHandle,
 ) -> Result<(), BrowserStoreError> {
     let fanouts = root.keys();
     while let Some(name) = next_key(&fanouts).await? {
-        if !valid_fanout(&name) {
-            continue;
-        }
-        let Some(directory) = directory_handle(root, &name, false).await? else {
-            continue;
-        };
-        let entries = directory.keys();
-        while let Some(entry) = next_key(&entries).await? {
-            if temporary_name(&entry) {
-                remove_temporary_entry(&directory, &entry).await?;
-            }
+        if valid_fanout(&name) {
+            remove_temps_in_fanout(root, &name).await?;
         }
     }
     Ok(())
@@ -479,12 +486,16 @@ async fn remove_namespace(
     }
 }
 
+fn is_reserved_name(namespace: &str) -> bool {
+    namespace.is_empty() || namespace == "." || namespace == ".."
+}
+
+fn has_path_separator(namespace: &str) -> bool {
+    namespace.contains(['/', '\\'])
+}
+
 fn validate_namespace(namespace: &str) -> Result<(), BrowserStoreError> {
-    if namespace.is_empty()
-        || namespace == "."
-        || namespace == ".."
-        || namespace.contains(['/', '\\'])
-    {
+    if is_reserved_name(namespace) || has_path_separator(namespace) {
         return Err(BrowserStoreError::InvalidNamespace {
             namespace: namespace.to_owned(),
         });

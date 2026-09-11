@@ -111,16 +111,18 @@ pub(super) async fn next_key(
         .as_string())
 }
 
-pub(super) fn is_not_found(value: &JsValue) -> bool {
+fn is_dom_exception(value: &JsValue, name: &str) -> bool {
     value
         .dyn_ref::<DomException>()
-        .is_some_and(|exception| exception.name() == "NotFoundError")
+        .is_some_and(|exception| exception.name() == name)
+}
+
+pub(super) fn is_not_found(value: &JsValue) -> bool {
+    is_dom_exception(value, "NotFoundError")
 }
 
 fn is_type_mismatch(value: &JsValue) -> bool {
-    value
-        .dyn_ref::<DomException>()
-        .is_some_and(|exception| exception.name() == "TypeMismatchError")
+    is_dom_exception(value, "TypeMismatchError")
 }
 
 pub(super) fn browser_error(operation: &'static str, value: &JsValue) -> BrowserStoreError {

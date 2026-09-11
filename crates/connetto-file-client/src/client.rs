@@ -6,10 +6,7 @@ use std::io::Read;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
-use connetto_client::{
-    ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome,
-    ImportPlan, SyncStatus,
-};
+use connetto_client::{ClientEvent, ExportScope, ImportChoices, ImportOutcome, SyncStatus};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
@@ -23,6 +20,9 @@ use tokio::sync::broadcast;
 use crate::db;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
+use crate::import::{
+    ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
+};
 use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
 use crate::worker::{content_attachments, outbox_manifests, retire, unreadable_chunk_count};
 use crate::{ticket, upload};
@@ -87,75 +87,6 @@ pub enum ContentEvent {
         /// What went wrong.
         detail: String,
     },
-}
-
-/// A checked device archive ready to restore with its content.
-#[must_use = "pass this plan and import choices to apply_local_data_import"]
-#[derive(Debug)]
-pub struct ContentImportPlan {
-    replica: ImportPlan,
-    manifests: Vec<Manifest>,
-    chunks: Vec<(connetto_file_core::ChunkHash, Vec<u8>)>,
-}
-
-impl ContentImportPlan {
-    /// The replica plan, including collisions the application must present.
-    pub fn replica_plan(&self) -> &ImportPlan {
-        &self.replica
-    }
-
-    /// How many unsent content files the archive restores.
-    #[must_use]
-    pub fn content_files(&self) -> usize {
-        self.manifests.len()
-    }
-}
-
-pub(crate) fn prepare_content_import<T: Transport>(
-    connection: &mut ConnettoConnection<T>,
-    bytes: &[u8],
-) -> Result<ContentImportPlan, ContentError> {
-    let replica = connection.import_local_data(bytes)?;
-    let content = crate::archive::decode(replica.attachments())?;
-    Ok(ContentImportPlan {
-        replica,
-        manifests: content.manifests,
-        chunks: content.chunks,
-    })
-}
-
-pub(crate) async fn write_import_chunks<B>(
-    store: &B,
-    root_key: &[u8; 32],
-    plan: &ContentImportPlan,
-) -> Result<(), ContentError>
-where
-    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
-{
-    let store = EncryptingStore::new(store.clone(), root_key);
-    for (hash, bytes) in &plan.chunks {
-        store
-            .write_chunk(hash, bytes)
-            .await
-            .map_err(|error| ContentError::Store(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn apply_content_import<T: Transport>(
-    connection: &mut ConnettoConnection<T>,
-    plan: &ContentImportPlan,
-    choices: &ImportChoices,
-) -> Result<ImportOutcome, ContentError> {
-    connection
-        .apply_import_with_bookkeeping(&plan.replica, choices, |database| {
-            for manifest in &plan.manifests {
-                db::put_manifest(database, manifest)?;
-                db::enqueue(database, manifest.file_id())?;
-            }
-            Ok::<(), ClientError>(())
-        })
-        .map_err(Into::into)
 }
 
 /// Files, on top of a running [`ConnettoClient`].

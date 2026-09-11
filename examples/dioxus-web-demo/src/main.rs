@@ -821,6 +821,80 @@ fn App() -> Element {
     }
 }
 
+/// Async body for the expiry warning effect: queries unsynced work and updates
+/// the warning signal. Skips the update if a newer session arrived meanwhile.
+async fn poll_expiry_warn(
+    secs: u64,
+    session_expires_at: Signal<Option<u64>>,
+    mut expiry_warn: Signal<Option<ExpiryWarning>>,
+) {
+    let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let pending = request_unsynced().await;
+    if *session_expires_at.read() != Some(secs) {
+        return;
+    }
+    let Ok(pending) = pending else {
+        if expiry_warn
+            .read()
+            .as_ref()
+            .is_some_and(|warn| warn.session_expires_at != expires_at)
+        {
+            expiry_warn.set(None);
+        }
+        return;
+    };
+    let now_f64 = js_sys::Date::now();
+    // Deliberate truncation: milliseconds to seconds, always finite and non-negative.
+    debug_assert!(
+        now_f64.is_finite() && now_f64 >= 0.0,
+        "Date::now() must be finite"
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
+    expiry_warn.set(expiry_warning(
+        now,
+        expires_at,
+        Duration::from_secs(7 * 24 * 3600),
+        pending.mutation_seqs,
+        pending.content_files,
+    ));
+}
+
+/// Returns `(enrol_offerable, custody_text)` for the given custody snapshot.
+fn custody_description(snap: Option<Custody>) -> (bool, Option<String>) {
+    let offerable = matches!(snap, Some(Custody::Unverified(NoGate::Offerable)));
+    let text = snap.as_ref().map(|c| match c {
+        Custody::Verified => "gate: verified by passkey".to_owned(),
+        Custody::Unverified(NoGate::Offerable) => {
+            "gate: not verified (passkey available)".to_owned()
+        }
+        Custody::Unverified(NoGate::Declined) => "gate: not verified (passkey declined)".to_owned(),
+        Custody::Unverified(NoGate::Unsupported) => {
+            "gate: not verified (passkey not available on this device)".to_owned()
+        }
+        Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
+    });
+    (offerable, text)
+}
+
+/// Formats the session expiry warning line shown in the auth banner.
+fn format_expiry_line(warn: &ExpiryWarning) -> String {
+    let n = warn.pending_count();
+    let secs = warn
+        .session_expires_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let now_f64 = js_sys::Date::now();
+    // Deliberate truncation: milliseconds to seconds, always finite and non-negative.
+    debug_assert!(
+        now_f64.is_finite() && now_f64 >= 0.0,
+        "Date::now() must be finite"
+    );
+    let now_secs = (now_f64 / 1000.0) as u64;
+    let days = secs.saturating_sub(now_secs) / 86400;
+    format!("Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh.")
+}
+
 /// Auth status banner shown above the dashboard.
 ///
 /// Shows the login button when interactive auth is needed, or the authenticated
@@ -844,46 +918,11 @@ fn AuthBanner() -> Element {
     let mut expiry_warn: Signal<Option<ExpiryWarning>> = use_signal(|| None);
     let mut enrol_msg: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
-        let expires_secs = *session_expires_at.read();
-        spawn(async move {
-            let Some(secs) = expires_secs else {
-                expiry_warn.set(None);
-                return;
-            };
-            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            let pending = request_unsynced().await;
-            if *session_expires_at.read() != Some(secs) {
-                // A newer session arrived while this query ran, and its own
-                // effect owns the warning now.
-                return;
-            }
-            let Ok(pending) = pending else {
-                // Local work is unknown, so the last warning is the best
-                // answer for this session, and no answer at all for another.
-                if expiry_warn
-                    .read()
-                    .as_ref()
-                    .is_some_and(|warn| warn.session_expires_at != expires_at)
-                {
-                    expiry_warn.set(None);
-                }
-                return;
-            };
-            let now_f64 = js_sys::Date::now();
-            // Deliberate truncation: milliseconds since epoch, always finite and non-negative.
-            debug_assert!(
-                now_f64.is_finite() && now_f64 >= 0.0,
-                "Date::now() must be finite"
-            );
-            let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
-            expiry_warn.set(expiry_warning(
-                now,
-                expires_at,
-                Duration::from_secs(7 * 24 * 3600),
-                pending.mutation_seqs,
-                pending.content_files,
-            ));
-        });
+        let Some(secs) = *session_expires_at.read() else {
+            expiry_warn.set(None);
+            return;
+        };
+        spawn(poll_expiry_warn(secs, session_expires_at, expiry_warn));
     });
 
     if user_id.read().is_none() && login_prompt.read().is_some() {
@@ -909,42 +948,13 @@ fn AuthBanner() -> Element {
         let is_active_picker = *picker_active.read();
 
         // Custody description and derived flags.
-        let custody_snap = *custody.read();
-        let enrol_offerable = matches!(custody_snap, Some(Custody::Unverified(NoGate::Offerable)));
-        let custody_text = custody_snap.as_ref().map(|c| match c {
-            Custody::Verified => "gate: verified by passkey".to_owned(),
-            Custody::Unverified(NoGate::Offerable) => {
-                "gate: not verified (passkey available)".to_owned()
-            }
-            Custody::Unverified(NoGate::Declined) => {
-                "gate: not verified (passkey declined)".to_owned()
-            }
-            Custody::Unverified(NoGate::Unsupported) => {
-                "gate: not verified (passkey not available on this device)".to_owned()
-            }
-            Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
-        });
+        let (enrol_offerable, custody_text) = custody_description(*custody.read());
 
         // Session expiry warning text, computed outside RSX to keep the template flat.
-        let expiry_line = expiry_warn.read().clone().map(|warn| {
-            let n = warn.pending_count();
-            let secs = warn
-                .session_expires_at
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let now_f64 = js_sys::Date::now();
-            // Deliberate truncation: ms to seconds, always finite and non-negative.
-            debug_assert!(
-                now_f64.is_finite() && now_f64 >= 0.0,
-                "Date::now() must be finite"
-            );
-            let now_secs = (now_f64 / 1000.0) as u64;
-            let days = secs.saturating_sub(now_secs) / 86400;
-            format!(
-                "Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh."
-            )
-        });
+        let expiry_line = {
+            let guard = expiry_warn.read();
+            guard.as_ref().map(format_expiry_line)
+        };
 
         // Accounts the user can switch to: all stored minus the live one.
         let switch_targets: Vec<(String, String)> = accounts

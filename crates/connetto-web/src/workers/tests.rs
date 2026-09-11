@@ -10,10 +10,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent};
 
-use super::{
-    DB_ALIVE_LOCK, EXPORT_CHANNEL, content_store_namespace, decode_export_request,
-    export_generation_reply, export_reply_ok, request_export,
-};
+use super::archive_channel::{decode_export_request, export_generation_reply, export_reply_ok};
+use super::helpers::content_store_namespace;
+use super::{DB_ALIVE_LOCK, EXPORT_CHANNEL, request_export};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 

@@ -27,7 +27,7 @@ pub(crate) struct IncomingRow {
 /// Index one schema's current rows by table and primary key, read through the
 /// same session mechanism the export uses so both sides of a comparison are
 /// typed the same way.
-type RowIndex = std::collections::HashMap<(String, Vec<Cell>), Vec<Cell>>;
+pub(crate) type RowIndex = std::collections::HashMap<(String, Vec<Cell>), Vec<Cell>>;
 
 #[derive(diesel::QueryableByName)]
 struct SchemaRow {
@@ -157,7 +157,16 @@ pub(crate) fn schema_columns(
     Ok(out)
 }
 
-/// Write one row into `schema`, updating the row already there.
+/// The schema, table, and column data for one upsert.
+pub(crate) struct RowWrite<'a> {
+    pub(crate) schema: &'a str,
+    pub(crate) table: &'a str,
+    pub(crate) columns: &'a [String],
+    pub(crate) key_columns: &'a [String],
+    pub(crate) values: &'a [Cell],
+}
+
+/// Write one row into its target schema, updating the row already there.
 ///
 /// An upsert rather than `INSERT OR REPLACE`, which deletes the row it
 /// replaces: that fires the table's delete triggers and takes any
@@ -166,21 +175,14 @@ pub(crate) fn schema_columns(
 ///
 /// Values bind by their own storage class, so a blob stays a blob and text
 /// holding a `NUL` survives.
-pub(crate) fn write_row(
-    db: &mut SqliteConnection,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-    key_columns: &[String],
-    values: &[Cell],
-) -> Result<(), ClientError> {
+pub(crate) fn write_row(db: &mut SqliteConnection, row: &RowWrite<'_>) -> Result<(), ClientError> {
     use diesel::sql_types::{Binary, Double, Nullable, Text};
     // The table and column names are runtime values from the archive; the
     // ON CONFLICT (excluded.*) pattern is not expressible in Diesel's typed
     // DSL without a compile-time table! schema.
-    let sql = build_upsert_sql(schema, table, columns, key_columns);
+    let sql = build_upsert_sql(row.schema, row.table, row.columns, row.key_columns);
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
-    for value in values {
+    for value in row.values {
         query = match value {
             sqlite_diff_rs::Value::Null => query.bind::<Nullable<Text>, _>(None::<String>),
             sqlite_diff_rs::Value::Integer(number) => {

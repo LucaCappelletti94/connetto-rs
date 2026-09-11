@@ -1575,6 +1575,109 @@ fn pending_tables(
     Ok(())
 }
 
+type ColumnMap = HashMap<String, Vec<String>>;
+
+fn validate_archive_compat(
+    archive: &archive::Incoming,
+    fingerprint: &str,
+    account: Option<&str>,
+) -> Result<(), ClientError> {
+    if archive.fingerprint != fingerprint {
+        return Err(ClientError::Import(
+            "the archive was made under a different schema than this build runs, so it cannot be restored here"
+                .to_owned(),
+        ));
+    }
+    if archive.account.as_deref() != account {
+        return Err(ClientError::Import(
+            "the archive belongs to another account, and an import only ever restores into the account that made it"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_pending_capacity(held: usize, incoming: usize) -> Result<(), ClientError> {
+    let queued = held.saturating_add(incoming);
+    if queued > PENDING_CAP {
+        return Err(ClientError::Import(format!(
+            "the archive carries {incoming} queued writes and this replica already holds {held}, which is past the {PENDING_CAP} it can hold"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_import_columns(
+    db: &mut SqliteConnection,
+    local_tables: &HashSet<String>,
+    hidden: &HashSet<String>,
+) -> Result<(ColumnMap, ColumnMap), ClientError> {
+    let local_columns = if local_tables.is_empty() {
+        HashMap::new()
+    } else {
+        archive::schema_columns(db, LOCAL_SCHEMA, Some(local_tables), &HashSet::new())?
+    };
+    let main_columns = archive::schema_columns(db, "main", None, hidden)?;
+    Ok((local_columns, main_columns))
+}
+
+fn build_import_index(
+    db: &mut SqliteConnection,
+    archive: &archive::Incoming,
+    local_columns: &ColumnMap,
+    local_tables: &HashSet<String>,
+    unrecorded: &HashSet<String>,
+) -> Result<(Vec<archive::rows::IncomingRow>, archive::rows::RowIndex), ClientError> {
+    let incoming = match &archive.local_rows {
+        Some(rows) => archive::read_rows(rows, local_columns)?,
+        None => Vec::new(),
+    };
+    let held = if local_tables.is_empty() {
+        archive::index_rows(&[], local_columns)?
+    } else {
+        let current = export_rows(
+            db,
+            LOCAL_SCHEMA,
+            Some(local_tables),
+            &HashSet::new(),
+            unrecorded,
+        )?;
+        archive::index_rows(&current, local_columns)?
+    };
+    Ok((incoming, held))
+}
+
+fn plan_import_rows(
+    incoming: Vec<archive::rows::IncomingRow>,
+    held: &archive::rows::RowIndex,
+) -> (Vec<archive::PlannedRow>, Vec<Collision>) {
+    let mut rows = Vec::with_capacity(incoming.len());
+    let mut collisions = Vec::new();
+    for row in incoming {
+        let collision = match held.get(&(row.table.clone(), row.key.clone())) {
+            Some(mine) if *mine != row.values => {
+                collisions.push(Collision {
+                    table: row.table.clone(),
+                    key: row.key.clone(),
+                    columns: row.columns.clone(),
+                    mine: mine.clone(),
+                    theirs: row.values.clone(),
+                });
+                Some(collisions.len() - 1)
+            }
+            _ => None,
+        };
+        rows.push(archive::PlannedRow {
+            table: row.table,
+            columns: row.columns,
+            key_columns: row.key_columns,
+            values: row.values,
+            collision,
+        });
+    }
+    (rows, collisions)
+}
+
 /// Rewrite a stored `CREATE TABLE` statement to name `target`, which is an
 /// already-quoted path: a bare name for the archive database, or a qualified
 /// one for a twin in the blank schema. Column definitions travel verbatim, so
@@ -2759,88 +2862,25 @@ where
     /// build does not have.
     pub fn import_local_data(&mut self, bytes: &[u8]) -> Result<ImportPlan, ClientError> {
         let archive = archive::read(bytes)?;
-        let fingerprint = self.schema_fingerprint()?;
-        if archive.fingerprint != fingerprint {
-            return Err(ClientError::Import(
-                "the archive was made under a different schema than this build runs, so it cannot be restored here"
-                    .to_owned(),
-            ));
-        }
-        if archive.account != self.account() {
-            return Err(ClientError::Import(
-                "the archive belongs to another account, and an import only ever restores into the account that made it"
-                    .to_owned(),
-            ));
-        }
-        // Refused rather than trimmed: the queue evicts its oldest record when
-        // full, and giving up a write inside the feature whose purpose is not
-        // losing writes is the one thing an import must never do (R56).
-        let queued = self.pending.len().saturating_add(archive.pending.len());
-        if queued > PENDING_CAP {
-            return Err(ClientError::Import(format!(
-                "the archive carries {} queued writes and this replica already holds {}, which is past the {PENDING_CAP} it can hold",
-                archive.pending.len(),
-                self.pending.len()
-            )));
-        }
-        let local_columns = if self.local_tables.is_empty() {
-            HashMap::new()
-        } else {
-            archive::schema_columns(
-                &mut self.db,
-                LOCAL_SCHEMA,
-                Some(&self.local_tables),
-                &HashSet::new(),
-            )?
-        };
-        let main_columns =
-            archive::schema_columns(&mut self.db, "main", None, &self.hidden_tables)?;
-        // The queue's tables are checked here too, on the same terms: a
-        // changeset naming a table the target lacks is skipped by SQLite in
-        // silence.
+        validate_archive_compat(
+            &archive,
+            &self.schema_fingerprint()?,
+            self.account().as_deref(),
+        )?;
+        check_pending_capacity(self.pending.len(), archive.pending.len())?;
+        let (local_columns, main_columns) =
+            resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
         for changeset in &archive.pending {
             pending_tables(changeset, &main_columns)?;
         }
-        let incoming = match &archive.local_rows {
-            Some(rows) => archive::read_rows(rows, &local_columns)?,
-            None => Vec::new(),
-        };
-        let held = if self.local_tables.is_empty() {
-            archive::index_rows(&[], &local_columns)?
-        } else {
-            let current = export_rows(
-                &mut self.db,
-                LOCAL_SCHEMA,
-                Some(&self.local_tables),
-                &HashSet::new(),
-                &self.config.unrecorded_tables,
-            )?;
-            archive::index_rows(&current, &local_columns)?
-        };
-        let mut rows = Vec::with_capacity(incoming.len());
-        let mut collisions = Vec::new();
-        for row in incoming {
-            let collision = match held.get(&(row.table.clone(), row.key.clone())) {
-                Some(mine) if *mine != row.values => {
-                    collisions.push(archive::Collision {
-                        table: row.table.clone(),
-                        key: row.key.clone(),
-                        columns: row.columns.clone(),
-                        mine: mine.clone(),
-                        theirs: row.values.clone(),
-                    });
-                    Some(collisions.len() - 1)
-                }
-                _ => None,
-            };
-            rows.push(archive::PlannedRow {
-                table: row.table,
-                columns: row.columns,
-                key_columns: row.key_columns,
-                values: row.values,
-                collision,
-            });
-        }
+        let (incoming, held) = build_import_index(
+            &mut self.db,
+            &archive,
+            &local_columns,
+            &self.local_tables,
+            &self.config.unrecorded_tables,
+        )?;
+        let (rows, collisions) = plan_import_rows(incoming, &held);
         Ok(ImportPlan {
             archive,
             rows,
@@ -2912,11 +2952,13 @@ where
                     }
                     archive::write_row(
                         db,
-                        LOCAL_SCHEMA,
-                        &row.table,
-                        &row.columns,
-                        &row.key_columns,
-                        &row.values,
+                        &archive::rows::RowWrite {
+                            schema: LOCAL_SCHEMA,
+                            table: &row.table,
+                            columns: &row.columns,
+                            key_columns: &row.key_columns,
+                            values: &row.values,
+                        },
                     )?;
                     outcome.rows_restored += 1;
                 }
