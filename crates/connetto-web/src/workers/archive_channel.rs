@@ -15,6 +15,7 @@ use super::helpers::sleep_ms;
 const EXPORT_REPLY_OK: &str = "export";
 const EXPORT_REPLY_FAILED: &str = "export-failed";
 const EXPORT_GENERATION_REPLY: &str = "export-generation";
+const IMPORT_GENERATION_REPLY: &str = "import-generation";
 const IMPORT_REPLY_OK: &str = "import";
 const IMPORT_REPLY_FAILED: &str = "import-failed";
 const IMPORT_REQUEST_KIND: &str = "import?";
@@ -27,7 +28,12 @@ pub(crate) const MAX_IMPORT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
 
-type ExportReply = Result<Vec<u8>, String>;
+/// An export the worker refused, carrying the reason it reported.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ExportWorkerError(String);
+
+type ExportReply = Result<Vec<u8>, ExportWorkerError>;
 
 #[derive(Default)]
 struct ExportWait {
@@ -37,8 +43,22 @@ struct ExportWait {
 }
 
 type ExportSlot = Rc<RefCell<ExportWait>>;
-type ImportReply = Result<(ImportOutcome, usize), String>;
-type ImportSlot = Rc<RefCell<Option<ImportReply>>>;
+
+/// An import the worker refused, carrying the reason it reported.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ImportWorkerError(String);
+
+type ImportReply = Result<(ImportOutcome, usize), ImportWorkerError>;
+
+#[derive(Default)]
+struct ImportWait {
+    generation: Option<String>,
+    replaced: bool,
+    result: Option<ImportReply>,
+}
+
+type ImportSlot = Rc<RefCell<ImportWait>>;
 
 /// Failure surfaced by the channel service installers.
 #[derive(Debug, thiserror::Error)]
@@ -101,20 +121,23 @@ impl ExportTag {
     }
 }
 
-/// Addresses one import exchange by caller id.
+/// Addresses one import exchange by worker generation and caller id.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ImportTag {
+    generation: String,
     request: String,
 }
 
 impl ImportTag {
     fn read(data: &JsValue) -> Option<Self> {
         Some(Self {
+            generation: export_message_field(data, "generation")?,
             request: export_message_field(data, "request")?,
         })
     }
 
     fn write(&self, message: &js_sys::Object) -> Result<(), ChannelError> {
+        set_export_generation(message, &self.generation)?;
         js_sys::Reflect::set(
             message,
             &JsValue::from_str("request"),
@@ -153,7 +176,19 @@ fn decode_export_generation(data: &JsValue) -> Option<String> {
     }
 }
 
-fn build_export_generation_request() -> JsValue {
+pub(super) fn is_import_generation_request(data: &JsValue) -> bool {
+    export_message_kind(data).as_deref() == Some("generation?")
+}
+
+fn decode_import_generation(data: &JsValue) -> Option<String> {
+    if export_message_kind(data).as_deref() == Some(IMPORT_GENERATION_REPLY) {
+        export_message_generation(data)
+    } else {
+        None
+    }
+}
+
+fn build_generation_request() -> JsValue {
     let request = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
         &request,
@@ -234,7 +269,7 @@ fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
                 .ok()
                 .and_then(|value| value.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Err(error)
+            Err(ExportWorkerError(error))
         }
         _ => return None,
     };
@@ -263,7 +298,7 @@ fn decode_import_reply(data: &JsValue) -> Option<(ImportTag, ImportReply)> {
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Err(error)
+            Err(ImportWorkerError(error))
         }
         _ => return None,
     };
@@ -295,6 +330,18 @@ pub(super) fn export_generation_reply(generation: &str) -> Result<JsValue, Chann
         &JsValue::from_str(EXPORT_GENERATION_REPLY),
     )
     .map_err(|e| reflect_error("export generation reply", &e))?;
+    set_export_generation(&reply, generation)?;
+    Ok(reply.into())
+}
+
+pub(super) fn import_generation_reply(generation: &str) -> Result<JsValue, ChannelError> {
+    let reply = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(IMPORT_GENERATION_REPLY),
+    )
+    .map_err(|e| reflect_error("import generation reply", &e))?;
     set_export_generation(&reply, generation)?;
     Ok(reply.into())
 }
@@ -531,20 +578,33 @@ where
             operation: "import channel",
             detail: format!("{err:?}"),
         })?;
+    let generation = Rc::new(rosetta_uuid::Uuid::new_v4().to_string());
     let import = Rc::new(import);
     let listener = {
         let channel = channel.clone();
+        let generation = Rc::clone(&generation);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if is_import_generation_request(&event.data()) {
+                if let Ok(reply) = import_generation_reply(&generation) {
+                    let _ = channel.post_message(&reply);
+                }
+                return;
+            }
             let Some((tag, file)) = decode_import_request(&event.data()) else {
                 return;
             };
+            if tag.generation != *generation {
+                return;
+            }
             let channel = channel.clone();
             let import = Rc::clone(&import);
             spawn_local(async move {
                 let buffer = match JsFuture::from(file.array_buffer()).await {
                     Ok(buffer) => buffer,
                     Err(err) => {
-                        tracing::error!(error = ?err, "db worker: reading import file failed");
+                        let error = format!("{err:?}");
+                        tracing::error!(error = %error, "db worker: reading import file failed");
+                        post_channel_reply(&channel, import_reply_failed(&tag, &error), "import");
                         return;
                     }
                 };
@@ -596,7 +656,9 @@ fn collect_export_result(
     let mut state = state.borrow_mut();
     match state.result.take() {
         Some(Ok(bytes)) if !state.replaced => Ok(bytes),
-        Some(Err(err)) if !state.replaced => Err(crate::relay::ExportRefused::Failed(err)),
+        Some(Err(err)) if !state.replaced => {
+            Err(crate::relay::ExportRefused::Failed(err.to_string()))
+        }
         _ => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
     }
 }
@@ -614,7 +676,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     let request = rosetta_uuid::Uuid::new_v4().to_string();
     let on_message = export_message_handler(Rc::clone(&state), request.clone());
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let generation_request = build_export_generation_request();
+    let generation_request = build_generation_request();
     let generation = poll_for_export_generation(&channel, &state, &generation_request).await;
     if let Some(generation) = generation
         && !state.borrow().replaced
@@ -628,11 +690,90 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     collect_export_result(&channel, on_message, &state)
 }
 
+fn import_message_handler(
+    state: Rc<RefCell<ImportWait>>,
+    request: String,
+) -> Closure<dyn FnMut(MessageEvent)> {
+    Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        if let Some(generation) = decode_import_generation(&event.data()) {
+            let mut state = state.borrow_mut();
+            match &state.generation {
+                Some(expected) if expected != &generation => state.replaced = true,
+                None => state.generation = Some(generation),
+                Some(_) => {}
+            }
+            return;
+        }
+        let Some((tag, reply)) = decode_import_reply(&event.data()) else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        if tag.request == request && state.generation.as_deref() == Some(tag.generation.as_str()) {
+            state.result.get_or_insert(reply);
+        }
+    })
+}
+
+async fn poll_for_import_generation(
+    channel: &BroadcastChannel,
+    state: &ImportSlot,
+    generation_request: &JsValue,
+) -> Option<String> {
+    let mut posted = channel.post_message(generation_request);
+    while posted.is_ok()
+        && state.borrow().generation.is_none()
+        && !state.borrow().replaced
+        && crate::locks::lock_is_held(super::DB_ALIVE_LOCK).await
+    {
+        sleep_ms(POLL_MS).await;
+        if state.borrow().generation.is_none() {
+            posted = channel.post_message(generation_request);
+        }
+    }
+    state.borrow().generation.clone()
+}
+
+async fn poll_for_import_reply(
+    channel: &BroadcastChannel,
+    state: &ImportSlot,
+    generation_request: &JsValue,
+    request_msg: &JsValue,
+) {
+    let posted = channel.post_message(request_msg);
+    while posted.is_ok()
+        && state.borrow().result.is_none()
+        && !state.borrow().replaced
+        && crate::locks::lock_is_held(super::DB_ALIVE_LOCK).await
+    {
+        let _ = channel.post_message(generation_request);
+        sleep_ms(POLL_MS).await;
+    }
+}
+
+fn collect_import_result(
+    channel: &BroadcastChannel,
+    on_message: Closure<dyn FnMut(MessageEvent)>,
+    state: &ImportSlot,
+) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    let mut state = state.borrow_mut();
+    match state.result.take() {
+        Some(Ok((outcome, collisions))) if !state.replaced => Ok((outcome, collisions)),
+        Some(Err(err)) if !state.replaced => {
+            Err(crate::relay::ImportRefused::Failed(err.to_string()))
+        }
+        _ => Err(crate::relay::ImportRefused::Gone(crate::relay::HubGone)),
+    }
+}
+
 /// Page side: hand the DB worker a `File` to import and wait for the outcome.
 ///
 /// # Errors
 ///
-/// [`crate::relay::ImportRefused::Gone`] when no DB worker is running,
+/// [`crate::relay::ImportRefused::Gone`] when no DB worker is running or a
+/// replacement worker takes the alive lock before the request is answered,
 /// [`crate::relay::ImportRefused::Failed`] when the worker refused the import.
 pub async fn request_import(
     file: File,
@@ -648,40 +789,29 @@ pub async fn request_import(
     }
     let channel = BroadcastChannel::new(super::IMPORT_CHANNEL)
         .map_err(|err| crate::relay::ImportRefused::Failed(format!("import channel: {err:?}")))?;
-    let result: ImportSlot = Rc::new(RefCell::new(None));
-    let tag = ImportTag {
-        request: rosetta_uuid::Uuid::new_v4().to_string(),
-    };
-    let Ok(request_msg) = build_import_request(&file, &tag) else {
-        return Err(crate::relay::ImportRefused::Failed(
-            "building import request failed".to_owned(),
-        ));
-    };
-    let request = tag.request;
-    let on_message = {
-        let result = Rc::clone(&result);
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some((reply_tag, reply)) = decode_import_reply(&event.data())
-                && reply_tag.request == request
-            {
-                result.borrow_mut().get_or_insert(reply);
-            }
-        })
-    };
+    let state: ImportSlot = Rc::new(RefCell::new(ImportWait::default()));
+    let request_id = rosetta_uuid::Uuid::new_v4().to_string();
+    let on_message = import_message_handler(Rc::clone(&state), request_id.clone());
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let posted = channel.post_message(&request_msg);
-    while posted.is_ok()
-        && result.borrow().is_none()
-        && crate::locks::lock_is_held(super::DB_ALIVE_LOCK).await
+    let generation_request = build_generation_request();
+    let generation = poll_for_import_generation(&channel, &state, &generation_request).await;
+    if let Some(generation) = generation
+        && !state.borrow().replaced
     {
-        sleep_ms(POLL_MS).await;
+        let tag = ImportTag {
+            generation,
+            request: request_id,
+        };
+        if let Ok(request_msg) = build_import_request(&file, &tag) {
+            poll_for_import_reply(&channel, &state, &generation_request, &request_msg).await;
+        } else {
+            channel.set_onmessage(None);
+            channel.close();
+            drop(on_message);
+            return Err(crate::relay::ImportRefused::Failed(
+                "building import request failed".to_owned(),
+            ));
+        }
     }
-    channel.set_onmessage(None);
-    channel.close();
-    drop(on_message);
-    match result.borrow_mut().take() {
-        Some(Ok((outcome, collisions))) => Ok((outcome, collisions)),
-        Some(Err(err)) => Err(crate::relay::ImportRefused::Failed(err)),
-        None => Err(crate::relay::ImportRefused::Gone(crate::relay::HubGone)),
-    }
+    collect_import_result(&channel, on_message, &state)
 }

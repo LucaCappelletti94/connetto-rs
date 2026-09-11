@@ -1,5 +1,7 @@
 use std::rc::Rc;
 
+use wasm_bindgen::JsCast;
+
 use connetto_client::{
     ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ReplicaStorage as StorageKind,
     Tier,
@@ -341,8 +343,8 @@ pub(super) async fn subscribe_and_boot(
     worker: &mut ConnettoConnection<BrowserSocket>,
     config: &DbWorkerConfig,
 ) -> Result<(), BootError> {
-    // Matches the hello-channel TIMEOUT_MS in intake.rs so the tab and the worker give up
-    // at the same wall-clock moment: both sides wait at most 15 s for the worker to be ready.
+    // Matches the hello-channel HELLO_TIMEOUT_MS so a silent server is detected
+    // as fast as the tab's own wait expires.
     const BOOT_TIMEOUT_MS: f64 = 15_000.0;
     if !worker.is_connected() {
         return Ok(());
@@ -352,16 +354,22 @@ pub(super) async fn subscribe_and_boot(
         .await
         .map_err(BootError::Subscribe)?;
     worker.ping(1).await.map_err(BootError::Subscribe)?;
-    let started = js_sys::Date::now();
+    // Performance::now() is monotonic so a backward wall-clock step cannot extend the wait.
+    let performance = js_sys::global()
+        .dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
+        .map_err(|v: js_sys::Object| BootError::NotWorkerScope(format!("{v:?}")))?
+        .performance()
+        .ok_or_else(|| BootError::NotWorkerScope("no Performance API in worker scope".into()))?;
+    let mut last_activity = performance.now();
     loop {
-        let elapsed = js_sys::Date::now() - started;
+        let elapsed = performance.now() - last_activity;
         if elapsed >= BOOT_TIMEOUT_MS {
             return Err(BootError::BootTimeout {
                 deadline_ms: BOOT_TIMEOUT_MS,
             });
         }
         let remaining = BOOT_TIMEOUT_MS - elapsed;
-        // Provably in i32 range: remaining <= BOOT_TIMEOUT_MS = 15_000.
+        // Provably in i32 range because remaining is at most BOOT_TIMEOUT_MS of 15_000.
         debug_assert!(remaining > 0.0 && remaining <= BOOT_TIMEOUT_MS);
         #[expect(
             clippy::cast_possible_truncation,
@@ -377,7 +385,11 @@ pub(super) async fn subscribe_and_boot(
             Some(ClientEvent::Closed) => {
                 return Err(BootError::BootClosed);
             }
-            Some(_) | None => {}
+            // Any non-Pong frame resets the inactivity timer; the sync is progressing.
+            Some(_) => {
+                last_activity = performance.now();
+            }
+            None => {}
         }
     }
     Ok(())

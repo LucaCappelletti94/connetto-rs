@@ -181,13 +181,16 @@ fn fresh_quantity() -> i64 {
     (r as i64 + 1) * 5
 }
 
-/// Convert an `f64` value to `u64`, returning 0 for pre-epoch or non-finite values.
+/// Convert an `f64` value to `u64`, returning 0 for pre-epoch, non-finite, or out-of-range values.
 ///
-/// `Date::now()` and server-sent timestamps are always non-negative in practice; this
-/// helper makes the negative case explicit rather than relying on the silent saturating
-/// behaviour of `as u64`.
+/// `Date::now()` and server-sent timestamps are always non-negative and well below
+/// `u64::MAX` in practice. This helper rejects every value that cannot round-trip
+/// safely, preventing a malformed broadcast from producing a false far-future deadline.
 fn f64_to_u64(v: f64) -> u64 {
-    if v.is_finite() && v >= 0.0 {
+    // u64::MAX as f64 rounds up to 2^64 (the nearest representable double above
+    // u64::MAX), so values >= this bound saturate on `as u64` and must be rejected.
+    const MAX: f64 = u64::MAX as f64;
+    if v.is_finite() && (0.0..MAX).contains(&v) {
         v as u64 // deliberate truncation: fractional part discarded
     } else {
         0

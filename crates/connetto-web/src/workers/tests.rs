@@ -7,13 +7,13 @@ use connetto_file_core::{ChunkHash, ChunkStore};
 use js_sys::{Date, Reflect};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, File, MessageEvent};
 
 use super::archive_channel::{
     decode_export_request, decode_import_request, export_generation_reply, export_reply_ok,
-    import_reply_failed, import_reply_ok,
+    import_generation_reply, import_reply_failed, import_reply_ok, is_import_generation_request,
 };
 use super::helpers::content_store_namespace;
 use super::{
@@ -169,60 +169,129 @@ async fn two_concurrent_exports_each_receive_their_own_archive() {
     alive.release();
 }
 
-/// Two callers on one channel: each reply carries the request it answers, so
-/// neither caller can be handed the other's outcome.
+/// Two callers on one channel: each reply is correlated by both generation
+/// and request id, so neither caller receives the other's outcome.
 ///
-/// Without tag correlation the assertion `successes == [true, false] || ...`
-/// fails because both callers accept the first reply broadcast, giving `[true, true]`.
+/// Caller A sends a file whose first byte is `A` (success, 3 `rows_restored`).
+/// Caller B sends a file whose first byte is `B` (failure). A swap would
+/// cause A to receive a failure and B to receive a success: the per-caller
+/// assertions catch it. Before per-request tag correlation, both callers
+/// accepted the first broadcast reply and both returned `Ok`.
 #[wasm_bindgen_test]
 async fn two_concurrent_imports_each_receive_their_own_outcome() {
     let alive = crate::locks::hold_lock(DB_ALIVE_LOCK).await;
     let channel = BroadcastChannel::new(IMPORT_CHANNEL).expect("open import responder");
-    let counter = Rc::new(Cell::new(0u32));
     let on_message = {
         let channel = channel.clone();
-        let counter = Rc::clone(&counter);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let Some((tag, _file)) = decode_import_request(&event.data()) else {
+            let data = event.data();
+            if is_import_generation_request(&data) {
+                let reply = import_generation_reply("gen-1").expect("build gen reply");
+                channel.post_message(&reply).expect("post gen reply");
+                return;
+            }
+            let Some((tag, file)) = decode_import_request(&data) else {
                 return;
             };
-            let n = counter.get();
-            counter.set(n + 1);
-            let reply = if n == 0 {
-                import_reply_ok(
-                    &tag,
-                    &ImportOutcome {
-                        rows_restored: 3,
-                        rows_kept: 0,
-                        writes_restored: 0,
-                    },
-                    0,
-                )
-            } else {
-                import_reply_failed(&tag, "second import intentionally failed")
-            };
-            channel
-                .post_message(&reply.expect("build import reply"))
-                .expect("post reply");
+            let channel = channel.clone();
+            spawn_local(async move {
+                let buffer = JsFuture::from(file.array_buffer())
+                    .await
+                    .expect("read file buffer");
+                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                let reply = if bytes.first() == Some(&b'A') {
+                    import_reply_ok(
+                        &tag,
+                        &ImportOutcome {
+                            rows_restored: 3,
+                            rows_kept: 0,
+                            writes_restored: 0,
+                        },
+                        0,
+                    )
+                } else {
+                    import_reply_failed(&tag, "file B rejected intentionally")
+                };
+                channel
+                    .post_message(&reply.expect("build import reply"))
+                    .expect("post reply");
+            });
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-    let make_file = || {
-        let content = js_sys::Array::new();
-        content.push(&JsValue::from_str("x"));
-        File::new_with_str_sequence(&content, "test.zip").expect("create test file")
+    let make_file = |content: &str| {
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str(content));
+        File::new_with_str_sequence(&arr, "test.zip").expect("create file")
     };
 
-    let (first, second) =
-        futures_util::future::join(request_import(make_file()), request_import(make_file())).await;
+    let (result_a, result_b) = futures_util::future::join(
+        request_import(make_file("A-file content")),
+        request_import(make_file("B-file content")),
+    )
+    .await;
 
-    // Exactly one caller must succeed and one must fail; without per-request tag
-    // correlation both handlers fire on the first reply and both return Ok.
-    let successes = [first.is_ok(), second.is_ok()];
     assert!(
-        successes == [true, false] || successes == [false, true],
-        "exactly one import must succeed and one must fail; got first={first:?} second={second:?}"
+        matches!(
+            result_a,
+            Ok((
+                ImportOutcome {
+                    rows_restored: 3,
+                    ..
+                },
+                0
+            ))
+        ),
+        "caller A expected success, got {result_a:?}"
+    );
+    assert!(
+        matches!(result_b, Err(crate::relay::ImportRefused::Failed(_))),
+        "caller B expected failure, got {result_b:?}"
+    );
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    alive.release();
+}
+
+/// An import wait ends with `Gone` when the answering worker is replaced by a
+/// new generation rather than polling until the alive lock drops.
+///
+/// The assertion that would have failed before the fix:
+/// `matches!(result, Err(ImportRefused::Gone(_)))` — the caller polled
+/// indefinitely because the import channel does not replay the request to the
+/// replacement worker and there was no generation check to break the loop.
+#[wasm_bindgen_test]
+async fn import_wait_ends_when_worker_generation_is_replaced() {
+    let alive = crate::locks::hold_lock(DB_ALIVE_LOCK).await;
+    let channel = BroadcastChannel::new(IMPORT_CHANNEL).expect("open import responder");
+    // Phase 0: first gen request -> "gen-1"; phase 1+: -> "gen-2"
+    let gen_phase: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    let on_message = {
+        let channel = channel.clone();
+        let gen_phase = Rc::clone(&gen_phase);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if !is_import_generation_request(&event.data()) {
+                return;
+            }
+            let phase = gen_phase.get();
+            gen_phase.set(phase + 1);
+            let generation_name = if phase == 0 { "gen-1" } else { "gen-2" };
+            let reply = import_generation_reply(generation_name).expect("build gen reply");
+            channel.post_message(&reply).expect("post gen reply");
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    let content = js_sys::Array::new();
+    content.push(&JsValue::from_str("x"));
+    let file = File::new_with_str_sequence(&content, "test.zip").expect("create test file");
+    let result = request_import(file).await;
+
+    assert!(
+        matches!(result, Err(crate::relay::ImportRefused::Gone(_))),
+        "expected Gone when generation replaced, got {result:?}"
     );
     channel.set_onmessage(None);
     channel.close();
@@ -299,17 +368,19 @@ async fn request_custody_without_worker_returns_timeout() {
     );
 }
 
-/// `spawn_db_worker` with a glue URL that cannot be parsed must return
-/// `BootError::BootstrapUrl`, not a stringly-typed `JsValue`.
+/// A relative glue URL must be resolved against the current location rather
+/// than fail URL parsing with `BootError::BootstrapUrl`.
 ///
-/// The assertion that would have failed before the fix: `BootError` did not exist and
-/// `spawn_db_worker` returned `Result<_, JsValue>`, making a typed match impossible.
+/// The assertion that would have failed before the fix: `web_sys::Url::new("./db-worker.js")`
+/// throws on a relative argument, so `generated_bootstrap_url` returned
+/// `Err(BootError::BootstrapUrl(...))` for any relative URL.
 #[wasm_bindgen_test]
-fn boot_spawn_db_worker_invalid_glue_url_returns_bootstrap_url_error() {
+fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     let result =
-        super::boot::spawn_db_worker("not-a-url", &super::boot::WorkerBootstrap::Generated);
+        super::boot::spawn_db_worker("./db-worker.js", &super::boot::WorkerBootstrap::Generated);
     assert!(
-        matches!(result, Err(super::boot::BootError::BootstrapUrl(_))),
-        "expected BootError::BootstrapUrl for an invalid glue URL"
+        !matches!(result, Err(super::boot::BootError::BootstrapUrl(_))),
+        "a relative glue URL must not return BootstrapUrl: the URL must be resolved against \
+         the current location"
     );
 }

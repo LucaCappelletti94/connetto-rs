@@ -41,8 +41,9 @@ pub(super) async fn prepare_boot_storage(
             .await
             .map_err(BootError::KeyStore)?,
     );
-    let was_enrolled = super::replica::setup_custody(config, &key_store).await?;
+    // Wipes run before custody so a pending deletion applies even when the unlock is refused or unconfigured.
     apply_pending_wipes(&storage, &key_store).await?;
+    let was_enrolled = super::replica::setup_custody(config, &key_store).await?;
     // After wipes (which free slots) and before login (which opens the refresh store).
     storage
         .reserve(super::BOOT_SLOTS)

@@ -1,3 +1,4 @@
+use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
@@ -35,10 +36,10 @@ pub enum BootError {
     /// The upstream subscription or boot-handshake ping failed.
     #[error("upstream subscription: {0}")]
     Subscribe(connetto_client::ClientError),
-    /// The upstream did not complete the boot handshake within the deadline.
-    #[error("upstream boot handshake timed out after {deadline_ms:.0} ms")]
+    /// No server frame arrived within the inactivity deadline during the upstream boot.
+    #[error("upstream boot handshake stalled: no frame for {deadline_ms:.0} ms")]
     BootTimeout {
-        /// The deadline that elapsed, in milliseconds.
+        /// The inactivity window that elapsed, in milliseconds.
         deadline_ms: f64,
     },
     /// The server closed the connection during the upstream boot.
@@ -47,8 +48,8 @@ pub enum BootError {
     /// An identified session has no content root key for the content store.
     #[error("content key unavailable")]
     ContentKey,
-    /// The global is not a `DedicatedWorkerGlobalScope` as required.
-    #[error("not a dedicated worker scope: {0}")]
+    /// The global is not a `DedicatedWorkerGlobalScope` or lacks a required browser API.
+    #[error("worker scope error: {0}")]
     NotWorkerScope(String),
     /// The browser content store could not be installed or removed.
     #[error("content store: {0}")]
@@ -291,7 +292,8 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
         WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options)
             .map_err(|e| BootError::WorkerSpawn(format!("{e:?}"))),
         WorkerBootstrap::Script(script_url) => {
-            let url = web_sys::Url::new(script_url)
+            let base = current_location_href()?;
+            let url = web_sys::Url::new_with_base(script_url, &base)
                 .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
             let encoded = String::from(js_sys::encode_uri_component(glue_url));
             let existing = url.search();
@@ -317,7 +319,9 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
 }
 
 fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
-    let url = web_sys::Url::new(glue_url).map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
+    let base = current_location_href()?;
+    let url = web_sys::Url::new_with_base(glue_url, &base)
+        .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
     let path = url.pathname();
     let wasm_path = path.strip_suffix(".js").map_or_else(
         || format!("{path}_bg.wasm"),
@@ -362,6 +366,22 @@ fn js_string_literal(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Resolve the current document or worker location to an absolute URL string.
+fn current_location_href() -> Result<String, BootError> {
+    match js_sys::global().dyn_into::<web_sys::Window>() {
+        Ok(window) => window
+            .location()
+            .href()
+            .map_err(|e| BootError::BootstrapUrl(format!("{e:?}"))),
+        Err(global) => match global.dyn_into::<web_sys::WorkerGlobalScope>() {
+            Ok(worker) => Ok(worker.location().href()),
+            Err(_) => Err(BootError::BootstrapUrl(
+                "cannot determine current location".into(),
+            )),
+        },
+    }
 }
 
 /// What the boot resolved about the session it opened.

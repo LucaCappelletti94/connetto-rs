@@ -146,6 +146,14 @@ impl Transport for Scripted {
     }
 }
 
+/// Error produced by the [`BulkFailing`] transport.
+#[derive(Debug, thiserror::Error)]
+pub enum BulkFailError {
+    /// The transport was reset during bulk replay, as the simulation intends.
+    #[error("connection reset during replay")]
+    ReplayReset,
+}
+
 /// A transport that completes the handshake and then fails every bulk send.
 ///
 /// Simulates a transport reset that occurs after a committed import, so tests
@@ -169,7 +177,7 @@ impl BulkFailing {
 }
 
 impl Transport for BulkFailing {
-    type Error = String;
+    type Error = BulkFailError;
 
     fn send_control(
         &mut self,
@@ -182,7 +190,7 @@ impl Transport for BulkFailing {
         &mut self,
         _message: BulkMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Err("connection reset during replay".to_owned()))
+        ready(Err(BulkFailError::ReplayReset))
     }
 
     async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {

@@ -79,7 +79,8 @@ thread_local! {
 /// Failure of a browser unlock or enrolment operation.
 #[derive(Debug, thiserror::Error)]
 pub enum UnlockError {
-    /// The global scope is not a dedicated worker; the handler cannot be installed.
+    /// The global scope is not a dedicated worker.
+    /// The handler cannot be installed.
     #[error("unlock handler: not a dedicated worker scope")]
     NotAWorker,
     /// The `WebAuthn` PRF extension is not available in this browsing context.
@@ -464,7 +465,8 @@ pub fn serve_unlock(worker: &Worker) -> Result<(), UnlockError> {
 ///
 /// [`UnlockError::Dismissed`] when the ceremony is dismissed or the credential is gone,
 /// [`UnlockError::UnsupportedProtocol`] when the platform cannot run the ceremony,
-/// or [`UnlockError::WorkerPost`] when the result cannot be sent to the worker.
+/// [`UnlockError::WorkerPost`] when the result cannot be sent to the worker, or
+/// [`UnlockError::Browser`] when any other browser API call fails.
 pub async fn enrol(worker: &Worker) -> Result<(), UnlockError> {
     let key_and_id = create_credential().await.map_err(|e| {
         if is_not_allowed(&e) {

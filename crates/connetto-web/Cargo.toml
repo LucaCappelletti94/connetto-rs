@@ -84,10 +84,12 @@ web-sys = { version = "0.3", features = [
   "Window",
   "Worker",
   "WorkerGlobalScope",
+  "WorkerLocation",
   "WorkerNavigator",
   "WorkerOptions",
   "WritableStream",
   "WorkerType",
+  "Performance",
   "console",
 ] }
 # The relay builds generic snapshots with a throwaway capture session
