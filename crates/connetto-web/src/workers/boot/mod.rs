@@ -220,9 +220,17 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
     match bootstrap {
         WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options),
         WorkerBootstrap::Script(script_url) => {
+            let url = web_sys::Url::new(script_url)?;
             let encoded = String::from(js_sys::encode_uri_component(glue_url));
-            let separator = if script_url.contains('?') { '&' } else { '?' };
-            Worker::new_with_options(&format!("{script_url}{separator}glue={encoded}"), &options)
+            let existing = url.search();
+            // existing is "" or "?key=val"; set_search prepends "?" automatically.
+            let new_search = if existing.is_empty() {
+                format!("glue={encoded}")
+            } else {
+                format!("{}&glue={encoded}", existing.trim_start_matches('?'))
+            };
+            url.set_search(&new_search);
+            Worker::new_with_options(&url.href(), &options)
         }
         WorkerBootstrap::Generated => {
             let object_url = generated_bootstrap_url(glue_url)?;
@@ -235,10 +243,15 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
 }
 
 fn generated_bootstrap_url(glue_url: &str) -> Result<String, JsValue> {
-    let wasm_url = glue_url.strip_suffix(".js").map_or_else(
-        || format!("{glue_url}_bg.wasm"),
+    let url = web_sys::Url::new(glue_url)?;
+    let path = url.pathname();
+    let wasm_path = path.strip_suffix(".js").map_or_else(
+        || format!("{path}_bg.wasm"),
         |base| format!("{base}_bg.wasm"),
     );
+    url.set_pathname(&wasm_path);
+    url.set_hash(""); // fragments are not meaningful for resource fetches
+    let wasm_url = url.href();
     let source = format!(
         r#"try {{
   const mod = await import({glue});

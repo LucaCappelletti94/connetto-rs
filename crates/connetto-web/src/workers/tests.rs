@@ -1,18 +1,21 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use connetto_client::ExportScope;
+use connetto_client::{ExportScope, ImportOutcome};
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
 use js_sys::{Date, Reflect};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent};
+use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, File, MessageEvent};
 
-use super::archive_channel::{decode_export_request, export_generation_reply, export_reply_ok};
+use super::archive_channel::{
+    decode_export_request, decode_import_request, export_generation_reply, export_reply_ok,
+    import_reply_failed, import_reply_ok,
+};
 use super::helpers::content_store_namespace;
-use super::{DB_ALIVE_LOCK, EXPORT_CHANNEL, request_export};
+use super::{DB_ALIVE_LOCK, EXPORT_CHANNEL, IMPORT_CHANNEL, request_export, request_import};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -156,6 +159,67 @@ async fn two_concurrent_exports_each_receive_their_own_archive() {
 
     assert_eq!(everything.expect("whole archive"), b"everything");
     assert_eq!(unsynced.expect("unsynced archive"), b"unsynced");
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    alive.release();
+}
+
+/// Two callers on one channel: each reply carries the request it answers, so
+/// neither caller can be handed the other's outcome.
+///
+/// Without tag correlation the assertion `successes == [true, false] || ...`
+/// fails because both callers accept the first reply broadcast, giving `[true, true]`.
+#[wasm_bindgen_test]
+async fn two_concurrent_imports_each_receive_their_own_outcome() {
+    let alive = crate::locks::hold_lock(DB_ALIVE_LOCK).await;
+    let channel = BroadcastChannel::new(IMPORT_CHANNEL).expect("open import responder");
+    let counter = Rc::new(Cell::new(0u32));
+    let on_message = {
+        let channel = channel.clone();
+        let counter = Rc::clone(&counter);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some((tag, _file)) = decode_import_request(&event.data()) else {
+                return;
+            };
+            let n = counter.get();
+            counter.set(n + 1);
+            let reply = if n == 0 {
+                import_reply_ok(
+                    &tag,
+                    &ImportOutcome {
+                        rows_restored: 3,
+                        rows_kept: 0,
+                        writes_restored: 0,
+                    },
+                    0,
+                )
+            } else {
+                import_reply_failed(&tag, "second import intentionally failed")
+            };
+            channel
+                .post_message(&reply.expect("build import reply"))
+                .expect("post reply");
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    let make_file = || {
+        let content = js_sys::Array::new();
+        content.push(&JsValue::from_str("x"));
+        File::new_with_str_sequence(&content, "test.zip").expect("create test file")
+    };
+
+    let (first, second) =
+        futures_util::future::join(request_import(make_file()), request_import(make_file())).await;
+
+    // Exactly one caller must succeed and one must fail; without per-request tag
+    // correlation both handlers fire on the first reply and both return Ok.
+    let successes = [first.is_ok(), second.is_ok()];
+    assert!(
+        successes == [true, false] || successes == [false, true],
+        "exactly one import must succeed and one must fail; got first={first:?} second={second:?}"
+    );
     channel.set_onmessage(None);
     channel.close();
     drop(on_message);

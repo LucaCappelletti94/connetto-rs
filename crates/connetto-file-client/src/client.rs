@@ -188,7 +188,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`ContentError`] when chunk storage, replica import, or mutation replay fails.
+    /// [`ContentError`] when chunk storage or replica import fails.
     pub async fn apply_local_data_import(
         &self,
         plan: &ContentImportPlan,
@@ -200,7 +200,8 @@ where
             .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
             .await?;
-        self.client.replay_pending().await?;
+        // Best-effort: the import is committed; the outbox driver retries replay later.
+        let _ = self.client.replay_pending().await;
         Ok(outcome)
     }
 

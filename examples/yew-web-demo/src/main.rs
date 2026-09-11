@@ -437,11 +437,13 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Generated);
     workers::await_db_worker_ready().await?;
     // Read custody after the worker has settled, while still on the hello channel.
-    let custody = workers::request_custody().await;
+    let custody = workers::request_custody()
+        .await
+        .unwrap_or(Custody::Ephemeral);
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
-    workers::announce_tab(&wire).await;
+    workers::announce_tab(&wire).await?;
     let transport =
         MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
@@ -567,6 +569,7 @@ impl PartialEq for ClientHandle {
 async fn compute_expiry_for_session(
     exp_secs: u64,
     latest: Rc<Cell<u64>>,
+    warned: Rc<Cell<Option<u64>>>,
     expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
 ) {
     let expires = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(exp_secs);
@@ -575,10 +578,10 @@ async fn compute_expiry_for_session(
         return;
     }
     let Ok(pending) = pending else {
-        if expiry_warn
-            .as_ref()
-            .is_some_and(|warn| warn.session_expires_at != expires)
-        {
+        // expiry_warn.as_ref() returns the value from the render that installed this hook,
+        // not the live value. Use warned to detect a stale warning from a different session.
+        if warned.get().is_some_and(|s| s != exp_secs) {
+            warned.set(None);
             expiry_warn.set(None);
         }
         return;
@@ -590,13 +593,15 @@ async fn compute_expiry_for_session(
     let now_secs = (now_ms / 1000.0) as u64;
     let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs);
     let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-    expiry_warn.set(expiry_warning(
+    let warning = expiry_warning(
         now,
         expires,
         lead,
         pending.mutation_seqs,
         pending.content_files,
-    ));
+    );
+    warned.set(warning.as_ref().map(|_| exp_secs));
+    expiry_warn.set(warning);
 }
 
 /// Registers the account chooser callback that the worker calls when it needs
@@ -658,6 +663,8 @@ fn use_boot_session_listener(
     use_effect_with((), move |()| {
         let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
         let latest_session = Rc::new(Cell::new(0u64));
+        // Tracks which session expiry the current warning was computed for.
+        let warned_session: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let on_msg = {
             let identity = identity.clone();
             let booted_account = booted_account.clone();
@@ -679,9 +686,11 @@ fn use_boot_session_listener(
                 if let Some(exp_secs) = expires_at {
                     latest_session.set(exp_secs);
                     let ls = Rc::clone(&latest_session);
+                    let ws = Rc::clone(&warned_session);
                     spawn_local(compute_expiry_for_session(
                         exp_secs,
                         ls,
+                        ws,
                         expiry_warn.clone(),
                     ));
                 }

@@ -251,7 +251,7 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
     );
 
     stage("test 1: reading custody from the worker");
-    let custody = request_custody().await;
+    let custody = request_custody().await.expect("the worker answers custody");
     assert_eq!(
         custody,
         Custody::Unverified(NoGate::Unsupported),
@@ -275,7 +275,7 @@ async fn custody_without_the_unlock_flag_reads_as_offerable() {
     await_db_worker_ready().await.expect("db worker ready");
 
     stage("test 2: reading custody from the worker");
-    let custody = request_custody().await;
+    let custody = request_custody().await.expect("the worker answers custody");
     assert_eq!(
         custody,
         Custody::Unverified(NoGate::Offerable),

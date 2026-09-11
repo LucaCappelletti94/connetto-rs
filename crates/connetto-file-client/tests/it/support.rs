@@ -146,6 +146,97 @@ impl Transport for Scripted {
     }
 }
 
+/// A transport that completes the handshake and then fails every bulk send.
+///
+/// Simulates a transport reset that occurs after a committed import, so tests
+/// can verify the caller sees success rather than a replay error.
+pub struct BulkFailing {
+    greeted: Arc<AtomicBool>,
+}
+
+impl Default for BulkFailing {
+    fn default() -> Self {
+        Self {
+            greeted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl BulkFailing {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Transport for BulkFailing {
+    type Error = String;
+
+    fn send_control(
+        &mut self,
+        _message: ControlMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+
+    fn send_bulk(
+        &mut self,
+        _message: BulkMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Err("connection reset during replay".to_owned()))
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        if !self.greeted.swap(true, Ordering::Relaxed) {
+            return Ok(Some(IncomingFrame::Control(ControlMessage::HandshakeAck(
+                HandshakeAck {
+                    connection_id: "bulk-failing".to_owned(),
+                    session_token: "bulk-failing".to_owned(),
+                    resume_token: "bulk-failing".to_owned(),
+                    current_cursor: Cursor::new(Vec::new()),
+                    schema_version: None,
+                    initial_credits: 64,
+                    last_applied_seq: None,
+                },
+            ))));
+        }
+        loop {
+            tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
+        ready(Ok(()))
+    }
+}
+
+/// Opens a connected replica at `path/replica.sqlite` and attaches a content
+/// client backed by a `BulkFailing` transport, which accepts the handshake
+/// and fails every subsequent bulk send.
+pub async fn connected_content_bulk_failing(
+    root: &std::path::Path,
+) -> ContentClient<BulkFailing, FsStore, RecordingHttp> {
+    let replica_path = root.join("replica.sqlite");
+    let replica = Replica::encrypted_file(
+        replica_path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    let mut conn = ConnettoConnection::<BulkFailing>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+    conn.attach(BulkFailing::new())
+        .await
+        .expect("attach the transport");
+    let client = ConnettoClient::start(conn);
+    ContentClient::attach(
+        client,
+        FsStore::new(root.join("chunks")),
+        ROOT_KEY,
+        RecordingHttp::default(),
+    )
+    .await
+    .expect("attach content handling")
+}
+
 /// One request the negotiation sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {

@@ -181,6 +181,19 @@ fn fresh_quantity() -> i64 {
     (r as i64 + 1) * 5
 }
 
+/// Convert an `f64` value to `u64`, returning 0 for pre-epoch or non-finite values.
+///
+/// `Date::now()` and server-sent timestamps are always non-negative in practice; this
+/// helper makes the negative case explicit rather than relying on the silent saturating
+/// behaviour of `as u64`.
+fn f64_to_u64(v: f64) -> u64 {
+    if v.is_finite() && v >= 0.0 {
+        v as u64 // deliberate truncation: fractional part discarded
+    } else {
+        0
+    }
+}
+
 /// The tab mirror's physical footprint, read straight off the replica the
 /// client holds: total pages and the free pages a trim can reclaim.
 async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
@@ -474,7 +487,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
-    workers::announce_tab(&wire).await;
+    workers::announce_tab(&wire).await?;
     let transport =
         MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
@@ -721,13 +734,11 @@ fn App() -> Element {
                         .ok()
                         .and_then(|v| v.as_f64())
                         .map(|f| {
-                            // Recovering unix seconds that were sent as f64.
-                            // Always finite and << u64::MAX for any plausible deadline.
                             debug_assert!(
                                 f.is_finite() && f >= 0.0,
                                 "session_expires_at from broadcast must be finite"
                             );
-                            f as u64 // deliberate truncation: integer seconds recovered from f64
+                            f64_to_u64(f)
                         }),
                 );
             });
@@ -789,7 +800,9 @@ fn App() -> Element {
             match boot_window().await {
                 Ok(boot) => {
                     // Fetch the custody level now that the worker has settled.
-                    custody_level.set(Some(workers::request_custody().await));
+                    if let Ok(level) = workers::request_custody().await {
+                        custody_level.set(Some(level));
+                    }
                     let mut events = boot.client.events();
                     client_slot.set(Some(boot.client.clone()));
                     status.set("connected".to_owned());
@@ -844,12 +857,12 @@ async fn poll_expiry_warn(
         return;
     };
     let now_f64 = js_sys::Date::now();
-    // Deliberate truncation: milliseconds to seconds, always finite and non-negative.
+    // Deliberate truncation: sub-millisecond time discarded.
     debug_assert!(
         now_f64.is_finite() && now_f64 >= 0.0,
         "Date::now() must be finite"
     );
-    let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_millis(f64_to_u64(now_f64));
     expiry_warn.set(expiry_warning(
         now,
         expires_at,
@@ -885,12 +898,12 @@ fn format_expiry_line(warn: &ExpiryWarning) -> String {
         .unwrap_or_default()
         .as_secs();
     let now_f64 = js_sys::Date::now();
-    // Deliberate truncation: milliseconds to seconds, always finite and non-negative.
+    // Deliberate truncation: sub-second time discarded.
     debug_assert!(
         now_f64.is_finite() && now_f64 >= 0.0,
         "Date::now() must be finite"
     );
-    let now_secs = (now_f64 / 1000.0) as u64;
+    let now_secs = f64_to_u64(now_f64 / 1000.0);
     let days = secs.saturating_sub(now_secs) / 86400;
     format!("Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh.")
 }
@@ -1002,9 +1015,9 @@ fn AuthBanner() -> Element {
                                         let result = membership.enrol_gate().await;
                                         match result {
                                             Ok(true) => {
-                                                custody.set(Some(
-                                                    workers::request_custody().await,
-                                                ));
+                                                if let Ok(level) = workers::request_custody().await {
+                                                    custody.set(Some(level));
+                                                }
                                                 enrol_msg.set(None);
                                             }
                                             Ok(false) => {

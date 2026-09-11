@@ -17,6 +17,12 @@ const EXPORT_REPLY_FAILED: &str = "export-failed";
 const EXPORT_GENERATION_REPLY: &str = "export-generation";
 const IMPORT_REPLY_OK: &str = "import";
 const IMPORT_REPLY_FAILED: &str = "import-failed";
+const IMPORT_REQUEST_KIND: &str = "import?";
+
+/// Maximum bytes a file may contain to be accepted for import.
+///
+/// Matches the 2-gibibyte aggregate attachment ceiling in `connetto-client`.
+pub(crate) const MAX_IMPORT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
@@ -51,6 +57,29 @@ impl ExportTag {
 
     fn write(&self, message: &js_sys::Object) -> Result<(), JsValue> {
         set_export_generation(message, &self.generation)?;
+        js_sys::Reflect::set(
+            message,
+            &JsValue::from_str("request"),
+            &JsValue::from_str(&self.request),
+        )?;
+        Ok(())
+    }
+}
+
+/// Addresses one import exchange by caller id.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ImportTag {
+    request: String,
+}
+
+impl ImportTag {
+    fn read(data: &JsValue) -> Option<Self> {
+        Some(Self {
+            request: export_message_field(data, "request")?,
+        })
+    }
+
+    fn write(&self, message: &js_sys::Object) -> Result<(), JsValue> {
         js_sys::Reflect::set(
             message,
             &JsValue::from_str("request"),
@@ -129,6 +158,30 @@ fn build_export_request(scope: ExportScope, tag: &ExportTag) -> JsValue {
     request.into()
 }
 
+pub(super) fn decode_import_request(data: &JsValue) -> Option<(ImportTag, File)> {
+    if export_message_kind(data).as_deref() != Some(IMPORT_REQUEST_KIND) {
+        return None;
+    }
+    let tag = ImportTag::read(data)?;
+    let file = js_sys::Reflect::get(data, &JsValue::from_str("file"))
+        .ok()?
+        .dyn_into::<File>()
+        .ok()?;
+    Some((tag, file))
+}
+
+fn build_import_request(file: &File, tag: &ImportTag) -> Result<JsValue, JsValue> {
+    let request = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &request,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(IMPORT_REQUEST_KIND),
+    )?;
+    tag.write(&request)?;
+    js_sys::Reflect::set(&request, &JsValue::from_str("file"), file.as_ref())?;
+    Ok(request.into())
+}
+
 fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
     let tag = ExportTag::read(data)?;
     let reply = match export_message_kind(data)?.as_str() {
@@ -148,11 +201,10 @@ fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
     Some((tag, reply))
 }
 
-fn decode_import_reply(data: &JsValue) -> Option<ImportReply> {
-    let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
-        .ok()?
-        .as_string()?;
-    match kind.as_str() {
+fn decode_import_reply(data: &JsValue) -> Option<(ImportTag, ImportReply)> {
+    let tag = ImportTag::read(data)?;
+    let kind = export_message_kind(data)?;
+    let reply = match kind.as_str() {
         IMPORT_REPLY_OK => {
             let get_count = |key: &str| -> Option<usize> {
                 let v = js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?;
@@ -164,17 +216,18 @@ fn decode_import_reply(data: &JsValue) -> Option<ImportReply> {
                 writes_restored: get_count("writes_restored")?,
             };
             let collisions = get_count("collisions")?;
-            Some(Ok((outcome, collisions)))
+            Ok((outcome, collisions))
         }
         IMPORT_REPLY_FAILED => {
             let error = js_sys::Reflect::get(data, &JsValue::from_str("error"))
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Some(Err(error))
+            Err(error)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((tag, reply))
 }
 
 /// A JS number used as a count: finite, non-negative, integer, at most `u32::MAX`.
@@ -245,13 +298,18 @@ fn export_reply_failed(tag: &ExportTag, error: &str) -> Result<JsValue, JsValue>
     Ok(reply.into())
 }
 
-fn import_reply_ok(outcome: &ImportOutcome, collisions: usize) -> Result<JsValue, JsValue> {
+pub(super) fn import_reply_ok(
+    tag: &ImportTag,
+    outcome: &ImportOutcome,
+    collisions: usize,
+) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(IMPORT_REPLY_OK),
     )?;
+    tag.write(&reply)?;
     let set = |key: &str, count: usize| -> Result<bool, JsValue> {
         // counts fit u32 on every wasm target; saturate rather than fail on the impossible overflow
         js_sys::Reflect::set(
@@ -267,13 +325,14 @@ fn import_reply_ok(outcome: &ImportOutcome, collisions: usize) -> Result<JsValue
     Ok(reply.into())
 }
 
-fn import_reply_failed(error: &str) -> Result<JsValue, JsValue> {
+pub(super) fn import_reply_failed(tag: &ImportTag, error: &str) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(IMPORT_REPLY_FAILED),
     )?;
+    tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("error"),
@@ -420,7 +479,7 @@ where
     let listener = {
         let channel = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let Ok(file) = event.data().dyn_into::<File>() else {
+            let Some((tag, file)) = decode_import_request(&event.data()) else {
                 return;
             };
             let channel = channel.clone();
@@ -435,8 +494,8 @@ where
                 };
                 let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
                 let reply = match import(bytes).await {
-                    Ok((outcome, collisions)) => import_reply_ok(&outcome, collisions),
-                    Err(err) => import_reply_failed(&err.to_string()),
+                    Ok((outcome, collisions)) => import_reply_ok(&tag, &outcome, collisions),
+                    Err(err) => import_reply_failed(&tag, &err.to_string()),
                 };
                 post_channel_reply(&channel, reply, "import");
             });
@@ -522,19 +581,39 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
 pub async fn request_import(
     file: File,
 ) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "2^31 is exactly representable as f64; no precision is lost"
+    )]
+    if file.size() > MAX_IMPORT_FILE_BYTES as f64 {
+        return Err(crate::relay::ImportRefused::Failed(
+            "file exceeds the 2 GiB import limit".to_owned(),
+        ));
+    }
     let channel = BroadcastChannel::new(super::IMPORT_CHANNEL)
         .map_err(|err| crate::relay::ImportRefused::Failed(format!("import channel: {err:?}")))?;
     let result: ImportSlot = Rc::new(RefCell::new(None));
+    let tag = ImportTag {
+        request: rosetta_uuid::Uuid::new_v4().to_string(),
+    };
+    let Ok(request_msg) = build_import_request(&file, &tag) else {
+        return Err(crate::relay::ImportRefused::Failed(
+            "building import request failed".to_owned(),
+        ));
+    };
+    let request = tag.request;
     let on_message = {
         let result = Rc::clone(&result);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(reply) = decode_import_reply(&event.data()) {
+            if let Some((reply_tag, reply)) = decode_import_reply(&event.data())
+                && reply_tag.request == request
+            {
                 result.borrow_mut().get_or_insert(reply);
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let posted = channel.post_message(file.as_ref());
+    let posted = channel.post_message(&request_msg);
     while posted.is_ok()
         && result.borrow().is_none()
         && crate::locks::lock_is_held(super::DB_ALIVE_LOCK).await

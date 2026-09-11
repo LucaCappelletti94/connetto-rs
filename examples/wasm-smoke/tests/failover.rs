@@ -202,7 +202,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
-    announce_tab(&wire).await;
+    announce_tab(&wire).await.expect("announce the tab");
     let transport = MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         .expect("boot wire");
     let config = ClientConfig::new(client_id.clone())

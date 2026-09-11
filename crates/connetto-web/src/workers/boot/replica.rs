@@ -8,7 +8,8 @@ use connetto_core::custody::{Custody, NoGate};
 use connetto_core::traits::ReplicaKeyStore as _;
 use wasm_bindgen::JsValue;
 
-use super::super::helpers::to_js;
+use super::super::helpers::{sleep_ms, to_js};
+
 use super::super::session::{
     RefreshStoreHandle, acquire_deferred, acquire_session, persist_deferred,
 };
@@ -320,6 +321,9 @@ pub(super) async fn subscribe_and_boot(
     worker: &mut ConnettoConnection<BrowserSocket>,
     config: &DbWorkerConfig,
 ) -> Result<(), JsValue> {
+    // Matches the hello-channel TIMEOUT_MS in intake.rs so the tab and the worker give up
+    // at the same wall-clock moment: both sides wait at most 15 s for the worker to be ready.
+    const BOOT_TIMEOUT_MS: f64 = 15_000.0;
     if !worker.is_connected() {
         return Ok(());
     }
@@ -328,13 +332,28 @@ pub(super) async fn subscribe_and_boot(
         .await
         .map_err(to_js)?;
     worker.ping(1).await.map_err(to_js)?;
+    let started = js_sys::Date::now();
     loop {
-        match worker.pump_one().await.map_err(to_js)? {
-            ClientEvent::Pong { nonce: 1 } => break,
-            ClientEvent::Closed => {
+        let elapsed = js_sys::Date::now() - started;
+        if elapsed >= BOOT_TIMEOUT_MS {
+            return Err(JsValue::from_str(
+                "upstream did not complete the boot handshake within the deadline",
+            ));
+        }
+        let remaining = BOOT_TIMEOUT_MS - elapsed;
+        // Provably in i32 range: remaining <= BOOT_TIMEOUT_MS = 15_000.
+        debug_assert!(remaining > 0.0 && remaining <= BOOT_TIMEOUT_MS);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "remaining <= BOOT_TIMEOUT_MS = 15_000; sub-ms truncation is deliberate"
+        )]
+        let cancel = sleep_ms(remaining as i32);
+        match worker.pump_one_or(cancel).await.map_err(to_js)? {
+            Some(ClientEvent::Pong { nonce: 1 }) => break,
+            Some(ClientEvent::Closed) => {
                 return Err(JsValue::from_str("server closed during the upstream boot"));
             }
-            _ => {}
+            Some(_) | None => {}
         }
     }
     Ok(())

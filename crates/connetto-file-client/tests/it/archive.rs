@@ -8,8 +8,8 @@ use diesel::prelude::*;
 use tempfile::tempdir;
 
 use crate::support::{
-    RecordingHttp, Scripted, attach_content, connected_client, insert_row_and_pin_album,
-    learn_file_id, offline_client, photos, stage_photo,
+    RecordingHttp, Scripted, attach_content, connected_client, connected_content_bulk_failing,
+    insert_row_and_pin_album, learn_file_id, offline_client, photos, stage_photo,
 };
 
 const PHOTO: &[u8] = b"an offline photograph that must survive a device replacement";
@@ -307,4 +307,37 @@ fn only_chunk(root: &std::path::Path) -> Vec<u8> {
         .expect("read chunk entry")
         .path();
     std::fs::read(chunk).expect("read ciphertext")
+}
+
+/// A replay failure after the import commits must not surface as an import
+/// error: the rows, chunks and outbox entry are durable, and the outbox
+/// driver retries later.
+///
+/// Before the fix, the `?` on `replay_pending` propagates the transport error
+/// and the caller's `.expect(...)` panics here.
+#[tokio::test]
+async fn import_succeeds_when_replay_fails_after_commit() {
+    let source_dir = tempdir().expect("source directory");
+    let (archive, file_id, _) = export_source(source_dir.path()).await;
+
+    let target_dir = tempdir().expect("target directory");
+    let target = connected_content_bulk_failing(target_dir.path()).await;
+
+    let plan = target
+        .prepare_local_data_import(&archive)
+        .await
+        .expect("verify archive");
+    // Assertion that fails before the fix: the transport error from
+    // `replay_pending` propagates and panics here.
+    target
+        .apply_local_data_import(&plan, &ImportChoices::keeping_the_file())
+        .await
+        .expect("import must succeed even when replay fails after commit");
+
+    // Chunks and manifest must be accessible under the target key.
+    let Resolved::Local { bytes, .. } = target.resolve(file_id).await.expect("resolve restored")
+    else {
+        panic!("restored content must resolve locally after replay failure");
+    };
+    assert_eq!(bytes, PHOTO);
 }
