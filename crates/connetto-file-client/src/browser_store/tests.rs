@@ -20,6 +20,33 @@ fn unexpected_browser_types_are_definitive_read_failures() {
     assert!(!store.read_failure_is_ambiguous(&unexpected));
 }
 
+/// A worker that asked for durable storage and did not get it must not accept
+/// bytes: the replica would record a manifest and an outbox entry for content
+/// that dies with the worker.
+#[wasm_bindgen_test]
+async fn the_fallback_store_refuses_writes_and_still_answers_reads() {
+    let fallback = BrowserStore::fallback();
+    let hash = ChunkHash::from_bytes([0x61; 32]);
+
+    assert!(matches!(
+        fallback.write_chunk(&hash, b"bytes with nowhere durable to go").await,
+        Err(BrowserStoreError::NotDurable { hash: named }) if named == hash
+    ));
+    assert!(!fallback.has_chunk(&hash).await.expect("probe fallback"));
+    assert!(
+        fallback.read_failure_is_ambiguous(&fallback.read_chunk(&hash).await.expect_err("absent")),
+        "absence here says nothing about what durable storage holds"
+    );
+
+    // An application that chose ephemeral storage is not being refused a
+    // durability it never asked for.
+    let chosen = BrowserStore::ephemeral();
+    chosen
+        .write_chunk(&hash, b"bytes this run only")
+        .await
+        .expect("an ephemeral store accepts its own writes");
+}
+
 #[wasm_bindgen_test]
 async fn inventory_excludes_a_closed_chunk_until_atomic_landing() {
     let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();

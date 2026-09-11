@@ -50,6 +50,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// One row per file whose unsent bytes were found unreadable.
+    ///
+    /// Retiring an outbox entry destroys the only record that this device ever
+    /// declared the file, and the application's own row still names it, so the
+    /// identity is kept here until the application says it has dealt with it.
+    _connetto_content_retired (file_id) {
+        /// BLAKE3 identity of the file whose bytes are gone.
+        file_id -> Binary,
+    }
+}
+
+diesel::table! {
     /// One row per content pin, under the application's chosen name.
     _connetto_content_pins (name) {
         /// The application-chosen pin name, its identity for replace and end.
@@ -68,6 +80,8 @@ pub(crate) const CONTENT_DDL: &str = "\
     (file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, hash BLOB NOT NULL, \
      len BIGINT NOT NULL, PRIMARY KEY (file_id, ordinal)); \
     CREATE TABLE IF NOT EXISTS _connetto_content_outbox \
+    (file_id BLOB NOT NULL PRIMARY KEY); \
+    CREATE TABLE IF NOT EXISTS _connetto_content_retired \
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
     (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL)";
@@ -192,6 +206,39 @@ pub(crate) fn dequeue(
 ) -> Result<(), diesel::result::Error> {
     diesel::delete(_connetto_content_outbox::table)
         .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Records that a file's unsent bytes were unreadable, so the loss survives a restart.
+pub(crate) fn record_retired(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_or_ignore_into(_connetto_content_retired::table)
+        .values(_connetto_content_retired::file_id.eq(file_id.as_bytes().to_vec()))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Every file whose loss the application has not acknowledged.
+pub(crate) fn retired(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
+    let rows: Vec<Vec<u8>> = _connetto_content_retired::table
+        .order(_connetto_content_retired::file_id.asc())
+        .select(_connetto_content_retired::file_id)
+        .load(conn)?;
+    rows.into_iter()
+        .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
+        .collect()
+}
+
+/// Drops one acknowledged loss.
+pub(crate) fn forget_retired(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(_connetto_content_retired::table)
+        .filter(_connetto_content_retired::file_id.eq(file_id.as_bytes().to_vec()))
         .execute(conn)
         .map(|_| ())
 }

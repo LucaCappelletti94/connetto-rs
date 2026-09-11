@@ -18,7 +18,7 @@ use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
 
 /// The application's own table: a photo entry naming its content.
-pub const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, \
+pub const DDL: &str = "CREATE TABLE IF NOT EXISTS photos (id INTEGER PRIMARY KEY, \
                        content_id BLOB NOT NULL, content_state TEXT)";
 
 diesel::table! {

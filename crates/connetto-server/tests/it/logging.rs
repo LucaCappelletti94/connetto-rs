@@ -1,14 +1,19 @@
-use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 
+use parking_lot::Mutex;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
-pub(crate) struct Buffer(Arc<Mutex<Vec<u8>>>);
+struct Buffer(Arc<Mutex<Vec<u8>>>);
 
 impl Buffer {
-    pub(crate) fn lines(&self) -> Vec<serde_json::Value> {
+    fn take(&self) {
+        self.0.lock().clear();
+    }
+
+    fn lines(&self) -> Vec<serde_json::Value> {
         String::from_utf8_lossy(&self.0.lock())
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -42,6 +47,33 @@ static BUFFER: LazyLock<Buffer> = LazyLock::new(|| {
     buffer
 });
 
-pub(crate) fn install_once() -> Buffer {
-    BUFFER.clone()
+/// Held for as long as one test reads the log, so two log-reading tests in this
+/// process never share a buffer.
+static READER: AsyncMutex<()> = AsyncMutex::const_new(());
+
+/// One test's exclusive view of the process-global log destination.
+///
+/// A subscriber is process-global, so every module in this target writes to one
+/// buffer. Opening a capture empties it and locks out the other log-reading
+/// tests, which is what makes an assertion about what this test provoked.
+pub(crate) struct LogCapture {
+    buffer: Buffer,
+    _reader: MutexGuard<'static, ()>,
+}
+
+impl LogCapture {
+    /// Every record written since this capture opened, each parsed as one JSON object.
+    pub(crate) fn lines(&self) -> Vec<serde_json::Value> {
+        self.buffer.lines()
+    }
+}
+
+pub(crate) async fn capture() -> LogCapture {
+    let reader = READER.lock().await;
+    let buffer = BUFFER.clone();
+    buffer.take();
+    LogCapture {
+        buffer,
+        _reader: reader,
+    }
 }

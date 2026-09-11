@@ -1361,19 +1361,18 @@ where
                 }
                 return;
             }
-            let Some((requested_generation, scope)) = decode_export_request(&event.data()) else {
+            let Some((tag, scope)) = decode_export_request(&event.data()) else {
                 return;
             };
-            if requested_generation != *generation {
+            if tag.generation != *generation {
                 return;
             }
             let channel = channel.clone();
-            let generation = Rc::clone(&generation);
             let export = Rc::clone(&export);
             spawn_local(async move {
                 let reply = match export(scope).await {
-                    Ok(bytes) => export_reply_ok(&generation, &bytes),
-                    Err(err) => export_reply_failed(&generation, &err.to_string()),
+                    Ok(bytes) => export_reply_ok(&tag, &bytes),
+                    Err(err) => export_reply_failed(&tag, &err.to_string()),
                 };
                 match reply {
                     Ok(reply) => {
@@ -1489,14 +1488,14 @@ fn set_export_generation(reply: &js_sys::Object, generation: &str) -> Result<boo
 }
 
 /// Build the export success reply.
-fn export_reply_ok(generation: &str, bytes: &[u8]) -> Result<JsValue, JsValue> {
+fn export_reply_ok(tag: &ExportTag, bytes: &[u8]) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_OK),
     )?;
-    set_export_generation(&reply, generation)?;
+    tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("bytes"),
@@ -1506,14 +1505,14 @@ fn export_reply_ok(generation: &str, bytes: &[u8]) -> Result<JsValue, JsValue> {
 }
 
 /// Build the export failure reply.
-fn export_reply_failed(generation: &str, error: &str) -> Result<JsValue, JsValue> {
+fn export_reply_failed(tag: &ExportTag, error: &str) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_FAILED),
     )?;
-    set_export_generation(&reply, generation)?;
+    tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("error"),
@@ -1607,8 +1606,12 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     let channel = BroadcastChannel::new(EXPORT_CHANNEL)
         .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
     let state: ExportSlot = Rc::new(RefCell::new(ExportWait::default()));
+    // This caller's own id, so a reply to a concurrent caller's request on the
+    // same channel is not mistaken for this one's archive.
+    let request = rosetta_uuid::Uuid::new_v4().to_string();
     let on_message = {
         let state = Rc::clone(&state);
+        let request = request.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             if let Some(generation) = decode_export_generation(&event.data()) {
                 let mut state = state.borrow_mut();
@@ -1619,11 +1622,13 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
                 }
                 return;
             }
-            let Some((generation, reply)) = decode_export_reply(&event.data()) else {
+            let Some((tag, reply)) = decode_export_reply(&event.data()) else {
                 return;
             };
             let mut state = state.borrow_mut();
-            if state.generation.as_deref() == Some(generation.as_str()) {
+            if tag.request == request
+                && state.generation.as_deref() == Some(tag.generation.as_str())
+            {
                 state.result.get_or_insert(reply);
             }
         })
@@ -1645,7 +1650,11 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     if let Some(generation) = generation
         && !state.borrow().replaced
     {
-        posted = channel.post_message(&build_export_request(scope, &generation));
+        let tag = ExportTag {
+            generation,
+            request,
+        };
+        posted = channel.post_message(&build_export_request(scope, &tag));
         while posted.is_ok()
             && state.borrow().result.is_none()
             && !state.borrow().replaced
@@ -1726,10 +1735,42 @@ fn export_message_kind(data: &JsValue) -> Option<String> {
         .as_string()
 }
 
-fn export_message_generation(data: &JsValue) -> Option<String> {
-    js_sys::Reflect::get(data, &JsValue::from_str("generation"))
+fn export_message_field(data: &JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(data, &JsValue::from_str(key))
         .ok()?
         .as_string()
+}
+
+fn export_message_generation(data: &JsValue) -> Option<String> {
+    export_message_field(data, "generation")
+}
+
+/// Addresses one export exchange: the worker generation that answers it, and
+/// which caller asked. The generation alone cannot tell two concurrent
+/// callers' replies apart.
+#[derive(Clone, PartialEq, Eq)]
+struct ExportTag {
+    generation: String,
+    request: String,
+}
+
+impl ExportTag {
+    fn read(data: &JsValue) -> Option<Self> {
+        Some(Self {
+            generation: export_message_field(data, "generation")?,
+            request: export_message_field(data, "request")?,
+        })
+    }
+
+    fn write(&self, message: &js_sys::Object) -> Result<(), JsValue> {
+        set_export_generation(message, &self.generation)?;
+        js_sys::Reflect::set(
+            message,
+            &JsValue::from_str("request"),
+            &JsValue::from_str(&self.request),
+        )?;
+        Ok(())
+    }
 }
 
 fn is_export_generation_request(data: &JsValue) -> bool {
@@ -1752,24 +1793,20 @@ fn build_export_generation_request() -> JsValue {
     request.into()
 }
 
-fn decode_export_request(data: &JsValue) -> Option<(String, ExportScope)> {
+fn decode_export_request(data: &JsValue) -> Option<(ExportTag, ExportScope)> {
     if export_message_kind(data).as_deref() != Some("export?") {
         return None;
     }
-    let generation = export_message_generation(data)?;
-    let scope = match js_sys::Reflect::get(data, &JsValue::from_str("scope"))
-        .ok()?
-        .as_string()?
-        .as_str()
-    {
+    let tag = ExportTag::read(data)?;
+    let scope = match export_message_field(data, "scope")?.as_str() {
         "everything" => ExportScope::Everything,
         "unsynced" => ExportScope::Unsynced,
         _ => return None,
     };
-    Some((generation, scope))
+    Some((tag, scope))
 }
 
-fn build_export_request(scope: ExportScope, generation: &str) -> JsValue {
+fn build_export_request(scope: ExportScope, tag: &ExportTag) -> JsValue {
     let request = js_sys::Object::new();
     let scope = match scope {
         ExportScope::Everything => "everything",
@@ -1780,7 +1817,7 @@ fn build_export_request(scope: ExportScope, generation: &str) -> JsValue {
         &JsValue::from_str("kind"),
         &JsValue::from_str("export?"),
     );
-    let _ = set_export_generation(&request, generation);
+    let _ = tag.write(&request);
     let _ = js_sys::Reflect::set(
         &request,
         &JsValue::from_str("scope"),
@@ -1789,8 +1826,8 @@ fn build_export_request(scope: ExportScope, generation: &str) -> JsValue {
     request.into()
 }
 
-fn decode_export_reply(data: &JsValue) -> Option<(String, ExportReply)> {
-    let generation = export_message_generation(data)?;
+fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
+    let tag = ExportTag::read(data)?;
     let reply = match export_message_kind(data)?.as_str() {
         EXPORT_REPLY_OK => {
             let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
@@ -1805,7 +1842,7 @@ fn decode_export_reply(data: &JsValue) -> Option<(String, ExportReply)> {
         }
         _ => return None,
     };
-    Some((generation, reply))
+    Some((tag, reply))
 }
 
 /// One count carried as a JS number, or `None` when the value is not a whole
@@ -1870,6 +1907,19 @@ async fn ask_unsynced(hub: &crate::relay::RelayHub) -> Option<crate::auth::Pendi
     }
 }
 
+/// Reads one hex file identity, or `None` when it is not one this build wrote.
+fn file_id_from_hex(text: &str) -> Option<connetto_file_client::FileId> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+        let digits = core::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(digits, 16).ok()?;
+    }
+    Some(connetto_file_client::FileId::from_bytes(bytes))
+}
+
 /// Carry out one logout-channel request, returning the reply to broadcast, or
 /// `None` for traffic that is not a request (this worker's own replies).
 async fn serve_logout(
@@ -1889,9 +1939,34 @@ async fn serve_logout(
             return Some(LogoutMessage::Pending { pending });
         }
         LogoutMessage::Logout { delete, force } => (*delete, *force),
+        LogoutMessage::ForgetRetired { files } => {
+            // All or nothing: the reply names what was forgotten, so a request
+            // carrying an identity this build cannot read is refused whole.
+            let refusal = |detail: &str| {
+                Some(LogoutMessage::ForgetFailed {
+                    files: files.clone(),
+                    detail: detail.to_owned(),
+                })
+            };
+            let Some(retired) = files
+                .iter()
+                .map(|file| file_id_from_hex(file))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return refusal("a file identity was not readable");
+            };
+            return match hub.forget_retired_content(retired).await {
+                Ok(()) => Some(LogoutMessage::Forgot {
+                    files: files.clone(),
+                }),
+                Err(err) => refusal(&err.to_string()),
+            };
+        }
         LogoutMessage::Pending { .. }
         | LogoutMessage::Done { .. }
-        | LogoutMessage::Refused { .. } => {
+        | LogoutMessage::Refused { .. }
+        | LogoutMessage::Forgot { .. }
+        | LogoutMessage::ForgetFailed { .. } => {
             return None;
         }
     };

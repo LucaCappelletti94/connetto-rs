@@ -383,6 +383,14 @@ pub struct PendingWork {
     pub mutation_seqs: Vec<u64>,
     /// Content files still waiting in the upload outbox.
     pub content_files: u64,
+    /// Content files whose unsent bytes were lost, as hex identities.
+    ///
+    /// These are not pending: the bytes are gone, and the application rows
+    /// naming them are the application's to delete or to ask for again. The
+    /// record survives restarts until
+    /// [`forget_retired_content`] acknowledges it.
+    #[serde(default)]
+    pub retired_files: Vec<String>,
 }
 
 impl PendingWork {
@@ -440,6 +448,25 @@ pub enum LogoutMessage {
     Refused {
         /// The local work that would have been lost.
         pending: PendingWork,
+    },
+    /// Tab to worker: these lost content files have been dealt with, so stop
+    /// reporting them.
+    ForgetRetired {
+        /// The hex identities [`PendingWork::retired_files`] reported.
+        files: Vec<String>,
+    },
+    /// Worker to tabs: the named losses are forgotten. The list is echoed so
+    /// two tabs acknowledging different sets cannot read each other's answer.
+    Forgot {
+        /// The acknowledged hex identities.
+        files: Vec<String>,
+    },
+    /// Worker to tabs: the named losses were not forgotten.
+    ForgetFailed {
+        /// The identities the request named.
+        files: Vec<String>,
+        /// Why the acknowledgement did not take effect.
+        detail: String,
     },
 }
 
@@ -1506,6 +1533,32 @@ pub async fn request_unsynced() -> Result<PendingWork, AuthError> {
         },
     )
     .await
+}
+
+/// Tells the worker that lost content files reported by [`request_unsynced`]
+/// have been dealt with, so it stops reporting them.
+///
+/// The reply names the files it acknowledges, so one tab's answer cannot
+/// satisfy another tab's acknowledgement of a different set.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers, and [`AuthError::Store`]
+/// when one answers that the acknowledgement did not take effect.
+pub async fn forget_retired_content(files: Vec<String>) -> Result<(), AuthError> {
+    let asked = files.clone();
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::ForgetRetired { files },
+        move |message| match message {
+            LogoutMessage::Forgot { files } if files == asked => Some(Ok(())),
+            LogoutMessage::ForgetFailed { files, detail } if files == asked => {
+                Some(Err(AuthError::Store(detail)))
+            }
+            _ => None,
+        },
+    )
+    .await?
 }
 
 /// Page-side: ask the worker to log out, optionally destroying the replica.

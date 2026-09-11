@@ -165,7 +165,7 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
 /// about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
-    let logs = crate::logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
     fixture

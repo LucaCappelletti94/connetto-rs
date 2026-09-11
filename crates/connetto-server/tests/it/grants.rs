@@ -325,11 +325,11 @@ async fn an_invented_handle_is_refused_and_a_fresh_run_starts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_grant_names_the_caller_and_which_grant_in_the_log() {
+    let buffer = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
-    let buffer = crate::logging::install_once();
 
-    // A client id unique to this test, so the assertion holds while the rest of
-    // the file runs in parallel against the same process-global destination.
+    // A client id unique to this test, so the assertion names what this test
+    // provoked even when the log carries other records.
     let client_id = "refusal-probe";
     let arrival = arrive(
         &fixture,

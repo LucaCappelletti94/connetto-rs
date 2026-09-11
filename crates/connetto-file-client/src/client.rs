@@ -125,6 +125,7 @@ pub enum ContentFlush {
 #[derive(Default)]
 pub struct ContentFlushState {
     pending_ticket: Option<ticket::PendingTicket>,
+    last_attempted: Option<FileId>,
 }
 impl ContentFlushState {
     /// Whether an interrupted ticket request still awaits its answer.
@@ -132,6 +133,32 @@ impl ContentFlushState {
     pub fn is_waiting(&self) -> bool {
         self.pending_ticket.is_some()
     }
+}
+
+/// The entry to attempt next: one past `last`, wrapping.
+///
+/// An entry whose ticket keeps being refused stays queued, so always taking
+/// the first one would leave every later file waiting on it forever.
+fn next_after(waiting: &[FileId], last: Option<FileId>) -> Option<FileId> {
+    if waiting.is_empty() {
+        return None;
+    }
+    let next = last
+        .and_then(|last| waiting.iter().position(|file| *file == last))
+        .map_or(0, |index| (index + 1) % waiting.len());
+    waiting.get(next).copied()
+}
+
+/// Takes one file out of the outbox and records its loss, in one transaction.
+///
+/// Split apart, an entry could leave the outbox with nothing recording that
+/// this device ever declared the file while an application row still names it.
+fn retire(conn: &mut diesel::SqliteConnection, file_id: FileId) -> Result<(), ContentError> {
+    conn.transaction(|conn| {
+        db::dequeue(conn, file_id)?;
+        db::record_retired(conn, file_id)
+    })
+    .map_err(ContentError::from)
 }
 
 /// A worker-owned outbox attempt after its cancel-safe ticket wait.
@@ -214,7 +241,8 @@ where
         db::outbox_count(connection.conn())
     }
 
-    /// Retires outbox entries whose bytes are conclusively unreadable.
+    /// Retires outbox entries whose bytes are conclusively unreadable, keeping
+    /// each identity in the replica until the application acknowledges it.
     ///
     /// # Errors
     ///
@@ -233,11 +261,39 @@ where
                 None => Some(0),
             };
             if unreadable.is_some() {
-                db::dequeue(connection.conn(), file_id)?;
+                retire(connection.conn(), file_id)?;
                 lost.push(file_id);
             }
         }
         Ok(lost)
+    }
+
+    /// Files whose unsent bytes were lost and whose loss is unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub fn retired_content<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<FileId>, ContentError> {
+        db::retired(connection.conn())
+    }
+
+    /// Drops the losses the application has dealt with.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub fn forget_retired_content<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        files: &[FileId],
+    ) -> Result<(), ContentError> {
+        for file_id in files {
+            db::forget_retired(connection.conn(), *file_id)?;
+        }
+        Ok(())
     }
 
     /// Attempts one raw-connection outbox entry.
@@ -350,7 +406,8 @@ where
             return Ok(Some(file_id));
         }
         state.pending_ticket = None;
-        Ok(waiting.first().copied())
+        state.last_attempted = next_after(&waiting, state.last_attempted);
+        Ok(state.last_attempted)
     }
 
     fn load_outbox_manifest<T: Transport>(
@@ -754,7 +811,7 @@ where
                 continue;
             };
             self.client
-                .with_conn(|conn| db::dequeue(conn.conn(), file_id))
+                .with_conn(|conn| retire(conn.conn(), file_id))
                 .await?;
             lost.push(file_id);
             let _ = self.events.send(ContentEvent::BytesLost {
@@ -763,6 +820,30 @@ where
             });
         }
         Ok(lost)
+    }
+
+    /// Files whose unsent bytes were lost and whose loss is unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub async fn retired_content(&self) -> Result<Vec<FileId>, ContentError> {
+        self.client.with_conn(|conn| db::retired(conn.conn())).await
+    }
+
+    /// Drops the losses the application has dealt with.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub async fn forget_retired_content(&self, files: &[FileId]) -> Result<(), ContentError> {
+        for file_id in files {
+            let file_id = *file_id;
+            self.client
+                .with_conn(move |conn| db::forget_retired(conn.conn(), file_id))
+                .await?;
+        }
+        Ok(())
     }
 
     /// How many of one unsent file's chunks cannot be read, or `None` when all
@@ -1291,4 +1372,42 @@ fn evictable(
 /// quoting has no such fallback and reports `no such column`.
 fn pin_sql(query: &str, column: &str) -> String {
     format!("SELECT [{column}] AS file_id FROM ({query}) AS _connetto_pin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileId, next_after};
+
+    fn file(byte: u8) -> FileId {
+        FileId::from_bytes([byte; 32])
+    }
+
+    /// A file that defers on every attempt must not hold up the rest.
+    #[test]
+    fn a_deferred_entry_hands_the_next_attempt_to_the_next_file() {
+        let waiting = [file(1), file(2), file(3)];
+
+        let first = next_after(&waiting, None);
+        let second = next_after(&waiting, first);
+        let third = next_after(&waiting, second);
+
+        assert_eq!(first, Some(file(1)));
+        assert_eq!(second, Some(file(2)));
+        assert_eq!(third, Some(file(3)));
+        assert_eq!(
+            next_after(&waiting, third),
+            Some(file(1)),
+            "the walk wraps rather than ending"
+        );
+    }
+
+    /// The uploaded file leaves the outbox, so the cursor no longer names a row.
+    #[test]
+    fn a_cursor_past_a_dequeued_file_restarts_the_walk() {
+        assert_eq!(
+            next_after(&[file(2), file(3)], Some(file(1))),
+            Some(file(2))
+        );
+        assert_eq!(next_after(&[], Some(file(1))), None);
+    }
 }

@@ -168,7 +168,7 @@ async fn first_reply<T: Transport>(client: &mut T, sub_id: &str, query: &str) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_are_byte_identical_across_causes() {
-    let logs = crate::logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(

@@ -850,7 +850,23 @@ fn AuthBanner() -> Element {
                 expiry_warn.set(None);
                 return;
             };
-            let Ok(pending) = request_unsynced().await else {
+            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            let pending = request_unsynced().await;
+            if *session_expires_at.read() != Some(secs) {
+                // A newer session arrived while this query ran, and its own
+                // effect owns the warning now.
+                return;
+            }
+            let Ok(pending) = pending else {
+                // Local work is unknown, so the last warning is the best
+                // answer for this session, and no answer at all for another.
+                if expiry_warn
+                    .read()
+                    .as_ref()
+                    .is_some_and(|warn| warn.session_expires_at != expires_at)
+                {
+                    expiry_warn.set(None);
+                }
                 return;
             };
             let now_f64 = js_sys::Date::now();
@@ -860,7 +876,6 @@ fn AuthBanner() -> Element {
                 "Date::now() must be finite"
             );
             let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
-            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
             expiry_warn.set(expiry_warning(
                 now,
                 expires_at,

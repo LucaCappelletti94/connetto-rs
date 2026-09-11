@@ -228,6 +228,53 @@ async fn the_boot_pass_retires_an_unsent_file_whose_bytes_are_gone() {
     );
 }
 
+/// The identity of a lost file outlives its outbox entry, because the
+/// application row still names it and only the application can settle that.
+#[tokio::test]
+async fn a_retired_file_stays_reported_until_it_is_acknowledged() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let (_, content) = offline_content(dir.path()).await;
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
+    for path in walk_files(&chunks) {
+        std::fs::remove_file(&path).expect("remove a chunk file");
+    }
+
+    content.verify_unsent().await.expect("the boot pass runs");
+    drop(content);
+
+    // A restart: the replica is the only thing that can still name the file.
+    let (_, after_restart) = offline_content(dir.path()).await;
+    assert_eq!(
+        after_restart
+            .retired_content()
+            .await
+            .expect("read the record"),
+        vec![file_id],
+        "the loss survives the outbox entry it retired, and the worker that saw it"
+    );
+    // A later pass finds nothing to retire, and must not forget the first loss.
+    after_restart
+        .verify_unsent()
+        .await
+        .expect("a second boot pass");
+    after_restart
+        .forget_retired_content(&[file_id])
+        .await
+        .expect("acknowledge the loss");
+    drop(after_restart);
+
+    let (_, acknowledged) = offline_content(dir.path()).await;
+    assert_eq!(
+        acknowledged
+            .retired_content()
+            .await
+            .expect("read the record"),
+        Vec::<FileId>::new(),
+        "an acknowledged loss is reported no more, across restarts too"
+    );
+}
+
 /// A chunk file that is present but does not authenticate is as lost as one
 /// that is absent, which is why the pass reads rather than probes.
 #[tokio::test]

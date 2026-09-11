@@ -203,7 +203,7 @@ async fn wide_rows_page_smaller_under_the_same_budget() {
 /// file-shaped data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers() {
-    let logs = crate::logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
     fixture
@@ -253,7 +253,7 @@ async fn a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers() {
 /// before a single row is read, which is the one refusal the estimate pays for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_table_wider_than_the_ceiling_is_refused_before_the_read() {
-    let logs = crate::logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
     fixture
@@ -367,7 +367,7 @@ async fn read_refusals_are_byte_identical_across_causes() {
 /// at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
-    let logs = crate::logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fill(&fixture, 40, 64).await;
     let serving = manager(
@@ -530,7 +530,7 @@ mod aggregates {
     /// refusal carries, and the log carries the cause.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_triggered_read_past_the_shared_bound_ends_the_subscription() {
-        let logs = crate::logging::install_once();
+        let logs = crate::logging::capture().await;
         let fixture = Fixture::acquire().await;
         fill_counts(&fixture, 200_000).await;
         let manager = manager(

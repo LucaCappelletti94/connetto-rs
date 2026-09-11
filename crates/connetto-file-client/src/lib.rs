@@ -19,6 +19,7 @@ pub use client::{
     ContentArchive, ContentClient, ContentEvent, ContentFlush, ContentFlushStart,
     ContentFlushState, ContentImportPlan, ContentUpload,
 };
+pub use connetto_file_core::FileId;
 pub use error::ContentError;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

@@ -28,6 +28,7 @@
 //! `CONNETTO_PG_DDL_FILE`, then `trunk serve` from this directory and open
 //! the served URL in several windows.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
@@ -632,6 +633,9 @@ fn app() -> Html {
         let expiry_warn = expiry_warn.clone();
         use_effect_with((), move |()| {
             let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
+            // The newest boot session this listener has seen, so a slow query
+            // cannot answer for a session that has already been replaced.
+            let latest_session = Rc::new(Cell::new(0u64));
             let on_msg = {
                 let identity = identity.clone();
                 let booted_account = booted_account.clone();
@@ -669,8 +673,27 @@ fn app() -> Html {
                     // Compute the expiry warning when we have all the inputs.
                     if let Some(exp_secs) = expires_at {
                         let expiry_warn = expiry_warn.clone();
+                        latest_session.set(exp_secs);
+                        let latest_session = Rc::clone(&latest_session);
                         spawn_local(async move {
-                            let Ok(pending) = connetto_web::auth::request_unsynced().await else {
+                            let expires = std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(exp_secs);
+                            let pending = connetto_web::auth::request_unsynced().await;
+                            if latest_session.get() != exp_secs {
+                                // A newer boot session arrived while this query
+                                // ran, and it owns the warning now.
+                                return;
+                            }
+                            let Ok(pending) = pending else {
+                                // Local work is unknown, so the last warning is
+                                // the best answer for this session, and no
+                                // answer at all for another.
+                                if expiry_warn
+                                    .as_ref()
+                                    .is_some_and(|warn| warn.session_expires_at != expires)
+                                {
+                                    expiry_warn.set(None);
+                                }
                                 return;
                             };
                             let now_ms = js_sys::Date::now();
@@ -680,8 +703,6 @@ fn app() -> Html {
                             let now_secs = (now_ms / 1000.0) as u64;
                             let now = std::time::SystemTime::UNIX_EPOCH
                                 + std::time::Duration::from_secs(now_secs);
-                            let expires = std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(exp_secs);
                             let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
                             expiry_warn.set(expiry_warning(
                                 now,

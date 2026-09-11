@@ -76,7 +76,7 @@ use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ContentArchive, ContentError, ContentFlush, ContentFlushStart,
-    ContentFlushState, ContentUpload,
+    ContentFlushState, ContentUpload, FileId,
 };
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -168,6 +168,17 @@ pub enum ImportRefused {
     Failed(String),
 }
 
+/// Why acknowledging lost content files did not take effect.
+#[derive(Debug, thiserror::Error)]
+pub enum ForgetRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the replica write failed.
+    #[error("forget retired content: {0}")]
+    Failed(String),
+}
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -199,6 +210,12 @@ enum HubEvent {
     Export(
         ExportScope,
         futures_channel::oneshot::Sender<Result<Vec<u8>, ArchiveServiceError>>,
+    ),
+    /// Acknowledge lost content files, so they stop being reported. Same
+    /// reason: only the core can reach the connection.
+    ForgetRetired(
+        Vec<FileId>,
+        futures_channel::oneshot::Sender<Result<(), ArchiveServiceError>>,
     ),
     /// Import an archive: device-private rows and queued writes. Same reason.
     Import(
@@ -732,6 +749,23 @@ impl RelayHub {
             .map_err(|_| HubGone)?
             .map_err(|err| ImportRefused::Failed(err.to_string()))
     }
+
+    /// Acknowledge lost content files, so pending-work answers stop naming them.
+    ///
+    /// # Errors
+    ///
+    /// [`ForgetRefused::Gone`] when the core has ended.
+    /// [`ForgetRefused::Failed`] when the replica write failed.
+    pub async fn forget_retired_content(&self, files: Vec<FileId>) -> Result<(), ForgetRefused> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events
+            .send(HubEvent::ForgetRetired(files, reply))
+            .map_err(|_| HubGone)?;
+        answer
+            .await
+            .map_err(|_| HubGone)?
+            .map_err(|err| ForgetRefused::Failed(err.to_string()))
+    }
 }
 
 fn prepare_hub_worker<U: Transport>(
@@ -1115,9 +1149,11 @@ where
             return;
         };
         match content.verify_unsent(&mut self.worker).await {
-            Ok(lost) if !lost.is_empty() => {
+            Ok(files) if !files.is_empty() => {
+                // The identities are durable in the replica until acknowledged,
+                // so a pending-work query reports them rather than this line.
                 tracing::warn!(
-                    files = lost.len(),
+                    files = files.len(),
                     "content integrity pass retired unreadable files"
                 );
             }
@@ -1229,6 +1265,21 @@ where
     }
 }
 
+/// Files whose unsent bytes were lost and remain unacknowledged, none when
+/// content is disabled.
+fn retired_content<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+) -> Result<Vec<FileId>, RelayError>
+where
+    U: Transport,
+{
+    match content {
+        Some(content) => Ok(content.retired_content(worker)?),
+        None => Ok(Vec::new()),
+    }
+}
+
 async fn handle_hub_event<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
@@ -1249,8 +1300,21 @@ where
             let pending = PendingWork {
                 mutation_seqs: worker.unsynced(),
                 content_files: content_pending_files(worker, content)?,
+                retired_files: retired_content(worker, content)?
+                    .iter()
+                    .map(FileId::to_string)
+                    .collect(),
             };
             let _ = reply.send(pending);
+        }
+        HubEvent::ForgetRetired(files, reply) => {
+            let answer = match content {
+                Some(content) => content
+                    .forget_retired_content(worker, &files)
+                    .map_err(ArchiveServiceError::from),
+                None => Ok(()),
+            };
+            let _ = reply.send(answer);
         }
         HubEvent::Export(scope, reply) => {
             let _ = reply.send(export_archive(worker, content, scope).await);

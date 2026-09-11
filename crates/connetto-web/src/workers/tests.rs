@@ -11,7 +11,8 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent};
 
 use super::{
-    DB_ALIVE_LOCK, EXPORT_CHANNEL, content_store_namespace, export_generation_reply, request_export,
+    DB_ALIVE_LOCK, EXPORT_CHANNEL, content_store_namespace, decode_export_request,
+    export_generation_reply, export_reply_ok, request_export,
 };
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -107,6 +108,55 @@ async fn an_export_wait_refuses_a_replacement_worker_generation() {
         Date::now() - started < 1_000.0,
         "generation replacement must end the old wait promptly"
     );
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+    alive.release();
+}
+
+/// Two callers on one channel: each reply carries the request it answers, so
+/// neither caller can be handed the other's archive.
+#[wasm_bindgen_test]
+async fn two_concurrent_exports_each_receive_their_own_archive() {
+    let alive = crate::locks::hold_lock(DB_ALIVE_LOCK).await;
+    let channel = BroadcastChannel::new(EXPORT_CHANNEL).expect("open export responder");
+    let on_message = {
+        let channel = channel.clone();
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let data = event.data();
+            if Reflect::get(&data, &JsValue::from_str("kind"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .as_deref()
+                == Some("generation?")
+            {
+                let reply = export_generation_reply("one-worker").expect("generation reply");
+                channel.post_message(&reply).expect("answer generation");
+                return;
+            }
+            let Some((tag, scope)) = decode_export_request(&data) else {
+                return;
+            };
+            // The archive names the scope it was asked for, which is what makes
+            // a crossed reply visible.
+            let archive = match scope {
+                ExportScope::Everything => b"everything".to_vec(),
+                ExportScope::Unsynced => b"unsynced".to_vec(),
+            };
+            let reply = export_reply_ok(&tag, &archive).expect("export reply");
+            channel.post_message(&reply).expect("answer export");
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    let (everything, unsynced) = futures_util::future::join(
+        request_export(ExportScope::Everything),
+        request_export(ExportScope::Unsynced),
+    )
+    .await;
+
+    assert_eq!(everything.expect("whole archive"), b"everything");
+    assert_eq!(unsynced.expect("unsynced archive"), b"unsynced");
     channel.set_onmessage(None);
     channel.close();
     drop(on_message);

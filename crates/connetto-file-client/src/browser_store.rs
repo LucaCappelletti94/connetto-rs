@@ -56,6 +56,13 @@ pub enum BrowserStoreError {
     /// The in-memory fallback failed.
     #[error(transparent)]
     Memory(#[from] MemStoreError),
+    /// Durable storage was asked for and is unavailable, so this store keeps
+    /// nothing past the worker's life and refuses to pretend otherwise.
+    #[error("browser content storage is unavailable, so {hash} cannot be stored durably")]
+    NotDurable {
+        /// The chunk that was not written.
+        hash: ChunkHash,
+    },
 }
 
 /// An OPFS store that reacquires the worker root and atomically exposes each closed replacement.
@@ -344,14 +351,13 @@ impl BrowserStore {
     ) -> Result<Self, BrowserStoreError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
-        let (inner, fallback_memory) = match OpfsStore::open(worker, namespace).await {
-            Ok(store) => (BrowserStoreInner::Opfs(store), false),
-            Err(_) => (BrowserStoreInner::Memory(Arc::new(MemStore::new())), true),
-        };
-        Ok(Self {
-            inner,
-            fallback_memory,
-        })
+        match OpfsStore::open(worker, namespace).await {
+            Ok(store) => Ok(Self {
+                inner: BrowserStoreInner::Opfs(store),
+                fallback_memory: false,
+            }),
+            Err(_) => Ok(Self::fallback()),
+        }
     }
 
     /// Removes one persistent namespace and all of its chunks.
@@ -381,6 +387,17 @@ impl BrowserStore {
     pub fn is_persistent(&self) -> bool {
         matches!(self.inner, BrowserStoreInner::Opfs(_))
     }
+
+    /// The store a worker gets when durable storage was asked for and refused.
+    ///
+    /// It answers reads so an earlier session's content still displays, and
+    /// refuses writes, because the replica would record them as held.
+    fn fallback() -> Self {
+        Self {
+            inner: BrowserStoreInner::Memory(Arc::new(MemStore::new())),
+            fallback_memory: true,
+        }
+    }
 }
 
 impl ChunkStore for BrowserStore {
@@ -396,6 +413,12 @@ impl ChunkStore for BrowserStore {
     }
 
     async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
+        // A durable replica records the manifest and the outbox entry, so
+        // accepting bytes that vanish with the worker would report content as
+        // held and then lose it on the next boot.
+        if self.fallback_memory {
+            return Err(BrowserStoreError::NotDurable { hash: *hash });
+        }
         match &self.inner {
             BrowserStoreInner::Opfs(store) => store.write_chunk(hash, data).await,
             BrowserStoreInner::Memory(store) => {

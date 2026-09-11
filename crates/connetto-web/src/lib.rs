@@ -54,7 +54,9 @@ use futures_channel::mpsc;
 use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
 pub use leader::{Membership, join};
-pub use relay::{ExportRefused, HubGone, HubNotice, RelayError, RelayHub, TabId};
+pub use relay::{
+    ExportRefused, ForgetRefused, HubGone, HubNotice, ImportRefused, RelayError, RelayHub, TabId,
+};
 pub use storage::{
     PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
     take_pending_wipes, wipe_replica,

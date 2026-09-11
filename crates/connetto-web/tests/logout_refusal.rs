@@ -30,7 +30,8 @@ use connetto_file_client::{BrowserStore, ContentArchive};
 use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 use connetto_web::RelayHub;
 use connetto_web::auth::{
-    LogoutOutcome, PendingWork, WorkerAuthConfig, request_logout, request_unsynced,
+    AuthError, LogoutOutcome, PendingWork, WorkerAuthConfig, forget_retired_content,
+    request_logout, request_unsynced,
 };
 use connetto_web::relay::HubReconnect;
 use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
@@ -226,12 +227,23 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     let pending = PendingWork {
         mutation_seqs: stranded.clone(),
         content_files: 1,
+        retired_files: Vec::new(),
     };
     assert_eq!(
         request_unsynced().await.expect("the worker answers"),
         pending,
         "the query reports both queues"
     );
+
+    // The acknowledgement protocol answers the caller that asked: an identity
+    // this build cannot read is refused with a reason rather than left to wait.
+    assert!(matches!(
+        forget_retired_content(vec!["not-a-file-identity".to_owned()]).await,
+        Err(AuthError::Store(_))
+    ));
+    forget_retired_content(Vec::new())
+        .await
+        .expect("an acknowledgement of nothing is still answered");
 
     // The delete is refused, and refused without destroying anything, so the write
     // can still be uploaded once the network returns.

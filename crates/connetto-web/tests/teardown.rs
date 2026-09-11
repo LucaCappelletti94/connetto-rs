@@ -98,6 +98,7 @@ fn work(seqs: &[u64]) -> PendingWork {
     PendingWork {
         mutation_seqs: seqs.to_vec(),
         content_files: 0,
+        retired_files: Vec::new(),
     }
 }
 
