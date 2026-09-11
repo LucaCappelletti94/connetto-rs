@@ -45,7 +45,11 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
 const TEST_LOCK: &str = "connetto-content-archive-test";
+/// Distinct bytes per test, because a relay a finished test left running keeps
+/// driving its own outbox against whatever `fetch` the current test installed.
 const PHOTO: &[u8] = b"a photograph written offline and restored onto a replacement browser worker";
+const RELAY_PHOTO: &[u8] = b"a photograph a relay import hands to the worker outbox with no tab";
+const CONCURRENT_PHOTO: &[u8] = b"a photograph uploading while the hub answers a local request";
 
 diesel::table! {
     /// Photo rows restored with the pending content.
@@ -193,7 +197,7 @@ async fn connected_client() -> ConnettoClient<TicketTransport> {
 #[wasm_bindgen_test]
 async fn an_offline_photo_restores_displays_locally_and_uploads() {
     let serial = locks::hold_lock(TEST_LOCK).await;
-    let (source_archive, file_id) = stage_source().await;
+    let (source_archive, file_id) = stage_source(PHOTO).await;
     let archive = relay_round_trip(&source_archive).await;
     let replacement = restore_target(&archive).await;
 
@@ -221,7 +225,7 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
         1
     );
     drop(fetch);
-    assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    assert_eq!(uploads_of(&uploaded, PHOTO), 1);
     serial.release();
 }
 
@@ -229,7 +233,7 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
 #[wasm_bindgen_test]
 async fn a_relay_import_drives_the_worker_outbox() {
     let serial = locks::hold_lock(TEST_LOCK).await;
-    let (archive, _) = stage_source().await;
+    let (archive, _) = stage_source(RELAY_PHOTO).await;
     let worker =
         ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
             .expect("open relay replica");
@@ -244,18 +248,18 @@ async fn a_relay_import_drives_the_worker_outbox() {
     let fetch = install_content_fetch(&uploaded);
     hub.import_local_data(archive).await.expect("relay import");
     assert!(
-        until(async || !uploaded.borrow().is_empty()).await,
+        until(async || uploads_of(&uploaded, RELAY_PHOTO) > 0).await,
         "the relay import must upload the restored photo"
     );
     drop(fetch);
-    assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    assert_eq!(uploads_of(&uploaded, RELAY_PHOTO), 1);
     serial.release();
 }
 
 #[wasm_bindgen_test]
 async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     let serial = locks::hold_lock(TEST_LOCK).await;
-    let (archive, _) = stage_source().await;
+    let (archive, _) = stage_source(CONCURRENT_PHOTO).await;
     let worker =
         ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
             .expect("open relay replica");
@@ -282,10 +286,10 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     };
     assert_eq!(pending.content_files, 1);
     assert!(
-        until(async || !uploaded.borrow().is_empty()).await,
+        until(async || uploads_of(&uploaded, CONCURRENT_PHOTO) > 0).await,
         "the released transfer must reach the server"
     );
-    assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    assert_eq!(uploads_of(&uploaded, CONCURRENT_PHOTO), 1);
     assert!(
         until(async || {
             hub.unsynced()
@@ -300,12 +304,12 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     serial.release();
 }
 
-async fn stage_source() -> (Vec<u8>, FileId) {
+async fn stage_source(photo: &'static [u8]) -> (Vec<u8>, FileId) {
     let source = attach_browser_content(offline_client(), "r68-archive-source", [1; 32])
         .await
         .expect("attach source content");
     let (file_id, ()) = source
-        .stage(PHOTO, MimeClass::Jpeg, |connection, file_id| {
+        .stage(photo, MimeClass::Jpeg, |connection, file_id| {
             diesel::insert_into(photos::table)
                 .values((
                     photos::id.eq(1),
@@ -321,6 +325,15 @@ async fn stage_source() -> (Vec<u8>, FileId) {
         .await
         .expect("export through content policy");
     (archive, file_id)
+}
+
+/// How many of the recorded uploads carried `photo`.
+fn uploads_of(uploaded: &RefCell<Vec<Vec<u8>>>, photo: &[u8]) -> usize {
+    uploaded
+        .borrow()
+        .iter()
+        .filter(|body| body.as_slice() == photo)
+        .count()
 }
 
 async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {

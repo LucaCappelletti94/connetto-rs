@@ -700,11 +700,7 @@ impl RelayHub {
     ///
     /// [`HubGone`] when the core has ended, so no answer will come.
     pub async fn unsynced(&self) -> Result<PendingWork, HubGone> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Unsynced(reply))
-            .map_err(|_| HubGone)?;
-        answer.await.map_err(|_| HubGone)
+        self.ask(HubEvent::Unsynced).await
     }
 
     /// A zip archive of the worker's local data, scoped as requested.
@@ -716,13 +712,8 @@ impl RelayHub {
     /// [`ExportRefused::Gone`] when the core has ended.
     /// [`ExportRefused::Failed`] when the core answered and the export failed.
     pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ExportRefused> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Export(scope, reply))
-            .map_err(|_| HubGone)?;
-        answer
-            .await
-            .map_err(|_| HubGone)?
+        self.ask(|reply| HubEvent::Export(scope, reply))
+            .await?
             .map_err(|err| ExportRefused::Failed(err.to_string()))
     }
 
@@ -740,13 +731,8 @@ impl RelayHub {
         &self,
         bytes: Vec<u8>,
     ) -> Result<(ImportOutcome, usize), ImportRefused> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Import(bytes, reply))
-            .map_err(|_| HubGone)?;
-        answer
-            .await
-            .map_err(|_| HubGone)?
+        self.ask(|reply| HubEvent::Import(bytes, reply))
+            .await?
             .map_err(|err| ImportRefused::Failed(err.to_string()))
     }
 
@@ -757,14 +743,19 @@ impl RelayHub {
     /// [`ForgetRefused::Gone`] when the core has ended.
     /// [`ForgetRefused::Failed`] when the replica write failed.
     pub async fn forget_retired_content(&self, files: Vec<FileId>) -> Result<(), ForgetRefused> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::ForgetRetired(files, reply))
-            .map_err(|_| HubGone)?;
-        answer
-            .await
-            .map_err(|_| HubGone)?
+        self.ask(|reply| HubEvent::ForgetRetired(files, reply))
+            .await?
             .map_err(|err| ForgetRefused::Failed(err.to_string()))
+    }
+
+    /// Queue one request the core answers on its own channel, and wait for it.
+    async fn ask<T>(
+        &self,
+        request: impl FnOnce(futures_channel::oneshot::Sender<T>) -> HubEvent,
+    ) -> Result<T, HubGone> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events.send(request(reply)).map_err(|_| HubGone)?;
+        answer.await.map_err(|_| HubGone)
     }
 }
 
@@ -1220,34 +1211,50 @@ where
     let http = BrowserHttp::new();
     let transfer = upload.transfer(&http);
     tokio::pin!(transfer);
-    let mut events_open = true;
+    let mut serving = true;
     let mut event_error = None;
     // A started upload is never cancelled: a failing local event only stops
     // the service loop, and the transfer plus its bookkeeping still finish.
     let result = loop {
-        if events_open {
-            tokio::select! {
-                result = &mut transfer => break result,
-                event = events.recv() => match event {
-                    Some(event) => {
-                        if let Err(error) =
-                            handle_hub_event(worker, state, notices, Some(content), event).await
-                        {
-                            event_error = Some(error);
-                            events_open = false;
-                        }
-                    }
-                    None => events_open = false,
-                },
+        match transfer_step(&mut transfer, events, serving).await {
+            TransferStep::Done(result) => break result,
+            TransferStep::Event(None) => serving = false,
+            TransferStep::Event(Some(event)) => {
+                if let Err(error) =
+                    handle_hub_event(worker, state, notices, Some(content), event).await
+                {
+                    event_error = Some(error);
+                    serving = false;
+                }
             }
-        } else {
-            break transfer.await;
         }
     };
     let flush = content.finish_upload(worker, upload, result)?;
     match event_error {
         Some(error) => Err(error),
         None => Ok(flush),
+    }
+}
+
+/// What happened first: the transfer finished, or a local request arrived.
+enum TransferStep {
+    Done(Result<(), ContentError>),
+    Event(Option<HubEvent>),
+}
+
+/// Waits for whichever comes first, or for the transfer alone once local
+/// events are no longer being served.
+async fn transfer_step(
+    transfer: &mut core::pin::Pin<&mut impl Future<Output = Result<(), ContentError>>>,
+    events: &mut UnboundedReceiver<HubEvent>,
+    serving: bool,
+) -> TransferStep {
+    if !serving {
+        return TransferStep::Done(transfer.as_mut().await);
+    }
+    tokio::select! {
+        result = transfer.as_mut() => TransferStep::Done(result),
+        event = events.recv() => TransferStep::Event(event),
     }
 }
 
