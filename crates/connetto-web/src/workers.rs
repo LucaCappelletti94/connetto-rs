@@ -696,53 +696,63 @@ async fn apply_pending_wipes(
     key_store: &crate::auth::IdbKeyStore,
 ) -> Result<(), JsValue> {
     for pending in crate::storage::pending_wipes().await.map_err(to_js)? {
-        let content_removed = if let Some(namespace) = &pending.content_namespace {
-            let scope: web_sys::DedicatedWorkerGlobalScope =
-                js_sys::global()
-                    .dyn_into()
-                    .map_err(|value: js_sys::Object| {
-                        JsValue::from_str(&format!("db worker scope: {value:?}"))
-                    })?;
-            match BrowserStore::remove(&scope, namespace).await {
-                Ok(()) => true,
-                Err(error @ BrowserStoreError::InvalidNamespace { .. }) => {
-                    return Err(to_js(error));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        replica = %pending.replica,
-                        error = %error,
-                        "db worker: content wipe deferred while browser storage is unavailable"
-                    );
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        if !pending.replica_deleted() {
-            crate::storage::wipe_replica(
-                storage,
-                key_store,
-                &pending.replica,
-                &crate::auth::PendingWork::default(),
-                true,
-            )
-            .await
-            .map_err(to_js)?;
-        }
-        if content_removed {
-            crate::storage::acknowledge_pending_wipe(&pending)
-                .await
-                .map_err(to_js)?;
-        } else if !pending.replica_deleted() {
-            crate::storage::defer_pending_content_wipe(&pending)
-                .await
-                .map_err(to_js)?;
-        }
-        tracing::info!(replica = %pending.replica, "db worker: advanced a pending data wipe");
+        apply_pending_wipe(storage, key_store, &pending).await?;
     }
     Ok(())
+}
+
+async fn apply_pending_wipe(
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+    pending: &crate::storage::PendingWipe,
+) -> Result<(), JsValue> {
+    let content_removed = remove_pending_content(pending).await?;
+    if !pending.replica_deleted() {
+        crate::storage::wipe_replica(
+            storage,
+            key_store,
+            &pending.replica,
+            &crate::auth::PendingWork::default(),
+            true,
+        )
+        .await
+        .map_err(to_js)?;
+    }
+    match (content_removed, pending.replica_deleted()) {
+        (true, _) => crate::storage::acknowledge_pending_wipe(pending)
+            .await
+            .map_err(to_js)?,
+        (false, false) => crate::storage::defer_pending_content_wipe(pending)
+            .await
+            .map_err(to_js)?,
+        (false, true) => {}
+    }
+    tracing::info!(replica = %pending.replica, "db worker: advanced a pending data wipe");
+    Ok(())
+}
+
+async fn remove_pending_content(pending: &crate::storage::PendingWipe) -> Result<bool, JsValue> {
+    let Some(namespace) = &pending.content_namespace else {
+        return Ok(true);
+    };
+    let scope: web_sys::DedicatedWorkerGlobalScope =
+        js_sys::global()
+            .dyn_into()
+            .map_err(|value: js_sys::Object| {
+                JsValue::from_str(&format!("db worker scope: {value:?}"))
+            })?;
+    match BrowserStore::remove(&scope, namespace).await {
+        Ok(()) => Ok(true),
+        Err(error @ BrowserStoreError::InvalidNamespace { .. }) => Err(to_js(error)),
+        Err(error) => {
+            tracing::warn!(
+                replica = %pending.replica,
+                error = %error,
+                "db worker: content wipe deferred while browser storage is unavailable"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// DB worker context: install the OPFS VFS, acquire connetto's session, open

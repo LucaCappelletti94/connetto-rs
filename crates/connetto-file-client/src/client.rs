@@ -151,6 +151,11 @@ pub struct ContentUpload<B> {
     root_key: [u8; 32],
 }
 
+enum ManifestStart {
+    Ready(Manifest),
+    Complete(ContentFlush),
+}
+
 impl<B> ContentUpload<B>
 where
     B: ChunkStore + Clone + Sync + MaybeSend + 'static,
@@ -283,12 +288,12 @@ where
     {
         let mut observed = Vec::new();
         let result = self
-            .begin_connection_flush_next_or(connection, &mut observed, state, cancel)
+            .begin_attempt(connection, &mut observed, state, cancel)
             .await;
         (result, observed)
     }
 
-    async fn begin_connection_flush_next_or<T, C>(
+    async fn begin_attempt<T, C>(
         &self,
         connection: &mut ConnettoConnection<T>,
         observed: &mut Vec<ClientEvent>,
@@ -300,31 +305,12 @@ where
         T::Error: Display,
         C: core::future::Future<Output = ()>,
     {
-        let waiting = db::outbox(connection.conn())?;
-        let file_id = match state.pending_ticket.as_ref().map(|ticket| ticket.file_id) {
-            Some(file_id) if waiting.contains(&file_id) => file_id,
-            _ => {
-                state.pending_ticket = None;
-                let Some(file_id) = waiting.first().copied() else {
-                    return Ok(ContentFlushStart::Complete(ContentFlush::Empty));
-                };
-                file_id
-            }
+        let Some(file_id) = Self::next_outbox_file(connection, state)? else {
+            return Ok(ContentFlushStart::Complete(ContentFlush::Empty));
         };
-        let manifest = match db::load_manifest(connection.conn(), file_id) {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => {
-                return Self::finish_attempt(
-                    connection,
-                    file_id,
-                    Err(ContentError::NoManifest { file_id }),
-                )
-                .map(ContentFlushStart::Complete);
-            }
-            Err(error) => {
-                return Self::finish_attempt(connection, file_id, Err(error))
-                    .map(ContentFlushStart::Complete);
-            }
+        let manifest = match Self::load_outbox_manifest(connection, file_id)? {
+            ManifestStart::Ready(manifest) => manifest,
+            ManifestStart::Complete(flush) => return Ok(ContentFlushStart::Complete(flush)),
         };
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
         let upload_url = match ticket::request_connection_or(
@@ -351,6 +337,38 @@ where
             store: self.store.clone(),
             root_key: self.root_key,
         }))
+    }
+
+    fn next_outbox_file<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        state: &mut ContentFlushState,
+    ) -> Result<Option<FileId>, ContentError> {
+        let waiting = db::outbox(connection.conn())?;
+        if let Some(file_id) = state.pending_ticket.as_ref().map(|ticket| ticket.file_id)
+            && waiting.contains(&file_id)
+        {
+            return Ok(Some(file_id));
+        }
+        state.pending_ticket = None;
+        Ok(waiting.first().copied())
+    }
+
+    fn load_outbox_manifest<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<ManifestStart, ContentError> {
+        match db::load_manifest(connection.conn(), file_id) {
+            Ok(Some(manifest)) => Ok(ManifestStart::Ready(manifest)),
+            Ok(None) => Self::finish_attempt(
+                connection,
+                file_id,
+                Err(ContentError::NoManifest { file_id }),
+            )
+            .map(ManifestStart::Complete),
+            Err(error) => {
+                Self::finish_attempt(connection, file_id, Err(error)).map(ManifestStart::Complete)
+            }
+        }
     }
 
     /// Finishes local bookkeeping for an HTTP transfer.

@@ -27,6 +27,7 @@ use connetto_client::cipher::cipher_url;
 use connetto_core::ReplicaKey;
 use connetto_core::traits::ReplicaKeyStore;
 use indexed_db_futures::database::Database as IdbDatabase;
+use indexed_db_futures::object_store::ObjectStore;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
 use serde::{Deserialize, Serialize};
@@ -443,41 +444,59 @@ async fn update_pending_wipe(
     let store = tx
         .object_store(WIPE_STORE)
         .map_err(|err| AuthError::Store(format!("update wipe store: {err}")))?;
-    let current: Option<String> = store
-        .get(wipe.replica.as_str())
-        .primitive()
-        .map_err(|err| AuthError::Store(format!("update wipe get: {err}")))?
-        .await
-        .map_err(|err| AuthError::Store(format!("update wipe get await: {err}")))?;
-    let matches = current
-        .map(decode_pending_wipe)
-        .transpose()
-        .map_err(|err| AuthError::Store(format!("update wipe decode: {err}")))?
+    if read_pending_wipe(&store, wipe.replica.as_str())
+        .await?
         .as_ref()
-        == Some(wipe);
-    if matches {
-        if let Some(replacement) = replacement {
-            let encoded = serde_json::to_string(replacement)
-                .map_err(|err| AuthError::Store(format!("update wipe encode: {err}")))?;
-            store
-                .put(encoded)
-                .with_key(wipe.replica.as_str())
-                .primitive()
-                .map_err(|err| AuthError::Store(format!("update wipe put: {err}")))?
-                .await
-                .map_err(|err| AuthError::Store(format!("update wipe put await: {err}")))?;
-        } else {
-            store
-                .delete(wipe.replica.as_str())
-                .primitive()
-                .map_err(|err| AuthError::Store(format!("update wipe delete: {err}")))?
-                .await
-                .map_err(|err| AuthError::Store(format!("update wipe delete await: {err}")))?;
-        }
+        == Some(wipe)
+    {
+        write_pending_wipe(&store, wipe.replica.as_str(), replacement).await?;
     }
     tx.commit()
         .await
         .map_err(|err| AuthError::Store(format!("update wipe commit: {err}")))
+}
+
+async fn read_pending_wipe(
+    store: &ObjectStore<'_>,
+    replica: &str,
+) -> Result<Option<PendingWipe>, AuthError> {
+    let current: Option<String> = store
+        .get(replica)
+        .primitive()
+        .map_err(|err| AuthError::Store(format!("update wipe get: {err}")))?
+        .await
+        .map_err(|err| AuthError::Store(format!("update wipe get await: {err}")))?;
+    current
+        .map(decode_pending_wipe)
+        .transpose()
+        .map_err(|err| AuthError::Store(format!("update wipe decode: {err}")))
+}
+
+async fn write_pending_wipe(
+    store: &ObjectStore<'_>,
+    replica: &str,
+    replacement: Option<&PendingWipe>,
+) -> Result<(), AuthError> {
+    match replacement {
+        Some(replacement) => {
+            let encoded = serde_json::to_string(replacement)
+                .map_err(|err| AuthError::Store(format!("update wipe encode: {err}")))?;
+            store
+                .put(encoded)
+                .with_key(replica)
+                .primitive()
+                .map_err(|err| AuthError::Store(format!("update wipe put: {err}")))?
+                .await
+                .map(|_| ())
+                .map_err(|err| AuthError::Store(format!("update wipe put await: {err}")))
+        }
+        None => store
+            .delete(replica)
+            .primitive()
+            .map_err(|err| AuthError::Store(format!("update wipe delete: {err}")))?
+            .await
+            .map_err(|err| AuthError::Store(format!("update wipe delete await: {err}"))),
+    }
 }
 
 pub(crate) async fn acknowledge_pending_wipe(wipe: &PendingWipe) -> Result<(), AuthError> {
