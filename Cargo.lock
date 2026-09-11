@@ -3814,7 +3814,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -4450,7 +4450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -4469,7 +4469,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5714,7 +5714,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#85b1a6f2223bf95d98cf1bc504971abd191dc869"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#b5950628a53de0ac1336d20cd1c618830e2706f0"
 dependencies = [
  "log",
  "recursive",
@@ -5744,7 +5744,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#85b1a6f2223bf95d98cf1bc504971abd191dc869"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#b5950628a53de0ac1336d20cd1c618830e2706f0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5819,7 +5819,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#21ef5572928341a3df78ca36e157650629ff091c"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#d8e071071e6d0532a04bfd947a8b846ff29a9b0a"
 dependencies = [
  "arc-swap",
  "async-lock",

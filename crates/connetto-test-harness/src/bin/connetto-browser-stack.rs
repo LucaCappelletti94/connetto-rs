@@ -288,9 +288,11 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
     let registry = Arc::new(registry);
 
     let config = AuthConfig::default();
-    let private = fs::read(&services.keys.private)
+    let private = tokio::fs::read(&services.keys.private)
+        .await
         .with_context(|| format!("reading {}", services.keys.private.display()))?;
-    let public = fs::read(&services.keys.public)
+    let public = tokio::fs::read(&services.keys.public)
+        .await
         .with_context(|| format!("reading {}", services.keys.public.display()))?;
     let authority = TokenAuthority::from_ed_pem(&private, &public, &config)
         .map_err(|err| anyhow!("loading the browser signing keypair: {err}"))?;
@@ -645,7 +647,9 @@ async fn generate_keys() -> Result<KeyDir> {
         std::process::id(),
         now_millis()
     ));
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
     let private = dir.join("priv.pem");
     let public = dir.join("pub.pem");
     let gen_args = vec![

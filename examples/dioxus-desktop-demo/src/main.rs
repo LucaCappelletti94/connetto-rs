@@ -381,7 +381,9 @@ async fn setup_authenticated(
 ) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx)> {
     use anyhow::Context as _;
 
-    std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
+    tokio::fs::create_dir_all(data_dir())
+        .await
+        .context("creating the application data directory")?;
 
     // Credential store: one entry per service, one record per account.
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));

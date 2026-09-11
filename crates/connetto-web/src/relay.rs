@@ -2511,7 +2511,7 @@ where
     // row by row. Rename to the physical backing tables first, mirroring the
     // client's own apply direction.
     let map = worker.policy_tables().clone();
-    let changeset = rename_to_physical(changeset, &map).map_err(TabFault::from)?;
+    let changeset = rename_to_physical(changeset, &map)?;
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };

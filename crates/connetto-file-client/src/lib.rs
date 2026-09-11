@@ -12,18 +12,19 @@ pub mod resolve;
 mod store;
 mod ticket;
 mod upload;
+mod worker;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use browser_store::{BrowserStore, BrowserStoreError};
 
-pub use client::{
-    ContentArchive, ContentClient, ContentEvent, ContentFlush, ContentFlushStart,
-    ContentFlushState, ContentImportPlan, ContentUpload,
-};
+pub use client::{ContentClient, ContentEvent, ContentImportPlan};
 pub use connetto_file_core::FileId;
 pub use error::ContentError;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use store::{FsStore, FsStoreError};
+pub use worker::{
+    ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState, ContentUpload,
+};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use http::ReqwestHttp;

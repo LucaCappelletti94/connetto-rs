@@ -44,6 +44,7 @@ use crate::frames::{MessageTransport, MessageTransportError};
 use crate::relay::HubReconnect;
 use crate::{BrowserSocket, HubNotice, RelayHub, locks};
 use connetto_client::reconnect::ReconnectPolicy;
+use connetto_client::reconnect::{Sleeper, TransportFactory};
 use connetto_client::{
     ClientConfig, ClientEvent, ConnettoConnection, ExportScope, Grant, ImportOutcome, Replica,
     ReplicaStorage as StorageKind, Tier,
@@ -51,6 +52,7 @@ use connetto_client::{
 use connetto_core::custody::{Custody, NoGate};
 use connetto_core::messages::SubscriptionSpec;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore as _};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The shared rendezvous channel for worker readiness and tab announcements.
 pub const HELLO_CHANNEL: &str = "connetto-hello";
@@ -777,10 +779,7 @@ async fn remove_pending_content(pending: &crate::storage::PendingWipe) -> Result
 ///
 /// A string describing the VFS, acquisition, upstream connect, or subscribe
 /// failure.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the boot sequence is one ordered list of steps and a split would hide the order"
-)]
+
 pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, JsValue>
 where
     // `Display` because the server binds this identity as the row-level
@@ -789,47 +788,141 @@ where
     Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {
     let storage = crate::storage::ReplicaStorage::install().await;
-
-    // Acquire connetto's own access token when auth is configured: a silent
-    // refresh from the OPFS-stored token on a cold start or leader failover,
-    // or an interactive tab login otherwise. The worker holds the tokens; the
-    // tab only ever sees the login URL and hands back the code.
-    //
-    // This runs before any transport exists, because the authenticated
-    // identity decides which replica file to open. Connecting first and
-    // checking identity afterwards would resume the previous identity's
-    // replica over the wire under the new user's token.
-    //
-    // One key store serves the whole boot: this device's own key, which unlocks
-    // the refresh store, and the per-replica key both live in it, and opening
-    // IndexedDB twice buys nothing.
-    //
-    // Opened whether or not authentication is configured. A durable replica is
-    // encrypted, and with no auth there is simply no identity in the record name,
-    // which is the same shape `device_key` already uses for the refresh store.
+    // Encrypted regardless of auth, and the per-replica key also lives here.
     let key_store = Rc::new(crate::auth::IdbKeyStore::open().await.map_err(to_js)?);
+    let was_enrolled = setup_custody(config, &key_store).await?;
+    apply_pending_wipes(&storage, &key_store).await?;
+    // After wipes (which free slots) and before login (which opens the refresh store).
+    storage.reserve(BOOT_SLOTS).await.map_err(to_js)?;
+    let session = acquire_boot_session::<Id>(config, &storage, &key_store, was_enrolled).await?;
+    let mut spec = BootReplicaSpec::from_session(config, session, &storage)?;
+    // Addressed by replica name, which exists only after identity resolves.
+    let replica_key =
+        provision_or_load_key(&key_store, &spec.replica_db_name, spec.existing).await?;
+    let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
+    let login = spec.login.take();
+    let client_config = build_boot_client_config(config, login, &spec);
+    // Offline at boot is valid; the hub reconnects when a transport is available.
+    let transport = try_connect_upstream(config.ws_url).await;
+    let mut worker =
+        open_boot_replica(transport, &spec, config, &client_config, replica_key).await?;
+    subscribe_and_boot(&mut worker, config).await?;
+    // Released by the browser when this worker context dies.
+    let alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    DB_ALIVE.with(|cell| cell.borrow_mut().replace(alive));
+    let ws_url = config.ws_url;
+    let reconnect = HubReconnect {
+        factory: move || async move {
+            BrowserSocket::connect(ws_url)
+                .await
+                .map_err(|err| err.to_string())
+        },
+        sleeper: sleep,
+        policy: ReconnectPolicy::default(),
+        upstream: vec![(
+            config.upstream_sub_id.to_owned(),
+            SubscriptionSpec::new(config.upstream_query),
+        )],
+    };
+    let (content, content_persistent, content_wipe_namespace) = setup_content_store(
+        config,
+        spec.identified,
+        &spec.replica_db_name,
+        content_root_key,
+    )
+    .await?;
+    let (hub, notices) = start_relay_hub(worker, config.hub_meta_name, reconnect, content)?;
+    install_dead_tab_reaper(hub.clone(), notices);
+    install_tab_services(
+        config,
+        &hub,
+        &spec.replica_db_name,
+        content_wipe_namespace,
+        spec.active_account.as_deref(),
+    )?;
+    install_hello_intake(hub)?;
+    Ok(BootedSession {
+        identity: spec.identity,
+        session_expires_at: spec.session_expires_at,
+        account: spec.active_account,
+        content_persistent,
+    })
+}
 
-    // Install the private-port handler and register the key store for late
-    // enrolments. Done unconditionally so the thread-local is always valid,
-    // even though actual tab communication only happens when `unlock` is true.
+/// Boot state resolved from the session: replica paths, account key, and session fields.
+struct BootReplicaSpec<Id> {
+    replica_db_name: String,
+    tier_db_name: String,
+    replica_url: String,
+    active_account: Option<String>,
+    identified: bool,
+    existing: bool,
+    identity: Option<Id>,
+    session_expires_at: Option<u64>,
+    login: Option<Grant>,
+}
+
+impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
+    fn from_session(
+        config: &DbWorkerConfig,
+        session: Option<crate::auth::BrowserSession<Id>>,
+        storage: &crate::storage::ReplicaStorage,
+    ) -> Result<Self, JsValue> {
+        // Each identity owns its own replica file; switching accounts opens a different one.
+        let replica_db_name = match &session {
+            Some(session) => {
+                connetto_client::replica_db_name(config.replica_db_prefix, &session.user_id)
+                    .map_err(to_js)?
+            }
+            None => config.replica_db_prefix.to_owned(),
+        };
+        // Keyed the same way as the credential row and the last-used marker.
+        let active_account = match &session {
+            Some(session) => {
+                Some(connetto_client::encode_identity(&session.user_id).map_err(to_js)?)
+            }
+            None => None,
+        };
+        // A prior generation of this identity resumes from the persisted cursor.
+        let existing = storage.exists(&replica_db_name);
+        // Derived from the replica name so both belong to the same identity.
+        let tier_db_name = crate::storage::tier_db_name(&replica_db_name);
+        let replica_url = storage.db_url(&replica_db_name);
+        let identified = session.is_some();
+        let session_expires_at = session.as_ref().map(|s| s.session_expires_at);
+        // None here means the server gets no grant and keeps everything in memory.
+        let login = session.as_ref().map(|s| Grant::new(s.access_token.clone()));
+        let identity = session.map(|s| s.user_id);
+        Ok(Self {
+            replica_db_name,
+            tier_db_name,
+            replica_url,
+            active_account,
+            identified,
+            existing,
+            identity,
+            session_expires_at,
+            login,
+        })
+    }
+}
+
+/// Install the unlock handler, initialise custody, and run the enrolment
+/// ceremony if credentials are already on disk. Returns whether a credential
+/// was enrolled.
+async fn setup_custody(
+    config: &DbWorkerConfig,
+    key_store: &Rc<crate::auth::IdbKeyStore>,
+) -> Result<bool, JsValue> {
+    // Thread-local must be valid even when unlock is disabled.
     if config.unlock {
         crate::unlock::install_worker_handler()?;
     }
-    // Default custody for a durable replica: the gate is available but nobody
-    // has adopted it yet. This gets overwritten below if the profile is enrolled
-    // or if the session is ephemeral.
-    crate::unlock::init_worker(
-        Rc::clone(&key_store),
-        Custody::Unverified(NoGate::Offerable),
-    );
-
+    // Overwritten below on enrolment or for an ephemeral session.
+    crate::unlock::init_worker(Rc::clone(key_store), Custody::Unverified(NoGate::Offerable));
     let enrolled_ids = key_store.enrolled().await.map_err(to_js)?;
     let was_enrolled = !enrolled_ids.is_empty();
-
-    // A stale configuration: credentials were enrolled (requiring the protocol
-    // to have been served at some point) but the caller did not enable it this
-    // boot. Refusing here is safer than silently ignoring the enrolled state and
-    // falling back to the stored key, which no longer exists after enrolment.
+    // Enrolled profiles need the protocol to derive the KEK; refusing is safer than silently falling back.
     if was_enrolled && !config.unlock {
         return Err(to_js(crate::auth::AuthError::Locked {
             detail: "a credential is enrolled but this build did not enable the unlock \
@@ -837,9 +930,6 @@ where
                 .into(),
         }));
     }
-
-    // Enrolled path: derive the KEK before reading anything encrypted.
-    // A Declined or Unsupported answer refuses the boot.
     if was_enrolled {
         match crate::unlock::ask_unlock(enrolled_ids)
             .await
@@ -852,10 +942,7 @@ where
                     .map_err(to_js)?;
                 crate::unlock::set_custody(Custody::Verified);
             }
-            // Nothing is destroyed on any of these: the application offers the
-            // ceremony again, and a genuine lockout is recovered by the user
-            // asking for a wipe. A dismissal and a credential that is gone are
-            // the same `NotAllowedError`, so the detail names only what is known.
+            // Recovery via wipe request, not here.
             crate::unlock::TabAnswer::Declined => {
                 return Err(to_js(crate::auth::AuthError::Locked {
                     detail: "the ceremony was dismissed or the credential is gone".into(),
@@ -871,9 +958,7 @@ where
             crate::unlock::TabAnswer::Failed { detail } => {
                 return Err(to_js(crate::auth::AuthError::Locked { detail }));
             }
-            // An answer to a question this was not: the tab's handler is confused
-            // about which request it is serving, which is a bug and not a platform
-            // outcome, so it must not downgrade custody.
+            // Wrong answer type is a handler bug, not a platform failure.
             other @ crate::unlock::TabAnswer::Account(_) => {
                 return Err(to_js(crate::auth::AuthError::Context(format!(
                     "the unlock request was answered with {}",
@@ -882,23 +967,19 @@ where
             }
         }
     }
+    Ok(was_enrolled)
+}
 
-    apply_pending_wipes(&storage, &key_store).await?;
-
-    // Here rather than earlier, because the wipes above are what free slots, and
-    // before the login, because acquisition opens the refresh store. Slots this
-    // boot does not need cost an empty file each, which is the cheap side of the
-    // trade.
-    storage.reserve(BOOT_SLOTS).await.map_err(to_js)?;
-
-    // A fresh profile that may still enrol must not write its credential first.
-    // The device key that encrypts the refresh store is a record in the key
-    // store, so writing it before the gate settles mints a stored
-    // key-encryption key, and enrolment could then only delete that record,
-    // which does not erase the bytes underneath. Deferred only when there is no
-    // store yet: with one already on disk a stored key already exists, so
-    // deferring buys nothing and reading the credential that is there saves the
-    // user an interactive login.
+/// Acquire the session (deferred or direct), run the optional enrolment
+/// ceremony, and persist the deferred credential once the gate has settled.
+async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
+    config: &DbWorkerConfig,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+    was_enrolled: bool,
+) -> Result<Option<crate::auth::BrowserSession<Id>>, JsValue> {
+    // Identity decides the replica file, so acquire before connecting.
+    // Deferred when the gate has not settled yet, to avoid minting a KEK before enrolment.
     let defer = config.unlock
         && !was_enrolled
         && config.auth.is_some()
@@ -913,8 +994,8 @@ where
                 acquire_session::<Id>(
                     auth_config,
                     config.auth_db_name,
-                    &storage,
-                    &key_store,
+                    storage,
+                    key_store,
                     config.pick_account,
                 )
                 .await?,
@@ -927,11 +1008,7 @@ where
             (None, None)
         }
     };
-
-    // Unenrolled path with unlock enabled: ask the tab to enrol now that somebody
-    // is signed in, because an anonymous run keeps nothing durable and has
-    // nothing to gate. No identity is passed: the credential is one per device
-    // and names the origin, per the plan's R23 decision 10.
+    // Unenrolled with unlock enabled: enrol now that someone is signed in.
     if config.unlock && !was_enrolled && session.is_some() {
         match crate::unlock::ask_enrol().await.map_err(to_js)? {
             crate::unlock::TabAnswer::Key { credential_id, key } => {
@@ -947,9 +1024,7 @@ where
             crate::unlock::TabAnswer::Unsupported => {
                 crate::unlock::set_custody(Custody::Unverified(NoGate::Unsupported));
             }
-            // A fault is not a platform limitation. Downgrading custody here
-            // would blame the browser for a bug and quietly ship an ungated
-            // profile, so the boot fails and names what threw.
+            // A fault is a bug, not a platform limitation; failing prevents a silent ungated profile.
             crate::unlock::TabAnswer::Failed { detail } => {
                 return Err(to_js(crate::auth::AuthError::Context(format!(
                     "the enrolment ceremony failed: {detail}"
@@ -963,252 +1038,237 @@ where
             }
         }
     }
-
-    // The gate has settled, so the device key now resolves under whichever
-    // key-encryption key won and the credential can land.
+    // Gate settled, so the KEK resolves under the winning key.
     if let Some(deferred) = &deferred {
-        persist_deferred(deferred, config.auth_db_name, &storage, &key_store).await?;
+        persist_deferred(deferred, config.auth_db_name, storage, key_store).await?;
     }
-    // Identity continuity by file selection: each identity owns the replica
-    // named from its own id, so an account switch opens a different file and
-    // can neither adopt the previous identity's rows nor upload its pending
-    // mutations. The identity that just left keeps its replica: switching back
-    // resumes from its persisted cursor instead of re-snapshotting, and any
-    // mutation it never got to upload is still there to replay. Destroying a
-    // replica is an explicit data wipe, never a side effect of someone else
-    // signing in.
-    let replica_db_name = match &session {
-        Some(session) => {
-            connetto_client::replica_db_name(config.replica_db_prefix, &session.user_id)
-                .map_err(to_js)?
-        }
-        None => config.replica_db_prefix.to_owned(),
-    };
-    // The account key of whoever is signed in, which is what a logout has to name
-    // so that signing one account out leaves the others signed in. The same
-    // encoding the credential row and the last-used marker are keyed by.
-    let active_account = match &session {
-        Some(session) => Some(connetto_client::encode_identity(&session.user_id).map_err(to_js)?),
-        None => None,
-    };
-    // A replica left by a previous worker generation of the SAME identity
-    // resumes: the persisted cursor rides the handshake and the subscription
-    // below catches up from the server oplog instead of re-snapshotting.
-    let existing = storage.exists(&replica_db_name);
+    Ok(session)
+}
 
-    // Provision-once custody of the per-replica encryption key, minted on this
-    // device. It resolves here rather than inside acquisition because the record
-    // is addressed by the replica name, which only exists once the identity
-    // does, or is the bare prefix when there is no identity at all. A fresh
-    // replica mints its key and caches it. An existing one reads the cache and
-    // nothing else: minting for it would return a key that decrypts nothing, and
-    // would fill the record that restoring a backed-up key still could, so an
-    // absent record refuses in `Replica::encrypted_file` instead.
-    let replica_key = if existing {
-        key_store.load(&replica_db_name).await.map_err(to_js)?
+/// Load the existing replica key or mint and cache a fresh one.
+async fn provision_or_load_key(
+    key_store: &crate::auth::IdbKeyStore,
+    replica_db_name: &str,
+    existing: bool,
+) -> Result<Option<connetto_core::ReplicaKey>, JsValue> {
+    if existing {
+        key_store.load(replica_db_name).await.map_err(to_js)
     } else {
-        Some(
-            crate::auth::provision_replica_key(&*key_store, &replica_db_name)
-                .await
-                .map_err(to_js)?,
-        )
-    };
-    let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
+        crate::auth::provision_replica_key(key_store, replica_db_name)
+            .await
+            .map_err(to_js)
+            .map(Some)
+    }
+}
 
-    // The login grant, when somebody signed in. Nobody signed in is a caller
-    // with no identity, which the server accepts and which keeps everything in
-    // memory below.
-    let login = session
-        .as_ref()
-        .map(|session| Grant::new(session.access_token.clone()));
-    let identified = session.is_some();
-    let session_expires_at = session.as_ref().map(|session| session.session_expires_at);
-    let identity = session.map(|session| session.user_id);
+/// Build the [`ClientConfig`] from the worker config and resolved session spec.
+fn build_boot_client_config<Id: core::fmt::Display>(
+    config: &DbWorkerConfig,
+    login: Option<Grant>,
+    spec: &BootReplicaSpec<Id>,
+) -> ClientConfig {
     let mut client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
         .with_login(login)
         .with_schema_version(Some(config.schema_version.clone()))
         .with_sql_functions(config.sql_functions.clone())
         .with_policy_tables(config.policy_tables.clone());
     if !config.caller_function.is_empty() {
-        // Nobody signed in gets the empty string, which no owner column equals,
-        // so a translated policy hides every row. That is what the server does
-        // too, by leaving the setting unbound so the comparison is NULL.
+        // Empty string means no owner match, hiding every row, matching server behaviour.
         client_config = client_config.with_caller(
             config.caller_function,
-            identity
+            spec.identity
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_default(),
         );
     }
-    // An unreachable server is a state, not a boot failure. The worker comes up
-    // on its replica, serves tabs from it, and the hub's reconnect driver
-    // attaches a transport when one can be had, declaring the upstream
-    // subscription then. Offline operation is a stated objective of this
-    // project, and dying here is what used to violate it.
-    let transport = match BrowserSocket::connect(config.ws_url).await {
+    client_config
+}
+
+/// Attempt an upstream connection, logging a warning and returning `None` on failure.
+async fn try_connect_upstream(ws_url: &str) -> Option<BrowserSocket> {
+    match BrowserSocket::connect(ws_url).await {
         Ok(transport) => Some(transport),
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                url = config.ws_url,
+                url = ws_url,
                 "db worker: no server reachable, starting offline"
             );
             None
         }
-    };
-    let replica_url = storage.db_url(&replica_db_name);
-    // The device-private database is named from the replica rather than
-    // configured, so it belongs to the same identity the replica's key does.
-    let tier_db_name = crate::storage::tier_db_name(&replica_db_name);
-    // One value describes everything this run keeps at rest, replica and
-    // device-private database together, so the pairing cannot be wrong. A run
-    // with an identity gets the durable pair: OPFS, or the in-memory VFS's
-    // named file when OPFS is unavailable. A run without one gets neither,
-    // because there is no identity to key a file to and a device-private file
-    // beside an unkeyed replica would be written in the clear.
-    let mut worker = if identified {
-        let replica = Replica::encrypted_file(&replica_url, replica_key)
+    }
+}
+
+/// Build and open the correct replica variant (durable or in-memory) and log the result.
+async fn open_boot_replica<Id>(
+    transport: Option<BrowserSocket>,
+    spec: &BootReplicaSpec<Id>,
+    config: &DbWorkerConfig,
+    client_config: &ClientConfig,
+    replica_key: Option<connetto_core::ReplicaKey>,
+) -> Result<ConnettoConnection<BrowserSocket>, JsValue> {
+    // Identified runs get a durable pair; anonymous runs stay in-memory to avoid unkeyed files.
+    let worker = if spec.identified {
+        let replica = Replica::encrypted_file(&spec.replica_url, replica_key)
             .map_err(to_js)?
-            .with_tier(&tier_db_name, config.frontend_ddl);
-        open_replica(transport, &replica, existing, config, &client_config).await?
+            .with_tier(&spec.tier_db_name, config.frontend_ddl);
+        open_replica(transport, &replica, spec.existing, config, client_config).await?
     } else {
         let replica = Replica::in_memory().with_tier(config.frontend_ddl);
-        open_replica(transport, &replica, false, config, &client_config).await?
+        open_replica(transport, &replica, false, config, client_config).await?
     };
-    let connected = worker.is_connected();
     tracing::info!(
-        replica = %replica_db_name,
-        resumed = existing,
-        durable = identified,
-        connected,
+        replica = %spec.replica_db_name,
+        resumed = spec.existing,
+        durable = spec.identified,
+        connected = worker.is_connected(),
         "db worker: replica open"
     );
-    // Only worth doing with a server. Offline, the hub declares this same
-    // subscription the moment its driver attaches a transport, from the
-    // `upstream` list below, so nothing is lost by skipping it.
-    if connected {
-        worker
-            .subscribe(config.upstream_sub_id, config.upstream_query)
-            .await
-            .map_err(to_js)?;
-        // Ping fence instead of waiting for a snapshot end: a resumed
-        // subscription catches up with plain live patches and never sends one.
-        // Control frames are processed in order, so the pong proves the
-        // subscription is fully served either way.
-        worker.ping(1).await.map_err(to_js)?;
-        loop {
-            match worker.pump_one().await.map_err(to_js)? {
-                ClientEvent::Pong { nonce: 1 } => break,
-                ClientEvent::Closed => {
-                    return Err(JsValue::from_str("server closed during the upstream boot"));
-                }
-                _ => {}
+    Ok(worker)
+}
+
+/// Declare the upstream subscription and pump until the pong proves it is served.
+async fn subscribe_and_boot(
+    worker: &mut ConnettoConnection<BrowserSocket>,
+    config: &DbWorkerConfig,
+) -> Result<(), JsValue> {
+    // Offline: the hub declares the subscription on first reconnect instead.
+    if !worker.is_connected() {
+        return Ok(());
+    }
+    worker
+        .subscribe(config.upstream_sub_id, config.upstream_query)
+        .await
+        .map_err(to_js)?;
+    // Pong arrives after any pending snapshot, proving the subscription is fully served.
+    worker.ping(1).await.map_err(to_js)?;
+    loop {
+        match worker.pump_one().await.map_err(to_js)? {
+            ClientEvent::Pong { nonce: 1 } => break,
+            ClientEvent::Closed => {
+                return Err(JsValue::from_str("server closed during the upstream boot"));
             }
+            _ => {}
         }
     }
+    Ok(())
+}
 
-    // Held for the worker's whole life: tab transports watch this lock to
-    // detect a dead worker, and the browser releases it with the context.
-    let alive = locks::hold_lock(DB_ALIVE_LOCK).await;
-    DB_ALIVE.with(|cell| cell.borrow_mut().replace(alive));
-
-    let ws_url = config.ws_url;
-    let reconnect = HubReconnect {
-        factory: move || async move {
-            BrowserSocket::connect(ws_url)
-                .await
-                .map_err(|err| err.to_string())
-        },
-        sleeper: sleep,
-        policy: ReconnectPolicy::default(),
-        upstream: vec![(
-            config.upstream_sub_id.to_owned(),
-            SubscriptionSpec::new(config.upstream_query),
-        )],
+/// Set up the browser content store and archive. Returns the archive, a
+/// persistence flag, and the wipe namespace (when configured and identified).
+async fn setup_content_store(
+    config: &DbWorkerConfig,
+    identified: bool,
+    replica_db_name: &str,
+    content_root_key: Option<[u8; 32]>,
+) -> Result<
+    (
+        Option<ContentArchive<BrowserStore>>,
+        Option<bool>,
+        Option<String>,
+    ),
+    JsValue,
+> {
+    let Some(seed) = config.content_namespace else {
+        return Ok((None, None, None));
     };
-    let (content, content_persistent, content_wipe_namespace) = match config.content_namespace {
-        Some(seed) => {
-            let namespace = content_store_namespace(seed, &replica_db_name);
-            let (store, root_key) = if identified {
-                let root_key = content_root_key
-                    .ok_or_else(|| JsValue::from_str("browser content key is unavailable"))?;
-                let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
-                    .dyn_into()
-                    .map_err(|value: js_sys::Object| {
-                        JsValue::from_str(&format!("db worker scope: {value:?}"))
-                    })?;
-                let store = BrowserStore::install(&scope, &namespace)
-                    .await
-                    .map_err(|err| JsValue::from_str(&format!("browser content store: {err}")))?;
-                (store, root_key)
-            } else {
-                (
-                    BrowserStore::ephemeral(),
-                    content_root_key.unwrap_or([0; 32]),
-                )
-            };
-            let persistent = store.is_persistent();
-            let wipe_namespace = identified.then_some(namespace);
-            (
-                Some(ContentArchive::new(store, root_key)),
-                Some(persistent),
-                wipe_namespace,
-            )
-        }
-        None => (None, None, None),
+    let namespace = content_store_namespace(seed, replica_db_name);
+    let (store, root_key) = if identified {
+        let root_key = content_root_key
+            .ok_or_else(|| JsValue::from_str("browser content key is unavailable"))?;
+        let scope: web_sys::DedicatedWorkerGlobalScope =
+            js_sys::global()
+                .dyn_into()
+                .map_err(|value: js_sys::Object| {
+                    JsValue::from_str(&format!("db worker scope: {value:?}"))
+                })?;
+        let store = BrowserStore::install(&scope, &namespace)
+            .await
+            .map_err(|err| JsValue::from_str(&format!("browser content store: {err}")))?;
+        (store, root_key)
+    } else {
+        (
+            BrowserStore::ephemeral(),
+            content_root_key.unwrap_or([0; 32]),
+        )
     };
+    let persistent = store.is_persistent();
+    let wipe_namespace = identified.then_some(namespace);
+    Ok((
+        Some(ContentArchive::new(store, root_key)),
+        Some(persistent),
+        wipe_namespace,
+    ))
+}
 
-    let (hub, pump, mut notices) =
-        RelayHub::with_reconnect_archive(worker, config.hub_meta_name, reconnect, content)
+/// Construct the relay hub, spawn its pump task, and return the hub and notice channel.
+fn start_relay_hub<F, S>(
+    worker: ConnettoConnection<BrowserSocket>,
+    hub_meta_name: &'static str,
+    reconnect: HubReconnect<F, S>,
+    content: Option<ContentArchive<BrowserStore>>,
+) -> Result<(RelayHub, UnboundedReceiver<HubNotice>), JsValue>
+where
+    F: TransportFactory<Transport = BrowserSocket> + 'static,
+    F::Error: core::fmt::Display,
+    S: Sleeper + Clone + 'static,
+{
+    let (hub, pump, notices) =
+        RelayHub::with_reconnect_archive(worker, hub_meta_name, reconnect, content)
             .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
     spawn_local(async move {
         if let Err(err) = pump.await {
             tracing::error!(error = %err, "relay hub ended");
         }
     });
+    Ok((hub, notices))
+}
 
-    // Dead-tab reaping: each handshake names a liveness lock. A tab that
-    // holds it is watched, and the lock coming free means the tab is gone.
-    // A tab that never held it (it must acquire BEFORE connecting) opted
-    // out and is never reaped.
-    {
-        let hub = hub.clone();
-        spawn_local(async move {
-            while let Some(HubNotice::Handshake { tab, client_id }) = notices.recv().await {
-                let hub = hub.clone();
-                spawn_local(async move {
-                    let name = locks::tab_lock_name(&client_id);
-                    if !locks::lock_is_held(&name).await {
-                        return;
-                    }
-                    locks::wait_until_free(&name).await;
-                    hub.kill(tab);
-                });
-            }
-        });
-    }
+/// Spawn the task that kills a tab in the hub when its liveness lock is released.
+fn install_dead_tab_reaper(hub: RelayHub, mut notices: UnboundedReceiver<HubNotice>) {
+    spawn_local(async move {
+        while let Some(HubNotice::Handshake { tab, client_id }) = notices.recv().await {
+            let hub = hub.clone();
+            spawn_local(async move {
+                let name = locks::tab_lock_name(&client_id);
+                if !locks::lock_is_held(&name).await {
+                    return;
+                }
+                locks::wait_until_free(&name).await;
+                hub.kill(tab);
+            });
+        }
+    });
+}
 
-    // Logout service, installed whenever logins are, because a session a tab can
-    // start is a session it must be able to end. A tab holds no token, no replica
-    // handle, and no key, so it can only ask.
+/// Install the logout, export, and import channel handlers.
+fn install_tab_services(
+    config: &DbWorkerConfig,
+    hub: &RelayHub,
+    replica_db_name: &str,
+    content_wipe_namespace: Option<String>,
+    active_account: Option<&str>,
+) -> Result<(), JsValue> {
+    // A tab that can start a session must be able to end it.
     if let Some(auth_config) = &config.auth {
         serve_logout_requests(
             auth_config.clone(),
             config.auth_db_name,
-            &replica_db_name,
+            replica_db_name,
             content_wipe_namespace,
-            active_account.clone(),
+            active_account.map(ToOwned::to_owned),
             hub.clone(),
         )?;
     }
-    // Export and import services. Unconditional, unlike logout: a run with no
-    // logins still holds data the user may want to save and restore.
+    // Export and import run unconditionally; anonymous sessions still hold data.
     serve_export_requests(hub.clone())?;
     serve_import_requests(hub.clone())?;
+    Ok(())
+}
 
-    // The hello channel intake: answer readiness asks and attach a wire
-    // transport per tab announcement, acking each attachment.
+/// Open the hello channel, install the message handler, and broadcast the initial `ready`.
+fn install_hello_intake(hub: RelayHub) -> Result<(), JsValue> {
     let hello = BroadcastChannel::new(HELLO_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
     let intake = {
@@ -1236,15 +1296,10 @@ where
         })
     };
     hello.set_onmessage(Some(intake.as_ref().unchecked_ref()));
-    // The intake handler lives for the worker's whole life.
+    // Handler lives for the worker's whole life.
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
-    Ok(BootedSession {
-        identity,
-        session_expires_at,
-        account: active_account,
-        content_persistent,
-    })
+    Ok(())
 }
 
 /// Serve [`LOGOUT_CHANNEL`](crate::auth::LOGOUT_CHANNEL) for this worker's life,
@@ -2069,7 +2124,7 @@ pub fn tab_wire_factory(
 }
 
 /// Resolve after roughly `duration`, in a window or a worker context. Also
-/// the browser [`Sleeper`](connetto_client::reconnect::Sleeper) for the
+/// the browser [`Sleeper`] for the
 /// reconnect drivers.
 pub async fn sleep(duration: core::time::Duration) {
     let ms = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
