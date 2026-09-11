@@ -9,8 +9,6 @@ use tower::ServiceExt;
 use crate::fixture::{Pg, build_router};
 
 mod race_schema {
-    use diesel::prelude::*;
-
     connetto_file_server::connetto_file_tables!();
 }
 
