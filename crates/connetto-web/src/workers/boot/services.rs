@@ -5,10 +5,11 @@ use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_core::messages::SubscriptionSpec;
 use connetto_file_client::{BrowserStore, BrowserStoreError, ContentArchive};
 use tokio::sync::mpsc::UnboundedReceiver;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-use super::super::helpers::{content_store_namespace, to_js};
+use super::super::helpers::content_store_namespace;
+use super::BootError;
 use super::DbWorkerConfig;
 use super::replica::BootReplicaSpec;
 use crate::relay::HubReconnect;
@@ -31,23 +32,33 @@ pub(super) async fn prepare_boot_storage(
         std::rc::Rc<crate::auth::IdbKeyStore>,
         bool,
     ),
-    JsValue,
+    BootError,
 > {
     let storage = crate::storage::ReplicaStorage::install().await;
     // Encrypted regardless of auth, and the per-replica key also lives here.
-    let key_store = std::rc::Rc::new(crate::auth::IdbKeyStore::open().await.map_err(to_js)?);
+    let key_store = std::rc::Rc::new(
+        crate::auth::IdbKeyStore::open()
+            .await
+            .map_err(BootError::KeyStore)?,
+    );
     let was_enrolled = super::replica::setup_custody(config, &key_store).await?;
     apply_pending_wipes(&storage, &key_store).await?;
     // After wipes (which free slots) and before login (which opens the refresh store).
-    storage.reserve(super::BOOT_SLOTS).await.map_err(to_js)?;
+    storage
+        .reserve(super::BOOT_SLOTS)
+        .await
+        .map_err(BootError::SlotReservation)?;
     Ok((storage, key_store, was_enrolled))
 }
 
 pub(super) async fn apply_pending_wipes(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
-) -> Result<(), JsValue> {
-    for pending in crate::storage::pending_wipes().await.map_err(to_js)? {
+) -> Result<(), BootError> {
+    for pending in crate::storage::pending_wipes()
+        .await
+        .map_err(BootError::KeyStore)?
+    {
         apply_pending_wipe(storage, key_store, &pending).await?;
     }
     Ok(())
@@ -57,7 +68,7 @@ async fn apply_pending_wipe(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     pending: &crate::storage::PendingWipe,
-) -> Result<(), JsValue> {
+) -> Result<(), BootError> {
     let content_removed = remove_pending_content(pending).await?;
     if !pending.replica_deleted() {
         crate::storage::wipe_replica(
@@ -67,35 +78,33 @@ async fn apply_pending_wipe(
             &crate::auth::PendingWork::default(),
             true,
         )
-        .await
-        .map_err(to_js)?;
+        .await?;
     }
     match (content_removed, pending.replica_deleted()) {
         (true, _) => crate::storage::acknowledge_pending_wipe(pending)
             .await
-            .map_err(to_js)?,
+            .map_err(BootError::KeyStore)?,
         (false, false) => crate::storage::defer_pending_content_wipe(pending)
             .await
-            .map_err(to_js)?,
+            .map_err(BootError::KeyStore)?,
         (false, true) => {}
     }
     tracing::info!(replica = %pending.replica, "db worker: advanced a pending data wipe");
     Ok(())
 }
 
-async fn remove_pending_content(pending: &crate::storage::PendingWipe) -> Result<bool, JsValue> {
+async fn remove_pending_content(pending: &crate::storage::PendingWipe) -> Result<bool, BootError> {
     let Some(namespace) = &pending.content_namespace else {
         return Ok(true);
     };
-    let scope: web_sys::DedicatedWorkerGlobalScope =
-        js_sys::global()
-            .dyn_into()
-            .map_err(|value: js_sys::Object| {
-                JsValue::from_str(&format!("db worker scope: {value:?}"))
-            })?;
+    let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
+        .dyn_into()
+        .map_err(|value: js_sys::Object| BootError::NotWorkerScope(format!("{value:?}")))?;
     match BrowserStore::remove(&scope, namespace).await {
         Ok(()) => Ok(true),
-        Err(error @ BrowserStoreError::InvalidNamespace { .. }) => Err(to_js(error)),
+        Err(error @ BrowserStoreError::InvalidNamespace { .. }) => {
+            Err(BootError::ContentStore(error))
+        }
         Err(error) => {
             tracing::warn!(
                 replica = %pending.replica,
@@ -117,7 +126,7 @@ pub(super) async fn start_boot_services<Id>(
     spec: &BootReplicaSpec<Id>,
     worker: ConnettoConnection<BrowserSocket>,
     content_root_key: Option<[u8; 32]>,
-) -> Result<Option<bool>, JsValue> {
+) -> Result<Option<bool>, BootError> {
     let ws_url = config.ws_url;
     let reconnect = HubReconnect {
         factory: move || async move {
@@ -163,24 +172,18 @@ async fn setup_content_store(
         Option<bool>,
         Option<String>,
     ),
-    JsValue,
+    BootError,
 > {
     let Some(seed) = config.content_namespace else {
         return Ok((None, None, None));
     };
     let namespace = content_store_namespace(seed, replica_db_name);
     let (store, root_key) = if identified {
-        let root_key = content_root_key
-            .ok_or_else(|| JsValue::from_str("browser content key is unavailable"))?;
-        let scope: web_sys::DedicatedWorkerGlobalScope =
-            js_sys::global()
-                .dyn_into()
-                .map_err(|value: js_sys::Object| {
-                    JsValue::from_str(&format!("db worker scope: {value:?}"))
-                })?;
-        let store = BrowserStore::install(&scope, &namespace)
-            .await
-            .map_err(|err| JsValue::from_str(&format!("browser content store: {err}")))?;
+        let root_key = content_root_key.ok_or(BootError::ContentKey)?;
+        let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
+            .dyn_into()
+            .map_err(|value: js_sys::Object| BootError::NotWorkerScope(format!("{value:?}")))?;
+        let store = BrowserStore::install(&scope, &namespace).await?;
         (store, root_key)
     } else {
         (
@@ -202,15 +205,14 @@ fn start_relay_hub<F, S>(
     hub_meta_name: &'static str,
     reconnect: HubReconnect<F, S>,
     content: Option<ContentArchive<BrowserStore>>,
-) -> Result<(RelayHub, UnboundedReceiver<HubNotice>), JsValue>
+) -> Result<(RelayHub, UnboundedReceiver<HubNotice>), BootError>
 where
     F: TransportFactory<Transport = BrowserSocket> + 'static,
     F::Error: core::fmt::Display,
     S: Sleeper + Clone + 'static,
 {
     let (hub, pump, notices) =
-        RelayHub::with_reconnect_archive(worker, hub_meta_name, reconnect, content)
-            .map_err(|err| JsValue::from_str(&format!("hub meta: {err}")))?;
+        RelayHub::with_reconnect_archive(worker, hub_meta_name, reconnect, content)?;
     spawn_local(async move {
         if let Err(err) = pump.await {
             tracing::error!(error = %err, "relay hub ended");
@@ -241,7 +243,7 @@ fn install_tab_services(
     replica_db_name: &str,
     content_wipe_namespace: Option<String>,
     active_account: Option<&str>,
-) -> Result<(), JsValue> {
+) -> Result<(), BootError> {
     if let Some(auth_config) = &config.auth {
         super::super::logout::serve_logout_requests(
             super::super::logout::LogoutConfig {

@@ -76,6 +76,42 @@ thread_local! {
 
 // ─────────────────────────────────────────────────────────── public types ──
 
+/// Failure of a browser unlock or enrolment operation.
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    /// The global scope is not a dedicated worker; the handler cannot be installed.
+    #[error("unlock handler: not a dedicated worker scope")]
+    NotAWorker,
+    /// The `WebAuthn` PRF extension is not available in this browsing context.
+    #[error("webauthn unlock protocol not supported in this context")]
+    UnsupportedProtocol,
+    /// The passkey ceremony was dismissed or the credential no longer exists.
+    #[error("passkey ceremony dismissed or credential absent")]
+    Dismissed,
+    /// Posting the ceremony result to the worker failed.
+    #[error("worker post ({op}): {detail}")]
+    WorkerPost {
+        /// Which post operation failed.
+        op: &'static str,
+        /// The exception text from the browser.
+        detail: String,
+    },
+    /// A browser `WebAuthn` or Crypto API call failed.
+    #[error("browser {op}: {detail}")]
+    Browser {
+        /// Which API call failed.
+        op: &'static str,
+        /// The exception text from the browser.
+        detail: String,
+    },
+}
+
+impl From<UnlockError> for JsValue {
+    fn from(value: UnlockError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
 /// An answer the tab sends back after receiving an unlock or enrol request.
 pub enum TabAnswer {
     /// The tab ran the ceremony and imported the PRF output as an HKDF key.
@@ -179,11 +215,11 @@ pub(crate) fn set_custody(c: Custody) {
 ///
 /// # Errors
 ///
-/// [`JsValue`] if the global scope cannot be cast to [`DedicatedWorkerGlobalScope`].
-pub(crate) fn install_worker_handler() -> Result<(), JsValue> {
+/// [`UnlockError::NotAWorker`] if the global scope is not a dedicated worker.
+pub(crate) fn install_worker_handler() -> Result<(), UnlockError> {
     let global: DedicatedWorkerGlobalScope = js_sys::global()
         .dyn_into()
-        .map_err(|_| JsValue::from_str("unlock handler: not a dedicated worker scope"))?;
+        .map_err(|_| UnlockError::NotAWorker)?;
     let handler = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         handle_worker_message(&event);
     });
@@ -390,8 +426,8 @@ fn set_str(obj: &Object, key: &str, val: &str) {
 ///
 /// # Errors
 ///
-/// [`JsValue`] if the handler cannot be installed.
-pub fn serve_unlock(worker: &Worker) -> Result<(), JsValue> {
+/// Never fails; the return type is `Result` for callers that use `?` uniformly.
+pub fn serve_unlock(worker: &Worker) -> Result<(), UnlockError> {
     let worker_for_handler = worker.clone();
     let handler = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         let worker = worker_for_handler.clone();
@@ -426,12 +462,32 @@ pub fn serve_unlock(worker: &Worker) -> Result<(), JsValue> {
 ///
 /// # Errors
 ///
-/// [`JsValue`] if the ceremony fails or the key cannot be posted.
-pub async fn enrol(worker: &Worker) -> Result<(), JsValue> {
-    let key_and_id = create_credential().await?;
+/// [`UnlockError::Dismissed`] when the ceremony is dismissed or the credential is gone,
+/// [`UnlockError::UnsupportedProtocol`] when the platform cannot run the ceremony,
+/// or [`UnlockError::WorkerPost`] when the result cannot be sent to the worker.
+pub async fn enrol(worker: &Worker) -> Result<(), UnlockError> {
+    let key_and_id = create_credential().await.map_err(|e| {
+        if is_not_allowed(&e) {
+            UnlockError::Dismissed
+        } else if error_name(&e).as_deref() == Some("SecurityError") {
+            UnlockError::UnsupportedProtocol
+        } else {
+            UnlockError::Browser {
+                op: "credential ceremony",
+                detail: format!("{e:?}"),
+            }
+        }
+    })?;
     match key_and_id {
-        Some((credential_id, hkdf_key)) => post_key_to_worker(worker, &credential_id, &hkdf_key),
-        None => post_unsupported(worker),
+        Some((credential_id, hkdf_key)) => post_key_to_worker(worker, &credential_id, &hkdf_key)
+            .map_err(|e| UnlockError::WorkerPost {
+                op: "key",
+                detail: format!("{e:?}"),
+            }),
+        None => post_unsupported(worker).map_err(|e| UnlockError::WorkerPost {
+            op: "unsupported",
+            detail: format!("{e:?}"),
+        }),
     }
 }
 
@@ -746,7 +802,12 @@ fn pub_key_params() -> js_sys::Array {
 
 fn random_challenge() -> Result<Vec<u8>, JsValue> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| JsValue::from_str(&format!("rng: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| {
+        JsValue::from(UnlockError::Browser {
+            op: "rng",
+            detail: e.to_string(),
+        })
+    })?;
     Ok(bytes.to_vec())
 }
 
@@ -867,9 +928,12 @@ fn post_failed(worker: &Worker, detail: &str) -> Result<(), JsValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountChoice, chosen_account, serve_account_choice, set_pending_switch};
+    use super::{
+        AccountChoice, UnlockError, chosen_account, serve_account_choice, set_pending_switch,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
+    use wasm_bindgen::JsValue;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -931,6 +995,19 @@ mod tests {
             offered.borrow().as_slice(),
             [2],
             "and it did not consult the chooser either"
+        );
+    }
+
+    /// The unsupported-protocol variant converts to the Display text, not a raw JS exception.
+    ///
+    /// Passkey ceremonies cannot be provoked headlessly, so this pins the `From` conversion
+    /// rather than the full ceremony path.
+    #[wasm_bindgen_test]
+    fn unsupported_protocol_from_conversion_carries_display_text() {
+        let js: JsValue = UnlockError::UnsupportedProtocol.into();
+        assert_eq!(
+            js.as_string().as_deref(),
+            Some("webauthn unlock protocol not supported in this context"),
         );
     }
 }

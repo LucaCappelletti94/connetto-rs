@@ -40,11 +40,45 @@ type ExportSlot = Rc<RefCell<ExportWait>>;
 type ImportReply = Result<(ImportOutcome, usize), String>;
 type ImportSlot = Rc<RefCell<Option<ImportReply>>>;
 
+/// Failure surfaced by the channel service installers.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    /// the broadcast channel could not be opened
+    #[error("{operation}: {detail}")]
+    ChannelOpen {
+        /// the operation that failed
+        operation: &'static str,
+        /// the browser exception text
+        detail: String,
+    },
+    /// a reply message object could not be encoded
+    #[error("{operation} reply encoding failed: {detail}")]
+    ReplyEncoding {
+        /// the operation that failed
+        operation: &'static str,
+        /// the browser exception text
+        detail: String,
+    },
+}
+
+impl From<ChannelError> for JsValue {
+    fn from(value: ChannelError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
+fn reflect_error(operation: &'static str, err: &JsValue) -> ChannelError {
+    ChannelError::ReplyEncoding {
+        operation,
+        detail: format!("{err:?}"),
+    }
+}
+
 /// Addresses one export exchange by worker generation and caller id.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ExportTag {
-    pub(super) generation: String,
-    pub(super) request: String,
+    generation: String,
+    request: String,
 }
 
 impl ExportTag {
@@ -55,13 +89,14 @@ impl ExportTag {
         })
     }
 
-    fn write(&self, message: &js_sys::Object) -> Result<(), JsValue> {
+    fn write(&self, message: &js_sys::Object) -> Result<(), ChannelError> {
         set_export_generation(message, &self.generation)?;
         js_sys::Reflect::set(
             message,
             &JsValue::from_str("request"),
             &JsValue::from_str(&self.request),
-        )?;
+        )
+        .map_err(|e| reflect_error("write export tag", &e))?;
         Ok(())
     }
 }
@@ -79,12 +114,13 @@ impl ImportTag {
         })
     }
 
-    fn write(&self, message: &js_sys::Object) -> Result<(), JsValue> {
+    fn write(&self, message: &js_sys::Object) -> Result<(), ChannelError> {
         js_sys::Reflect::set(
             message,
             &JsValue::from_str("request"),
             &JsValue::from_str(&self.request),
-        )?;
+        )
+        .map_err(|e| reflect_error("write import tag", &e))?;
         Ok(())
     }
 }
@@ -110,9 +146,11 @@ fn is_export_generation_request(data: &JsValue) -> bool {
 }
 
 fn decode_export_generation(data: &JsValue) -> Option<String> {
-    (export_message_kind(data).as_deref() == Some(EXPORT_GENERATION_REPLY))
-        .then(|| export_message_generation(data))
-        .flatten()
+    if export_message_kind(data).as_deref() == Some(EXPORT_GENERATION_REPLY) {
+        export_message_generation(data)
+    } else {
+        None
+    }
 }
 
 fn build_export_generation_request() -> JsValue {
@@ -170,15 +208,17 @@ pub(super) fn decode_import_request(data: &JsValue) -> Option<(ImportTag, File)>
     Some((tag, file))
 }
 
-fn build_import_request(file: &File, tag: &ImportTag) -> Result<JsValue, JsValue> {
+fn build_import_request(file: &File, tag: &ImportTag) -> Result<JsValue, ChannelError> {
     let request = js_sys::Object::new();
     js_sys::Reflect::set(
         &request,
         &JsValue::from_str("kind"),
         &JsValue::from_str(IMPORT_REQUEST_KIND),
-    )?;
+    )
+    .map_err(|e| reflect_error("build import request", &e))?;
     tag.write(&request)?;
-    js_sys::Reflect::set(&request, &JsValue::from_str("file"), file.as_ref())?;
+    js_sys::Reflect::set(&request, &JsValue::from_str("file"), file.as_ref())
+        .map_err(|e| reflect_error("build import request", &e))?;
     Ok(request.into())
 }
 
@@ -237,7 +277,7 @@ fn count_from_js(value: &JsValue) -> Option<usize> {
     {
         return None;
     }
-    // no TryFrom<f64> for u32 exists; guard above proves finite, non-negative, whole, within u32
+    // guard above proves finite, non-negative, whole, within u32
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -247,54 +287,60 @@ fn count_from_js(value: &JsValue) -> Option<usize> {
     usize::try_from(count).ok()
 }
 
-pub(super) fn export_generation_reply(generation: &str) -> Result<JsValue, JsValue> {
+pub(super) fn export_generation_reply(generation: &str) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_GENERATION_REPLY),
-    )?;
+    )
+    .map_err(|e| reflect_error("export generation reply", &e))?;
     set_export_generation(&reply, generation)?;
     Ok(reply.into())
 }
 
-fn set_export_generation(reply: &js_sys::Object, generation: &str) -> Result<bool, JsValue> {
+fn set_export_generation(reply: &js_sys::Object, generation: &str) -> Result<bool, ChannelError> {
     js_sys::Reflect::set(
         reply,
         &JsValue::from_str("generation"),
         &JsValue::from_str(generation),
     )
+    .map_err(|e| reflect_error("set export generation", &e))
 }
 
-pub(super) fn export_reply_ok(tag: &ExportTag, bytes: &[u8]) -> Result<JsValue, JsValue> {
+pub(super) fn export_reply_ok(tag: &ExportTag, bytes: &[u8]) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_OK),
-    )?;
+    )
+    .map_err(|e| reflect_error("export reply ok", &e))?;
     tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("bytes"),
         &js_sys::Uint8Array::from(bytes),
-    )?;
+    )
+    .map_err(|e| reflect_error("export reply ok", &e))?;
     Ok(reply.into())
 }
 
-fn export_reply_failed(tag: &ExportTag, error: &str) -> Result<JsValue, JsValue> {
+fn export_reply_failed(tag: &ExportTag, error: &str) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_FAILED),
-    )?;
+    )
+    .map_err(|e| reflect_error("export reply failed", &e))?;
     tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("error"),
         &JsValue::from_str(error),
-    )?;
+    )
+    .map_err(|e| reflect_error("export reply failed", &e))?;
     Ok(reply.into())
 }
 
@@ -302,21 +348,23 @@ pub(super) fn import_reply_ok(
     tag: &ImportTag,
     outcome: &ImportOutcome,
     collisions: usize,
-) -> Result<JsValue, JsValue> {
+) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(IMPORT_REPLY_OK),
-    )?;
+    )
+    .map_err(|e| reflect_error("import reply ok", &e))?;
     tag.write(&reply)?;
-    let set = |key: &str, count: usize| -> Result<bool, JsValue> {
+    let set = |key: &str, count: usize| -> Result<bool, ChannelError> {
         // counts fit u32 on every wasm target; saturate rather than fail on the impossible overflow
         js_sys::Reflect::set(
             &reply,
             &JsValue::from_str(key),
             &JsValue::from(u32::try_from(count).unwrap_or(u32::MAX)),
         )
+        .map_err(|e| reflect_error("import reply ok", &e))
     };
     set("rows_restored", outcome.rows_restored)?;
     set("rows_kept", outcome.rows_kept)?;
@@ -325,19 +373,21 @@ pub(super) fn import_reply_ok(
     Ok(reply.into())
 }
 
-pub(super) fn import_reply_failed(tag: &ImportTag, error: &str) -> Result<JsValue, JsValue> {
+pub(super) fn import_reply_failed(tag: &ImportTag, error: &str) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(IMPORT_REPLY_FAILED),
-    )?;
+    )
+    .map_err(|e| reflect_error("import reply failed", &e))?;
     tag.write(&reply)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("error"),
         &JsValue::from_str(error),
-    )?;
+    )
+    .map_err(|e| reflect_error("import reply failed", &e))?;
     Ok(reply.into())
 }
 
@@ -384,8 +434,8 @@ async fn poll_for_export_reply(
 ///
 /// # Errors
 ///
-/// The `BroadcastChannel` error when the channel cannot be opened.
-pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue> {
+/// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
+pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), ChannelError> {
     serve_exports(move |scope| {
         let hub = hub.clone();
         async move { hub.export_local_data(scope).await }
@@ -394,7 +444,7 @@ pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue>
 
 fn post_channel_reply(
     channel: &BroadcastChannel,
-    reply: Result<JsValue, JsValue>,
+    reply: Result<JsValue, ChannelError>,
     label: &'static str,
 ) {
     match reply {
@@ -402,7 +452,7 @@ fn post_channel_reply(
             let _ = channel.post_message(&msg);
         }
         Err(err) => {
-            tracing::error!(error = ?err, "db worker: building a {label} reply failed");
+            tracing::error!(error = %err, "db worker: building a {label} reply failed");
         }
     }
 }
@@ -412,14 +462,17 @@ fn install_worker_listener(channel: &BroadcastChannel, listener: Closure<dyn FnM
     listener.forget();
 }
 
-fn serve_exports<F, Fut, E>(export: F) -> Result<(), JsValue>
+fn serve_exports<F, Fut, E>(export: F) -> Result<(), ChannelError>
 where
     F: Fn(ExportScope) -> Fut + 'static,
     Fut: Future<Output = Result<Vec<u8>, E>> + 'static,
     E: Display + 'static,
 {
-    let channel = BroadcastChannel::new(super::EXPORT_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("export channel: {err:?}")))?;
+    let channel =
+        BroadcastChannel::new(super::EXPORT_CHANNEL).map_err(|err| ChannelError::ChannelOpen {
+            operation: "export channel",
+            detail: format!("{err:?}"),
+        })?;
     let generation = Rc::new(rosetta_uuid::Uuid::new_v4().to_string());
     let export = Rc::new(export);
     let listener = {
@@ -459,22 +512,25 @@ where
 ///
 /// # Errors
 ///
-/// The `BroadcastChannel` error when the channel cannot be opened.
-pub fn serve_import_requests(hub: crate::relay::RelayHub) -> Result<(), JsValue> {
+/// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
+pub fn serve_import_requests(hub: crate::relay::RelayHub) -> Result<(), ChannelError> {
     serve_imports(move |bytes| {
         let hub = hub.clone();
         async move { hub.import_local_data(bytes).await }
     })
 }
 
-fn serve_imports<F, Fut, E>(import: F) -> Result<(), JsValue>
+fn serve_imports<F, Fut, E>(import: F) -> Result<(), ChannelError>
 where
     F: Fn(Vec<u8>) -> Fut + 'static,
     Fut: Future<Output = Result<(ImportOutcome, usize), E>> + 'static,
     E: Display + 'static,
 {
-    let channel = BroadcastChannel::new(super::IMPORT_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("import channel: {err:?}")))?;
+    let channel =
+        BroadcastChannel::new(super::IMPORT_CHANNEL).map_err(|err| ChannelError::ChannelOpen {
+            operation: "import channel",
+            detail: format!("{err:?}"),
+        })?;
     let import = Rc::new(import);
     let listener = {
         let channel = channel.clone();

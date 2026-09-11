@@ -24,13 +24,17 @@ pub struct LogoutConfig {
 ///
 /// # Errors
 ///
-/// The `BroadcastChannel` error when the channel cannot be opened.
+/// [`super::archive_channel::ChannelError::ChannelOpen`] when the channel cannot be opened.
 pub fn serve_logout_requests(
     config: LogoutConfig,
     hub: crate::relay::RelayHub,
-) -> Result<(), JsValue> {
-    let channel = BroadcastChannel::new(crate::auth::LOGOUT_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("logout channel: {err:?}")))?;
+) -> Result<(), super::archive_channel::ChannelError> {
+    let channel = BroadcastChannel::new(crate::auth::LOGOUT_CHANNEL).map_err(|err| {
+        super::archive_channel::ChannelError::ChannelOpen {
+            operation: "logout channel",
+            detail: format!("{err:?}"),
+        }
+    })?;
     let listener = {
         let channel = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {

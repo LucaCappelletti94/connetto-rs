@@ -94,6 +94,12 @@ pub enum AuthError {
     },
 }
 
+impl From<AuthError> for JsValue {
+    fn from(value: AuthError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
 /// The error string a JS caller receives when the key store is locked.
 ///
 /// The refusal message always starts with this, so a caller recognises it by
@@ -1446,15 +1452,19 @@ pub async fn await_login_code(login_url: &str) -> Result<(String, String), AuthE
 ///
 /// # Errors
 ///
-/// The `BroadcastChannel` error if the channel cannot be opened or posted to.
-pub fn deliver_login_code(code: &str, state: &str) -> Result<(), JsValue> {
-    let channel = BroadcastChannel::new(LOGIN_CHANNEL)?;
+/// [`AuthError::Context`] if the channel cannot be opened or posted to, or
+/// the message cannot be serialized.
+pub fn deliver_login_code(code: &str, state: &str) -> Result<(), AuthError> {
+    let channel = BroadcastChannel::new(LOGIN_CHANNEL)
+        .map_err(|e| AuthError::Context(format!("login channel: {e:?}")))?;
     let message = serde_json::to_string(&LoginMessage::Code {
         code: code.to_owned(),
         state: state.to_owned(),
     })
-    .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    channel.post_message(&JsValue::from_str(&message))?;
+    .map_err(|e| AuthError::Context(format!("login message serialize: {e}")))?;
+    channel
+        .post_message(&JsValue::from_str(&message))
+        .map_err(|e| AuthError::Context(format!("login channel post: {e:?}")))?;
     channel.close();
     Ok(())
 }

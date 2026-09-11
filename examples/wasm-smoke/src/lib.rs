@@ -149,6 +149,7 @@ pub mod workers {
             glue_url,
             &connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url)),
         )
+        .map_err(JsValue::from)
     }
 
     /// DB worker entry point: boot the connetto DB tier with the smoke config.
@@ -184,6 +185,7 @@ pub mod workers {
         )
         .await
         .map(drop)
+        .map_err(JsValue::from)
     }
 
     /// DB worker entry point for the unlock-protocol test binary. Same as
@@ -217,5 +219,6 @@ pub mod workers {
         )
         .await
         .map(drop)
+        .map_err(JsValue::from)
     }
 }

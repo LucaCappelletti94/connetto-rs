@@ -4,11 +4,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
-/// Convert any `Display` value to a `JsValue` string error.
-pub(super) fn to_js(err: impl core::fmt::Display) -> JsValue {
-    JsValue::from_str(&err.to_string())
-}
-
 /// Derive the browser content store namespace from `seed` and `replica_db_name`.
 pub(super) fn content_store_namespace(seed: &str, replica_db_name: &str) -> String {
     let mut digest = Sha256::new();

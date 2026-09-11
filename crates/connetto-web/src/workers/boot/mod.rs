@@ -7,6 +7,75 @@ mod services;
 /// Storage-pool slots reserved by [`boot_db_worker`]: 4 databases plus a rollback journal each.
 const BOOT_SLOTS: u32 = 8;
 
+/// Failure of the DB worker boot sequence or worker spawn.
+#[derive(Debug, thiserror::Error)]
+pub enum BootError {
+    /// The credential key store could not be opened, queried, or the enrolled credential is
+    /// unusable in this context.
+    #[error("key store: {0}")]
+    KeyStore(crate::auth::AuthError),
+    /// The passkey unlock or custody ceremony failed.
+    #[error("unlock: {0}")]
+    Unlock(#[from] crate::unlock::UnlockError),
+    /// A pending data wipe could not be applied.
+    #[error("pending wipe: {0}")]
+    PendingWipe(#[from] crate::storage::WipeError),
+    /// Database slot reservation failed.
+    #[error("slot reservation: {0}")]
+    SlotReservation(crate::auth::AuthError),
+    /// Session acquisition or refresh-token persistence failed.
+    #[error("session acquisition: {0}")]
+    SessionAcquisition(crate::auth::AuthError),
+    /// The replica could not be opened or its session-derived name could not be encoded.
+    #[error("replica open: {0}")]
+    ReplicaOpen(connetto_client::ClientError),
+    /// No device-private database was configured alongside the replica.
+    #[error("no device-private database configured")]
+    NoTierConfigured,
+    /// The upstream subscription or boot-handshake ping failed.
+    #[error("upstream subscription: {0}")]
+    Subscribe(connetto_client::ClientError),
+    /// The upstream did not complete the boot handshake within the deadline.
+    #[error("upstream boot handshake timed out after {deadline_ms:.0} ms")]
+    BootTimeout {
+        /// The deadline that elapsed, in milliseconds.
+        deadline_ms: f64,
+    },
+    /// The server closed the connection during the upstream boot.
+    #[error("server closed during upstream boot")]
+    BootClosed,
+    /// An identified session has no content root key for the content store.
+    #[error("content key unavailable")]
+    ContentKey,
+    /// The global is not a `DedicatedWorkerGlobalScope` as required.
+    #[error("not a dedicated worker scope: {0}")]
+    NotWorkerScope(String),
+    /// The browser content store could not be installed or removed.
+    #[error("content store: {0}")]
+    ContentStore(#[from] connetto_file_client::BrowserStoreError),
+    /// The relay hub could not start.
+    #[error("relay hub: {0}")]
+    RelayHub(#[from] crate::relay::RelayError),
+    /// A tab-service channel handler could not be installed.
+    #[error("tab service: {0}")]
+    TabService(#[from] super::ChannelError),
+    /// The hello-channel intake handler could not be installed.
+    #[error("intake: {0}")]
+    Intake(#[from] super::IntakeError),
+    /// The bootstrap script or blob URL could not be constructed from the glue URL.
+    #[error("bootstrap URL: {0}")]
+    BootstrapUrl(String),
+    /// Spawning the browser worker failed.
+    #[error("worker spawn: {0}")]
+    WorkerSpawn(String),
+}
+
+impl From<BootError> for JsValue {
+    fn from(value: BootError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
 /// Application-specific inputs for [`boot_db_worker`].
 pub struct DbWorkerConfig {
     /// The server WebSocket URL the worker connects upstream to.
@@ -212,15 +281,18 @@ pub enum WorkerBootstrap {
 ///
 /// # Errors
 ///
-/// The `Worker` constructor's error, or a blob-URL failure for [`WorkerBootstrap::Generated`].
-pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Worker, JsValue> {
+/// [`BootError::BootstrapUrl`] when a URL cannot be parsed, [`BootError::WorkerSpawn`] when the
+/// `Worker` constructor fails.
+pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Worker, BootError> {
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");
     match bootstrap {
-        WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options),
+        WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options)
+            .map_err(|e| BootError::WorkerSpawn(format!("{e:?}"))),
         WorkerBootstrap::Script(script_url) => {
-            let url = web_sys::Url::new(script_url)?;
+            let url = web_sys::Url::new(script_url)
+                .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
             let encoded = String::from(js_sys::encode_uri_component(glue_url));
             let existing = url.search();
             // existing is "" or "?key=val"; set_search prepends "?" automatically.
@@ -231,10 +303,12 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
             };
             url.set_search(&new_search);
             Worker::new_with_options(&url.href(), &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))
         }
         WorkerBootstrap::Generated => {
             let object_url = generated_bootstrap_url(glue_url)?;
-            let worker = Worker::new_with_options(&object_url, &options);
+            let worker = Worker::new_with_options(&object_url, &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")));
             // The worker takes its reference to the blob during construction.
             let _ = web_sys::Url::revoke_object_url(&object_url);
             worker
@@ -242,8 +316,8 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
     }
 }
 
-fn generated_bootstrap_url(glue_url: &str) -> Result<String, JsValue> {
-    let url = web_sys::Url::new(glue_url)?;
+fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
+    let url = web_sys::Url::new(glue_url).map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
     let path = url.pathname();
     let wasm_path = path.strip_suffix(".js").map_or_else(
         || format!("{path}_bg.wasm"),
@@ -268,8 +342,10 @@ fn generated_bootstrap_url(glue_url: &str) -> Result<String, JsValue> {
     let parts = js_sys::Array::of1(&JsValue::from_str(&source));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)?;
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
     web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))
 }
 
 fn js_string_literal(value: &str) -> String {
@@ -306,8 +382,8 @@ pub struct BootedSession<Id> {
 ///
 /// # Errors
 ///
-/// A string describing the VFS, acquisition, upstream connect, or subscribe failure.
-pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, JsValue>
+/// [`BootError`] describing the VFS, acquisition, upstream connect, or subscribe failure.
+pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, BootError>
 where
     Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {

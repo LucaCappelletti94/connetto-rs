@@ -6,13 +6,12 @@ use connetto_client::{
 };
 use connetto_core::custody::{Custody, NoGate};
 use connetto_core::traits::ReplicaKeyStore as _;
-use wasm_bindgen::JsValue;
 
-use super::super::helpers::{sleep_ms, to_js};
-
+use super::super::helpers::sleep_ms;
 use super::super::session::{
     RefreshStoreHandle, acquire_deferred, acquire_session, persist_deferred,
 };
+use super::BootError;
 use super::DbWorkerConfig;
 use crate::BrowserSocket;
 
@@ -33,18 +32,19 @@ impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
         config: &DbWorkerConfig,
         session: Option<crate::auth::BrowserSession<Id>>,
         storage: &crate::storage::ReplicaStorage,
-    ) -> Result<Self, JsValue> {
+    ) -> Result<Self, BootError> {
         let replica_db_name = match &session {
             Some(session) => {
                 connetto_client::replica_db_name(config.replica_db_prefix, &session.user_id)
-                    .map_err(to_js)?
+                    .map_err(BootError::ReplicaOpen)?
             }
             None => config.replica_db_prefix.to_owned(),
         };
         let active_account = match &session {
-            Some(session) => {
-                Some(connetto_client::encode_identity(&session.user_id).map_err(to_js)?)
-            }
+            Some(session) => Some(
+                connetto_client::encode_identity(&session.user_id)
+                    .map_err(BootError::ReplicaOpen)?,
+            ),
             None => None,
         };
         let existing = storage.exists(&replica_db_name);
@@ -74,7 +74,7 @@ pub(super) async fn resolve_replica_spec<Id>(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     was_enrolled: bool,
-) -> Result<BootReplicaSpec<Id>, JsValue>
+) -> Result<BootReplicaSpec<Id>, BootError>
 where
     Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {
@@ -85,15 +85,15 @@ where
 pub(super) async fn setup_custody(
     config: &DbWorkerConfig,
     key_store: &Rc<crate::auth::IdbKeyStore>,
-) -> Result<bool, JsValue> {
+) -> Result<bool, BootError> {
     if config.unlock {
         crate::unlock::install_worker_handler()?;
     }
     crate::unlock::init_worker(Rc::clone(key_store), Custody::Unverified(NoGate::Offerable));
-    let enrolled_ids = key_store.enrolled().await.map_err(to_js)?;
+    let enrolled_ids = key_store.enrolled().await.map_err(BootError::KeyStore)?;
     let was_enrolled = !enrolled_ids.is_empty();
     if was_enrolled && !config.unlock {
-        return Err(to_js(crate::auth::AuthError::Locked {
+        return Err(BootError::KeyStore(crate::auth::AuthError::Locked {
             detail: "a credential is enrolled but this build did not enable the unlock \
                      protocol, so nothing here can derive the key"
                 .into(),
@@ -108,38 +108,42 @@ pub(super) async fn setup_custody(
 async fn run_unlock_ceremony(
     enrolled_ids: Vec<Vec<u8>>,
     key_store: &crate::auth::IdbKeyStore,
-) -> Result<(), JsValue> {
+) -> Result<(), BootError> {
     match crate::unlock::ask_unlock(enrolled_ids)
         .await
-        .map_err(to_js)?
+        .map_err(BootError::KeyStore)?
     {
         crate::unlock::TabAnswer::Key { credential_id, key } => {
             key_store
                 .use_derived(key, &credential_id)
                 .await
-                .map_err(to_js)?;
+                .map_err(BootError::KeyStore)?;
             crate::unlock::set_custody(Custody::Verified);
         }
         crate::unlock::TabAnswer::Declined => {
-            return Err(to_js(crate::auth::AuthError::Locked {
+            return Err(BootError::KeyStore(crate::auth::AuthError::Locked {
                 detail: "the ceremony was dismissed or the credential is gone".into(),
             }));
         }
         crate::unlock::TabAnswer::Unsupported => {
-            return Err(to_js(crate::auth::AuthError::Locked {
+            return Err(BootError::KeyStore(crate::auth::AuthError::Locked {
                 detail: "this browsing context cannot run the ceremony that enrolled this \
                          profile"
                     .into(),
             }));
         }
         crate::unlock::TabAnswer::Failed { detail } => {
-            return Err(to_js(crate::auth::AuthError::Locked { detail }));
+            return Err(BootError::KeyStore(crate::auth::AuthError::Locked {
+                detail,
+            }));
         }
         other @ crate::unlock::TabAnswer::Account(_) => {
-            return Err(to_js(crate::auth::AuthError::Context(format!(
-                "the unlock request was answered with {}",
-                crate::unlock::answer_kind(&other)
-            ))));
+            return Err(BootError::KeyStore(crate::auth::AuthError::Context(
+                format!(
+                    "the unlock request was answered with {}",
+                    crate::unlock::answer_kind(&other)
+                ),
+            )));
         }
     }
     Ok(())
@@ -155,7 +159,7 @@ async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeO
         Option<crate::auth::BrowserSession<Id>>,
         Option<crate::auth::DeferredRefreshStore>,
     ),
-    JsValue,
+    BootError,
 > {
     let defer = config.unlock
         && !was_enrolled
@@ -163,7 +167,9 @@ async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeO
         && !storage.exists(config.auth_db_name);
     match &config.auth {
         Some(auth_config) if defer => {
-            let (session, deferred) = acquire_deferred::<Id>(auth_config).await?;
+            let (session, deferred) = acquire_deferred::<Id>(auth_config)
+                .await
+                .map_err(BootError::SessionAcquisition)?;
             Ok((Some(session), Some(deferred)))
         }
         Some(auth_config) => {
@@ -173,7 +179,11 @@ async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeO
                 key_store,
             };
             Ok((
-                Some(acquire_session::<Id>(auth_config, &store, config.pick_account).await?),
+                Some(
+                    acquire_session::<Id>(auth_config, &store, config.pick_account)
+                        .await
+                        .map_err(BootError::SessionAcquisition)?,
+                ),
                 None,
             ))
         }
@@ -184,13 +194,16 @@ async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeO
     }
 }
 
-async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), JsValue> {
-    match crate::unlock::ask_enrol().await.map_err(to_js)? {
+async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), BootError> {
+    match crate::unlock::ask_enrol()
+        .await
+        .map_err(BootError::KeyStore)?
+    {
         crate::unlock::TabAnswer::Key { credential_id, key } => {
             key_store
                 .adopt_derived(key, &credential_id)
                 .await
-                .map_err(to_js)?;
+                .map_err(BootError::KeyStore)?;
             crate::unlock::set_custody(Custody::Verified);
         }
         crate::unlock::TabAnswer::Declined => {
@@ -200,15 +213,17 @@ async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), 
             crate::unlock::set_custody(Custody::Unverified(NoGate::Unsupported));
         }
         crate::unlock::TabAnswer::Failed { detail } => {
-            return Err(to_js(crate::auth::AuthError::Context(format!(
-                "the enrolment ceremony failed: {detail}"
-            ))));
+            return Err(BootError::KeyStore(crate::auth::AuthError::Context(
+                format!("enrolment ceremony failed: {detail}"),
+            )));
         }
         other @ crate::unlock::TabAnswer::Account(_) => {
-            return Err(to_js(crate::auth::AuthError::Context(format!(
-                "the enrolment request was answered with {}",
-                crate::unlock::answer_kind(&other)
-            ))));
+            return Err(BootError::KeyStore(crate::auth::AuthError::Context(
+                format!(
+                    "enrolment request was answered with {}",
+                    crate::unlock::answer_kind(&other)
+                ),
+            )));
         }
     }
     Ok(())
@@ -219,7 +234,7 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     was_enrolled: bool,
-) -> Result<Option<crate::auth::BrowserSession<Id>>, JsValue> {
+) -> Result<Option<crate::auth::BrowserSession<Id>>, BootError> {
     let (session, deferred) =
         acquire_or_defer_session::<Id>(config, storage, key_store, was_enrolled).await?;
     if config.unlock && !was_enrolled && session.is_some() {
@@ -231,7 +246,9 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
             storage,
             key_store,
         };
-        persist_deferred(deferred, &store).await?;
+        persist_deferred(deferred, &store)
+            .await
+            .map_err(BootError::SessionAcquisition)?;
     }
     Ok(session)
 }
@@ -240,13 +257,16 @@ pub(super) async fn provision_or_load_key(
     key_store: &crate::auth::IdbKeyStore,
     replica_db_name: &str,
     existing: bool,
-) -> Result<Option<connetto_core::ReplicaKey>, JsValue> {
+) -> Result<Option<connetto_core::ReplicaKey>, BootError> {
     if existing {
-        key_store.load(replica_db_name).await.map_err(to_js)
+        key_store
+            .load(replica_db_name)
+            .await
+            .map_err(BootError::KeyStore)
     } else {
         crate::auth::provision_replica_key(key_store, replica_db_name)
             .await
-            .map_err(to_js)
+            .map_err(BootError::KeyStore)
             .map(Some)
     }
 }
@@ -296,11 +316,11 @@ pub(super) async fn open_boot_replica<Id>(
     config: &DbWorkerConfig,
     client_config: &ClientConfig,
     replica_key: Option<connetto_core::ReplicaKey>,
-) -> Result<(ConnettoConnection<BrowserSocket>, Option<[u8; 32]>), JsValue> {
+) -> Result<(ConnettoConnection<BrowserSocket>, Option<[u8; 32]>), BootError> {
     let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
     let worker = if spec.identified {
         let replica = Replica::encrypted_file(&spec.replica_url, replica_key)
-            .map_err(to_js)?
+            .map_err(BootError::ReplicaOpen)?
             .with_tier(&spec.tier_db_name, config.frontend_ddl);
         open_replica(transport, &replica, spec.existing, config, client_config).await?
     } else {
@@ -320,7 +340,7 @@ pub(super) async fn open_boot_replica<Id>(
 pub(super) async fn subscribe_and_boot(
     worker: &mut ConnettoConnection<BrowserSocket>,
     config: &DbWorkerConfig,
-) -> Result<(), JsValue> {
+) -> Result<(), BootError> {
     // Matches the hello-channel TIMEOUT_MS in intake.rs so the tab and the worker give up
     // at the same wall-clock moment: both sides wait at most 15 s for the worker to be ready.
     const BOOT_TIMEOUT_MS: f64 = 15_000.0;
@@ -330,15 +350,15 @@ pub(super) async fn subscribe_and_boot(
     worker
         .subscribe(config.upstream_sub_id, config.upstream_query)
         .await
-        .map_err(to_js)?;
-    worker.ping(1).await.map_err(to_js)?;
+        .map_err(BootError::Subscribe)?;
+    worker.ping(1).await.map_err(BootError::Subscribe)?;
     let started = js_sys::Date::now();
     loop {
         let elapsed = js_sys::Date::now() - started;
         if elapsed >= BOOT_TIMEOUT_MS {
-            return Err(JsValue::from_str(
-                "upstream did not complete the boot handshake within the deadline",
-            ));
+            return Err(BootError::BootTimeout {
+                deadline_ms: BOOT_TIMEOUT_MS,
+            });
         }
         let remaining = BOOT_TIMEOUT_MS - elapsed;
         // Provably in i32 range: remaining <= BOOT_TIMEOUT_MS = 15_000.
@@ -348,10 +368,14 @@ pub(super) async fn subscribe_and_boot(
             reason = "remaining <= BOOT_TIMEOUT_MS = 15_000; sub-ms truncation is deliberate"
         )]
         let cancel = sleep_ms(remaining as i32);
-        match worker.pump_one_or(cancel).await.map_err(to_js)? {
+        match worker
+            .pump_one_or(cancel)
+            .await
+            .map_err(BootError::Subscribe)?
+        {
             Some(ClientEvent::Pong { nonce: 1 }) => break,
             Some(ClientEvent::Closed) => {
-                return Err(JsValue::from_str("server closed during the upstream boot"));
+                return Err(BootError::BootClosed);
             }
             Some(_) | None => {}
         }
@@ -366,19 +390,22 @@ async fn open_replica<S: StorageKind>(
     existing: bool,
     config: &DbWorkerConfig,
     client_config: &ClientConfig,
-) -> Result<ConnettoConnection<BrowserSocket>, JsValue> {
+) -> Result<ConnettoConnection<BrowserSocket>, BootError> {
     if matches!(replica.tier(), Tier::None) {
-        return Err(JsValue::from_str(
-            "the db worker named no device-private database",
-        ));
+        return Err(BootError::NoTierConfigured);
     }
     let mut worker = if existing {
-        ConnettoConnection::open_existing(replica, client_config, None).map_err(to_js)?
+        ConnettoConnection::open_existing(replica, client_config, None)
+            .map_err(BootError::ReplicaOpen)?
     } else {
-        ConnettoConnection::open(replica, config.replica_ddl, client_config, None).map_err(to_js)?
+        ConnettoConnection::open(replica, config.replica_ddl, client_config, None)
+            .map_err(BootError::ReplicaOpen)?
     };
     if let Some(transport) = transport {
-        worker.attach(transport).await.map_err(to_js)?;
+        worker
+            .attach(transport)
+            .await
+            .map_err(BootError::ReplicaOpen)?;
     }
     Ok(worker)
 }

@@ -53,7 +53,7 @@ pub use frames::{MessageSink, MessageTransport, MessageTransportError};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
-pub use leader::{Membership, join};
+pub use leader::{LeaderError, Membership, join};
 pub use relay::{
     ExportRefused, ForgetRefused, HubGone, HubNotice, ImportRefused, RelayError, RelayHub, TabId,
 };
@@ -61,9 +61,12 @@ pub use storage::{
     PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
     take_pending_wipes, wipe_replica,
 };
+pub use unlock::UnlockError;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
+pub use workers::BootError;
+pub use workers::{ChannelError, IntakeError};
 
 /// Failure surfaced by [`BrowserSocket`].
 #[derive(Debug, thiserror::Error)]

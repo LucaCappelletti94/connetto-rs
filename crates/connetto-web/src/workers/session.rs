@@ -1,8 +1,6 @@
-use wasm_bindgen::JsValue;
-
 use connetto_core::traits::RefreshTokenStore;
 
-use super::helpers::to_js;
+use crate::auth::AuthError;
 
 /// Bundled storage context for session acquisition and token persistence.
 pub(crate) struct RefreshStoreHandle<'a> {
@@ -16,7 +14,7 @@ pub(crate) async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Ser
     auth: &crate::auth::WorkerAuthConfig,
     store: &RefreshStoreHandle<'_>,
     pick_account: bool,
-) -> Result<crate::auth::BrowserSession<Id>, JsValue> {
+) -> Result<crate::auth::BrowserSession<Id>, AuthError> {
     let refresh = open_refresh_store(store).await?;
     let account = choose_account(&refresh, pick_account).await?;
     drive_acquisition(auth, &refresh, account).await
@@ -26,30 +24,30 @@ pub(crate) async fn acquire_session<Id: serde::de::DeserializeOwned + serde::Ser
 async fn choose_account(
     store: &crate::auth::RefreshStore,
     pick_account: bool,
-) -> Result<Option<String>, JsValue> {
-    let remembered = crate::auth::remembered_account(store).map_err(to_js)?;
+) -> Result<Option<String>, AuthError> {
+    let remembered = crate::auth::remembered_account(store)?;
     if !pick_account {
         return Ok(remembered);
     }
-    let accounts = RefreshTokenStore::accounts(store).map_err(to_js)?;
+    let accounts = RefreshTokenStore::accounts(store)?;
     if accounts.is_empty() && remembered.is_none() {
         return Ok(None);
     }
-    match crate::unlock::ask_account(&accounts).await.map_err(to_js)? {
+    match crate::unlock::ask_account(&accounts).await? {
         crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::Named(chosen)) => {
             if !accounts.contains(&chosen) {
-                return Err(to_js(crate::auth::AuthError::Context(
+                return Err(AuthError::Context(
                     "the tab named an account that was not offered".into(),
-                )));
+                ));
             }
             Ok(Some(chosen))
         }
         crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::LastUsed) => Ok(remembered),
         crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::New) => Ok(None),
-        other => Err(to_js(crate::auth::AuthError::Context(format!(
+        other => Err(AuthError::Context(format!(
             "the tab answered the account question with {}",
             crate::unlock::answer_kind(&other)
-        )))),
+        ))),
     }
 }
 
@@ -61,7 +59,7 @@ pub(crate) async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Se
         crate::auth::BrowserSession<Id>,
         crate::auth::DeferredRefreshStore,
     ),
-    JsValue,
+    AuthError,
 > {
     let deferred = crate::auth::DeferredRefreshStore::default();
     let session = drive_acquisition(auth, &deferred, None).await?;
@@ -72,10 +70,10 @@ pub(crate) async fn acquire_deferred<Id: serde::de::DeserializeOwned + serde::Se
 pub(crate) async fn persist_deferred(
     deferred: &crate::auth::DeferredRefreshStore,
     store: &RefreshStoreHandle<'_>,
-) -> Result<(), JsValue> {
+) -> Result<(), AuthError> {
     let refresh = open_refresh_store(store).await?;
     for (account, token) in deferred.take() {
-        RefreshTokenStore::store(&refresh, &account, &token).map_err(to_js)?;
+        RefreshTokenStore::store(&refresh, &account, &token)?;
     }
     Ok(())
 }
@@ -83,23 +81,21 @@ pub(crate) async fn persist_deferred(
 /// Open the refresh store under this device's own key.
 async fn open_refresh_store(
     ctx: &RefreshStoreHandle<'_>,
-) -> Result<crate::auth::RefreshStore, JsValue> {
-    let device_key = crate::storage::device_key(ctx.key_store)
-        .await
-        .map_err(to_js)?;
+) -> Result<crate::auth::RefreshStore, AuthError> {
+    let device_key = crate::storage::device_key(ctx.key_store).await?;
     let auth_db_url = ctx.storage.db_url(ctx.db_name);
     match crate::auth::RefreshStore::open(&auth_db_url, &device_key) {
         Ok(store) => Ok(store),
-        Err(crate::auth::AuthError::Undecryptable(detail)) => {
+        Err(AuthError::Undecryptable(detail)) => {
             tracing::warn!(
                 detail = %detail,
                 "db worker: the refresh store does not decrypt, discarding it and requiring a \
                  fresh login"
             );
-            ctx.storage.delete_db(ctx.db_name).map_err(to_js)?;
-            crate::auth::RefreshStore::open(&auth_db_url, &device_key).map_err(to_js)
+            ctx.storage.delete_db(ctx.db_name)?;
+            crate::auth::RefreshStore::open(&auth_db_url, &device_key)
         }
-        Err(err) => Err(to_js(err)),
+        Err(err) => Err(err),
     }
 }
 
@@ -108,22 +104,17 @@ async fn drive_acquisition<Id, S>(
     auth: &crate::auth::WorkerAuthConfig,
     store: &S,
     account: Option<String>,
-) -> Result<crate::auth::BrowserSession<Id>, JsValue>
+) -> Result<crate::auth::BrowserSession<Id>, AuthError>
 where
     Id: serde::de::DeserializeOwned + serde::Serialize,
     S: RefreshTokenStore<Error = crate::auth::AuthError>,
 {
     let authenticator = crate::auth::BrowserAuthenticator::new(auth.clone(), account);
-    match authenticator.acquire(store).await.map_err(to_js)? {
+    match authenticator.acquire(store).await? {
         crate::auth::Acquired::Access(session) => Ok(session),
         crate::auth::Acquired::NeedLogin(pending) => {
-            let (code, state) = crate::auth::await_login_code(&pending.login_url)
-                .await
-                .map_err(to_js)?;
-            authenticator
-                .complete(&pending, &code, &state, store)
-                .await
-                .map_err(to_js)
+            let (code, state) = crate::auth::await_login_code(&pending.login_url).await?;
+            authenticator.complete(&pending, &code, &state, store).await
         }
     }
 }

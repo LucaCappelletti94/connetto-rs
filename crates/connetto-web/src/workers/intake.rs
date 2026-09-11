@@ -11,10 +11,10 @@ use connetto_core::custody::{Custody, NoGate};
 use crate::RelayHub;
 use crate::frames::{MessageTransport, MessageTransportError};
 
-use super::helpers::sleep_ms;
-
 /// Deadline for all hello-channel exchanges.
 const HELLO_TIMEOUT_MS: f64 = 15_000.0;
+/// Deadline in milliseconds for the [`IntakeError::Timeout`] variant.
+const HELLO_TIMEOUT_DEADLINE_MS: u64 = 15_000;
 
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
@@ -25,10 +25,41 @@ enum HelloReady {
     Failed(String),
 }
 
+/// Failure surfaced by the page-side hello-channel functions.
+#[derive(Debug, thiserror::Error)]
+pub enum IntakeError {
+    /// the hello channel could not be opened
+    #[error("{operation}: {detail}")]
+    ChannelOpen {
+        /// the operation that failed
+        operation: &'static str,
+        /// the browser exception text
+        detail: String,
+    },
+    /// the db worker reported a boot failure
+    #[error("db worker boot failed: {detail}")]
+    BootFailed {
+        /// the detail the worker sent
+        detail: String,
+    },
+    /// the db worker did not answer within the readiness deadline
+    #[error("db worker did not answer within {deadline_ms} ms")]
+    Timeout {
+        /// the deadline that expired, in milliseconds
+        deadline_ms: u64,
+    },
+}
+
+impl From<IntakeError> for JsValue {
+    fn from(value: IntakeError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
-) -> Result<(), JsValue> {
+) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
     let started = js_sys::Date::now();
     loop {
@@ -36,14 +67,14 @@ async fn poll_hello_channel(
             HelloReady::Up => return Ok(()),
             HelloReady::Failed(detail) => {
                 let detail = detail.clone();
-                return Err(JsValue::from_str(&format!(
-                    "db worker boot failed: {detail}"
-                )));
+                return Err(IntakeError::BootFailed { detail });
             }
             HelloReady::Waiting => {}
         }
         if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
-            return Err(JsValue::from_str("db worker did not answer readiness"));
+            return Err(IntakeError::Timeout {
+                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+            });
         }
         let _ = channel.post_message(&JsValue::from_str("ask"));
         sleep_ms(POLL_MS).await;
@@ -54,10 +85,15 @@ async fn poll_hello_channel(
 ///
 /// # Errors
 ///
-/// A boot-failure string if the worker reported one, or a timeout string.
-pub async fn await_db_worker_ready() -> Result<(), JsValue> {
-    let channel = BroadcastChannel::new(super::HELLO_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
+/// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened,
+/// [`IntakeError::BootFailed`] when the worker reported a failure, or
+/// [`IntakeError::Timeout`] when the deadline expires.
+pub async fn await_db_worker_ready() -> Result<(), IntakeError> {
+    let channel =
+        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
+            operation: "hello channel",
+            detail: format!("{err:?}"),
+        })?;
     let state = Rc::new(RefCell::new(HelloReady::Waiting));
     let on_message = {
         let state = Rc::clone(&state);
@@ -83,10 +119,14 @@ pub async fn await_db_worker_ready() -> Result<(), JsValue> {
 ///
 /// # Errors
 ///
-/// A timeout string when the worker does not acknowledge within the readiness deadline.
-pub async fn announce_tab(wire: &str) -> Result<(), JsValue> {
-    let channel = BroadcastChannel::new(super::HELLO_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
+/// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened, or
+/// [`IntakeError::Timeout`] when the worker does not acknowledge within the deadline.
+pub async fn announce_tab(wire: &str) -> Result<(), IntakeError> {
+    let channel =
+        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
+            operation: "hello channel",
+            detail: format!("{err:?}"),
+        })?;
     let expected = format!("attached:{wire}");
     let attached = Rc::new(Cell::new(false));
     let on_message = {
@@ -104,7 +144,9 @@ pub async fn announce_tab(wire: &str) -> Result<(), JsValue> {
         if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
             channel.set_onmessage(None);
             channel.close();
-            return Err(JsValue::from_str("db worker did not acknowledge the tab"));
+            return Err(IntakeError::Timeout {
+                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+            });
         }
         sleep_ms(10).await;
     }
@@ -131,10 +173,10 @@ pub fn tab_wire_factory(
         Box::pin(async move {
             await_db_worker_ready()
                 .await
-                .map_err(|err| MessageTransportError::Sink(format!("{err:?}")))?;
+                .map_err(|err| MessageTransportError::Sink(err.to_string()))?;
             announce_tab(&wire)
                 .await
-                .map_err(|err| MessageTransportError::Sink(format!("{err:?}")))?;
+                .map_err(|err| MessageTransportError::Sink(err.to_string()))?;
             MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, super::DB_ALIVE_LOCK)
         })
     }
@@ -156,10 +198,14 @@ fn decode_custody_reply(data: &JsValue) -> Option<Custody> {
 ///
 /// # Errors
 ///
-/// A timeout string when the worker does not answer within the readiness deadline.
-pub async fn request_custody() -> Result<Custody, JsValue> {
-    let channel = BroadcastChannel::new(super::HELLO_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
+/// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened, or
+/// [`IntakeError::Timeout`] when the worker does not answer within the deadline.
+pub async fn request_custody() -> Result<Custody, IntakeError> {
+    let channel =
+        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
+            operation: "hello channel",
+            detail: format!("{err:?}"),
+        })?;
     let result: Rc<Cell<Option<Custody>>> = Rc::new(Cell::new(None));
     let on_message = {
         let result = Rc::clone(&result);
@@ -177,7 +223,9 @@ pub async fn request_custody() -> Result<Custody, JsValue> {
             channel.set_onmessage(None);
             channel.close();
             drop(on_message);
-            return Err(JsValue::from_str("db worker did not answer custody"));
+            return Err(IntakeError::Timeout {
+                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+            });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.
         let _ = channel.post_message(&JsValue::from_str("custody?"));
@@ -191,9 +239,12 @@ pub async fn request_custody() -> Result<Custody, JsValue> {
 }
 
 /// Open the hello channel and broadcast the initial `ready`.
-pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), JsValue> {
-    let hello = BroadcastChannel::new(super::HELLO_CHANNEL)
-        .map_err(|err| JsValue::from_str(&format!("hello channel: {err:?}")))?;
+pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
+    let hello =
+        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
+            operation: "hello channel",
+            detail: format!("{err:?}"),
+        })?;
     let intake = {
         let hello = hello.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -248,3 +299,5 @@ fn decode_custody(s: &str) -> Option<Custody> {
         _ => None,
     }
 }
+
+use super::helpers::sleep_ms;

@@ -7,6 +7,7 @@ use connetto_file_core::{ChunkHash, ChunkStore};
 use js_sys::{Date, Reflect};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, File, MessageEvent};
 
@@ -15,7 +16,10 @@ use super::archive_channel::{
     import_reply_failed, import_reply_ok,
 };
 use super::helpers::content_store_namespace;
-use super::{DB_ALIVE_LOCK, EXPORT_CHANNEL, IMPORT_CHANNEL, request_export, request_import};
+use super::{
+    DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError, announce_tab,
+    await_db_worker_ready, request_custody, request_export, request_import,
+};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -224,4 +228,88 @@ async fn two_concurrent_imports_each_receive_their_own_outcome() {
     channel.close();
     drop(on_message);
     alive.release();
+}
+
+/// A boot-failure message on the hello channel causes `await_db_worker_ready` to return
+/// the typed `BootFailed` variant, not an opaque `JsValue`.
+///
+/// The assertion that would have failed before the fix: callers had to call
+/// `err.as_string()` (a `JsValue` method) to inspect the failure; now `matches!`
+/// on the enum variant suffices.
+#[wasm_bindgen_test]
+async fn await_db_worker_ready_reports_boot_failure_as_typed_error() {
+    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let sender = channel.clone();
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str("failed:schema-mismatch"));
+    });
+    let error = await_db_worker_ready()
+        .await
+        .expect_err("boot failure is reported");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("schema-mismatch")),
+        "expected BootFailed with the worker detail, got {error:?}"
+    );
+    channel.close();
+}
+
+/// A mock worker that acknowledges the wire causes `announce_tab` to return `Ok(())`.
+///
+/// The typed `Result<(), IntakeError>` return makes this success case matchable; before
+/// the fix the return was `Result<(), JsValue>`, so the caller had to treat errors as
+/// opaque strings.
+#[wasm_bindgen_test]
+async fn announce_tab_returns_ok_when_worker_acknowledges() {
+    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let wire = "mock-wire-ack-test";
+    let replier = channel.clone();
+    let on_message = {
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if event.data().as_string().as_deref() == Some(&format!("tab:{wire}")) {
+                let _ = replier.post_message(&JsValue::from_str(&format!("attached:{wire}")));
+            }
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    announce_tab(wire)
+        .await
+        .expect("mock worker acknowledged the tab wire");
+    channel.set_onmessage(None);
+    channel.close();
+    drop(on_message);
+}
+
+/// Without a running worker, `request_custody` returns the typed timeout variant.
+///
+/// The assertion that would have failed before the fix:
+/// `matches!(error, IntakeError::Timeout { .. })` — previously the function returned
+/// `Result<_, JsValue>`.
+#[wasm_bindgen_test]
+async fn request_custody_without_worker_returns_timeout() {
+    let error = request_custody().await.expect_err("no worker is running");
+    assert!(
+        matches!(
+            error,
+            IntakeError::Timeout {
+                deadline_ms: 15_000
+            }
+        ),
+        "expected Timeout {{deadline_ms: 15_000}}, got {error:?}"
+    );
+}
+
+/// `spawn_db_worker` with a glue URL that cannot be parsed must return
+/// `BootError::BootstrapUrl`, not a stringly-typed `JsValue`.
+///
+/// The assertion that would have failed before the fix: `BootError` did not exist and
+/// `spawn_db_worker` returned `Result<_, JsValue>`, making a typed match impossible.
+#[wasm_bindgen_test]
+fn boot_spawn_db_worker_invalid_glue_url_returns_bootstrap_url_error() {
+    let result =
+        super::boot::spawn_db_worker("not-a-url", &super::boot::WorkerBootstrap::Generated);
+    assert!(
+        matches!(result, Err(super::boot::BootError::BootstrapUrl(_))),
+        "expected BootError::BootstrapUrl for an invalid glue URL"
+    );
 }
