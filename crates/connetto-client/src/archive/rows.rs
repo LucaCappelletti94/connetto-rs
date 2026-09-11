@@ -64,39 +64,47 @@ pub(crate) fn read_rows(
                 "a tier's rows must be inserts only".to_owned(),
             ));
         };
-        let name = table.name().to_owned();
-        let Some(columns) = known.get(&name.to_lowercase()) else {
-            return Err(ClientError::Import(format!(
-                "the archive carries table {name}, which this build does not have"
-            )));
-        };
-        if columns.len() != values.len() {
-            return Err(ClientError::Import(format!(
-                "the archive's table {name} has {} columns and this build's has {}",
-                values.len(),
-                columns.len()
-            )));
-        }
-        let mut flags = vec![0u8; table.number_of_columns()];
-        table.write_pk_flags(&mut flags);
-        // The flag is the column's 1-based position in the key, so sorting by
-        // it puts a composite key in key order rather than table order.
-        let mut key: Vec<(u8, String, Cell)> = flags
-            .iter()
-            .zip(columns.iter().zip(values.iter()))
-            .filter(|(flag, _)| **flag > 0)
-            .map(|(flag, (column, value))| (*flag, column.clone(), value.clone()))
-            .collect();
-        key.sort_by_key(|(flag, _, _)| *flag);
-        rows.push(IncomingRow {
-            table: name,
-            columns: columns.clone(),
-            key_columns: key.iter().map(|(_, column, _)| column.clone()).collect(),
-            key: key.into_iter().map(|(_, _, value)| value).collect(),
-            values: values.to_vec(),
-        });
+        rows.push(decode_insert(table, values, known)?);
     }
     Ok(rows)
+}
+
+fn decode_insert(
+    table: &impl DynTable,
+    values: &[Cell],
+    known: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<IncomingRow, ClientError> {
+    let name = table.name().to_owned();
+    let Some(columns) = known.get(&name.to_lowercase()) else {
+        return Err(ClientError::Import(format!(
+            "the archive carries table {name}, which this build does not have"
+        )));
+    };
+    if columns.len() != values.len() {
+        return Err(ClientError::Import(format!(
+            "the archive's table {name} has {} columns and this build's has {}",
+            values.len(),
+            columns.len()
+        )));
+    }
+    let mut flags = vec![0u8; table.number_of_columns()];
+    table.write_pk_flags(&mut flags);
+    // The flag is the column's 1-based position in the key, so sorting by
+    // it puts a composite key in key order rather than table order.
+    let mut key: Vec<(u8, String, Cell)> = flags
+        .iter()
+        .zip(columns.iter().zip(values.iter()))
+        .filter(|(flag, _)| **flag > 0)
+        .map(|(flag, (column, value))| (*flag, column.clone(), value.clone()))
+        .collect();
+    key.sort_by_key(|(flag, _, _)| *flag);
+    Ok(IncomingRow {
+        table: name,
+        columns: columns.clone(),
+        key_columns: key.iter().map(|(_, column, _)| column.clone()).collect(),
+        key: key.into_iter().map(|(_, _, value)| value).collect(),
+        values: values.to_vec(),
+    })
 }
 
 /// Index the rows a record carries, for comparing the two sides of a clash.
@@ -167,42 +175,10 @@ pub(crate) fn write_row(
     values: &[Cell],
 ) -> Result<(), ClientError> {
     use diesel::sql_types::{Binary, Double, Nullable, Text};
-    let names = columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let places = vec!["?"; columns.len()].join(", ");
-    let key = key_columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let updates = columns
-        .iter()
-        .filter(|column| !key_columns.iter().any(|key| key == *column))
-        .map(|column| {
-            let column = quote_ident(column);
-            format!("{column} = excluded.{column}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    // A table whose every column is in the key has nothing to update, and its
-    // row is already exactly what the file carries.
-    let resolution = if updates.is_empty() {
-        "NOTHING".to_owned()
-    } else {
-        format!("UPDATE SET {updates}")
-    };
     // The table and column names are runtime values from the archive; the
     // ON CONFLICT (excluded.*) pattern is not expressible in Diesel's typed
     // DSL without a compile-time table! schema.
-    let sql = format!(
-        "INSERT INTO {}.{} ({names}) VALUES ({places}) \
-         ON CONFLICT ({key}) DO {resolution}",
-        quote_ident(schema),
-        quote_ident(table)
-    );
+    let sql = build_upsert_sql(schema, table, columns, key_columns);
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
     for value in values {
         query = match value {
@@ -217,6 +193,47 @@ pub(crate) fn write_row(
     }
     query.execute(db)?;
     Ok(())
+}
+
+fn build_upsert_sql(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    key_columns: &[String],
+) -> String {
+    let names = columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let places = vec!["?"; columns.len()].join(", ");
+    let key = key_columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updates = columns
+        .iter()
+        .filter(|column| !key_columns.iter().any(|k| k == *column))
+        .map(|column| {
+            let column = quote_ident(column);
+            format!("{column} = excluded.{column}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A table whose every column is in the key has nothing to update, and its
+    // row is already exactly what the file carries.
+    let resolution = if updates.is_empty() {
+        "NOTHING".to_owned()
+    } else {
+        format!("UPDATE SET {updates}")
+    };
+    format!(
+        "INSERT INTO {}.{} ({names}) VALUES ({places}) \
+         ON CONFLICT ({key}) DO {resolution}",
+        quote_ident(schema),
+        quote_ident(table)
+    )
 }
 
 /// A fingerprint of the schema an archive was made under, over both the

@@ -330,4 +330,5 @@ fn read_error(error: impl core::fmt::Display) -> ClientError {
 }
 
 pub(crate) use rows::{fingerprint, index_rows, read_rows, schema_columns, write_row};
-pub(crate) use zip::{read, write};
+pub(crate) use zip::read::read;
+pub(crate) use zip::write::write;

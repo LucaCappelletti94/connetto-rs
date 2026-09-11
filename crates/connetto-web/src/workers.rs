@@ -807,9 +807,31 @@ where
     let mut worker =
         open_boot_replica(transport, &spec, config, &client_config, replica_key).await?;
     subscribe_and_boot(&mut worker, config).await?;
+    hold_alive_lock().await;
+    let content_persistent = start_boot_services(config, &spec, worker, content_root_key).await?;
+    Ok(BootedSession {
+        identity: spec.identity,
+        session_expires_at: spec.session_expires_at,
+        account: spec.active_account,
+        content_persistent,
+    })
+}
+
+/// Hold the worker liveness lock for this context's whole life.
+async fn hold_alive_lock() {
     // Released by the browser when this worker context dies.
     let alive = locks::hold_lock(DB_ALIVE_LOCK).await;
     DB_ALIVE.with(|cell| cell.borrow_mut().replace(alive));
+}
+
+/// Open content storage, start the relay hub behind the upstream reconnect
+/// driver, and install the tab-facing services.
+async fn start_boot_services<Id>(
+    config: &DbWorkerConfig,
+    spec: &BootReplicaSpec<Id>,
+    worker: ConnettoConnection<BrowserSocket>,
+    content_root_key: Option<[u8; 32]>,
+) -> Result<Option<bool>, JsValue> {
     let ws_url = config.ws_url;
     let reconnect = HubReconnect {
         factory: move || async move {
@@ -841,12 +863,7 @@ where
         spec.active_account.as_deref(),
     )?;
     install_hello_intake(hub)?;
-    Ok(BootedSession {
-        identity: spec.identity,
-        session_expires_at: spec.session_expires_at,
-        account: spec.active_account,
-        content_persistent,
-    })
+    Ok(content_persistent)
 }
 
 /// Boot state resolved from the session: replica paths, account key, and session fields.
@@ -907,6 +924,49 @@ impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
     }
 }
 
+/// Derive the KEK from an enrolled credential and update the custody level.
+async fn run_unlock_ceremony(
+    enrolled_ids: Vec<Vec<u8>>,
+    key_store: &crate::auth::IdbKeyStore,
+) -> Result<(), JsValue> {
+    match crate::unlock::ask_unlock(enrolled_ids)
+        .await
+        .map_err(to_js)?
+    {
+        crate::unlock::TabAnswer::Key { credential_id, key } => {
+            key_store
+                .use_derived(key, &credential_id)
+                .await
+                .map_err(to_js)?;
+            crate::unlock::set_custody(Custody::Verified);
+        }
+        // Recovery via wipe request, not here.
+        crate::unlock::TabAnswer::Declined => {
+            return Err(to_js(crate::auth::AuthError::Locked {
+                detail: "the ceremony was dismissed or the credential is gone".into(),
+            }));
+        }
+        crate::unlock::TabAnswer::Unsupported => {
+            return Err(to_js(crate::auth::AuthError::Locked {
+                detail: "this browsing context cannot run the ceremony that enrolled this \
+                         profile"
+                    .into(),
+            }));
+        }
+        crate::unlock::TabAnswer::Failed { detail } => {
+            return Err(to_js(crate::auth::AuthError::Locked { detail }));
+        }
+        // Wrong answer type is a handler bug, not a platform failure.
+        other @ crate::unlock::TabAnswer::Account(_) => {
+            return Err(to_js(crate::auth::AuthError::Context(format!(
+                "the unlock request was answered with {}",
+                crate::unlock::answer_kind(&other)
+            ))));
+        }
+    }
+    Ok(())
+}
+
 /// Install the unlock handler, initialise custody, and run the enrolment
 /// ceremony if credentials are already on disk. Returns whether a credential
 /// was enrolled.
@@ -931,65 +991,34 @@ async fn setup_custody(
         }));
     }
     if was_enrolled {
-        match crate::unlock::ask_unlock(enrolled_ids)
-            .await
-            .map_err(to_js)?
-        {
-            crate::unlock::TabAnswer::Key { credential_id, key } => {
-                key_store
-                    .use_derived(key, &credential_id)
-                    .await
-                    .map_err(to_js)?;
-                crate::unlock::set_custody(Custody::Verified);
-            }
-            // Recovery via wipe request, not here.
-            crate::unlock::TabAnswer::Declined => {
-                return Err(to_js(crate::auth::AuthError::Locked {
-                    detail: "the ceremony was dismissed or the credential is gone".into(),
-                }));
-            }
-            crate::unlock::TabAnswer::Unsupported => {
-                return Err(to_js(crate::auth::AuthError::Locked {
-                    detail: "this browsing context cannot run the ceremony that enrolled this \
-                             profile"
-                        .into(),
-                }));
-            }
-            crate::unlock::TabAnswer::Failed { detail } => {
-                return Err(to_js(crate::auth::AuthError::Locked { detail }));
-            }
-            // Wrong answer type is a handler bug, not a platform failure.
-            other @ crate::unlock::TabAnswer::Account(_) => {
-                return Err(to_js(crate::auth::AuthError::Context(format!(
-                    "the unlock request was answered with {}",
-                    crate::unlock::answer_kind(&other)
-                ))));
-            }
-        }
+        run_unlock_ceremony(enrolled_ids, key_store).await?;
     }
     Ok(was_enrolled)
 }
 
-/// Acquire the session (deferred or direct), run the optional enrolment
-/// ceremony, and persist the deferred credential once the gate has settled.
-async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
+/// Resolve whether to defer (pre-gate) or acquire the session directly, or neither.
+async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
     config: &DbWorkerConfig,
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     was_enrolled: bool,
-) -> Result<Option<crate::auth::BrowserSession<Id>>, JsValue> {
-    // Identity decides the replica file, so acquire before connecting.
-    // Deferred when the gate has not settled yet, to avoid minting a KEK before enrolment.
+) -> Result<
+    (
+        Option<crate::auth::BrowserSession<Id>>,
+        Option<crate::auth::DeferredRefreshStore>,
+    ),
+    JsValue,
+> {
     let defer = config.unlock
         && !was_enrolled
         && config.auth.is_some()
         && !storage.exists(config.auth_db_name);
-    let (session, deferred) = match &config.auth {
+    match &config.auth {
         Some(auth_config) if defer => {
             let (session, deferred) = acquire_deferred::<Id>(auth_config).await?;
-            (Some(session), Some(deferred))
+            Ok((Some(session), Some(deferred)))
         }
-        Some(auth_config) => (
+        Some(auth_config) => Ok((
             Some(
                 acquire_session::<Id>(
                     auth_config,
@@ -1001,42 +1030,61 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
                 .await?,
             ),
             None,
-        ),
+        )),
         None => {
             // Nothing durable: the replica is in memory and there is no key.
             crate::unlock::set_custody(Custody::Ephemeral);
-            (None, None)
+            Ok((None, None))
         }
-    };
+    }
+}
+
+/// Offer the enrolment ceremony to a freshly signed-in, unenrolled identity.
+async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), JsValue> {
+    match crate::unlock::ask_enrol().await.map_err(to_js)? {
+        crate::unlock::TabAnswer::Key { credential_id, key } => {
+            key_store
+                .adopt_derived(key, &credential_id)
+                .await
+                .map_err(to_js)?;
+            crate::unlock::set_custody(Custody::Verified);
+        }
+        crate::unlock::TabAnswer::Declined => {
+            crate::unlock::set_custody(Custody::Unverified(NoGate::Declined));
+        }
+        crate::unlock::TabAnswer::Unsupported => {
+            crate::unlock::set_custody(Custody::Unverified(NoGate::Unsupported));
+        }
+        // A fault is a bug, not a platform limitation; failing prevents a silent ungated profile.
+        crate::unlock::TabAnswer::Failed { detail } => {
+            return Err(to_js(crate::auth::AuthError::Context(format!(
+                "the enrolment ceremony failed: {detail}"
+            ))));
+        }
+        other @ crate::unlock::TabAnswer::Account(_) => {
+            return Err(to_js(crate::auth::AuthError::Context(format!(
+                "the enrolment request was answered with {}",
+                crate::unlock::answer_kind(&other)
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// Acquire the session (deferred or direct), run the optional enrolment
+/// ceremony, and persist the deferred credential once the gate has settled.
+async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
+    config: &DbWorkerConfig,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &crate::auth::IdbKeyStore,
+    was_enrolled: bool,
+) -> Result<Option<crate::auth::BrowserSession<Id>>, JsValue> {
+    // Acquire before connecting: identity decides the replica file.
+    let (session, deferred) =
+        acquire_or_defer_session::<Id>(config, storage, key_store, was_enrolled).await?;
     // Unenrolled with unlock enabled: enrol now that someone is signed in.
     if config.unlock && !was_enrolled && session.is_some() {
-        match crate::unlock::ask_enrol().await.map_err(to_js)? {
-            crate::unlock::TabAnswer::Key { credential_id, key } => {
-                key_store
-                    .adopt_derived(key, &credential_id)
-                    .await
-                    .map_err(to_js)?;
-                crate::unlock::set_custody(Custody::Verified);
-            }
-            crate::unlock::TabAnswer::Declined => {
-                crate::unlock::set_custody(Custody::Unverified(NoGate::Declined));
-            }
-            crate::unlock::TabAnswer::Unsupported => {
-                crate::unlock::set_custody(Custody::Unverified(NoGate::Unsupported));
-            }
-            // A fault is a bug, not a platform limitation; failing prevents a silent ungated profile.
-            crate::unlock::TabAnswer::Failed { detail } => {
-                return Err(to_js(crate::auth::AuthError::Context(format!(
-                    "the enrolment ceremony failed: {detail}"
-                ))));
-            }
-            other @ crate::unlock::TabAnswer::Account(_) => {
-                return Err(to_js(crate::auth::AuthError::Context(format!(
-                    "the enrolment request was answered with {}",
-                    crate::unlock::answer_kind(&other)
-                ))));
-            }
-        }
+        run_enrol_ceremony(key_store).await?;
     }
     // Gate settled, so the KEK resolves under the winning key.
     if let Some(deferred) = &deferred {
@@ -1638,6 +1686,45 @@ type ImportSlot = Rc<RefCell<Option<ImportReply>>>;
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
 
+/// Poll the export channel until the worker's generation id arrives or the worker goes away.
+async fn poll_for_export_generation(
+    channel: &BroadcastChannel,
+    state: &ExportSlot,
+    generation_request: &JsValue,
+) -> Option<String> {
+    let mut posted = channel.post_message(generation_request);
+    while posted.is_ok()
+        && state.borrow().generation.is_none()
+        && !state.borrow().replaced
+        && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
+    {
+        sleep_ms(POLL_MS).await;
+        if state.borrow().generation.is_none() {
+            posted = channel.post_message(generation_request);
+        }
+    }
+    state.borrow().generation.clone()
+}
+
+/// Send the export request and poll until the reply arrives or the worker goes away.
+async fn poll_for_export_reply(
+    channel: &BroadcastChannel,
+    state: &ExportSlot,
+    generation_request: &JsValue,
+    scope: ExportScope,
+    tag: ExportTag,
+) {
+    let posted = channel.post_message(&build_export_request(scope, &tag));
+    while posted.is_ok()
+        && state.borrow().result.is_none()
+        && !state.borrow().replaced
+        && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
+    {
+        let _ = channel.post_message(generation_request);
+        sleep_ms(POLL_MS).await;
+    }
+}
+
 /// Page side: ask the DB worker for a zip archive of this device's local data.
 ///
 /// `scope` selects what the archive carries: [`ExportScope::Everything`] for a
@@ -1661,8 +1748,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     let channel = BroadcastChannel::new(EXPORT_CHANNEL)
         .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
     let state: ExportSlot = Rc::new(RefCell::new(ExportWait::default()));
-    // This caller's own id, so a reply to a concurrent caller's request on the
-    // same channel is not mistaken for this one's archive.
+    // Request-unique id to distinguish this caller's replies on the shared channel.
     let request = rosetta_uuid::Uuid::new_v4().to_string();
     let on_message = {
         let state = Rc::clone(&state);
@@ -1690,18 +1776,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let generation_request = build_export_generation_request();
-    let mut posted = channel.post_message(&generation_request);
-    while posted.is_ok()
-        && state.borrow().generation.is_none()
-        && !state.borrow().replaced
-        && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
-    {
-        sleep_ms(POLL_MS).await;
-        if state.borrow().generation.is_none() {
-            posted = channel.post_message(&generation_request);
-        }
-    }
-    let generation = state.borrow().generation.clone();
+    let generation = poll_for_export_generation(&channel, &state, &generation_request).await;
     if let Some(generation) = generation
         && !state.borrow().replaced
     {
@@ -1709,15 +1784,7 @@ pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay:
             generation,
             request,
         };
-        posted = channel.post_message(&build_export_request(scope, &tag));
-        while posted.is_ok()
-            && state.borrow().result.is_none()
-            && !state.borrow().replaced
-            && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
-        {
-            let _ = channel.post_message(&generation_request);
-            sleep_ms(POLL_MS).await;
-        }
+        poll_for_export_reply(&channel, &state, &generation_request, scope, tag).await;
     }
     channel.set_onmessage(None);
     channel.close();
@@ -1975,6 +2042,58 @@ fn file_id_from_hex(text: &str) -> Option<connetto_file_client::FileId> {
     Some(connetto_file_client::FileId::from_bytes(bytes))
 }
 
+/// Handle a `ForgetRetired` request: decode the file ids and forget them from the hub.
+async fn handle_forget_retired(
+    files: &[String],
+    hub: &crate::relay::RelayHub,
+) -> Option<crate::auth::LogoutMessage> {
+    use crate::auth::LogoutMessage;
+    let Some(retired) = files
+        .iter()
+        .map(|file| file_id_from_hex(file))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Some(LogoutMessage::ForgetFailed {
+            files: files.to_vec(),
+            detail: "a file identity was not readable".to_owned(),
+        });
+    };
+    match hub.forget_retired_content(retired).await {
+        Ok(()) => Some(LogoutMessage::Forgot {
+            files: files.to_vec(),
+        }),
+        Err(err) => Some(LogoutMessage::ForgetFailed {
+            files: files.to_vec(),
+            detail: err.to_string(),
+        }),
+    }
+}
+
+/// Check for unsynced work and mark the replica for deletion if the guard passes.
+async fn guard_replica_deletion(
+    replica_db_name: &str,
+    content_namespace: Option<&str>,
+    hub: &crate::relay::RelayHub,
+    force: bool,
+) -> Result<(), Option<crate::auth::LogoutMessage>> {
+    let Some(pending) = ask_unsynced(hub).await else {
+        return Err(None);
+    };
+    let wipe =
+        crate::storage::PendingWipe::new(replica_db_name, content_namespace.map(ToOwned::to_owned));
+    crate::storage::mark_wipe_pending(&wipe, &pending, force)
+        .await
+        .map_err(|err| match err {
+            crate::storage::WipeError::Unsynced(pending) => {
+                Some(crate::auth::LogoutMessage::Refused { pending })
+            }
+            other => {
+                tracing::error!(error = %other, "db worker: marking the replica for deletion failed");
+                None
+            }
+        })
+}
+
 /// Carry out one logout-channel request, returning the reply to broadcast, or
 /// `None` for traffic that is not a request (this worker's own replies).
 async fn serve_logout(
@@ -1987,7 +2106,6 @@ async fn serve_logout(
     account: Option<&str>,
 ) -> Option<crate::auth::LogoutMessage> {
     use crate::auth::LogoutMessage;
-
     let (delete, force) = match request {
         LogoutMessage::Unsynced => {
             let pending = ask_unsynced(hub).await?;
@@ -1995,27 +2113,7 @@ async fn serve_logout(
         }
         LogoutMessage::Logout { delete, force } => (*delete, *force),
         LogoutMessage::ForgetRetired { files } => {
-            // All or nothing: the reply names what was forgotten, so a request
-            // carrying an identity this build cannot read is refused whole.
-            let refusal = |detail: &str| {
-                Some(LogoutMessage::ForgetFailed {
-                    files: files.clone(),
-                    detail: detail.to_owned(),
-                })
-            };
-            let Some(retired) = files
-                .iter()
-                .map(|file| file_id_from_hex(file))
-                .collect::<Option<Vec<_>>>()
-            else {
-                return refusal("a file identity was not readable");
-            };
-            return match hub.forget_retired_content(retired).await {
-                Ok(()) => Some(LogoutMessage::Forgot {
-                    files: files.clone(),
-                }),
-                Err(err) => refusal(&err.to_string()),
-            };
+            return handle_forget_retired(files, hub).await;
         }
         LogoutMessage::Pending { .. }
         | LogoutMessage::Done { .. }
@@ -2025,37 +2123,15 @@ async fn serve_logout(
             return None;
         }
     };
-
-    // The guard runs before the revoke, so a refused delete leaves the session
-    // whole. Revoking first would answer a refusal to a tab that is already
-    // logged out, and the retry with `force` would then be a bare delete against
-    // a half-torn-down session.
-    //
-    // The replica is only marked here. It is destroyed at the next startup,
-    // because this worker holds it open for its whole life and OPFS cannot
-    // delete a live file.
-    if delete {
-        let pending = ask_unsynced(hub).await?;
-        let wipe = crate::storage::PendingWipe::new(
-            replica_db_name,
-            content_namespace.map(ToOwned::to_owned),
-        );
-        if let Err(err) = crate::storage::mark_wipe_pending(&wipe, &pending, force).await {
-            return match err {
-                crate::storage::WipeError::Unsynced(pending) => {
-                    Some(LogoutMessage::Refused { pending })
-                }
-                other => {
-                    tracing::error!(error = %other, "db worker: marking the replica for deletion failed");
-                    None
-                }
-            };
-        }
+    // Guard before revoke: a refused delete must leave the session intact.
+    // Replica marked here only; OPFS cannot delete a live file.
+    if delete
+        && let Err(reply) =
+            guard_replica_deletion(replica_db_name, content_namespace, hub, force).await
+    {
+        return reply;
     }
-
-    // The credential is gone locally either way. A failed revoke leaves the
-    // session alive on the server until it expires, which is worth logging but
-    // does not make this tab any less logged out.
+    // A failed revoke leaves the server session alive; the tab is logged out regardless.
     match logout_locally(auth, auth_db_name, account).await {
         Ok(()) => {}
         Err(err) => tracing::warn!(
