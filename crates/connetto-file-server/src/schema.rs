@@ -655,11 +655,8 @@ macro_rules! connetto_file_tables {
             + 'static {
                 diesel::update(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
-                        diesel::QueryDsl::filter(
-                            $manifests::table,
-                            diesel::ExpressionMethods::eq($manifests::file_id, file_id),
-                        ),
-                        diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
+                        $manifests::table,
+                        Self::manifest_pk_eq(file_id, caller),
                     ),
                     diesel::ExpressionMethods::le($manifests::accepted_bytes, allowed),
                 ))
@@ -695,11 +692,8 @@ macro_rules! connetto_file_tables {
             + 'static {
                 diesel::update(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
-                        diesel::QueryDsl::filter(
-                            $manifests::table,
-                            diesel::ExpressionMethods::eq($manifests::file_id, file_id),
-                        ),
-                        diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
+                        $manifests::table,
+                        Self::manifest_pk_eq(file_id, caller),
                     ),
                     diesel::ExpressionMethods::eq($manifests::committed, false),
                 ))
