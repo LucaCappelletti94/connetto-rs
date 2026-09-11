@@ -6,6 +6,7 @@
 //! the content-state setter) before each test.
 
 mod fixture;
+mod macro_hygiene;
 mod preflight;
 mod serve;
 mod sweep;

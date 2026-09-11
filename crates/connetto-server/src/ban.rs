@@ -420,10 +420,10 @@ macro_rules! connetto_ban_table {
 
             fn ban_delete(user_id: &Self::Id) -> Self::Lift {
                 use diesel::ExpressionMethods as _;
-                use diesel::QueryDsl as _;
-                diesel::delete(
-                    connetto_bans::table.filter(connetto_bans::user_id.eq(user_id.clone())),
-                )
+                diesel::delete(diesel::QueryDsl::filter(
+                    connetto_bans::table,
+                    connetto_bans::user_id.eq(user_id.clone()),
+                ))
             }
         }
     };

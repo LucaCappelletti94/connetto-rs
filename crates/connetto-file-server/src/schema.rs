@@ -19,63 +19,6 @@ use diesel::sql_types::{BigInt, Bool, Bytea, Integer, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::methods::LoadQuery as AsyncLoadQuery;
 
-diesel::table! {
-    /// File manifests: one row per (upload, uploader) pair.
-    _cfs_manifests (file_id, uploaded_by) {
-        /// 32-byte BLAKE3 file identity.
-        file_id -> Bytea,
-        /// Declared byte total (must equal the sum of chunk lengths).
-        total_len -> BigInt,
-        /// Running tally of PUT bytes, enforced against the ticket ceiling.
-        accepted_bytes -> BigInt,
-        /// Whether the manifest has been committed.
-        committed -> Bool,
-        /// Ticket caller identity.
-        uploaded_by -> Text,
-        /// When the intent was declared; used by the sweep grace window.
-        created_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
-    /// Per-chunk rows for each manifest.
-    _cfs_manifest_chunks (file_id, uploaded_by, position) {
-        /// Part of the composite foreign key to `_cfs_manifests`.
-        file_id -> Bytea,
-        /// Part of the composite foreign key to `_cfs_manifests`.
-        uploaded_by -> Text,
-        /// 0-based position in the chunk sequence.
-        position -> Integer,
-        /// BLAKE3 hash of the chunk bytes.
-        chunk_hash -> Bytea,
-        /// Declared byte length.
-        chunk_len -> BigInt,
-        /// True once the chunk is durably in the object store.
-        stored -> Bool,
-    }
-}
-
-diesel::table! {
-    /// Per-hash chunk state registry.
-    ///
-    /// A hash is live while any `_cfs_manifest_chunks` row references it;
-    /// liveness is derived and no counter is maintained.  The `state` column
-    /// tracks the chunk's lifecycle: `pending` (declared at intent), `stored`
-    /// (written to the object store), or `deleting` (marked for GC).
-    _cfs_chunk_registry (chunk_hash) {
-        /// BLAKE3 hash identifying the chunk object.
-        chunk_hash -> Bytea,
-        /// `pending` | `stored` | `deleting`
-        state -> Text,
-    }
-}
-
-diesel::allow_tables_to_appear_in_same_query!(
-    _cfs_manifests,
-    _cfs_manifest_chunks,
-    _cfs_chunk_registry,
-);
-
 /// A column usable in typed diesel expressions for table `Tab` with SQL type `St`.
 pub trait FileSchemaColumn<Tab, St>:
     Column<Table = Tab> + Expression<SqlType = St> + Default + Send
@@ -390,372 +333,6 @@ where
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
 }
 
-/// The default file-server schema over the `_cfs_` prefix tables.
-///
-/// Used by the crate's own tests, by `preflight`, and as the template for the
-/// shipped DDL constant.  External deployments that need different table names
-/// implement [`ConnettoFileSchema`] directly or invoke [`crate::connetto_file_tables!`]
-/// with custom names.
-pub struct DefaultFileSchema;
-
-impl ConnettoFileSchema for DefaultFileSchema {
-    type Manifests = _cfs_manifests::table;
-    type ManifestChunks = _cfs_manifest_chunks::table;
-    type ChunkRegistry = _cfs_chunk_registry::table;
-
-    type ManifestsQuery = _cfs_manifests::table;
-    type ManifestChunksQuery = _cfs_manifest_chunks::table;
-    type ChunkRegistryQuery = _cfs_chunk_registry::table;
-
-    type MColFileId = _cfs_manifests::columns::file_id;
-    type MColCommitted = _cfs_manifests::columns::committed;
-    type MColCreatedAt = _cfs_manifests::columns::created_at;
-    type MColAcceptedBytes = _cfs_manifests::columns::accepted_bytes;
-
-    type MCColFileId = _cfs_manifest_chunks::columns::file_id;
-    type MCColPosition = _cfs_manifest_chunks::columns::position;
-    type MCColChunkHash = _cfs_manifest_chunks::columns::chunk_hash;
-    type MCColChunkLen = _cfs_manifest_chunks::columns::chunk_len;
-    type MCColStored = _cfs_manifest_chunks::columns::stored;
-
-    type CRColChunkHash = _cfs_chunk_registry::columns::chunk_hash;
-    type CRColState = _cfs_chunk_registry::columns::state;
-
-    type ManifestPkEq = helper_types::And<
-        helper_types::Eq<_cfs_manifests::columns::file_id, Vec<u8>>,
-        helper_types::Eq<_cfs_manifests::columns::uploaded_by, String>,
-    >;
-    type MCPkEq = helper_types::And<
-        helper_types::Eq<_cfs_manifest_chunks::columns::file_id, Vec<u8>>,
-        helper_types::Eq<_cfs_manifest_chunks::columns::uploaded_by, String>,
-    >;
-    type MCChunkHashEq = helper_types::Eq<_cfs_manifest_chunks::columns::chunk_hash, Vec<u8>>;
-    type CRChunkHashEq = helper_types::Eq<_cfs_chunk_registry::columns::chunk_hash, Vec<u8>>;
-    type CRStateEq = helper_types::Eq<_cfs_chunk_registry::columns::state, &'static str>;
-
-    const MANIFESTS_SQL: &'static str = "_cfs_manifests";
-    const MANIFEST_CHUNKS_SQL: &'static str = "_cfs_manifest_chunks";
-    const CHUNK_REGISTRY_SQL: &'static str = "_cfs_chunk_registry";
-
-    fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq {
-        _cfs_manifests::file_id
-            .eq(file_id)
-            .and(_cfs_manifests::uploaded_by.eq(caller))
-    }
-
-    fn mc_pk_eq(file_id: Vec<u8>, caller: String) -> Self::MCPkEq {
-        _cfs_manifest_chunks::file_id
-            .eq(file_id)
-            .and(_cfs_manifest_chunks::uploaded_by.eq(caller))
-    }
-
-    fn mc_chunk_hash_eq(hash: Vec<u8>) -> Self::MCChunkHashEq {
-        _cfs_manifest_chunks::chunk_hash.eq(hash)
-    }
-
-    fn cr_chunk_hash_eq(hash: Vec<u8>) -> Self::CRChunkHashEq {
-        _cfs_chunk_registry::chunk_hash.eq(hash)
-    }
-
-    fn cr_state_eq_deleting() -> Self::CRStateEq {
-        _cfs_chunk_registry::state.eq("deleting")
-    }
-
-    fn insert_manifest_stmt(
-        file_id: Vec<u8>,
-        total_len: i64,
-        caller: String,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::insert_into(_cfs_manifests::table)
-            .values((
-                _cfs_manifests::file_id.eq(file_id),
-                _cfs_manifests::total_len.eq(total_len),
-                _cfs_manifests::accepted_bytes.eq(0_i64),
-                _cfs_manifests::committed.eq(false),
-                _cfs_manifests::uploaded_by.eq(caller),
-                _cfs_manifests::created_at.eq(at),
-            ))
-            .on_conflict_do_nothing()
-    }
-
-    fn insert_registry_pending_batch_stmt(
-        hashes: Vec<Vec<u8>>,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::insert_into(_cfs_chunk_registry::table)
-            .values(
-                hashes
-                    .into_iter()
-                    .map(|h| {
-                        (
-                            _cfs_chunk_registry::chunk_hash.eq(h),
-                            _cfs_chunk_registry::state.eq("pending"),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .on_conflict_do_nothing()
-    }
-
-    fn lock_registry_rows_stmt(
-        hashes: Vec<Vec<u8>>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)> + Send + 'static
-    {
-        diesel::QueryDsl::select(
-            diesel::QueryDsl::for_update(diesel::QueryDsl::order(
-                diesel::QueryDsl::filter(
-                    _cfs_chunk_registry::table,
-                    _cfs_chunk_registry::chunk_hash.eq_any(hashes),
-                ),
-                _cfs_chunk_registry::chunk_hash.asc(),
-            )),
-            (_cfs_chunk_registry::chunk_hash, _cfs_chunk_registry::state),
-        )
-    }
-
-    fn lock_sweep_rows_stmt(
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
-        // A hash is live while any manifest_chunks row references it through a
-        // committed or graced (created_at >= cutoff) manifest.  The join uses
-        // both columns of the composite FK so uncommitted chunks from one caller
-        // do not keep a hash live when a different caller's manifest is the only
-        // graced reference.
-        let surviving = diesel::dsl::exists(SelectDsl::select(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    _cfs_manifest_chunks::table,
-                    _cfs_manifest_chunks::chunk_hash.eq(_cfs_chunk_registry::chunk_hash),
-                ),
-                diesel::dsl::exists(SelectDsl::select(
-                    diesel::QueryDsl::filter(
-                        diesel::QueryDsl::filter(
-                            diesel::QueryDsl::filter(
-                                _cfs_manifests::table,
-                                _cfs_manifests::file_id.eq(_cfs_manifest_chunks::file_id),
-                            ),
-                            _cfs_manifests::uploaded_by.eq(_cfs_manifest_chunks::uploaded_by),
-                        ),
-                        _cfs_manifests::committed
-                            .eq(true)
-                            .or(_cfs_manifests::created_at.ge(cutoff)),
-                    ),
-                    _cfs_manifests::file_id,
-                )),
-            ),
-            _cfs_manifest_chunks::chunk_hash,
-        ));
-        diesel::QueryDsl::select(
-            diesel::QueryDsl::for_update(diesel::QueryDsl::order(
-                diesel::QueryDsl::filter(
-                    diesel::QueryDsl::filter(
-                        _cfs_chunk_registry::table,
-                        _cfs_chunk_registry::state.ne("deleting"),
-                    ),
-                    diesel::dsl::not(surviving),
-                ),
-                _cfs_chunk_registry::chunk_hash.asc(),
-            )),
-            _cfs_chunk_registry::chunk_hash,
-        )
-    }
-
-    fn lock_manifest_row_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + Send + 'static {
-        diesel::QueryDsl::select(
-            diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    _cfs_manifests::table,
-                    _cfs_manifests::file_id.eq(file_id),
-                ),
-                _cfs_manifests::uploaded_by.eq(caller),
-            )),
-            _cfs_manifests::committed,
-        )
-    }
-
-    fn mark_chunk_stored_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-        hash: Vec<u8>,
-        chunk_len: i64,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    diesel::QueryDsl::filter(
-                        diesel::QueryDsl::filter(
-                            _cfs_manifest_chunks::table,
-                            _cfs_manifest_chunks::file_id.eq(file_id),
-                        ),
-                        _cfs_manifest_chunks::uploaded_by.eq(caller),
-                    ),
-                    _cfs_manifest_chunks::chunk_hash.eq(hash),
-                ),
-                _cfs_manifest_chunks::chunk_len.eq(chunk_len),
-            ),
-            _cfs_manifest_chunks::stored.eq(false),
-        ))
-        .set(_cfs_manifest_chunks::stored.eq(true))
-    }
-
-    fn tally_bytes_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-        chunk_len: i64,
-        allowed: i64,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    _cfs_manifests::table,
-                    _cfs_manifests::file_id.eq(file_id),
-                ),
-                _cfs_manifests::uploaded_by.eq(caller),
-            ),
-            _cfs_manifests::accepted_bytes.le(allowed),
-        ))
-        .set(_cfs_manifests::accepted_bytes.eq(_cfs_manifests::accepted_bytes + chunk_len))
-    }
-
-    fn mark_registry_stored_stmt(
-        hash: Vec<u8>,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(
-                _cfs_chunk_registry::table,
-                _cfs_chunk_registry::chunk_hash.eq(hash),
-            ),
-            _cfs_chunk_registry::state.eq("pending"),
-        ))
-        .set(_cfs_chunk_registry::state.eq("stored"))
-    }
-
-    fn mark_manifest_committed_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    _cfs_manifests::table,
-                    _cfs_manifests::file_id.eq(file_id),
-                ),
-                _cfs_manifests::uploaded_by.eq(caller),
-            ),
-            _cfs_manifests::committed.eq(false),
-        ))
-        .set(_cfs_manifests::committed.eq(true))
-    }
-
-    fn mark_unreferenced_deleting_stmt(
-        hashes: Vec<Vec<u8>>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
-        diesel::update(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    _cfs_chunk_registry::table,
-                    _cfs_chunk_registry::chunk_hash.eq_any(hashes),
-                ),
-                _cfs_chunk_registry::state.ne("deleting"),
-            ),
-            diesel::dsl::not(diesel::dsl::exists(SelectDsl::select(
-                diesel::QueryDsl::filter(
-                    _cfs_manifest_chunks::table,
-                    _cfs_manifest_chunks::chunk_hash.eq(_cfs_chunk_registry::chunk_hash),
-                ),
-                _cfs_manifest_chunks::chunk_hash,
-            ))),
-        ))
-        .set(_cfs_chunk_registry::state.eq("deleting"))
-        .returning(_cfs_chunk_registry::chunk_hash)
-    }
-
-    fn insert_chunk_rows_batch_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-        rows: Vec<(i32, Vec<u8>, i64)>,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::insert_into(_cfs_manifest_chunks::table)
-            .values(
-                rows.into_iter()
-                    .map(|(pos, hash, len)| {
-                        (
-                            _cfs_manifest_chunks::file_id.eq(file_id.clone()),
-                            _cfs_manifest_chunks::uploaded_by.eq(caller.clone()),
-                            _cfs_manifest_chunks::position.eq(pos),
-                            _cfs_manifest_chunks::chunk_hash.eq(hash),
-                            _cfs_manifest_chunks::chunk_len.eq(len),
-                            _cfs_manifest_chunks::stored.eq(false),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .on_conflict_do_nothing()
-    }
-
-    fn delete_registry_row_stmt(
-        hash: Vec<u8>,
-    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static {
-        diesel::delete(diesel::QueryDsl::filter(
-            _cfs_chunk_registry::table,
-            _cfs_chunk_registry::chunk_hash.eq(hash),
-        ))
-    }
-
-    fn delete_orphaned_stmt(
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
-        diesel::delete(diesel::QueryDsl::filter(
-            diesel::QueryDsl::filter(_cfs_manifests::table, _cfs_manifests::committed.eq(false)),
-            _cfs_manifests::created_at.lt(cutoff),
-        ))
-        .returning(_cfs_manifests::file_id)
-    }
-
-    fn all_unstored_chunk_hashes_stmt(
-        file_id: Vec<u8>,
-        caller: String,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static {
-        diesel::QueryDsl::select(
-            diesel::QueryDsl::filter(
-                diesel::QueryDsl::filter(
-                    diesel::QueryDsl::filter(
-                        _cfs_manifest_chunks::table,
-                        _cfs_manifest_chunks::file_id.eq(file_id),
-                    ),
-                    _cfs_manifest_chunks::uploaded_by.eq(caller),
-                ),
-                _cfs_manifest_chunks::stored.eq(false),
-            ),
-            _cfs_manifest_chunks::chunk_hash,
-        )
-    }
-
-    fn any_committed_manifest_caller_stmt(
-        file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static {
-        diesel::QueryDsl::select(
-            diesel::QueryDsl::limit(
-                diesel::QueryDsl::order(
-                    diesel::QueryDsl::filter(
-                        diesel::QueryDsl::filter(
-                            _cfs_manifests::table,
-                            _cfs_manifests::file_id.eq(file_id),
-                        ),
-                        _cfs_manifests::committed.eq(true),
-                    ),
-                    _cfs_manifests::uploaded_by.asc(),
-                ),
-                1,
-            ),
-            _cfs_manifests::uploaded_by,
-        )
-    }
-}
-
 /// Generate the file-server tables and their [`ConnettoFileSchema`] impl
 /// under deployment-chosen names.
 ///
@@ -777,15 +354,15 @@ macro_rules! connetto_file_tables {
             $manifests (file_id, uploaded_by) {
                 /// 32-byte BLAKE3 file identity.
                 file_id -> diesel::sql_types::Bytea,
-                /// Declared byte total.
+                /// Declared byte total, equal to the sum of the chunk lengths.
                 total_len -> diesel::sql_types::BigInt,
-                /// Running PUT tally.
+                /// Running tally of PUT bytes, enforced against the ticket ceiling.
                 accepted_bytes -> diesel::sql_types::BigInt,
                 /// Whether the manifest is committed.
                 committed -> diesel::sql_types::Bool,
                 /// Caller identity from the write ticket.
                 uploaded_by -> diesel::sql_types::Text,
-                /// Intent declaration timestamp.
+                /// When the intent was declared, read by the sweep grace window.
                 created_at -> diesel::sql_types::Timestamptz,
             }
         }
@@ -810,6 +387,9 @@ macro_rules! connetto_file_tables {
 
         diesel::table! {
             /// Per-hash chunk state registry generated by `connetto_file_tables!`.
+            ///
+            /// A hash is live while any manifest-chunk row references it, so liveness
+            /// is derived and no counter is maintained.
             $chunk_registry (chunk_hash) {
                 /// BLAKE3 hash identifying the chunk object.
                 chunk_hash -> diesel::sql_types::Bytea,
@@ -870,23 +450,25 @@ macro_rules! connetto_file_tables {
             const CHUNK_REGISTRY_SQL: &'static str = stringify!($chunk_registry);
 
             fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq {
-                $manifests::file_id
-                    .eq(file_id)
-                    .and($manifests::uploaded_by.eq(caller))
+                diesel::BoolExpressionMethods::and(
+                    diesel::ExpressionMethods::eq($manifests::file_id, file_id),
+                    diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
+                )
             }
             fn mc_pk_eq(file_id: Vec<u8>, caller: String) -> Self::MCPkEq {
-                $manifest_chunks::file_id
-                    .eq(file_id)
-                    .and($manifest_chunks::uploaded_by.eq(caller))
+                diesel::BoolExpressionMethods::and(
+                    diesel::ExpressionMethods::eq($manifest_chunks::file_id, file_id),
+                    diesel::ExpressionMethods::eq($manifest_chunks::uploaded_by, caller),
+                )
             }
             fn mc_chunk_hash_eq(hash: Vec<u8>) -> Self::MCChunkHashEq {
-                $manifest_chunks::chunk_hash.eq(hash)
+                diesel::ExpressionMethods::eq($manifest_chunks::chunk_hash, hash)
             }
             fn cr_chunk_hash_eq(hash: Vec<u8>) -> Self::CRChunkHashEq {
-                $chunk_registry::chunk_hash.eq(hash)
+                diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, hash)
             }
             fn cr_state_eq_deleting() -> Self::CRStateEq {
-                $chunk_registry::state.eq("deleting")
+                diesel::ExpressionMethods::eq($chunk_registry::state, "deleting")
             }
             fn insert_manifest_stmt(
                 file_id: Vec<u8>,
@@ -899,12 +481,12 @@ macro_rules! connetto_file_tables {
             + 'static {
                 diesel::insert_into($manifests::table)
                     .values((
-                        $manifests::file_id.eq(file_id),
-                        $manifests::total_len.eq(total_len),
-                        $manifests::accepted_bytes.eq(0_i64),
-                        $manifests::committed.eq(false),
-                        $manifests::uploaded_by.eq(caller),
-                        $manifests::created_at.eq(at),
+                        diesel::ExpressionMethods::eq($manifests::file_id, file_id),
+                        diesel::ExpressionMethods::eq($manifests::total_len, total_len),
+                        diesel::ExpressionMethods::eq($manifests::accepted_bytes, 0_i64),
+                        diesel::ExpressionMethods::eq($manifests::committed, false),
+                        diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
+                        diesel::ExpressionMethods::eq($manifests::created_at, at),
                     ))
                     .on_conflict_do_nothing()
             }
@@ -920,8 +502,11 @@ macro_rules! connetto_file_tables {
                             .into_iter()
                             .map(|h| {
                                 (
-                                    $chunk_registry::chunk_hash.eq(h),
-                                    $chunk_registry::state.eq("pending"),
+                                    diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, h),
+                                    diesel::ExpressionMethods::eq(
+                                        $chunk_registry::state,
+                                        "pending",
+                                    ),
                                 )
                             })
                             .collect::<Vec<_>>(),
@@ -940,9 +525,9 @@ macro_rules! connetto_file_tables {
                     diesel::QueryDsl::for_update(diesel::QueryDsl::order(
                         diesel::QueryDsl::filter(
                             $chunk_registry::table,
-                            $chunk_registry::chunk_hash.eq_any(hashes),
+                            diesel::ExpressionMethods::eq_any($chunk_registry::chunk_hash, hashes),
                         ),
-                        $chunk_registry::chunk_hash.asc(),
+                        diesel::ExpressionMethods::asc($chunk_registry::chunk_hash),
                     )),
                     ($chunk_registry::chunk_hash, $chunk_registry::state),
                 )
@@ -959,20 +544,30 @@ macro_rules! connetto_file_tables {
                     diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
                             $manifest_chunks::table,
-                            $manifest_chunks::chunk_hash.eq($chunk_registry::chunk_hash),
+                            diesel::ExpressionMethods::eq(
+                                $manifest_chunks::chunk_hash,
+                                $chunk_registry::chunk_hash,
+                            ),
                         ),
                         diesel::dsl::exists(diesel::query_dsl::methods::SelectDsl::select(
                             diesel::QueryDsl::filter(
                                 diesel::QueryDsl::filter(
                                     diesel::QueryDsl::filter(
                                         $manifests::table,
-                                        $manifests::file_id.eq($manifest_chunks::file_id),
+                                        diesel::ExpressionMethods::eq(
+                                            $manifests::file_id,
+                                            $manifest_chunks::file_id,
+                                        ),
                                     ),
-                                    $manifests::uploaded_by.eq($manifest_chunks::uploaded_by),
+                                    diesel::ExpressionMethods::eq(
+                                        $manifests::uploaded_by,
+                                        $manifest_chunks::uploaded_by,
+                                    ),
                                 ),
-                                $manifests::committed
-                                    .eq(true)
-                                    .or($manifests::created_at.ge(cutoff)),
+                                diesel::BoolExpressionMethods::or(
+                                    diesel::ExpressionMethods::eq($manifests::committed, true),
+                                    diesel::ExpressionMethods::ge($manifests::created_at, cutoff),
+                                ),
                             ),
                             $manifests::file_id,
                         )),
@@ -984,11 +579,11 @@ macro_rules! connetto_file_tables {
                         diesel::QueryDsl::filter(
                             diesel::QueryDsl::filter(
                                 $chunk_registry::table,
-                                $chunk_registry::state.ne("deleting"),
+                                diesel::ExpressionMethods::ne($chunk_registry::state, "deleting"),
                             ),
                             diesel::dsl::not(surviving),
                         ),
-                        $chunk_registry::chunk_hash.asc(),
+                        diesel::ExpressionMethods::asc($chunk_registry::chunk_hash),
                     )),
                     $chunk_registry::chunk_hash,
                 )
@@ -1006,9 +601,9 @@ macro_rules! connetto_file_tables {
                     diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
                             $manifests::table,
-                            $manifests::file_id.eq(file_id),
+                            diesel::ExpressionMethods::eq($manifests::file_id, file_id),
                         ),
-                        $manifests::uploaded_by.eq(caller),
+                        diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
                     )),
                     $manifests::committed,
                 )
@@ -1022,15 +617,32 @@ macro_rules! connetto_file_tables {
             + diesel::query_builder::QueryId
             + Send
             + 'static {
-                diesel::update(
-                    $manifest_chunks::table
-                        .filter($manifest_chunks::file_id.eq(file_id))
-                        .filter($manifest_chunks::uploaded_by.eq(caller))
-                        .filter($manifest_chunks::chunk_hash.eq(hash))
-                        .filter($manifest_chunks::chunk_len.eq(chunk_len))
-                        .filter($manifest_chunks::stored.eq(false)),
-                )
-                .set($manifest_chunks::stored.eq(true))
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        diesel::QueryDsl::filter(
+                            diesel::QueryDsl::filter(
+                                diesel::QueryDsl::filter(
+                                    $manifest_chunks::table,
+                                    diesel::ExpressionMethods::eq(
+                                        $manifest_chunks::file_id,
+                                        file_id,
+                                    ),
+                                ),
+                                diesel::ExpressionMethods::eq(
+                                    $manifest_chunks::uploaded_by,
+                                    caller,
+                                ),
+                            ),
+                            diesel::ExpressionMethods::eq($manifest_chunks::chunk_hash, hash),
+                        ),
+                        diesel::ExpressionMethods::eq($manifest_chunks::chunk_len, chunk_len),
+                    ),
+                    diesel::ExpressionMethods::eq($manifest_chunks::stored, false),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $manifest_chunks::stored,
+                    true,
+                ))
             }
             fn tally_bytes_stmt(
                 file_id: Vec<u8>,
@@ -1041,13 +653,17 @@ macro_rules! connetto_file_tables {
             + diesel::query_builder::QueryId
             + Send
             + 'static {
-                diesel::update(
-                    $manifests::table
-                        .filter($manifests::file_id.eq(file_id))
-                        .filter($manifests::uploaded_by.eq(caller))
-                        .filter($manifests::accepted_bytes.le(allowed)),
-                )
-                .set($manifests::accepted_bytes.eq($manifests::accepted_bytes + chunk_len))
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifests::table,
+                        Self::manifest_pk_eq(file_id, caller),
+                    ),
+                    diesel::ExpressionMethods::le($manifests::accepted_bytes, allowed),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $manifests::accepted_bytes,
+                    $manifests::accepted_bytes + chunk_len,
+                ))
             }
             fn mark_registry_stored_stmt(
                 hash: Vec<u8>,
@@ -1055,12 +671,17 @@ macro_rules! connetto_file_tables {
             + diesel::query_builder::QueryId
             + Send
             + 'static {
-                diesel::update(
-                    $chunk_registry::table
-                        .filter($chunk_registry::chunk_hash.eq(hash))
-                        .filter($chunk_registry::state.eq("pending")),
-                )
-                .set($chunk_registry::state.eq("stored"))
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $chunk_registry::table,
+                        diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, hash),
+                    ),
+                    diesel::ExpressionMethods::eq($chunk_registry::state, "pending"),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $chunk_registry::state,
+                    "stored",
+                ))
             }
             fn mark_manifest_committed_stmt(
                 file_id: Vec<u8>,
@@ -1069,13 +690,14 @@ macro_rules! connetto_file_tables {
             + diesel::query_builder::QueryId
             + Send
             + 'static {
-                diesel::update(
-                    $manifests::table
-                        .filter($manifests::file_id.eq(file_id))
-                        .filter($manifests::uploaded_by.eq(caller))
-                        .filter($manifests::committed.eq(false)),
-                )
-                .set($manifests::committed.eq(true))
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifests::table,
+                        Self::manifest_pk_eq(file_id, caller),
+                    ),
+                    diesel::ExpressionMethods::eq($manifests::committed, false),
+                ))
+                .set(diesel::ExpressionMethods::eq($manifests::committed, true))
             }
             fn mark_unreferenced_deleting_stmt(
                 hashes: Vec<Vec<u8>>,
@@ -1089,21 +711,27 @@ macro_rules! connetto_file_tables {
                     diesel::QueryDsl::filter(
                         diesel::QueryDsl::filter(
                             $chunk_registry::table,
-                            $chunk_registry::chunk_hash.eq_any(hashes),
+                            diesel::ExpressionMethods::eq_any($chunk_registry::chunk_hash, hashes),
                         ),
-                        $chunk_registry::state.ne("deleting"),
+                        diesel::ExpressionMethods::ne($chunk_registry::state, "deleting"),
                     ),
                     diesel::dsl::not(diesel::dsl::exists(
                         diesel::query_dsl::methods::SelectDsl::select(
                             diesel::QueryDsl::filter(
                                 $manifest_chunks::table,
-                                $manifest_chunks::chunk_hash.eq($chunk_registry::chunk_hash),
+                                diesel::ExpressionMethods::eq(
+                                    $manifest_chunks::chunk_hash,
+                                    $chunk_registry::chunk_hash,
+                                ),
                             ),
                             $manifest_chunks::chunk_hash,
                         ),
                     )),
                 ))
-                .set($chunk_registry::state.eq("deleting"))
+                .set(diesel::ExpressionMethods::eq(
+                    $chunk_registry::state,
+                    "deleting",
+                ))
                 .returning($chunk_registry::chunk_hash)
             }
             fn insert_chunk_rows_batch_stmt(
@@ -1119,12 +747,21 @@ macro_rules! connetto_file_tables {
                         rows.into_iter()
                             .map(|(pos, hash, len)| {
                                 (
-                                    $manifest_chunks::file_id.eq(file_id.clone()),
-                                    $manifest_chunks::uploaded_by.eq(caller.clone()),
-                                    $manifest_chunks::position.eq(pos),
-                                    $manifest_chunks::chunk_hash.eq(hash),
-                                    $manifest_chunks::chunk_len.eq(len),
-                                    $manifest_chunks::stored.eq(false),
+                                    diesel::ExpressionMethods::eq(
+                                        $manifest_chunks::file_id,
+                                        file_id.clone(),
+                                    ),
+                                    diesel::ExpressionMethods::eq(
+                                        $manifest_chunks::uploaded_by,
+                                        caller.clone(),
+                                    ),
+                                    diesel::ExpressionMethods::eq($manifest_chunks::position, pos),
+                                    diesel::ExpressionMethods::eq(
+                                        $manifest_chunks::chunk_hash,
+                                        hash,
+                                    ),
+                                    diesel::ExpressionMethods::eq($manifest_chunks::chunk_len, len),
+                                    diesel::ExpressionMethods::eq($manifest_chunks::stored, false),
                                 )
                             })
                             .collect::<Vec<_>>(),
@@ -1137,7 +774,10 @@ macro_rules! connetto_file_tables {
             + diesel::query_builder::QueryId
             + Send
             + 'static {
-                diesel::delete($chunk_registry::table.filter($chunk_registry::chunk_hash.eq(hash)))
+                diesel::delete(diesel::QueryDsl::filter(
+                    $chunk_registry::table,
+                    diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, hash),
+                ))
             }
             fn delete_orphaned_stmt(
                 cutoff: chrono::DateTime<chrono::Utc>,
@@ -1147,11 +787,13 @@ macro_rules! connetto_file_tables {
                 Vec<u8>,
             > + Send
             + 'static {
-                diesel::delete(
-                    $manifests::table
-                        .filter($manifests::committed.eq(false))
-                        .filter($manifests::created_at.lt(cutoff)),
-                )
+                diesel::delete(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifests::table,
+                        diesel::ExpressionMethods::eq($manifests::committed, false),
+                    ),
+                    diesel::ExpressionMethods::lt($manifests::created_at, cutoff),
+                ))
                 .returning($manifests::file_id)
             }
             fn all_unstored_chunk_hashes_stmt(
@@ -1168,11 +810,11 @@ macro_rules! connetto_file_tables {
                         diesel::QueryDsl::filter(
                             diesel::QueryDsl::filter(
                                 $manifest_chunks::table,
-                                $manifest_chunks::file_id.eq(file_id),
+                                diesel::ExpressionMethods::eq($manifest_chunks::file_id, file_id),
                             ),
-                            $manifest_chunks::uploaded_by.eq(caller),
+                            diesel::ExpressionMethods::eq($manifest_chunks::uploaded_by, caller),
                         ),
-                        $manifest_chunks::stored.eq(false),
+                        diesel::ExpressionMethods::eq($manifest_chunks::stored, false),
                     ),
                     $manifest_chunks::chunk_hash,
                 )
@@ -1191,11 +833,11 @@ macro_rules! connetto_file_tables {
                             diesel::QueryDsl::filter(
                                 diesel::QueryDsl::filter(
                                     $manifests::table,
-                                    $manifests::file_id.eq(file_id),
+                                    diesel::ExpressionMethods::eq($manifests::file_id, file_id),
                                 ),
-                                $manifests::committed.eq(true),
+                                diesel::ExpressionMethods::eq($manifests::committed, true),
                             ),
-                            $manifests::uploaded_by.asc(),
+                            diesel::ExpressionMethods::asc($manifests::uploaded_by),
                         ),
                         1,
                     ),
@@ -1205,3 +847,13 @@ macro_rules! connetto_file_tables {
         }
     };
 }
+
+connetto_file_tables!();
+
+/// The default file-server schema over the `_cfs_` prefix tables.
+///
+/// Used by the crate's own tests, by `preflight`, and as the template for the
+/// shipped DDL constant.  External deployments that need different table names
+/// implement [`ConnettoFileSchema`] directly or invoke [`crate::connetto_file_tables!`]
+/// with custom names.
+pub type DefaultFileSchema = ConnettoFileSchemaImpl;
