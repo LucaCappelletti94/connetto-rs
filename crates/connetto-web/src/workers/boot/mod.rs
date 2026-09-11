@@ -1,9 +1,5 @@
-use std::rc::Rc;
-
 use wasm_bindgen::JsValue;
 use web_sys::{Worker, WorkerOptions, WorkerType};
-
-use super::helpers::to_js;
 
 mod replica;
 mod services;
@@ -302,11 +298,7 @@ pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession
 where
     Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {
-    let storage = crate::storage::ReplicaStorage::install().await;
-    let key_store = Rc::new(crate::auth::IdbKeyStore::open().await.map_err(to_js)?);
-    let was_enrolled = replica::setup_custody(config, &key_store).await?;
-    services::apply_pending_wipes(&storage, &key_store).await?;
-    storage.reserve(BOOT_SLOTS).await.map_err(to_js)?;
+    let (storage, key_store, was_enrolled) = services::prepare_boot_storage(config).await?;
     let mut spec =
         replica::resolve_replica_spec::<Id>(config, &storage, &key_store, was_enrolled).await?;
     let replica_key =

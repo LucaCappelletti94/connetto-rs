@@ -18,6 +18,31 @@ thread_local! {
     static DB_ALIVE: RefCell<Option<locks::HeldLock>> = const { RefCell::new(None) };
 }
 
+/// Install storage and custody, carry out any outstanding data wipe, and
+/// reserve this boot's database slots.
+///
+/// Returns the storage handle, the key store, and whether a credential was
+/// already enrolled.
+pub(super) async fn prepare_boot_storage(
+    config: &DbWorkerConfig,
+) -> Result<
+    (
+        crate::storage::ReplicaStorage,
+        std::rc::Rc<crate::auth::IdbKeyStore>,
+        bool,
+    ),
+    JsValue,
+> {
+    let storage = crate::storage::ReplicaStorage::install().await;
+    // Encrypted regardless of auth, and the per-replica key also lives here.
+    let key_store = std::rc::Rc::new(crate::auth::IdbKeyStore::open().await.map_err(to_js)?);
+    let was_enrolled = super::replica::setup_custody(config, &key_store).await?;
+    apply_pending_wipes(&storage, &key_store).await?;
+    // After wipes (which free slots) and before login (which opens the refresh store).
+    storage.reserve(super::BOOT_SLOTS).await.map_err(to_js)?;
+    Ok((storage, key_store, was_enrolled))
+}
+
 pub(super) async fn apply_pending_wipes(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
