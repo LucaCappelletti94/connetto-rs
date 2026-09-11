@@ -168,7 +168,7 @@ async fn first_reply<T: Transport>(client: &mut T, sub_id: &str, query: &str) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_are_byte_identical_across_causes() {
-    let logs = logging::install_once();
+    let logs = crate::logging::install_once();
     let fixture = Fixture::acquire().await;
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
@@ -549,61 +549,4 @@ async fn a_mid_read_page_failure_causes_exactly_one_restart_then_refuses() {
         .await
         .expect("serve task")
         .expect("session ends cleanly after a refused restart");
-}
-
-/// The process-global log destination, installed once and read back.
-mod logging {
-    use std::io::Write;
-    use std::sync::{Arc, LazyLock, Mutex};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    pub struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Buffer {
-        /// Every line written so far, each parsed as one JSON object.
-        pub fn lines(&self) -> Vec<serde_json::Value> {
-            String::from_utf8_lossy(&self.0.lock().expect("buffer poisoned"))
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
-        }
-    }
-
-    impl Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for Buffer {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// A subscriber is process-global, so it is installed exactly once, on
-    /// the first read of the buffer.
-    static BUFFER: LazyLock<Buffer> = LazyLock::new(|| {
-        let buffer = Buffer::default();
-        connetto_core::logging::install(buffer.clone(), "warn");
-        buffer
-    });
-
-    /// Install the destination the first time and hand back the buffer.
-    pub fn install_once() -> Buffer {
-        BUFFER.clone()
-    }
 }

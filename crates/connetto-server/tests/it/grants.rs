@@ -326,7 +326,7 @@ async fn an_invented_handle_is_refused_and_a_fresh_run_starts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_grant_names_the_caller_and_which_grant_in_the_log() {
     let fixture = Fixture::acquire().await;
-    let buffer = logging::install_once();
+    let buffer = crate::logging::install_once();
 
     // A client id unique to this test, so the assertion holds while the rest of
     // the file runs in parallel against the same process-global destination.
@@ -359,63 +359,4 @@ async fn a_refused_grant_names_the_caller_and_which_grant_in_the_log() {
         refusal["span"]["session"].is_string(),
         "inside the connection context, so the run it belongs to rides along: {refusal}"
     );
-}
-
-/// The process-global log destination, installed once and read back.
-mod logging {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    pub struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Buffer {
-        /// Every line written so far, each parsed as one JSON object.
-        pub fn lines(&self) -> Vec<serde_json::Value> {
-            String::from_utf8_lossy(&self.0.lock().expect("buffer poisoned"))
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
-        }
-    }
-
-    impl Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for Buffer {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    static BUFFER: OnceLock<Buffer> = OnceLock::new();
-
-    /// Install the destination the first time and hand back the buffer. A
-    /// subscriber is process-global, so a second install would be refused and
-    /// the test would read an empty buffer.
-    pub fn install_once() -> Buffer {
-        BUFFER
-            .get_or_init(|| {
-                let buffer = Buffer::default();
-                connetto_core::logging::install(buffer.clone(), "warn");
-                buffer
-            })
-            .clone()
-    }
 }

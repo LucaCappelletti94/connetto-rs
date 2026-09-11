@@ -134,6 +134,38 @@ impl ContentFlushState {
     }
 }
 
+/// A worker-owned outbox attempt after its cancel-safe ticket wait.
+pub enum ContentFlushStart<B> {
+    /// The attempt finished without an HTTP transfer.
+    Complete(ContentFlush),
+    /// A granted upload can run while the connection owner serves local work.
+    Upload(ContentUpload<B>),
+}
+
+/// One granted content upload that no longer borrows the sync connection.
+pub struct ContentUpload<B> {
+    file_id: FileId,
+    upload_url: String,
+    manifest: Manifest,
+    store: B,
+    root_key: [u8; 32],
+}
+
+impl<B> ContentUpload<B>
+where
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+{
+    /// Transfers the granted content over HTTP.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when reading a chunk or completing the HTTP upload fails.
+    pub async fn transfer<H: ContentHttp>(&self, http: &H) -> Result<(), ContentError> {
+        let store = EncryptingStore::new(self.store.clone(), &self.root_key);
+        upload::upload(http, &self.upload_url, &self.manifest, &store).await
+    }
+}
+
 /// Content archive policy for an owner of a raw sync connection.
 pub struct ContentArchive<B> {
     store: B,
@@ -178,6 +210,10 @@ where
     }
 
     /// Retires outbox entries whose bytes are conclusively unreadable.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when reading the outbox or a manifest fails, or when the dequeue write fails.
     pub async fn verify_unsent<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
@@ -217,25 +253,51 @@ where
         H: ContentHttp,
         C: core::future::Future<Output = ()>,
     {
+        let (start, observed) = self.begin_flush_next_or(connection, state, cancel).await;
+        let result = match start {
+            Ok(ContentFlushStart::Complete(flush)) => Ok(flush),
+            Ok(ContentFlushStart::Upload(upload)) => {
+                let result = upload.transfer(http).await;
+                self.finish_upload(connection, &upload, result)
+            }
+            Err(error) => Err(error),
+        };
+        (result, observed)
+    }
+
+    /// Waits for one upload ticket without retaining the sync connection for the HTTP transfer.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the outbox, manifest, ticket exchange, or dequeue write fails.
+    pub async fn begin_flush_next_or<T, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        state: &mut ContentFlushState,
+        cancel: C,
+    ) -> (Result<ContentFlushStart<B>, ContentError>, Vec<ClientEvent>)
+    where
+        T: Transport,
+        T::Error: Display,
+        C: core::future::Future<Output = ()>,
+    {
         let mut observed = Vec::new();
         let result = self
-            .flush_connection_next_or(connection, http, &mut observed, state, cancel)
+            .begin_connection_flush_next_or(connection, &mut observed, state, cancel)
             .await;
         (result, observed)
     }
 
-    async fn flush_connection_next_or<T, H, C>(
+    async fn begin_connection_flush_next_or<T, C>(
         &self,
         connection: &mut ConnettoConnection<T>,
-        http: &H,
         observed: &mut Vec<ClientEvent>,
         state: &mut ContentFlushState,
         cancel: C,
-    ) -> Result<ContentFlush, ContentError>
+    ) -> Result<ContentFlushStart<B>, ContentError>
     where
         T: Transport,
         T::Error: Display,
-        H: ContentHttp,
         C: core::future::Future<Output = ()>,
     {
         let waiting = db::outbox(connection.conn())?;
@@ -244,65 +306,79 @@ where
             _ => {
                 state.pending_ticket = None;
                 let Some(file_id) = waiting.first().copied() else {
-                    return Ok(ContentFlush::Empty);
+                    return Ok(ContentFlushStart::Complete(ContentFlush::Empty));
                 };
                 file_id
             }
         };
-        match self
-            .upload_from_connection_or(
-                connection,
-                http,
-                file_id,
-                observed,
-                cancel,
-                &mut state.pending_ticket,
-            )
-            .await
-        {
-            Ok(None) => Ok(ContentFlush::Interrupted),
-            Err(err) if err.is_retryable() => Ok(ContentFlush::Deferred),
-            Ok(Some(())) | Err(_) => {
-                db::dequeue(connection.conn(), file_id)?;
-                Ok(ContentFlush::Progressed)
+        let manifest = match db::load_manifest(connection.conn(), file_id) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                return Self::finish_attempt(
+                    connection,
+                    file_id,
+                    Err(ContentError::NoManifest { file_id }),
+                )
+                .map(ContentFlushStart::Complete);
             }
-        }
-    }
-
-    async fn upload_from_connection_or<T, H, C>(
-        &self,
-        connection: &mut ConnettoConnection<T>,
-        http: &H,
-        file_id: FileId,
-        observed: &mut Vec<ClientEvent>,
-        cancel: C,
-        pending_ticket: &mut Option<ticket::PendingTicket>,
-    ) -> Result<Option<()>, ContentError>
-    where
-        T: Transport,
-        T::Error: Display,
-        H: ContentHttp,
-        C: core::future::Future<Output = ()>,
-    {
-        let manifest = db::load_manifest(connection.conn(), file_id)?
-            .ok_or(ContentError::NoManifest { file_id })?;
+            Err(error) => {
+                return Self::finish_attempt(connection, file_id, Err(error))
+                    .map(ContentFlushStart::Complete);
+            }
+        };
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
-        let Some(url) = ticket::request_connection_or(
+        let upload_url = match ticket::request_connection_or(
             connection,
             file_id,
             ContentVerb::Write { declared_len },
             observed,
             cancel,
-            pending_ticket,
+            &mut state.pending_ticket,
         )
-        .await?
-        else {
-            return Ok(None);
+        .await
+        {
+            Ok(Some(url)) => url,
+            Ok(None) => return Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)),
+            Err(error) => {
+                return Self::finish_attempt(connection, file_id, Err(error))
+                    .map(ContentFlushStart::Complete);
+            }
         };
-        let store = EncryptingStore::new(self.store.clone(), &self.root_key);
-        upload::upload(http, &url, &manifest, &store)
-            .await
-            .map(Some)
+        Ok(ContentFlushStart::Upload(ContentUpload {
+            file_id,
+            upload_url,
+            manifest,
+            store: self.store.clone(),
+            root_key: self.root_key,
+        }))
+    }
+
+    /// Finishes local bookkeeping for an HTTP transfer.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox entry cannot be removed.
+    pub fn finish_upload<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        upload: &ContentUpload<B>,
+        result: Result<(), ContentError>,
+    ) -> Result<ContentFlush, ContentError> {
+        Self::finish_attempt(connection, upload.file_id, result)
+    }
+
+    fn finish_attempt<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+        result: Result<(), ContentError>,
+    ) -> Result<ContentFlush, ContentError> {
+        match result {
+            Err(error) if error.is_retryable() => Ok(ContentFlush::Deferred),
+            Ok(()) | Err(_) => {
+                db::dequeue(connection.conn(), file_id)?;
+                Ok(ContentFlush::Progressed)
+            }
+        }
     }
 
     /// Exports unsent content and replica data.
@@ -336,6 +412,7 @@ where
         let collisions = plan.replica_plan().collisions().len();
         write_import_chunks(&self.store, &self.root_key, &plan).await?;
         let outcome = apply_content_import(connection, &plan, &ImportChoices::keeping_the_file())?;
+        connection.replay_pending().await?;
         Ok((outcome, collisions))
     }
 }
@@ -547,7 +624,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`ContentError`] when chunk storage or replica import fails.
+    /// [`ContentError`] when chunk storage, replica import, or mutation replay fails.
     pub async fn apply_local_data_import(
         &self,
         plan: &ContentImportPlan,
@@ -555,9 +632,12 @@ where
     ) -> Result<ImportOutcome, ContentError> {
         let _writing = self.content_writes.lock().await;
         write_import_chunks(&self.store, &self.root_key, plan).await?;
-        self.client
+        let outcome = self
+            .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
-            .await
+            .await?;
+        self.client.replay_pending().await?;
+        Ok(outcome)
     }
 
     /// Registers a further local source, asked after the ones already there.

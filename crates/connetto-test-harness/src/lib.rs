@@ -8,11 +8,7 @@
 //! aggregate re-execution through [`PgReadConnector`]. It mirrors the
 //! wiring in `crates/connetto-server/src/bin/connetto-server.rs` main.
 //!
-//! Every test starts its own Postgres, and its own authorization service if it
-//! asks for one, so nothing is shared and nothing is provisioned by hand: no
-//! environment variable names a service, no lock orders one test against
-//! another, and one replication slot name is free because one database serves
-//! one test. Dropping the [`Fixture`] stops what it started.
+//! Every test starts its own Postgres and authorization service. Fixtures overlap unless a process-global counter measurement calls [`Fixture::acquire_exclusive`], which excludes other fixtures in that test binary.
 //!
 //! The fixture-setup helpers run schema, role, policy, publication, and slot
 //! statements through [`diesel::sql_query`]. These are DDL and vendor
@@ -58,7 +54,7 @@ use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinHandle;
 
 pub mod fanout;
@@ -499,6 +495,8 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
     .await;
 }
 
+static COUNTER_SCOPE: RwLock<()> = RwLock::const_new(());
+
 /// One test's own Postgres, and the authorization service it may ask for.
 ///
 /// Dropping the fixture stops whatever it started, so a test needs no cleanup
@@ -511,6 +509,8 @@ pub struct Fixture {
     /// Started on the first ask, because most tests never ask and an unused
     /// service is a container start for nothing.
     fga: OnceCell<Authorization>,
+    _shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
+    _exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
 }
 
 /// The authorization service one fixture owns, and where it listens.
@@ -527,6 +527,20 @@ impl Fixture {
     ///
     /// Panics when the Docker daemon is unreachable, when the container host address or mapped port cannot be resolved, or when watermark provisioning fails, all of which are test setup failures.
     pub async fn acquire() -> Self {
+        let scope = COUNTER_SCOPE.read().await;
+        Self::acquire_with(Some(scope), None).await
+    }
+
+    /// Start a fixture isolated from shared fixtures for process-global counter measurements.
+    pub async fn acquire_exclusive() -> Self {
+        let scope = COUNTER_SCOPE.write().await;
+        Self::acquire_with(None, Some(scope)).await
+    }
+
+    async fn acquire_with(
+        shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
+        exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+    ) -> Self {
         if let Some(directives) = std::env::var("CONNETTO_TEST_LOG")
             .ok()
             .filter(|directives| !directives.is_empty())
@@ -541,10 +555,6 @@ impl Fixture {
             .with_exposed_port(POSTGRES_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stderr(POSTGRES_READY))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
-            // This replaces the image's own command outright, so every flag
-            // belongs here: `wal_level=logical` is what a replication slot
-            // needs, and `fsync=off` costs a database that lives for one test
-            // nothing.
             .with_cmd(["-c", "wal_level=logical", "-c", "fsync=off"])
             .with_labels(container_labels("postgres"))
             .with_startup_timeout(STARTUP_TIMEOUT)
@@ -558,16 +568,14 @@ impl Fixture {
             .expect("the mapped postgres port");
         let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
         let admin = pool_when_ready(&admin_url).await;
-        // Every session's handshake reads its client's durable mutation
-        // watermark from this table, so it must exist for any session, even one
-        // that never writes. A write-path test that grants a role on it does so
-        // in its own setup, after acquire.
         provision_watermark(&admin).await;
         Self {
             admin_url,
             admin,
             _postgres: postgres,
             fga: OnceCell::new(),
+            _shared_counter_scope: shared_counter_scope,
+            _exclusive_counter_scope: exclusive_counter_scope,
         }
     }
 

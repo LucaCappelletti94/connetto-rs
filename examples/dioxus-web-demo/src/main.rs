@@ -850,7 +850,9 @@ fn AuthBanner() -> Element {
                 expiry_warn.set(None);
                 return;
             };
-            let pending = request_unsynced().await.unwrap_or_default();
+            let Ok(pending) = request_unsynced().await else {
+                return;
+            };
             let now_f64 = js_sys::Date::now();
             // Deliberate truncation: milliseconds since epoch, always finite and non-negative.
             debug_assert!(
@@ -925,7 +927,7 @@ fn AuthBanner() -> Element {
             let now_secs = (now_f64 / 1000.0) as u64;
             let days = secs.saturating_sub(now_secs) / 86400;
             format!(
-                "Session lapses in {days} day(s). {n} local write(s) at risk. Connect to refresh."
+                "Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh."
             )
         });
 
@@ -1111,7 +1113,7 @@ enum LogoutState {
 ///
 /// "Log out, keep local data" keeps the encrypted replica so a future login
 /// with the same account resumes from the persisted cursor. "Delete local data
-/// and log out" checks for unsynced writes first and confirms before losing any.
+/// and log out" checks for pending local work first and confirms before losing any.
 #[component]
 #[allow(non_snake_case)]
 fn LogoutControls() -> Element {
@@ -1176,7 +1178,7 @@ fn LogoutControls() -> Element {
         LogoutState::ConfirmDelete { unsynced_count } => rsx! {
             div { class: "logout-confirm",
                 p {
-                    "You have {unsynced_count} unsynced write(s) that would be permanently lost."
+                    "You have {unsynced_count} pending local item(s) that would be permanently lost."
                 }
                 div { class: "row",
                     button { onclick: on_confirm, "Confirm: delete and log out" }

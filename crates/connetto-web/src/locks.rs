@@ -55,6 +55,12 @@ impl HeldLock {
     /// Release the lock explicitly, simulating the holder's death for the
     /// watcher side.
     pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
         let _ = self.release.call0(&JsValue::NULL);
     }
 }

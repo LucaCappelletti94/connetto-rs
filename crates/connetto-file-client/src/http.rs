@@ -122,7 +122,7 @@ mod browser {
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{
         AbortController, AbortSignal, DedicatedWorkerGlobalScope, DomException, Headers, Request,
-        RequestInit, Response, Url,
+        RequestInit, RequestRedirect, Response, Url,
     };
 
     use super::{ContentHttp, HttpReply};
@@ -205,6 +205,7 @@ mod browser {
         validate_url(url)?;
         let init = RequestInit::new();
         init.set_signal(Some(signal));
+        init.set_redirect(RequestRedirect::Error);
         init.set_method(method);
         let headers = Headers::new().map_err(|value| error("create headers", &value))?;
         if let Some((bytes, content_type)) = body {

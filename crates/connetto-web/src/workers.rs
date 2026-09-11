@@ -32,7 +32,7 @@ use core::future::Future;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use connetto_file_client::{BrowserStore, ContentArchive};
+use connetto_file_client::{BrowserStore, BrowserStoreError, ContentArchive};
 use js_sys::Promise;
 use sha2::{Digest, Sha256};
 use wasm_bindgen::closure::Closure;
@@ -696,30 +696,51 @@ async fn apply_pending_wipes(
     key_store: &crate::auth::IdbKeyStore,
 ) -> Result<(), JsValue> {
     for pending in crate::storage::pending_wipes().await.map_err(to_js)? {
-        if let Some(namespace) = &pending.content_namespace {
+        let content_removed = if let Some(namespace) = &pending.content_namespace {
             let scope: web_sys::DedicatedWorkerGlobalScope =
                 js_sys::global()
                     .dyn_into()
                     .map_err(|value: js_sys::Object| {
                         JsValue::from_str(&format!("db worker scope: {value:?}"))
                     })?;
-            BrowserStore::remove(&scope, namespace)
+            match BrowserStore::remove(&scope, namespace).await {
+                Ok(()) => true,
+                Err(error @ BrowserStoreError::InvalidNamespace { .. }) => {
+                    return Err(to_js(error));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        replica = %pending.replica,
+                        error = %error,
+                        "db worker: content wipe deferred while browser storage is unavailable"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if !pending.replica_deleted() {
+            crate::storage::wipe_replica(
+                storage,
+                key_store,
+                &pending.replica,
+                &crate::auth::PendingWork::default(),
+                true,
+            )
+            .await
+            .map_err(to_js)?;
+        }
+        if content_removed {
+            crate::storage::acknowledge_pending_wipe(&pending)
+                .await
+                .map_err(to_js)?;
+        } else if !pending.replica_deleted() {
+            crate::storage::defer_pending_content_wipe(&pending)
                 .await
                 .map_err(to_js)?;
         }
-        crate::storage::wipe_replica(
-            storage,
-            key_store,
-            &pending.replica,
-            &crate::auth::PendingWork::default(),
-            true,
-        )
-        .await
-        .map_err(to_js)?;
-        crate::storage::clear_pending_wipe(&pending.replica)
-            .await
-            .map_err(to_js)?;
-        tracing::info!(replica = %pending.replica, "db worker: carried out a pending data wipe");
+        tracing::info!(replica = %pending.replica, "db worker: advanced a pending data wipe");
     }
     Ok(())
 }
@@ -1318,19 +1339,31 @@ where
 {
     let channel = BroadcastChannel::new(EXPORT_CHANNEL)
         .map_err(|err| JsValue::from_str(&format!("export channel: {err:?}")))?;
+    let generation = Rc::new(rosetta_uuid::Uuid::new_v4().to_string());
     let export = Rc::new(export);
     let listener = {
         let channel = channel.clone();
+        let generation = Rc::clone(&generation);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let Some(scope) = decode_export_request(&event.data()) else {
+            if is_export_generation_request(&event.data()) {
+                if let Ok(reply) = export_generation_reply(&generation) {
+                    let _ = channel.post_message(&reply);
+                }
+                return;
+            }
+            let Some((requested_generation, scope)) = decode_export_request(&event.data()) else {
                 return;
             };
+            if requested_generation != *generation {
+                return;
+            }
             let channel = channel.clone();
+            let generation = Rc::clone(&generation);
             let export = Rc::clone(&export);
             spawn_local(async move {
                 let reply = match export(scope).await {
-                    Ok(bytes) => export_reply_ok(&bytes),
-                    Err(err) => export_reply_failed(&err.to_string()),
+                    Ok(bytes) => export_reply_ok(&generation, &bytes),
+                    Err(err) => export_reply_failed(&generation, &err.to_string()),
                 };
                 match reply {
                     Ok(reply) => {
@@ -1418,19 +1451,42 @@ where
 const EXPORT_REPLY_OK: &str = "export";
 /// `kind` of a reply carrying an export failure.
 const EXPORT_REPLY_FAILED: &str = "export-failed";
+/// `kind` of a worker-generation reply.
+const EXPORT_GENERATION_REPLY: &str = "export-generation";
 /// `kind` of a reply carrying import counts.
 const IMPORT_REPLY_OK: &str = "import";
 /// `kind` of a reply carrying an import failure.
 const IMPORT_REPLY_FAILED: &str = "import-failed";
 
-/// Build the export success reply: `{ kind: "export", bytes: Uint8Array }`.
-fn export_reply_ok(bytes: &[u8]) -> Result<JsValue, JsValue> {
+/// Build the worker-generation reply.
+fn export_generation_reply(generation: &str) -> Result<JsValue, JsValue> {
+    let reply = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &reply,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(EXPORT_GENERATION_REPLY),
+    )?;
+    set_export_generation(&reply, generation)?;
+    Ok(reply.into())
+}
+
+fn set_export_generation(reply: &js_sys::Object, generation: &str) -> Result<bool, JsValue> {
+    js_sys::Reflect::set(
+        reply,
+        &JsValue::from_str("generation"),
+        &JsValue::from_str(generation),
+    )
+}
+
+/// Build the export success reply.
+fn export_reply_ok(generation: &str, bytes: &[u8]) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_OK),
     )?;
+    set_export_generation(&reply, generation)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("bytes"),
@@ -1439,14 +1495,15 @@ fn export_reply_ok(bytes: &[u8]) -> Result<JsValue, JsValue> {
     Ok(reply.into())
 }
 
-/// Build the export failure reply: `{ kind: "export-failed", error: String }`.
-fn export_reply_failed(error: &str) -> Result<JsValue, JsValue> {
+/// Build the export failure reply.
+fn export_reply_failed(generation: &str, error: &str) -> Result<JsValue, JsValue> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("kind"),
         &JsValue::from_str(EXPORT_REPLY_FAILED),
     )?;
+    set_export_generation(&reply, generation)?;
     js_sys::Reflect::set(
         &reply,
         &JsValue::from_str("error"),
@@ -1499,8 +1556,15 @@ fn import_reply_failed(error: &str) -> Result<JsValue, JsValue> {
 type ExportReply = Result<Vec<u8>, String>;
 
 /// Where the channel listener leaves the reply for the awaiting caller.
-type ExportSlot = Rc<RefCell<Option<ExportReply>>>;
+#[derive(Default)]
+struct ExportWait {
+    generation: Option<String>,
+    replaced: bool,
+    result: Option<ExportReply>,
+}
 
+/// Where the channel listener records the worker generation and reply.
+type ExportSlot = Rc<RefCell<ExportWait>>;
 /// One import reply: the outcome counts and collision total, or an error.
 type ImportReply = Result<(ImportOutcome, usize), String>;
 
@@ -1532,31 +1596,63 @@ const POLL_MS: i32 = 25;
 pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay::ExportRefused> {
     let channel = BroadcastChannel::new(EXPORT_CHANNEL)
         .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
-    let result: ExportSlot = Rc::new(RefCell::new(None));
+    let state: ExportSlot = Rc::new(RefCell::new(ExportWait::default()));
     let on_message = {
-        let result = Rc::clone(&result);
+        let state = Rc::clone(&state);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(reply) = decode_export_reply(&event.data()) {
-                result.borrow_mut().get_or_insert(reply);
+            if let Some(generation) = decode_export_generation(&event.data()) {
+                let mut state = state.borrow_mut();
+                match &state.generation {
+                    Some(expected) if expected != &generation => state.replaced = true,
+                    None => state.generation = Some(generation),
+                    Some(_) => {}
+                }
+                return;
+            }
+            let Some((generation, reply)) = decode_export_reply(&event.data()) else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            if state.generation.as_deref() == Some(generation.as_str()) {
+                state.result.get_or_insert(reply);
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let request = build_export_request(scope);
-    let posted = channel.post_message(&request);
+    let generation_request = build_export_generation_request();
+    let mut posted = channel.post_message(&generation_request);
     while posted.is_ok()
-        && result.borrow().is_none()
+        && state.borrow().generation.is_none()
+        && !state.borrow().replaced
         && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
     {
         sleep_ms(POLL_MS).await;
+        if state.borrow().generation.is_none() {
+            posted = channel.post_message(&generation_request);
+        }
+    }
+    let generation = state.borrow().generation.clone();
+    if let Some(generation) = generation
+        && !state.borrow().replaced
+    {
+        posted = channel.post_message(&build_export_request(scope, &generation));
+        while posted.is_ok()
+            && state.borrow().result.is_none()
+            && !state.borrow().replaced
+            && crate::locks::lock_is_held(DB_ALIVE_LOCK).await
+        {
+            let _ = channel.post_message(&generation_request);
+            sleep_ms(POLL_MS).await;
+        }
     }
     channel.set_onmessage(None);
     channel.close();
     drop(on_message);
-    match result.borrow_mut().take() {
-        Some(Ok(bytes)) => Ok(bytes),
-        Some(Err(err)) => Err(crate::relay::ExportRefused::Failed(err)),
-        None => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
+    let mut state = state.borrow_mut();
+    match state.result.take() {
+        Some(Ok(bytes)) if !state.replaced => Ok(bytes),
+        Some(Err(err)) if !state.replaced => Err(crate::relay::ExportRefused::Failed(err)),
+        _ => Err(crate::relay::ExportRefused::Gone(crate::relay::HubGone)),
     }
 }
 
@@ -1614,63 +1710,92 @@ pub async fn request_import(
     }
 }
 
-/// Decode an export request from a channel message: `{ kind: "export?", scope }`.
-fn decode_export_request(data: &JsValue) -> Option<ExportScope> {
-    let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
+fn export_message_kind(data: &JsValue) -> Option<String> {
+    js_sys::Reflect::get(data, &JsValue::from_str("kind"))
         .ok()?
-        .as_string()?;
-    if kind != "export?" {
-        return None;
-    }
-    let scope_str = js_sys::Reflect::get(data, &JsValue::from_str("scope"))
-        .ok()?
-        .as_string()?;
-    match scope_str.as_str() {
-        "everything" => Some(ExportScope::Everything),
-        "unsynced" => Some(ExportScope::Unsynced),
-        _ => None,
-    }
+        .as_string()
 }
 
-/// Build the export request object: `{ kind: "export?", scope }`.
-fn build_export_request(scope: ExportScope) -> JsValue {
-    let obj = js_sys::Object::new();
-    let scope_str = match scope {
+fn export_message_generation(data: &JsValue) -> Option<String> {
+    js_sys::Reflect::get(data, &JsValue::from_str("generation"))
+        .ok()?
+        .as_string()
+}
+
+fn is_export_generation_request(data: &JsValue) -> bool {
+    export_message_kind(data).as_deref() == Some("generation?")
+}
+
+fn decode_export_generation(data: &JsValue) -> Option<String> {
+    (export_message_kind(data).as_deref() == Some(EXPORT_GENERATION_REPLY))
+        .then(|| export_message_generation(data))
+        .flatten()
+}
+
+fn build_export_generation_request() -> JsValue {
+    let request = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &request,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str("generation?"),
+    );
+    request.into()
+}
+
+fn decode_export_request(data: &JsValue) -> Option<(String, ExportScope)> {
+    if export_message_kind(data).as_deref() != Some("export?") {
+        return None;
+    }
+    let generation = export_message_generation(data)?;
+    let scope = match js_sys::Reflect::get(data, &JsValue::from_str("scope"))
+        .ok()?
+        .as_string()?
+        .as_str()
+    {
+        "everything" => ExportScope::Everything,
+        "unsynced" => ExportScope::Unsynced,
+        _ => return None,
+    };
+    Some((generation, scope))
+}
+
+fn build_export_request(scope: ExportScope, generation: &str) -> JsValue {
+    let request = js_sys::Object::new();
+    let scope = match scope {
         ExportScope::Everything => "everything",
         ExportScope::Unsynced => "unsynced",
     };
     let _ = js_sys::Reflect::set(
-        &obj,
+        &request,
         &JsValue::from_str("kind"),
         &JsValue::from_str("export?"),
     );
+    let _ = set_export_generation(&request, generation);
     let _ = js_sys::Reflect::set(
-        &obj,
+        &request,
         &JsValue::from_str("scope"),
-        &JsValue::from_str(scope_str),
+        &JsValue::from_str(scope),
     );
-    obj.into()
+    request.into()
 }
 
-/// Read one [`EXPORT_CHANNEL`] message as an export reply, or `None`.
-fn decode_export_reply(data: &JsValue) -> Option<ExportReply> {
-    let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
-        .ok()?
-        .as_string()?;
-    match kind.as_str() {
+fn decode_export_reply(data: &JsValue) -> Option<(String, ExportReply)> {
+    let generation = export_message_generation(data)?;
+    let reply = match export_message_kind(data)?.as_str() {
         EXPORT_REPLY_OK => {
             let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
-            Some(Ok(js_sys::Uint8Array::new(&bytes).to_vec()))
+            Ok(js_sys::Uint8Array::new(&bytes).to_vec())
         }
         EXPORT_REPLY_FAILED => {
             let error = js_sys::Reflect::get(data, &JsValue::from_str("error"))
                 .ok()
-                .and_then(|v| v.as_string())
+                .and_then(|value| value.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Some(Err(error))
+            Err(error)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((generation, reply))
 }
 
 /// One count carried as a JS number, or `None` when the value is not a whole

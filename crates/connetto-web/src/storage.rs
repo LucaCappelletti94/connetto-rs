@@ -332,6 +332,9 @@ pub struct PendingWipe {
     pub replica: String,
     /// Persistent browser content namespace to remove.
     pub content_namespace: Option<String>,
+    /// Whether the replica is already gone and only content cleanup remains.
+    #[serde(default)]
+    replica_deleted: bool,
 }
 
 impl PendingWipe {
@@ -341,7 +344,18 @@ impl PendingWipe {
         Self {
             replica: replica.into(),
             content_namespace,
+            replica_deleted: false,
         }
+    }
+
+    pub(crate) const fn replica_deleted(&self) -> bool {
+        self.replica_deleted
+    }
+
+    fn after_replica_deleted(&self) -> Self {
+        let mut pending = self.clone();
+        pending.replica_deleted = true;
+        pending
     }
 }
 
@@ -416,25 +430,62 @@ pub(crate) async fn pending_wipes() -> Result<Vec<PendingWipe>, AuthError> {
         .map_err(|err| AuthError::Store(format!("decode pending wipe: {err}")))
 }
 
-pub(crate) async fn clear_pending_wipe(replica: &str) -> Result<(), AuthError> {
+async fn update_pending_wipe(
+    wipe: &PendingWipe,
+    replacement: Option<&PendingWipe>,
+) -> Result<(), AuthError> {
     let db = open_pending_wipes().await?;
     let tx = db
         .transaction(WIPE_STORE)
         .with_mode(TransactionMode::Readwrite)
         .build()
-        .map_err(|err| AuthError::Store(format!("clear tx: {err}")))?;
+        .map_err(|err| AuthError::Store(format!("update wipe tx: {err}")))?;
     let store = tx
         .object_store(WIPE_STORE)
-        .map_err(|err| AuthError::Store(format!("clear store: {err}")))?;
-    store
-        .delete(replica)
+        .map_err(|err| AuthError::Store(format!("update wipe store: {err}")))?;
+    let current: Option<String> = store
+        .get(wipe.replica.as_str())
         .primitive()
-        .map_err(|err| AuthError::Store(format!("clear delete: {err}")))?
+        .map_err(|err| AuthError::Store(format!("update wipe get: {err}")))?
         .await
-        .map_err(|err| AuthError::Store(format!("clear delete await: {err}")))?;
+        .map_err(|err| AuthError::Store(format!("update wipe get await: {err}")))?;
+    let matches = current
+        .map(decode_pending_wipe)
+        .transpose()
+        .map_err(|err| AuthError::Store(format!("update wipe decode: {err}")))?
+        .as_ref()
+        == Some(wipe);
+    if matches {
+        if let Some(replacement) = replacement {
+            let encoded = serde_json::to_string(replacement)
+                .map_err(|err| AuthError::Store(format!("update wipe encode: {err}")))?;
+            store
+                .put(encoded)
+                .with_key(wipe.replica.as_str())
+                .primitive()
+                .map_err(|err| AuthError::Store(format!("update wipe put: {err}")))?
+                .await
+                .map_err(|err| AuthError::Store(format!("update wipe put await: {err}")))?;
+        } else {
+            store
+                .delete(wipe.replica.as_str())
+                .primitive()
+                .map_err(|err| AuthError::Store(format!("update wipe delete: {err}")))?
+                .await
+                .map_err(|err| AuthError::Store(format!("update wipe delete await: {err}")))?;
+        }
+    }
     tx.commit()
         .await
-        .map_err(|err| AuthError::Store(format!("clear commit: {err}")))
+        .map_err(|err| AuthError::Store(format!("update wipe commit: {err}")))
+}
+
+pub(crate) async fn acknowledge_pending_wipe(wipe: &PendingWipe) -> Result<(), AuthError> {
+    update_pending_wipe(wipe, None).await
+}
+
+pub(crate) async fn defer_pending_content_wipe(wipe: &PendingWipe) -> Result<(), AuthError> {
+    update_pending_wipe(wipe, Some(&wipe.after_replica_deleted())).await
 }
 
 /// Takes every outstanding wipe record.
@@ -445,7 +496,83 @@ pub(crate) async fn clear_pending_wipe(replica: &str) -> Result<(), AuthError> {
 pub async fn take_pending_wipes() -> Result<Vec<PendingWipe>, AuthError> {
     let pending = pending_wipes().await?;
     for wipe in &pending {
-        clear_pending_wipe(&wipe.replica).await?;
+        acknowledge_pending_wipe(wipe).await?;
     }
     Ok(pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::{
+        PendingWipe, acknowledge_pending_wipe, defer_pending_content_wipe, mark_wipe_pending,
+        pending_wipes,
+    };
+    use crate::auth::PendingWork;
+
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    #[wasm_bindgen_test]
+    async fn acknowledging_an_observed_wipe_preserves_its_replacement() {
+        let first = PendingWipe::new(
+            "r68-replaced-pending-wipe.sqlite",
+            Some("r68-first-content".to_owned()),
+        );
+        let replacement = PendingWipe::new(
+            first.replica.clone(),
+            Some("r68-replacement-content".to_owned()),
+        );
+        mark_wipe_pending(&first, &PendingWork::default(), false)
+            .await
+            .expect("mark first wipe");
+        let observed = pending_wipes()
+            .await
+            .expect("list first wipe")
+            .into_iter()
+            .find(|wipe| wipe.replica == first.replica)
+            .expect("find first wipe");
+        mark_wipe_pending(&replacement, &PendingWork::default(), false)
+            .await
+            .expect("replace wipe");
+
+        acknowledge_pending_wipe(&observed)
+            .await
+            .expect("acknowledge observed wipe");
+
+        let pending = pending_wipes().await.expect("list replacement");
+        assert!(
+            pending.contains(&replacement),
+            "acknowledging the old record must preserve its replacement"
+        );
+        acknowledge_pending_wipe(&replacement)
+            .await
+            .expect("clean replacement");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_failed_content_removal_leaves_only_content_cleanup_pending() {
+        let wipe = PendingWipe::new(
+            "r68-deferred-content-wipe.sqlite",
+            Some("r68-deferred-content".to_owned()),
+        );
+        mark_wipe_pending(&wipe, &PendingWork::default(), false)
+            .await
+            .expect("mark wipe");
+
+        defer_pending_content_wipe(&wipe)
+            .await
+            .expect("defer content cleanup");
+
+        let pending = pending_wipes().await.expect("list deferred cleanup");
+        let deferred = pending
+            .iter()
+            .find(|pending| pending.replica == wipe.replica)
+            .expect("find deferred cleanup");
+        assert!(deferred.replica_deleted());
+        assert_eq!(deferred.content_namespace, wipe.content_namespace);
+        acknowledge_pending_wipe(deferred)
+            .await
+            .expect("clean deferred wipe");
+    }
 }

@@ -27,6 +27,7 @@ use connetto_web::{
 use diesel::prelude::*;
 use futures_channel::mpsc;
 use futures_util::StreamExt;
+use futures_util::future::{Either, select};
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -37,6 +38,7 @@ use web_sys::{DedicatedWorkerGlobalScope, File, Request, Response};
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
+const TEST_LOCK: &str = "connetto-content-archive-test";
 const PHOTO: &[u8] = b"a photograph written offline and restored onto a replacement browser worker";
 
 diesel::table! {
@@ -54,6 +56,7 @@ struct TicketTransport {
     answers: mpsc::UnboundedSender<IncomingFrame>,
     completed_subscribes: Rc<Cell<u32>>,
     stall_subscribe: bool,
+    mutation_sent: Rc<Cell<bool>>,
 }
 
 impl TicketTransport {
@@ -89,6 +92,7 @@ impl TicketTransport {
             answers,
             completed_subscribes,
             stall_subscribe: false,
+            mutation_sent: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -106,7 +110,12 @@ impl Transport for TicketTransport {
             self.stall_subscribe = false;
         }
         let completed_subscribes = Rc::clone(&self.completed_subscribes);
+        let mutation_sent = Rc::clone(&self.mutation_sent);
         if let ControlMessage::ContentTicketRequest(request) = message {
+            assert!(
+                mutation_sent.get(),
+                "restored mutations must precede the content ticket"
+            );
             let file_id = FileId::from_bytes(request.file_id);
             self.answers
                 .unbounded_send(IncomingFrame::Control(ControlMessage::ContentTicketGrant(
@@ -131,10 +140,10 @@ impl Transport for TicketTransport {
         }
     }
 
-    fn send_bulk(
-        &mut self,
-        _message: BulkMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
+    fn send_bulk(&mut self, message: BulkMessage) -> impl Future<Output = Result<(), Self::Error>> {
+        if matches!(message, BulkMessage::MutationPatch(_)) {
+            self.mutation_sent.set(true);
+        }
         ready(Ok(()))
     }
 
@@ -177,6 +186,7 @@ async fn connected_client() -> ConnettoClient<TicketTransport> {
 
 #[wasm_bindgen_test]
 async fn an_offline_photo_restores_displays_locally_and_uploads() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
     let (source_archive, file_id) = stage_source().await;
     let archive = relay_round_trip(&source_archive).await;
     let replacement = restore_target(&archive).await;
@@ -206,11 +216,13 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
     );
     drop(fetch);
     assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    serial.release();
 }
 
 /// A relay import uploads restored content without a tab-owned client.
 #[wasm_bindgen_test]
 async fn a_relay_import_drives_the_worker_outbox() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
     let (archive, _) = stage_source().await;
     let worker =
         ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
@@ -235,6 +247,58 @@ async fn a_relay_import_drives_the_worker_outbox() {
     }
     drop(fetch);
     assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    serial.release();
+}
+
+#[wasm_bindgen_test]
+async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let (archive, _) = stage_source().await;
+    let worker =
+        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
+            .expect("open relay replica");
+    let scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .expect("dedicated worker");
+    let store = BrowserStore::install(&scope, "r68-concurrent-uploader")
+        .await
+        .expect("install content store");
+    let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [4; 32]));
+    let uploaded = Rc::new(RefCell::new(Vec::new()));
+    let fetch = install_blocked_content_fetch(&uploaded);
+    hub.import_local_data(archive).await.expect("relay import");
+    for _ in 0..100 {
+        if fetch.started.get() {
+            break;
+        }
+        timeout_ms(10).await;
+    }
+    assert!(fetch.started.get(), "the content transfer must start");
+
+    let answer = select(Box::pin(hub.unsynced()), Box::pin(timeout_ms(1_000))).await;
+    fetch.release();
+    let pending = match answer {
+        Either::Left((answer, _)) => answer.expect("pending-work reply"),
+        Either::Right(_) => panic!("the hub did not service local work during content transfer"),
+    };
+    assert_eq!(pending.content_files, 1);
+    for _ in 0..100 {
+        if !uploaded.borrow().is_empty() {
+            break;
+        }
+        timeout_ms(10).await;
+    }
+    assert_eq!(*uploaded.borrow(), [PHOTO.to_vec()]);
+    let mut after = hub.unsynced().await.expect("post-upload pending work");
+    for _ in 0..100 {
+        if after.content_files == 0 {
+            break;
+        }
+        timeout_ms(10).await;
+        after = hub.unsynced().await.expect("retry pending-work query");
+    }
+    assert_eq!(after.content_files, 0);
+    serial.release();
 }
 
 async fn stage_source() -> (Vec<u8>, FileId) {
@@ -372,15 +436,57 @@ struct FetchReplacement {
     _closure: Closure<dyn FnMut(JsValue) -> Promise>,
 }
 
+struct BlockedFetch {
+    _fetch: FetchReplacement,
+    started: Rc<Cell<bool>>,
+    release: Function,
+}
+
+impl BlockedFetch {
+    fn release(&self) {
+        self.release
+            .call0(&JsValue::UNDEFINED)
+            .expect("release upload");
+    }
+}
+
 fn install_content_fetch(uploaded: &Rc<RefCell<Vec<Vec<u8>>>>) -> FetchReplacement {
+    replace_content_fetch(uploaded, None)
+}
+
+fn install_blocked_content_fetch(uploaded: &Rc<RefCell<Vec<Vec<u8>>>>) -> BlockedFetch {
+    let resolver = Rc::new(RefCell::new(None));
+    let release = Rc::clone(&resolver);
+    let gate = Promise::new(&mut move |resolve, _reject| {
+        release.borrow_mut().replace(resolve);
+    });
+    let release = resolver.borrow_mut().take().expect("upload gate resolver");
+    let started = Rc::new(Cell::new(false));
+    let fetch = replace_content_fetch(uploaded, Some((Rc::clone(&started), gate)));
+    BlockedFetch {
+        _fetch: fetch,
+        started,
+        release,
+    }
+}
+
+fn replace_content_fetch(
+    uploaded: &Rc<RefCell<Vec<Vec<u8>>>>,
+    gate: Option<(Rc<Cell<bool>>, Promise)>,
+) -> FetchReplacement {
     let captured = Rc::clone(uploaded);
     let closure = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
         let request = value.dyn_into::<Request>().expect("fetch receives Request");
         let captured = Rc::clone(&captured);
+        let gate = gate.clone();
         future_to_promise(async move {
             let body = JsFuture::from(request.array_buffer()?).await?;
             let body = Uint8Array::new(&body).to_vec();
             if request.method() == "PUT" {
+                if let Some((started, gate)) = gate {
+                    started.set(true);
+                    JsFuture::from(gate).await?;
+                }
                 captured.borrow_mut().push(body);
                 response(None, 204)
             } else if request.url().contains("/intent?") {
@@ -442,4 +548,18 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
         .dyn_into::<Response>()?;
     let buffer = JsFuture::from(response.array_buffer()?).await?;
     Ok(Uint8Array::new(&buffer).to_vec())
+}
+
+async fn timeout_ms(ms: i32) {
+    let promise = Promise::new(&mut |resolve, _reject| {
+        let global = js_sys::global();
+        let set_timeout = Reflect::get(&global, &JsValue::from_str("setTimeout"))
+            .expect("read setTimeout")
+            .dyn_into::<Function>()
+            .expect("setTimeout function");
+        set_timeout
+            .call2(&global, &resolve, &JsValue::from_f64(f64::from(ms)))
+            .expect("schedule timeout");
+    });
+    JsFuture::from(promise).await.expect("timeout");
 }

@@ -30,7 +30,7 @@ const EVENTS: u64 = 5;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_two_executors_never_disagree_about_a_row() {
-    let fixture = Fixture::acquire().await;
+    let fixture = Fixture::acquire_exclusive().await;
 
     let settled = fanout_parity_run(&fixture, WATCHERS, EVENTS, PolicyShape::Row).await;
     assert_eq!(

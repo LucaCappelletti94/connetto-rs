@@ -75,7 +75,8 @@ use connetto_core::messages::{
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use connetto_file_client::{
-    BrowserHttp, BrowserStore, ContentArchive, ContentError, ContentFlush, ContentFlushState,
+    BrowserHttp, BrowserStore, ContentArchive, ContentError, ContentFlush, ContentFlushStart,
+    ContentFlushState,
 };
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -964,7 +965,9 @@ where
         return Ok(true);
     };
     let (queued, progressed) =
-        match flush_content_outbox(worker, state, content, events, &mut retry.flush).await? {
+        match flush_content_outbox(worker, state, notices, content, events, &mut retry.flush)
+            .await?
+        {
             ContentWalk::Complete { queued, progressed } => (queued, progressed),
             ContentWalk::Interrupted(Some(event)) => {
                 handle_hub_event(worker, state, notices, Some(content), event).await?;
@@ -1038,6 +1041,7 @@ where
 async fn flush_content_outbox<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
+    notices: &UnboundedSender<HubNotice>,
     content: &ContentArchive<BrowserStore>,
     events: &mut UnboundedReceiver<HubEvent>,
     flush_state: &mut ContentFlushState,
@@ -1046,27 +1050,58 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    let http = BrowserHttp::new();
     let mut interrupted = None;
     let cancel = async {
         interrupted = Some(events.recv().await);
     };
-    let (result, observed) = content
-        .flush_next_or(worker, &http, flush_state, cancel)
+    let (start, observed) = content
+        .begin_flush_next_or(worker, flush_state, cancel)
         .await;
     for event in observed {
         handle_worker_event(worker, state, event)?;
     }
-    let flush = match result {
-        Ok(flush) => flush,
+    let flush = match start {
+        Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
+            return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
+        }
+        Ok(ContentFlushStart::Complete(flush)) => flush,
+        Ok(ContentFlushStart::Upload(upload)) => {
+            let http = BrowserHttp::new();
+            let transfer = upload.transfer(&http);
+            tokio::pin!(transfer);
+            let mut events_open = true;
+            let mut event_error = None;
+            let result = loop {
+                if events_open {
+                    tokio::select! {
+                        result = &mut transfer => break result,
+                        event = events.recv() => match event {
+                            Some(event) => {
+                                if let Err(error) =
+                                    handle_hub_event(worker, state, notices, Some(content), event).await
+                                {
+                                    event_error = Some(error);
+                                    events_open = false;
+                                }
+                            }
+                            None => events_open = false,
+                        },
+                    }
+                } else {
+                    break transfer.await;
+                }
+            };
+            let flush = content.finish_upload(worker, &upload, result)?;
+            if let Some(error) = event_error {
+                return Err(error);
+            }
+            flush
+        }
         Err(err) => {
             tracing::warn!(error = %err, "content outbox walk failed");
             ContentFlush::Deferred
         }
     };
-    if flush == ContentFlush::Interrupted {
-        return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
-    }
     Ok(ContentWalk::Complete {
         queued: content.pending_files(worker)? > 0,
         progressed: flush == ContentFlush::Progressed,
@@ -1167,20 +1202,17 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    match content {
-        Some(content) => content
+    if let Some(content) = content {
+        content
             .import_local_data(worker, bytes)
             .await
-            .map_err(Into::into),
-        None => worker
-            .import_local_data(bytes)
-            .and_then(|plan| {
-                let collisions = plan.collisions().len();
-                worker
-                    .apply_import(&plan, &ImportChoices::keeping_the_file())
-                    .map(|outcome| (outcome, collisions))
-            })
-            .map_err(Into::into),
+            .map_err(Into::into)
+    } else {
+        let plan = worker.import_local_data(bytes)?;
+        let collisions = plan.collisions().len();
+        let outcome = worker.apply_import(&plan, &ImportChoices::keeping_the_file())?;
+        worker.replay_pending().await?;
+        Ok((outcome, collisions))
     }
 }
 

@@ -9,7 +9,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{Request, Response};
+use web_sys::{Request, RequestRedirect, Response};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -75,6 +75,7 @@ fn install_recording_fetch() -> (Rc<RefCell<Vec<SeenRequest>>>, FetchReplacement
         let request = value
             .dyn_into::<Request>()
             .expect("fetch receives a request");
+        assert_eq!(request.redirect(), RequestRedirect::Error);
         let captured = Rc::clone(&captured);
         future_to_promise(async move {
             let buffer = JsFuture::from(request.array_buffer()?).await?;

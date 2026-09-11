@@ -16,7 +16,8 @@ mod upload;
 pub use browser_store::{BrowserStore, BrowserStoreError};
 
 pub use client::{
-    ContentArchive, ContentClient, ContentEvent, ContentFlush, ContentFlushState, ContentImportPlan,
+    ContentArchive, ContentClient, ContentEvent, ContentFlush, ContentFlushStart,
+    ContentFlushState, ContentImportPlan, ContentUpload,
 };
 pub use error::ContentError;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};

@@ -670,9 +670,9 @@ fn app() -> Html {
                     if let Some(exp_secs) = expires_at {
                         let expiry_warn = expiry_warn.clone();
                         spawn_local(async move {
-                            let pending = connetto_web::auth::request_unsynced()
-                                .await
-                                .unwrap_or_default();
+                            let Ok(pending) = connetto_web::auth::request_unsynced().await else {
+                                return;
+                            };
                             let now_ms = js_sys::Date::now();
                             // Date.now() is always finite and non-negative (ms since epoch).
                             debug_assert!(now_ms.is_finite() && now_ms >= 0.0);
@@ -922,11 +922,11 @@ fn app() -> Html {
 
     // Expiry warning banner.
     let expiry_html = if let Some(warn) = (*expiry_warn).clone() {
-        let count = warn.unsynced.len();
+        let count = warn.pending_count();
         html! {
             <div class="expiry-warn">
                 { format!(
-                    "Session nearing expiry with {count} unsynced write(s). \
+                    "Session nearing expiry with {count} pending local item(s). \
                      Reconnect before the session lapses to avoid data loss."
                 ) }
             </div>

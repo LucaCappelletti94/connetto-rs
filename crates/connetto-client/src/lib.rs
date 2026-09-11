@@ -2453,6 +2453,20 @@ where
             }
             self.next_seq = self.next_seq.max(watermark.saturating_add(1));
         }
+        self.replay_pending().await
+    }
+
+    /// Replays every unacknowledged mutation on the current transport.
+    ///
+    /// Calling this while offline leaves the durable queue untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when encoding or sending a queued mutation fails.
+    pub async fn replay_pending(&mut self) -> Result<(), ClientError> {
+        if !self.is_connected() {
+            return Ok(());
+        }
         let replays: Vec<(u64, Vec<u8>)> = self
             .pending
             .iter()
