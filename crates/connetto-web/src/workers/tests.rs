@@ -368,19 +368,29 @@ async fn request_custody_without_worker_returns_timeout() {
     );
 }
 
-/// A relative glue URL must be resolved against the current location rather
-/// than fail URL parsing with `BootError::BootstrapUrl`.
-///
-/// The assertion that would have failed before the fix: `web_sys::Url::new("./db-worker.js")`
-/// throws on a relative argument, so `generated_bootstrap_url` returned
-/// `Err(BootError::BootstrapUrl(...))` for any relative URL.
+/// A relative glue URL resolves against the current location rather than failing to parse.
 #[wasm_bindgen_test]
 fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     let result =
         super::boot::spawn_db_worker("./db-worker.js", &super::boot::WorkerBootstrap::Generated);
     assert!(
         !matches!(result, Err(super::boot::BootError::BootstrapUrl(_))),
-        "a relative glue URL must not return BootstrapUrl: the URL must be resolved against \
-         the current location"
+        "a relative glue URL must resolve against the current location"
+    );
+}
+
+/// The generated bootstrap module imports the glue by absolute URL, because a blob module
+/// resolves a relative specifier against `blob:`.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
+    let source = super::boot::generated_bootstrap_source("./db-worker.js")
+        .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        !source.contains("\"./db-worker.js\""),
+        "the import specifier must not stay relative: {source}"
+    );
+    assert!(
+        source.contains("await import(\"http"),
+        "the import specifier must be absolute: {source}"
     );
 }

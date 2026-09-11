@@ -22,16 +22,20 @@ const IMPORT_REQUEST_KIND: &str = "import?";
 
 /// Maximum bytes a file may contain to be accepted for import.
 ///
-/// Matches the 2-gibibyte aggregate attachment ceiling in `connetto-client`.
+/// The whole archive is buffered in the worker to be read, so the ceiling is what a
+/// `wasm32` linear memory can hold beside the rows it decompresses.
 pub(crate) const MAX_IMPORT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
 
-/// An export the worker refused, carrying the reason it reported.
+/// An export the worker refused.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct ExportWorkerError(String);
+enum ExportWorkerError {
+    /// The worker reported this reason.
+    #[error("{0}")]
+    Failed(String),
+}
 
 type ExportReply = Result<Vec<u8>, ExportWorkerError>;
 
@@ -44,10 +48,13 @@ struct ExportWait {
 
 type ExportSlot = Rc<RefCell<ExportWait>>;
 
-/// An import the worker refused, carrying the reason it reported.
+/// An import the worker refused.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct ImportWorkerError(String);
+enum ImportWorkerError {
+    /// The worker reported this reason.
+    #[error("{0}")]
+    Failed(String),
+}
 
 type ImportReply = Result<(ImportOutcome, usize), ImportWorkerError>;
 
@@ -269,7 +276,7 @@ fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
                 .ok()
                 .and_then(|value| value.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Err(ExportWorkerError(error))
+            Err(ExportWorkerError::Failed(error))
         }
         _ => return None,
     };
@@ -298,7 +305,7 @@ fn decode_import_reply(data: &JsValue) -> Option<(ImportTag, ImportReply)> {
                 .ok()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "the worker gave no reason".to_owned());
-            Err(ImportWorkerError(error))
+            Err(ImportWorkerError::Failed(error))
         }
         _ => return None,
     };
@@ -784,7 +791,8 @@ pub async fn request_import(
     )]
     if file.size() > MAX_IMPORT_FILE_BYTES as f64 {
         return Err(crate::relay::ImportRefused::Failed(
-            "file exceeds the 2 GiB import limit".to_owned(),
+            "archive is above the 2 GiB a browser worker can buffer, import it from a native client"
+                .to_owned(),
         ));
     }
     let channel = BroadcastChannel::new(super::IMPORT_CHANNEL)

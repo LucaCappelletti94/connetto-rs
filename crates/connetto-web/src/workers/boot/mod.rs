@@ -319,18 +319,34 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
 }
 
 fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
+    let source = generated_bootstrap_source(glue_url)?;
+    let parts = js_sys::Array::of1(&JsValue::from_str(&source));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
+    web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))
+}
+
+/// Build the module source that imports the glue and initializes it against its wasm file.
+pub(super) fn generated_bootstrap_source(glue_url: &str) -> Result<String, BootError> {
     let base = current_location_href()?;
     let url = web_sys::Url::new_with_base(glue_url, &base)
         .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
+    // A blob module resolves a relative specifier against blob:, so the import needs the
+    // absolute URL captured before the pathname is rewritten.
+    let resolved_glue = url.href();
     let path = url.pathname();
     let wasm_path = path.strip_suffix(".js").map_or_else(
         || format!("{path}_bg.wasm"),
         |base| format!("{base}_bg.wasm"),
     );
     url.set_pathname(&wasm_path);
-    url.set_hash(""); // fragments are not meaningful for resource fetches
+    // A fragment is not meaningful for a resource fetch.
+    url.set_hash("");
     let wasm_url = url.href();
-    let source = format!(
+    Ok(format!(
         r#"try {{
   const mod = await import({glue});
   await mod.default({{ module_or_path: {wasm} }});
@@ -340,16 +356,9 @@ fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
   throw err;
 }}
 "#,
-        glue = js_string_literal(glue_url),
+        glue = js_string_literal(&resolved_glue),
         wasm = js_string_literal(&wasm_url),
-    );
-    let parts = js_sys::Array::of1(&JsValue::from_str(&source));
-    let options = web_sys::BlobPropertyBag::new();
-    options.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
-        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
-    web_sys::Url::create_object_url_with_blob(&blob)
-        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))
+    ))
 }
 
 fn js_string_literal(value: &str) -> String {
