@@ -41,6 +41,8 @@ mod grouped_wire;
 
 mod inprocess_loop;
 
+mod macro_hygiene;
+
 mod oidc_spine;
 
 mod openfga_live;

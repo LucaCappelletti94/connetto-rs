@@ -354,37 +354,42 @@ macro_rules! connetto_auth_tables {
                 connetto_sessions::session_id.eq(session_id)
             }
             fn session_row_for_update(session_id: $crate::SessionId) -> Self::SessionRow {
-                use diesel::{ExpressionMethods as _, QueryDsl as _};
-                connetto_sessions::table
-                    .filter(connetto_sessions::session_id.eq(session_id))
-                    .select((
+                use diesel::ExpressionMethods as _;
+                diesel::QueryDsl::for_update(diesel::QueryDsl::select(
+                    diesel::QueryDsl::filter(
+                        connetto_sessions::table,
+                        connetto_sessions::session_id.eq(session_id),
+                    ),
+                    (
                         connetto_sessions::user_id,
                         connetto_sessions::current_refresh_hash,
                         connetto_sessions::idle_deadline,
                         connetto_sessions::absolute_deadline,
                         connetto_sessions::revoked,
-                    ))
-                    .for_update()
+                    ),
+                ))
             }
             fn rotation_update(
                 session_id: $crate::SessionId,
                 current_refresh_hash: Vec<u8>,
                 idle_deadline: $crate::authn::schema::Instant,
             ) -> Self::RotationUpdate {
-                use diesel::{ExpressionMethods as _, QueryDsl as _};
-                diesel::update(
-                    connetto_sessions::table.filter(connetto_sessions::session_id.eq(session_id)),
-                )
+                use diesel::ExpressionMethods as _;
+                diesel::update(diesel::QueryDsl::filter(
+                    connetto_sessions::table,
+                    connetto_sessions::session_id.eq(session_id),
+                ))
                 .set((
                     connetto_sessions::current_refresh_hash.eq(current_refresh_hash),
                     connetto_sessions::idle_deadline.eq(idle_deadline),
                 ))
             }
             fn revoke_update(session_id: $crate::SessionId) -> Self::RevokeUpdate {
-                use diesel::{ExpressionMethods as _, QueryDsl as _};
-                diesel::update(
-                    connetto_sessions::table.filter(connetto_sessions::session_id.eq(session_id)),
-                )
+                use diesel::ExpressionMethods as _;
+                diesel::update(diesel::QueryDsl::filter(
+                    connetto_sessions::table,
+                    connetto_sessions::session_id.eq(session_id),
+                ))
                 .set(connetto_sessions::revoked.eq(true))
             }
 
