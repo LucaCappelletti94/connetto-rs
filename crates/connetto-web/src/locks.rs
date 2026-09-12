@@ -46,6 +46,10 @@ impl HeldLock {
 
 /// Acquire and hold the lock `name`. Resolves once the lock is actually
 /// held, so a caller can order acquisition strictly before connecting.
+///
+/// # Panics
+///
+/// Panics if the browser's `LockManager.request` callback is invoked but the `Promise` constructor does not call its resolver function synchronously, which cannot occur in any conforming browser environment.
 pub async fn hold_lock(name: &str) -> HeldLock {
     let (tx, rx) = oneshot::channel::<js_sys::Function>();
     let callback = Closure::once_into_js(move |_lock: JsValue| -> JsValue {

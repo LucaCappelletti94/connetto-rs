@@ -36,6 +36,13 @@ impl<E: std::error::Error + 'static> From<bb8::RunError<E>> for SweepError {
 }
 
 /// Runs one sweep cycle and returns the number of artifacts removed.
+///
+/// # Errors
+///
+/// Returns `SweepError::GracePeriodOutOfRange` if `grace` cannot be converted to a `chrono::TimeDelta`.
+/// Returns `SweepError::Pool` if a database connection cannot be acquired from the pool.
+/// Returns `SweepError::Db` on any database query failure.
+/// Returns `SweepError::Store` if the chunk store fails to delete a chunk.
 pub async fn sweep<S: ConnettoFileSchema>(
     pool: &DbPool,
     store: &AnyStore,

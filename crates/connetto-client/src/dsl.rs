@@ -121,8 +121,10 @@ pub mod wire {
         // 2^53 is the largest magnitude at which every integer is exactly
         // representable in an f64, so within it the cast below cannot truncate.
         if f.is_finite() && f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
-            // Intended conversion: integral and range-checked just above.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "integral and within 2^53, checked just above"
+            )]
             return Some(f as i64);
         }
         None
@@ -178,16 +180,19 @@ fn decode_nullable_f64(json: &str) -> Result<Option<f64>, ClientError> {
 
 /// Decode a non-null float push, narrowing to `f32`.
 fn decode_f32(json: &str) -> Result<f32, ClientError> {
-    // Intended narrowing: the column's declared SQL type is a 4-byte float,
-    // so the app's own model already accepts this precision.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the column's SQL type is a 4-byte float, so the model already accepts this precision"
+    )]
     Ok(decode_f64(json)? as f32)
 }
 
 /// Decode a nullable float push, narrowing to `f32`.
 fn decode_nullable_f32(json: &str) -> Result<Option<f32>, ClientError> {
-    // Intended narrowing: see [`decode_f32`].
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the column's SQL type is a 4-byte float, so the model already accepts this precision"
+    )]
     Ok(decode_nullable_f64(json)?.map(|f| f as f32))
 }
 

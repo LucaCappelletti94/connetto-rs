@@ -191,7 +191,10 @@ pub struct SourceRow {
 /// The read runs as the caller, so a row the caller may not see is
 /// indistinguishable from one that is not there and minting cannot be turned
 /// into a probe for rows.
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "the futures are bound by MaybeSend, which is Send on native, so the auto trait warning does not apply"
+)]
 pub trait RowSource<Id = String, Key = String> {
     /// Failure to reach the row, as distinct from not finding one.
     type Error: core::fmt::Display;

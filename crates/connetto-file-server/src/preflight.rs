@@ -254,6 +254,13 @@ pub async fn preflight<S: ConnettoFileSchema>(
 /// file-server tables.  Postgres bypasses row level security for all three
 /// conditions silently, so a reader pool wired to a privileged role makes the
 /// visibility checks this server relies on meaningless.
+///
+/// # Errors
+///
+/// Returns `PreflightError::Db` on any database query failure.
+/// Returns `PreflightError::ReaderIsSuperuser` if the reader role is a superuser.
+/// Returns `PreflightError::ReaderBypassesRls` if the reader role has the `BYPASSRLS` attribute.
+/// Returns `PreflightError::ReaderOwnsTable` if the reader role owns any of the manifests, manifest chunks, or chunk registry tables.
 pub async fn preflight_reader<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
 ) -> Result<(), PreflightError> {

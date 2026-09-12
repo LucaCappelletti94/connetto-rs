@@ -12,8 +12,6 @@
 //! non-superuser role. The test creates `app_reader` for that and runs the
 //! policy checks through it, doing privileged setup as the admin role.
 
-#![allow(clippy::too_many_lines)]
-
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::{RlsAuth, RlsAuthError, ValuesRow};

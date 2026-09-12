@@ -48,7 +48,10 @@ diesel::table! {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 fn archive_carries_manifest_and_compressed_patchset_entries() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let replica_path = dir.path().join("replica.sqlite");

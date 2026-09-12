@@ -13,7 +13,10 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
-#![allow(clippy::too_many_lines)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -91,7 +94,10 @@ struct SeedSnapshot;
 impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -104,7 +110,10 @@ impl SnapshotSource for SeedSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -139,7 +148,10 @@ struct CursoredSeed;
 impl SnapshotSource for CursoredSeed {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -152,7 +164,10 @@ impl SnapshotSource for CursoredSeed {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -184,7 +199,10 @@ struct RecordingSeed {
 impl SnapshotSource for RecordingSeed {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -197,7 +215,10 @@ impl SnapshotSource for RecordingSeed {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         select_sql: &str,
@@ -322,7 +343,10 @@ struct GadgetSeed {
 impl SnapshotSource for GadgetSeed {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -335,7 +359,10 @@ impl SnapshotSource for GadgetSeed {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -380,7 +407,10 @@ struct GatedSnapshot {
 impl SnapshotSource for GatedSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -1515,7 +1545,10 @@ impl QueuedConnector {
     }
 }
 
-#[allow(clippy::manual_async_fn)]
+#[expect(
+    clippy::manual_async_fn,
+    reason = "the trait names the future type so the Send bound is stated on the signature"
+)]
 impl AsyncConnector for QueuedConnector {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
@@ -1933,7 +1966,10 @@ struct GatedSeed {
     rows: Arc<Mutex<VecDeque<Vec<PgValue<Postgres>>>>>,
 }
 
-#[allow(clippy::manual_async_fn)]
+#[expect(
+    clippy::manual_async_fn,
+    reason = "the trait names the future type so the Send bound is stated on the signature"
+)]
 impl AsyncConnector for GatedSeed {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
@@ -3997,7 +4033,10 @@ struct StatusSnapshot {
 impl SnapshotSource for StatusSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -4010,7 +4049,10 @@ impl SnapshotSource for StatusSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,

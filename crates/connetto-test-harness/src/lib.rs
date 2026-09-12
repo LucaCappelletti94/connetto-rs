@@ -174,6 +174,10 @@ fn container_labels(role: &str) -> [(String, String); 2] {
 /// client binary, whose stored key the test can then read back. Each calling
 /// test gets its own fresh session, so keyring tests cannot see each other's
 /// entries whichever runner schedules them.
+///
+/// # Panics
+///
+/// Panics when the Linux keyring API refuses the anonymous session join, which is a test setup failure.
 #[cfg(target_os = "linux")]
 pub fn isolated_session_keyring() {
     keyutils::Keyring::join_anonymous_session().expect("join a fresh anonymous session keyring");
@@ -249,6 +253,10 @@ async fn pool_when_ready(url: &str) -> Pool<AsyncPgConnection> {
 
 /// Rewrite a Postgres URL's user info, keeping host, port, and database. Used to
 /// point a pool at a non-superuser role subject to RLS.
+///
+/// # Panics
+///
+/// Panics when `url` does not contain `://`.
 #[must_use]
 pub fn with_user(url: &str, user: &str, password: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("url has a scheme");
@@ -257,6 +265,10 @@ pub fn with_user(url: &str, user: &str, password: &str) -> String {
 }
 
 /// Build a bb8 pool for a conninfo string.
+///
+/// # Panics
+///
+/// Panics when the connection pool cannot be built for `url`, which is a test setup failure.
 pub async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
     Pool::builder().build(manager).await.expect("build pool")
@@ -270,6 +282,10 @@ pub struct MockOauth {
 
 impl MockOauth {
     /// Start one provider and return the host-reachable issuer URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Docker daemon is unreachable, when the container host address cannot be resolved, or when the mapped port is unavailable, all of which are test setup failures.
     pub async fn start() -> Self {
         sweep_abandoned_containers();
         let container = GenericImage::new(MOCK_OAUTH_IMAGE, MOCK_OAUTH_TAG)
@@ -359,6 +375,10 @@ fn env_prefix(name: &str) -> String {
 /// (autocommit). These are statements the diesel query DSL cannot express, so
 /// the raw string is the sanctioned case; a test's read-back assertions must use
 /// the typed DSL instead.
+///
+/// # Panics
+///
+/// Panics when the pool cannot provide an admin connection, or when `sql` execution fails.
 pub async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
     let mut conn = pool.get().await.expect("admin connection");
     conn.batch_execute(sql)
@@ -369,6 +389,10 @@ pub async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
 /// Drop the replication slot, terminating any active walsender first and
 /// retrying until the slot is gone. A prior test's aborted CDC task can still
 /// hold the slot for a moment, and an active slot cannot be dropped.
+///
+/// # Panics
+///
+/// Panics when an admin connection cannot be obtained, when any DDL statement fails, or when the `connetto_slot` replication slot cannot be dropped within 50 retries.
 pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
     for _ in 0..50 {
         exec(
@@ -433,6 +457,10 @@ pub const OPLOG_TABLE: &str = "connetto_oplog";
 /// current and sends it nothing (R32). Bringing up a scratch database is the
 /// one job `PgOplog::ensure_schema` exists for, so this calls it rather than
 /// keeping a second copy of the shape that could drift from it.
+///
+/// # Panics
+///
+/// Panics when `PgOplog::ensure_schema` fails to create or verify the oplog schema, which is a test setup failure.
 pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
     connetto_server::PgOplog::new(
         pool.clone(),
@@ -494,6 +522,10 @@ struct Authorization {
 
 impl Fixture {
     /// Start this test's own `Postgres` and create the watermark table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Docker daemon is unreachable, when the container host address or mapped port cannot be resolved, or when watermark provisioning fails, all of which are test setup failures.
     pub async fn acquire() -> Self {
         if let Some(directives) = std::env::var("CONNETTO_TEST_LOG")
             .ok()
@@ -579,6 +611,10 @@ impl Fixture {
     ///
     /// A fresh store per call, so two calls in one test cannot see each other's
     /// rules or facts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the authorization service endpoint URL is malformed, when the gRPC channel cannot connect to the service, or when the store creation request fails, all of which are test setup failures.
     pub async fn fga_store(&self) -> (Channel, String) {
         let endpoint = self.fga_url().await.to_owned();
         let channel = Channel::from_shared(endpoint.clone())
@@ -1049,6 +1085,10 @@ impl Server {
 /// When `config` carries replication tables, this function calls
 /// [`start_replication`](Fixture::start_replication) over the admin URL before
 /// starting CDC, so the ordering cannot be forgotten.
+///
+/// # Panics
+///
+/// Panics when the admin pool cannot be built, when replication setup fails, or when the materializer, write target, or withdrawal snapshot source cannot be constructed from `pg_ddl`. The `install_withdrawal_source` assertion is unreachable because the session manager is freshly constructed inside this function.
 pub async fn spawn_server(
     config: ServerConfig,
     snapshot: PgSnapshotSource,
@@ -1178,6 +1218,10 @@ impl Client {
 
     /// Send a handshake presenting `grants`, each checked on its own, plus an
     /// optional resume credential from a previous ack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the handshake frame fails on the transport, or when the server's reply is not a `HandshakeAck`.
     pub async fn handshake_presenting(
         &mut self,
         client_id: &str,
@@ -1202,6 +1246,10 @@ impl Client {
     /// Send a handshake presenting `grant` and the cursor a client persisted, so
     /// the server catches the subscription up from that point instead of
     /// snapshotting it afresh.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the handshake frame fails on the transport, or when the server's reply is not a `HandshakeAck`.
     pub async fn handshake_resuming(
         &mut self,
         client_id: &str,
@@ -1224,6 +1272,10 @@ impl Client {
     /// Register a subscription. The snapshot and any live patches follow on the
     /// transport; drain them with [`Client::expect_snapshot`] and
     /// [`Client::wait_for_live`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `Subscribe` frame fails on the transport.
     pub async fn subscribe(&mut self, sub_id: &str, query: &str) {
         self.transport
             .send_control(ControlMessage::Subscribe(Subscribe {
@@ -1235,6 +1287,10 @@ impl Client {
     }
 
     /// Cancel a subscription.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `Unsubscribe` frame fails on the transport.
     pub async fn unsubscribe(&mut self, sub_id: &str) {
         self.transport
             .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -1246,6 +1302,10 @@ impl Client {
 
     /// Upload one mutation: a header naming the op count, then the compressed
     /// changeset patch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when zstd compression of `changeset` fails, or when sending the mutation header or patch frame fails on the transport.
     pub async fn upload(&mut self, client_seq: u64, changeset: Vec<u8>) {
         let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress");
         self.transport
@@ -1263,6 +1323,10 @@ impl Client {
     }
 
     /// Replenish the server's delivery credits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `AckCredits` frame fails on the transport.
     pub async fn ack_credits(&mut self, credits: u32) {
         self.transport
             .send_control(ControlMessage::AckCredits(AckCredits { credits }))
@@ -1272,6 +1336,10 @@ impl Client {
 
     /// Ping and return the next control frame. A pong proves every preceding
     /// frame was handled, so any earlier apply ack or reject arrives before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the ping frame fails on the transport, or when the server's next frame is not a control frame.
     pub async fn barrier(&mut self, nonce: u64) -> ControlMessage {
         self.transport
             .send_control(ControlMessage::Ping(Ping { nonce }))
@@ -1281,6 +1349,10 @@ impl Client {
     }
 
     /// Read the next frame, asserting it is a control frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transport returns a receive error, or when the next frame is not a control frame.
     pub async fn next_control(&mut self) -> ControlMessage {
         match self.recv().await {
             Some(IncomingFrame::Control(msg)) => msg,
@@ -1289,6 +1361,10 @@ impl Client {
     }
 
     /// Read the next frame, asserting it is a bulk frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transport returns a receive error, or when the next frame is not a bulk frame.
     pub async fn next_bulk(&mut self) -> BulkMessage {
         match self.recv().await {
             Some(IncomingFrame::Bulk(msg)) => msg,
@@ -1297,6 +1373,10 @@ impl Client {
     }
 
     /// Read the next frame, returning `None` on a clean close.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transport returns an error while receiving a frame.
     pub async fn recv(&mut self) -> Option<IncomingFrame> {
         self.transport.recv().await.expect("recv frame")
     }
@@ -1304,6 +1384,10 @@ impl Client {
     /// Drain a subscription's initial snapshot, from `SnapshotBegin` through
     /// `SnapshotEnd`, and return the snapshot patches seen in between (an empty
     /// snapshot has none).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first frame is not a `SnapshotBegin` for `sub_id`, when the begin or end names a different subscription, when a mid-snapshot frame is not a `SnapshotPatch` or `SnapshotEnd`, or when the transport returns a receive error.
     pub async fn expect_snapshot(&mut self, sub_id: &str) -> Vec<SnapshotPatch> {
         let frame = self.next_control().await;
         let ControlMessage::SnapshotBegin(begin) = frame else {
@@ -1334,6 +1418,10 @@ impl Client {
 
     /// Wait for a live patch to arrive, skipping any interleaved control frames
     /// (keepalive pongs and the like). Panics if none arrives within `timeout`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no `LivePatch` arrives within `timeout`, when the transport returns a receive error, or when an unexpected non-control frame arrives.
     pub async fn wait_for_live(&mut self, timeout: Duration) -> LivePatch {
         self.try_live(timeout)
             .await
@@ -1346,6 +1434,10 @@ impl Client {
     /// assertion: that nothing is delivered. A confidentiality test needs that
     /// one, because silence is the correct outcome for a caller who may not see
     /// the row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transport returns a receive error, or when a frame that is neither a `LivePatch` nor a control frame arrives.
     pub async fn try_live(&mut self, timeout: Duration) -> Option<LivePatch> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -1366,6 +1458,10 @@ impl Client {
     ///
     /// [`None`] when no notice arrives within `timeout`, which is the assertion
     /// a caller nothing changed for needs: silence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transport returns a receive error, when a `FullResyncRequired` notice names a subscription other than `sub_id`, when the following snapshot sequence is malformed, or when the connection closes or an unexpected bulk frame arrives.
     pub async fn try_resync(
         &mut self,
         sub_id: &str,
@@ -1394,6 +1490,10 @@ impl Client {
     }
 
     /// Close the transport cleanly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when closing the transport returns an error.
     pub async fn close(&mut self) {
         self.transport.close().await.expect("close client");
     }
@@ -1403,6 +1503,10 @@ impl Client {
 ///
 /// `columns` names the row's columns in order, `pk` gives the primary-key
 /// column indices, and `values` gives one value per column in `columns` order.
+///
+/// # Panics
+///
+/// Panics when `values` contains more entries than `columns`, causing an out-of-range column index in the underlying `SimpleTable`.
 #[must_use]
 pub fn insert_changeset(
     table: &str,

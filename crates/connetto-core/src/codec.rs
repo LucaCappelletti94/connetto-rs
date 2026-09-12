@@ -39,21 +39,37 @@ pub const TAG_BULK: u8 = 1;
 ///
 /// Use this over transports that already delimit messages (`WebSocket` binary
 /// frames).
+///
+/// # Errors
+///
+/// Returns `CodecError::Encode` when `rmp_serde` cannot serialize `message`.
 pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, CodecError> {
     Ok(rmp_serde::to_vec_named(message)?)
 }
 
 /// Decode a raw `MessagePack` payload as a control-plane message (no framing).
+///
+/// # Errors
+///
+/// Returns `CodecError::Decode` when `rmp_serde` cannot deserialize `payload` as a `ControlMessage`.
 pub fn decode_control(payload: &[u8]) -> Result<ControlMessage, CodecError> {
     Ok(rmp_serde::from_slice(payload)?)
 }
 
 /// Encode a bulk-plane message as a raw `MessagePack` payload (no framing).
+///
+/// # Errors
+///
+/// Returns `CodecError::Encode` when `rmp_serde` cannot serialize `message`.
 pub fn encode_bulk(message: &BulkMessage) -> Result<Vec<u8>, CodecError> {
     Ok(rmp_serde::to_vec_named(message)?)
 }
 
 /// Decode a raw `MessagePack` payload as a bulk-plane message (no framing).
+///
+/// # Errors
+///
+/// Returns `CodecError::Decode` when `rmp_serde` cannot deserialize `payload` as a `BulkMessage`.
 pub fn decode_bulk(payload: &[u8]) -> Result<BulkMessage, CodecError> {
     Ok(rmp_serde::from_slice(payload)?)
 }
@@ -64,12 +80,20 @@ pub fn decode_bulk(payload: &[u8]) -> Result<BulkMessage, CodecError> {
 ///
 /// The output is `[4 bytes: BE length][payload]`. Bytes returned to the caller
 /// are ready to write directly to a byte-stream transport.
+///
+/// # Errors
+///
+/// Returns `CodecError::Encode` when `rmp_serde` cannot serialize `message`.
 pub fn encode_control_framed(message: &ControlMessage) -> Result<Vec<u8>, CodecError> {
     let payload = encode_control(message)?;
     Ok(prepend_length(&payload))
 }
 
 /// Encode a bulk message with a `u32` big-endian length header.
+///
+/// # Errors
+///
+/// Returns `CodecError::Encode` when `rmp_serde` cannot serialize `message`.
 pub fn encode_bulk_framed(message: &BulkMessage) -> Result<Vec<u8>, CodecError> {
     let payload = encode_bulk(message)?;
     Ok(prepend_length(&payload))
@@ -81,12 +105,20 @@ pub fn encode_bulk_framed(message: &BulkMessage) -> Result<Vec<u8>, CodecError> 
 /// (`4 + payload_len`). The caller can advance its buffer by that amount.
 /// Fails cleanly on truncated headers, truncated payloads, or payloads larger
 /// than [`DEFAULT_MAX_FRAME_LEN`].
+///
+/// # Errors
+///
+/// Returns `CodecError::FrameHeaderTruncated` when `buffer` is shorter than four bytes, `CodecError::FrameTooLarge` when the header length exceeds `DEFAULT_MAX_FRAME_LEN`, `CodecError::FrameTruncated` when the buffer ends before the payload completes, or `CodecError::Decode` when `rmp_serde` cannot deserialize the payload as a `ControlMessage`.
 pub fn decode_control_framed(buffer: &[u8]) -> Result<(ControlMessage, usize), CodecError> {
     decode_control_framed_with_limit(buffer, DEFAULT_MAX_FRAME_LEN)
 }
 
 /// Decode a control message from a length-prefixed buffer with an explicit
 /// upper bound on payload length.
+///
+/// # Errors
+///
+/// Returns `CodecError::FrameHeaderTruncated` when `buffer` is shorter than four bytes, `CodecError::FrameTooLarge` when the header length exceeds `limit`, `CodecError::FrameTruncated` when the buffer ends before the payload completes, or `CodecError::Decode` when `rmp_serde` cannot deserialize the payload as a `ControlMessage`.
 pub fn decode_control_framed_with_limit(
     buffer: &[u8],
     limit: usize,
@@ -97,12 +129,20 @@ pub fn decode_control_framed_with_limit(
 }
 
 /// Decode a bulk message from a length-prefixed buffer.
+///
+/// # Errors
+///
+/// Returns `CodecError::FrameHeaderTruncated` when `buffer` is shorter than four bytes, `CodecError::FrameTooLarge` when the header length exceeds `DEFAULT_MAX_FRAME_LEN`, `CodecError::FrameTruncated` when the buffer ends before the payload completes, or `CodecError::Decode` when `rmp_serde` cannot deserialize the payload as a `BulkMessage`.
 pub fn decode_bulk_framed(buffer: &[u8]) -> Result<(BulkMessage, usize), CodecError> {
     decode_bulk_framed_with_limit(buffer, DEFAULT_MAX_FRAME_LEN)
 }
 
 /// Decode a bulk message from a length-prefixed buffer with an explicit
 /// upper bound on payload length.
+///
+/// # Errors
+///
+/// Returns `CodecError::FrameHeaderTruncated` when `buffer` is shorter than four bytes, `CodecError::FrameTooLarge` when the header length exceeds `limit`, `CodecError::FrameTruncated` when the buffer ends before the payload completes, or `CodecError::Decode` when `rmp_serde` cannot deserialize the payload as a `BulkMessage`.
 pub fn decode_bulk_framed_with_limit(
     buffer: &[u8],
     limit: usize,

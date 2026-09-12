@@ -243,7 +243,10 @@ impl FromSql<ChangeOpSql, Pg> for ChangeOp {
 /// The seam the session layer appends to on every dispatched event and reads
 /// from on reconnect. Shaped like [`SnapshotSource`](crate::session::SnapshotSource):
 /// async, `Send + Sync`, one associated error.
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "the futures are bound by MaybeSend, which is Send on native, so the auto trait warning does not apply"
+)]
 pub trait Oplog: Send + Sync {
     /// Oplog-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
@@ -419,7 +422,10 @@ impl Default for InMemoryOplog {
 impl Oplog for InMemoryOplog {
     type Error = Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn append(&self, record: ChangeRecord) -> Result<(), Infallible> {
         let now = self.clock.now_micros();
         let mut inner = self.inner.lock();
@@ -433,7 +439,10 @@ impl Oplog for InMemoryOplog {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Infallible> {
         let inner = self.inner.lock();
         Ok(inner
@@ -444,18 +453,27 @@ impl Oplog for InMemoryOplog {
             .collect())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn min_lsn(&self) -> Result<Option<u64>, Infallible> {
         let inner = self.inner.lock();
         Ok(inner.entries.front().map(|entry| entry.record.lsn()))
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn current_lsn(&self) -> Result<Option<u64>, Infallible> {
         Ok(self.inner.lock().max_lsn)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn forget_through(&self, lsn: u64) -> Result<(), Infallible> {
         self.inner.lock().entries.retain(|e| e.record.lsn() > lsn);
         Ok(())

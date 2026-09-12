@@ -18,8 +18,6 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
-#![allow(clippy::too_many_lines)]
-
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -483,7 +481,10 @@ struct AlwaysFound;
 impl RowSource for AlwaysFound {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn read_row(
         &self,
         _caller: &Principal,
@@ -561,7 +562,10 @@ impl VisibilityPolicy for ReadOnlyPolicy {
         self.reads.may_see(row, watchers, verdicts)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_write<R>(
         &self,
         write: RowWrite<'_, R>,

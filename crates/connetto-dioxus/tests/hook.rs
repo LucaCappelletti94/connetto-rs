@@ -62,7 +62,10 @@ struct EmptySnapshot;
 impl SnapshotSource for EmptySnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -75,7 +78,10 @@ impl SnapshotSource for EmptySnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -103,7 +109,10 @@ struct SeedOneOrder;
 impl SnapshotSource for SeedOneOrder {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -116,7 +125,10 @@ impl SnapshotSource for SeedOneOrder {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -151,7 +163,10 @@ struct SeedRows {
     rows: Arc<StdMutex<Vec<Vec<PgValue<Postgres>>>>>,
 }
 
-#[allow(clippy::manual_async_fn)]
+#[expect(
+    clippy::manual_async_fn,
+    reason = "the trait names the future type so the Send bound is stated on the signature"
+)]
 impl AsyncConnector for SeedRows {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;

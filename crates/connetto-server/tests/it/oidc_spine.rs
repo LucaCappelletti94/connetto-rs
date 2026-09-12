@@ -180,7 +180,10 @@ fn client_pkce() -> (&'static str, String) {
 /// at the client's redirect URI, and redeeming that code yields a connetto access
 /// token whose session the real handshake verifier accepts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 async fn the_oauth_spine_completes_against_a_real_identity_provider() {
     let stack = Stack::start().await;
     let base = &stack.connetto_base;
@@ -568,7 +571,10 @@ impl AuthStore for OutageStore {
         self.0.session_is_live(session_id, now)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn rotate_refresh(
         &self,
         _refresh_token: &str,

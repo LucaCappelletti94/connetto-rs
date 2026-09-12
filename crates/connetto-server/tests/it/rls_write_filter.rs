@@ -12,8 +12,6 @@
 //! superuser bypasses RLS. The test creates `app_writer` for the write target
 //! and does privileged setup as the admin role.
 
-#![allow(clippy::too_many_lines)]
-
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -100,7 +98,10 @@ struct NoSnapshot;
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -113,7 +114,10 @@ impl SnapshotSource for NoSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,

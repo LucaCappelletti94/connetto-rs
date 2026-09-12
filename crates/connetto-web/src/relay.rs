@@ -463,7 +463,7 @@ impl RelayHub {
     /// # Errors
     ///
     /// [`RelayError::Replica`] when attaching the hub meta database fails.
-    #[allow(
+    #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]
@@ -498,7 +498,7 @@ impl RelayHub {
     /// # Errors
     ///
     /// [`RelayError::Replica`] when attaching the hub meta database fails.
-    #[allow(
+    #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]
@@ -526,7 +526,7 @@ impl RelayHub {
     /// Shared constructor body behind the two hub flavors: attach the hub
     /// meta database and ensure its schema, ensure the device-private tier's
     /// watermark table when this run has one, then assemble the channels.
-    #[allow(
+    #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]
@@ -1931,7 +1931,10 @@ where
 ///
 /// The worker client already rolled the change back out of its replica. The
 /// reject tells the tab to do the same to its mirror, so both converge.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the event dispatch calls every handler through the same fallible signature"
+)]
 fn reject_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,
@@ -1961,7 +1964,10 @@ fn reject_tab_mutation(
 /// untouched, so the tab sees exactly what a direct client would. The table
 /// name comes from the locally rolled-back rows, which the worker client
 /// carries alongside it.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the event dispatch calls every handler through the same fallible signature"
+)]
 fn conflict_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,

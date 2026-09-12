@@ -76,7 +76,10 @@ pub fn loopback() -> (LoopbackTransport, LoopbackTransport) {
 impl Transport for LoopbackTransport {
     type Error = LoopbackError;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
         self.tx
             .as_ref()
@@ -85,7 +88,10 @@ impl Transport for LoopbackTransport {
             .map_err(|_| LoopbackError::Disconnected)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
         self.tx
             .as_ref()
@@ -98,7 +104,10 @@ impl Transport for LoopbackTransport {
         Ok(self.rx.recv().await)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn close(&mut self) -> Result<(), Self::Error> {
         // Dropping the sender closes the peer's receive channel, so its
         // `recv` returns `None` and its session loop ends.

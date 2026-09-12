@@ -14,8 +14,6 @@
 //! not mentioned. The old rule got the first case right by getting the second
 //! wrong.
 
-#![allow(clippy::too_many_lines)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,7 +71,10 @@ impl VisibilityPolicy for DenyId2 {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_write<R>(
         &self,
         _write: RowWrite<'_, R>,
@@ -92,7 +93,10 @@ struct EmptySnapshot;
 impl SnapshotSource for EmptySnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -105,7 +109,10 @@ impl SnapshotSource for EmptySnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -313,7 +320,10 @@ impl CdcSource for OneEvent {
     // reason: the trait wants a `Send` future and clippy's other arm wants
     // `async fn`, so one of the two fires whichever form this takes. Matching the
     // form the rest of this file uses.
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn ack(&mut self, _upto: PgLsn) -> Result<(), std::io::Error> {
         Ok(())
     }

@@ -338,6 +338,10 @@ impl PendingLogins {
     }
 
     /// Record an in-flight authorization under `state`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned by a thread that panicked while holding it.
     pub fn insert(&self, state: String, pending: PendingLogin) {
         let now = Instant::now();
         let mut map = self.inner.lock().expect("pending logins lock");
@@ -356,6 +360,10 @@ impl PendingLogins {
     /// Remove and return the authorization for `state`, consuming it so a
     /// callback cannot be replayed. An entry past its TTL is dropped and treated
     /// as absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned by a thread that panicked while holding it.
     #[must_use]
     pub fn take(&self, state: &str) -> Option<PendingLogin> {
         let now = Instant::now();
@@ -424,6 +432,10 @@ impl<Id> AuthCodes<Id> {
     }
 
     /// Issue a code for `issued`, returning the opaque code string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned by a thread that panicked while holding it.
     pub fn issue(&self, issued: IssuedAuthCode<Id>) -> String {
         let now = Instant::now();
         let code = format!(
@@ -445,6 +457,10 @@ impl<Id> AuthCodes<Id> {
 
     /// Remove and return the code, consuming it so it cannot be redeemed twice.
     /// A code past its TTL is dropped and treated as absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned by a thread that panicked while holding it.
     #[must_use]
     pub fn redeem(&self, code: &str) -> Option<IssuedAuthCode<Id>> {
         let now = Instant::now();
@@ -461,9 +477,10 @@ impl<Id> Default for AuthCodes<Id> {
 
 #[cfg(test)]
 mod tests {
-    // The stand-in providers return `&str` literals from trait methods whose
-    // signature is fixed, so the lifetime-tightening lint does not apply.
-    #![allow(clippy::unnecessary_literal_bound)]
+    #![expect(
+        clippy::unnecessary_literal_bound,
+        reason = "the stand-in providers return literals from trait methods whose signature is fixed"
+    )]
     use super::*;
 
     /// A provider whose issuer matches by prefix, standing in for a pattern

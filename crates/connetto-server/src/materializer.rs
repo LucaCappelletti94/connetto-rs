@@ -1823,6 +1823,10 @@ where
     ///
     /// [`MaterializerError::Register`] when `subql` rejects the SELECT, the
     /// binds, or the term.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice. The `viewer.expect` on the retry path is reached only when the `viewer.is_some()` match arm condition is true, which guarantees `viewer` is `Some`.
     pub fn register_translated(
         &mut self,
         consumer_id: u64,

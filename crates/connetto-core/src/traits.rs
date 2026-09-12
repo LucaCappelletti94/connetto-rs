@@ -5,7 +5,7 @@
 //! No default methods, because the plumbing that composes these traits belongs
 //! above `connetto-core`, not inside it.
 //!
-//! The `#[allow(async_fn_in_trait)]` lint suppression matches upstream guidance.
+//! The `#[expect(async_fn_in_trait)]` lint suppression matches upstream guidance.
 //! [`Transport`] futures are bound by [`MaybeSend`]: `Send` on native targets,
 //! unconstrained on wasm, where the runtime is single threaded and transport
 //! futures hold JS values that cannot be `Send`. Native consumers keep spawning
@@ -109,7 +109,10 @@ pub struct PendingMutation {
 /// Owns the local `SQLite` database, the mutation queue, the resume cursor, and
 /// the persisted session token. All accessors take `&mut self` so an
 /// implementation can serialise transactions internally without extra locking.
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "the futures are bound by MaybeSend, which is Send on native, so the auto trait warning does not apply"
+)]
 pub trait Store {
     /// Persistence-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;

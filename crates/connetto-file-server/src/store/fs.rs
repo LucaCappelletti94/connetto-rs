@@ -19,6 +19,10 @@ pub struct FsStore {
 
 impl FsStore {
     /// Opens (or creates) a store rooted at `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` if `create_dir_all` fails to create the store root directory.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;

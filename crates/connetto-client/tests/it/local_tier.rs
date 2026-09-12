@@ -13,8 +13,6 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
-#![allow(clippy::too_many_lines)]
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -112,7 +110,10 @@ struct RecordingSnapshot {
 impl SnapshotSource for RecordingSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -125,7 +126,10 @@ impl SnapshotSource for RecordingSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         select_sql: &str,

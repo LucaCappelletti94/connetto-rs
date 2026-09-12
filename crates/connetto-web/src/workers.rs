@@ -402,6 +402,12 @@ fn js_string_literal(value: &str) -> String {
 /// The worker reports boot failures on the same channel. A stale or absent
 /// stack therefore fails here by name rather than spinning until the browser
 /// runner kills the test.
+///
+/// # Errors
+///
+/// Returns `Err(JsValue)` with a message beginning `"hello channel:"` if the browser's `BroadcastChannel` constructor fails.
+/// Returns `Err(JsValue)` with a message of the form `"db worker boot failed: <detail>"` if the worker sends a failure report on the hello channel.
+/// Returns `Err(JsValue)` with `"db worker did not answer readiness"` if the 15-second timeout elapses before the worker signals readiness.
 pub async fn await_db_worker_ready() -> Result<(), JsValue> {
     const POLL_MS: i32 = 50;
     const TIMEOUT_MS: f64 = 15_000.0;
@@ -459,6 +465,10 @@ pub async fn await_db_worker_ready() -> Result<(), JsValue> {
 /// Page side: announce a tab's wire channel and wait for the worker's
 /// attachment ack, after which the wire channel's far end exists and the
 /// client handshake cannot be lost.
+///
+/// # Panics
+///
+/// Panics if the browser's `BroadcastChannel` constructor fails for the hello channel, which cannot occur in any conforming browser environment.
 pub async fn announce_tab(wire: &str) {
     let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
     let expected = format!("attached:{wire}");
@@ -687,7 +697,10 @@ pub struct BootedSession<Id> {
 ///
 /// A string describing the VFS, acquisition, upstream connect, or subscribe
 /// failure.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the boot sequence is one ordered list of steps and a split would hide the order"
+)]
 pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, JsValue>
 where
     // `Display` because the server binds this identity as the row-level
@@ -1592,10 +1605,11 @@ fn count_from_js(value: &JsValue) -> Option<usize> {
     {
         return None;
     }
-    // reason: std offers no fallible conversion from f64, and the guard above
-    // proves this one is a whole number inside u32, so neither cast lint can
-    // fire here.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "std offers no fallible conversion from f64 and the guard above proves a whole number inside u32"
+    )]
     let count = number as u32;
     usize::try_from(count).ok()
 }
@@ -1741,6 +1755,10 @@ pub type TabWire = MessageTransport<BroadcastChannel>;
 /// transport watching the worker's alive lock, so a dead worker surfaces
 /// as a clean close instead of silence. Pass it to
 /// `ConnettoClient::with_reconnect` together with [`sleep`] as the sleeper.
+///
+/// # Panics
+///
+/// Each call to the returned factory closure panics if `await_db_worker_ready` returns an error, that is, if the DB worker does not become ready within 15 seconds or reports a boot failure.
 pub fn tab_wire_factory(
     client_id: String,
 ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<TabWire, MessageTransportError>>>>
@@ -1866,6 +1884,10 @@ fn decode_custody(s: &str) -> Option<Custody> {
 /// The answer reflects the state at the moment the worker processes the
 /// message, so call this after [`await_db_worker_ready`] to be sure boot has
 /// settled.
+///
+/// # Panics
+///
+/// Panics if the browser's `BroadcastChannel` constructor fails for the hello channel, which cannot occur in any conforming browser environment.
 pub async fn request_custody() -> Custody {
     let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
     let result: Rc<Cell<Option<Custody>>> = Rc::new(Cell::new(None));

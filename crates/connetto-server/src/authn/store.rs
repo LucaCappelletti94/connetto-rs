@@ -342,7 +342,10 @@ impl<
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn session_is_live(
         &self,
         session_id: SessionId,
@@ -354,7 +357,10 @@ impl<
             .is_some_and(|record| !record.revoked && now <= record.absolute_deadline))
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn rotate_refresh(
         &self,
         refresh_token: &str,
@@ -387,7 +393,10 @@ impl<
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
         if let Some(record) = self
             .sessions
@@ -400,7 +409,10 @@ impl<
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn session_for_refresh(
         &self,
         refresh_token: &str,
@@ -418,7 +430,10 @@ impl<
         Ok(Some(session_id))
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn set_retained_provider_token(
         &self,
         session_id: SessionId,
@@ -436,7 +451,10 @@ impl<
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn retained_provider_token(
         &self,
         session_id: SessionId,

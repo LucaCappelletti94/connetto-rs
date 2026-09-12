@@ -33,6 +33,10 @@ pub enum ProcessError<E: std::error::Error + Send + Sync + 'static> {
 ///
 /// Returns [`ProcessError::Read`] on I/O failure reading from `reader`, and
 /// [`ProcessError::Store`] when a chunk-store write fails.
+///
+/// # Panics
+///
+/// Does not panic in practice. Converting `params.max` from `u32` to `usize` cannot fail on any Rust target because `usize` is at least 32 bits wide.
 pub async fn process_file_from_reader<R, S>(
     mut reader: R,
     mime: MimeClass,

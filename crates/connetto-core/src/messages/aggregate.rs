@@ -44,7 +44,10 @@ pub struct AggregateUpdate {
 // serde_bytes support for `Option<Vec<u8>>`. serde_bytes ships helpers only for
 // the direct `Vec<u8>` and `[u8]` cases, so provide a light wrapper for the
 // optional field so it still rides as a `MessagePack` `bin` on the wire.
-#[allow(clippy::ref_option)] // serde `with = "..."` calls serialize(&self, ..).
+#[expect(
+    clippy::ref_option,
+    reason = "serde with = \"...\" calls serialize(&self, ..) with a reference to the Option"
+)]
 mod serde_bytes_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_bytes::ByteBuf;

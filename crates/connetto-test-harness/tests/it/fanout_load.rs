@@ -82,7 +82,10 @@ async fn baseline_throughput_and_lock_wait() {
 
 /// A count as a float, for the delivery-gap comparison. These are thousands at
 /// most, far below the range `f64` holds exactly.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "every count here is far below the range f64 holds exactly"
+)]
 fn rounded(count: u64) -> f64 {
     count as f64
 }

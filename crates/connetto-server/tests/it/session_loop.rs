@@ -5,7 +5,10 @@
 //! backpressure and resume, and unsubscribe. The loopback test covers the whole
 //! matrix; the WebSocket test proves the same spine over a real localhost socket.
 
-#![allow(clippy::too_many_lines)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +45,10 @@ struct SeedSnapshot;
 impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -55,7 +61,10 @@ impl SnapshotSource for SeedSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -444,7 +453,10 @@ struct SeedReadings;
 impl SnapshotSource for SeedReadings {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -457,7 +469,10 @@ impl SnapshotSource for SeedReadings {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
