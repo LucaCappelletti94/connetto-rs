@@ -1791,7 +1791,10 @@ fn schedule_recovery_event(deferred: &mut VecDeque<HubEvent>, event: HubEvent) -
 fn recovery_local(event: &HubEvent) -> bool {
     matches!(
         event,
-        HubEvent::Unsynced(_) | HubEvent::Export(_, _) | HubEvent::Import(_, _)
+        HubEvent::Unsynced(_)
+            | HubEvent::Export(_, _)
+            | HubEvent::Import(_, _)
+            | HubEvent::ForgetRetired(_, _)
     )
 }
 
@@ -3357,6 +3360,20 @@ mod tests {
         assert!(matches!(
             schedule_recovery_event(&mut deferred, HubEvent::Unsynced(reply)),
             Some(HubEvent::Unsynced(_))
+        ));
+        assert!(deferred.is_empty());
+    }
+
+    /// Acknowledging a retirement only writes the replica, so it is served during recovery
+    /// rather than queued behind an upstream that may never come back.
+    #[wasm_bindgen_test]
+    fn a_retirement_acknowledgement_is_serviceable_during_recovery() {
+        let mut deferred = std::collections::VecDeque::new();
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::ForgetRetired(Vec::new(), reply)),
+            Some(HubEvent::ForgetRetired(_, _))
         ));
         assert!(deferred.is_empty());
     }

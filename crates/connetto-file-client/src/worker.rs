@@ -38,7 +38,7 @@ pub enum ContentFlush {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChunkScan {
     file: Option<FileId>,
-    chunks: usize,
+    chunks: u64,
     next: usize,
     missing: Option<usize>,
     ambiguous: bool,
@@ -250,12 +250,15 @@ where
             return Ok(ScanStep::Retired);
         };
         let chunks = manifest.chunks();
-        let mut scan = if scan.file == Some(file_id) && scan.chunks == chunks.len() {
+        // A replacement manifest can name other chunks under the same file identity, so the
+        // cursor is bound to the list it was taken over rather than to its length.
+        let fingerprint = chunk_fingerprint(chunks);
+        let mut scan = if scan.file == Some(file_id) && scan.chunks == fingerprint {
             scan
         } else {
             ChunkScan {
                 file: Some(file_id),
-                chunks: chunks.len(),
+                chunks: fingerprint,
                 ..ChunkScan::default()
             }
         };
@@ -284,7 +287,7 @@ where
         if encrypted.read_chunk(&chunks[missing].hash).await.is_ok() {
             return Ok(ScanStep::More(ChunkScan {
                 file: Some(file_id),
-                chunks: chunks.len(),
+                chunks: fingerprint,
                 ..ChunkScan::default()
             }));
         }
@@ -584,6 +587,27 @@ where
     crate::archive::encode(manifests, chunks)
 }
 
+/// Fingerprints the ordered chunk list, so a replaced manifest is never resumed into.
+///
+/// `FNV-1a` over each chunk hash and length, which needs to separate lists rather than
+/// resist an adversary.
+fn chunk_fingerprint(chunks: &[connetto_file_core::ChunkMeta]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    };
+    for chunk in chunks {
+        for byte in chunk.hash.as_bytes() {
+            mix(*byte);
+        }
+        for byte in chunk.len.to_le_bytes() {
+            mix(byte);
+        }
+    }
+    hash
+}
+
 pub(crate) async fn unreadable_chunk_count<B>(
     store: &B,
     root_key: &[u8; 32],
@@ -642,6 +666,83 @@ mod tests {
             Some(file(2))
         );
         assert_eq!(next_after(&[], Some(file(1))), None);
+    }
+
+    /// A manifest replaced under the same identity is scanned from the start, even when the
+    /// replacement names the same number of chunks.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_replaced_manifest_restarts_the_scan() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("replace"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let present = process_file(&vec![4u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the readable file chunks");
+        let replacement = process_file(&vec![5u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the replacement chunks");
+        encrypted
+            .delete_chunk(&replacement.chunks()[0].hash)
+            .await
+            .expect("drop the replacement chunk");
+        assert_eq!(
+            present.chunks().len(),
+            replacement.chunks().len(),
+            "the replacement must be the same length to exercise the fingerprint"
+        );
+
+        db::put_manifest(connection.conn(), &present).expect("record the manifest");
+        db::enqueue(connection.conn(), present.file_id()).expect("queue the file");
+        let past_the_chunk = match archive
+            .scan_unsent_file(
+                &mut connection,
+                present.file_id(),
+                super::ChunkScan::default(),
+                8,
+            )
+            .await
+            .expect("the readable file scans")
+        {
+            super::ScanStep::Intact => super::ChunkScan {
+                file: Some(present.file_id()),
+                chunks: super::chunk_fingerprint(present.chunks()),
+                next: present.chunks().len(),
+                missing: None,
+                ambiguous: false,
+            },
+            other => panic!("a readable file stays queued, got {other:?}"),
+        };
+
+        // The same identity now names other chunks, one of which is gone.
+        db::drop_manifest(connection.conn(), present.file_id()).expect("drop the manifest");
+        let swapped =
+            connetto_file_core::Manifest::new(present.file_id(), replacement.chunks().to_vec());
+        db::put_manifest(connection.conn(), &swapped).expect("record the replacement");
+
+        let step = archive
+            .scan_unsent_file(&mut connection, present.file_id(), past_the_chunk, 8)
+            .await
+            .expect("the replacement scans");
+        assert!(
+            matches!(step, super::ScanStep::Retired),
+            "a cursor from the old chunk list must not skip the new one, got {step:?}"
+        );
     }
 
     /// A restore landing between slices keeps the entry, because an import can put back
@@ -770,7 +871,7 @@ mod tests {
             super::ScanStep::More(scan) => scan,
             _ => super::ChunkScan {
                 file: Some(elsewhere.file_id()),
-                chunks: elsewhere.chunks().len(),
+                chunks: super::chunk_fingerprint(elsewhere.chunks()),
                 next: elsewhere.chunks().len(),
                 missing: None,
                 ambiguous: false,
