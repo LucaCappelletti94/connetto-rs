@@ -4107,7 +4107,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#b8940281ed8c36e037b97cbad3d0baeef410cfbf"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#5d2a89b633d4c3d1b53762754fd57c739510de45"
 dependencies = [
  "git2",
  "sql-traits",
@@ -4976,7 +4976,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b10e5952df50701f3d3870992db480161af41227"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#93f427e1f9fc7fe9eedfc13546d7892cbc5f15d6"
 dependencies = [
  "openfga-client",
  "rls2fga-types",
@@ -4990,7 +4990,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b10e5952df50701f3d3870992db480161af41227"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#93f427e1f9fc7fe9eedfc13546d7892cbc5f15d6"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
