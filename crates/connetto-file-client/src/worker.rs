@@ -163,6 +163,43 @@ where
         db::outbox_count(connection.conn())
     }
 
+    /// Lists the files waiting in the outbox, in queue order.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox cannot be read.
+    pub fn unsent_files<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<FileId>, ContentError> {
+        db::outbox(connection.conn())
+    }
+
+    /// Retires one outbox entry when its bytes are conclusively unreadable, reporting
+    /// whether it was retired.
+    ///
+    /// A caller holding a long outbox verifies one file per turn so a waiting request is
+    /// served between files.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when reading the manifest fails, or when the dequeue write fails.
+    pub async fn verify_unsent_file<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<bool, ContentError> {
+        let unreadable = match db::load_manifest(connection.conn(), file_id)? {
+            Some(manifest) => unreadable_chunk_count(&self.store, &self.root_key, &manifest).await,
+            None => Some(0),
+        };
+        if unreadable.is_none() {
+            return Ok(false);
+        }
+        retire(connection.conn(), file_id)?;
+        Ok(true)
+    }
+
     /// Retires outbox entries whose bytes are conclusively unreadable, keeping
     /// each identity in the replica until the application acknowledges it.
     ///
@@ -173,17 +210,9 @@ where
         &self,
         connection: &mut ConnettoConnection<T>,
     ) -> Result<Vec<FileId>, ContentError> {
-        let waiting = db::outbox(connection.conn())?;
         let mut lost = Vec::new();
-        for file_id in waiting {
-            let unreadable = match db::load_manifest(connection.conn(), file_id)? {
-                Some(manifest) => {
-                    unreadable_chunk_count(&self.store, &self.root_key, &manifest).await
-                }
-                None => Some(0),
-            };
-            if unreadable.is_some() {
-                retire(connection.conn(), file_id)?;
+        for file_id in self.unsent_files(connection)? {
+            if self.verify_unsent_file(connection, file_id).await? {
                 lost.push(file_id);
             }
         }

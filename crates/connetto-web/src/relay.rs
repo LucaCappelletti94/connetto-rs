@@ -896,6 +896,8 @@ struct HubRuntime<U: Transport> {
     content: Option<ContentArchive<BrowserStore>>,
     events: UnboundedReceiver<HubEvent>,
     retry: ContentRetry,
+    /// Outbox files still to be checked for readable bytes, one per turn.
+    unverified: VecDeque<connetto_file_client::FileId>,
 }
 
 /// Why one hub cycle woke.
@@ -925,8 +927,7 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        self.verify_content().await;
-        self.wake_content()?;
+        self.load_unverified();
         while self.cycle(reconnect.as_mut(), sleeper.as_mut()).await? {}
         Ok(())
     }
@@ -942,6 +943,9 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
+        if !self.unverified.is_empty() {
+            return self.verify_turn().await;
+        }
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -1098,6 +1102,7 @@ where
             content,
             events,
             retry,
+            unverified: _,
         } = self;
         let Some(content) = content.as_ref() else {
             return Ok(ContentWalk::Complete {
@@ -1134,23 +1139,48 @@ where
         })
     }
 
-    /// Retire outbox entries whose bytes are gone, so the driver never retries them.
-    async fn verify_content(&mut self) {
+    /// Queue the outbox for the integrity walk, which runs one file per turn.
+    fn load_unverified(&mut self) {
         let Some(content) = self.content.as_ref() else {
             return;
         };
-        match content.verify_unsent(&mut self.worker).await {
-            Ok(files) if !files.is_empty() => {
-                // The identities are durable in the replica until acknowledged,
-                // so a pending-work query reports them rather than this line.
-                tracing::warn!(
-                    files = files.len(),
-                    "content integrity pass retired unreadable files"
-                );
-            }
-            Ok(_) => {}
+        match content.unsent_files(&mut self.worker) {
+            Ok(files) => self.unverified = files.into(),
             Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
+    }
+
+    /// Serve a waiting event, or check one outbox file when nothing is waiting.
+    ///
+    /// The walk reads and decrypts every unsent chunk, so a long outbox would hold off a
+    /// tab's attachment for longer than the tab waits for it.
+    async fn verify_turn(&mut self) -> Result<bool, RelayError> {
+        match self.events.try_recv() {
+            Ok(event) => {
+                self.serve(event).await?;
+                return Ok(true);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+        let Some(file_id) = self.unverified.pop_front() else {
+            return Ok(true);
+        };
+        let Some(content) = self.content.as_ref() else {
+            self.unverified.clear();
+            return Ok(true);
+        };
+        match content.verify_unsent_file(&mut self.worker, file_id).await {
+            // The identity is durable in the replica until acknowledged, so a pending-work
+            // query reports it rather than this line.
+            Ok(true) => tracing::warn!(%file_id, "content integrity pass retired unreadable file"),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
+        }
+        if self.unverified.is_empty() {
+            self.wake_content()?;
+        }
+        Ok(true)
     }
 
     /// Run the content driver now when anything is queued.
@@ -1190,6 +1220,7 @@ where
         content,
         events,
         retry: ContentRetry::default(),
+        unverified: VecDeque::new(),
     }
     .run(reconnect, content_sleeper)
     .await
@@ -3635,6 +3666,51 @@ mod tests {
             body(target.conn()).as_deref(),
             Some("restored"),
             "the rows are committed before the replay is attempted"
+        );
+    }
+
+    /// A tab attaching while the content integrity walk is outstanding is served on that
+    /// turn, so a long outbox cannot hold the attachment past the tab's own deadline.
+    #[wasm_bindgen_test]
+    async fn a_tab_attaches_during_the_content_integrity_walk() {
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::FileId;
+        use std::collections::VecDeque;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let config = ClientConfig::new("worker");
+        let worker =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the worker opens offline");
+        let (notices, _notice_rx) = unbounded_channel();
+        let (events, event_rx) = unbounded_channel();
+        let (out, _out_rx) = unbounded_channel();
+        let mut runtime = super::HubRuntime {
+            worker,
+            state: super::HubState::default(),
+            notices,
+            content: None,
+            events: event_rx,
+            retry: super::ContentRetry::default(),
+            unverified: VecDeque::from([FileId::from_bytes([7; 32])]),
+        };
+        events
+            .send(super::HubEvent::Attached(1, out))
+            .expect("the attachment queues");
+
+        assert!(
+            runtime.verify_turn().await.expect("the turn serves"),
+            "the hub keeps running"
+        );
+        assert!(
+            runtime.state.tabs.contains_key(&1),
+            "the attaching tab must be registered on this turn"
+        );
+        assert_eq!(
+            runtime.unverified.len(),
+            1,
+            "and the walk must still have its file to check"
         );
     }
 }

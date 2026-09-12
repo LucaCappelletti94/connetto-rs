@@ -110,11 +110,16 @@ pub enum HandshakeReply {
     Refuse(FatalErrorReason),
 }
 
-/// The typed error the transport trait requires, standing for a peer that has gone
-/// or a connection reset under a send.
+/// The typed error the transport trait requires.
 #[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-pub struct FakeClosed;
+pub enum FakeTransportError {
+    /// The peer is gone.
+    #[error("fake transport closed")]
+    Closed,
+    /// A bulk send was rejected, as a connection reset under an upload does.
+    #[error("fake transport rejected a bulk send")]
+    BulkRejected,
+}
 
 /// A transport that answers the handshake with a canned reply and drops
 /// everything else on the floor.
@@ -239,13 +244,13 @@ impl FakeTransport {
 }
 
 impl Transport for FakeTransport {
-    type Error = FakeClosed;
+    type Error = FakeTransportError;
 
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeTransportError> {
         if matches!(message, ControlMessage::Handshake(_)) {
             let frame = self.answer();
             self.inbox.push_back(frame);
@@ -264,14 +269,14 @@ impl Transport for FakeTransport {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
+    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeTransportError> {
         if self.bulk_fails {
-            return Err(FakeClosed);
+            return Err(FakeTransportError::BulkRejected);
         }
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeTransportError> {
         if let Some(frame) = self.inbox.pop_front() {
             return Ok(Some(frame));
         }
@@ -285,7 +290,7 @@ impl Transport for FakeTransport {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
+    async fn close(&mut self) -> Result<(), FakeTransportError> {
         Ok(())
     }
 }
