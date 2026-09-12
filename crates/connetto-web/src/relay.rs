@@ -900,6 +900,12 @@ struct HubRuntime<U: Transport> {
     content: Option<ContentArchive<BrowserStore>>,
     events: UnboundedReceiver<HubEvent>,
     retry: ContentRetry,
+    walk: WalkState,
+}
+
+/// What the content integrity walk still owes this run.
+#[derive(Default)]
+struct WalkState {
     /// Outbox files still to be checked for readable bytes.
     unverified: VecDeque<connetto_file_client::FileId>,
     /// Position of the scan over the head file's chunks.
@@ -956,7 +962,7 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        let unverified = !self.unverified.is_empty() || self.unswept;
+        let unverified = !self.walk.unverified.is_empty() || self.walk.unswept;
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -997,6 +1003,7 @@ where
             &mut self.state,
             &self.notices,
             self.content.as_ref(),
+            &mut self.walk,
             event,
         )
         .await
@@ -1009,10 +1016,6 @@ where
         let imported = matches!(&event, HubEvent::Import(_, _));
         self.serve(event).await?;
         if imported {
-            // An import can restore the very chunks a scan in progress has already missed,
-            // and it can leave its own behind when it fails part way.
-            self.scan = ChunkScan::default();
-            self.unswept = true;
             self.wake_content()?;
         }
         Ok(true)
@@ -1071,6 +1074,7 @@ where
             &self.notices,
             self.content.as_ref(),
             &mut self.events,
+            &mut self.walk,
         )
         .await
     }
@@ -1121,9 +1125,7 @@ where
             content,
             events,
             retry,
-            unverified: _,
-            scan: _,
-            unswept: _,
+            walk,
         } = self;
         let Some(content) = content.as_ref() else {
             return Ok(ContentWalk::Complete {
@@ -1147,7 +1149,8 @@ where
             }
             Ok(ContentFlushStart::Complete(flush)) => flush,
             Ok(ContentFlushStart::Upload(upload)) => {
-                finish_content_upload(worker, state, notices, content, events, &upload).await?
+                finish_content_upload(worker, state, notices, content, events, walk, &upload)
+                    .await?
             }
             Err(err) => {
                 tracing::warn!(error = %err, "content outbox walk failed");
@@ -1166,7 +1169,7 @@ where
             return;
         };
         match content.unsent_files(&mut self.worker) {
-            Ok(files) => self.unverified = files.into(),
+            Ok(files) => self.walk.unverified = files.into(),
             Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
     }
@@ -1178,23 +1181,28 @@ where
     /// attachment past the tab's own deadline.
     async fn verify_turn(&mut self) -> Result<bool, RelayError> {
         let Some(content) = self.content.as_ref() else {
-            self.unverified.clear();
-            self.unswept = false;
+            self.walk.unverified.clear();
+            self.walk.unswept = false;
             return Ok(true);
         };
-        let Some(&file_id) = self.unverified.front() else {
+        let Some(&file_id) = self.walk.unverified.front() else {
             // The files are settled, so the bytes none of them name can go.
             self.reclaim_orphans().await;
-            self.unswept = false;
+            self.walk.unswept = false;
             self.wake_content()?;
             return Ok(true);
         };
         let step = content
-            .scan_unsent_file(&mut self.worker, file_id, self.scan, VERIFY_CHUNK_BUDGET)
+            .scan_unsent_file(
+                &mut self.worker,
+                file_id,
+                self.walk.scan,
+                VERIFY_CHUNK_BUDGET,
+            )
             .await;
         match step {
             Ok(ScanStep::More(scan)) => {
-                self.scan = scan;
+                self.walk.scan = scan;
                 return Ok(true);
             }
             // The identity is durable in the replica until acknowledged, so a pending-work
@@ -1205,8 +1213,8 @@ where
             Ok(ScanStep::Intact) => {}
             Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
-        self.unverified.pop_front();
-        self.scan = ChunkScan::default();
+        self.walk.unverified.pop_front();
+        self.walk.scan = ChunkScan::default();
         Ok(true)
     }
 
@@ -1262,9 +1270,10 @@ where
         content,
         events,
         retry: ContentRetry::default(),
-        unverified: VecDeque::new(),
-        scan: ChunkScan::default(),
-        unswept: true,
+        walk: WalkState {
+            unswept: true,
+            ..WalkState::default()
+        },
     }
     .run(reconnect, content_sleeper)
     .await
@@ -1277,6 +1286,7 @@ async fn finish_content_upload<U>(
     notices: &UnboundedSender<HubNotice>,
     content: &ContentArchive<BrowserStore>,
     events: &mut UnboundedReceiver<HubEvent>,
+    walk: &mut WalkState,
     upload: &ContentUpload<BrowserStore>,
 ) -> Result<ContentFlush, RelayError>
 where
@@ -1296,7 +1306,7 @@ where
             TransferStep::Event(None) => serving = false,
             TransferStep::Event(Some(event)) => {
                 if let Err(error) =
-                    handle_hub_event(worker, state, notices, Some(content), event).await
+                    handle_hub_event(worker, state, notices, Some(content), walk, event).await
                 {
                     event_error = Some(error);
                     serving = false;
@@ -1367,6 +1377,7 @@ async fn handle_hub_event<U>(
     state: &mut HubState,
     notices: &UnboundedSender<HubNotice>,
     content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
     event: HubEvent,
 ) -> Result<(), RelayError>
 where
@@ -1403,6 +1414,10 @@ where
         }
         HubEvent::Import(bytes, reply) => {
             let _ = reply.send(import_archive(worker, content, &bytes).await);
+            // An import can restore the chunks a scan in progress has already missed, and
+            // can leave its own behind when it fails part way.
+            walk.scan = ChunkScan::default();
+            walk.unswept = true;
         }
         HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
@@ -1525,6 +1540,7 @@ where
     content: Option<&'a ContentArchive<BrowserStore>>,
     events: &'a mut UnboundedReceiver<HubEvent>,
     deferred: &'a mut VecDeque<HubEvent>,
+    walk: &'a mut WalkState,
 }
 
 async fn hub_recover<U, F, S>(
@@ -1534,6 +1550,7 @@ async fn hub_recover<U, F, S>(
     notices: &UnboundedSender<HubNotice>,
     content: Option<&ContentArchive<BrowserStore>>,
     events: &mut UnboundedReceiver<HubEvent>,
+    walk: &mut WalkState,
 ) -> Result<bool, RelayError>
 where
     U: Transport + MaybeSend + 'static,
@@ -1551,6 +1568,7 @@ where
         content,
         events,
         deferred: &mut deferred,
+        walk,
     };
     loop {
         attempt = attempt.saturating_add(1);
@@ -1604,6 +1622,7 @@ where
                     context.state,
                     context.notices,
                     context.content,
+                    context.walk,
                     event,
                 )
                 .await?;
@@ -1798,6 +1817,7 @@ where
         context.state,
         context.notices,
         context.content,
+        context.walk,
         local,
     )
     .await
@@ -1832,6 +1852,7 @@ where
             context.state,
             context.notices,
             context.content,
+            context.walk,
             event,
         )
         .await?;
@@ -3745,7 +3766,6 @@ mod tests {
     async fn an_import_schedules_the_orphan_sweep() {
         use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica};
         use connetto_core::test_support::FakeTransport;
-        use std::collections::VecDeque;
         use tokio::sync::mpsc::unbounded_channel;
 
         let config = ClientConfig::new("worker");
@@ -3772,9 +3792,7 @@ mod tests {
             content: None,
             events: event_rx,
             retry: super::ContentRetry::default(),
-            unverified: VecDeque::new(),
-            scan: super::ChunkScan::default(),
-            unswept: false,
+            walk: super::WalkState::default(),
         };
 
         let (reply, answer) = futures_channel::oneshot::channel();
@@ -3787,7 +3805,7 @@ mod tests {
             .expect("the caller is answered")
             .expect("the import applies");
         assert!(
-            runtime.unswept,
+            runtime.walk.unswept,
             "an import must leave the orphan sweep owed a turn"
         );
     }
@@ -3818,9 +3836,13 @@ mod tests {
             content: Some(content),
             events: event_rx,
             retry: super::ContentRetry::default(),
-            unverified: VecDeque::from([FileId::from_bytes([7; 32]), FileId::from_bytes([9; 32])]),
-            scan: super::ChunkScan::default(),
-            unswept: false,
+            walk: super::WalkState {
+                unverified: VecDeque::from([
+                    FileId::from_bytes([7; 32]),
+                    FileId::from_bytes([9; 32]),
+                ]),
+                ..super::WalkState::default()
+            },
         };
 
         assert!(
@@ -3828,7 +3850,7 @@ mod tests {
             "the hub keeps running"
         );
         assert_eq!(
-            runtime.unverified.len(),
+            runtime.walk.unverified.len(),
             1,
             "one turn checks exactly one file, leaving the cycle free for everything else"
         );
@@ -3837,7 +3859,7 @@ mod tests {
             "the hub keeps running"
         );
         assert!(
-            runtime.unverified.is_empty(),
+            runtime.walk.unverified.is_empty(),
             "and the walk finishes file by file"
         );
     }
