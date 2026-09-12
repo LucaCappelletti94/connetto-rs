@@ -914,10 +914,15 @@ struct WalkState {
     unswept: bool,
     /// Whether a failed sweep is waiting for the content retry timer.
     sweep_waiting: bool,
+    /// Orphaned chunks the sweep has listed and not yet deleted.
+    orphans: VecDeque<connetto_file_client::ChunkHash>,
 }
 
 /// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
 const VERIFY_CHUNK_BUDGET: usize = 8;
+
+/// Orphaned chunks deleted per turn, for the same reason.
+const DISCARD_BUDGET: usize = 8;
 
 /// Why one hub cycle woke.
 enum Wake {
@@ -1189,9 +1194,12 @@ where
             self.walk.unswept = false;
             return Ok(true);
         };
+        if !self.walk.orphans.is_empty() {
+            return self.discard_turn().await;
+        }
         let Some(&file_id) = self.walk.unverified.front() else {
             // The files are settled, so the bytes none of them name can go.
-            if self.reclaim_orphans().await {
+            if self.list_orphans().await {
                 self.walk.unswept = false;
                 self.wake_content()?;
             } else {
@@ -1228,25 +1236,59 @@ where
         Ok(true)
     }
 
-    /// Reclaim chunks an interrupted import or stage left behind, reporting whether the
-    /// sweep completed.
+    /// Drop the manifests nothing covers, then list the chunks that leaves behind along
+    /// with those an interrupted import or stage left, reporting whether the listing
+    /// succeeded.
     ///
-    /// One attempt per turn, because a sweep asks the store for everything it holds.
-    async fn reclaim_orphans(&mut self) -> bool {
+    /// The deletions follow one turn at a time, because a crowded store holds as many of
+    /// them as it holds chunks.
+    async fn list_orphans(&mut self) -> bool {
         let Some(content) = self.content.as_ref() else {
             return true;
         };
-        match content.reclaim_orphans(&mut self.worker).await {
-            Ok(0) => true,
-            Ok(reclaimed) => {
-                tracing::info!(reclaimed, "reclaimed orphaned content chunks");
+        match content.evict_uncovered(&mut self.worker) {
+            Ok(0) => {}
+            Ok(evicted) => tracing::info!(evicted, "evicted uncovered content manifests"),
+            Err(err) => tracing::warn!(error = %err, "evicting uncovered manifests failed"),
+        }
+        match content.orphan_chunks(&mut self.worker).await {
+            Ok(orphans) => {
+                if !orphans.is_empty() {
+                    tracing::info!(
+                        orphans = orphans.len(),
+                        "reclaiming orphaned content chunks"
+                    );
+                }
+                self.walk.orphans = orphans.into();
                 true
             }
             Err(err) => {
-                tracing::warn!(error = %err, "reclaiming orphaned chunks failed");
+                tracing::warn!(error = %err, "listing orphaned chunks failed");
                 false
             }
         }
+    }
+
+    /// Delete a bounded number of the listed orphans.
+    async fn discard_turn(&mut self) -> Result<bool, RelayError> {
+        let Some(content) = self.content.as_ref() else {
+            self.walk.orphans.clear();
+            return Ok(true);
+        };
+        for _ in 0..DISCARD_BUDGET {
+            let Some(hash) = self.walk.orphans.pop_front() else {
+                break;
+            };
+            if let Err(err) = content.discard_chunk(&hash).await {
+                tracing::warn!(error = %err, "discarding an orphaned chunk failed");
+                self.walk.orphans.clear();
+                self.walk.sweep_waiting = true;
+                self.walk.unswept = true;
+                self.retry.schedule(true, false);
+                return Ok(true);
+            }
+        }
+        Ok(true)
     }
 
     /// Run the content driver now when anything is queued.

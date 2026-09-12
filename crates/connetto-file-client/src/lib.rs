@@ -9,6 +9,7 @@ mod error;
 pub mod http;
 mod import;
 pub mod resolve;
+mod retain;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod store;
 mod ticket;
@@ -18,7 +19,7 @@ mod worker;
 pub use browser_store::{BrowserStore, BrowserStoreError};
 
 pub use client::{ContentClient, ContentEvent};
-pub use connetto_file_core::FileId;
+pub use connetto_file_core::{ChunkHash, FileId};
 pub use error::ContentError;
 pub use import::ContentImportPlan;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};
