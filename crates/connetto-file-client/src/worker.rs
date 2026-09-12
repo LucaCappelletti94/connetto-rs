@@ -446,10 +446,15 @@ where
         connection: &mut ConnettoConnection<T>,
         files: &[FileId],
     ) -> Result<(), ContentError> {
-        for file_id in files {
-            db::forget_retired(connection.conn(), *file_id)?;
-        }
-        Ok(())
+        connection
+            .conn()
+            .transaction(|conn| {
+                for file_id in files {
+                    db::forget_retired(conn, *file_id)?;
+                }
+                Ok::<(), diesel::result::Error>(())
+            })
+            .map_err(ContentError::from)
     }
 
     /// Attempts one raw-connection outbox entry.
@@ -604,8 +609,12 @@ where
     ) -> Result<ContentFlush, ContentError> {
         match result {
             Err(error) if error.is_retryable() => Ok(ContentFlush::Deferred),
-            Ok(()) | Err(_) => {
+            Ok(()) => {
                 db::dequeue(connection.conn(), file_id)?;
+                Ok(ContentFlush::Progressed)
+            }
+            Err(_) => {
+                retire(connection.conn(), file_id)?;
                 Ok(ContentFlush::Progressed)
             }
         }

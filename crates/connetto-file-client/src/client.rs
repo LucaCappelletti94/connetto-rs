@@ -112,6 +112,9 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// bytes it had. One store belongs to one process, the same assumption the
     /// store's temporary names rest on, so one mutex closes it.
     content_writes: tokio::sync::Mutex<()>,
+    /// Signalled by `apply_local_data_import` so `drive_outbox` wakes without
+    /// a replica mutation when a content-only archive lands.
+    import_notify: tokio::sync::Notify,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -152,6 +155,7 @@ where
             sources: vec![Box::new(local)],
             events,
             content_writes: tokio::sync::Mutex::new(()),
+            import_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -200,8 +204,9 @@ where
             .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
             .await?;
-        // The import is committed, so a failed replay is left to the outbox driver.
+        // The import is committed; a failed replay is left to the outbox driver.
         let _ = self.client.replay_pending().await;
+        self.import_notify.notify_one();
         Ok(outcome)
     }
 
@@ -327,13 +332,18 @@ where
     ///
     /// [`ContentError::Replica`] when the record cannot be written.
     pub async fn forget_retired_content(&self, files: &[FileId]) -> Result<(), ContentError> {
-        for file_id in files {
-            let file_id = *file_id;
-            self.client
-                .with_conn(move |conn| db::forget_retired(conn.conn(), file_id))
-                .await?;
-        }
-        Ok(())
+        let files = files.to_vec();
+        self.client
+            .with_conn(move |conn| {
+                conn.conn().transaction(|c| {
+                    for file_id in &files {
+                        db::forget_retired(c, *file_id)?;
+                    }
+                    Ok::<(), diesel::result::Error>(())
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// How many of one unsent file's chunks cannot be read, or `None` when all
@@ -385,13 +395,13 @@ where
                     });
                 }
                 Err(err) => {
+                    let detail = err.to_string();
                     self.client
-                        .with_conn(|conn| db::dequeue(conn.conn(), file_id))
+                        .with_conn(move |conn| retire(conn.conn(), file_id))
                         .await?;
-                    let _ = self.events.send(ContentEvent::UploadRefused {
-                        file_id,
-                        detail: err.to_string(),
-                    });
+                    let _ = self
+                        .events
+                        .send(ContentEvent::UploadRefused { file_id, detail });
                 }
             }
         }
@@ -451,14 +461,17 @@ where
             }
             attempt = 0;
             loop {
-                match events.recv().await {
-                    Ok(
-                        ClientEvent::Reconnected
-                        | ClientEvent::SyncStatus(SyncStatus::Connected)
-                        | ClientEvent::MutationApplied { .. },
-                    ) => break,
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
+                tokio::select! {
+                    () = self.import_notify.notified() => break,
+                    result = events.recv() => match result {
+                        Ok(
+                            ClientEvent::Reconnected
+                            | ClientEvent::SyncStatus(SyncStatus::Connected)
+                            | ClientEvent::MutationApplied { .. },
+                        ) => break,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 }
             }
         }

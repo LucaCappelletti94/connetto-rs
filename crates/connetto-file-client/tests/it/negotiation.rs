@@ -383,3 +383,50 @@ async fn malformed_grant_url_sends_no_requests_and_retires_entry() {
         "a malformed grant URL must produce UploadRefused; got {ev:?}"
     );
 }
+
+/// A 413 response records the identity in `retired_content` and empties the outbox.
+#[tokio::test]
+async fn permanent_upload_failure_is_recorded_in_retired_content() {
+    let dir = tempdir().expect("temp dir");
+    let cc = staged_outbox_entry(dir.path(), RecordingHttp::new([(413_u16, vec![])])).await;
+    let mut events = cc.events();
+    cc.flush_outbox().await.expect("flush");
+    let ev = events.try_recv().expect("UploadRefused event must arrive");
+    let ContentEvent::UploadRefused { file_id, .. } = ev else {
+        panic!("expected UploadRefused, got {ev:?}");
+    };
+    let retired = cc.retired_content().await.expect("read retired_content");
+    assert_eq!(
+        retired,
+        vec![file_id],
+        "permanent failure must record the identity in retired_content"
+    );
+    let sent = cc.flush_outbox().await.expect("second flush");
+    let second_ev = events.try_recv();
+    assert_eq!(sent, 0, "outbox must be empty after permanent failure");
+    assert!(
+        second_ev.is_err(),
+        "no event on second flush when outbox is already empty"
+    );
+}
+
+/// A successful upload leaves `retired_content` empty.
+#[tokio::test]
+async fn successful_upload_leaves_retired_content_empty() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new([(200_u16, br#"{"needed":[]}"#.to_vec()), (200_u16, vec![])]);
+    let cc = staged_outbox_entry(dir.path(), http).await;
+    let mut events = cc.events();
+    let sent = cc.flush_outbox().await.expect("flush");
+    assert_eq!(sent, 1, "one file uploaded");
+    let ev = events.try_recv().expect("Uploaded event must arrive");
+    assert!(
+        matches!(ev, ContentEvent::Uploaded { .. }),
+        "success must produce Uploaded, got {ev:?}"
+    );
+    let retired = cc.retired_content().await.expect("read retired_content");
+    assert!(
+        retired.is_empty(),
+        "successful upload must leave retired_content empty, got {retired:?}"
+    );
+}
