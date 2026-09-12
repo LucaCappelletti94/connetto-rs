@@ -258,7 +258,7 @@ The replica filename is `prefix-sha256(canonical(user_id))` truncated to 128 bit
 
 ## No open decisions
 
-Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23). One item remains decided rather than built: R21, which moves the native side onto the browser's page codec. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. The anonymous-access and adoption work in phase E6 introduces no new encryption decisions, since decision 1 of that set (the unauthenticated replica is encrypted under a device-scoped key) was built in E5 and the `boot_db_worker` path that provisions it is already in place.
+Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23). One item remains decided rather than built: R21, which moves the native side onto the browser's page codec. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. An unidentified run introduces no encryption decision at all: its local copy is SQLite's own `:memory:` and carries no key (chapter 12, **Built (R3)**), so nothing of it is at rest. (Corrected 2026-09-12: this paragraph used to say the unauthenticated replica is encrypted under a device-scoped key built in phase E5, a discarded series and a shape R3 replaced with in-memory.)
 
 ---
 

@@ -267,7 +267,7 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 
 **Q7.1 to Q7.8** ~~All file sync questions.~~
 
-**Decision: file sync is permanently outside `connetto-core`'s scope.** Amended 2026-08-21 when R24 concluded: the boundary is the crate rather than a separate repository, so the file crates live in this repo beside the demos (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are answered by the R24 positions in the master plan and the phases R64 to R69 derived from them, except the file-tree conflict question (X2), which stays open for the file crates. See https://github.com/LucaCappelletti94/file-system-review for the research this was designed against.
+**Decision: file sync is permanently outside `connetto-core`'s scope.** Amended 2026-08-21 when R24 concluded: the boundary is the crate rather than a separate repository, so the file crates live in this repo beside the demos (Q1.2). The listed design questions (transport channel, chunking, hashing, conflict resolution, GC, size limits, encryption, CDN integration) are answered by the R24 positions in the master plan and the phases R64 to R69 derived from them. The file-tree conflict question (X2) was left open for the file crates and closed by construction on 2026-09-12: chapter 18 has no file tree, so there is nothing to resolve beyond a row conflict. See https://github.com/LucaCappelletti94/file-system-review for the research this was designed against.
 
 ---
 
@@ -454,9 +454,9 @@ These were called out in the original plan as the most consequential open decisi
 | # | Question | Primary doc |
 |---|---|---|
 | X1 | ~~Aggregate query IVM scope: which shapes get incremental support, which fall back to re-execution?~~ Answered by Q5.1 (the delivered delta family plus the v1 `MIN`/`MAX` path) and completed 2026-08-22 by R30's tier model, which classifies every query by delta-composability into fold, hybrid, or re-execution (see the R30 section of the master plan) | Q5.1 |
-| X2 | File tree conflict resolution: last-writer-wins vs. CRDT-based tree | Q7.4 |
-| X3 | External crate dependency strategy: how to reference the author's other crates during development | Q0.2, Q1.1 |
-| X4 | Protocol serialization format: MessagePack / Protobuf / FlatBuffers / CBOR / JSON | Q2.1 |
-| X5 | Oplog retention policy: size, age, and what triggers a forced full re-sync | Q6.1, Q6.2 |
+| X2 | File tree conflict resolution: last-writer-wins vs. CRDT-based tree. **Not applicable as posed (recorded 2026-09-12):** chapter 18 has no file tree, a file is immutable content-addressed bytes behind an ordinary synced row, so a conflict is a row conflict and rides the sync pipeline's existing server-wins rule (chapter 03) and, offline between peers, chapter 19's provisional-tier rule (R77). A mutable tree would be an application schema, not a connetto concept. Kept as the pointer, closed by construction | Q7.4 |
+| X3 | ~~External crate dependency strategy: how to reference the author's other crates during development~~ Answered by Q0.2 and Q1.1, and in practice by git pins with `[patch.crates-io]` recorded per move in the master plan's pin records | Q0.2, Q1.1 |
+| X4 | ~~Protocol serialization format: MessagePack / Protobuf / FlatBuffers / CBOR / JSON~~ Answered by Q2.1: MessagePack for the control plane, the patchset's own binary format for rows, JSON for aggregate results | Q2.1 |
+| X5 | ~~Oplog retention policy: size, age, and what triggers a forced full re-sync~~ Answered by Q6.1 and Q6.2, built as `FullResyncRequired` and the R32 slot lifecycle | Q6.1, Q6.2 |
 | X6 | Clock discipline, OPEN, to be discussed: grace countdowns, the session staleness bound, and cache TTLs all assume a sane running clock, and nothing states monotonic versus wall time or what suspend and resume does (a device waking after a week fires every grace expiry at once, while reconnect races catch-up, under the offline eviction pause) | `15-replica-retention.md` (grace), `11-authentication.md` (staleness bound) |
 | X7 | The PostgreSQL mesh, OPEN, needs a design: `11-authentication.md` asserts a multi-server deployment where stores and the oplog replicate, but cursors are positions in one server's change log, and client failover between nodes, cursor validity across them, and per-node replication-slot topology are unexamined. Either design it or scope it out as explicitly as file sync was | `11-authentication.md` (mesh), `06-reconnect.md` (cursors) |
