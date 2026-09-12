@@ -599,7 +599,7 @@ impl RelayHub {
         )
     }
 
-    #[allow(
+    #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]
@@ -629,7 +629,7 @@ impl RelayHub {
     /// Shared constructor body behind the two hub flavors: attach the hub
     /// meta database and ensure its schema, ensure the device-private tier's
     /// watermark table when this run has one, then assemble the channels.
-    #[allow(
+    #[expect(
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]

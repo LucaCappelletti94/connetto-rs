@@ -33,6 +33,5 @@ pub const IMPORT_CHANNEL: &str = "connetto-import";
 /// what a `wasm32` linear memory can hold beside the rows it compresses.
 pub const MAX_ARCHIVE_BUFFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-
 #[cfg(test)]
 mod tests;
