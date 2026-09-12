@@ -10,7 +10,7 @@ mod process;
 mod store;
 
 pub use encrypt::{EncryptStoreError, EncryptingStore, PURPOSE_LABEL};
-pub use identity::{ChunkHash, FileId};
+pub use identity::{ChunkHash, FileId, FileIdHasher};
 pub use manifest::{ChunkMeta, Manifest};
 pub use maybe_send::MaybeSend;
 pub use mem::{MemStore, MemStoreError};

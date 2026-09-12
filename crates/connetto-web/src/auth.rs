@@ -94,6 +94,12 @@ pub enum AuthError {
     },
 }
 
+impl From<AuthError> for JsValue {
+    fn from(value: AuthError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
+
 /// The error string a JS caller receives when the key store is locked.
 ///
 /// The refusal message always starts with this, so a caller recognises it by
@@ -376,6 +382,39 @@ pub enum LoginMessage {
     },
 }
 
+/// Local work that would become unrecoverable if this device's data were deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWork {
+    /// Mutation sequence numbers not yet acknowledged by the server.
+    pub mutation_seqs: Vec<u64>,
+    /// Content files still waiting in the upload outbox.
+    pub content_files: u64,
+    /// Content files whose unsent bytes were lost, as hex identities.
+    ///
+    /// These are not pending: the bytes are gone, and the application rows
+    /// naming them are the application's to delete or to ask for again. The
+    /// record survives restarts until
+    /// [`forget_retired_content`] acknowledges it.
+    #[serde(default)]
+    pub retired_files: Vec<String>,
+}
+
+impl PendingWork {
+    /// Whether deleting local data would discard nothing pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mutation_seqs.is_empty() && self.content_files == 0
+    }
+
+    /// The number of pending mutations and content files.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        u64::try_from(self.mutation_seqs.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.content_files)
+    }
+}
+
 /// A logout message on [`LOGOUT_CHANNEL`], tokenless for the same reason
 /// [`LoginMessage`] is: no variant can carry a credential, so a tab still cannot
 /// reach the worker's token custody by speaking on this channel.
@@ -391,11 +430,10 @@ pub enum LogoutMessage {
     /// changes nothing, so a tab can offer an honest prompt before the user
     /// commits to anything.
     Unsynced,
-    /// Worker to tabs: the seqs behind, whose length is the count to show. A
-    /// snapshot, since the worker keeps syncing after answering.
+    /// Worker to tabs: a snapshot of local work that has not reached the server.
     Pending {
-        /// Mutations applied locally and queued but not yet acknowledged.
-        seqs: Vec<u64>,
+        /// The local work still at risk.
+        pending: PendingWork,
     },
     /// Tab to worker: revoke the session and clear the stored credential. With
     /// `delete` set, also destroy the replica, which needs `force` when work is
@@ -412,13 +450,29 @@ pub enum LogoutMessage {
         /// Whether the replica was marked for destruction.
         deleted: bool,
     },
-    /// Worker to tabs: the delete was refused because work is still queued and
-    /// `force` was not set. Reachable even after
-    /// [`Pending`](LogoutMessage::Pending) answered zero, because a write can
-    /// land between the question and the request.
+    /// Worker to tabs: the delete was refused because local work is still queued.
     Refused {
-        /// The queued seqs that would have been lost.
-        seqs: Vec<u64>,
+        /// The local work that would have been lost.
+        pending: PendingWork,
+    },
+    /// Tab to worker: these lost content files have been dealt with, so stop
+    /// reporting them.
+    ForgetRetired {
+        /// The hex identities [`PendingWork::retired_files`] reported.
+        files: Vec<String>,
+    },
+    /// Worker to tabs: the named losses are forgotten. The list is echoed so
+    /// two tabs acknowledging different sets cannot read each other's answer.
+    Forgot {
+        /// The acknowledged hex identities.
+        files: Vec<String>,
+    },
+    /// Worker to tabs: the named losses were not forgotten.
+    ForgetFailed {
+        /// The identities the request named.
+        files: Vec<String>,
+        /// Why the acknowledgement did not take effect.
+        detail: String,
     },
 }
 
@@ -1398,15 +1452,19 @@ pub async fn await_login_code(login_url: &str) -> Result<(String, String), AuthE
 ///
 /// # Errors
 ///
-/// The `BroadcastChannel` error if the channel cannot be opened or posted to.
-pub fn deliver_login_code(code: &str, state: &str) -> Result<(), JsValue> {
-    let channel = BroadcastChannel::new(LOGIN_CHANNEL)?;
+/// [`AuthError::Context`] if the channel cannot be opened or posted to, or
+/// the message cannot be serialized.
+pub fn deliver_login_code(code: &str, state: &str) -> Result<(), AuthError> {
+    let channel = BroadcastChannel::new(LOGIN_CHANNEL)
+        .map_err(|e| AuthError::Context(format!("login channel: {e:?}")))?;
     let message = serde_json::to_string(&LoginMessage::Code {
         code: code.to_owned(),
         state: state.to_owned(),
     })
-    .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    channel.post_message(&JsValue::from_str(&message))?;
+    .map_err(|e| AuthError::Context(format!("login message serialize: {e}")))?;
+    channel
+        .post_message(&JsValue::from_str(&message))
+        .map_err(|e| AuthError::Context(format!("login channel post: {e:?}")))?;
     channel.close();
     Ok(())
 }
@@ -1418,11 +1476,10 @@ pub enum LogoutOutcome {
     Kept,
     /// Logged out, replica marked for destruction at the next startup.
     Deleted,
-    /// Still logged in: the delete would have destroyed queued work and `force`
-    /// was not set.
+    /// Still logged in because deleting local data would discard queued work.
     Refused {
-        /// The queued seqs that would have been lost.
-        seqs: Vec<u64>,
+        /// The local work that would have been lost.
+        pending: PendingWork,
     },
 }
 
@@ -1471,27 +1528,47 @@ where
     outcome
 }
 
-/// Page-side: how many local writes have not reached the server yet.
-///
-/// Ask before offering to delete, so the prompt can name the number instead of
-/// warning vaguely. The answer is a snapshot: the worker keeps syncing, so by the
-/// time a user confirms, the true count may be lower, or higher if another tab
-/// wrote meanwhile.
+/// Asks the worker for a snapshot of local work that has not reached the server.
 ///
 /// # Errors
 ///
-/// [`AuthError::Cancelled`] when no worker answers, which is what a dead or
-/// still-booting DB worker looks like from a tab.
-pub async fn request_unsynced() -> Result<Vec<u64>, AuthError> {
+/// [`AuthError::Cancelled`] when no worker answers.
+pub async fn request_unsynced() -> Result<PendingWork, AuthError> {
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::Unsynced,
         |message| match message {
-            LogoutMessage::Pending { seqs } => Some(seqs),
+            LogoutMessage::Pending { pending } => Some(pending),
             _ => None,
         },
     )
     .await
+}
+
+/// Tells the worker that lost content files reported by [`request_unsynced`]
+/// have been dealt with, so it stops reporting them.
+///
+/// The reply names the files it acknowledges, so one tab's answer cannot
+/// satisfy another tab's acknowledgement of a different set.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers, and [`AuthError::Store`]
+/// when one answers that the acknowledgement did not take effect.
+pub async fn forget_retired_content(files: Vec<String>) -> Result<(), AuthError> {
+    let asked = files.clone();
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::ForgetRetired { files },
+        move |message| match message {
+            LogoutMessage::Forgot { files } if files == asked => Some(Ok(())),
+            LogoutMessage::ForgetFailed { files, detail } if files == asked => {
+                Some(Err(AuthError::Store(detail)))
+            }
+            _ => None,
+        },
+    )
+    .await?
 }
 
 /// Page-side: ask the worker to log out, optionally destroying the replica.
@@ -1514,7 +1591,7 @@ pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, 
             } else {
                 LogoutOutcome::Kept
             }),
-            LogoutMessage::Refused { seqs } => Some(LogoutOutcome::Refused { seqs }),
+            LogoutMessage::Refused { pending } => Some(LogoutOutcome::Refused { pending }),
             _ => None,
         },
     )

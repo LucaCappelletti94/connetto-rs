@@ -113,11 +113,11 @@ fn archive_carries_manifest_and_compressed_patchset_entries() {
 
     let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open zip");
 
-    // Manifest carries format, version 2, scope, schema fingerprint, and account.
+    // Manifest carries format, version 3, scope, schema fingerprint, and account.
     let manifest: serde_json::Value =
         serde_json::from_slice(&zip_entry(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
-    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["version"], 3);
     assert_eq!(manifest["scope"], "everything");
     assert!(
         manifest["schema_fingerprint"].is_string(),

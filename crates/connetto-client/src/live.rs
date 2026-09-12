@@ -2229,6 +2229,18 @@ where
         out
     }
 
+    /// Replays every unacknowledged mutation on the current transport.
+    ///
+    /// A disconnected client keeps the durable queue unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when encoding or sending a queued mutation fails.
+    pub async fn replay_pending(&self) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.replay_pending().await
+    }
+
     /// Keep a query's rows synced and covered until [`unpin`](Self::unpin),
     /// under an application-chosen name.
     ///

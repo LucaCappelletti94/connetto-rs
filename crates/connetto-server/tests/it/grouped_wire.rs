@@ -165,7 +165,7 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
 /// about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
-    let logs = logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
     fixture
@@ -212,62 +212,4 @@ async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
         .into_iter()
         .any(|line| line["message"] == "subscription changed maintenance tier");
     assert!(named, "the log names the transition");
-}
-
-/// The process-global log destination, installed once and read back. The
-/// transition line is `info`, so this binary listens below `warn`.
-mod logging {
-    use std::io::Write;
-    use std::sync::{Arc, LazyLock, Mutex};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    pub struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Buffer {
-        /// Every line written so far, each parsed as one JSON object.
-        pub fn lines(&self) -> Vec<serde_json::Value> {
-            String::from_utf8_lossy(&self.0.lock().expect("buffer poisoned"))
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
-        }
-    }
-
-    impl Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for Buffer {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// A subscriber is process-global, so it is installed exactly once, on the
-    /// first read of the buffer.
-    static BUFFER: LazyLock<Buffer> = LazyLock::new(|| {
-        let buffer = Buffer::default();
-        connetto_core::logging::install(buffer.clone(), "info");
-        buffer
-    });
-
-    /// Install the destination the first time and hand back the buffer.
-    pub fn install_once() -> Buffer {
-        BUFFER.clone()
-    }
 }

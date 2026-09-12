@@ -12,13 +12,14 @@ use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, NonFatalError,
 };
+use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpReply};
 use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
 
 /// The application's own table: a photo entry naming its content.
-pub const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, \
+pub const DDL: &str = "CREATE TABLE IF NOT EXISTS photos (id INTEGER PRIMARY KEY, \
                        content_id BLOB NOT NULL, content_state TEXT)";
 
 diesel::table! {
@@ -144,6 +145,33 @@ impl Transport for Scripted {
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
         ready(Ok(()))
     }
+}
+
+/// Opens a connected replica at `path/replica.sqlite` and attaches a content client over a
+/// transport that accepts the handshake and fails every subsequent bulk send.
+pub async fn connected_content_bulk_failing(
+    root: &std::path::Path,
+) -> ContentClient<FakeTransport, FsStore, RecordingHttp> {
+    let replica_path = root.join("replica.sqlite");
+    let replica = Replica::encrypted_file(
+        replica_path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+    conn.attach(FakeTransport::accepting_but_failing_bulk())
+        .await
+        .expect("attach the transport");
+    let client = ConnettoClient::start(conn);
+    ContentClient::attach(
+        client,
+        FsStore::new(root.join("chunks")),
+        ROOT_KEY,
+        RecordingHttp::default(),
+    )
+    .await
+    .expect("attach content handling")
 }
 
 /// One request the negotiation sent.

@@ -10,9 +10,9 @@
 
 use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
-use connetto_web::RelayHub;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
-use connetto_web::workers::{request_export, serve_export_requests};
+use connetto_web::workers::{DB_ALIVE_LOCK, request_export, serve_export_requests};
+use connetto_web::{RelayHub, locks};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
@@ -97,17 +97,18 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
         pump.await.expect("hub pump");
     });
     serve_export_requests(hub).expect("install the export service");
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
 
     let bytes = request_export(ExportScope::Everything)
         .await
         .expect("the worker answers");
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("a plain zip");
 
-    // Verify the manifest describes the new format.
+    // The manifest declares the outer archive contract.
     let manifest: serde_json::Value =
         serde_json::from_slice(&entry_raw(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
-    assert_eq!(manifest["version"], 2, "R56 version");
+    assert_eq!(manifest["version"], 3, "archive version");
     assert_eq!(
         manifest["entries"][0]["path"], "synced.patchset",
         "synced rows travel as a patchset"

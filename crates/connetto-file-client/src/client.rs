@@ -6,7 +6,7 @@ use std::io::Read;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
-use connetto_client::{ClientEvent, SyncStatus};
+use connetto_client::{ClientEvent, ExportScope, ImportChoices, ImportOutcome, SyncStatus};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
@@ -20,7 +20,11 @@ use tokio::sync::broadcast;
 use crate::db;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
+use crate::import::{
+    ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
+};
 use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
+use crate::worker::{content_attachments, outbox_manifests, retire, unreadable_chunk_count};
 use crate::{ticket, upload};
 
 /// How many content events are held for a slow observer.
@@ -151,6 +155,56 @@ where
         })
     }
 
+    /// Exports unsent content and replica data.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the outbox, chunk store, or replica export fails.
+    pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ContentError> {
+        let _writing = self.content_writes.lock().await;
+        let manifests = self.client.with_conn(outbox_manifests).await?;
+        let attachments = content_attachments(&self.store, &self.root_key, &manifests).await?;
+        self.client
+            .with_conn(|conn| conn.export_local_data_with_attachments(scope, &attachments))
+            .await
+            .map_err(ContentError::Client)
+    }
+
+    /// Verifies replica data and content identities without mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the archive or its content does not validate.
+    pub async fn prepare_local_data_import(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ContentImportPlan, ContentError> {
+        self.client
+            .with_conn(|connection| prepare_content_import(connection, bytes))
+            .await
+    }
+
+    /// Restores content under this device key.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when chunk storage or replica import fails.
+    pub async fn apply_local_data_import(
+        &self,
+        plan: &ContentImportPlan,
+        choices: &ImportChoices,
+    ) -> Result<ImportOutcome, ContentError> {
+        let _writing = self.content_writes.lock().await;
+        write_import_chunks(&self.store, &self.root_key, plan).await?;
+        let outcome = self
+            .client
+            .with_conn(|connection| apply_content_import(connection, plan, choices))
+            .await?;
+        // The import is committed, so a failed replay is left to the outbox driver.
+        let _ = self.client.replay_pending().await;
+        Ok(outcome)
+    }
+
     /// Registers a further local source, asked after the ones already there.
     #[must_use]
     pub fn with_source(mut self, source: BoxedSource) -> Self {
@@ -247,7 +301,7 @@ where
                 continue;
             };
             self.client
-                .with_conn(|conn| db::dequeue(conn.conn(), file_id))
+                .with_conn(|conn| retire(conn.conn(), file_id))
                 .await?;
             lost.push(file_id);
             let _ = self.events.send(ContentEvent::BytesLost {
@@ -256,6 +310,30 @@ where
             });
         }
         Ok(lost)
+    }
+
+    /// Files whose unsent bytes were lost and whose loss is unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub async fn retired_content(&self) -> Result<Vec<FileId>, ContentError> {
+        self.client.with_conn(|conn| db::retired(conn.conn())).await
+    }
+
+    /// Drops the losses the application has dealt with.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub async fn forget_retired_content(&self, files: &[FileId]) -> Result<(), ContentError> {
+        for file_id in files {
+            let file_id = *file_id;
+            self.client
+                .with_conn(move |conn| db::forget_retired(conn.conn(), file_id))
+                .await?;
+        }
+        Ok(())
     }
 
     /// How many of one unsent file's chunks cannot be read, or `None` when all
@@ -271,14 +349,7 @@ where
         let Some(manifest) = manifest else {
             return Ok(Some(0));
         };
-        let store = self.store_for(FETCHED_CLASS);
-        let mut count = 0;
-        for chunk in manifest.chunks() {
-            if store.read_chunk(&chunk.hash).await.is_err() {
-                count += 1;
-            }
-        }
-        Ok((count > 0).then_some(count))
+        Ok(unreadable_chunk_count(&self.store, &self.root_key, &manifest).await)
     }
 
     /// Uploads every file waiting in the outbox, returning how many landed.
@@ -508,20 +579,23 @@ where
                 column: file_id_column.to_owned(),
             });
         }
-        let probe = pin_sql(query, file_id_column);
+        let probe = crate::retain::pin_sql(query, file_id_column);
         let name = name.to_owned();
         let query = query.to_owned();
         let column = file_id_column.to_owned();
         self.client
             .with_conn(move |conn| {
-                let c = conn.conn();
                 if diesel::sql_query(format!("{probe} LIMIT 0"))
-                    .execute(c)
+                    .execute(conn.conn())
                     .is_err()
                 {
                     return Err(ContentError::PinColumnMissing { name, column });
                 }
-                db::put_pin(c, &name, &query, &column).map_err(ContentError::Replica)
+                conn.transact_with_bookkeeping(
+                    |c| db::put_pin(c, &name, &query, &column).map_err(ContentError::Replica),
+                    |_| Ok::<(), ContentError>(()),
+                )
+                .map(|_| ())
             })
             .await
     }
@@ -534,7 +608,13 @@ where
     pub async fn unpin_content(&self, name: &str) -> Result<(), ContentError> {
         let name = name.to_owned();
         self.client
-            .with_conn(move |conn| db::drop_pin(conn.conn(), &name))
+            .with_conn(move |conn| {
+                conn.transact_with_bookkeeping(
+                    |c| db::drop_pin(c, &name),
+                    |_| Ok::<(), diesel::result::Error>(()),
+                )
+                .map(|_| ())
+            })
             .await
             .map_err(ContentError::Replica)
     }
@@ -558,20 +638,7 @@ where
     /// [`ContentError::Replica`] when a pin's query cannot be evaluated.
     pub async fn pinned(&self) -> Result<HashSet<FileId>, ContentError> {
         self.client
-            .with_conn(|conn| {
-                let c = conn.conn();
-                let mut wanted = HashSet::new();
-                for (_, query, column) in db::pins(c)? {
-                    let rows: Vec<PinnedId> =
-                        diesel::sql_query(pin_sql(&query, &column)).load(c)?;
-                    for row in rows {
-                        if let Ok(bytes) = <[u8; 32]>::try_from(row.file_id.as_slice()) {
-                            wanted.insert(FileId::from_bytes(bytes));
-                        }
-                    }
-                }
-                Ok(wanted)
-            })
+            .with_conn(|conn| crate::retain::pinned_ids(conn.conn()))
             .await
     }
 
@@ -690,7 +757,7 @@ where
             .with_conn(|conn| {
                 conn.transact_with_bookkeeping(
                     |c| {
-                        let evicted = evict_uncovered(c, &pinned)?;
+                        let evicted = crate::retain::evict_uncovered(c, &pinned)?;
                         Ok((evicted, db::referenced_hashes(c)?))
                     },
                     |_| Ok::<(), ContentError>(()),
@@ -727,59 +794,4 @@ where
         }
         Ok(())
     }
-}
-
-/// One file identity out of a pin query.
-#[derive(diesel::QueryableByName)]
-struct PinnedId {
-    /// The identity bytes the pin's named column carried.
-    #[diesel(sql_type = diesel::sql_types::Binary)]
-    file_id: Vec<u8>,
-}
-
-/// Drops every manifest nothing covers and answers how many went.
-///
-/// The chunk files are not touched here. The rows have to commit before any
-/// file goes, because the reverse order leaves a manifest pointing at bytes
-/// that are gone.
-fn evict_uncovered(
-    conn: &mut SqliteConnection,
-    pinned: &HashSet<FileId>,
-) -> Result<usize, ContentError> {
-    let mut evicted = 0;
-    for file_id in db::all_manifests(conn)? {
-        if evictable(conn, pinned, file_id)?.is_none() {
-            continue;
-        }
-        db::drop_manifest(conn, file_id)?;
-        evicted += 1;
-    }
-    Ok(evicted)
-}
-
-/// The manifest to evict, or `None` when something still wants this file.
-fn evictable(
-    conn: &mut SqliteConnection,
-    pinned: &HashSet<FileId>,
-    file_id: FileId,
-) -> Result<Option<Manifest>, ContentError> {
-    if pinned.contains(&file_id) || db::is_unsent(conn, file_id)? {
-        return Ok(None);
-    }
-    db::load_manifest(conn, file_id)
-}
-
-/// Wraps a pin's query so one fixed column name comes back.
-///
-/// The wrap costs nothing: SQLite flattens a bare subselect, which R58
-/// measured on the server side of the same pattern.
-///
-/// The column is bracket-quoted rather than double-quoted, and the difference
-/// is load-bearing. SQLite resolves a double-quoted identifier that names no
-/// column as a string literal instead of refusing it, so a pin naming a
-/// column its query does not return would be accepted and would then answer
-/// the text of its own column name for every row, as a file identity. Bracket
-/// quoting has no such fallback and reports `no such column`.
-fn pin_sql(query: &str, column: &str) -> String {
-    format!("SELECT [{column}] AS file_id FROM ({query}) AS _connetto_pin")
 }

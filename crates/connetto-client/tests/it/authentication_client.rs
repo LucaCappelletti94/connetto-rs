@@ -17,7 +17,7 @@ use connetto_client::{
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{BulkMessage, ControlMessage, FatalErrorReason, HandshakeAck};
-use connetto_core::test_support::{FakeClosed, FakeTransport};
+use connetto_core::test_support::{FakeTransport, FakeTransportError};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{AuthConfig, TokenAuthority};
 use diesel::prelude::*;
@@ -211,7 +211,7 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
             .with_token_source(AccessTokenSource::new(|| async {
                 Err(ClientError::Auth("credential no longer valid".to_owned()))
             }));
-    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
+    let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
@@ -254,7 +254,7 @@ async fn a_mid_session_close_surfaces_its_reason_then_routes_to_relogin() {
             }));
     // A revoked session causes the token source to fail on the next reconnect,
     // routing to re-login rather than an endless retry.
-    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
+    let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
@@ -302,7 +302,7 @@ async fn reconnect_retries_a_transient_refresh_fault() {
                     "refresh endpoint returned 503".to_owned(),
                 ))
             }));
-    let factory = || async { Ok::<FakeTransport, FakeClosed>(FakeTransport::accepting()) };
+    let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
@@ -340,12 +340,12 @@ struct GrantRecorder {
 }
 
 impl Transport for GrantRecorder {
-    type Error = FakeClosed;
+    type Error = FakeTransportError;
 
     fn send_control(
         &mut self,
         message: ControlMessage,
-    ) -> impl Future<Output = Result<(), FakeClosed>> {
+    ) -> impl Future<Output = Result<(), FakeTransportError>> {
         if let ControlMessage::Handshake(handshake) = message {
             self.grants.lock().expect("grants lock").extend(
                 handshake
@@ -371,15 +371,18 @@ impl Transport for GrantRecorder {
         ready(Ok(()))
     }
 
-    fn send_bulk(&mut self, _message: BulkMessage) -> impl Future<Output = Result<(), FakeClosed>> {
+    fn send_bulk(
+        &mut self,
+        _message: BulkMessage,
+    ) -> impl Future<Output = Result<(), FakeTransportError>> {
         ready(Ok(()))
     }
 
-    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, FakeClosed>> {
+    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, FakeTransportError>> {
         ready(Ok(self.inbox.lock().expect("inbox lock").pop_front()))
     }
 
-    fn close(&mut self) -> impl Future<Output = Result<(), FakeClosed>> {
+    fn close(&mut self) -> impl Future<Output = Result<(), FakeTransportError>> {
         ready(Ok(()))
     }
 }

@@ -203,7 +203,7 @@ async fn wide_rows_page_smaller_under_the_same_budget() {
 /// file-shaped data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers() {
-    let logs = logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
     fixture
@@ -253,7 +253,7 @@ async fn a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers() {
 /// before a single row is read, which is the one refusal the estimate pays for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_table_wider_than_the_ceiling_is_refused_before_the_read() {
-    let logs = logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
     fixture
@@ -358,63 +358,6 @@ async fn read_refusals_are_byte_identical_across_causes() {
     );
 }
 
-/// The process-global log destination, installed once and read back.
-mod logging {
-    use std::io::Write;
-    use std::sync::{Arc, LazyLock, Mutex};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    pub struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Buffer {
-        /// Every line written so far, each parsed as one JSON object.
-        pub fn lines(&self) -> Vec<serde_json::Value> {
-            String::from_utf8_lossy(&self.0.lock().expect("buffer poisoned"))
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
-        }
-    }
-
-    impl Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for Buffer {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// A subscriber is process-global, so it is installed exactly once, on the
-    /// first read of the buffer.
-    static BUFFER: LazyLock<Buffer> = LazyLock::new(|| {
-        let buffer = Buffer::default();
-        connetto_core::logging::install(buffer.clone(), "warn");
-        buffer
-    });
-
-    /// Install the destination the first time and hand back the buffer.
-    pub fn install_once() -> Buffer {
-        BUFFER.clone()
-    }
-}
-
 /// A subscription the server has to replace, over a table this tier refuses,
 /// ends rather than retrying a refusal for ever.
 ///
@@ -424,7 +367,7 @@ mod logging {
 /// at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
-    let logs = logging::install_once();
+    let logs = crate::logging::capture().await;
     let fixture = Fixture::acquire().await;
     fill(&fixture, 40, 64).await;
     let serving = manager(
@@ -464,7 +407,7 @@ async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
 /// triggered read spends the server's shorter bound, because a trigger is
 /// awaited on the loop that fans every patch to every client.
 mod aggregates {
-    use super::{PG_DDL, logging};
+    use super::PG_DDL;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -587,7 +530,7 @@ mod aggregates {
     /// refusal carries, and the log carries the cause.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_triggered_read_past_the_shared_bound_ends_the_subscription() {
-        let logs = logging::install_once();
+        let logs = crate::logging::capture().await;
         let fixture = Fixture::acquire().await;
         fill_counts(&fixture, 200_000).await;
         let manager = manager(

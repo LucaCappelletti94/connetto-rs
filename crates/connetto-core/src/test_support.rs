@@ -110,11 +110,16 @@ pub enum HandshakeReply {
     Refuse(FatalErrorReason),
 }
 
-/// The typed error the transport trait requires. This fake never fails, so it
-/// stands only for "the peer is gone".
+/// The typed error the transport trait requires.
 #[derive(Debug, thiserror::Error)]
-#[error("fake transport closed")]
-pub struct FakeClosed;
+pub enum FakeTransportError {
+    /// The peer is gone.
+    #[error("fake transport closed")]
+    Closed,
+    /// A bulk send was rejected, as a connection reset under an upload does.
+    #[error("fake transport rejected a bulk send")]
+    BulkRejected,
+}
 
 /// A transport that answers the handshake with a canned reply and drops
 /// everything else on the floor.
@@ -140,6 +145,8 @@ pub struct FakeTransport {
     /// the frames a connected session would receive (a snapshot, a live patch,
     /// an aggregate push) before the stream drains and the peer looks gone.
     post_handshake: VecDeque<IncomingFrame>,
+    /// Fail every bulk send, as a connection reset under an upload does.
+    bulk_fails: bool,
 }
 
 impl FakeTransport {
@@ -192,6 +199,16 @@ impl FakeTransport {
         }
     }
 
+    /// A transport whose handshake succeeds, which then stays open without saying
+    /// anything, and which fails every bulk send, as a reset under an upload does.
+    #[must_use]
+    pub fn accepting_but_failing_bulk() -> Self {
+        Self {
+            bulk_fails: true,
+            ..Self::accepting_but_silent()
+        }
+    }
+
     /// A transport answering with `reply`, whose peer looks gone once its inbox
     /// drains.
     #[must_use]
@@ -202,6 +219,7 @@ impl FakeTransport {
             silent: false,
             closing: None,
             post_handshake: VecDeque::new(),
+            bulk_fails: false,
         }
     }
 
@@ -226,13 +244,13 @@ impl FakeTransport {
 }
 
 impl Transport for FakeTransport {
-    type Error = FakeClosed;
+    type Error = FakeTransportError;
 
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeTransportError> {
         if matches!(message, ControlMessage::Handshake(_)) {
             let frame = self.answer();
             self.inbox.push_back(frame);
@@ -251,11 +269,14 @@ impl Transport for FakeTransport {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
+    async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeTransportError> {
+        if self.bulk_fails {
+            return Err(FakeTransportError::BulkRejected);
+        }
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeTransportError> {
         if let Some(frame) = self.inbox.pop_front() {
             return Ok(Some(frame));
         }
@@ -269,7 +290,7 @@ impl Transport for FakeTransport {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn close(&mut self) -> Result<(), FakeClosed> {
+    async fn close(&mut self) -> Result<(), FakeTransportError> {
         Ok(())
     }
 }

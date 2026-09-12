@@ -33,7 +33,7 @@ const EVENTS: u64 = 5;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_change_path_asks_the_service_nothing_whatever_the_audience() {
-    let fixture = Fixture::acquire().await;
+    let fixture = Fixture::acquire_exclusive().await;
     let small = fanout_run(&fixture, SMALL, EVENTS, PolicyShape::Row).await;
     let large = fanout_run(&fixture, LARGE, EVENTS, PolicyShape::Row).await;
 

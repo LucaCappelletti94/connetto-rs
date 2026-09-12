@@ -40,6 +40,7 @@ mod grants;
 mod grouped_wire;
 
 mod inprocess_loop;
+mod logging;
 
 mod macro_hygiene;
 

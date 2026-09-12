@@ -17,13 +17,28 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
+use core::cell::Cell;
+use core::convert::Infallible;
+use core::future::ready;
+use std::rc::Rc;
+
+use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::test_support::{FakeTransport, replica_key};
+use connetto_core::{BulkMessage, ControlMessage, IncomingFrame, Transport};
+use connetto_file_client::{BrowserStore, ContentArchive};
+use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 use connetto_web::RelayHub;
-use connetto_web::auth::{LogoutOutcome, WorkerAuthConfig, request_logout, request_unsynced};
-use connetto_web::storage::{ReplicaStorage, take_pending_wipes};
-use connetto_web::workers::serve_logout_requests;
+use connetto_web::auth::{
+    AuthError, LogoutOutcome, PendingWork, WorkerAuthConfig, forget_retired_content,
+    request_logout, request_unsynced,
+};
+use connetto_web::relay::HubReconnect;
+use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
+use connetto_web::workers::{LogoutConfig, serve_logout_requests};
 use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Binary};
+use tokio::sync::Notify;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -56,6 +71,104 @@ fn config() -> ClientConfig {
 fn unused_auth() -> WorkerAuthConfig {
     WorkerAuthConfig::new("http://127.0.0.1:1", "unused", "http://127.0.0.1:1/unused")
 }
+struct CountingTransport {
+    inner: FakeTransport,
+    ticket_requests: Rc<Cell<u32>>,
+    ticket_sent: Rc<Notify>,
+}
+
+impl CountingTransport {
+    fn new(ticket_requests: Rc<Cell<u32>>, ticket_sent: Rc<Notify>) -> Self {
+        Self {
+            inner: FakeTransport::accepting_but_silent(),
+            ticket_requests,
+            ticket_sent,
+        }
+    }
+}
+
+impl Transport for CountingTransport {
+    type Error = <FakeTransport as Transport>::Error;
+
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
+        if matches!(&message, ControlMessage::ContentTicketRequest(_)) {
+            self.ticket_requests
+                .set(self.ticket_requests.get().saturating_add(1));
+            self.ticket_sent.notify_one();
+        }
+        self.inner.send_control(message).await
+    }
+
+    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
+        self.inner.send_bulk(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        self.inner.recv().await
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+async fn stage_pending_content<T: Transport>(
+    worker: &mut ConnettoConnection<T>,
+) -> ContentArchive<BrowserStore> {
+    let store = BrowserStore::ephemeral();
+    let root_key = [0x71; 32];
+    let encrypted = EncryptingStore::new(store.clone(), &root_key);
+    let manifest = process_file(b"stranded photo", MimeClass::Generic, &encrypted)
+        .await
+        .expect("stage content bytes");
+    let [chunk] = manifest.chunks() else {
+        panic!("the small fixture must produce one chunk");
+    };
+    let content = ContentArchive::new(store, root_key);
+    content.install(worker).expect("install content tables");
+    diesel::sql_query(
+        "INSERT INTO _connetto_content_chunks (file_id, ordinal, hash, len) VALUES (?, 0, ?, ?)",
+    )
+    .bind::<Binary, _>(manifest.file_id().as_bytes().to_vec())
+    .bind::<Binary, _>(chunk.hash.as_bytes().to_vec())
+    .bind::<BigInt, _>(i64::try_from(chunk.len).expect("fixture length"))
+    .execute(worker.conn())
+    .expect("record content manifest");
+    diesel::sql_query("INSERT INTO _connetto_content_outbox (file_id) VALUES (?)")
+        .bind::<Binary, _>(manifest.file_id().as_bytes().to_vec())
+        .execute(worker.conn())
+        .expect("queue content");
+    content
+}
+async fn stranded_worker(
+    storage: &ReplicaStorage,
+    ticket_requests: Rc<Cell<u32>>,
+    ticket_sent: Rc<Notify>,
+) -> (
+    ConnettoConnection<CountingTransport>,
+    ContentArchive<BrowserStore>,
+    Vec<u64>,
+) {
+    let url = storage.db_url(REPLICA);
+    let mut worker = ConnettoConnection::connect(
+        CountingTransport::new(ticket_requests, ticket_sent),
+        &Replica::encrypted_file(&url, Some(replica_key())).expect("a resolved key"),
+        SQLITE_DDL,
+        &config(),
+        None,
+    )
+    .await
+    .expect("connect over an upstream that never acknowledges");
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq("written on a train")))
+        .execute(worker.conn())
+        .expect("write locally");
+    worker.push().await.expect("upload the captured mutation");
+    let stranded = worker.unsynced();
+    assert!(!stranded.is_empty(), "the mutation must remain queued");
+    let content = stage_pending_content(&mut worker).await;
+    (worker, content, stranded)
+}
 
 /// A delete is refused while a write is stranded offline, and forcing it through
 /// destroys the replica anyway.
@@ -72,42 +185,67 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
 
     // Strand a write: the insert is captured, the push uploads it, and the fake
     // upstream never acknowledges it, so its seq stays queued for good.
-    let url = storage.db_url(REPLICA);
-    let mut worker = ConnettoConnection::connect(
-        FakeTransport::accepting_but_silent(),
-        &Replica::encrypted_file(&url, Some(replica_key())).expect("a resolved key"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let ticket_requests = Rc::new(Cell::new(0));
+    let ticket_sent = Rc::new(Notify::new());
+    let (worker, content, stranded) = stranded_worker(
+        &storage,
+        Rc::clone(&ticket_requests),
+        Rc::clone(&ticket_sent),
     )
-    .await
-    .expect("connect over an upstream that never acknowledges");
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::label.eq("written on a train")))
-        .execute(worker.conn())
-        .expect("write locally");
-    worker.push().await.expect("upload the captured mutation");
-    let stranded = worker.unsynced();
-    assert!(
-        !stranded.is_empty(),
-        "the fake upstream acknowledges nothing, so the write stays queued"
-    );
+    .await;
 
-    // The hub takes the connection, so from here the count is only reachable by
-    // asking the pump, which is exactly what the logout service does.
-    let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
+    let reconnect_tickets = Rc::clone(&ticket_requests);
+    let reconnect_signal = Rc::clone(&ticket_sent);
+    let reconnect = HubReconnect {
+        factory: move || {
+            ready(Ok::<_, Infallible>(CountingTransport::new(
+                Rc::clone(&reconnect_tickets),
+                Rc::clone(&reconnect_signal),
+            )))
+        },
+        sleeper: |_| ready(()),
+        policy: ReconnectPolicy::default(),
+        upstream: Vec::new(),
+    };
+    let (hub, pump, _notices) =
+        RelayHub::with_reconnect_and_content(worker, ":memory:", reconnect, content)
+            .expect("hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("hub pump");
     });
-    serve_logout_requests(unused_auth(), AUTH_DB, REPLICA, None, hub.clone())
-        .expect("install the logout service");
+    serve_logout_requests(
+        LogoutConfig {
+            auth: unused_auth(),
+            auth_db_name: AUTH_DB.to_owned(),
+            replica_db_name: REPLICA.to_owned(),
+            content_namespace: Some("content-wipe-namespace".to_owned()),
+            account: None,
+        },
+        hub.clone(),
+    )
+    .expect("install the logout service");
+    ticket_sent.notified().await;
 
-    // The query reports the stranded work, so a prompt can name it.
+    let pending = PendingWork {
+        mutation_seqs: stranded.clone(),
+        content_files: 1,
+        retired_files: Vec::new(),
+    };
     assert_eq!(
         request_unsynced().await.expect("the worker answers"),
-        stranded,
-        "the query reports exactly what is queued"
+        pending,
+        "the query reports both queues"
     );
+
+    // The acknowledgement protocol answers the caller that asked: an identity
+    // this build cannot read is refused with a reason rather than left to wait.
+    assert!(matches!(
+        forget_retired_content(vec!["not-a-file-identity".to_owned()]).await,
+        Err(AuthError::Store(_))
+    ));
+    forget_retired_content(Vec::new())
+        .await
+        .expect("an acknowledgement of nothing is still answered");
 
     // The delete is refused, and refused without destroying anything, so the write
     // can still be uploaded once the network returns.
@@ -116,9 +254,14 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
             .await
             .expect("the worker answers"),
         LogoutOutcome::Refused {
-            seqs: stranded.clone()
+            pending: pending.clone()
         },
         "a delete that would lose queued work is refused"
+    );
+    assert_eq!(
+        ticket_requests.get(),
+        1,
+        "local requests resume the pending ticket instead of minting another"
     );
     assert!(
         take_pending_wipes().await.expect("drain").is_empty(),
@@ -136,7 +279,10 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     );
     assert_eq!(
         take_pending_wipes().await.expect("drain"),
-        vec![REPLICA.to_owned()],
-        "the forced delete marks this replica"
+        vec![PendingWipe::new(
+            REPLICA,
+            Some("content-wipe-namespace".to_owned())
+        )],
+        "the forced delete names both stores"
     );
 }

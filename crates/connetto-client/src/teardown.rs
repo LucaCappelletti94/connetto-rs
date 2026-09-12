@@ -28,32 +28,38 @@
 
 use std::time::{Duration, SystemTime};
 
-/// A proactive warning that the local session is near its end while unsynced
-/// mutations are still queued, so a teardown now would lose them.
+/// A proactive warning that the local session is near its end while local work
+/// remains, so a teardown now would lose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiryWarning {
     /// When the session (refresh-token lifetime) lapses if never refreshed.
     pub session_expires_at: SystemTime,
     /// The unsynced mutation sequence numbers at risk.
     pub unsynced: Vec<u64>,
+    /// Additional local items at risk outside the mutation queue.
+    pub additional_pending: u64,
 }
 
-/// Warn when `now` is within `lead` of `session_expires_at` and `unsynced` is
-/// non-empty, otherwise `None` (not near expiry, or nothing at risk).
-///
-/// `session_expires_at` is the instant connetto-server returns with each token
-/// pair: when the current refresh token stops working if never used again. An
-/// online client keeps sliding it forward on every refresh, so this only bites
-/// while offline, the one time a session can lapse unrefreshed. The app polls
-/// this to prompt the user to reconnect before the queued writes are lost.
+impl ExpiryWarning {
+    /// Counts every local item at risk.
+    #[must_use]
+    pub fn pending_count(&self) -> u64 {
+        u64::try_from(self.unsynced.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.additional_pending)
+    }
+}
+
+/// Warns near session expiry when mutations or additional local work remain.
 #[must_use]
 pub fn expiry_warning(
     now: SystemTime,
     session_expires_at: SystemTime,
     lead: Duration,
     unsynced: Vec<u64>,
+    additional_pending: u64,
 ) -> Option<ExpiryWarning> {
-    if unsynced.is_empty() {
+    if unsynced.is_empty() && additional_pending == 0 {
         return None;
     }
     let warn_from = session_expires_at
@@ -62,6 +68,7 @@ pub fn expiry_warning(
     (now >= warn_from).then_some(ExpiryWarning {
         session_expires_at,
         unsynced,
+        additional_pending,
     })
 }
 
@@ -231,14 +238,14 @@ mod tests {
         let expires_far = now + Duration::from_secs(600);
 
         // Near expiry with queued work: warn, carrying the deadline and seqs.
-        let warning = expiry_warning(now, expires_soon, lead, vec![1, 2]).expect("warn");
+        let warning = expiry_warning(now, expires_soon, lead, vec![1, 2], 0).expect("warn");
         assert_eq!(warning.session_expires_at, expires_soon);
         assert_eq!(warning.unsynced, vec![1, 2]);
 
-        // Near expiry but nothing at risk: silent.
-        assert!(expiry_warning(now, expires_soon, lead, Vec::new()).is_none());
-        // Queued work but expiry is comfortably far: silent.
-        assert!(expiry_warning(now, expires_far, lead, vec![1]).is_none());
+        assert!(expiry_warning(now, expires_soon, lead, Vec::new(), 0).is_none());
+        assert!(expiry_warning(now, expires_far, lead, vec![1], 0).is_none());
+        let content = expiry_warning(now, expires_soon, lead, Vec::new(), 1).expect("warn");
+        assert_eq!(content.additional_pending, 1);
     }
 
     #[test]

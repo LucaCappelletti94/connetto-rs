@@ -23,7 +23,7 @@ async fn readiness_wait_reports_worker_boot_failure() {
     let err = await_db_worker_ready()
         .await
         .expect_err("the worker failure is reported");
-    let detail = err.as_string().expect("the failure is a string");
+    let detail = err.to_string();
     assert!(
         detail.contains("stale schema"),
         "the named worker failure is returned"

@@ -38,7 +38,7 @@ const fn calls_per_event(watchers: u64) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_policy_the_row_does_not_settle_costs_one_batch_per_fifty_watchers() {
-    let fixture = Fixture::acquire().await;
+    let fixture = Fixture::acquire_exclusive().await;
     let small = fanout_run(&fixture, SMALL, EVENTS, PolicyShape::CrossTable).await;
     let large = fanout_run(&fixture, LARGE, EVENTS, PolicyShape::CrossTable).await;
 

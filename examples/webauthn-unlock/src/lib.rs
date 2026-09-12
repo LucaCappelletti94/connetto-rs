@@ -94,7 +94,7 @@ mod inner {
         let worker = spawn_worker(glue_url)?;
         // Install the unlock handler before the worker's first async yield so
         // any enrol or unlock request the worker posts finds a handler.
-        serve_unlock(&worker).map_err(|e| js_err("serve_unlock", e))?;
+        serve_unlock(&worker).context("serve_unlock")?;
         WORKER.with(|c| *c.borrow_mut() = Some(worker));
 
         // Listen for step results on the harness channel. Write each result to
@@ -155,7 +155,7 @@ mod inner {
             *c.borrow_mut() = None;
         });
         let worker = spawn_worker(&glue)?;
-        serve_unlock(&worker).map_err(|e| js_err("serve_unlock (restart)", e))?;
+        serve_unlock(&worker).context("serve_unlock (restart)")?;
         WORKER.with(|c| *c.borrow_mut() = Some(worker));
         Ok(())
     }

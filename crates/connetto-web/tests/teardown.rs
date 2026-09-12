@@ -14,13 +14,18 @@
 
 use connetto_client::cipher::ReplicaKey;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
-use connetto_web::auth::{AuthError, IdbKeyStore, RefreshStore, provision_replica_key};
+use connetto_web::auth::{
+    AuthError, IdbKeyStore, PendingWork, RefreshStore, provision_replica_key,
+};
 use connetto_web::storage::{
-    ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
-    tier_db_name, wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
+    take_pending_wipes, tier_db_name, wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use indexed_db_futures::database::Database as IdbDatabase;
+use indexed_db_futures::prelude::*;
+use indexed_db_futures::transaction::TransactionMode;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -89,6 +94,18 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn work(seqs: &[u64]) -> PendingWork {
+    PendingWork {
+        mutation_seqs: seqs.to_vec(),
+        content_files: 0,
+        retired_files: Vec::new(),
+    }
+}
+
+fn pending_wipe(name: &str) -> PendingWipe {
+    PendingWipe::new(name, None)
+}
+
 /// Leave no trace of `name` from an earlier run, so each test starts from nothing
 /// rather than from whatever the last one left in this origin's OPFS.
 async fn reset(storage: &ReplicaStorage, keys: &IdbKeyStore, name: &str) {
@@ -124,7 +141,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
         "both are here"
     );
 
-    wipe_replica(&storage, &keys, alice, &[], false)
+    wipe_replica(&storage, &keys, alice, &work(&[]), false)
         .await
         .expect("wipe alice");
 
@@ -193,7 +210,7 @@ async fn a_wipe_destroys_the_tier_beside_the_replica() {
         "both device-private databases are here"
     );
 
-    wipe_replica(&storage, &keys, alice, &[], false)
+    wipe_replica(&storage, &keys, alice, &work(&[]), false)
         .await
         .expect("wipe alice");
 
@@ -223,8 +240,9 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
         .expect("mint a key");
     write_marker(&mut open(&storage, name, &key));
 
-    match wipe_replica(&storage, &keys, name, &[7, 9], false).await {
-        Err(WipeError::Unsynced(blocked)) => assert_eq!(blocked, vec![7, 9]),
+    let blocked = work(&[7, 9]);
+    match wipe_replica(&storage, &keys, name, &blocked, false).await {
+        Err(WipeError::Unsynced(actual)) => assert_eq!(actual, blocked),
         Err(other) => panic!("expected Unsynced, got {other:?}"),
         Ok(()) => panic!("a wipe must not silently drop queued writes"),
     }
@@ -339,10 +357,8 @@ async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discar
     );
 }
 
-/// A wipe the application asks for is deferred to the next boot, because nothing
-/// can delete the replica while the hub's pump holds a connection to it. The record
-/// survives being written and is taken exactly once, so the wipe happens on the
-/// next boot and not on the one after that too.
+/// A wipe record survives being written and one successful acknowledgement
+/// clears it, so a completed wipe is not repeated on the next boot.
 #[wasm_bindgen_test]
 async fn a_pending_wipe_is_taken_exactly_once() {
     let name = "e4c-pending.sqlite";
@@ -350,24 +366,52 @@ async fn a_pending_wipe_is_taken_exactly_once() {
     // Whatever an earlier test or run left, start from nothing.
     take_pending_wipes().await.expect("drain");
 
-    mark_wipe_pending(name, &[], false)
+    mark_wipe_pending(&pending_wipe(name), &work(&[]), false)
         .await
         .expect("mark a clean replica");
     // Marking twice is the same as marking once, which matters because a user can
     // press the button twice.
-    mark_wipe_pending(name, &[], false)
+    mark_wipe_pending(&pending_wipe(name), &work(&[]), false)
         .await
         .expect("mark again");
 
     let taken = take_pending_wipes().await.expect("take");
     assert_eq!(
         taken,
-        vec![name.to_owned()],
+        vec![pending_wipe(name)],
         "the boot after the request finds it, once"
     );
     assert!(
         take_pending_wipes().await.expect("take again").is_empty(),
         "and the boot after that finds nothing, so a wipe is not repeated"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_legacy_replica_only_wipe_is_preserved() {
+    take_pending_wipes().await.expect("drain");
+    let name = "e4c-legacy-pending.sqlite";
+    let db = IdbDatabase::open("connetto-pending-wipes")
+        .await
+        .expect("open pending wipes");
+    let tx = db
+        .transaction("pending")
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+        .expect("write transaction");
+    tx.object_store("pending")
+        .expect("wipe store")
+        .put(name)
+        .with_key(name)
+        .primitive()
+        .expect("legacy put")
+        .await
+        .expect("legacy put await");
+    tx.commit().await.expect("legacy commit");
+
+    assert_eq!(
+        take_pending_wipes().await.expect("read legacy wipe"),
+        vec![PendingWipe::new(name, None)]
     );
 }
 
@@ -380,14 +424,18 @@ async fn pending_wipes_are_drained_without_naming_anyone() {
 
     let alice = "e4c-drain-alice.sqlite";
     let bob = "e4c-drain-bob.sqlite";
-    mark_wipe_pending(alice, &[], false).await.expect("mark");
-    mark_wipe_pending(bob, &[], false).await.expect("mark");
+    mark_wipe_pending(&pending_wipe(alice), &work(&[]), false)
+        .await
+        .expect("mark");
+    mark_wipe_pending(&pending_wipe(bob), &work(&[]), false)
+        .await
+        .expect("mark");
 
     let mut taken = take_pending_wipes().await.expect("take");
     taken.sort();
     assert_eq!(
         taken,
-        vec![alice.to_owned(), bob.to_owned()],
+        vec![pending_wipe(alice), pending_wipe(bob)],
         "one drain returns every outstanding wipe, whoever asked for it"
     );
 }
@@ -401,8 +449,9 @@ async fn marking_a_wipe_refuses_to_discard_unsynced_writes() {
     let name = "e4c-pending-guard.sqlite";
     take_pending_wipes().await.expect("drain");
 
-    match mark_wipe_pending(name, &[3, 4], false).await {
-        Err(WipeError::Unsynced(blocked)) => assert_eq!(blocked, vec![3, 4]),
+    let blocked = work(&[3, 4]);
+    match mark_wipe_pending(&pending_wipe(name), &blocked, false).await {
+        Err(WipeError::Unsynced(actual)) => assert_eq!(actual, blocked),
         Err(other) => panic!("expected Unsynced, got {other:?}"),
         Ok(()) => panic!("marking must not silently accept losing queued writes"),
     }
@@ -412,12 +461,12 @@ async fn marking_a_wipe_refuses_to_discard_unsynced_writes() {
     );
 
     // Forcing is the app telling the user what is being discarded and proceeding.
-    mark_wipe_pending(name, &[3, 4], true)
+    mark_wipe_pending(&pending_wipe(name), &blocked, true)
         .await
         .expect("a forced request is accepted");
     assert_eq!(
         take_pending_wipes().await.expect("take"),
-        vec![name.to_owned()],
+        vec![pending_wipe(name)],
         "and it is pending for the next boot"
     );
 }
@@ -439,14 +488,22 @@ async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
     assert!(storage.exists(name), "the replica is here to begin with");
 
     // What the application does at the prompt.
-    mark_wipe_pending(name, &[], false).await.expect("mark");
+    mark_wipe_pending(&pending_wipe(name), &work(&[]), false)
+        .await
+        .expect("mark");
 
     // What the next boot does before its login and before it opens anything, which
     // is exactly the sequence `boot_db_worker` runs.
     for pending in take_pending_wipes().await.expect("take") {
-        wipe_replica(&storage, &keys, &pending, &[], true)
-            .await
-            .expect("carry out the deferred wipe");
+        wipe_replica(
+            &storage,
+            &keys,
+            &pending.replica,
+            &PendingWork::default(),
+            true,
+        )
+        .await
+        .expect("carry out the deferred wipe");
     }
 
     assert!(

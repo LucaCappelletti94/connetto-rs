@@ -18,6 +18,11 @@ pub trait ChunkStore {
     /// The error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Whether this read failure can mean the backing store is unavailable.
+    fn read_failure_is_ambiguous(&self, _error: &Self::Error) -> bool {
+        false
+    }
+
     /// Stores a chunk at its content hash.
     ///
     /// Overwrites silently when the hash is already present.

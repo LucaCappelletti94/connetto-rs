@@ -100,7 +100,7 @@ async fn connect_tab(
     identity: &str,
 ) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
-    announce_tab(&wire).await;
+    announce_tab(&wire).await.expect("announce the tab");
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let config = ClientConfig::new(client_id.to_owned())
         .with_login(Some(Grant::new(token)))

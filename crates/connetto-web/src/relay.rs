@@ -60,6 +60,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::auth::PendingWork;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
@@ -73,6 +74,10 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
+use connetto_file_client::{
+    BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
+    ContentFlushStart, ContentFlushState, ContentUpload, FileId, ScanStep,
+};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -122,6 +127,21 @@ pub enum RelayError {
     /// Compressing or decompressing a payload failed.
     #[error("compress: {0}")]
     Compress(#[from] std::io::Error),
+    /// Browser content bookkeeping could not be installed.
+    #[error(transparent)]
+    Content(#[from] ContentError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ArchiveServiceError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error(transparent)]
+    Content(#[from] ContentError),
+    #[error(
+        "the {bytes} bytes of unsent content are above the {ceiling} a browser worker can buffer, export from a native client"
+    )]
+    Unbufferable { bytes: u64, ceiling: u64 },
 }
 
 /// The hub core has ended, so it can no longer answer.
@@ -152,6 +172,17 @@ pub enum ImportRefused {
     Failed(String),
 }
 
+/// Why acknowledging lost content files did not take effect.
+#[derive(Debug, thiserror::Error)]
+pub enum ForgetRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the replica write failed.
+    #[error("forget retired content: {0}")]
+    Failed(String),
+}
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -176,19 +207,24 @@ enum HubEvent {
     Gone(TabId),
     /// The owner wants this tab disconnected (a liveness watcher fired).
     Kill(TabId),
-    /// Report the worker's queued, unacknowledged mutations. The core owns the
-    /// connection, so a caller outside it can only ask and be answered.
-    Unsynced(futures_channel::oneshot::Sender<Vec<u64>>),
+    /// Report local work that has not reached the server.
+    Unsynced(futures_channel::oneshot::Sender<PendingWork>),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
     Export(
         ExportScope,
-        futures_channel::oneshot::Sender<Result<Vec<u8>, ClientError>>,
+        futures_channel::oneshot::Sender<Result<Vec<u8>, ArchiveServiceError>>,
+    ),
+    /// Acknowledge lost content files, so they stop being reported. Same
+    /// reason: only the core can reach the connection.
+    ForgetRetired(
+        Vec<FileId>,
+        futures_channel::oneshot::Sender<Result<(), ArchiveServiceError>>,
     ),
     /// Import an archive: device-private rows and queued writes. Same reason.
     Import(
         Vec<u8>,
-        futures_channel::oneshot::Sender<Result<(ImportOutcome, usize), ClientError>>,
+        futures_channel::oneshot::Sender<Result<(ImportOutcome, usize), ArchiveServiceError>>,
     ),
 }
 
@@ -486,6 +522,8 @@ impl RelayHub {
             worker,
             hub_meta,
             None::<HubReconnect<NoFactory<U>, NoSleep>>,
+            None,
+            None::<NoSleep>,
         )
     }
 
@@ -520,7 +558,72 @@ impl RelayHub {
         F: TransportFactory<Transport = U>,
         S: Sleeper,
     {
-        Self::build(worker, hub_meta, Some(reconnect))
+        Self::build(worker, hub_meta, Some(reconnect), None, None::<NoSleep>)
+    }
+
+    /// Builds a content-aware reconnecting hub.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Content`] when content setup fails or [`RelayError::Replica`] when hub metadata cannot attach.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple is the constructor contract"
+    )]
+    pub fn with_reconnect_and_content<U, F, S>(
+        worker: ConnettoConnection<U>,
+        hub_meta: &str,
+        reconnect: HubReconnect<F, S>,
+        content: ContentArchive<BrowserStore>,
+    ) -> Result<
+        (
+            Self,
+            impl Future<Output = Result<(), RelayError>>,
+            UnboundedReceiver<HubNotice>,
+        ),
+        RelayError,
+    >
+    where
+        U: Transport + MaybeSend + 'static,
+        U::Error: core::fmt::Display,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper + Clone,
+    {
+        let content_sleeper = reconnect.sleeper.clone();
+        Self::build(
+            worker,
+            hub_meta,
+            Some(reconnect),
+            Some(content),
+            Some(content_sleeper),
+        )
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple is the constructor contract"
+    )]
+    pub(crate) fn with_reconnect_archive<U, F, S>(
+        worker: ConnettoConnection<U>,
+        hub_meta: &str,
+        reconnect: HubReconnect<F, S>,
+        content: Option<ContentArchive<BrowserStore>>,
+    ) -> Result<
+        (
+            Self,
+            impl Future<Output = Result<(), RelayError>>,
+            UnboundedReceiver<HubNotice>,
+        ),
+        RelayError,
+    >
+    where
+        U: Transport + MaybeSend + 'static,
+        U::Error: core::fmt::Display,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper + Clone,
+    {
+        let content_sleeper = content.as_ref().map(|_| reconnect.sleeper.clone());
+        Self::build(worker, hub_meta, Some(reconnect), content, content_sleeper)
     }
 
     /// Shared constructor body behind the two hub flavors: attach the hub
@@ -530,10 +633,12 @@ impl RelayHub {
         clippy::type_complexity,
         reason = "the tuple is the constructor contract"
     )]
-    fn build<U, F, S>(
+    fn build<U, F, S, CS>(
         mut worker: ConnettoConnection<U>,
         hub_meta: &str,
         reconnect: Option<HubReconnect<F, S>>,
+        content: Option<ContentArchive<BrowserStore>>,
+        content_sleeper: Option<CS>,
     ) -> Result<
         (
             Self,
@@ -547,29 +652,9 @@ impl RelayHub {
         U::Error: core::fmt::Display,
         F: TransportFactory<Transport = U>,
         S: Sleeper,
+        CS: Sleeper,
     {
-        // The hub's own state is attached to the worker replica, so it shares
-        // the replica's cipher: an attached database takes the connection's VFS
-        // and the page codec gives it the main database's derived key. Creating
-        // it here through the keyed connection is also what makes its key salt
-        // agree with the replica's, which is what lets a later run re-attach it.
-        connetto_client::harden::attach_in_window(
-            worker.conn(),
-            hub_meta,
-            HUB_SCHEMA,
-            // The file does not exist on the first run of a device, and this is
-            // where it is created.
-            connetto_client::harden::AttachPermits::CreateAndWrite,
-        )?;
-        worker.conn().batch_execute(HUB_META_DDL)?;
-        // The tier is already attached to this same connection by the client,
-        // which is what keeps one handle on that file. Its watermark table is
-        // created here rather than by the client, because the per-tab counter
-        // is the hub's own bookkeeping and a run with no tabs never needs it.
-        let local_tables = worker.local_tables().clone();
-        if !local_tables.is_empty() {
-            worker.conn().batch_execute(LOCAL_META_DDL)?;
-        }
+        let local_tables = prepare_hub_worker(&mut worker, hub_meta, content.as_ref())?;
         let (events_tx, events_rx) = unbounded_channel();
         let (notices_tx, notices_rx) = unbounded_channel();
         let hub = Self {
@@ -578,7 +663,15 @@ impl RelayHub {
         };
         Ok((
             hub,
-            run_hub(worker, local_tables, events_rx, notices_tx, reconnect),
+            run_hub(
+                worker,
+                local_tables,
+                events_rx,
+                notices_tx,
+                reconnect,
+                content,
+                content_sleeper,
+            ),
             notices_rx,
         ))
     }
@@ -605,23 +698,13 @@ impl RelayHub {
         let _ = self.events.send(HubEvent::Kill(tab));
     }
 
-    /// The seqs of mutations applied locally and queued for the server but not
-    /// yet acknowledged, which is what a logout has to warn about before
-    /// destroying a replica.
-    ///
-    /// The count is a snapshot. The core may acknowledge or accept writes right
-    /// after answering, so a caller showing it to a user is describing the past,
-    /// not promising the present.
+    /// Returns a snapshot of mutations and content files not yet acknowledged.
     ///
     /// # Errors
     ///
     /// [`HubGone`] when the core has ended, so no answer will come.
-    pub async fn unsynced(&self) -> Result<Vec<u64>, HubGone> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Unsynced(reply))
-            .map_err(|_| HubGone)?;
-        answer.await.map_err(|_| HubGone)
+    pub async fn unsynced(&self) -> Result<PendingWork, HubGone> {
+        self.ask(HubEvent::Unsynced).await
     }
 
     /// A zip archive of the worker's local data, scoped as requested.
@@ -633,13 +716,8 @@ impl RelayHub {
     /// [`ExportRefused::Gone`] when the core has ended.
     /// [`ExportRefused::Failed`] when the core answered and the export failed.
     pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ExportRefused> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Export(scope, reply))
-            .map_err(|_| HubGone)?;
-        answer
-            .await
-            .map_err(|_| HubGone)?
+        self.ask(|reply| HubEvent::Export(scope, reply))
+            .await?
             .map_err(|err| ExportRefused::Failed(err.to_string()))
     }
 
@@ -657,15 +735,55 @@ impl RelayHub {
         &self,
         bytes: Vec<u8>,
     ) -> Result<(ImportOutcome, usize), ImportRefused> {
-        let (reply, answer) = futures_channel::oneshot::channel();
-        self.events
-            .send(HubEvent::Import(bytes, reply))
-            .map_err(|_| HubGone)?;
-        answer
-            .await
-            .map_err(|_| HubGone)?
+        self.ask(|reply| HubEvent::Import(bytes, reply))
+            .await?
             .map_err(|err| ImportRefused::Failed(err.to_string()))
     }
+
+    /// Acknowledge lost content files, so pending-work answers stop naming them.
+    ///
+    /// # Errors
+    ///
+    /// [`ForgetRefused::Gone`] when the core has ended.
+    /// [`ForgetRefused::Failed`] when the replica write failed.
+    pub async fn forget_retired_content(&self, files: Vec<FileId>) -> Result<(), ForgetRefused> {
+        self.ask(|reply| HubEvent::ForgetRetired(files, reply))
+            .await?
+            .map_err(|err| ForgetRefused::Failed(err.to_string()))
+    }
+
+    /// Queue one request the core answers on its own channel, and wait for it.
+    async fn ask<T>(
+        &self,
+        request: impl FnOnce(futures_channel::oneshot::Sender<T>) -> HubEvent,
+    ) -> Result<T, HubGone> {
+        let (reply, answer) = futures_channel::oneshot::channel();
+        self.events.send(request(reply)).map_err(|_| HubGone)?;
+        answer.await.map_err(|_| HubGone)
+    }
+}
+
+fn prepare_hub_worker<U: Transport>(
+    worker: &mut ConnettoConnection<U>,
+    hub_meta: &str,
+    content: Option<&ContentArchive<BrowserStore>>,
+) -> Result<HashSet<String>, RelayError> {
+    if let Some(content) = content {
+        content.install(worker)?;
+    }
+    // Hub metadata must share the replica codec and key salt.
+    connetto_client::harden::attach_in_window(
+        worker.conn(),
+        hub_meta,
+        HUB_SCHEMA,
+        connetto_client::harden::AttachPermits::CreateAndWrite,
+    )?;
+    worker.conn().batch_execute(HUB_META_DDL)?;
+    let local_tables = worker.local_tables().clone();
+    if !local_tables.is_empty() {
+        worker.conn().batch_execute(LOCAL_META_DDL)?;
+    }
+    Ok(local_tables)
 }
 
 /// The per-tab I/O task: owns the transport, feeds inbound frames to the
@@ -715,28 +833,16 @@ async fn shovel<D>(
     let _ = events.send(HubEvent::Gone(id));
 }
 
-/// The hub core: one task owning the worker connection and every tab's
-/// state, fed exclusively by channels. With reconnect wiring, an upstream
-/// transport drop is recovered in place: tabs stay attached and their
-/// queued frames are served after the resume.
-async fn run_hub<U, F, S>(
-    mut worker: ConnettoConnection<U>,
+fn initial_hub_state<U, F, S>(
+    worker: &ConnettoConnection<U>,
+    reconnect: Option<&HubReconnect<F, S>>,
     local_tables: HashSet<String>,
-    mut events: UnboundedReceiver<HubEvent>,
-    notices: UnboundedSender<HubNotice>,
-    mut reconnect: Option<HubReconnect<F, S>>,
-) -> Result<(), RelayError>
+) -> HubState
 where
-    U: Transport + MaybeSend + 'static,
-    U::Error: core::fmt::Display,
-    F: TransportFactory<Transport = U>,
-    S: Sleeper,
+    U: Transport,
 {
     let mut state = HubState {
         local_tables,
-        // Taken from the worker rather than defaulted, because the hub may not
-        // have pumped its opening notice yet and a tab that handshakes first
-        // would otherwise be told the connection is down when it is not.
         sync_status: if worker.is_connected() {
             SyncStatus::Connected
         } else {
@@ -744,9 +850,7 @@ where
         },
         ..HubState::default()
     };
-    // Row upstream subs the hub can re-snapshot after a full resync. Aggregate
-    // upstreams hold no replica rows, so they never enter this map.
-    if let Some(driver) = reconnect.as_ref() {
+    if let Some(driver) = reconnect {
         for (sub_id, spec) in &driver.upstream {
             if let Ok(false) = subscription_is_aggregate(&spec.query)
                 && let Ok(tables) = subscription_tables(&spec.query)
@@ -755,98 +859,811 @@ where
             }
         }
     }
-    loop {
-        // Cancel safety: the events leg is an mpsc receive, and the worker
-        // leg completes in one poll once its frame lands (browser socket
-        // sends resolve immediately), so a losing branch is only ever
-        // dropped while parked.
-        tokio::select! {
-            event = events.recv() => match event {
-                // Every handle and every shovel is gone.
-                None => break,
-                Some(HubEvent::Attached(id, out)) => {
-                    state.tabs.insert(id, TabState {
-                        out,
-                        handshaken: false,
-                        subs: Vec::new(),
-                        pending_write: None,
-                        client_id: None,
-                        applied_watermark: None,
-                        local_watermark: None,
-                        credits: INITIAL_CREDITS,
-                        pending: VecDeque::new(),
-                    });
-                }
-                Some(HubEvent::Frame(id, frame)) => {
-                    handle_tab_frame(&mut worker, &mut state, &notices, id, frame).await?;
-                }
-                // A dropped receiver means the asker gave up, which is not the
-                // core's problem.
-                Some(HubEvent::Unsynced(reply)) => {
-                    let _ = reply.send(worker.unsynced());
-                }
-                // Runs on the core because it reads the connection, and it
-                // holds the core for its duration: a tab frame arriving
-                // mid-export waits rather than writing into the copy.
-                Some(HubEvent::Export(scope, reply)) => {
-                    let _ = reply.send(worker.export_local_data(scope));
-                }
-                Some(HubEvent::Import(bytes, reply)) => {
-                    let result = worker.import_local_data(&bytes).and_then(|plan| {
-                        let collisions = plan.collisions().len();
-                        let choices = ImportChoices::keeping_the_file();
-                        worker.apply_import(&plan, &choices).map(|o| (o, collisions))
-                    });
-                    let _ = reply.send(result);
-                }
-                // Removing the state drops the tab's sender, and the shovel
-                // answers the closed channel by closing the transport.
-                Some(HubEvent::Gone(id) | HubEvent::Kill(id)) => {
-                    state.tabs.remove(&id);
-                    // Tear down any aggregate upstreams this tab owned, so the
-                    // server stops maintaining them and hub_recover does not
-                    // re-declare a dead route.
-                    let upstreams: Vec<String> = state
-                        .agg_routes
-                        .iter()
-                        .filter(|(_, route)| route.tab == id)
-                        .map(|(upstream_id, _)| upstream_id.clone())
-                        .collect();
-                    for upstream_id in upstreams {
-                        state.agg_routes.remove(&upstream_id);
-                        let _ = worker.unsubscribe(&upstream_id).await;
-                    }
-                }
-            },
-            event = worker.pump_one() => match event {
-                // A worker that started with no server is in the same position
-                // as one whose transport died: it wants a transport, and the
-                // driver is what gets one.
-                Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
-                | Err(ClientError::Transport(_) | ClientError::NotConnected) => {
-                    let Some(driver) = reconnect.as_mut() else {
-                        break;
-                    };
-                    if !hub_recover(&mut worker, driver, &state.agg_routes).await {
-                        break;
-                    }
-                }
-                Ok(event) => handle_worker_event(&mut worker, &mut state, event)?,
-                Err(err) => return Err(err.into()),
-            },
+    state
+}
+
+#[derive(Default)]
+struct ContentRetry {
+    policy: ReconnectPolicy,
+    attempt: u32,
+    delay: Option<core::time::Duration>,
+    flush: ContentFlushState,
+}
+impl ContentRetry {
+    fn schedule(&mut self, queued: bool, progressed: bool) {
+        match (queued, progressed) {
+            (false, _) => self.attempt = 0,
+            (true, true) => {
+                self.attempt = 0;
+                self.delay = Some(core::time::Duration::ZERO);
+            }
+            (true, false) => {
+                self.attempt = self.attempt.saturating_add(1);
+                self.delay = Some(self.policy.backoff(self.attempt));
+            }
         }
+    }
+}
+
+enum ContentWalk {
+    Complete { queued: bool, progressed: bool },
+    Interrupted(Option<HubEvent>),
+}
+
+/// Everything one hub task owns: the worker connection, tab state, the notice
+/// channel, the optional content archive, the event intake and the content
+/// retry schedule.
+struct HubRuntime<U: Transport> {
+    worker: ConnettoConnection<U>,
+    state: HubState,
+    notices: UnboundedSender<HubNotice>,
+    content: Option<ContentArchive<BrowserStore>>,
+    events: UnboundedReceiver<HubEvent>,
+    retry: ContentRetry,
+    walk: WalkState,
+}
+
+/// What the content integrity walk still owes this run.
+#[derive(Default)]
+struct WalkState {
+    /// Outbox files still to be checked for readable bytes.
+    unverified: VecDeque<connetto_file_client::FileId>,
+    /// Position of the scan over the head file's chunks.
+    scan: ChunkScan,
+    /// Whether the orphan sweep owes a turn, set at the start and by every import.
+    unswept: bool,
+    /// Whether a failed sweep is waiting for the content retry timer.
+    sweep_waiting: bool,
+    /// Orphaned chunks the sweep has listed and not yet deleted.
+    orphans: VecDeque<connetto_file_client::ChunkHash>,
+    /// Whether a commit has queued work the outbox driver has not been told about.
+    outbox_wake: bool,
+}
+
+/// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
+const VERIFY_CHUNK_BUDGET: usize = 8;
+
+/// Orphaned chunks deleted per turn, for the same reason.
+const DISCARD_BUDGET: usize = 8;
+
+/// Why one hub cycle woke.
+enum Wake {
+    /// The content retry timer elapsed.
+    Content,
+    /// A tab or application request arrived.
+    Local(Option<HubEvent>),
+    /// The worker connection produced an event.
+    Upstream(Result<ClientEvent, ClientError>),
+    /// The content integrity walk has a file left to check.
+    Verify,
+}
+
+impl<U> HubRuntime<U>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    /// Serve hub events until the intake closes or the connection is beyond recovery.
+    async fn run<F, S, CS>(
+        mut self,
+        mut reconnect: Option<HubReconnect<F, S>>,
+        mut sleeper: Option<CS>,
+    ) -> Result<(), RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+        CS: Sleeper,
+    {
+        self.load_unverified();
+        while self.cycle(reconnect.as_mut(), sleeper.as_mut()).await? {}
+        Ok(())
+    }
+
+    async fn cycle<F, S, CS>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+        sleeper: Option<&mut CS>,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+        CS: Sleeper,
+    {
+        if self.walk.outbox_wake {
+            // An import commits restored writes and files wherever it was served, so the
+            // driver is told here rather than by whichever path served it.
+            self.walk.outbox_wake = false;
+            self.wake_content()?;
+        }
+        let unverified = walk_owes(&self.walk);
+        let delay = self.retry.delay;
+        let content_wait = async {
+            match (delay, sleeper) {
+                (Some(delay), Some(sleeper)) => sleeper.sleep(delay).await,
+                _ => core::future::pending().await,
+            }
+        };
+        tokio::pin!(content_wait);
+        // Each arm only names its wake reason, so a losing branch leaves
+        // nothing half applied: every mpsc receive loses nothing when dropped.
+        let wake = {
+            let Self {
+                worker,
+                events,
+                retry,
+                ..
+            } = self;
+            tokio::select! {
+                () = &mut content_wait => Wake::Content,
+                event = events.recv() => Wake::Local(event),
+                event = worker.pump_one(), if !retry.flush.is_waiting() => Wake::Upstream(event),
+                // Always ready, so the walk shares the cycle with every other source
+                // rather than holding it or being starved by it.
+                () = core::future::ready(()), if unverified => Wake::Verify,
+            }
+        };
+        match wake {
+            Wake::Content => self.drive_content(reconnect).await,
+            Wake::Local(event) => self.serve_local(event).await,
+            Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
+            Wake::Verify => self.verify_turn().await,
+        }
+    }
+
+    async fn serve(&mut self, event: HubEvent) -> Result<(), RelayError> {
+        handle_hub_event(
+            &mut self.worker,
+            &mut self.state,
+            &self.notices,
+            self.content.as_ref(),
+            &mut self.walk,
+            event,
+        )
+        .await
+    }
+
+    async fn serve_local(&mut self, event: Option<HubEvent>) -> Result<bool, RelayError> {
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.serve(event).await?;
+        Ok(true)
+    }
+
+    async fn serve_upstream<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+        event: Result<ClientEvent, ClientError>,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        match event {
+            Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
+            | Err(ClientError::Transport(_) | ClientError::NotConnected) => {
+                self.retry.delay = None;
+                let Some(driver) = reconnect else {
+                    return Ok(false);
+                };
+                if !self.recover(driver).await? {
+                    return Ok(false);
+                }
+                self.wake_content()?;
+                Ok(true)
+            }
+            Ok(event) => {
+                let wake_content = matches!(
+                    &event,
+                    ClientEvent::Reconnected
+                        | ClientEvent::SyncStatus(SyncStatus::Connected)
+                        | ClientEvent::MutationApplied { .. }
+                );
+                handle_worker_event(&mut self.worker, &mut self.state, event)?;
+                if wake_content {
+                    self.wake_content()?;
+                }
+                Ok(true)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn recover<F, S>(&mut self, driver: &mut HubReconnect<F, S>) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        hub_recover(
+            &mut self.worker,
+            driver,
+            &mut self.state,
+            &self.notices,
+            self.content.as_ref(),
+            &mut self.events,
+            &mut self.walk,
+        )
+        .await
+    }
+
+    /// Walk the content outbox once, then reschedule the driver from what the walk left.
+    async fn drive_content<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        self.retry.delay = None;
+        self.walk.sweep_waiting = false;
+        if self.content.is_none() {
+            return Ok(true);
+        }
+        let (queued, progressed) = match self.flush_content().await? {
+            ContentWalk::Complete { queued, progressed } => (queued, progressed),
+            ContentWalk::Interrupted(Some(event)) => {
+                self.serve(event).await?;
+                self.retry.schedule(true, true);
+                return Ok(true);
+            }
+            ContentWalk::Interrupted(None) => return Ok(false),
+        };
+        if progressed {
+            // An uploaded file is no longer unsent, so retention can release it.
+            self.walk.unswept = true;
+            self.walk.sweep_waiting = false;
+        }
+        if !self.worker.is_connected() {
+            let Some(driver) = reconnect else {
+                return Ok(false);
+            };
+            if !self.recover(driver).await? {
+                return Ok(false);
+            }
+            self.retry.schedule(queued, true);
+            return Ok(true);
+        }
+        self.retry.schedule(queued, progressed);
+        Ok(true)
+    }
+
+    /// One outbox attempt, serving local events across its HTTP transfer.
+    async fn flush_content(&mut self) -> Result<ContentWalk, RelayError> {
+        let Self {
+            worker,
+            state,
+            notices,
+            content,
+            events,
+            retry,
+            walk,
+        } = self;
+        let Some(content) = content.as_ref() else {
+            return Ok(ContentWalk::Complete {
+                queued: false,
+                progressed: false,
+            });
+        };
+        let mut interrupted = None;
+        let cancel = async {
+            interrupted = Some(events.recv().await);
+        };
+        let (start, observed) = content
+            .begin_flush_next_or(worker, &mut retry.flush, cancel)
+            .await;
+        for event in observed {
+            handle_worker_event(worker, state, event)?;
+        }
+        let flush = match start {
+            Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
+                return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
+            }
+            Ok(ContentFlushStart::Complete(flush)) => flush,
+            Ok(ContentFlushStart::Upload(upload)) => {
+                finish_content_upload(worker, state, notices, content, events, walk, &upload)
+                    .await?
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "content outbox walk failed");
+                ContentFlush::Deferred
+            }
+        };
+        Ok(ContentWalk::Complete {
+            queued: content.pending_files(worker)? > 0,
+            progressed: flush == ContentFlush::Progressed,
+        })
+    }
+
+    /// Queue the outbox for the integrity walk, which runs one file per turn.
+    fn load_unverified(&mut self) {
+        let Some(content) = self.content.as_ref() else {
+            return;
+        };
+        match content.unsent_files(&mut self.worker) {
+            Ok(files) => self.walk.unverified = files.into(),
+            Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
+        }
+    }
+
+    /// Take one turn of the content integrity walk.
+    ///
+    /// The turn is bounded, and a failure asks for the upload retry's own backoff rather
+    /// than the next cycle, so a store that keeps failing is not walked in a loop.
+    async fn verify_turn(&mut self) -> Result<bool, RelayError> {
+        let Self {
+            worker,
+            content,
+            walk,
+            retry,
+            ..
+        } = self;
+        if walk_turn(worker, content.as_ref(), walk).await == WalkTurn::Deferred {
+            retry.schedule(true, false);
+            return Ok(true);
+        }
+        if walk_owes(&self.walk) {
+            return Ok(true);
+        }
+        self.wake_content()?;
+        Ok(true)
+    }
+
+    /// Run the content driver now when anything is queued.
+    fn wake_content(&mut self) -> Result<(), RelayError> {
+        if content_pending_files(&mut self.worker, self.content.as_ref())? > 0 {
+            self.retry.schedule(true, true);
+        }
+        Ok(())
+    }
+}
+
+/// Whether the content integrity walk still owes this run a turn.
+fn walk_owes(walk: &WalkState) -> bool {
+    !walk.unverified.is_empty() || !walk.orphans.is_empty() || (walk.unswept && !walk.sweep_waiting)
+}
+
+/// What one walk turn left behind.
+#[derive(PartialEq, Eq)]
+enum WalkTurn {
+    /// The turn ran, and the walk may owe more.
+    Taken,
+    /// The store failed, so the rest waits for the retry timer.
+    Deferred,
+}
+
+/// One bounded turn of the integrity walk: eight chunks of the head file, or the sweep
+/// listing, or eight of the listed deletions.
+///
+/// Driven from the connected cycle and from the recovery waits that leave the connection
+/// idle, because the walk reads only the replica and the chunk store.
+async fn walk_turn<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
+) -> WalkTurn
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        walk.unverified.clear();
+        walk.orphans.clear();
+        walk.unswept = false;
+        return WalkTurn::Taken;
+    };
+    if !walk.orphans.is_empty() {
+        return discard_turn(worker, content, walk).await;
+    }
+    let Some(&file_id) = walk.unverified.front() else {
+        // The files are settled, so the bytes none of them name can go.
+        if list_orphans(worker, content, walk).await {
+            walk.unswept = false;
+            return WalkTurn::Taken;
+        }
+        walk.sweep_waiting = true;
+        return WalkTurn::Deferred;
+    };
+    match content
+        .scan_unsent_file(worker, file_id, walk.scan, VERIFY_CHUNK_BUDGET)
+        .await
+    {
+        Ok(ScanStep::More(scan)) => {
+            walk.scan = scan;
+            return WalkTurn::Taken;
+        }
+        // The identity is durable in the replica until acknowledged, so a pending-work
+        // query reports it rather than this line.
+        Ok(ScanStep::Retired) => {
+            tracing::warn!(%file_id, "content integrity pass retired unreadable file");
+        }
+        Ok(ScanStep::Intact) => {}
+        Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
+    }
+    walk.unverified.pop_front();
+    walk.scan = ChunkScan::default();
+    WalkTurn::Taken
+}
+
+/// Drop the manifests nothing covers, then list the chunks that leaves behind along with
+/// those an interrupted import or stage left, reporting whether the listing succeeded.
+async fn list_orphans<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &ContentArchive<BrowserStore>,
+    walk: &mut WalkState,
+) -> bool
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match content.evict_uncovered(worker) {
+        Ok(0) => {}
+        Ok(evicted) => tracing::info!(evicted, "evicted uncovered content manifests"),
+        Err(err) => tracing::warn!(error = %err, "evicting uncovered manifests failed"),
+    }
+    match content.orphan_chunks(worker).await {
+        Ok(orphans) => {
+            if !orphans.is_empty() {
+                tracing::info!(
+                    orphans = orphans.len(),
+                    "reclaiming orphaned content chunks"
+                );
+            }
+            walk.orphans = orphans.into();
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "listing orphaned chunks failed");
+            false
+        }
+    }
+}
+
+/// Delete a bounded number of the listed orphans.
+async fn discard_turn<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &ContentArchive<BrowserStore>,
+    walk: &mut WalkState,
+) -> WalkTurn
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    for _ in 0..DISCARD_BUDGET {
+        let Some(hash) = walk.orphans.pop_front() else {
+            break;
+        };
+        if let Err(err) = content.discard_chunk(worker, &hash).await {
+            tracing::warn!(error = %err, "discarding an orphaned chunk failed");
+            walk.orphans.clear();
+            walk.sweep_waiting = true;
+            walk.unswept = true;
+            return WalkTurn::Deferred;
+        }
+    }
+    WalkTurn::Taken
+}
+
+/// The hub core: one task owning the worker connection and every tab's
+/// state, fed exclusively by channels. With reconnect wiring, an upstream
+/// transport drop is recovered in place: tabs stay attached and their
+/// queued frames are served after the resume.
+async fn run_hub<U, F, S, CS>(
+    worker: ConnettoConnection<U>,
+    local_tables: HashSet<String>,
+    events: UnboundedReceiver<HubEvent>,
+    notices: UnboundedSender<HubNotice>,
+    reconnect: Option<HubReconnect<F, S>>,
+    content: Option<ContentArchive<BrowserStore>>,
+    content_sleeper: Option<CS>,
+) -> Result<(), RelayError>
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+    S: Sleeper,
+    CS: Sleeper,
+{
+    let state = initial_hub_state(&worker, reconnect.as_ref(), local_tables);
+    HubRuntime {
+        worker,
+        state,
+        notices,
+        content,
+        events,
+        retry: ContentRetry::default(),
+        walk: WalkState {
+            unswept: true,
+            ..WalkState::default()
+        },
+    }
+    .run(reconnect, content_sleeper)
+    .await
+}
+
+/// One granted upload, run to completion while local events keep being served.
+async fn finish_content_upload<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    notices: &UnboundedSender<HubNotice>,
+    content: &ContentArchive<BrowserStore>,
+    events: &mut UnboundedReceiver<HubEvent>,
+    walk: &mut WalkState,
+    upload: &ContentUpload<BrowserStore>,
+) -> Result<ContentFlush, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let http = BrowserHttp::new();
+    let transfer = upload.transfer(&http);
+    tokio::pin!(transfer);
+    let mut serving = true;
+    let mut event_error = None;
+    // A started upload is never cancelled: a failing local event only stops
+    // the service loop, and the transfer plus its bookkeeping still finish.
+    let result = loop {
+        match transfer_step(&mut transfer, events, serving).await {
+            TransferStep::Done(result) => break result,
+            TransferStep::Event(None) => serving = false,
+            TransferStep::Event(Some(event)) => {
+                if let Err(error) =
+                    handle_hub_event(worker, state, notices, Some(content), walk, event).await
+                {
+                    event_error = Some(error);
+                    serving = false;
+                }
+            }
+        }
+    };
+    let flush = content.finish_upload(worker, upload, result)?;
+    match event_error {
+        Some(error) => Err(error),
+        None => Ok(flush),
+    }
+}
+
+/// What happened first: the transfer finished, or a local request arrived.
+enum TransferStep {
+    Done(Result<(), ContentError>),
+    Event(Option<HubEvent>),
+}
+
+/// Waits for whichever comes first, or for the transfer alone once local
+/// events are no longer being served.
+async fn transfer_step(
+    transfer: &mut core::pin::Pin<&mut impl Future<Output = Result<(), ContentError>>>,
+    events: &mut UnboundedReceiver<HubEvent>,
+    serving: bool,
+) -> TransferStep {
+    if !serving {
+        return TransferStep::Done(transfer.as_mut().await);
+    }
+    tokio::select! {
+        result = transfer.as_mut() => TransferStep::Done(result),
+        event = events.recv() => TransferStep::Event(event),
+    }
+}
+
+/// Content files this device still owes the server, zero when content is disabled.
+fn content_pending_files<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+) -> Result<u64, RelayError>
+where
+    U: Transport,
+{
+    match content {
+        Some(content) => Ok(content.pending_files(worker)?),
+        None => Ok(0),
+    }
+}
+
+/// Files whose unsent bytes were lost and remain unacknowledged, none when
+/// content is disabled.
+fn retired_content<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+) -> Result<Vec<FileId>, RelayError>
+where
+    U: Transport,
+{
+    match content {
+        Some(content) => Ok(content.retired_content(worker)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn handle_hub_event<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    notices: &UnboundedSender<HubNotice>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
+    event: HubEvent,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match event {
+        HubEvent::Attached(id, out) => attach_tab(state, id, out),
+        HubEvent::Frame(id, frame) => {
+            handle_tab_frame(worker, state, notices, id, frame).await?;
+        }
+        HubEvent::Unsynced(reply) => {
+            let pending = PendingWork {
+                mutation_seqs: worker.unsynced(),
+                content_files: content_pending_files(worker, content)?,
+                retired_files: retired_content(worker, content)?
+                    .iter()
+                    .map(FileId::to_string)
+                    .collect(),
+            };
+            let _ = reply.send(pending);
+        }
+        HubEvent::ForgetRetired(files, reply) => {
+            let answer = match content {
+                Some(content) => content
+                    .forget_retired_content(worker, &files)
+                    .map_err(ArchiveServiceError::from),
+                None => Ok(()),
+            };
+            let _ = reply.send(answer);
+        }
+        HubEvent::Export(scope, reply) => {
+            let _ = reply.send(export_archive(worker, content, scope).await);
+        }
+        HubEvent::Import(bytes, reply) => {
+            let _ = reply.send(import_archive(worker, content, &bytes).await);
+            // An import can restore the chunks a scan in progress has already missed, and
+            // can leave its own behind when it fails part way.
+            walk.scan = ChunkScan::default();
+            walk.unswept = true;
+            walk.sweep_waiting = false;
+            // A listed orphan can be exactly what this import restored, so the list is
+            // taken again rather than trusted.
+            walk.orphans.clear();
+            walk.outbox_wake = true;
+        }
+        HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
     Ok(())
 }
 
-/// Recover the hub's upstream: backoff, fresh transport, session resume,
-/// re-declared upstream subscriptions. Returns whether the upstream is live
-/// again, `false` meaning the policy is exhausted.
+fn attach_tab(state: &mut HubState, id: TabId, out: UnboundedSender<TabOut>) {
+    state.tabs.insert(
+        id,
+        TabState {
+            out,
+            handshaken: false,
+            subs: Vec::new(),
+            pending_write: None,
+            client_id: None,
+            applied_watermark: None,
+            local_watermark: None,
+            credits: INITIAL_CREDITS,
+            pending: VecDeque::new(),
+        },
+    );
+}
+
+async fn export_archive<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    scope: ExportScope,
+) -> Result<Vec<u8>, ArchiveServiceError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match content {
+        Some(content) => {
+            let bytes = content.unsent_content_bytes(worker)?;
+            if bytes > crate::workers::MAX_ARCHIVE_BUFFER_BYTES {
+                return Err(ArchiveServiceError::Unbufferable {
+                    bytes,
+                    ceiling: crate::workers::MAX_ARCHIVE_BUFFER_BYTES,
+                });
+            }
+            content
+                .export_local_data(worker, scope)
+                .await
+                .map_err(Into::into)
+        }
+        None => worker.export_local_data(scope).map_err(Into::into),
+    }
+}
+
+async fn import_archive<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    bytes: &[u8],
+) -> Result<(ImportOutcome, usize), ArchiveServiceError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    if let Some(content) = content {
+        content
+            .import_local_data(worker, bytes)
+            .await
+            .map_err(Into::into)
+    } else {
+        let plan = worker.import_local_data(bytes)?;
+        let collisions = plan.collisions().len();
+        let outcome = worker.apply_import(&plan, &ImportChoices::keeping_the_file())?;
+        // The import is committed, so a failed replay is left to the outbox driver.
+        let _ = worker.replay_pending().await;
+        Ok((outcome, collisions))
+    }
+}
+
+async fn remove_tab<U>(worker: &mut ConnettoConnection<U>, state: &mut HubState, id: TabId)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    state.tabs.remove(&id);
+    let upstreams: Vec<String> = state
+        .agg_routes
+        .iter()
+        .filter(|(_, route)| route.tab == id)
+        .map(|(upstream_id, _)| upstream_id.clone())
+        .collect();
+    for upstream_id in upstreams {
+        state.agg_routes.remove(&upstream_id);
+        let _ = worker.unsubscribe(&upstream_id).await;
+    }
+}
+
+/// Reconnects upstream while continuing to serve replica-only commands.
+enum RecoveryAttempt {
+    Connected,
+    Failed,
+    Interrupted(HubEvent),
+    Closed,
+}
+
+enum RecoveryCycle {
+    Connected,
+    Failed,
+    Closed,
+}
+
+enum ConnectAttempt<U> {
+    Connected(U),
+    Failed,
+    Closed,
+}
+
+struct RecoveryContext<'a, U>
+where
+    U: Transport,
+{
+    worker: &'a mut ConnettoConnection<U>,
+    state: &'a mut HubState,
+    notices: &'a UnboundedSender<HubNotice>,
+    content: Option<&'a ContentArchive<BrowserStore>>,
+    events: &'a mut UnboundedReceiver<HubEvent>,
+    deferred: &'a mut VecDeque<HubEvent>,
+    walk: &'a mut WalkState,
+}
+
 async fn hub_recover<U, F, S>(
     worker: &mut ConnettoConnection<U>,
     driver: &mut HubReconnect<F, S>,
-    agg_routes: &HashMap<String, AggRoute>,
-) -> bool
+    state: &mut HubState,
+    notices: &UnboundedSender<HubNotice>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    events: &mut UnboundedReceiver<HubEvent>,
+    walk: &mut WalkState,
+) -> Result<bool, RelayError>
 where
     U: Transport + MaybeSend + 'static,
     U::Error: core::fmt::Display,
@@ -855,6 +1672,16 @@ where
 {
     let mut backoff = driver.policy.initial_backoff();
     let mut attempt: u32 = 0;
+    let mut deferred = VecDeque::new();
+    let mut recovery_io = RecoveryContext {
+        worker,
+        state,
+        notices,
+        content,
+        events,
+        deferred: &mut deferred,
+        walk,
+    };
     loop {
         attempt = attempt.saturating_add(1);
         if driver
@@ -862,44 +1689,392 @@ where
             .max_attempts()
             .is_some_and(|max| attempt > max)
         {
-            return false;
+            return Ok(false);
         }
         tracing::warn!(attempt, "relay hub upstream reconnecting");
-        driver.sleeper.sleep(backoff).await;
+        if !wait_recovery_backoff(&mut recovery_io, &mut driver.sleeper, backoff).await? {
+            return Ok(false);
+        }
         backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff());
-
-        let Ok(transport) = driver.factory.connect().await else {
-            continue;
-        };
-        if worker.attach(transport).await.is_err() {
-            continue;
-        }
-        let mut redeclared = true;
-        for (sub_id, spec) in &driver.upstream {
-            if worker.subscribe_spec(sub_id, spec.clone()).await.is_err() {
-                redeclared = false;
-                break;
-            }
-        }
-        // The dynamic per-tab aggregate upstreams are upstream subscriptions
-        // too, so a resume must re-declare them or a tab's LiveValue would go
-        // silent after an outage.
-        if redeclared {
-            for (upstream_id, route) in agg_routes {
-                if worker
-                    .subscribe_spec(upstream_id, route.spec.clone())
-                    .await
-                    .is_err()
-                {
-                    redeclared = false;
-                    break;
-                }
-            }
-        }
-        if redeclared {
-            return true;
+        match finish_recovery(&mut recovery_io, &mut driver.factory, &driver.upstream).await? {
+            RecoveryCycle::Connected => return Ok(true),
+            RecoveryCycle::Failed => {}
+            RecoveryCycle::Closed => return Ok(false),
         }
     }
+}
+
+async fn finish_recovery<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Result<RecoveryCycle, RelayError>
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    let mut attempt = recovery_attempt(context, factory, upstream).await?;
+    loop {
+        match attempt {
+            RecoveryAttempt::Connected => {
+                handle_deferred_events(context).await?;
+                return Ok(RecoveryCycle::Connected);
+            }
+            RecoveryAttempt::Failed => {
+                context.worker.disconnect();
+                return Ok(RecoveryCycle::Failed);
+            }
+            RecoveryAttempt::Interrupted(event) => {
+                if !context.worker.is_connected() {
+                    context.worker.disconnect();
+                }
+                handle_hub_event(
+                    context.worker,
+                    context.state,
+                    context.notices,
+                    context.content,
+                    context.walk,
+                    event,
+                )
+                .await?;
+                attempt = if context.worker.is_connected() {
+                    finish_attached_during_recovery(context, upstream).await
+                } else {
+                    recovery_attempt(context, factory, upstream).await?
+                };
+            }
+            RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
+        }
+    }
+}
+
+async fn finish_attached_during_recovery<U>(
+    context: &mut RecoveryContext<'_, U>,
+    upstream: &[(String, SubscriptionSpec)],
+) -> RecoveryAttempt
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+{
+    let subscriptions = recovery_subscriptions(context.state, upstream);
+    let worker = &mut *context.worker;
+    let state = &mut *context.state;
+    let events = &mut *context.events;
+    let deferred = &mut *context.deferred;
+    let recovery = async {
+        worker.resume_attach().await?;
+        restore_recovery_subscriptions(worker, &subscriptions).await
+    };
+    tokio::pin!(recovery);
+    loop {
+        tokio::select! {
+            result = &mut recovery => {
+                return match result {
+                    Ok(()) => RecoveryAttempt::Connected,
+                    Err(_) => RecoveryAttempt::Failed,
+                };
+            }
+            event = events.recv() => match event {
+                Some(event) => {
+                    if let Some(local) = attach_during_recovery(state, deferred, event) {
+                        return RecoveryAttempt::Interrupted(local);
+                    }
+                }
+                None => return RecoveryAttempt::Closed,
+            },
+        }
+    }
+}
+
+async fn wait_recovery_backoff<U, S>(
+    context: &mut RecoveryContext<'_, U>,
+    sleeper: &mut S,
+    backoff: core::time::Duration,
+) -> Result<bool, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+    S: Sleeper,
+{
+    let sleep = sleeper.sleep(backoff);
+    tokio::pin!(sleep);
+    loop {
+        let owes = walk_owes(context.walk);
+        let wake = {
+            let events = &mut *context.events;
+            tokio::select! {
+                () = &mut sleep => return Ok(true),
+                event = events.recv() => IdleWake::Event(event),
+                // The walk reads only the replica and the chunk store, so the sleep is
+                // where it belongs rather than a pause until the server returns.
+                () = core::future::ready(()), if owes => IdleWake::Walk,
+            }
+        };
+        match wake {
+            IdleWake::Event(Some(event)) => handle_recovery_event(context, event).await?,
+            IdleWake::Event(None) => return Ok(false),
+            IdleWake::Walk => {
+                walk_recovery_turn(context).await;
+            }
+        }
+    }
+}
+
+/// Why one idle recovery wait woke.
+enum IdleWake {
+    /// A request arrived, or the intake closed.
+    Event(Option<HubEvent>),
+    /// The content integrity walk owes a turn.
+    Walk,
+}
+
+/// One walk turn while the connection is idle.
+///
+/// A deferred turn waits for the connected cycle's retry timer, which is the schedule the
+/// walk already uses, so a failing store is not walked in a loop here either.
+async fn walk_recovery_turn<U>(context: &mut RecoveryContext<'_, U>)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let _ = walk_turn(context.worker, context.content, context.walk).await;
+}
+
+async fn recovery_attempt<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Result<RecoveryAttempt, RelayError>
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    match connect_during_recovery(context, factory).await? {
+        ConnectAttempt::Connected(transport) => {
+            Ok(resume_during_recovery(context, transport, upstream).await)
+        }
+        ConnectAttempt::Failed => Ok(RecoveryAttempt::Failed),
+        ConnectAttempt::Closed => Ok(RecoveryAttempt::Closed),
+    }
+}
+
+async fn connect_during_recovery<U, F>(
+    context: &mut RecoveryContext<'_, U>,
+    factory: &mut F,
+) -> Result<ConnectAttempt<U>, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+    F: TransportFactory<Transport = U>,
+{
+    let connect = factory.connect();
+    tokio::pin!(connect);
+    loop {
+        let owes = walk_owes(context.walk);
+        let wake = {
+            let events = &mut *context.events;
+            tokio::select! {
+                result = &mut connect => {
+                    return Ok(match result {
+                        Ok(transport) => ConnectAttempt::Connected(transport),
+                        Err(_) => ConnectAttempt::Failed,
+                    });
+                }
+                event = events.recv() => IdleWake::Event(event),
+                () = core::future::ready(()), if owes => IdleWake::Walk,
+            }
+        };
+        match wake {
+            IdleWake::Event(Some(event)) => handle_recovery_event(context, event).await?,
+            IdleWake::Event(None) => return Ok(ConnectAttempt::Closed),
+            IdleWake::Walk => {
+                walk_recovery_turn(context).await;
+            }
+        }
+    }
+}
+
+async fn resume_during_recovery<U>(
+    context: &mut RecoveryContext<'_, U>,
+    transport: U,
+    upstream: &[(String, SubscriptionSpec)],
+) -> RecoveryAttempt
+where
+    U: Transport + MaybeSend + 'static,
+    U::Error: core::fmt::Display,
+{
+    let subscriptions = recovery_subscriptions(context.state, upstream);
+    let worker = &mut *context.worker;
+    let state = &mut *context.state;
+    let events = &mut *context.events;
+    let deferred = &mut *context.deferred;
+    let recovery = async {
+        worker.attach(transport).await?;
+        restore_recovery_subscriptions(worker, &subscriptions).await
+    };
+    tokio::pin!(recovery);
+    loop {
+        tokio::select! {
+            result = &mut recovery => {
+                return match result {
+                    Ok(()) => RecoveryAttempt::Connected,
+                    Err(_) => RecoveryAttempt::Failed,
+                };
+            }
+            event = events.recv() => match event {
+                Some(event) => {
+                    if let Some(local) = attach_during_recovery(state, deferred, event) {
+                        return RecoveryAttempt::Interrupted(local);
+                    }
+                }
+                None => return RecoveryAttempt::Closed,
+            },
+        }
+    }
+}
+
+/// Registers a tab where it arrives, because that writes hub state and touches neither the
+/// connection the attach owns nor the replica.
+///
+/// The tab's own announce gives up after fifteen seconds, so holding it for the length of
+/// a reconnect fails a healthy tab. Everything else follows chapter 18's attach column.
+fn attach_during_recovery(
+    state: &mut HubState,
+    deferred: &mut VecDeque<HubEvent>,
+    event: HubEvent,
+) -> Option<HubEvent> {
+    if deferred.is_empty()
+        && let HubEvent::Attached(id, out) = event
+    {
+        attach_tab(state, id, out);
+        return None;
+    }
+    schedule_recovery_event(deferred, event, recovery_interrupts_attach)
+}
+
+/// Every subscription the replay puts back, taken before the attach starts so the attach
+/// borrows no hub state and a tab can be registered while it runs.
+fn recovery_subscriptions(
+    state: &HubState,
+    upstream: &[(String, SubscriptionSpec)],
+) -> Vec<(String, SubscriptionSpec)> {
+    upstream
+        .iter()
+        .map(|(sub_id, spec)| (sub_id.clone(), spec.clone()))
+        .chain(
+            state
+                .agg_routes
+                .iter()
+                .map(|(upstream_id, route)| (upstream_id.clone(), route.spec.clone())),
+        )
+        .collect()
+}
+
+async fn restore_recovery_subscriptions<U>(
+    worker: &mut ConnettoConnection<U>,
+    subscriptions: &[(String, SubscriptionSpec)],
+) -> Result<(), ClientError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    for (sub_id, spec) in subscriptions {
+        worker.subscribe_spec(sub_id, spec.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn handle_recovery_event<U>(
+    context: &mut RecoveryContext<'_, U>,
+    event: HubEvent,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(local) = schedule_recovery_event(context.deferred, event, recovery_serves_idle) else {
+        return Ok(());
+    };
+    handle_hub_event(
+        context.worker,
+        context.state,
+        context.notices,
+        context.content,
+        context.walk,
+        local,
+    )
+    .await
+}
+
+/// Queues `event` unless it is served where it arrives, which chapter 18's table decides
+/// per situation through `served`.
+///
+/// One order rule covers every served cell: anything older already queued keeps its place,
+/// so a kill can never overtake a frame of the tab it kills.
+fn schedule_recovery_event(
+    deferred: &mut VecDeque<HubEvent>,
+    event: HubEvent,
+    served: fn(&HubEvent) -> bool,
+) -> Option<HubEvent> {
+    if deferred.is_empty() && served(&event) {
+        Some(event)
+    } else {
+        deferred.push_back(event);
+        None
+    }
+}
+
+/// What the recovery loop serves while the connection sits idle, in the retry sleep and
+/// during the connect.
+///
+/// Everything but a frame, which needs the server.
+fn recovery_serves_idle(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Attached(_, _)
+            | HubEvent::Gone(_)
+            | HubEvent::Kill(_)
+            | HubEvent::Unsynced(_)
+            | HubEvent::Export(_, _)
+            | HubEvent::Import(_, _)
+            | HubEvent::ForgetRetired(_, _)
+    )
+}
+
+/// What interrupts an attach or a subscription replay rather than waiting for it.
+///
+/// The four requests answered from the replica, because a caller waits on each. A
+/// departure and a kill unsubscribe through the connection the attach owns and nothing
+/// waits on them, so they keep their place in the queue instead.
+fn recovery_interrupts_attach(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Unsynced(_)
+            | HubEvent::Export(_, _)
+            | HubEvent::Import(_, _)
+            | HubEvent::ForgetRetired(_, _)
+    )
+}
+
+async fn handle_deferred_events<U>(context: &mut RecoveryContext<'_, U>) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    while let Some(event) = context.deferred.pop_front() {
+        handle_hub_event(
+            context.worker,
+            context.state,
+            context.notices,
+            context.content,
+            context.walk,
+            event,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Handle one frame from a tab, downgrading tab-level faults to closing
@@ -1662,7 +2837,7 @@ where
     // row by row. Rename to the physical backing tables first, mirroring the
     // client's own apply direction.
     let map = worker.policy_tables().clone();
-    let changeset = rename_to_physical(changeset, &map).map_err(TabFault::from)?;
+    let changeset = rename_to_physical(changeset, &map)?;
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
@@ -2417,7 +3592,10 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabApplyError, apply_local_changeset};
+    use super::{
+        HubEvent, TabApplyError, apply_local_changeset, recovery_interrupts_attach,
+        recovery_serves_idle, schedule_recovery_event,
+    };
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
     use diesel_sqlite_session::SqliteSessionExt;
@@ -2426,6 +3604,150 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+
+    #[wasm_bindgen_test]
+    fn a_local_recovery_request_cannot_overtake_an_ordinary_event() {
+        let mut deferred = std::collections::VecDeque::new();
+        deferred.push_back(HubEvent::Kill(7));
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_serves_idle
+            )
+            .is_none()
+        );
+        assert!(matches!(deferred.pop_front(), Some(HubEvent::Kill(7))));
+        assert!(matches!(deferred.pop_front(), Some(HubEvent::Unsynced(_))));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_local_recovery_request_is_serviceable_at_the_queue_head() {
+        let mut deferred = std::collections::VecDeque::new();
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(matches!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_serves_idle
+            ),
+            Some(HubEvent::Unsynced(_))
+        ));
+        assert!(deferred.is_empty());
+    }
+
+    /// Acknowledging a retirement only writes the replica, so it is served during recovery
+    /// rather than queued behind an upstream that may never come back.
+    #[wasm_bindgen_test]
+    fn a_retirement_acknowledgement_is_serviceable_during_recovery() {
+        let mut deferred = std::collections::VecDeque::new();
+        let (reply, _answer) = futures_channel::oneshot::channel();
+
+        assert!(matches!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::ForgetRetired(Vec::new(), reply),
+                recovery_serves_idle,
+            ),
+            Some(HubEvent::ForgetRetired(_, _))
+        ));
+        assert!(deferred.is_empty());
+    }
+
+    /// Chapter 18's idle column: everything but a frame is served where it arrives while
+    /// the connection sits idle, because a frame is the only request that needs the server.
+    #[wasm_bindgen_test]
+    fn only_a_frame_waits_for_the_upstream_while_the_connection_is_idle() {
+        use connetto_core::messages::{ControlMessage, Ping};
+        use connetto_core::traits::IncomingFrame;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let mut deferred = std::collections::VecDeque::new();
+        let (out, _out_rx) = unbounded_channel();
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut deferred,
+                    HubEvent::Attached(1, out),
+                    recovery_serves_idle
+                ),
+                Some(HubEvent::Attached(_, _))
+            ),
+            "a tab attaching only writes hub state, and its announce has its own deadline"
+        );
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::Gone(1), recovery_serves_idle),
+            Some(HubEvent::Gone(1))
+        ));
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::Kill(1), recovery_serves_idle),
+            Some(HubEvent::Kill(1))
+        ));
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Frame(
+                    1,
+                    IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 })),
+                ),
+                recovery_serves_idle,
+            )
+            .is_none(),
+            "a frame needs the server, so it waits"
+        );
+        assert_eq!(deferred.len(), 1, "and only the frame is queued");
+    }
+
+    /// Chapter 18's attach column: a departure or a kill unsubscribes through the
+    /// connection the attach owns, so it keeps its place instead of interrupting.
+    #[wasm_bindgen_test]
+    fn a_departure_does_not_interrupt_an_attach() {
+        let mut deferred = std::collections::VecDeque::new();
+        assert!(
+            schedule_recovery_event(&mut deferred, HubEvent::Gone(1), recovery_interrupts_attach)
+                .is_none()
+        );
+        let (reply, _answer) = futures_channel::oneshot::channel();
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_interrupts_attach,
+            )
+            .is_none(),
+            "and the request behind it keeps the arrival order"
+        );
+        assert_eq!(deferred.len(), 2);
+    }
+
+    /// Chapter 18's job table: the walk owes a turn through the retry sleep and the
+    /// connect, where the connection is idle.
+    #[wasm_bindgen_test]
+    fn the_walk_owes_a_turn_while_the_connection_is_idle() {
+        use connetto_file_core::FileId;
+
+        let settled = super::WalkState::default();
+        assert!(
+            !super::walk_owes(&settled),
+            "a settled walk asks for no turn"
+        );
+        let mut owing = super::WalkState::default();
+        owing.unverified.push_back(FileId::from_bytes([1; 32]));
+        assert!(super::walk_owes(&owing), "a queued file owes a turn");
+        let mut swept = super::WalkState {
+            unswept: true,
+            ..super::WalkState::default()
+        };
+        assert!(super::walk_owes(&swept), "an owed sweep owes a turn");
+        swept.sweep_waiting = true;
+        assert!(
+            !super::walk_owes(&swept),
+            "and a sweep waiting for the retry timer does not"
+        );
+    }
 
     /// A database holding `drafts` with one row, in memory.
     fn seeded(body: &str) -> SqliteConnection {
@@ -2718,5 +4040,154 @@ mod tests {
             }
             _ => panic!("expected a synthesized aggregate frame toward the tab"),
         }
+    }
+
+    /// A committed import stays a success when the post-commit replay fails, because the
+    /// rows are durable and the outbox driver retries the upload.
+    #[wasm_bindgen_test]
+    async fn a_committed_import_survives_a_failing_replay() {
+        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Grant, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let config = ClientConfig::new("worker").with_login(Some(Grant::new("user:token")));
+        let mut source =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("source opens offline");
+        source
+            .conn()
+            .batch_execute("INSERT INTO drafts VALUES (1, 'restored')")
+            .expect("the source writes one row");
+        source
+            .push()
+            .await
+            .expect("the write queues while the source is offline");
+        let archive = source
+            .export_local_data(ExportScope::Everything)
+            .expect("the source exports");
+
+        let mut target =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("target opens offline");
+        target
+            .attach(FakeTransport::accepting_but_failing_bulk())
+            .await
+            .expect("the target attaches");
+
+        let (outcome, _collisions) = super::import_archive(&mut target, None, &archive)
+            .await
+            .expect("a committed import must survive a failing replay");
+        assert!(
+            outcome.writes_restored > 0,
+            "the restored writes must be reported, got {outcome:?}"
+        );
+        assert_eq!(
+            body(target.conn()).as_deref(),
+            Some("restored"),
+            "the rows are committed before the replay is attempted"
+        );
+    }
+
+    /// An import schedules the orphan sweep again, because an import that fails part way
+    /// leaves chunks no manifest names.
+    #[wasm_bindgen_test]
+    async fn an_import_schedules_the_orphan_sweep() {
+        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let config = ClientConfig::new("worker");
+        let mut source =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the source opens offline");
+        source
+            .conn()
+            .batch_execute("INSERT INTO drafts VALUES (1, 'swept')")
+            .expect("the source writes one row");
+        let archive = source
+            .export_local_data(ExportScope::Everything)
+            .expect("the source exports");
+
+        let worker =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the worker opens offline");
+        let (notices, _notice_rx) = unbounded_channel();
+        let (_events, event_rx) = unbounded_channel();
+        let mut runtime = super::HubRuntime {
+            worker,
+            state: super::HubState::default(),
+            notices,
+            content: None,
+            events: event_rx,
+            retry: super::ContentRetry::default(),
+            walk: super::WalkState::default(),
+        };
+
+        let (reply, answer) = futures_channel::oneshot::channel();
+        runtime
+            .serve_local(Some(HubEvent::Import(archive, reply)))
+            .await
+            .expect("the import is served");
+        answer
+            .await
+            .expect("the caller is answered")
+            .expect("the import applies");
+        assert!(
+            runtime.walk.unswept,
+            "an import must leave the orphan sweep owed a turn"
+        );
+    }
+
+    /// The integrity walk checks one outbox file per turn, so the cycle it shares with
+    /// tab attachments and upstream frames is never held by a long outbox.
+    #[wasm_bindgen_test]
+    async fn the_content_integrity_walk_checks_one_file_per_turn() {
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_client::{BrowserStore, ContentArchive};
+        use connetto_file_core::FileId;
+        use std::collections::VecDeque;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let config = ClientConfig::new("worker");
+        let mut worker =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the worker opens offline");
+        let content = ContentArchive::new(BrowserStore::ephemeral(), [5; 32]);
+        content.install(&mut worker).expect("content tables");
+        let (notices, _notice_rx) = unbounded_channel();
+        let (_events, event_rx) = unbounded_channel();
+        let mut runtime = super::HubRuntime {
+            worker,
+            state: super::HubState::default(),
+            notices,
+            content: Some(content),
+            events: event_rx,
+            retry: super::ContentRetry::default(),
+            walk: super::WalkState {
+                unverified: VecDeque::from([
+                    FileId::from_bytes([7; 32]),
+                    FileId::from_bytes([9; 32]),
+                ]),
+                ..super::WalkState::default()
+            },
+        };
+
+        assert!(
+            runtime.verify_turn().await.expect("the turn serves"),
+            "the hub keeps running"
+        );
+        assert_eq!(
+            runtime.walk.unverified.len(),
+            1,
+            "one turn checks exactly one file, leaving the cycle free for everything else"
+        );
+        assert!(
+            runtime.verify_turn().await.expect("the turn serves"),
+            "the hub keeps running"
+        );
+        assert!(
+            runtime.walk.unverified.is_empty(),
+            "and the walk finishes file by file"
+        );
     }
 }

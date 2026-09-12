@@ -181,6 +181,22 @@ fn fresh_quantity() -> i64 {
     (r as i64 + 1) * 5
 }
 
+/// Convert an `f64` value to `u64`, returning 0 for pre-epoch, non-finite, or out-of-range values.
+///
+/// `Date::now()` and server-sent timestamps are always non-negative and well below
+/// `u64::MAX` in practice. This helper rejects every value that cannot round-trip
+/// safely, preventing a malformed broadcast from producing a false far-future deadline.
+fn f64_to_u64(v: f64) -> u64 {
+    // u64::MAX as f64 rounds up to 2^64 (the nearest representable double above
+    // u64::MAX), so values >= this bound saturate on `as u64` and must be rejected.
+    const MAX: f64 = u64::MAX as f64;
+    if v.is_finite() && (0.0..MAX).contains(&v) {
+        v as u64 // deliberate truncation: fractional part discarded
+    } else {
+        0
+    }
+}
+
 /// The tab mirror's physical footprint, read straight off the replica the
 /// client holds: total pages and the free pages a trim can reclaim.
 async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
@@ -474,7 +490,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
-    workers::announce_tab(&wire).await;
+    workers::announce_tab(&wire).await?;
     let transport =
         MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
@@ -721,13 +737,11 @@ fn App() -> Element {
                         .ok()
                         .and_then(|v| v.as_f64())
                         .map(|f| {
-                            // Recovering unix seconds that were sent as f64.
-                            // Always finite and << u64::MAX for any plausible deadline.
                             debug_assert!(
                                 f.is_finite() && f >= 0.0,
                                 "session_expires_at from broadcast must be finite"
                             );
-                            f as u64 // deliberate truncation: integer seconds recovered from f64
+                            f64_to_u64(f)
                         }),
                 );
             });
@@ -789,7 +803,9 @@ fn App() -> Element {
             match boot_window().await {
                 Ok(boot) => {
                     // Fetch the custody level now that the worker has settled.
-                    custody_level.set(Some(workers::request_custody().await));
+                    if let Ok(level) = workers::request_custody().await {
+                        custody_level.set(Some(level));
+                    }
                     let mut events = boot.client.events();
                     client_slot.set(Some(boot.client.clone()));
                     status.set("connected".to_owned());
@@ -821,6 +837,80 @@ fn App() -> Element {
     }
 }
 
+/// Async body for the expiry warning effect: queries unsynced work and updates
+/// the warning signal. Skips the update if a newer session arrived meanwhile.
+async fn poll_expiry_warn(
+    secs: u64,
+    session_expires_at: Signal<Option<u64>>,
+    mut expiry_warn: Signal<Option<ExpiryWarning>>,
+) {
+    let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let pending = request_unsynced().await;
+    if *session_expires_at.read() != Some(secs) {
+        return;
+    }
+    let Ok(pending) = pending else {
+        if expiry_warn
+            .read()
+            .as_ref()
+            .is_some_and(|warn| warn.session_expires_at != expires_at)
+        {
+            expiry_warn.set(None);
+        }
+        return;
+    };
+    let now_f64 = js_sys::Date::now();
+    // Deliberate truncation: sub-millisecond time discarded.
+    debug_assert!(
+        now_f64.is_finite() && now_f64 >= 0.0,
+        "Date::now() must be finite"
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_millis(f64_to_u64(now_f64));
+    expiry_warn.set(expiry_warning(
+        now,
+        expires_at,
+        Duration::from_secs(7 * 24 * 3600),
+        pending.mutation_seqs,
+        pending.content_files,
+    ));
+}
+
+/// Returns `(enrol_offerable, custody_text)` for the given custody snapshot.
+fn custody_description(snap: Option<Custody>) -> (bool, Option<String>) {
+    let offerable = matches!(snap, Some(Custody::Unverified(NoGate::Offerable)));
+    let text = snap.as_ref().map(|c| match c {
+        Custody::Verified => "gate: verified by passkey".to_owned(),
+        Custody::Unverified(NoGate::Offerable) => {
+            "gate: not verified (passkey available)".to_owned()
+        }
+        Custody::Unverified(NoGate::Declined) => "gate: not verified (passkey declined)".to_owned(),
+        Custody::Unverified(NoGate::Unsupported) => {
+            "gate: not verified (passkey not available on this device)".to_owned()
+        }
+        Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
+    });
+    (offerable, text)
+}
+
+/// Formats the session expiry warning line shown in the auth banner.
+fn format_expiry_line(warn: &ExpiryWarning) -> String {
+    let n = warn.pending_count();
+    let secs = warn
+        .session_expires_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let now_f64 = js_sys::Date::now();
+    // Deliberate truncation: sub-second time discarded.
+    debug_assert!(
+        now_f64.is_finite() && now_f64 >= 0.0,
+        "Date::now() must be finite"
+    );
+    let now_secs = f64_to_u64(now_f64 / 1000.0);
+    let days = secs.saturating_sub(now_secs) / 86400;
+    format!("Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh.")
+}
+
 /// Auth status banner shown above the dashboard.
 ///
 /// Shows the login button when interactive auth is needed, or the authenticated
@@ -844,28 +934,11 @@ fn AuthBanner() -> Element {
     let mut expiry_warn: Signal<Option<ExpiryWarning>> = use_signal(|| None);
     let mut enrol_msg: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
-        let expires_secs = *session_expires_at.read();
-        spawn(async move {
-            let Some(secs) = expires_secs else {
-                expiry_warn.set(None);
-                return;
-            };
-            let unsynced = request_unsynced().await.unwrap_or_default();
-            let now_f64 = js_sys::Date::now();
-            // Deliberate truncation: milliseconds since epoch, always finite and non-negative.
-            debug_assert!(
-                now_f64.is_finite() && now_f64 >= 0.0,
-                "Date::now() must be finite"
-            );
-            let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_f64 as u64);
-            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            expiry_warn.set(expiry_warning(
-                now,
-                expires_at,
-                Duration::from_secs(7 * 24 * 3600),
-                unsynced,
-            ));
-        });
+        let Some(secs) = *session_expires_at.read() else {
+            expiry_warn.set(None);
+            return;
+        };
+        spawn(poll_expiry_warn(secs, session_expires_at, expiry_warn));
     });
 
     if user_id.read().is_none() && login_prompt.read().is_some() {
@@ -891,42 +964,13 @@ fn AuthBanner() -> Element {
         let is_active_picker = *picker_active.read();
 
         // Custody description and derived flags.
-        let custody_snap = *custody.read();
-        let enrol_offerable = matches!(custody_snap, Some(Custody::Unverified(NoGate::Offerable)));
-        let custody_text = custody_snap.as_ref().map(|c| match c {
-            Custody::Verified => "gate: verified by passkey".to_owned(),
-            Custody::Unverified(NoGate::Offerable) => {
-                "gate: not verified (passkey available)".to_owned()
-            }
-            Custody::Unverified(NoGate::Declined) => {
-                "gate: not verified (passkey declined)".to_owned()
-            }
-            Custody::Unverified(NoGate::Unsupported) => {
-                "gate: not verified (passkey not available on this device)".to_owned()
-            }
-            Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
-        });
+        let (enrol_offerable, custody_text) = custody_description(*custody.read());
 
         // Session expiry warning text, computed outside RSX to keep the template flat.
-        let expiry_line = expiry_warn.read().clone().map(|warn| {
-            let n = warn.unsynced.len();
-            let secs = warn
-                .session_expires_at
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let now_f64 = js_sys::Date::now();
-            // Deliberate truncation: ms to seconds, always finite and non-negative.
-            debug_assert!(
-                now_f64.is_finite() && now_f64 >= 0.0,
-                "Date::now() must be finite"
-            );
-            let now_secs = (now_f64 / 1000.0) as u64;
-            let days = secs.saturating_sub(now_secs) / 86400;
-            format!(
-                "Session lapses in {days} day(s). {n} local write(s) at risk. Connect to refresh."
-            )
-        });
+        let expiry_line = {
+            let guard = expiry_warn.read();
+            guard.as_ref().map(format_expiry_line)
+        };
 
         // Accounts the user can switch to: all stored minus the live one.
         let switch_targets: Vec<(String, String)> = accounts
@@ -974,9 +1018,9 @@ fn AuthBanner() -> Element {
                                         let result = membership.enrol_gate().await;
                                         match result {
                                             Ok(true) => {
-                                                custody.set(Some(
-                                                    workers::request_custody().await,
-                                                ));
+                                                if let Ok(level) = workers::request_custody().await {
+                                                    custody.set(Some(level));
+                                                }
                                                 enrol_msg.set(None);
                                             }
                                             Ok(false) => {
@@ -1097,8 +1141,9 @@ fn AuthBanner() -> Element {
 enum LogoutState {
     /// Showing the two logout buttons.
     Idle,
-    /// Awaiting user confirmation: delete would lose this many unsynced writes.
-    ConfirmDelete { unsynced_count: usize },
+    ConfirmDelete {
+        unsynced_count: u64,
+    },
     /// A logout or unsynced-count request is in flight.
     Working,
     /// The request failed.
@@ -1109,7 +1154,7 @@ enum LogoutState {
 ///
 /// "Log out, keep local data" keeps the encrypted replica so a future login
 /// with the same account resumes from the persisted cursor. "Delete local data
-/// and log out" checks for unsynced writes first and confirms before losing any.
+/// and log out" checks for pending local work first and confirms before losing any.
 #[component]
 #[allow(non_snake_case)]
 fn LogoutControls() -> Element {
@@ -1131,25 +1176,20 @@ fn LogoutControls() -> Element {
         spawn(async move {
             state.set(LogoutState::Working);
             match request_unsynced().await {
-                Ok(seqs) if seqs.is_empty() => {
-                    // Nothing would be lost: proceed without a confirmation prompt.
-                    match request_logout(true, false).await {
-                        Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => {
-                            reload_page();
-                        }
-                        Ok(LogoutOutcome::Refused { seqs }) => {
-                            // A write landed between our check and the request.
-                            // Show the count and let the user confirm.
-                            state.set(LogoutState::ConfirmDelete {
-                                unsynced_count: seqs.len(),
-                            });
-                        }
-                        Err(err) => state.set(LogoutState::Error(err.to_string())),
+                Ok(pending) if pending.is_empty() => match request_logout(true, false).await {
+                    Ok(LogoutOutcome::Kept | LogoutOutcome::Deleted) => {
+                        reload_page();
                     }
-                }
-                Ok(seqs) => {
+                    Ok(LogoutOutcome::Refused { pending }) => {
+                        state.set(LogoutState::ConfirmDelete {
+                            unsynced_count: pending.len(),
+                        });
+                    }
+                    Err(err) => state.set(LogoutState::Error(err.to_string())),
+                },
+                Ok(pending) => {
                     state.set(LogoutState::ConfirmDelete {
-                        unsynced_count: seqs.len(),
+                        unsynced_count: pending.len(),
                     });
                 }
                 Err(err) => state.set(LogoutState::Error(err.to_string())),
@@ -1179,7 +1219,7 @@ fn LogoutControls() -> Element {
         LogoutState::ConfirmDelete { unsynced_count } => rsx! {
             div { class: "logout-confirm",
                 p {
-                    "You have {unsynced_count} unsynced write(s) that would be permanently lost."
+                    "You have {unsynced_count} pending local item(s) that would be permanently lost."
                 }
                 div { class: "row",
                     button { onclick: on_confirm, "Confirm: delete and log out" }

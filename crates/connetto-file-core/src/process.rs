@@ -5,7 +5,7 @@ use std::io::Read;
 use fastcdc::v2020::StreamCDC;
 use thiserror::Error;
 
-use crate::identity::{ChunkHash, FileId};
+use crate::identity::{ChunkHash, FileIdHasher};
 use crate::manifest::{ChunkMeta, Manifest};
 use crate::maybe_send::MaybeSend;
 use crate::params::MimeClass;
@@ -48,7 +48,7 @@ where
 {
     let params = mime.params();
     let max = usize::try_from(params.max).expect("max chunk size fits in usize");
-    let mut file_hasher = blake3::Hasher::new();
+    let mut file_hasher = FileIdHasher::new();
     let mut chunk_metas = Vec::new();
     let mut buf = read_prefix(&mut reader, max + 1)?;
 
@@ -81,7 +81,7 @@ where
         }
     }
 
-    let file_id = FileId::from_bytes(*file_hasher.finalize().as_bytes());
+    let file_id = file_hasher.finalize();
     Ok(Manifest::new(file_id, chunk_metas))
 }
 
@@ -143,12 +143,12 @@ fn read_prefix<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, std::io
 /// Hashes `data`, writes it to `store`, and records the chunk metadata.
 async fn store_chunk<S: ChunkStore>(
     data: &[u8],
-    file_hasher: &mut blake3::Hasher,
+    file_hasher: &mut FileIdHasher,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), S::Error> {
     file_hasher.update(data);
-    let chunk_hash = ChunkHash::from_bytes(*blake3::hash(data).as_bytes());
+    let chunk_hash = ChunkHash::from_data(data);
     store.write_chunk(&chunk_hash, data).await?;
     metas.push(ChunkMeta {
         hash: chunk_hash,
@@ -161,7 +161,7 @@ async fn store_chunk<S: ChunkStore>(
 async fn stream_slabs<R, S>(
     mut reader: R,
     slab_size: usize,
-    file_hasher: &mut blake3::Hasher,
+    file_hasher: &mut FileIdHasher,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), ProcessError<S::Error>>
@@ -187,7 +187,7 @@ async fn stream_cdc_chunks<R, S>(
     min: u32,
     avg: u32,
     max: u32,
-    file_hasher: &mut blake3::Hasher,
+    file_hasher: &mut FileIdHasher,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), ProcessError<S::Error>>

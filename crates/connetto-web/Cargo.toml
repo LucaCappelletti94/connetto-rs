@@ -13,6 +13,7 @@ publish = false
 workspace = true
 
 [dependencies]
+connetto-file-client = { path = "../connetto-file-client" }
 connetto-client = { path = "../connetto-client", default-features = false }
 connetto-core = { path = "../connetto-core" }
 diesel = { version = "2", features = ["sqlite"] }
@@ -50,6 +51,11 @@ web-sys = { version = "0.3", features = [
   "Event",
   "ErrorEvent",
   "File",
+  "FileSystemDirectoryHandle",
+  "FileSystemFileHandle",
+  "FileSystemGetDirectoryOptions",
+  "FileSystemGetFileOptions",
+  "FileSystemWritableFileStream",
   "Headers",
   "Location",
   "Lock",
@@ -78,9 +84,12 @@ web-sys = { version = "0.3", features = [
   "Window",
   "Worker",
   "WorkerGlobalScope",
+  "WorkerLocation",
   "WorkerNavigator",
   "WorkerOptions",
+  "WritableStream",
   "WorkerType",
+  "Performance",
   "console",
 ] }
 # The relay builds generic snapshots with a throwaway capture session
@@ -143,6 +152,7 @@ rosetta-uuid = { version = "0.1.3", features = ["serde", "sqlite"] }
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 indexed_db_futures = "0.6"
+connetto-file-core = { path = "../connetto-file-core" }
 # Encoding credential ids as base64url-no-pad in the key-store tests.
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 wasm-bindgen-futures = "0.4"

@@ -41,6 +41,7 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         .with_upstream_sub_id("e42-upstream")
         .with_upstream_query(DEMO_QUERY)
         .with_hub_meta_name("e42-hub-meta.sqlite")
+        .with_content_namespace("e42-content")
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
         .with_caller_function(connetto_wasm_smoke::CALLER_FUNCTION)

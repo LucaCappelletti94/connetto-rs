@@ -80,8 +80,8 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
     let pending = take_pending_wipes().await.expect("drain");
     assert_eq!(pending.len(), 1, "one replica was marked, got {pending:?}");
     assert!(
-        pending[0].starts_with(DB_NAME) && pending[0] != DB_NAME,
+        pending[0].replica.starts_with(DB_NAME) && pending[0].replica != DB_NAME,
         "the marked replica is this identity's, got {}",
-        pending[0]
+        pending[0].replica
     );
 }

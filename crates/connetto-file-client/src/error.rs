@@ -15,6 +15,9 @@ pub enum ContentError {
     /// Reading the file being staged, or a chunk store operation, failed.
     #[error("chunk store: {0}")]
     Store(String),
+    /// Content attachments in a device archive are malformed or incomplete.
+    #[error("content archive: {0}")]
+    Archive(String),
     /// The HTTP transport failed before any status was seen.
     #[error("content transport: {0}")]
     Transport(String),
@@ -108,6 +111,7 @@ impl ContentError {
             | Self::MalformedGrant(_)
             | Self::NoManifest { .. }
             | Self::IdentityMismatch { .. }
+            | Self::Archive(_)
             | Self::PinColumnMissing { .. } => false,
             Self::Replica(_)
             | Self::Client(_)

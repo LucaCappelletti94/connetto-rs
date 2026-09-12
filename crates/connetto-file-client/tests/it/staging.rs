@@ -1,18 +1,47 @@
 //! Step 1 and the boot integrity pass: the same-transaction invariant, and
 //! what happens to unsent bytes that are no longer there.
 
-use connetto_file_client::{ContentError, ContentEvent, Resolved};
-use connetto_file_core::{FileId, MimeClass};
+use std::sync::Arc;
+
+use connetto_file_client::{ContentClient, ContentError, ContentEvent, Resolved};
+use connetto_file_core::{ChunkHash, ChunkStore, FileId, MemStore, MemStoreError, MimeClass};
 use diesel::prelude::*;
 use tempfile::tempdir;
 
 use crate::support::{
-    RecordingHttp, Scripted, attach_content, connected_client, learn_file_id, offline_content,
-    photos, stage_photo,
+    ROOT_KEY, RecordingHttp, Scripted, attach_content, connected_client, learn_file_id,
+    offline_content, photos, stage_photo,
 };
 
 /// The photo bytes every case here stages.
 const PHOTO: &[u8] = b"the bytes of one photograph, authored on this device";
+
+#[derive(Clone, Default)]
+struct UnavailableStore(Arc<MemStore>);
+
+impl ChunkStore for UnavailableStore {
+    type Error = MemStoreError;
+
+    fn read_failure_is_ambiguous(&self, _error: &Self::Error) -> bool {
+        true
+    }
+
+    async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
+        self.0.write_chunk(hash, data).await
+    }
+
+    async fn read_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Self::Error> {
+        self.0.read_chunk(hash).await
+    }
+
+    async fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, Self::Error> {
+        self.0.has_chunk(hash).await
+    }
+
+    async fn delete_chunk(&self, hash: &ChunkHash) -> Result<(), Self::Error> {
+        self.0.delete_chunk(hash).await
+    }
+}
 
 /// A staged file commits its manifest, its outbox entry and the row that names
 /// it together, and its chunk files are on disk before any of them.
@@ -127,6 +156,38 @@ async fn an_entry_row_never_outlives_its_manifest() {
     );
 }
 
+/// An unavailable store cannot turn unreadable bytes into confirmed loss.
+#[tokio::test]
+async fn the_boot_pass_preserves_outbox_when_absence_is_not_authoritative() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new(vec![(200, br#"{"needed":[]}"#.to_vec()), (200, Vec::new())]);
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting("http://files.test/files/ab/intent?t=TOKEN"),
+    )
+    .await;
+    let content = attach_content(client.clone(), &dir.path().join("chunks"), http).await;
+    stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
+    let unavailable = ContentClient::attach(
+        client,
+        UnavailableStore::default(),
+        ROOT_KEY,
+        RecordingHttp::default(),
+    )
+    .await
+    .expect("attach unavailable store");
+
+    assert_eq!(
+        unavailable.verify_unsent().await.expect("boot pass"),
+        Vec::<FileId>::new()
+    );
+    assert_eq!(
+        content.flush_outbox().await.expect("upload retained file"),
+        1,
+        "the unavailable store must not retire recoverable outbox work"
+    );
+}
+
 /// An unsent file whose chunk files are gone loses its outbox entry, keeps its
 /// manifest, and says so.
 #[tokio::test]
@@ -164,6 +225,53 @@ async fn the_boot_pass_retires_an_unsent_file_whose_bytes_are_gone() {
     assert!(
         matches!(content.resolve(file_id).await, Ok(Resolved::Unavailable)),
         "the manifest survives and the bytes do not"
+    );
+}
+
+/// The identity of a lost file outlives its outbox entry, because the
+/// application row still names it and only the application can settle that.
+#[tokio::test]
+async fn a_retired_file_stays_reported_until_it_is_acknowledged() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let (_, content) = offline_content(dir.path()).await;
+    let file_id = stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
+    for path in walk_files(&chunks) {
+        std::fs::remove_file(&path).expect("remove a chunk file");
+    }
+
+    content.verify_unsent().await.expect("the boot pass runs");
+    drop(content);
+
+    // A restart: the replica is the only thing that can still name the file.
+    let (_, after_restart) = offline_content(dir.path()).await;
+    assert_eq!(
+        after_restart
+            .retired_content()
+            .await
+            .expect("read the record"),
+        vec![file_id],
+        "the loss survives the outbox entry it retired, and the worker that saw it"
+    );
+    // A later pass finds nothing to retire, and must not forget the first loss.
+    after_restart
+        .verify_unsent()
+        .await
+        .expect("a second boot pass");
+    after_restart
+        .forget_retired_content(&[file_id])
+        .await
+        .expect("acknowledge the loss");
+    drop(after_restart);
+
+    let (_, acknowledged) = offline_content(dir.path()).await;
+    assert_eq!(
+        acknowledged
+            .retired_content()
+            .await
+            .expect("read the record"),
+        Vec::<FileId>::new(),
+        "an acknowledged loss is reported no more, across restarts too"
     );
 }
 

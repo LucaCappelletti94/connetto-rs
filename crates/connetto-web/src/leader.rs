@@ -31,8 +31,36 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, ErrorEvent, Event, MessageEvent, Worker};
 
 use crate::locks::{HeldLock, hold_lock};
-use crate::unlock::AccountChoice;
+use crate::unlock::{AccountChoice, UnlockError};
 use crate::workers::{WorkerBootstrap, spawn_db_worker};
+
+/// Failure of a leader-managed operation.
+#[derive(Debug, thiserror::Error)]
+pub enum LeaderError {
+    /// The broadcast switch channel could not be opened or posted to.
+    #[error("switch channel ({op}): {detail}")]
+    SwitchChannel {
+        /// Which step failed (open or post).
+        op: &'static str,
+        /// The exception text from the browser.
+        detail: String,
+    },
+    /// A replacement DB worker could not be spawned.
+    #[error("worker spawn: {detail}")]
+    WorkerSpawn {
+        /// The exception text from the browser.
+        detail: String,
+    },
+    /// The passkey unlock or enrolment ceremony failed.
+    #[error(transparent)]
+    Unlock(#[from] UnlockError),
+}
+
+impl From<LeaderError> for JsValue {
+    fn from(value: LeaderError) -> Self {
+        JsValue::from_str(&value.to_string())
+    }
+}
 
 /// What the winning page holds: the leader lock and the DB worker it spawned.
 /// Kept alive by the owning [`Membership`] for the leader's whole tenure.
@@ -85,9 +113,9 @@ impl Membership {
     ///
     /// # Errors
     ///
-    /// [`JsValue`] if a replacement worker cannot be spawned, or if the request
-    /// cannot be broadcast to the leader.
-    pub fn switch_account(&self, account: &str) -> Result<(), JsValue> {
+    /// [`LeaderError::WorkerSpawn`] if a replacement worker cannot be spawned, or
+    /// [`LeaderError::SwitchChannel`] if the request cannot be broadcast to the leader.
+    pub fn switch_account(&self, account: &str) -> Result<(), LeaderError> {
         self.reboot_as(AccountChoice::Named(account.to_owned()))
     }
 
@@ -102,9 +130,9 @@ impl Membership {
     ///
     /// # Errors
     ///
-    /// [`JsValue`] if a replacement worker cannot be spawned, or if the request
-    /// cannot be broadcast to the leader.
-    pub fn add_account(&self) -> Result<(), JsValue> {
+    /// [`LeaderError::WorkerSpawn`] if a replacement worker cannot be spawned, or
+    /// [`LeaderError::SwitchChannel`] if the request cannot be broadcast to the leader.
+    pub fn add_account(&self) -> Result<(), LeaderError> {
         self.reboot_as(AccountChoice::New)
     }
 
@@ -128,8 +156,8 @@ impl Membership {
     ///
     /// # Errors
     ///
-    /// [`JsValue`] if the ceremony fails or the key cannot be posted.
-    pub async fn enrol_gate(&self) -> Result<bool, JsValue> {
+    /// [`LeaderError::Unlock`] if the ceremony fails or the key cannot be posted.
+    pub async fn enrol_gate(&self) -> Result<bool, LeaderError> {
         // Cloned out of the slot so the borrow is released before the ceremony is
         // awaited: it runs for as long as the user takes to present a finger, and
         // holding a borrow across that would poison every other use of the slot.
@@ -151,7 +179,7 @@ impl Membership {
     /// so it asks the leader to, which is why this does not report whether the
     /// replacement has happened yet. Wait for it the way a first boot does, with
     /// [`await_db_worker_ready`](crate::workers::await_db_worker_ready).
-    fn reboot_as(&self, choice: AccountChoice) -> Result<(), JsValue> {
+    fn reboot_as(&self, choice: AccountChoice) -> Result<(), LeaderError> {
         if self.is_leader() {
             // The worker asks the page that spawned it, so the choice belongs on
             // this page only when this page is the one that will spawn it.
@@ -161,19 +189,28 @@ impl Membership {
         // A `BroadcastChannel` never delivers to its own sender, so this reaches
         // every other page and no leader can miss it by having sent it.
         BroadcastChannel::new(SWITCH_CHANNEL)
-            .map_err(|err| JsValue::from_str(&format!("switch channel: {err:?}")))?
+            .map_err(|e| LeaderError::SwitchChannel {
+                op: "open",
+                detail: format!("{e:?}"),
+            })?
             .post_message(&JsValue::from_str(&encode_choice(&choice)))
+            .map_err(|e| LeaderError::SwitchChannel {
+                op: "post",
+                detail: format!("{e:?}"),
+            })
     }
 
     /// Replace the worker this page owns, keeping the lock so no other page can
     /// take leadership in between.
-    fn restart_worker(&self) -> Result<(), JsValue> {
+    fn restart_worker(&self) -> Result<(), LeaderError> {
         let mut slot = self.leadership.borrow_mut();
         let Some(leadership) = slot.as_mut() else {
             return Ok(());
         };
         leadership.worker.terminate();
-        let worker = spawn_worker(&self.launch)?;
+        let worker = spawn_worker(&self.launch).map_err(|e| LeaderError::WorkerSpawn {
+            detail: format!("{e:?}"),
+        })?;
         leadership.worker = worker;
         Ok(())
     }

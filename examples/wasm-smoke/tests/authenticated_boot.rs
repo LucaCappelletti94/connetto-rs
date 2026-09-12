@@ -28,12 +28,12 @@ use connetto_client::{encode_identity, replica_db_name};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, RefreshStore, provision_replica_key,
+    Acquired, BrowserAuthenticator, IdbKeyStore, PendingWork, RefreshStore, provision_replica_key,
     remembered_account, remembered_identity,
 };
 use connetto_web::storage::{
-    ReplicaStorage, clear_device_key, device_key, mark_wipe_pending, take_pending_wipes,
-    tier_db_name,
+    PendingWipe, ReplicaStorage, clear_device_key, device_key, mark_wipe_pending,
+    take_pending_wipes, tier_db_name,
 };
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -90,9 +90,13 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let doomed_key = provision_replica_key(&keys, &replica_name)
         .await
         .expect("key the doomed replica");
-    mark_wipe_pending(&replica_name, &[], false)
-        .await
-        .expect("ask for the delete");
+    mark_wipe_pending(
+        &PendingWipe::new(&replica_name, None),
+        &PendingWork::default(),
+        false,
+    )
+    .await
+    .expect("ask for the delete");
 
     // The startup. It has no refresh token, so it asks the tab to log in and the
     // test answers. Then it drains the delete request and carries it out before

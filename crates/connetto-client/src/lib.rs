@@ -80,7 +80,8 @@ pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
 pub use archive::{
-    Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome, ImportPlan, Keep,
+    ArchiveAttachment, Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome,
+    ImportPlan, Keep,
 };
 #[cfg(feature = "native-auth")]
 pub use auth::{
@@ -1574,6 +1575,109 @@ fn pending_tables(
     Ok(())
 }
 
+type ColumnMap = HashMap<String, Vec<String>>;
+
+fn validate_archive_compat(
+    archive: &archive::Incoming,
+    fingerprint: &str,
+    account: Option<&str>,
+) -> Result<(), ClientError> {
+    if archive.fingerprint != fingerprint {
+        return Err(ClientError::Import(
+            "the archive was made under a different schema than this build runs, so it cannot be restored here"
+                .to_owned(),
+        ));
+    }
+    if archive.account.as_deref() != account {
+        return Err(ClientError::Import(
+            "the archive belongs to another account, and an import only ever restores into the account that made it"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_pending_capacity(held: usize, incoming: usize) -> Result<(), ClientError> {
+    let queued = held.saturating_add(incoming);
+    if queued > PENDING_CAP {
+        return Err(ClientError::Import(format!(
+            "the archive carries {incoming} queued writes and this replica already holds {held}, which is past the {PENDING_CAP} it can hold"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_import_columns(
+    db: &mut SqliteConnection,
+    local_tables: &HashSet<String>,
+    hidden: &HashSet<String>,
+) -> Result<(ColumnMap, ColumnMap), ClientError> {
+    let local_columns = if local_tables.is_empty() {
+        HashMap::new()
+    } else {
+        archive::schema_columns(db, LOCAL_SCHEMA, Some(local_tables), &HashSet::new())?
+    };
+    let main_columns = archive::schema_columns(db, "main", None, hidden)?;
+    Ok((local_columns, main_columns))
+}
+
+fn build_import_index(
+    db: &mut SqliteConnection,
+    archive: &archive::Incoming,
+    local_columns: &ColumnMap,
+    local_tables: &HashSet<String>,
+    unrecorded: &HashSet<String>,
+) -> Result<(Vec<archive::rows::IncomingRow>, archive::rows::RowIndex), ClientError> {
+    let incoming = match &archive.local_rows {
+        Some(rows) => archive::read_rows(rows, local_columns)?,
+        None => Vec::new(),
+    };
+    let held = if local_tables.is_empty() {
+        archive::index_rows(&[], local_columns)?
+    } else {
+        let current = export_rows(
+            db,
+            LOCAL_SCHEMA,
+            Some(local_tables),
+            &HashSet::new(),
+            unrecorded,
+        )?;
+        archive::index_rows(&current, local_columns)?
+    };
+    Ok((incoming, held))
+}
+
+fn plan_import_rows(
+    incoming: Vec<archive::rows::IncomingRow>,
+    held: &archive::rows::RowIndex,
+) -> (Vec<archive::PlannedRow>, Vec<Collision>) {
+    let mut rows = Vec::with_capacity(incoming.len());
+    let mut collisions = Vec::new();
+    for row in incoming {
+        let collision = match held.get(&(row.table.clone(), row.key.clone())) {
+            Some(mine) if *mine != row.values => {
+                collisions.push(Collision {
+                    table: row.table.clone(),
+                    key: row.key.clone(),
+                    columns: row.columns.clone(),
+                    mine: mine.clone(),
+                    theirs: row.values.clone(),
+                });
+                Some(collisions.len() - 1)
+            }
+            _ => None,
+        };
+        rows.push(archive::PlannedRow {
+            table: row.table,
+            columns: row.columns,
+            key_columns: row.key_columns,
+            values: row.values,
+            collision,
+        });
+    }
+    (rows, collisions)
+}
+
 /// Rewrite a stored `CREATE TABLE` statement to name `target`, which is an
 /// already-quoted path: a bare name for the archive database, or a qualified
 /// one for a twin in the blank schema. Column definitions travel verbatim, so
@@ -1979,6 +2083,12 @@ struct Wire<T> {
     connection_id: String,
 }
 
+#[derive(Clone, Copy)]
+enum AttachReplay {
+    Idle,
+    Pending { watermark: Option<u64> },
+}
+
 /// A sync client bound to one local SQLite database, with or without a server.
 ///
 /// It exists before any transport does. Opening the replica, serving reads from
@@ -1991,6 +2101,8 @@ pub struct ConnettoConnection<T: Transport> {
     /// The run this caller's work belongs to, absent until a first handshake
     /// and kept across every later drop.
     run: Option<Run>,
+    /// Post-handshake replay progress retained across a local interruption.
+    attach_replay: AttachReplay,
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
@@ -2261,6 +2373,7 @@ where
         let mut conn = Self {
             wire: None,
             run: None,
+            attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
             session,
             db,
@@ -2396,12 +2509,29 @@ where
             transport,
             connection_id: ack.connection_id,
         });
+        self.attach_replay = AttachReplay::Pending { watermark };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
+        self.resume_attach().await
+    }
+
+    /// Finishes post-handshake replay after an outer operation temporarily
+    /// yielded the connection for local work.
+    ///
+    /// Calling this after a completed attach is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when pending mutation or subscription replay fails.
+    pub async fn resume_attach(&mut self) -> Result<(), ClientError> {
+        let AttachReplay::Pending { watermark } = self.attach_replay else {
+            return Ok(());
+        };
         self.reconcile_pending(watermark).await?;
         self.replay_subscriptions().await?;
+        self.attach_replay = AttachReplay::Idle;
         Ok(())
     }
 
@@ -2425,6 +2555,20 @@ where
                 }
             }
             self.next_seq = self.next_seq.max(watermark.saturating_add(1));
+        }
+        self.replay_pending().await
+    }
+
+    /// Replays every unacknowledged mutation on the current transport.
+    ///
+    /// Calling this while offline leaves the durable queue untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when encoding or sending a queued mutation fails.
+    pub async fn replay_pending(&mut self) -> Result<(), ClientError> {
+        if !self.is_connected() {
+            return Ok(());
         }
         let replays: Vec<(u64, Vec<u8>)> = self
             .pending
@@ -2459,10 +2603,16 @@ where
 
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
+        self.attach_replay = AttachReplay::Idle;
         if self.wire.take().is_some() {
             self.notices
                 .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
         }
+    }
+
+    /// Drop the current transport while preserving the resumable session.
+    pub fn disconnect(&mut self) {
+        self.disconnected();
     }
 
     /// Whether a handshake currently stands.
@@ -2601,11 +2751,7 @@ where
     /// the device-private tier and the writes that never reached the server.
     /// Authentication state and sync cursors are never exported.
     ///
-    /// Every entry is a SQLite change record, connetto's own binary format
-    /// rather than a database, so the file is read back by connetto and not by
-    /// an ordinary SQLite tool. Handing a person a readable copy of their data
-    /// is a different job with a different scope, which only the application
-    /// knows.
+    /// Rows use connetto's SQLite change-record format, while optional client layers may add declared attachments.
     ///
     /// **The archive is not encrypted.** It holds every row this device can
     /// read, in the clear, so it is a bearer document: whoever holds the file
@@ -2619,6 +2765,20 @@ where
     /// records no changes for one and its rows would be silently absent. A
     /// named one is skipped, which is what the declaration means.
     pub fn export_local_data(&mut self, scope: ExportScope) -> Result<Vec<u8>, ClientError> {
+        self.export_local_data_with_attachments(scope, &[])
+    }
+
+    /// Writes a local-data archive with uninterpreted attachments at their declared relative paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Self::export_local_data`] and refuses unsafe
+    /// or repeated attachment paths.
+    pub fn export_local_data_with_attachments(
+        &mut self,
+        scope: ExportScope,
+        attachments: &[ArchiveAttachment],
+    ) -> Result<Vec<u8>, ClientError> {
         let synced_rows = match scope {
             ExportScope::Everything => Some(export_rows(
                 &mut self.db,
@@ -2647,6 +2807,7 @@ where
             synced_rows,
             local_rows,
             pending: self.pending.values().cloned().collect(),
+            attachments,
         })
     }
 
@@ -2701,84 +2862,25 @@ where
     /// build does not have.
     pub fn import_local_data(&mut self, bytes: &[u8]) -> Result<ImportPlan, ClientError> {
         let archive = archive::read(bytes)?;
-        let fingerprint = self.schema_fingerprint()?;
-        if archive.fingerprint != fingerprint {
-            return Err(ClientError::Import(
-                "the archive was made under a different schema than this build runs, so it cannot be restored here"
-                    .to_owned(),
-            ));
-        }
-        if archive.account != self.account() {
-            return Err(ClientError::Import(
-                "the archive belongs to another account, and an import only ever restores into the account that made it"
-                    .to_owned(),
-            ));
-        }
-        // Refused rather than trimmed: the queue evicts its oldest record when
-        // full, and giving up a write inside the feature whose purpose is not
-        // losing writes is the one thing an import must never do (R56).
-        let queued = self.pending.len().saturating_add(archive.pending.len());
-        if queued > PENDING_CAP {
-            return Err(ClientError::Import(format!(
-                "the archive carries {} queued writes and this replica already holds {}, which is past the {PENDING_CAP} it can hold",
-                archive.pending.len(),
-                self.pending.len()
-            )));
-        }
-        let local_columns = archive::schema_columns(
-            &mut self.db,
-            LOCAL_SCHEMA,
-            Some(&self.local_tables),
-            &HashSet::new(),
+        validate_archive_compat(
+            &archive,
+            &self.schema_fingerprint()?,
+            self.account().as_deref(),
         )?;
-        let main_columns =
-            archive::schema_columns(&mut self.db, "main", None, &self.hidden_tables)?;
-        // The queue's tables are checked here too, on the same terms: a
-        // changeset naming a table the target lacks is skipped by SQLite in
-        // silence.
+        check_pending_capacity(self.pending.len(), archive.pending.len())?;
+        let (local_columns, main_columns) =
+            resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
         for changeset in &archive.pending {
             pending_tables(changeset, &main_columns)?;
         }
-        let incoming = match &archive.local_rows {
-            Some(rows) => archive::read_rows(rows, &local_columns)?,
-            None => Vec::new(),
-        };
-        let held = if self.local_tables.is_empty() {
-            archive::index_rows(&[], &local_columns)?
-        } else {
-            let current = export_rows(
-                &mut self.db,
-                LOCAL_SCHEMA,
-                Some(&self.local_tables),
-                &HashSet::new(),
-                &self.config.unrecorded_tables,
-            )?;
-            archive::index_rows(&current, &local_columns)?
-        };
-        let mut rows = Vec::with_capacity(incoming.len());
-        let mut collisions = Vec::new();
-        for row in incoming {
-            let collision = match held.get(&(row.table.clone(), row.key.clone())) {
-                Some(mine) if *mine != row.values => {
-                    collisions.push(archive::Collision {
-                        table: row.table.clone(),
-                        key: row.key.clone(),
-                        columns: row.columns.clone(),
-                        mine: mine.clone(),
-                        theirs: row.values.clone(),
-                    });
-                    Some(collisions.len() - 1)
-                }
-                _ => None,
-            };
-            rows.push(archive::PlannedRow {
-                table: row.table,
-                columns: row.columns,
-                key_columns: row.key_columns,
-                values: row.values,
-                collision,
-            });
-        }
+        let (incoming, held) = build_import_index(
+            &mut self.db,
+            &archive,
+            &local_columns,
+            &self.local_tables,
+            &self.config.unrecorded_tables,
+        )?;
+        let (rows, collisions) = plan_import_rows(incoming, &held);
         Ok(ImportPlan {
             archive,
             rows,
@@ -2806,13 +2908,35 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Import`] when a row or a queued write cannot be applied,
-    /// and [`ClientError::Db`] on a local database failure.
+    /// [`ClientError::Import`] when rows, queued writes, or attachment handling fail, and [`ClientError::Db`] on a local database failure.
     pub fn apply_import(
         &mut self,
         plan: &ImportPlan,
         choices: &ImportChoices,
     ) -> Result<ImportOutcome, ClientError> {
+        if !plan.attachments().is_empty() {
+            return Err(ClientError::Import(
+                "the archive carries attachments that require an attachment-aware importer"
+                    .to_owned(),
+            ));
+        }
+        self.apply_import_with_bookkeeping(plan, choices, |_| Ok(()))
+    }
+
+    /// Applies imported rows and writes before running `bookkeeping` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Self::apply_import`] or `bookkeeping`.
+    pub fn apply_import_with_bookkeeping<F>(
+        &mut self,
+        plan: &ImportPlan,
+        choices: &ImportChoices,
+        bookkeeping: F,
+    ) -> Result<ImportOutcome, ClientError>
+    where
+        F: FnOnce(&mut SqliteConnection) -> Result<(), ClientError>,
+    {
         let mut outcome = ImportOutcome::default();
         let mut restored: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut next_seq = self.next_seq;
@@ -2828,11 +2952,13 @@ where
                     }
                     archive::write_row(
                         db,
-                        LOCAL_SCHEMA,
-                        &row.table,
-                        &row.columns,
-                        &row.key_columns,
-                        &row.values,
+                        &archive::rows::RowWrite {
+                            schema: LOCAL_SCHEMA,
+                            table: &row.table,
+                            columns: &row.columns,
+                            key_columns: &row.key_columns,
+                            values: &row.values,
+                        },
                     )?;
                     outcome.rows_restored += 1;
                 }
@@ -2850,6 +2976,7 @@ where
                     next_seq += 1;
                     outcome.writes_restored += 1;
                 }
+                bookkeeping(db)?;
                 Ok(())
             })?;
         }
@@ -4471,6 +4598,7 @@ mod tests {
             synced_rows: None,
             local_rows: Some(rows),
             pending: Vec::new(),
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {
@@ -4503,6 +4631,7 @@ mod tests {
             synced_rows: None,
             local_rows: None,
             pending: vec![Vec::new()],
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {
@@ -4536,6 +4665,7 @@ mod tests {
             synced_rows: None,
             local_rows: None,
             pending: vec![Vec::new(); PENDING_CAP + 1],
+            attachments: &[],
         })
         .expect("write archive");
         match conn.import_local_data(&bytes) {

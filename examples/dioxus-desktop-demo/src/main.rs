@@ -381,7 +381,9 @@ async fn setup_authenticated(
 ) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx)> {
     use anyhow::Context as _;
 
-    std::fs::create_dir_all(data_dir()).context("creating the application data directory")?;
+    tokio::fs::create_dir_all(data_dir())
+        .await
+        .context("creating the application data directory")?;
 
     // Credential store: one entry per service, one record per account.
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
@@ -625,6 +627,7 @@ fn app() -> Element {
                     session_expires_at,
                     lead,
                     unsynced,
+                    0,
                 ) {
                     let remaining = w
                         .session_expires_at
@@ -632,9 +635,9 @@ fn app() -> Element {
                         .unwrap_or_default();
                     let days = remaining.as_secs() / 86400;
                     expiry_warn.set(Some(format!(
-                        "Session expires in {days} day(s): {} unsynced write(s) at risk. \
+                        "Session expires in {days} day(s): {} pending local item(s) at risk. \
                          Stay connected to extend the deadline automatically.",
-                        w.unsynced.len()
+                        w.pending_count()
                     )));
                 } else {
                     expiry_warn.set(None);

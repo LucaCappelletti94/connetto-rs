@@ -49,7 +49,7 @@ async fn baseline_throughput_and_lock_wait() {
         return;
     }
 
-    let fixture = Fixture::acquire().await;
+    let fixture = Fixture::acquire_exclusive().await;
     for width in [RowWidth::Narrow, RowWidth::Wide] {
         for subscribers in [SMALL, LARGE] {
             let run = fanout_load(&fixture, subscribers, WINDOW, width).await;
