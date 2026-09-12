@@ -1004,9 +1004,11 @@ where
         let Some(event) = event else {
             return Ok(false);
         };
-        let wake_content = matches!(&event, HubEvent::Import(_, _));
+        let imported = matches!(&event, HubEvent::Import(_, _));
         self.serve(event).await?;
-        if wake_content {
+        if imported {
+            // An import can restore the very chunks a scan in progress has already missed.
+            self.scan = ChunkScan::default();
             self.wake_content()?;
         }
         Ok(true)

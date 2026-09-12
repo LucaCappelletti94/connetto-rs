@@ -32,11 +32,24 @@ pub enum ContentFlush {
 }
 
 /// Resumable position of an integrity scan over one file's chunks.
+///
+/// A scan is bound to the file and the chunk list it was taken over, so a cursor offered
+/// for another file, or for a manifest that has since been replaced, starts again.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChunkScan {
+    file: Option<FileId>,
+    chunks: usize,
     next: usize,
-    unreadable: usize,
+    missing: Option<usize>,
     ambiguous: bool,
+}
+
+impl ChunkScan {
+    /// Whether this scan has yet to read a chunk.
+    #[must_use]
+    pub const fn is_fresh(&self) -> bool {
+        self.next == 0
+    }
 }
 
 /// What one budgeted integrity scan concluded.
@@ -236,9 +249,17 @@ where
             retire(connection.conn(), file_id)?;
             return Ok(ScanStep::Retired);
         };
-        let mut scan = scan;
-        let encrypted = EncryptingStore::new(self.store.clone(), &self.root_key);
         let chunks = manifest.chunks();
+        let mut scan = if scan.file == Some(file_id) && scan.chunks == chunks.len() {
+            scan
+        } else {
+            ChunkScan {
+                file: Some(file_id),
+                chunks: chunks.len(),
+                ..ChunkScan::default()
+            }
+        };
+        let encrypted = EncryptingStore::new(self.store.clone(), &self.root_key);
         let stop = scan.next.saturating_add(budget.max(1)).min(chunks.len());
         while scan.next < stop {
             match encrypted.read_chunk(&chunks[scan.next].hash).await {
@@ -248,15 +269,24 @@ where
                 {
                     scan.ambiguous = true;
                 }
-                Err(_) => scan.unreadable += 1,
+                Err(_) => scan.missing = scan.missing.or(Some(scan.next)),
             }
             scan.next += 1;
         }
         if scan.next < chunks.len() {
             return Ok(ScanStep::More(scan));
         }
-        if scan.ambiguous || scan.unreadable == 0 {
+        let (false, Some(missing)) = (scan.ambiguous, scan.missing) else {
             return Ok(ScanStep::Intact);
+        };
+        // A restore can land between slices, so the decision rests on a fresh read rather
+        // than on what an earlier slice saw.
+        if encrypted.read_chunk(&chunks[missing].hash).await.is_ok() {
+            return Ok(ScanStep::More(ChunkScan {
+                file: Some(file_id),
+                chunks: chunks.len(),
+                ..ChunkScan::default()
+            }));
         }
         retire(connection.conn(), file_id)?;
         Ok(ScanStep::Retired)
@@ -612,6 +642,149 @@ mod tests {
             Some(file(2))
         );
         assert_eq!(next_after(&[], Some(file(1))), None);
+    }
+
+    /// A restore landing between slices keeps the entry, because an import can put back
+    /// the very chunk an earlier slice found missing.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_chunk_restored_mid_scan_keeps_the_entry() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("restore"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let bytes = vec![7u8; 33 * 1024 * 1024];
+        let manifest = process_file(&bytes, MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        let first_hash = manifest.chunks()[0].hash;
+        let chunk = encrypted
+            .read_chunk(&first_hash)
+            .await
+            .expect("read the first chunk");
+        encrypted
+            .delete_chunk(&first_hash)
+            .await
+            .expect("drop the first chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+
+        let mut scan = super::ChunkScan::default();
+        for _ in 0..manifest.chunks().len() - 1 {
+            match archive
+                .scan_unsent_file(&mut connection, manifest.file_id(), scan, 1)
+                .await
+                .expect("each slice scans")
+            {
+                super::ScanStep::More(next) => scan = next,
+                other => panic!("the scan cannot conclude before its last chunk: {other:?}"),
+            }
+        }
+        // The import lands between slices, putting the missing bytes back.
+        encrypted
+            .write_chunk(&first_hash, &chunk)
+            .await
+            .expect("restore the first chunk");
+
+        let mut step = archive
+            .scan_unsent_file(&mut connection, manifest.file_id(), scan, 1)
+            .await
+            .expect("the last slice scans");
+        while let super::ScanStep::More(next) = step {
+            step = archive
+                .scan_unsent_file(&mut connection, manifest.file_id(), next, 8)
+                .await
+                .expect("the restarted scan runs");
+        }
+        assert!(
+            matches!(step, super::ScanStep::Intact),
+            "restored bytes must keep the entry, got {step:?}"
+        );
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read the outbox"),
+            vec![manifest.file_id()],
+            "and the file is still queued to upload"
+        );
+    }
+
+    /// A cursor belongs to the file it was taken over, so one offered for another file
+    /// reads that file's chunks from the start rather than skipping them.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_cursor_from_another_file_does_not_skip_chunks() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("cursor"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let elsewhere = process_file(&vec![1u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the other file chunks");
+        let manifest = process_file(&vec![2u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("this file chunks");
+        encrypted
+            .delete_chunk(&manifest.chunks()[0].hash)
+            .await
+            .expect("drop the only chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+
+        let foreign = match archive
+            .scan_unsent_file(
+                &mut connection,
+                elsewhere.file_id(),
+                super::ChunkScan::default(),
+                8,
+            )
+            .await
+            .expect("the other file scans")
+        {
+            super::ScanStep::More(scan) => scan,
+            _ => super::ChunkScan {
+                file: Some(elsewhere.file_id()),
+                chunks: elsewhere.chunks().len(),
+                next: elsewhere.chunks().len(),
+                missing: None,
+                ambiguous: false,
+            },
+        };
+
+        let step = archive
+            .scan_unsent_file(&mut connection, manifest.file_id(), foreign, 8)
+            .await
+            .expect("this file scans");
+        assert!(
+            matches!(step, super::ScanStep::Retired),
+            "a foreign cursor must not pass an unreadable chunk off as read, got {step:?}"
+        );
     }
 
     /// An export of the unsent files carries their distinct chunk bytes, which is the
