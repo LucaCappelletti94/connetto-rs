@@ -336,7 +336,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -4107,7 +4107,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#b8940281ed8c36e037b97cbad3d0baeef410cfbf"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#5d2a89b633d4c3d1b53762754fd57c739510de45"
 dependencies = [
  "git2",
  "sql-traits",
@@ -4450,7 +4450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -4469,7 +4469,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4976,7 +4976,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b10e5952df50701f3d3870992db480161af41227"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#93f427e1f9fc7fe9eedfc13546d7892cbc5f15d6"
 dependencies = [
  "openfga-client",
  "rls2fga-types",
@@ -4990,7 +4990,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b10e5952df50701f3d3870992db480161af41227"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#93f427e1f9fc7fe9eedfc13546d7892cbc5f15d6"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -5958,7 +5958,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
