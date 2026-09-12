@@ -277,15 +277,24 @@ where
             .collect())
     }
 
-    /// Deletes one chunk the caller has established nothing references.
+    /// Deletes one listed orphan, unless a manifest has come to name it since.
     ///
     /// A caller holding a long orphan list deletes a few per turn, so a crowded store
-    /// cannot hold the turn.
+    /// cannot hold the turn, and an import landing in between can reference a listed
+    /// chunk, so the reference is checked here rather than trusted from the list.
     ///
     /// # Errors
     ///
+    /// [`ContentError::Replica`] when the reference cannot be read, and
     /// [`ContentError::Store`] when the delete fails.
-    pub async fn discard_chunk(&self, hash: &ChunkHash) -> Result<(), ContentError> {
+    pub async fn discard_chunk<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        hash: &ChunkHash,
+    ) -> Result<(), ContentError> {
+        if db::hash_is_referenced(connection.conn(), hash)? {
+            return Ok(());
+        }
         self.store
             .delete_chunk(hash)
             .await
@@ -307,7 +316,7 @@ where
     {
         let orphans = self.orphan_chunks(connection).await?;
         for hash in &orphans {
-            self.discard_chunk(hash).await?;
+            self.discard_chunk(connection, hash).await?;
         }
         Ok(orphans.len())
     }
@@ -758,6 +767,52 @@ mod tests {
             Some(file(2))
         );
         assert_eq!(next_after(&[], Some(file(1))), None);
+    }
+
+    /// A chunk a manifest has come to name since it was listed survives the sweep, which
+    /// is the race an import between the listing and the deletion opens.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_relisted_chunk_survives_the_sweep() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("relisted"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let manifest = process_file(&vec![3u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        let hash = manifest.chunks()[0].hash;
+        let listed = archive
+            .orphan_chunks(&mut connection)
+            .await
+            .expect("the listing runs");
+        assert_eq!(listed, vec![hash], "nothing names the chunk yet");
+
+        // The import lands between the listing and the deletion.
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+
+        archive
+            .discard_chunk(&mut connection, &hash)
+            .await
+            .expect("the discard runs");
+        assert!(
+            encrypted.read_chunk(&hash).await.is_ok(),
+            "a chunk a manifest names must survive a stale orphan listing"
+        );
     }
 
     /// An uploaded file no pin covers is released, while an unsent one is kept, so a

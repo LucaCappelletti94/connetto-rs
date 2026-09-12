@@ -274,6 +274,18 @@ pub(crate) fn is_unsent(
         .map(|n| n > 0)
 }
 
+/// Whether any manifest still names this chunk.
+pub(crate) fn hash_is_referenced(
+    conn: &mut SqliteConnection,
+    hash: &ChunkHash,
+) -> Result<bool, diesel::result::Error> {
+    _connetto_content_chunks::table
+        .filter(_connetto_content_chunks::hash.eq(hash.as_bytes().to_vec()))
+        .count()
+        .get_result::<i64>(conn)
+        .map(|n| n > 0)
+}
+
 /// Creates or replaces a pin under `name`.
 pub(crate) fn put_pin(
     conn: &mut SqliteConnection,

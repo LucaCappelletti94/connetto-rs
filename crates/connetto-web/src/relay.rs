@@ -916,6 +916,8 @@ struct WalkState {
     sweep_waiting: bool,
     /// Orphaned chunks the sweep has listed and not yet deleted.
     orphans: VecDeque<connetto_file_client::ChunkHash>,
+    /// Whether a commit has queued work the outbox driver has not been told about.
+    outbox_wake: bool,
 }
 
 /// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
@@ -969,8 +971,13 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        let unverified =
-            !self.walk.unverified.is_empty() || (self.walk.unswept && !self.walk.sweep_waiting);
+        if self.walk.outbox_wake {
+            // An import commits restored writes and files wherever it was served, so the
+            // driver is told here rather than by whichever path served it.
+            self.walk.outbox_wake = false;
+            self.wake_content()?;
+        }
+        let unverified = walk_owes(&self.walk);
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -1021,11 +1028,7 @@ where
         let Some(event) = event else {
             return Ok(false);
         };
-        let imported = matches!(&event, HubEvent::Import(_, _));
         self.serve(event).await?;
-        if imported {
-            self.wake_content()?;
-        }
         Ok(true)
     }
 
@@ -1111,6 +1114,11 @@ where
             }
             ContentWalk::Interrupted(None) => return Ok(false),
         };
+        if progressed {
+            // An uploaded file is no longer unsent, so retention can release it.
+            self.walk.unswept = true;
+            self.walk.sweep_waiting = false;
+        }
         if !self.worker.is_connected() {
             let Some(driver) = reconnect else {
                 return Ok(false);
@@ -1183,111 +1191,26 @@ where
         }
     }
 
-    /// Scan a bounded number of the head file's chunks.
+    /// Take one turn of the content integrity walk.
     ///
-    /// The scan reads and decrypts every chunk it names, so the cycle takes it in slices:
-    /// a long outbox, or one file naming many chunks, would otherwise hold a tab's
-    /// attachment past the tab's own deadline.
+    /// The turn is bounded, and a failure asks for the upload retry's own backoff rather
+    /// than the next cycle, so a store that keeps failing is not walked in a loop.
     async fn verify_turn(&mut self) -> Result<bool, RelayError> {
-        let Some(content) = self.content.as_ref() else {
-            self.walk.unverified.clear();
-            self.walk.unswept = false;
+        let Self {
+            worker,
+            content,
+            walk,
+            retry,
+            ..
+        } = self;
+        if walk_turn(worker, content.as_ref(), walk).await == WalkTurn::Deferred {
+            retry.schedule(true, false);
             return Ok(true);
-        };
-        if !self.walk.orphans.is_empty() {
-            return self.discard_turn().await;
         }
-        let Some(&file_id) = self.walk.unverified.front() else {
-            // The files are settled, so the bytes none of them name can go.
-            if self.list_orphans().await {
-                self.walk.unswept = false;
-                self.wake_content()?;
-            } else {
-                // A store that failed once is given the upload retry's own backoff rather
-                // than the next cycle, which would be a hot loop over the whole namespace.
-                self.walk.sweep_waiting = true;
-                self.retry.schedule(true, false);
-            }
+        if walk_owes(&self.walk) {
             return Ok(true);
-        };
-        let step = content
-            .scan_unsent_file(
-                &mut self.worker,
-                file_id,
-                self.walk.scan,
-                VERIFY_CHUNK_BUDGET,
-            )
-            .await;
-        match step {
-            Ok(ScanStep::More(scan)) => {
-                self.walk.scan = scan;
-                return Ok(true);
-            }
-            // The identity is durable in the replica until acknowledged, so a pending-work
-            // query reports it rather than this line.
-            Ok(ScanStep::Retired) => {
-                tracing::warn!(%file_id, "content integrity pass retired unreadable file");
-            }
-            Ok(ScanStep::Intact) => {}
-            Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
-        self.walk.unverified.pop_front();
-        self.walk.scan = ChunkScan::default();
-        Ok(true)
-    }
-
-    /// Drop the manifests nothing covers, then list the chunks that leaves behind along
-    /// with those an interrupted import or stage left, reporting whether the listing
-    /// succeeded.
-    ///
-    /// The deletions follow one turn at a time, because a crowded store holds as many of
-    /// them as it holds chunks.
-    async fn list_orphans(&mut self) -> bool {
-        let Some(content) = self.content.as_ref() else {
-            return true;
-        };
-        match content.evict_uncovered(&mut self.worker) {
-            Ok(0) => {}
-            Ok(evicted) => tracing::info!(evicted, "evicted uncovered content manifests"),
-            Err(err) => tracing::warn!(error = %err, "evicting uncovered manifests failed"),
-        }
-        match content.orphan_chunks(&mut self.worker).await {
-            Ok(orphans) => {
-                if !orphans.is_empty() {
-                    tracing::info!(
-                        orphans = orphans.len(),
-                        "reclaiming orphaned content chunks"
-                    );
-                }
-                self.walk.orphans = orphans.into();
-                true
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "listing orphaned chunks failed");
-                false
-            }
-        }
-    }
-
-    /// Delete a bounded number of the listed orphans.
-    async fn discard_turn(&mut self) -> Result<bool, RelayError> {
-        let Some(content) = self.content.as_ref() else {
-            self.walk.orphans.clear();
-            return Ok(true);
-        };
-        for _ in 0..DISCARD_BUDGET {
-            let Some(hash) = self.walk.orphans.pop_front() else {
-                break;
-            };
-            if let Err(err) = content.discard_chunk(&hash).await {
-                tracing::warn!(error = %err, "discarding an orphaned chunk failed");
-                self.walk.orphans.clear();
-                self.walk.sweep_waiting = true;
-                self.walk.unswept = true;
-                self.retry.schedule(true, false);
-                return Ok(true);
-            }
-        }
+        self.wake_content()?;
         Ok(true)
     }
 
@@ -1298,6 +1221,132 @@ where
         }
         Ok(())
     }
+}
+
+/// Whether the content integrity walk still owes this run a turn.
+fn walk_owes(walk: &WalkState) -> bool {
+    !walk.unverified.is_empty() || !walk.orphans.is_empty() || (walk.unswept && !walk.sweep_waiting)
+}
+
+/// What one walk turn left behind.
+#[derive(PartialEq, Eq)]
+enum WalkTurn {
+    /// The turn ran, and the walk may owe more.
+    Taken,
+    /// The store failed, so the rest waits for the retry timer.
+    Deferred,
+}
+
+/// One bounded turn of the integrity walk: eight chunks of the head file, or the sweep
+/// listing, or eight of the listed deletions.
+///
+/// Driven from the connected cycle and from the recovery waits that leave the connection
+/// idle, because the walk reads only the replica and the chunk store.
+async fn walk_turn<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
+) -> WalkTurn
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        walk.unverified.clear();
+        walk.orphans.clear();
+        walk.unswept = false;
+        return WalkTurn::Taken;
+    };
+    if !walk.orphans.is_empty() {
+        return discard_turn(worker, content, walk).await;
+    }
+    let Some(&file_id) = walk.unverified.front() else {
+        // The files are settled, so the bytes none of them name can go.
+        if list_orphans(worker, content, walk).await {
+            walk.unswept = false;
+            return WalkTurn::Taken;
+        }
+        walk.sweep_waiting = true;
+        return WalkTurn::Deferred;
+    };
+    match content
+        .scan_unsent_file(worker, file_id, walk.scan, VERIFY_CHUNK_BUDGET)
+        .await
+    {
+        Ok(ScanStep::More(scan)) => {
+            walk.scan = scan;
+            return WalkTurn::Taken;
+        }
+        // The identity is durable in the replica until acknowledged, so a pending-work
+        // query reports it rather than this line.
+        Ok(ScanStep::Retired) => {
+            tracing::warn!(%file_id, "content integrity pass retired unreadable file");
+        }
+        Ok(ScanStep::Intact) => {}
+        Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
+    }
+    walk.unverified.pop_front();
+    walk.scan = ChunkScan::default();
+    WalkTurn::Taken
+}
+
+/// Drop the manifests nothing covers, then list the chunks that leaves behind along with
+/// those an interrupted import or stage left, reporting whether the listing succeeded.
+async fn list_orphans<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &ContentArchive<BrowserStore>,
+    walk: &mut WalkState,
+) -> bool
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    match content.evict_uncovered(worker) {
+        Ok(0) => {}
+        Ok(evicted) => tracing::info!(evicted, "evicted uncovered content manifests"),
+        Err(err) => tracing::warn!(error = %err, "evicting uncovered manifests failed"),
+    }
+    match content.orphan_chunks(worker).await {
+        Ok(orphans) => {
+            if !orphans.is_empty() {
+                tracing::info!(
+                    orphans = orphans.len(),
+                    "reclaiming orphaned content chunks"
+                );
+            }
+            walk.orphans = orphans.into();
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "listing orphaned chunks failed");
+            false
+        }
+    }
+}
+
+/// Delete a bounded number of the listed orphans.
+async fn discard_turn<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &ContentArchive<BrowserStore>,
+    walk: &mut WalkState,
+) -> WalkTurn
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    for _ in 0..DISCARD_BUDGET {
+        let Some(hash) = walk.orphans.pop_front() else {
+            break;
+        };
+        if let Err(err) = content.discard_chunk(worker, &hash).await {
+            tracing::warn!(error = %err, "discarding an orphaned chunk failed");
+            walk.orphans.clear();
+            walk.sweep_waiting = true;
+            walk.unswept = true;
+            return WalkTurn::Deferred;
+        }
+    }
+    WalkTurn::Taken
 }
 
 /// The hub core: one task owning the worker connection and every tab's
@@ -1477,6 +1526,10 @@ where
             walk.scan = ChunkScan::default();
             walk.unswept = true;
             walk.sweep_waiting = false;
+            // A listed orphan can be exactly what this import restored, so the list is
+            // taken again rather than trusted.
+            walk.orphans.clear();
+            walk.outbox_wake = true;
         }
         HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
@@ -1704,13 +1757,14 @@ where
     U: Transport + MaybeSend + 'static,
     U::Error: core::fmt::Display,
 {
+    let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
-    let state = &*context.state;
+    let state = &mut *context.state;
     let events = &mut *context.events;
     let deferred = &mut *context.deferred;
     let recovery = async {
         worker.resume_attach().await?;
-        restore_recovery_subscriptions(worker, state, upstream).await
+        restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
     loop {
@@ -1723,7 +1777,7 @@ where
             }
             event = events.recv() => match event {
                 Some(event) => {
-                    if let Some(local) = schedule_recovery_event(deferred, event) {
+                    if let Some(local) = attach_during_recovery(state, deferred, event) {
                         return RecoveryAttempt::Interrupted(local);
                     }
                 }
@@ -1746,14 +1800,45 @@ where
     let sleep = sleeper.sleep(backoff);
     tokio::pin!(sleep);
     loop {
-        tokio::select! {
-            () = &mut sleep => return Ok(true),
-            event = context.events.recv() => match event {
-                Some(event) => handle_recovery_event(context, event).await?,
-                None => return Ok(false),
-            },
+        let owes = walk_owes(context.walk);
+        let wake = {
+            let events = &mut *context.events;
+            tokio::select! {
+                () = &mut sleep => return Ok(true),
+                event = events.recv() => IdleWake::Event(event),
+                // The walk reads only the replica and the chunk store, so the sleep is
+                // where it belongs rather than a pause until the server returns.
+                () = core::future::ready(()), if owes => IdleWake::Walk,
+            }
+        };
+        match wake {
+            IdleWake::Event(Some(event)) => handle_recovery_event(context, event).await?,
+            IdleWake::Event(None) => return Ok(false),
+            IdleWake::Walk => {
+                walk_recovery_turn(context).await;
+            }
         }
     }
+}
+
+/// Why one idle recovery wait woke.
+enum IdleWake {
+    /// A request arrived, or the intake closed.
+    Event(Option<HubEvent>),
+    /// The content integrity walk owes a turn.
+    Walk,
+}
+
+/// One walk turn while the connection is idle.
+///
+/// A deferred turn waits for the connected cycle's retry timer, which is the schedule the
+/// walk already uses, so a failing store is not walked in a loop here either.
+async fn walk_recovery_turn<U>(context: &mut RecoveryContext<'_, U>)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let _ = walk_turn(context.worker, context.content, context.walk).await;
 }
 
 async fn recovery_attempt<U, F>(
@@ -1787,17 +1872,26 @@ where
     let connect = factory.connect();
     tokio::pin!(connect);
     loop {
-        tokio::select! {
-            result = &mut connect => {
-                return Ok(match result {
-                    Ok(transport) => ConnectAttempt::Connected(transport),
-                    Err(_) => ConnectAttempt::Failed,
-                });
+        let owes = walk_owes(context.walk);
+        let wake = {
+            let events = &mut *context.events;
+            tokio::select! {
+                result = &mut connect => {
+                    return Ok(match result {
+                        Ok(transport) => ConnectAttempt::Connected(transport),
+                        Err(_) => ConnectAttempt::Failed,
+                    });
+                }
+                event = events.recv() => IdleWake::Event(event),
+                () = core::future::ready(()), if owes => IdleWake::Walk,
             }
-            event = context.events.recv() => match event {
-                Some(event) => handle_recovery_event(context, event).await?,
-                None => return Ok(ConnectAttempt::Closed),
-            },
+        };
+        match wake {
+            IdleWake::Event(Some(event)) => handle_recovery_event(context, event).await?,
+            IdleWake::Event(None) => return Ok(ConnectAttempt::Closed),
+            IdleWake::Walk => {
+                walk_recovery_turn(context).await;
+            }
         }
     }
 }
@@ -1811,13 +1905,14 @@ where
     U: Transport + MaybeSend + 'static,
     U::Error: core::fmt::Display,
 {
+    let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
-    let state = &*context.state;
+    let state = &mut *context.state;
     let events = &mut *context.events;
     let deferred = &mut *context.deferred;
     let recovery = async {
         worker.attach(transport).await?;
-        restore_recovery_subscriptions(worker, state, upstream).await
+        restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
     loop {
@@ -1830,7 +1925,7 @@ where
             }
             event = events.recv() => match event {
                 Some(event) => {
-                    if let Some(local) = schedule_recovery_event(deferred, event) {
+                    if let Some(local) = attach_during_recovery(state, deferred, event) {
                         return RecoveryAttempt::Interrupted(local);
                     }
                 }
@@ -1840,22 +1935,53 @@ where
     }
 }
 
-async fn restore_recovery_subscriptions<U>(
-    worker: &mut ConnettoConnection<U>,
+/// Registers a tab where it arrives, because that writes hub state and touches neither the
+/// connection the attach owns nor the replica.
+///
+/// The tab's own announce gives up after fifteen seconds, so holding it for the length of
+/// a reconnect fails a healthy tab. Everything else follows chapter 18's attach column.
+fn attach_during_recovery(
+    state: &mut HubState,
+    deferred: &mut VecDeque<HubEvent>,
+    event: HubEvent,
+) -> Option<HubEvent> {
+    if deferred.is_empty()
+        && let HubEvent::Attached(id, out) = event
+    {
+        attach_tab(state, id, out);
+        return None;
+    }
+    schedule_recovery_event(deferred, event, recovery_interrupts_attach)
+}
+
+/// Every subscription the replay puts back, taken before the attach starts so the attach
+/// borrows no hub state and a tab can be registered while it runs.
+fn recovery_subscriptions(
     state: &HubState,
     upstream: &[(String, SubscriptionSpec)],
+) -> Vec<(String, SubscriptionSpec)> {
+    upstream
+        .iter()
+        .map(|(sub_id, spec)| (sub_id.clone(), spec.clone()))
+        .chain(
+            state
+                .agg_routes
+                .iter()
+                .map(|(upstream_id, route)| (upstream_id.clone(), route.spec.clone())),
+        )
+        .collect()
+}
+
+async fn restore_recovery_subscriptions<U>(
+    worker: &mut ConnettoConnection<U>,
+    subscriptions: &[(String, SubscriptionSpec)],
 ) -> Result<(), ClientError>
 where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    for (sub_id, spec) in upstream {
+    for (sub_id, spec) in subscriptions {
         worker.subscribe_spec(sub_id, spec.clone()).await?;
-    }
-    for (upstream_id, route) in &state.agg_routes {
-        worker
-            .subscribe_spec(upstream_id, route.spec.clone())
-            .await?;
     }
     Ok(())
 }
@@ -1868,7 +1994,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    let Some(local) = schedule_recovery_event(context.deferred, event) else {
+    let Some(local) = schedule_recovery_event(context.deferred, event, recovery_serves_idle) else {
         return Ok(());
     };
     handle_hub_event(
@@ -1881,8 +2007,18 @@ where
     )
     .await
 }
-fn schedule_recovery_event(deferred: &mut VecDeque<HubEvent>, event: HubEvent) -> Option<HubEvent> {
-    if deferred.is_empty() && recovery_local(&event) {
+
+/// Queues `event` unless it is served where it arrives, which chapter 18's table decides
+/// per situation through `served`.
+///
+/// One order rule covers every served cell: anything older already queued keeps its place,
+/// so a kill can never overtake a frame of the tab it kills.
+fn schedule_recovery_event(
+    deferred: &mut VecDeque<HubEvent>,
+    event: HubEvent,
+    served: fn(&HubEvent) -> bool,
+) -> Option<HubEvent> {
+    if deferred.is_empty() && served(&event) {
         Some(event)
     } else {
         deferred.push_back(event);
@@ -1890,7 +2026,29 @@ fn schedule_recovery_event(deferred: &mut VecDeque<HubEvent>, event: HubEvent) -
     }
 }
 
-fn recovery_local(event: &HubEvent) -> bool {
+/// What the recovery loop serves while the connection sits idle, in the retry sleep and
+/// during the connect.
+///
+/// Everything but a frame, which needs the server.
+fn recovery_serves_idle(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Attached(_, _)
+            | HubEvent::Gone(_)
+            | HubEvent::Kill(_)
+            | HubEvent::Unsynced(_)
+            | HubEvent::Export(_, _)
+            | HubEvent::Import(_, _)
+            | HubEvent::ForgetRetired(_, _)
+    )
+}
+
+/// What interrupts an attach or a subscription replay rather than waiting for it.
+///
+/// The four requests answered from the replica, because a caller waits on each. A
+/// departure and a kill unsubscribe through the connection the attach owns and nothing
+/// waits on them, so they keep their place in the queue instead.
+fn recovery_interrupts_attach(event: &HubEvent) -> bool {
     matches!(
         event,
         HubEvent::Unsynced(_)
@@ -3434,7 +3592,10 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HubEvent, TabApplyError, apply_local_changeset, schedule_recovery_event};
+    use super::{
+        HubEvent, TabApplyError, apply_local_changeset, recovery_interrupts_attach,
+        recovery_serves_idle, schedule_recovery_event,
+    };
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
     use diesel_sqlite_session::SqliteSessionExt;
@@ -3450,7 +3611,14 @@ mod tests {
         deferred.push_back(HubEvent::Kill(7));
         let (reply, _answer) = futures_channel::oneshot::channel();
 
-        assert!(schedule_recovery_event(&mut deferred, HubEvent::Unsynced(reply)).is_none());
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_serves_idle
+            )
+            .is_none()
+        );
         assert!(matches!(deferred.pop_front(), Some(HubEvent::Kill(7))));
         assert!(matches!(deferred.pop_front(), Some(HubEvent::Unsynced(_))));
     }
@@ -3461,7 +3629,11 @@ mod tests {
         let (reply, _answer) = futures_channel::oneshot::channel();
 
         assert!(matches!(
-            schedule_recovery_event(&mut deferred, HubEvent::Unsynced(reply)),
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_serves_idle
+            ),
             Some(HubEvent::Unsynced(_))
         ));
         assert!(deferred.is_empty());
@@ -3475,10 +3647,106 @@ mod tests {
         let (reply, _answer) = futures_channel::oneshot::channel();
 
         assert!(matches!(
-            schedule_recovery_event(&mut deferred, HubEvent::ForgetRetired(Vec::new(), reply)),
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::ForgetRetired(Vec::new(), reply),
+                recovery_serves_idle,
+            ),
             Some(HubEvent::ForgetRetired(_, _))
         ));
         assert!(deferred.is_empty());
+    }
+
+    /// Chapter 18's idle column: everything but a frame is served where it arrives while
+    /// the connection sits idle, because a frame is the only request that needs the server.
+    #[wasm_bindgen_test]
+    fn only_a_frame_waits_for_the_upstream_while_the_connection_is_idle() {
+        use connetto_core::messages::{ControlMessage, Ping};
+        use connetto_core::traits::IncomingFrame;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let mut deferred = std::collections::VecDeque::new();
+        let (out, _out_rx) = unbounded_channel();
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut deferred,
+                    HubEvent::Attached(1, out),
+                    recovery_serves_idle
+                ),
+                Some(HubEvent::Attached(_, _))
+            ),
+            "a tab attaching only writes hub state, and its announce has its own deadline"
+        );
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::Gone(1), recovery_serves_idle),
+            Some(HubEvent::Gone(1))
+        ));
+        assert!(matches!(
+            schedule_recovery_event(&mut deferred, HubEvent::Kill(1), recovery_serves_idle),
+            Some(HubEvent::Kill(1))
+        ));
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Frame(
+                    1,
+                    IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 })),
+                ),
+                recovery_serves_idle,
+            )
+            .is_none(),
+            "a frame needs the server, so it waits"
+        );
+        assert_eq!(deferred.len(), 1, "and only the frame is queued");
+    }
+
+    /// Chapter 18's attach column: a departure or a kill unsubscribes through the
+    /// connection the attach owns, so it keeps its place instead of interrupting.
+    #[wasm_bindgen_test]
+    fn a_departure_does_not_interrupt_an_attach() {
+        let mut deferred = std::collections::VecDeque::new();
+        assert!(
+            schedule_recovery_event(&mut deferred, HubEvent::Gone(1), recovery_interrupts_attach)
+                .is_none()
+        );
+        let (reply, _answer) = futures_channel::oneshot::channel();
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Unsynced(reply),
+                recovery_interrupts_attach,
+            )
+            .is_none(),
+            "and the request behind it keeps the arrival order"
+        );
+        assert_eq!(deferred.len(), 2);
+    }
+
+    /// Chapter 18's job table: the walk owes a turn through the retry sleep and the
+    /// connect, where the connection is idle.
+    #[wasm_bindgen_test]
+    fn the_walk_owes_a_turn_while_the_connection_is_idle() {
+        use connetto_file_core::FileId;
+
+        let settled = super::WalkState::default();
+        assert!(
+            !super::walk_owes(&settled),
+            "a settled walk asks for no turn"
+        );
+        let mut owing = super::WalkState::default();
+        owing.unverified.push_back(FileId::from_bytes([1; 32]));
+        assert!(super::walk_owes(&owing), "a queued file owes a turn");
+        let mut swept = super::WalkState {
+            unswept: true,
+            ..super::WalkState::default()
+        };
+        assert!(super::walk_owes(&swept), "an owed sweep owes a turn");
+        swept.sweep_waiting = true;
+        assert!(
+            !super::walk_owes(&swept),
+            "and a sweep waiting for the retry timer does not"
+        );
     }
 
     /// A database holding `drafts` with one row, in memory.
