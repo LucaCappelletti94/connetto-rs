@@ -322,12 +322,19 @@ where
         };
         // A restore can land between slices, so the decision rests on a fresh read rather
         // than on what an earlier slice saw.
-        if encrypted.read_chunk(&chunks[missing].hash).await.is_ok() {
-            return Ok(ScanStep::More(ChunkScan {
-                file: Some(file_id),
-                chunks: fingerprint,
-                ..ChunkScan::default()
-            }));
+        match encrypted.read_chunk(&chunks[missing].hash).await {
+            Ok(_) => {
+                return Ok(ScanStep::More(ChunkScan {
+                    file: Some(file_id),
+                    chunks: fingerprint,
+                    ..ChunkScan::default()
+                }));
+            }
+            Err(EncryptStoreError::Inner(err)) if self.store.read_failure_is_ambiguous(&err) => {
+                // An unavailable store is not an absence, so the entry keeps its bytes.
+                return Ok(ScanStep::Intact);
+            }
+            Err(_) => {}
         }
         retire(connection.conn(), file_id)?;
         Ok(ScanStep::Retired)
@@ -834,6 +841,105 @@ mod tests {
             matches!(step, super::ScanStep::Retired),
             "a cursor from the old chunk list must not skip the new one, got {step:?}"
         );
+    }
+
+    /// An unavailable store is not an absence, so the confirmation read keeps the entry
+    /// rather than retiring it.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn an_ambiguous_confirmation_read_keeps_the_entry() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("ambiguous"),
+            None,
+        )
+        .expect("the replica opens offline");
+
+        let unavailable = super::ContentArchive::new(Unavailable(store.clone()), [1; 32]);
+        unavailable
+            .install(&mut connection)
+            .expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let manifest = process_file(&vec![6u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        encrypted
+            .delete_chunk(&manifest.chunks()[0].hash)
+            .await
+            .expect("drop the only chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+
+        let step = unavailable
+            .scan_unsent_file(
+                &mut connection,
+                manifest.file_id(),
+                super::ChunkScan::default(),
+                8,
+            )
+            .await
+            .expect("the scan runs");
+        assert!(
+            matches!(step, super::ScanStep::Intact),
+            "an unavailable store must keep the entry, got {step:?}"
+        );
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read the outbox"),
+            vec![manifest.file_id()],
+            "and the file stays queued"
+        );
+    }
+
+    /// A store whose read failures all mean it may be unavailable.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[derive(Clone)]
+    struct Unavailable(crate::store::FsStore);
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    impl connetto_file_core::ChunkStore for Unavailable {
+        type Error = crate::store::FsStoreError;
+
+        fn read_failure_is_ambiguous(&self, _error: &Self::Error) -> bool {
+            true
+        }
+
+        async fn write_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            connetto_file_core::ChunkStore::write_chunk(&self.0, hash, bytes).await
+        }
+
+        async fn read_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<Vec<u8>, Self::Error> {
+            connetto_file_core::ChunkStore::read_chunk(&self.0, hash).await
+        }
+
+        async fn has_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<bool, Self::Error> {
+            connetto_file_core::ChunkStore::has_chunk(&self.0, hash).await
+        }
+
+        async fn delete_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<(), Self::Error> {
+            connetto_file_core::ChunkStore::delete_chunk(&self.0, hash).await
+        }
     }
 
     /// A restore landing between slices keeps the entry, because an import can put back

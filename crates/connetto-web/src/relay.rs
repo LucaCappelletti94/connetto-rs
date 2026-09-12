@@ -912,6 +912,8 @@ struct WalkState {
     scan: ChunkScan,
     /// Whether the orphan sweep owes a turn, set at the start and by every import.
     unswept: bool,
+    /// Whether a failed sweep is waiting for the content retry timer.
+    sweep_waiting: bool,
 }
 
 /// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
@@ -962,7 +964,8 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        let unverified = !self.walk.unverified.is_empty() || self.walk.unswept;
+        let unverified =
+            !self.walk.unverified.is_empty() || (self.walk.unswept && !self.walk.sweep_waiting);
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -1090,6 +1093,7 @@ where
         S: Sleeper,
     {
         self.retry.delay = None;
+        self.walk.sweep_waiting = false;
         if self.content.is_none() {
             return Ok(true);
         }
@@ -1187,9 +1191,15 @@ where
         };
         let Some(&file_id) = self.walk.unverified.front() else {
             // The files are settled, so the bytes none of them name can go.
-            self.reclaim_orphans().await;
-            self.walk.unswept = false;
-            self.wake_content()?;
+            if self.reclaim_orphans().await {
+                self.walk.unswept = false;
+                self.wake_content()?;
+            } else {
+                // A store that failed once is given the upload retry's own backoff rather
+                // than the next cycle, which would be a hot loop over the whole namespace.
+                self.walk.sweep_waiting = true;
+                self.retry.schedule(true, false);
+            }
             return Ok(true);
         };
         let step = content
@@ -1218,18 +1228,24 @@ where
         Ok(true)
     }
 
-    /// Reclaim chunks an interrupted import or stage left behind.
+    /// Reclaim chunks an interrupted import or stage left behind, reporting whether the
+    /// sweep completed.
     ///
-    /// One attempt per schedule, because a sweep asks the store for everything it holds.
-    /// A failed attempt is left to the next import, which is what puts chunks at risk.
-    async fn reclaim_orphans(&mut self) {
+    /// One attempt per turn, because a sweep asks the store for everything it holds.
+    async fn reclaim_orphans(&mut self) -> bool {
         let Some(content) = self.content.as_ref() else {
-            return;
+            return true;
         };
         match content.reclaim_orphans(&mut self.worker).await {
-            Ok(0) => {}
-            Ok(reclaimed) => tracing::info!(reclaimed, "reclaimed orphaned content chunks"),
-            Err(err) => tracing::warn!(error = %err, "reclaiming orphaned chunks failed"),
+            Ok(0) => true,
+            Ok(reclaimed) => {
+                tracing::info!(reclaimed, "reclaimed orphaned content chunks");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "reclaiming orphaned chunks failed");
+                false
+            }
         }
     }
 
@@ -1418,6 +1434,7 @@ where
             // can leave its own behind when it fails part way.
             walk.scan = ChunkScan::default();
             walk.unswept = true;
+            walk.sweep_waiting = false;
         }
         HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
