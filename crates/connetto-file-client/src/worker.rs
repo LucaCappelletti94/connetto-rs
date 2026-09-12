@@ -229,6 +229,44 @@ where
         Ok(total)
     }
 
+    /// Deletes chunks no manifest references, answering how many went.
+    ///
+    /// An import or a stage lands chunks before the transaction that records their
+    /// manifest, so a failure in between leaves bytes nothing will ever name. The sweep
+    /// asks the replica what is referenced rather than what was released, which is what
+    /// lets it see those.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the referenced set cannot be read, and
+    /// [`ContentError::Store`] when the store cannot be listed or a delete fails.
+    pub async fn reclaim_orphans<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<usize, ContentError>
+    where
+        B: connetto_file_core::ChunkInventory,
+    {
+        let referenced = db::referenced_hashes(connection.conn())?;
+        let held = self
+            .store
+            .stored_hashes()
+            .await
+            .map_err(|error| ContentError::Store(error.to_string()))?;
+        let mut reclaimed = 0;
+        for hash in held {
+            if referenced.contains(&hash) {
+                continue;
+            }
+            self.store
+                .delete_chunk(&hash)
+                .await
+                .map_err(|error| ContentError::Store(error.to_string()))?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
     /// Checks up to `budget` of one outbox entry's chunks, resuming from `scan`.
     ///
     /// A caller drives this with a small budget so a file naming many chunks cannot hold
@@ -666,6 +704,59 @@ mod tests {
             Some(file(2))
         );
         assert_eq!(next_after(&[], Some(file(1))), None);
+    }
+
+    /// Chunks an interrupted import left behind are reclaimed, and the ones a manifest
+    /// names are kept.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn an_interrupted_import_leaves_no_chunks_behind() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("sweep"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let kept = process_file(&vec![8u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the recorded file chunks");
+        // The import that wrote these bytes failed before its manifest could commit.
+        let abandoned = process_file(&vec![9u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the abandoned file chunks");
+        db::put_manifest(connection.conn(), &kept).expect("record the manifest");
+
+        assert_eq!(
+            archive
+                .reclaim_orphans(&mut connection)
+                .await
+                .expect("the sweep runs"),
+            abandoned.chunks().len(),
+            "every chunk no manifest names is reclaimed"
+        );
+        assert!(
+            encrypted.read_chunk(&kept.chunks()[0].hash).await.is_ok(),
+            "a referenced chunk survives the sweep"
+        );
+        assert!(
+            encrypted
+                .read_chunk(&abandoned.chunks()[0].hash)
+                .await
+                .is_err(),
+            "and the abandoned bytes are gone"
+        );
     }
 
     /// A manifest replaced under the same identity is scanned from the start, even when the

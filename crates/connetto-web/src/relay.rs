@@ -904,6 +904,8 @@ struct HubRuntime<U: Transport> {
     unverified: VecDeque<connetto_file_client::FileId>,
     /// Position of the scan over the head file's chunks.
     scan: ChunkScan,
+    /// Whether the orphan sweep still owes this run a turn.
+    unswept: bool,
 }
 
 /// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
@@ -954,7 +956,7 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        let unverified = !self.unverified.is_empty();
+        let unverified = !self.unverified.is_empty() || self.unswept;
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -1119,6 +1121,7 @@ where
             retry,
             unverified: _,
             scan: _,
+            unswept: _,
         } = self;
         let Some(content) = content.as_ref() else {
             return Ok(ContentWalk::Complete {
@@ -1172,11 +1175,16 @@ where
     /// a long outbox, or one file naming many chunks, would otherwise hold a tab's
     /// attachment past the tab's own deadline.
     async fn verify_turn(&mut self) -> Result<bool, RelayError> {
-        let Some(&file_id) = self.unverified.front() else {
-            return Ok(true);
-        };
         let Some(content) = self.content.as_ref() else {
             self.unverified.clear();
+            self.unswept = false;
+            return Ok(true);
+        };
+        let Some(&file_id) = self.unverified.front() else {
+            // The files are settled, so the bytes none of them name can go.
+            self.reclaim_orphans().await;
+            self.unswept = false;
+            self.wake_content()?;
             return Ok(true);
         };
         let step = content
@@ -1197,10 +1205,21 @@ where
         }
         self.unverified.pop_front();
         self.scan = ChunkScan::default();
-        if self.unverified.is_empty() {
-            self.wake_content()?;
-        }
         Ok(true)
+    }
+
+    /// Reclaim chunks an interrupted import or stage left behind.
+    ///
+    /// Once per run, because a sweep asks the store for everything it holds.
+    async fn reclaim_orphans(&mut self) {
+        let Some(content) = self.content.as_ref() else {
+            return;
+        };
+        match content.reclaim_orphans(&mut self.worker).await {
+            Ok(0) => {}
+            Ok(reclaimed) => tracing::info!(reclaimed, "reclaimed orphaned content chunks"),
+            Err(err) => tracing::warn!(error = %err, "reclaiming orphaned chunks failed"),
+        }
     }
 
     /// Run the content driver now when anything is queued.
@@ -1242,6 +1261,7 @@ where
         retry: ContentRetry::default(),
         unverified: VecDeque::new(),
         scan: ChunkScan::default(),
+        unswept: true,
     }
     .run(reconnect, content_sleeper)
     .await
@@ -3744,6 +3764,7 @@ mod tests {
             retry: super::ContentRetry::default(),
             unverified: VecDeque::from([FileId::from_bytes([7; 32]), FileId::from_bytes([9; 32])]),
             scan: super::ChunkScan::default(),
+            unswept: false,
         };
 
         assert!(
