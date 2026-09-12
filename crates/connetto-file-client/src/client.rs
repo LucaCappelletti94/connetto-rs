@@ -200,7 +200,7 @@ where
             .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
             .await?;
-        // Best-effort: the import is committed; the outbox driver retries replay later.
+        // The import is committed, so a failed replay is left to the outbox driver.
         let _ = self.client.replay_pending().await;
         Ok(outcome)
     }

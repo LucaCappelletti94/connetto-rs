@@ -110,8 +110,8 @@ pub enum HandshakeReply {
     Refuse(FatalErrorReason),
 }
 
-/// The typed error the transport trait requires. This fake never fails, so it
-/// stands only for "the peer is gone".
+/// The typed error the transport trait requires, standing for a peer that has gone
+/// or a connection reset under a send.
 #[derive(Debug, thiserror::Error)]
 #[error("fake transport closed")]
 pub struct FakeClosed;
@@ -140,6 +140,8 @@ pub struct FakeTransport {
     /// the frames a connected session would receive (a snapshot, a live patch,
     /// an aggregate push) before the stream drains and the peer looks gone.
     post_handshake: VecDeque<IncomingFrame>,
+    /// Fail every bulk send, as a connection reset under an upload does.
+    bulk_fails: bool,
 }
 
 impl FakeTransport {
@@ -192,6 +194,16 @@ impl FakeTransport {
         }
     }
 
+    /// A transport whose handshake succeeds, which then stays open without saying
+    /// anything, and which fails every bulk send, as a reset under an upload does.
+    #[must_use]
+    pub fn accepting_but_failing_bulk() -> Self {
+        Self {
+            bulk_fails: true,
+            ..Self::accepting_but_silent()
+        }
+    }
+
     /// A transport answering with `reply`, whose peer looks gone once its inbox
     /// drains.
     #[must_use]
@@ -202,6 +214,7 @@ impl FakeTransport {
             silent: false,
             closing: None,
             post_handshake: VecDeque::new(),
+            bulk_fails: false,
         }
     }
 
@@ -252,6 +265,9 @@ impl Transport for FakeTransport {
         reason = "the trait method is async and this body finishes without awaiting"
     )]
     async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
+        if self.bulk_fails {
+            return Err(FakeClosed);
+        }
         Ok(())
     }
 

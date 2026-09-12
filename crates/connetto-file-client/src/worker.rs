@@ -408,7 +408,7 @@ where
         let collisions = plan.replica_plan().collisions().len();
         write_import_chunks(&self.store, &self.root_key, &plan).await?;
         let outcome = apply_content_import(connection, &plan, &ImportChoices::keeping_the_file())?;
-        // Best-effort: the import is committed; the outbox driver retries replay later.
+        // The import is committed, so a failed replay is left to the outbox driver.
         let _ = connection.replay_pending().await;
         Ok((outcome, collisions))
     }

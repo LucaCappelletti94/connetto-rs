@@ -1387,7 +1387,8 @@ where
         let plan = worker.import_local_data(bytes)?;
         let collisions = plan.collisions().len();
         let outcome = worker.apply_import(&plan, &ImportChoices::keeping_the_file())?;
-        worker.replay_pending().await?;
+        // The import is committed, so a failed replay is left to the outbox driver.
+        let _ = worker.replay_pending().await;
         Ok((outcome, collisions))
     }
 }
@@ -3590,5 +3591,50 @@ mod tests {
             }
             _ => panic!("expected a synthesized aggregate frame toward the tab"),
         }
+    }
+
+    /// A committed import stays a success when the post-commit replay fails, because the
+    /// rows are durable and the outbox driver retries the upload.
+    #[wasm_bindgen_test]
+    async fn a_committed_import_survives_a_failing_replay() {
+        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Grant, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let config = ClientConfig::new("worker").with_login(Some(Grant::new("user:token")));
+        let mut source =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("source opens offline");
+        source
+            .conn()
+            .batch_execute("INSERT INTO drafts VALUES (1, 'restored')")
+            .expect("the source writes one row");
+        source
+            .push()
+            .await
+            .expect("the write queues while the source is offline");
+        let archive = source
+            .export_local_data(ExportScope::Everything)
+            .expect("the source exports");
+
+        let mut target =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("target opens offline");
+        target
+            .attach(FakeTransport::accepting_but_failing_bulk())
+            .await
+            .expect("the target attaches");
+
+        let (outcome, _collisions) = super::import_archive(&mut target, None, &archive)
+            .await
+            .expect("a committed import must survive a failing replay");
+        assert!(
+            outcome.writes_restored > 0,
+            "the restored writes must be reported, got {outcome:?}"
+        );
+        assert_eq!(
+            body(target.conn()).as_deref(),
+            Some("restored"),
+            "the rows are committed before the replay is attempted"
+        );
     }
 }
