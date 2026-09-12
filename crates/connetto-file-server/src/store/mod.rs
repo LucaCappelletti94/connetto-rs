@@ -78,6 +78,12 @@ pub enum AnyStore {
 
 impl AnyStore {
     /// Stores `data` at `hash`.  Overwrites silently when already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` when the `Fs` backend cannot write or rename the chunk file.
+    /// Returns `StoreError::Object` when the `Object` backend reports an object store error.
+    /// Propagates whatever `StoreError` the `Custom` backend returns.
     pub async fn write(&self, hash: &ChunkHash, data: Bytes) -> Result<(), StoreError> {
         match self {
             Self::Fs(s) => {
@@ -93,6 +99,12 @@ impl AnyStore {
     }
 
     /// Reads the bytes stored at `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` when the `Fs` backend cannot read the chunk file.
+    /// Returns `StoreError::Object` when the `Object` backend reports an object store error.
+    /// Propagates whatever `StoreError` the `Custom` backend returns.
     pub async fn read(&self, hash: &ChunkHash) -> Result<Bytes, StoreError> {
         let vec = match self {
             Self::Fs(s) => {
@@ -109,6 +121,12 @@ impl AnyStore {
     }
 
     /// Returns `true` when a chunk for `hash` is already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Object` when the `Object` backend reports an object store error.
+    /// Propagates whatever `StoreError` the `Custom` backend returns.
+    /// The `Fs` backend never returns an error from this method because `Path::exists` silently converts filesystem errors to `false`.
     pub async fn exists(&self, hash: &ChunkHash) -> Result<bool, StoreError> {
         match self {
             Self::Fs(s) => {
@@ -124,6 +142,12 @@ impl AnyStore {
     }
 
     /// Deletes the chunk at `hash`.  A missing chunk is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` when the `Fs` backend fails to remove the chunk file for a reason other than the file being absent.
+    /// Returns `StoreError::Object` when the `Object` backend reports an object store error.
+    /// Propagates whatever `StoreError` the `Custom` backend returns.
     pub async fn delete(&self, hash: &ChunkHash) -> Result<(), StoreError> {
         match self {
             Self::Fs(s) => {

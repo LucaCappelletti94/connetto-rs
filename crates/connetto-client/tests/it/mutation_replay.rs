@@ -41,7 +41,10 @@ struct SeedSnapshot;
 impl SnapshotSource for SeedSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -54,7 +57,10 @@ impl SnapshotSource for SeedSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,

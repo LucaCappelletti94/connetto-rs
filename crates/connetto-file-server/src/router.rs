@@ -68,6 +68,11 @@ pub type AppState<S> = Arc<Config<S>>;
 /// - `PUT /chunks/{hash}` — upload one chunk
 /// - `POST /files/{id}/commit` — finalize the upload
 /// - `GET /files/{id}` — range-aware download under a read ticket
+///
+/// # Errors
+///
+/// Returns `PreflightError::Pool` if a connection cannot be acquired from the admin or reader pool.
+/// Returns any other `PreflightError` variant if a required deployment artifact is absent or misconfigured.
 pub async fn serve<S: ConnettoFileSchema>(config: Config<S>) -> Result<Router, PreflightError> {
     let mut conn = config
         .pools

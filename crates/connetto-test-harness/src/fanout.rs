@@ -824,7 +824,10 @@ async fn run(conn: &mut AsyncPgConnection, sql: String) {
 
 /// A per-second rate. Every count here is far below the range `f64` holds
 /// exactly, so the cast loses nothing.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "every count here is far below the range f64 holds exactly"
+)]
 fn rate(count: u64, window: Duration) -> f64 {
     let seconds = window.as_secs_f64();
     if seconds > 0.0 {

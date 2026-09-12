@@ -1700,7 +1700,10 @@ fn qualify_create_table(statement: &str) -> Result<String, ClientError> {
 #[derive(diesel::QueryableByName)]
 struct Present {
     #[diesel(sql_type = diesel::sql_types::Integer)]
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "diesel reads the column through QueryableByName and no Rust code names the field"
+    )]
     present: i32,
 }
 

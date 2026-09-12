@@ -86,7 +86,10 @@ struct KeyedSnapshot;
 impl SnapshotSource for KeyedSnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -99,7 +102,10 @@ impl SnapshotSource for KeyedSnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
@@ -157,7 +163,10 @@ impl VisibilityPolicy for DenyAll {
 
     // The caller pre-fills every verdict with a denial, so granting nothing
     // withholds every row.
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_see<R>(
         &self,
         _row: &R,
@@ -170,7 +179,10 @@ impl VisibilityPolicy for DenyAll {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_write<R>(
         &self,
         _write: RowWrite<'_, R>,

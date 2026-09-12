@@ -134,6 +134,10 @@ impl<Id, Key> Principal<Id, Key> {
     /// a minted one. A second identity is refused and both are dropped: a run
     /// has one identity, and keeping whichever arrived first would make the
     /// order of checks decide the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AmbiguousIdentity` when a second `Subject::Identity` is offered because a run permits only one identity.
     pub fn accept(&mut self, subject: Subject<Id, Key>) -> Result<(), AmbiguousIdentity> {
         match subject {
             Subject::Capability(subject) => {

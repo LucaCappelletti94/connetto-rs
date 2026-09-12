@@ -160,7 +160,10 @@ impl VisibilityPolicy for RosterAuth {
         ready(Ok(()))
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_write<R>(
         &self,
         write: RowWrite<'_, R>,

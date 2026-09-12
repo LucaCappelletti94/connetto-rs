@@ -372,7 +372,10 @@ impl KeyringKeyStore {
 // R41 accepted: the trait awaits because the browser must, and the keychain
 // call blocks whoever polls it. Bounded, since key custody runs at open and at
 // logout rather than per change.
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait method is async and this body finishes without awaiting"
+)]
 impl ReplicaKeyStore for KeyringKeyStore {
     type Error = ClientError;
 
@@ -408,7 +411,10 @@ pub struct MemoryKeyStore {
     inner: Mutex<std::collections::HashMap<String, ReplicaKey>>,
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait method is async and this body finishes without awaiting"
+)]
 impl ReplicaKeyStore for MemoryKeyStore {
     type Error = ClientError;
 

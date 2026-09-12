@@ -251,6 +251,10 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the store or the provider refresh fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `refresh_locks` mutex is poisoned by a thread that panicked while holding it.
     pub async fn provider_access_token(
         &self,
         session_id: SessionId,

@@ -1365,7 +1365,10 @@ async fn intent_duplicate_hash_conflicting_lengths_refused() {
 /// grants every file) lets identity pass and the commit succeeds with 200,
 /// proving the test actually exercises the visibility gate and not a vacuous
 /// identity refusal.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 #[tokio::test]
 async fn commit_without_put_refused_same_as_chunk_never_stored() {
     use connetto_file_core::ChunkStore;
@@ -1690,7 +1693,10 @@ async fn commit_by_non_declarer_refused() {
 
 /// Proves the dedup scenario from Finding 1: commit X as [A, B], intent Y as [A, C],
 /// PUT only C (following the server's needed answer), commit Y succeeds.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 #[tokio::test]
 async fn dedup_commit_round_trip() {
     let pg = Pg::start().await;
@@ -1876,7 +1882,11 @@ async fn dedup_commit_round_trip() {
 
 /// Proves Finding 1's security invariant: a caller who cannot see file X is still
 /// told chunk A is needed and is refused at commit if the PUT is skipped.
-#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "the test walks its scenario in order and names its two uploads by their roles"
+)]
 #[tokio::test]
 async fn dedup_commit_rejected_for_invisible_file() {
     let pg = Pg::start().await;
@@ -2236,7 +2246,11 @@ async fn intent_refuses_too_many_chunks() {
 /// called as admin the function bypasses RLS and returns every file, so bob's
 /// commit would wrongly succeed.  With the reader-role implementation the RLS
 /// policy on `test_file_metadata` correctly hides alice's file from bob.
-#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "the test walks its scenario in order and names its two uploads by their roles"
+)]
 #[tokio::test]
 async fn dedup_commit_rejected_for_invisible_file_rls_only() {
     let pg = Pg::start_rls_only().await;
@@ -2405,7 +2419,10 @@ async fn dedup_commit_rejected_for_invisible_file_rls_only() {
 /// Malicious file Y = [B (length lied to 999), A] uses blake3 of the real
 /// bytes in reversed order as its identity so the identity check passes.
 /// The length check on stored B (real length != 999) must be the gate that refuses.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 #[tokio::test]
 async fn dedup_commit_with_lying_chunk_length_refused() {
     use connetto_file_core::ChunkStore;
@@ -2603,7 +2620,10 @@ async fn dedup_commit_with_lying_chunk_length_refused() {
 ///
 /// With the composite (`file_id`, `uploaded_by`) PK bob gets his own independent
 /// row, his PUTs mark his own chunk rows stored, and his commit succeeds (200).
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 #[tokio::test]
 async fn two_callers_identical_content_both_commit() {
     let pg = Pg::start().await;
@@ -2848,7 +2868,10 @@ async fn non_declarer_cannot_commit_after_composite_key_fix() {
 
 /// Proves Finding 1 property 3: GET with two committed manifests from different
 /// callers serves the right bytes to each and denies a caller without a manifest.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks its scenario in order and a split would hide the sequence"
+)]
 #[tokio::test]
 async fn get_file_scoped_to_committed_caller() {
     let pg = Pg::start().await;

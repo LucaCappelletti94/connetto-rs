@@ -228,7 +228,10 @@ impl FakeTransport {
 impl Transport for FakeTransport {
     type Error = FakeClosed;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeClosed> {
         if matches!(message, ControlMessage::Handshake(_)) {
             let frame = self.answer();
@@ -244,12 +247,14 @@ impl Transport for FakeTransport {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn send_bulk(&mut self, _message: BulkMessage) -> Result<(), FakeClosed> {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeClosed> {
         if let Some(frame) = self.inbox.pop_front() {
             return Ok(Some(frame));
@@ -260,7 +265,10 @@ impl Transport for FakeTransport {
         Ok(None)
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn close(&mut self) -> Result<(), FakeClosed> {
         Ok(())
     }

@@ -45,6 +45,10 @@ pub fn percent_encode(value: &str) -> String {
 /// assert_eq!(percent_decode("a%20b%26c"), "a b&c");
 /// assert_eq!(percent_decode("100% sure"), "100%ure");
 /// ```
+///
+/// # Panics
+///
+/// Does not panic in practice. The `u8::try_from` call is guarded by `char::to_digit(16)`, which constrains each nibble to 0..=15 so their product-sum is 0..=255 and always fits in `u8`.
 #[must_use]
 pub fn percent_decode(value: &str) -> String {
     let mut out = Vec::with_capacity(value.len());

@@ -233,7 +233,10 @@ fn membership_label(member_table: &str) -> String {
 /// not an abuse: the first sync of a new device and a resync the server itself
 /// demands are both the whole working set (R58 decision 6). The session paces
 /// the pages with the delivery credits it already has.
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "the futures are bound by MaybeSend, which is Send on native, so the auto trait warning does not apply"
+)]
 pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// Snapshot-source error.
     ///
@@ -1097,7 +1100,6 @@ where
     /// subscriptions need a connector; use
     /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
     /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         materializer: Materializer,
@@ -1135,7 +1137,10 @@ where
 {
     /// Build a manager with a re-execution connector and a default in-memory
     /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
+    )]
     #[must_use]
     pub fn with_connector(
         materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
@@ -1176,11 +1181,10 @@ where
     S: ContentTicketSigner,
 {
     /// Build a manager with an explicit re-execution connector and oplog.
-    // Every collaborator the manager owns arrives here explicitly. The other
-    // two constructors delegate to it with defaults, so this is the one place
-    // the full set is named, and grouping it into a config struct would only
-    // move the same arity behind another type.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
+    )]
     #[must_use]
     pub fn with_oplog(
         materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,

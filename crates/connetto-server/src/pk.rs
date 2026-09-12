@@ -87,6 +87,10 @@ pub(crate) fn row_from_wire<DB: DatabaseLike>(
 ///
 /// Serialization of `Value<Postgres>` into an in-memory buffer cannot fail, so
 /// this returns the bytes directly.
+///
+/// # Panics
+///
+/// Does not panic in practice. Serializing `Vec<Value<Postgres>>` into a `Vec<u8>` with `rmp_serde` has no I/O path and every `Value` variant maps cleanly to a `MessagePack` type.
 #[must_use]
 pub fn encode(values: &[Value<Postgres>]) -> Vec<u8> {
     rmp_serde::to_vec(values).expect("encoding Vec<Value<Postgres>> into a Vec cannot fail")

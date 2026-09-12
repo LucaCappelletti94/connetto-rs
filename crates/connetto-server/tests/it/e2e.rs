@@ -301,9 +301,10 @@ fn spawn_client(
     )
 }
 
-// A test spawn helper mirroring the client binary's env surface, so its
-// argument list tracks that surface rather than a smaller abstraction.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the argument list mirrors the client binary's environment surface"
+)]
 fn spawn_client_env(
     ws: &str,
     db_path: &Path,

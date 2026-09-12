@@ -186,7 +186,10 @@ pub(crate) fn statement_timeout_ms(budget: Duration) -> u32 {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoConnector;
 
-#[allow(clippy::manual_async_fn)]
+#[expect(
+    clippy::manual_async_fn,
+    reason = "the trait names the future type so the Send bound is stated on the signature"
+)]
 impl AsyncConnector for NoConnector {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;

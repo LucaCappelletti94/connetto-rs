@@ -92,6 +92,10 @@ impl TicketSigner {
     /// matching [`TicketVerifier`].  `base_url` is the file server's base address
     /// without a trailing slash; `ticket_ttl` is how long each minted ticket
     /// remains valid; `read_ceiling` is the byte cap on every read ticket.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TicketError::Ring` if key generation fails or if the ring library rejects the generated PKCS8 document.
     pub fn generate(
         base_url: String,
         ticket_ttl: Duration,
@@ -118,6 +122,10 @@ impl TicketSigner {
     ///
     /// `base_url`, `ticket_ttl`, and `read_ceiling` carry the same meaning as
     /// in [`Self::generate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `TicketError::Ring` if `der` is not a valid PKCS8 document for an Ed25519 key pair.
     pub fn from_pkcs8_der(
         der: &[u8],
         base_url: String,
@@ -140,6 +148,10 @@ impl TicketSigner {
     }
 
     /// Mints a signed token for `payload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TicketError::Postcard` if the payload cannot be serialized.
     pub fn mint(&self, payload: &TicketPayload) -> Result<String, TicketError> {
         let payload_bytes = postcard::to_allocvec(payload)?;
         let sig = self.key_pair.sign(&payload_bytes);
@@ -207,6 +219,14 @@ impl TicketVerifier {
 
     /// Verifies `token` and returns the payload if the signature is valid and
     /// the token is not expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TicketError::Malformed` if `token` does not contain a dot separator.
+    /// Returns `TicketError::Base64` if the payload or signature segment is not valid URL-safe base64.
+    /// Returns `TicketError::InvalidSignature` if the Ed25519 signature does not verify against the stored public key.
+    /// Returns `TicketError::Postcard` if the payload bytes cannot be deserialized.
+    /// Returns `TicketError::Expired` if the token's expiry timestamp is in the past.
     pub fn verify(&self, token: &str) -> Result<TicketPayload, TicketError> {
         let dot = token.rfind('.').ok_or(TicketError::Malformed)?;
         let payload_b64 = &token[..dot];
@@ -226,6 +246,11 @@ impl TicketVerifier {
 
     /// Verifies the token and additionally asserts it authorizes `expected_verb`.
     /// Returns the payload on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns all errors from [`Self::verify`].
+    /// Returns `TicketError::WrongVerb` if the token's verb does not match `expected_verb`.
     pub fn verify_verb(
         &self,
         token: &str,

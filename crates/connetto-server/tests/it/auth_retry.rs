@@ -7,8 +7,6 @@
 //! `source.ack` to be called and the cursor to advance past the unanswered
 //! event.
 
-#![allow(clippy::too_many_lines)]
-
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +38,10 @@ impl VisibilityPolicy for AlwaysErrSee {
     type Error = io::Error;
     type Backend = Postgres;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_see<R>(
         &self,
         _row: &R,
@@ -53,7 +54,10 @@ impl VisibilityPolicy for AlwaysErrSee {
         Err(io::Error::other("auth service unreachable"))
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn may_write<R>(
         &self,
         _write: RowWrite<'_, R>,
@@ -75,7 +79,10 @@ struct EmptySnapshot;
 impl SnapshotSource for EmptySnapshot {
     type Error = std::convert::Infallible;
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn estimate(
         &self,
         _select_sql: &str,
@@ -88,7 +95,10 @@ impl SnapshotSource for EmptySnapshot {
         })
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn snapshot_page(
         &self,
         _select_sql: &str,
