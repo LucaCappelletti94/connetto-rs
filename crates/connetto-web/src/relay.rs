@@ -904,7 +904,7 @@ struct HubRuntime<U: Transport> {
     unverified: VecDeque<connetto_file_client::FileId>,
     /// Position of the scan over the head file's chunks.
     scan: ChunkScan,
-    /// Whether the orphan sweep still owes this run a turn.
+    /// Whether the orphan sweep owes a turn, set at the start and by every import.
     unswept: bool,
 }
 
@@ -1009,8 +1009,10 @@ where
         let imported = matches!(&event, HubEvent::Import(_, _));
         self.serve(event).await?;
         if imported {
-            // An import can restore the very chunks a scan in progress has already missed.
+            // An import can restore the very chunks a scan in progress has already missed,
+            // and it can leave its own behind when it fails part way.
             self.scan = ChunkScan::default();
+            self.unswept = true;
             self.wake_content()?;
         }
         Ok(true)
@@ -1210,7 +1212,8 @@ where
 
     /// Reclaim chunks an interrupted import or stage left behind.
     ///
-    /// Once per run, because a sweep asks the store for everything it holds.
+    /// One attempt per schedule, because a sweep asks the store for everything it holds.
+    /// A failed attempt is left to the next import, which is what puts chunks at risk.
     async fn reclaim_orphans(&mut self) {
         let Some(content) = self.content.as_ref() else {
             return;
@@ -3733,6 +3736,59 @@ mod tests {
             body(target.conn()).as_deref(),
             Some("restored"),
             "the rows are committed before the replay is attempted"
+        );
+    }
+
+    /// An import schedules the orphan sweep again, because an import that fails part way
+    /// leaves chunks no manifest names.
+    #[wasm_bindgen_test]
+    async fn an_import_schedules_the_orphan_sweep() {
+        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use std::collections::VecDeque;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let config = ClientConfig::new("worker");
+        let mut source =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the source opens offline");
+        source
+            .conn()
+            .batch_execute("INSERT INTO drafts VALUES (1, 'swept')")
+            .expect("the source writes one row");
+        let archive = source
+            .export_local_data(ExportScope::Everything)
+            .expect("the source exports");
+
+        let worker =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the worker opens offline");
+        let (notices, _notice_rx) = unbounded_channel();
+        let (_events, event_rx) = unbounded_channel();
+        let mut runtime = super::HubRuntime {
+            worker,
+            state: super::HubState::default(),
+            notices,
+            content: None,
+            events: event_rx,
+            retry: super::ContentRetry::default(),
+            unverified: VecDeque::new(),
+            scan: super::ChunkScan::default(),
+            unswept: false,
+        };
+
+        let (reply, answer) = futures_channel::oneshot::channel();
+        runtime
+            .serve_local(Some(HubEvent::Import(archive, reply)))
+            .await
+            .expect("the import is served");
+        answer
+            .await
+            .expect("the caller is answered")
+            .expect("the import applies");
+        assert!(
+            runtime.unswept,
+            "an import must leave the orphan sweep owed a turn"
         );
     }
 
