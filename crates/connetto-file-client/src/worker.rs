@@ -31,6 +31,25 @@ pub enum ContentFlush {
     Interrupted,
 }
 
+/// Resumable position of an integrity scan over one file's chunks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkScan {
+    next: usize,
+    unreadable: usize,
+    ambiguous: bool,
+}
+
+/// What one budgeted integrity scan concluded.
+#[derive(Debug, Clone, Copy)]
+pub enum ScanStep {
+    /// Chunks remain, to be scanned from this position.
+    More(ChunkScan),
+    /// Every chunk read, so the entry stays queued.
+    Intact,
+    /// Bytes are conclusively gone, so the entry was retired.
+    Retired,
+}
+
 /// Resumable state for worker-owned outbox attempts.
 #[derive(Default)]
 pub struct ContentFlushState {
@@ -175,29 +194,72 @@ where
         db::outbox(connection.conn())
     }
 
-    /// Retires one outbox entry when its bytes are conclusively unreadable, reporting
-    /// whether it was retired.
+    /// Sums the distinct bytes the unsent files name, which is what an export of them carries.
     ///
-    /// A caller holding a long outbox verifies one file per turn so a waiting request is
-    /// served between files.
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox or a manifest cannot be read, and
+    /// [`ContentError::NoManifest`] when an outbox entry names no manifest.
+    pub fn unsent_content_bytes<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<u64, ContentError> {
+        let mut seen = HashSet::new();
+        let mut total = 0;
+        for manifest in outbox_manifests(connection)? {
+            for chunk in manifest.chunks() {
+                if seen.insert(chunk.hash) {
+                    total += chunk.len;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Checks up to `budget` of one outbox entry's chunks, resuming from `scan`.
+    ///
+    /// A caller drives this with a small budget so a file naming many chunks cannot hold
+    /// its turn: the decision waits until every chunk has been read, because an ambiguous
+    /// read anywhere keeps the entry.
     ///
     /// # Errors
     ///
     /// [`ContentError::Replica`] when reading the manifest fails, or when the dequeue write fails.
-    pub async fn verify_unsent_file<T: Transport>(
+    pub async fn scan_unsent_file<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
         file_id: FileId,
-    ) -> Result<bool, ContentError> {
-        let unreadable = match db::load_manifest(connection.conn(), file_id)? {
-            Some(manifest) => unreadable_chunk_count(&self.store, &self.root_key, &manifest).await,
-            None => Some(0),
+        scan: ChunkScan,
+        budget: usize,
+    ) -> Result<ScanStep, ContentError> {
+        let Some(manifest) = db::load_manifest(connection.conn(), file_id)? else {
+            retire(connection.conn(), file_id)?;
+            return Ok(ScanStep::Retired);
         };
-        if unreadable.is_none() {
-            return Ok(false);
+        let mut scan = scan;
+        let encrypted = EncryptingStore::new(self.store.clone(), &self.root_key);
+        let chunks = manifest.chunks();
+        let stop = scan.next.saturating_add(budget.max(1)).min(chunks.len());
+        while scan.next < stop {
+            match encrypted.read_chunk(&chunks[scan.next].hash).await {
+                Ok(_) => {}
+                Err(EncryptStoreError::Inner(err))
+                    if self.store.read_failure_is_ambiguous(&err) =>
+                {
+                    scan.ambiguous = true;
+                }
+                Err(_) => scan.unreadable += 1,
+            }
+            scan.next += 1;
+        }
+        if scan.next < chunks.len() {
+            return Ok(ScanStep::More(scan));
+        }
+        if scan.ambiguous || scan.unreadable == 0 {
+            return Ok(ScanStep::Intact);
         }
         retire(connection.conn(), file_id)?;
-        Ok(true)
+        Ok(ScanStep::Retired)
     }
 
     /// Retires outbox entries whose bytes are conclusively unreadable, keeping
@@ -212,8 +274,19 @@ where
     ) -> Result<Vec<FileId>, ContentError> {
         let mut lost = Vec::new();
         for file_id in self.unsent_files(connection)? {
-            if self.verify_unsent_file(connection, file_id).await? {
-                lost.push(file_id);
+            let mut scan = ChunkScan::default();
+            loop {
+                match self
+                    .scan_unsent_file(connection, file_id, scan, usize::MAX)
+                    .await?
+                {
+                    ScanStep::More(next) => scan = next,
+                    ScanStep::Retired => {
+                        lost.push(file_id);
+                        break;
+                    }
+                    ScanStep::Intact => break,
+                }
             }
         }
         Ok(lost)
@@ -539,5 +612,122 @@ mod tests {
             Some(file(2))
         );
         assert_eq!(next_after(&[], Some(file(1))), None);
+    }
+
+    /// An export of the unsent files carries their distinct chunk bytes, which is the
+    /// total the browser buffering guard compares against.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn the_unsent_total_counts_each_chunk_once() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("total"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+        assert_eq!(
+            archive
+                .unsent_content_bytes(&mut connection)
+                .expect("an empty outbox sums to nothing"),
+            0
+        );
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let bytes = vec![3u8; 1024];
+        let manifest = process_file(&bytes, MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+        // The same bytes chunk to the same hashes, so a second entry adds nothing.
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue it again");
+
+        assert_eq!(
+            archive
+                .unsent_content_bytes(&mut connection)
+                .expect("the outbox sums"),
+            u64::try_from(bytes.len()).expect("a small length"),
+            "each distinct chunk counts once"
+        );
+    }
+
+    /// A chunk lost in a later slice still retires the entry, so the accumulation a
+    /// budgeted scan carries across turns has to survive the resume.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_resumed_scan_retires_a_file_whose_last_chunk_is_gone() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("scan"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        // Fixed 16 MiB slabs, so the chunk count is exactly three rather than content defined.
+        let bytes = vec![7u8; 33 * 1024 * 1024];
+        let manifest = process_file(&bytes, MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        assert_eq!(
+            manifest.chunks().len(),
+            3,
+            "the test needs more chunks than one slice"
+        );
+        let last = manifest.chunks().last().expect("a chunk").hash;
+        encrypted
+            .delete_chunk(&last)
+            .await
+            .expect("drop the last chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+
+        let mut scan = super::ChunkScan::default();
+        let step = archive
+            .scan_unsent_file(&mut connection, manifest.file_id(), scan, 1)
+            .await
+            .expect("the first slice scans");
+        let super::ScanStep::More(next) = step else {
+            panic!("a multi-chunk file cannot conclude in one slice of one chunk");
+        };
+        scan = next;
+
+        loop {
+            match archive
+                .scan_unsent_file(&mut connection, manifest.file_id(), scan, 1)
+                .await
+                .expect("each slice scans")
+            {
+                super::ScanStep::More(next) => scan = next,
+                super::ScanStep::Retired => break,
+                super::ScanStep::Intact => panic!("the missing last chunk must retire the entry"),
+            }
+        }
+        assert!(
+            db::outbox(connection.conn())
+                .expect("read the outbox")
+                .is_empty(),
+            "a retired entry leaves the outbox"
+        );
     }
 }

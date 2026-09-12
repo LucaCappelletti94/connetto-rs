@@ -20,12 +20,6 @@ const IMPORT_REPLY_OK: &str = "import";
 const IMPORT_REPLY_FAILED: &str = "import-failed";
 const IMPORT_REQUEST_KIND: &str = "import?";
 
-/// Maximum bytes a file may contain to be accepted for import.
-///
-/// The whole archive is buffered in the worker to be read, so the ceiling is what a
-/// `wasm32` linear memory can hold beside the rows it decompresses.
-pub(crate) const MAX_IMPORT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 /// Poll step while waiting for a channel reply.
 const POLL_MS: i32 = 25;
 
@@ -789,7 +783,7 @@ pub async fn request_import(
         clippy::cast_precision_loss,
         reason = "2^31 is exactly representable as f64; no precision is lost"
     )]
-    if file.size() > MAX_IMPORT_FILE_BYTES as f64 {
+    if file.size() > super::MAX_ARCHIVE_BUFFER_BYTES as f64 {
         return Err(crate::relay::ImportRefused::Failed(
             "archive is above the 2 GiB a browser worker can buffer, import it from a native client"
                 .to_owned(),

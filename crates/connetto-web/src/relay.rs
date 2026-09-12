@@ -75,8 +75,8 @@ use connetto_core::messages::{
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use connetto_file_client::{
-    BrowserHttp, BrowserStore, ContentArchive, ContentError, ContentFlush, ContentFlushStart,
-    ContentFlushState, ContentUpload, FileId,
+    BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
+    ContentFlushStart, ContentFlushState, ContentUpload, FileId, ScanStep,
 };
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -138,6 +138,10 @@ enum ArchiveServiceError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Content(#[from] ContentError),
+    #[error(
+        "the {bytes} bytes of unsent content are above the {ceiling} a browser worker can buffer, export from a native client"
+    )]
+    Unbufferable { bytes: u64, ceiling: u64 },
 }
 
 /// The hub core has ended, so it can no longer answer.
@@ -896,9 +900,14 @@ struct HubRuntime<U: Transport> {
     content: Option<ContentArchive<BrowserStore>>,
     events: UnboundedReceiver<HubEvent>,
     retry: ContentRetry,
-    /// Outbox files still to be checked for readable bytes, one per turn.
+    /// Outbox files still to be checked for readable bytes.
     unverified: VecDeque<connetto_file_client::FileId>,
+    /// Position of the scan over the head file's chunks.
+    scan: ChunkScan,
 }
+
+/// Chunks read per integrity turn, small enough that a turn cannot hold the cycle.
+const VERIFY_CHUNK_BUDGET: usize = 8;
 
 /// Why one hub cycle woke.
 enum Wake {
@@ -908,6 +917,8 @@ enum Wake {
     Local(Option<HubEvent>),
     /// The worker connection produced an event.
     Upstream(Result<ClientEvent, ClientError>),
+    /// The content integrity walk has a file left to check.
+    Verify,
 }
 
 impl<U> HubRuntime<U>
@@ -943,9 +954,7 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
-        if !self.unverified.is_empty() {
-            return self.verify_turn().await;
-        }
+        let unverified = !self.unverified.is_empty();
         let delay = self.retry.delay;
         let content_wait = async {
             match (delay, sleeper) {
@@ -967,12 +976,16 @@ where
                 () = &mut content_wait => Wake::Content,
                 event = events.recv() => Wake::Local(event),
                 event = worker.pump_one(), if !retry.flush.is_waiting() => Wake::Upstream(event),
+                // Always ready, so the walk shares the cycle with every other source
+                // rather than holding it or being starved by it.
+                () = core::future::ready(()), if unverified => Wake::Verify,
             }
         };
         match wake {
             Wake::Content => self.drive_content(reconnect).await,
             Wake::Local(event) => self.serve_local(event).await,
             Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
+            Wake::Verify => self.verify_turn().await,
         }
     }
 
@@ -1103,6 +1116,7 @@ where
             events,
             retry,
             unverified: _,
+            scan: _,
         } = self;
         let Some(content) = content.as_ref() else {
             return Ok(ContentWalk::Complete {
@@ -1150,33 +1164,37 @@ where
         }
     }
 
-    /// Serve a waiting event, or check one outbox file when nothing is waiting.
+    /// Scan a bounded number of the head file's chunks.
     ///
-    /// The walk reads and decrypts every unsent chunk, so a long outbox would hold off a
-    /// tab's attachment for longer than the tab waits for it.
+    /// The scan reads and decrypts every chunk it names, so the cycle takes it in slices:
+    /// a long outbox, or one file naming many chunks, would otherwise hold a tab's
+    /// attachment past the tab's own deadline.
     async fn verify_turn(&mut self) -> Result<bool, RelayError> {
-        match self.events.try_recv() {
-            Ok(event) => {
-                self.serve(event).await?;
-                return Ok(true);
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(false),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        }
-        let Some(file_id) = self.unverified.pop_front() else {
+        let Some(&file_id) = self.unverified.front() else {
             return Ok(true);
         };
         let Some(content) = self.content.as_ref() else {
             self.unverified.clear();
             return Ok(true);
         };
-        match content.verify_unsent_file(&mut self.worker, file_id).await {
+        let step = content
+            .scan_unsent_file(&mut self.worker, file_id, self.scan, VERIFY_CHUNK_BUDGET)
+            .await;
+        match step {
+            Ok(ScanStep::More(scan)) => {
+                self.scan = scan;
+                return Ok(true);
+            }
             // The identity is durable in the replica until acknowledged, so a pending-work
             // query reports it rather than this line.
-            Ok(true) => tracing::warn!(%file_id, "content integrity pass retired unreadable file"),
-            Ok(false) => {}
+            Ok(ScanStep::Retired) => {
+                tracing::warn!(%file_id, "content integrity pass retired unreadable file");
+            }
+            Ok(ScanStep::Intact) => {}
             Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
+        self.unverified.pop_front();
+        self.scan = ChunkScan::default();
         if self.unverified.is_empty() {
             self.wake_content()?;
         }
@@ -1221,6 +1239,7 @@ where
         events,
         retry: ContentRetry::default(),
         unverified: VecDeque::new(),
+        scan: ChunkScan::default(),
     }
     .run(reconnect, content_sleeper)
     .await
@@ -1392,10 +1411,19 @@ where
     U::Error: core::fmt::Display,
 {
     match content {
-        Some(content) => content
-            .export_local_data(worker, scope)
-            .await
-            .map_err(Into::into),
+        Some(content) => {
+            let bytes = content.unsent_content_bytes(worker)?;
+            if bytes > crate::workers::MAX_ARCHIVE_BUFFER_BYTES {
+                return Err(ArchiveServiceError::Unbufferable {
+                    bytes,
+                    ceiling: crate::workers::MAX_ARCHIVE_BUFFER_BYTES,
+                });
+            }
+            content
+                .export_local_data(worker, scope)
+                .await
+                .map_err(Into::into)
+        }
         None => worker.export_local_data(scope).map_err(Into::into),
     }
 }
@@ -3669,48 +3697,52 @@ mod tests {
         );
     }
 
-    /// A tab attaching while the content integrity walk is outstanding is served on that
-    /// turn, so a long outbox cannot hold the attachment past the tab's own deadline.
+    /// The integrity walk checks one outbox file per turn, so the cycle it shares with
+    /// tab attachments and upstream frames is never held by a long outbox.
     #[wasm_bindgen_test]
-    async fn a_tab_attaches_during_the_content_integrity_walk() {
+    async fn the_content_integrity_walk_checks_one_file_per_turn() {
         use connetto_client::{ClientConfig, ConnettoConnection, Replica};
         use connetto_core::test_support::FakeTransport;
+        use connetto_file_client::{BrowserStore, ContentArchive};
         use connetto_file_core::FileId;
         use std::collections::VecDeque;
         use tokio::sync::mpsc::unbounded_channel;
 
         let config = ClientConfig::new("worker");
-        let worker =
+        let mut worker =
             ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
                 .expect("the worker opens offline");
+        let content = ContentArchive::new(BrowserStore::ephemeral(), [5; 32]);
+        content.install(&mut worker).expect("content tables");
         let (notices, _notice_rx) = unbounded_channel();
-        let (events, event_rx) = unbounded_channel();
-        let (out, _out_rx) = unbounded_channel();
+        let (_events, event_rx) = unbounded_channel();
         let mut runtime = super::HubRuntime {
             worker,
             state: super::HubState::default(),
             notices,
-            content: None,
+            content: Some(content),
             events: event_rx,
             retry: super::ContentRetry::default(),
-            unverified: VecDeque::from([FileId::from_bytes([7; 32])]),
+            unverified: VecDeque::from([FileId::from_bytes([7; 32]), FileId::from_bytes([9; 32])]),
+            scan: super::ChunkScan::default(),
         };
-        events
-            .send(super::HubEvent::Attached(1, out))
-            .expect("the attachment queues");
 
         assert!(
             runtime.verify_turn().await.expect("the turn serves"),
             "the hub keeps running"
         );
-        assert!(
-            runtime.state.tabs.contains_key(&1),
-            "the attaching tab must be registered on this turn"
-        );
         assert_eq!(
             runtime.unverified.len(),
             1,
-            "and the walk must still have its file to check"
+            "one turn checks exactly one file, leaving the cycle free for everything else"
+        );
+        assert!(
+            runtime.verify_turn().await.expect("the turn serves"),
+            "the hub keeps running"
+        );
+        assert!(
+            runtime.unverified.is_empty(),
+            "and the walk finishes file by file"
         );
     }
 }

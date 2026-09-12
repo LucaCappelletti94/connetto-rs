@@ -27,6 +27,11 @@ pub const DB_ALIVE_LOCK: &str = "connetto-db-alive";
 pub const EXPORT_CHANNEL: &str = "connetto-export";
 /// The channel a tab asks for a local-data import on.
 pub const IMPORT_CHANNEL: &str = "connetto-import";
+/// Maximum bytes an archive may carry to pass through a browser worker.
+///
+/// The whole archive is buffered in the worker to be read or written, so the ceiling is
+/// what a `wasm32` linear memory can hold beside the rows it compresses.
+pub const MAX_ARCHIVE_BUFFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 
 #[cfg(test)]

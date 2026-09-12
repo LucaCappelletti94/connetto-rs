@@ -25,7 +25,8 @@ pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, S
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use store::{FsStore, FsStoreError};
 pub use worker::{
-    ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState, ContentUpload, FlushCursor,
+    ChunkScan, ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState, ContentUpload,
+    FlushCursor, ScanStep,
 };
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
