@@ -446,6 +446,58 @@ async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
     worker.terminate();
 }
 
+/// A waiter that named nothing, in a context whose own boot is in flight, still refuses another
+/// boot announced beside it.
+#[wasm_bindgen_test]
+async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
+    let mine = super::boot::BootIdentity::mint();
+    crate::workers::intake::announce_current_boot(&mine);
+    let other = super::boot::BootIdentity::mint().to_string();
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{other}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!(
+                "failed:{other}:someone-elses-boot"
+            )));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 600.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "another boot's failure must not resolve a wait for this context's boot, got {error:?}"
+    );
+}
+
+/// A boot that failed before anyone started waiting still explains itself, because a reconnect
+/// can begin after both the announcement and the failure have been broadcast.
+#[wasm_bindgen_test]
+async fn a_failure_broadcast_before_the_wait_is_replayed_to_it() {
+    let identity = super::boot::BootIdentity::mint();
+    let announcer =
+        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{identity}:already-gone"
+        )));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 2_000.0)
+        .await
+        .expect_err("a wait that starts after the failure must still learn of it");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("already-gone")),
+        "expected the failure to be replayed, got {error:?}"
+    );
+    drop(announcer);
+}
+
 /// A boot stays obtainable while it is in flight, so a waiter that joined after the announcement
 /// gets it from the announcer rather than from another waiter.
 #[wasm_bindgen_test]
@@ -455,14 +507,11 @@ async fn an_announcer_answers_a_waiter_that_joined_late() {
     let announcer =
         crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
 
-    spawn_local({
-        let id_str = id_str.clone();
-        async move {
-            crate::workers::sleep(core::time::Duration::from_millis(300)).await;
-            if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
-                let _ = sender
-                    .post_message(&JsValue::from_str(&format!("failed:{id_str}:late-joiner")));
-            }
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(300)).await;
+        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+            let _ =
+                sender.post_message(&JsValue::from_str(&format!("failed:{id_str}:late-joiner")));
         }
     });
 

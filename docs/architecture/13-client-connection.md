@@ -53,11 +53,12 @@ And every waiter has a rule for whose failure it may act on, because acting on a
 | a reconnect attempt, handed none | the boot this context spawned last, while that boot is still in flight |
 | a waiter that named no identity | an identity heard as `booting:<identity>` while it waits |
 | a waiter that joined after the announcement | the identity the spawning context answers with when it asks |
+| a waiter that joined after the failure too | that same answer, followed by the failure it replays |
 | any waiter, for an untagged failure | none, it waits out the deadline |
 
 A waiter that named its own boot ignores an announcement, because two boots overlap whenever one worker replaces another and the announcement beside it belongs to the boot being replaced. A waiter that named none has nothing else to go on, and the origin hosts one worker topology, since the hello channel, the election lock and the alive lock are all origin-global names, so the announcement it hears is that topology's.
 
-A spawn announces its boot and keeps answering for it, because a broadcast is not replayed and a tab that joins later would otherwise have nothing to attribute a failure to. The announcer answers `ask` with `booting:<identity>` until the worker reports ready or the boot reports its failure, which is exactly the window a failure can still arrive in, and a context keeps one, replaced by its next spawn. That window is also what a reconnect consults, so a boot that has already resolved stops standing in for the next one, which a remembered identity with no lifetime would have done for as long as the page lived.
+A spawn announces its boot and keeps answering for it, because a broadcast is not replayed and a tab that joins later would otherwise have nothing to attribute a failure to. The announcer answers `ask` with `booting:<identity>` while the boot is pending, and with that announcement followed by `failed:<identity>:<detail>` once it has failed, since a reconnect can begin after the termination it reacts to and would otherwise find both messages gone. It falls silent when the worker reports ready or when a newer boot is announced, because the newer boot is what a waiter needs to hear about. A context keeps one announcer, replaced by its next spawn, and a reconnect handed no identity waits for the pending one, so a resolved boot never stands in for the next, which a remembered identity with no lifetime would have done for as long as the page lived.
 
 | Context | SQLite access | How queries travel |
 |---|---|---|

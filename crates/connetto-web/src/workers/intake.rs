@@ -102,16 +102,29 @@ fn current_boot_in_flight() -> Option<super::boot::BootIdentity> {
     })
 }
 
-/// Keeps a boot's identity obtainable while the boot is in flight.
+/// What an announced boot has come to, which is what a later `ask` is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootOutcome {
+    /// A failure for this boot can still arrive.
+    Pending,
+    /// The boot failed, and the reason is still worth telling a waiter that joins now.
+    Failed(String),
+    /// The worker is up, or a newer boot has been announced, so this one has nothing to say.
+    Spent,
+}
+
+/// Keeps a boot's identity and its outcome obtainable for as long as they explain anything.
 ///
-/// The announcement is posted once and a broadcast is not replayed, so a waiter that joins
-/// later would have nothing to attribute a failure to. This answers `ask` with the identity for
-/// as long as the boot has neither reported ready nor failed, which is the window a failure can
-/// still arrive in. Dropping it stops answering.
+/// Both the announcement and the failure are single broadcasts and a broadcast is not replayed,
+/// so a waiter that joins later would have nothing to attribute a failure to, and one that
+/// joins after the failure would have no failure either. This answers `ask` with the
+/// announcement while the boot is pending and with the announcement followed by the failure
+/// once it has failed, until a newer boot is announced or the worker reports ready. Dropping it
+/// stops answering.
 pub struct BootAnnouncer {
     channel: BroadcastChannel,
     identity: super::boot::BootIdentity,
-    in_flight: Rc<Cell<bool>>,
+    outcome: Rc<RefCell<BootOutcome>>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
 }
 
@@ -126,7 +139,7 @@ impl BootAnnouncer {
     /// reported ready or the boot reported its failure.
     #[must_use]
     pub fn in_flight(&self) -> bool {
-        self.in_flight.get()
+        *self.outcome.borrow() == BootOutcome::Pending
     }
 }
 
@@ -144,30 +157,45 @@ impl Drop for BootAnnouncer {
 #[must_use]
 pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<BootAnnouncer> {
     let channel = BroadcastChannel::new(super::HELLO_CHANNEL).ok()?;
-    let message = format!("booting:{identity}");
-    let in_flight = Rc::new(Cell::new(true));
+    let announcement = format!("booting:{identity}");
+    let outcome = Rc::new(RefCell::new(BootOutcome::Pending));
     let on_message = {
         let channel = channel.clone();
         let failure = format!("failed:{identity}:");
-        let answer = message.clone();
-        let in_flight = Rc::clone(&in_flight);
+        let announcement = announcement.clone();
+        let outcome = Rc::clone(&outcome);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(heard) = event.data().as_string() else {
                 return;
             };
-            if heard == "ready" || heard.starts_with(failure.as_str()) {
-                in_flight.set(false);
-            } else if heard == "ask" && in_flight.get() {
-                let _ = channel.post_message(&JsValue::from_str(&answer));
+            if heard == "ready" {
+                *outcome.borrow_mut() = BootOutcome::Spent;
+            } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
+                *outcome.borrow_mut() = BootOutcome::Failed(detail.to_owned());
+            } else if heard.starts_with("booting:") && heard != announcement {
+                // A newer boot is the one a waiter should hear about now.
+                *outcome.borrow_mut() = BootOutcome::Spent;
+            } else if heard == "ask" {
+                let reason = match &*outcome.borrow() {
+                    BootOutcome::Pending => None,
+                    BootOutcome::Failed(detail) => Some(format!("{failure}{detail}")),
+                    BootOutcome::Spent => return,
+                };
+                // The identity goes first, because a waiter acts on a failure only for an
+                // identity it knows.
+                let _ = channel.post_message(&JsValue::from_str(&announcement));
+                if let Some(reason) = reason {
+                    let _ = channel.post_message(&JsValue::from_str(&reason));
+                }
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let _ = channel.post_message(&JsValue::from_str(&message));
+    let _ = channel.post_message(&JsValue::from_str(&announcement));
     Some(BootAnnouncer {
         channel,
         identity: identity.clone(),
-        in_flight,
+        outcome,
         _on_message: on_message,
     })
 }
