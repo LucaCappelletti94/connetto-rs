@@ -79,17 +79,97 @@ async fn poll_hello_channel(
 }
 
 thread_local! {
-    /// The boot this context spawned most recently, which a reconnect attempt waits for.
-    static CURRENT_BOOT: RefCell<Option<super::boot::BootIdentity>> = const { RefCell::new(None) };
+    /// The boot this context spawned most recently, answering for it while it is in flight.
+    static CURRENT_BOOT: RefCell<Option<BootAnnouncer>> = const { RefCell::new(None) };
 }
 
-/// Records the boot this context has just spawned, replacing the one before it.
+/// Announces the boot this context has just spawned, replacing the announcement before it.
 ///
 /// A reconnect attempt is handed no identity, and the boot it waits for is by construction the
-/// newest one this context spawned, so remembering only that one keeps a replaced worker's
-/// failure unattributable.
-pub(super) fn record_current_boot(identity: &super::boot::BootIdentity) {
-    CURRENT_BOOT.with_borrow_mut(|current| *current = Some(identity.clone()));
+/// newest one this context spawned, so one slot is all a context needs.
+pub(super) fn announce_current_boot(identity: &super::boot::BootIdentity) {
+    let announcer = announce_boot(identity);
+    CURRENT_BOOT.with_borrow_mut(|current| *current = announcer);
+}
+
+/// The boot this context spawned, while a failure for it can still arrive.
+fn current_boot_in_flight() -> Option<super::boot::BootIdentity> {
+    CURRENT_BOOT.with_borrow(|current| {
+        current
+            .as_ref()
+            .filter(|announcer| announcer.in_flight())
+            .map(BootAnnouncer::identity)
+    })
+}
+
+/// Keeps a boot's identity obtainable while the boot is in flight.
+///
+/// The announcement is posted once and a broadcast is not replayed, so a waiter that joins
+/// later would have nothing to attribute a failure to. This answers `ask` with the identity for
+/// as long as the boot has neither reported ready nor failed, which is the window a failure can
+/// still arrive in. Dropping it stops answering.
+pub struct BootAnnouncer {
+    channel: BroadcastChannel,
+    identity: super::boot::BootIdentity,
+    in_flight: Rc<Cell<bool>>,
+    _on_message: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl BootAnnouncer {
+    /// The boot being announced.
+    #[must_use]
+    pub fn identity(&self) -> super::boot::BootIdentity {
+        self.identity.clone()
+    }
+
+    /// Whether a failure for this boot can still arrive, which it cannot once the worker
+    /// reported ready or the boot reported its failure.
+    #[must_use]
+    pub fn in_flight(&self) -> bool {
+        self.in_flight.get()
+    }
+}
+
+impl Drop for BootAnnouncer {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+/// Announces a boot and keeps answering for it, or `None` when the channel cannot be opened.
+///
+/// A caller that cannot announce still boots, because the announcement only makes a failure
+/// attributable to a context that did not spawn it.
+#[must_use]
+pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<BootAnnouncer> {
+    let channel = BroadcastChannel::new(super::HELLO_CHANNEL).ok()?;
+    let message = format!("booting:{identity}");
+    let in_flight = Rc::new(Cell::new(true));
+    let on_message = {
+        let channel = channel.clone();
+        let failure = format!("failed:{identity}:");
+        let answer = message.clone();
+        let in_flight = Rc::clone(&in_flight);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some(heard) = event.data().as_string() else {
+                return;
+            };
+            if heard == "ready" || heard.starts_with(failure.as_str()) {
+                in_flight.set(false);
+            } else if heard == "ask" && in_flight.get() {
+                let _ = channel.post_message(&JsValue::from_str(&answer));
+            }
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    let _ = channel.post_message(&JsValue::from_str(&message));
+    Some(BootAnnouncer {
+        channel,
+        identity: identity.clone(),
+        in_flight,
+        _on_message: on_message,
+    })
 }
 
 /// Page side: resolve once the DB worker's intake answers on the hello channel.
@@ -122,17 +202,15 @@ pub(super) async fn await_db_worker_ready_bounded(
         })?;
     let state = Rc::new(RefCell::new(HelloReady::Waiting));
     let mut initial = known.to_vec();
-    CURRENT_BOOT.with_borrow(|current| {
-        if let Some(identity) = current
-            && !initial.contains(identity)
-        {
-            initial.push(identity.clone());
-        }
-    });
+    if initial.is_empty() {
+        // Only a caller that named nothing falls back to this context's boot, because a caller
+        // that named one is scoped to it and a newer spawn is not what it is waiting for.
+        initial.extend(current_boot_in_flight());
+    }
     let known_ids = Rc::new(RefCell::new(initial));
-    // A waiter that named the boot it is waiting for has no business adopting another one, and
-    // a waiter that named none has only this context's last spawn and the announcement to go on.
-    let trusts_announcements = known.is_empty();
+    // A waiter that knows which boot it waits for has no business adopting another one, and a
+    // waiter that knows none has only the announcement to go on.
+    let trusts_announcements = known_ids.borrow().is_empty();
     let on_message = {
         let state = Rc::clone(&state);
         let known_ids = Rc::clone(&known_ids);

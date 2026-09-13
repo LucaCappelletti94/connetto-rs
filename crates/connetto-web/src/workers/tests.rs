@@ -425,6 +425,57 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// A wait scoped to one boot ignores the failure of a boot spawned after it, because a caller
+/// that named an identity asked about that one.
+#[wasm_bindgen_test]
+async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
+    let older = super::boot::BootIdentity::mint();
+    let (worker, newer) = super::boot::spawn_db_worker(
+        "./connetto-absent-module.js",
+        &super::boot::WorkerBootstrap::Glue,
+    )
+    .expect("spawning the worker itself must succeed");
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[older], 700.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "the newer boot {newer}'s failure must not resolve this wait, got {error:?}"
+    );
+    worker.terminate();
+}
+
+/// A boot stays obtainable while it is in flight, so a waiter that joined after the announcement
+/// gets it from the announcer rather than from another waiter.
+#[wasm_bindgen_test]
+async fn an_announcer_answers_a_waiter_that_joined_late() {
+    let identity = super::boot::BootIdentity::mint();
+    let id_str = identity.to_string();
+    let announcer =
+        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
+
+    spawn_local({
+        let id_str = id_str.clone();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(300)).await;
+            if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+                let _ = sender
+                    .post_message(&JsValue::from_str(&format!("failed:{id_str}:late-joiner")));
+            }
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 3_000.0)
+        .await
+        .expect_err("the late joiner must act on the announced boot's failure");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("late-joiner")),
+        "expected the announcer to make the boot attributable, got {error:?}"
+    );
+    drop(announcer);
+}
+
 /// A waiter that knows the boot it is waiting for does not adopt another boot announced beside
 /// it, because two boots can overlap while one worker replaces another.
 #[wasm_bindgen_test]

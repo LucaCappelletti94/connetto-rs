@@ -335,7 +335,7 @@ pub fn spawn_db_worker(
     bootstrap: &WorkerBootstrap,
 ) -> Result<(Worker, BootIdentity), BootError> {
     let identity = BootIdentity::mint();
-    super::intake::record_current_boot(&identity);
+    super::intake::announce_current_boot(&identity);
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");

@@ -32,7 +32,7 @@ use web_sys::{BroadcastChannel, ErrorEvent, Event, MessageEvent, Worker};
 
 use crate::locks::{HeldLock, hold_lock};
 use crate::unlock::{AccountChoice, UnlockError};
-use crate::workers::{BootIdentity, HELLO_CHANNEL, WorkerBootstrap, spawn_db_worker};
+use crate::workers::{BootIdentity, WorkerBootstrap, spawn_db_worker};
 
 /// Failure of a leader-managed operation.
 #[derive(Debug, thiserror::Error)]
@@ -223,7 +223,6 @@ impl Membership {
             spawn_worker(&self.launch).map_err(|e| LeaderError::WorkerSpawn {
                 detail: format!("{e:?}"),
             })?;
-        announce_boot(&identity);
         leadership.worker = worker;
         leadership.boot_identity = identity;
         Ok(())
@@ -269,14 +268,6 @@ fn spawn_worker(launch: &Launch) -> Result<(Worker, BootIdentity), JsValue> {
     log_worker_errors(&worker);
     crate::unlock::serve_unlock(&worker)?;
     Ok((worker, identity))
-}
-
-/// Post `booting:<identity>` on the hello channel, silently ignoring a channel open failure.
-fn announce_boot(identity: &BootIdentity) {
-    if let Ok(ch) = BroadcastChannel::new(HELLO_CHANNEL) {
-        let _ = ch.post_message(&JsValue::from_str(&format!("booting:{identity}")));
-        ch.close();
-    }
 }
 
 impl Drop for Membership {
@@ -348,7 +339,6 @@ fn serve_switch_requests(
         current.worker.terminate();
         match spawn_worker(&launch) {
             Ok((worker, identity)) => {
-                announce_boot(&identity);
                 current.worker = worker;
                 current.boot_identity = identity;
             }
@@ -381,7 +371,6 @@ async fn run_election(
     }
     match spawn_worker(&launch) {
         Ok((worker, identity)) => {
-            announce_boot(&identity);
             leadership.borrow_mut().replace(Leadership {
                 held,
                 worker,

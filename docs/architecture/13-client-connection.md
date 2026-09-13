@@ -50,12 +50,14 @@ And every waiter has a rule for whose failure it may act on, because acting on a
 | The waiter | Identities it may act on |
 |---|---|
 | the tab that spawned the worker | the identity the spawn returned, and nothing announced beside it |
-| a reconnect attempt, handed none | the newest boot this context spawned, deliberately not the ones before it |
+| a reconnect attempt, handed none | the boot this context spawned last, while that boot is still in flight |
 | a waiter that named no identity | an identity heard as `booting:<identity>` while it waits |
-| a waiter that joined after the announcement | the identities another waiter re-announces in answer to its `ask` |
+| a waiter that joined after the announcement | the identity the spawning context answers with when it asks |
 | any waiter, for an untagged failure | none, it waits out the deadline |
 
 A waiter that named its own boot ignores an announcement, because two boots overlap whenever one worker replaces another and the announcement beside it belongs to the boot being replaced. A waiter that named none has nothing else to go on, and the origin hosts one worker topology, since the hello channel, the election lock and the alive lock are all origin-global names, so the announcement it hears is that topology's.
+
+A spawn announces its boot and keeps answering for it, because a broadcast is not replayed and a tab that joins later would otherwise have nothing to attribute a failure to. The announcer answers `ask` with `booting:<identity>` until the worker reports ready or the boot reports its failure, which is exactly the window a failure can still arrive in, and a context keeps one, replaced by its next spawn. That window is also what a reconnect consults, so a boot that has already resolved stops standing in for the next one, which a remembered identity with no lifetime would have done for as long as the page lived.
 
 | Context | SQLite access | How queries travel |
 |---|---|---|
