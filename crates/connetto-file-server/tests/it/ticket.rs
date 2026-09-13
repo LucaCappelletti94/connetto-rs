@@ -277,6 +277,27 @@ fn http_loopback_127_base_is_accepted() {
     .expect("loopback http base must be accepted");
 }
 
+/// Proves: another address in `127.0.0.0/8` is refused, because the browser transport
+/// sends only to `127.0.0.1` and a base that signs must be a base a client will send.
+#[test]
+fn an_unsendable_loopback_base_is_refused() {
+    let Err(err) = connetto_file_server::TicketSigner::generate(
+        "http://127.0.0.2:8080".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    ) else {
+        panic!("a base no client sends to must be refused, got Ok")
+    };
+    assert!(
+        matches!(
+            &err,
+            connetto_file_server::ticket::TicketError::InsecureBase { base }
+                if base == "http://127.0.0.2:8080"
+        ),
+        "expected InsecureBase naming the base, got {err:?}"
+    );
+}
+
 /// Proves: an authority whose userinfo reads as loopback is refused, because the host a
 /// client resolves is the one after the at sign.
 #[test]
