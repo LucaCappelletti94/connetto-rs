@@ -425,6 +425,33 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// A waiter that knows the boot it is waiting for does not adopt another boot announced beside
+/// it, because two boots can overlap while one worker replaces another.
+#[wasm_bindgen_test]
+async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
+    let mine = super::boot::BootIdentity::mint();
+    let other = super::boot::BootIdentity::mint().to_string();
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{other}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!(
+                "failed:{other}:someone-elses-boot"
+            )));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[mine], 400.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "another boot's failure must not be adopted, got {error:?}"
+    );
+}
+
 /// A module that cannot be fetched fails before any Rust runs, and the spawning context
 /// reports it, so a reconnect attempt handed no identity still learns why.
 #[wasm_bindgen_test]

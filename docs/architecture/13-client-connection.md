@@ -49,11 +49,13 @@ And every waiter has a rule for whose failure it may act on, because acting on a
 
 | The waiter | Identities it may act on |
 |---|---|
-| the tab that spawned the worker | the identity the spawn returned |
+| the tab that spawned the worker | the identity the spawn returned, and nothing announced beside it |
 | a reconnect attempt, handed none | the newest boot this context spawned, deliberately not the ones before it |
-| any waiter | an identity heard as `booting:<identity>` while it waits |
+| a waiter that named no identity | an identity heard as `booting:<identity>` while it waits |
 | a waiter that joined after the announcement | the identities another waiter re-announces in answer to its `ask` |
 | any waiter, for an untagged failure | none, it waits out the deadline |
+
+A waiter that named its own boot ignores an announcement, because two boots overlap whenever one worker replaces another and the announcement beside it belongs to the boot being replaced. A waiter that named none has nothing else to go on, and the origin hosts one worker topology, since the hello channel, the election lock and the alive lock are all origin-global names, so the announcement it hears is that topology's.
 
 | Context | SQLite access | How queries travel |
 |---|---|---|

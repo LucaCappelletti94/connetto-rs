@@ -95,8 +95,10 @@ pub(super) fn record_current_boot(identity: &super::boot::BootIdentity) {
 /// Page side: resolve once the DB worker's intake answers on the hello channel.
 ///
 /// `known` lists boot identities this caller may act on; a failure whose identity is not among
-/// them is ignored. The caller also learns an identity from a `booting:<identity>` message that
-/// arrives while it waits.
+/// them is ignored. A caller that knows no identity, and spawned no boot in this context, learns
+/// one from a `booting:<identity>` announcement or from another waiter's answer to its `ask`,
+/// because the origin hosts one worker topology and that announcement is its boot. A caller that
+/// does know one stays with it.
 ///
 /// # Errors
 ///
@@ -128,6 +130,9 @@ pub(super) async fn await_db_worker_ready_bounded(
         }
     });
     let known_ids = Rc::new(RefCell::new(initial));
+    // A waiter that named the boot it is waiting for has no business adopting another one, and
+    // a waiter that named none has only this context's last spawn and the announcement to go on.
+    let trusts_announcements = known.is_empty();
     let on_message = {
         let state = Rc::clone(&state);
         let known_ids = Rc::clone(&known_ids);
@@ -147,7 +152,7 @@ pub(super) async fn await_db_worker_ready_bounded(
             } else if let Some(id) = message.strip_prefix("booting:") {
                 let heard = super::boot::BootIdentity::from_wire(id);
                 let mut known_ids = known_ids.borrow_mut();
-                if !known_ids.contains(&heard) {
+                if trusts_announcements && !known_ids.contains(&heard) {
                     known_ids.push(heard);
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
