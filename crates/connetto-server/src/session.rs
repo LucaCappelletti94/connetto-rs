@@ -3707,6 +3707,32 @@ where
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let tier = Tier::of(&state.principal);
+        // The reader-share permit (R39) comes first and the allowance second,
+        // so a subscribe the share defers has spent nothing and its retry is
+        // not refused by count, while a probe that fails to resolve still pays
+        // (R36 counts probing, and a free failure would hand it an unlimited
+        // budget). The permit is held across registration, which is a
+        // materializer-lock translate and touches no database, and a computed
+        // subscription drops it before bootstrapping on the owner pool.
+        let reader_permit = match self.guard.reader_permit(tier).await {
+            Ok(permit) => permit,
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    sub_id = %sub.sub_id,
+                    retry_after_ms,
+                    "subscription deferred, the unreserved reader share is full"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(sub.sub_id),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
+        };
         if let Some(wait) = self.guard.subscription(state.session_id, tier) {
             let retry_after_ms = retry_ms(wait);
             tracing::warn!(
@@ -3764,18 +3790,26 @@ where
                     pg_sql,
                     member_tables,
                 };
-                self.serve_term_row(transport, sub, state, tier, reg).await
+                self.serve_term_row(transport, sub, state, tier, reg, reader_permit)
+                    .await
             }
             Registration::Computed(capture) => {
+                // Aggregates bootstrap through the re-execution connector on
+                // the owner pool and hold no share permit (R39).
+                drop(reader_permit);
                 self.subscribe_computed(transport, sub, state, capture)
                     .await
             }
         }
     }
 
-    /// Serve one registered row subscription: the R39 reader permit, the R27
-    /// allowance pre-charge for the membership subscription a term needs, the
-    /// snapshot or catchup, and the membership open behind it.
+    /// Serve one registered row subscription under the R39 reader permit the
+    /// caller already holds, which spans the whole row delivery (the snapshot
+    /// read or the catchup replay's visibility questions, which check out
+    /// reader connections one at a time, so an unidentified caller counts once
+    /// for the operation however many checkouts it makes): the R27 allowance
+    /// pre-charge for the membership subscription a term needs, the snapshot
+    /// or catchup, and the membership open behind it.
     async fn serve_term_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -3783,19 +3817,8 @@ where
         state: &mut SessionState<Id, Key>,
         tier: Tier,
         reg: RowRegistration,
+        reader_permit: ReaderPermit,
     ) -> Result<(), SessionError> {
-        // One share permit spans the whole row delivery (R39): the snapshot
-        // read or the catchup replay's visibility questions, which check out
-        // reader connections one at a time, so an unidentified caller counts
-        // once for the operation however many checkouts it makes. Aggregates
-        // bootstrap through the re-execution connector on the owner pool and
-        // take none.
-        let Some(reader_permit) = self
-            .subscribe_reader_permit(transport, tier, &sub.sub_id, reg.sub_id)
-            .await?
-        else {
-            return Ok(());
-        };
         let sub_label = sub.sub_id.clone();
         let (consumer_id, sub_id) = (reg.consumer_id, reg.sub_id);
         // R27 decisions 4 and 7: the membership subscription this term needs

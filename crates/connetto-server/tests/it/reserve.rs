@@ -142,6 +142,14 @@ type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermar
 /// write target (the handshake watermark read), and the gate all over the one
 /// pool under test.
 fn manager(reader: &Pool<AsyncPgConnection>) -> Manager {
+    manager_with(reader, |tier| tier)
+}
+
+/// [`manager`] with the anonymous tier's limits adjusted by `anonymous`.
+fn manager_with(
+    reader: &Pool<AsyncPgConnection>,
+    anonymous: impl FnOnce(TierLimits) -> TierLimits,
+) -> Manager {
     let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
     // The read limits are raised for one reason only: this fixture's policy
     // sleeps for seconds per row on purpose, to hold a pooled connection, and
@@ -151,7 +159,7 @@ fn manager(reader: &Pool<AsyncPgConnection>) -> Manager {
     let guard = RequestGuard::new(
         ThrottleConfig::default()
             .with_identified(unhurried(TierLimits::identified()))
-            .with_anonymous(unhurried(TierLimits::anonymous())),
+            .with_anonymous(anonymous(unhurried(TierLimits::anonymous()))),
         AbuseConfig::default(),
     )
     .with_reader_gate(
@@ -443,4 +451,57 @@ async fn anonymous_callers_reach_the_full_unreserved_share() {
         matches!(served_b, ControlMessage::SnapshotEnd(_)),
         "the second anonymous snapshot is served, got {served_b:?}"
     );
+}
+
+/// A subscribe the share defers spends none of the caller's subscription
+/// allowance: with an allowance of exactly one, the retry after the share
+/// frees is served rather than refused by count for the rest of the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_deferred_subscribe_spends_no_subscription_allowance() {
+    let fixture = Fixture::acquire().await;
+    let reader = setup(&fixture, 4.0).await;
+    let manager = manager_with(&reader, |tier| {
+        tier.with_subscriptions(1, Duration::from_secs(600))
+    });
+
+    let (mut anon_a, _a) = connect(&manager, "anon-a", &[]).await;
+    let (mut anon_b, _b) = connect(&manager, "anon-b", &[]).await;
+    let (mut anon_c, _c) = connect(&manager, "anon-c", &[]).await;
+    send_subscribe(&mut anon_a, "anon-a-slow", "SELECT * FROM slow_rows").await;
+    send_subscribe(&mut anon_b, "anon-b-slow", "SELECT * FROM slow_rows").await;
+    wait_for_slow_reads(&fixture, 2).await;
+
+    send_subscribe(&mut anon_c, "anon-c-fast", "SELECT * FROM fast_rows").await;
+    let deferred = settle(&mut anon_c).await;
+    assert!(
+        matches!(deferred, ControlMessage::RateLimited(_)),
+        "the share is full, so the subscribe is deferred, got {deferred:?}"
+    );
+
+    // The share frees as the two slow snapshots complete.
+    assert!(matches!(
+        settle(&mut anon_a).await,
+        ControlMessage::SnapshotEnd(_)
+    ));
+    assert!(matches!(
+        settle(&mut anon_b).await,
+        ControlMessage::SnapshotEnd(_)
+    ));
+
+    // The retry is the caller's first served subscription, and its one
+    // allowance is still whole.
+    send_subscribe(&mut anon_c, "anon-c-fast", "SELECT * FROM fast_rows").await;
+    let served = settle(&mut anon_c).await;
+    assert!(
+        matches!(served, ControlMessage::SnapshotEnd(_)),
+        "the deferred subscribe spent no allowance, so its retry is served, got {served:?}"
+    );
+
+    // And the allowance is real: the next one is refused by count.
+    send_subscribe(&mut anon_c, "anon-c-second", "SELECT * FROM fast_rows").await;
+    let refused = settle(&mut anon_c).await;
+    let ControlMessage::RateLimited(limited) = refused else {
+        panic!("the second subscription exceeds an allowance of one, got {refused:?}");
+    };
+    assert_eq!(limited.related_to.as_deref(), Some("anon-c-second"));
 }
