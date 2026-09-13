@@ -277,7 +277,7 @@ fn http_loopback_127_base_is_accepted() {
     .expect("loopback http base must be accepted");
 }
 
-/// Proves: the bracketed IPv6 loopback is accepted with a port, which is the form a
+/// Proves: the bracketed `IPv6` loopback is accepted with a port, which is the form a
 /// harness binds when it serves on `::1`.
 #[test]
 fn http_loopback_ipv6_base_is_accepted() {
