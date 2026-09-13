@@ -143,7 +143,10 @@ where
         http: H,
     ) -> Result<Self, ContentError> {
         client
-            .with_conn(|conn| conn.batch_execute(db::CONTENT_DDL))
+            .with_conn(|conn| {
+                conn.batch_execute(db::CONTENT_DDL)?;
+                db::add_refused_column(conn.conn())
+            })
             .await?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let local = ChunkStoreSource::new(EncryptingStore::new(store.clone(), &root_key));
@@ -326,6 +329,29 @@ where
         self.client.with_conn(|conn| db::retired(conn.conn())).await
     }
 
+    /// Every refused outbox entry with its permanent refusal detail.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub async fn refused_content(&self) -> Result<Vec<(FileId, String)>, ContentError> {
+        self.client
+            .with_conn(|conn| db::refusals(conn.conn()))
+            .await
+    }
+
+    /// Clears the refusal mark on one outbox entry so the next walk attempts it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub async fn retry_refused(&self, file_id: FileId) -> Result<(), ContentError> {
+        self.client
+            .with_conn(move |conn| db::clear_refusal(conn.conn(), file_id))
+            .await
+            .map_err(ContentError::from)
+    }
+
     /// Drops the losses the application has dealt with.
     ///
     /// # Errors
@@ -376,7 +402,7 @@ where
     pub async fn flush_outbox(&self) -> Result<usize, ContentError> {
         let waiting = self
             .client
-            .with_conn(|conn| db::outbox(conn.conn()))
+            .with_conn(|conn| db::sendable(conn.conn()))
             .await?;
         let mut sent = 0;
         for file_id in waiting {
@@ -395,13 +421,15 @@ where
                     });
                 }
                 Err(err) => {
+                    let event = ContentEvent::UploadRefused {
+                        file_id,
+                        detail: err.to_string(),
+                    };
                     let detail = err.to_string();
                     self.client
-                        .with_conn(move |conn| retire(conn.conn(), file_id))
+                        .with_conn(move |conn| db::refuse(conn.conn(), file_id, &detail))
                         .await?;
-                    let _ = self
-                        .events
-                        .send(ContentEvent::UploadRefused { file_id, detail });
+                    let _ = self.events.send(event);
                 }
             }
         }
@@ -451,7 +479,7 @@ where
             let _ = self.flush_outbox().await;
             let queued = self
                 .client
-                .with_conn(|conn| db::outbox(conn.conn()))
+                .with_conn(|conn| db::sendable(conn.conn()))
                 .await
                 .is_ok_and(|waiting| !waiting.is_empty());
             if queued {

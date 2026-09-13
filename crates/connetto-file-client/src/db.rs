@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId, Manifest};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
 use crate::error::ContentError;
@@ -42,10 +43,15 @@ diesel::table! {
     ///
     /// Presence here is what makes content unsent rather than cached, which
     /// is the distinction chapter 18 draws: unsent content is data and cannot
-    /// be refetched, fetched content is cache.
+    /// be refetched, fetched content is cache. A non-null `refused` column
+    /// means a permanent error was recorded and the entry waits for an
+    /// explicit retry; it is still counted as unsent by `outbox` and
+    /// `outbox_count` and excluded from `sendable`.
     _connetto_content_outbox (file_id) {
         /// BLAKE3 identity of the file awaiting upload.
         file_id -> Binary,
+        /// Permanent refusal detail, set when no later attempt can succeed.
+        refused -> Nullable<Text>,
     }
 }
 
@@ -73,18 +79,39 @@ diesel::table! {
     }
 }
 
-/// The bookkeeping schema, applied on every open so an existing replica gains
-/// it without a migration, the same way `_connetto_meta` arrives.
+/// The bookkeeping schema, applied on every open so a new replica gains all
+/// tables, the same way `_connetto_meta` arrives.
 pub(crate) const CONTENT_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _connetto_content_chunks \
     (file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, hash BLOB NOT NULL, \
      len BIGINT NOT NULL, PRIMARY KEY (file_id, ordinal)); \
     CREATE TABLE IF NOT EXISTS _connetto_content_outbox \
-    (file_id BLOB NOT NULL PRIMARY KEY); \
+    (file_id BLOB NOT NULL PRIMARY KEY, refused TEXT); \
     CREATE TABLE IF NOT EXISTS _connetto_content_retired \
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
     (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL)";
+
+/// Adds the `refused` column to an existing outbox table that predates it.
+///
+/// Run as a separate statement after `CONTENT_DDL` because `batch_execute`
+/// aborts the whole batch on the first error, and this statement is expected
+/// to fail with a duplicate-column error on replicas that already have it.
+///
+/// # Errors
+///
+/// [`diesel::result::Error`] for any error other than a duplicate-column name.
+pub(crate) fn add_refused_column(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    match conn.batch_execute("ALTER TABLE _connetto_content_outbox ADD COLUMN refused TEXT") {
+        Ok(()) => Ok(()),
+        Err(diesel::result::Error::DatabaseError(_, ref info))
+            if info.message().contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
 
 /// Writes a manifest's chunk rows, replacing any the same file already had.
 ///
@@ -260,6 +287,90 @@ pub(crate) fn outbox_count(conn: &mut SqliteConnection) -> Result<u64, ContentEr
         .count()
         .get_result::<i64>(conn)?;
     Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))
+}
+
+/// Marks an outbox entry as permanently refused, recording the detail.
+///
+/// The entry stays in the outbox and is counted by `outbox` and
+/// `outbox_count`, but `sendable` excludes it until `clear_refusal` clears
+/// the mark.
+///
+/// # Errors
+///
+/// [`diesel::result::Error`] when the update cannot be written.
+pub(crate) fn refuse(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    detail: &str,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(_connetto_content_outbox::table)
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .set(_connetto_content_outbox::refused.eq(detail))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Clears the refusal mark on one outbox entry so the next walk attempts it.
+///
+/// # Errors
+///
+/// [`diesel::result::Error`] when the update cannot be written.
+pub(crate) fn clear_refusal(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(_connetto_content_outbox::table)
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .set(_connetto_content_outbox::refused.eq::<Option<String>>(None))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Outbox entries that have not been marked as permanently refused, in
+/// identity order.
+///
+/// This is the candidate list the upload driver walks: refused entries wait
+/// for an explicit retry and are never re-attempted on their own.
+///
+/// # Errors
+///
+/// [`ContentError::Replica`] when the outbox cannot be read.
+pub(crate) fn sendable(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
+    let rows: Vec<Vec<u8>> = _connetto_content_outbox::table
+        .order(_connetto_content_outbox::file_id.asc())
+        .filter(_connetto_content_outbox::refused.is_null())
+        .select(_connetto_content_outbox::file_id)
+        .load(conn)?;
+    rows.into_iter()
+        .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
+        .collect()
+}
+
+/// Every refused outbox entry with its permanent refusal detail, in identity order.
+///
+/// # Errors
+///
+/// [`ContentError::Replica`] when the outbox cannot be read.
+pub(crate) fn refusals(conn: &mut SqliteConnection) -> Result<Vec<(FileId, String)>, ContentError> {
+    let rows: Vec<(Vec<u8>, Option<String>)> = _connetto_content_outbox::table
+        .order(_connetto_content_outbox::file_id.asc())
+        .filter(_connetto_content_outbox::refused.is_not_null())
+        .select((
+            _connetto_content_outbox::file_id,
+            _connetto_content_outbox::refused,
+        ))
+        .load(conn)?;
+    rows.into_iter()
+        .map(|(id, detail)| {
+            let file_id = FileId::from_bytes(exactly_32(&id)?);
+            let detail = detail.ok_or_else(|| {
+                diesel::result::Error::DeserializationError(
+                    "refused column was null after IS NOT NULL filter".into(),
+                )
+            })?;
+            Ok((file_id, detail))
+        })
+        .collect()
 }
 
 /// Whether this file is still awaiting upload.
