@@ -78,6 +78,20 @@ async fn poll_hello_channel(
     }
 }
 
+thread_local! {
+    /// The boot this context spawned most recently, which a reconnect attempt waits for.
+    static CURRENT_BOOT: RefCell<Option<super::boot::BootIdentity>> = const { RefCell::new(None) };
+}
+
+/// Records the boot this context has just spawned, replacing the one before it.
+///
+/// A reconnect attempt is handed no identity, and the boot it waits for is by construction the
+/// newest one this context spawned, so remembering only that one keeps a replaced worker's
+/// failure unattributable.
+pub(super) fn record_current_boot(identity: &super::boot::BootIdentity) {
+    CURRENT_BOOT.with_borrow_mut(|current| *current = Some(identity.clone()));
+}
+
 /// Page side: resolve once the DB worker's intake answers on the hello channel.
 ///
 /// `known` lists boot identities this caller may act on; a failure whose identity is not among
@@ -105,20 +119,37 @@ pub(super) async fn await_db_worker_ready_bounded(
             detail: format!("{err:?}"),
         })?;
     let state = Rc::new(RefCell::new(HelloReady::Waiting));
-    let known_ids = Rc::new(RefCell::new(known.to_vec()));
+    let mut initial = known.to_vec();
+    CURRENT_BOOT.with_borrow(|current| {
+        if let Some(identity) = current
+            && !initial.contains(identity)
+        {
+            initial.push(identity.clone());
+        }
+    });
+    let known_ids = Rc::new(RefCell::new(initial));
     let on_message = {
         let state = Rc::clone(&state);
         let known_ids = Rc::clone(&known_ids);
+        let sender = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
             if message == "ready" {
                 *state.borrow_mut() = HelloReady::Up;
+            } else if message == "ask" {
+                // A waiter that joins after the announcement gets it from whoever heard it,
+                // because a broadcast is not replayed.
+                for identity in known_ids.borrow().iter() {
+                    let _ = sender.post_message(&JsValue::from_str(&format!("booting:{identity}")));
+                }
             } else if let Some(id) = message.strip_prefix("booting:") {
-                known_ids
-                    .borrow_mut()
-                    .push(super::boot::BootIdentity::from_wire(id));
+                let heard = super::boot::BootIdentity::from_wire(id);
+                let mut known_ids = known_ids.borrow_mut();
+                if !known_ids.contains(&heard) {
+                    known_ids.push(heard);
+                }
             } else if let Some(rest) = message.strip_prefix("failed:")
                 && let Some((id, detail)) = rest.split_once(':')
                 && known_ids.borrow().iter().any(|known| known.matches_str(id))

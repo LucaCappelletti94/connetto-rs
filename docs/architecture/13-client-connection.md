@@ -35,6 +35,26 @@ In WASM the elected DB worker (Web Locks election, `spawn_db_worker` and `boot_d
 
 **Amended (2026-09-13): a boot failure names the boot it belongs to, whichever bootstrap spawned it.** The hello channel is one name for the whole origin, so a failure that names nothing is delivered to whoever is waiting, and R42's worker replacement makes that wrong rather than merely imprecise: a tab waiting for the new worker could adopt the failure of the worker being replaced. A spawn now mints a boot identity and puts it on the worker's own URL, the generated bootstrap also leaves it in a global because a blob worker's location carries no query, and a failure is posted as `failed:<identity>:<detail>` by the generated bootstrap when the import fails, by a deployment's own bootstrap script from the parameter it was spawned with, as the shipped `db-worker.js` does, and by `boot_db_worker` itself when the boot fails after the import, which is the case no bootstrap reported before. A reserved parameter already on a supplied URL is replaced rather than appended, because the worker reads the first value of the name. The spawning tab announces `booting:<identity>`. A waiter acts on a failure only when the identity is one it knows, its own or one it heard announced while waiting, and otherwise waits out the readiness deadline. `ready` stays untagged, because a ready worker serves every tab, and a worker spawned with no identity stays silent, which is what a deployment's own bootstrap does when it drops the parameter. Rejected: letting only the spawning tab act on a failure, which makes every other tab wait the full deadline on a broken deployment, and trusting the newest boot, which still guesses while two boots overlap.
 
+Every stage of a boot has a reporter, because a stage that reports nothing is a fifteen second wait for the page.
+
+| When the boot fails | Who reports it | How it names the boot |
+|---|---|---|
+| the module cannot be fetched, or throws while initializing | the spawning context, from the worker's `error` event | the identity it minted |
+| the generated bootstrap's import or init throws | the blob module's `catch` | the identity compiled into it |
+| a deployment's own bootstrap script fails before Rust runs | that script's `catch` | the `boot` parameter it was spawned with, staying silent without one |
+| `boot_db_worker` returns an error | the worker itself | the `boot` parameter on its URL, or the `connettoBoot` global a blob bootstrap left |
+| the worker never answers and nothing failed | nobody | the waiter's deadline expires |
+
+And every waiter has a rule for whose failure it may act on, because acting on another boot's failure is the bug this replaced.
+
+| The waiter | Identities it may act on |
+|---|---|
+| the tab that spawned the worker | the identity the spawn returned |
+| a reconnect attempt, handed none | the newest boot this context spawned, deliberately not the ones before it |
+| any waiter | an identity heard as `booting:<identity>` while it waits |
+| a waiter that joined after the announcement | the identities another waiter re-announces in answer to its `ask` |
+| any waiter, for an untagged failure | none, it waits out the deadline |
+
 | Context | SQLite access | How queries travel |
 |---|---|---|
 | Native | in-process `ConnettoConnection` | direct |

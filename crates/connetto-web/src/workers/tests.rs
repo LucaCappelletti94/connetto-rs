@@ -425,6 +425,61 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// A module that cannot be fetched fails before any Rust runs, and the spawning context
+/// reports it, so a reconnect attempt handed no identity still learns why.
+#[wasm_bindgen_test]
+async fn a_module_that_cannot_load_reports_its_failure_to_a_later_wait() {
+    let (worker, _identity) = super::boot::spawn_db_worker(
+        "./connetto-absent-module.js",
+        &super::boot::WorkerBootstrap::Glue,
+    )
+    .expect("spawning the worker itself must succeed");
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 5_000.0)
+        .await
+        .expect_err("a worker whose module is absent must not report readiness");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { .. }),
+        "expected the failure to be attributed, got {error:?}"
+    );
+    worker.terminate();
+}
+
+/// A waiter that joins after the announcement asks for it, because a broadcast is not replayed.
+#[wasm_bindgen_test]
+async fn a_waiter_hears_an_announced_boot_from_another_waiter() {
+    let identity = super::boot::BootIdentity::mint();
+    let id_str = identity.to_string();
+
+    // The holder knows the identity and answers the newcomer's ask, then the failure lands.
+    spawn_local({
+        let id_str = id_str.clone();
+        async move {
+            let _ = crate::workers::intake::await_db_worker_ready_bounded(
+                &[super::boot::BootIdentity::from_wire(&id_str)],
+                4_000.0,
+            )
+            .await;
+        }
+    });
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(400)).await;
+        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+            let _ = sender.post_message(&JsValue::from_str(&format!(
+                "failed:{id_str}:module-load-error"
+            )));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 3_000.0)
+        .await
+        .expect_err("the newcomer must act on the announced boot's failure");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("module-load-error")),
+        "expected the newcomer to attribute the failure, got {error:?}"
+    );
+}
+
 /// A boot parameter already on the worker URL is replaced, not duplicated, because the worker
 /// reads the first value of the name.
 #[wasm_bindgen_test]

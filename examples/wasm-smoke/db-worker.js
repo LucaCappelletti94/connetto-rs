@@ -28,6 +28,9 @@ try {
   debug.postMessage("db worker: serving");
 } catch (err) {
   debug.postMessage("db worker FAILED: " + err);
-  hello.postMessage(boot ? "failed:" + boot + ":" + err : "failed:" + err);
+  // A worker that cannot name its boot stays silent, because a page cannot attribute it.
+  if (boot) {
+    hello.postMessage("failed:" + boot + ":" + err);
+  }
   throw err;
 }
