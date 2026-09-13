@@ -8,6 +8,13 @@ use web_sys::{Worker, WorkerOptions, WorkerType};
 mod replica;
 mod services;
 
+/// The query parameter a spawned worker reads its boot identity from.
+const BOOT_PARAM: &str = "boot";
+
+/// The global a generated bootstrap leaves its boot identity in, because a blob worker's own
+/// location carries no query.
+const BOOT_GLOBAL: &str = "connettoBoot";
+
 /// Storage-pool slots reserved by [`boot_db_worker`]: 4 databases plus a rollback journal each.
 const BOOT_SLOTS: u32 = 8;
 
@@ -329,7 +336,8 @@ pub fn spawn_db_worker(
     options.set_name("connetto-db");
     match bootstrap {
         WorkerBootstrap::Glue => {
-            let worker = Worker::new_with_options(glue_url, &options)
+            let url = boot_tagged_url(glue_url, &identity)?;
+            let worker = Worker::new_with_options(&url, &options)
                 .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
             Ok((worker, identity))
         }
@@ -341,10 +349,10 @@ pub fn spawn_db_worker(
             let existing = url.search();
             // existing is "" or "?key=val"; set_search prepends "?" automatically.
             let new_search = if existing.is_empty() {
-                format!("glue={encoded}&boot={identity}")
+                format!("glue={encoded}&{BOOT_PARAM}={identity}")
             } else {
                 format!(
-                    "{}&glue={encoded}&boot={identity}",
+                    "{}&glue={encoded}&{BOOT_PARAM}={identity}",
                     existing.trim_start_matches('?')
                 )
             };
@@ -362,6 +370,27 @@ pub fn spawn_db_worker(
             Ok((worker?, identity))
         }
     }
+}
+
+/// The URL a worker is spawned from, carrying the boot identity as a query parameter.
+///
+/// The worker reads it back from its own location, which is how a boot failure after the
+/// import names the boot it belongs to.
+fn boot_tagged_url(url: &str, identity: &BootIdentity) -> Result<String, BootError> {
+    let base = current_location_href()?;
+    let tagged = web_sys::Url::new_with_base(url, &base)
+        .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
+    let existing = tagged.search();
+    let query = if existing.is_empty() {
+        format!("{BOOT_PARAM}={identity}")
+    } else {
+        format!(
+            "{}&{BOOT_PARAM}={identity}",
+            existing.trim_start_matches('?')
+        )
+    };
+    tagged.set_search(&query);
+    Ok(tagged.href())
 }
 
 fn generated_bootstrap_url(glue_url: &str, identity: &BootIdentity) -> Result<String, BootError> {
@@ -396,7 +425,8 @@ pub(super) fn generated_bootstrap_source(
     url.set_hash("");
     let wasm_url = url.href();
     Ok(format!(
-        r#"try {{
+        r#"self.{param} = {id_literal};
+try {{
   const mod = await import({glue});
   await mod.default({{ module_or_path: {wasm} }});
 }} catch (err) {{
@@ -405,6 +435,8 @@ pub(super) fn generated_bootstrap_source(
   throw err;
 }}
 "#,
+        param = BOOT_GLOBAL,
+        id_literal = js_string_literal(&identity.to_string()),
         glue = js_string_literal(&resolved_glue),
         wasm = js_string_literal(&wasm_url),
         id = identity,
@@ -463,6 +495,50 @@ pub struct BootedSession<Id> {
 ///
 /// [`BootError`] describing the VFS, acquisition, upstream connect, or subscribe failure.
 pub async fn boot_db_worker<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, BootError>
+where
+    Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
+{
+    let booted = boot_session(config).await;
+    if let Err(error) = &booted {
+        report_boot_failure(&error.to_string());
+    }
+    booted
+}
+
+/// Tells the waiting page why this boot failed, naming the boot it was spawned as.
+///
+/// The identity arrives on this worker's own URL, which the page sets for every bootstrap
+/// kind, so a page waiting on readiness hears the reason instead of waiting out its deadline.
+/// A worker spawned without one stays silent, which is what a deployment's own bootstrap
+/// does when it does not forward the parameter.
+fn report_boot_failure(detail: &str) {
+    let Some(identity) = boot_identity_from_location() else {
+        return;
+    };
+    if let Ok(hello) = web_sys::BroadcastChannel::new(super::HELLO_CHANNEL) {
+        let _ = hello.post_message(&JsValue::from_str(&format!("failed:{identity}:{detail}")));
+        hello.close();
+    }
+}
+
+/// The boot identity this worker was spawned with, from its own URL or from the global a
+/// generated bootstrap leaves behind.
+fn boot_identity_from_location() -> Option<String> {
+    let global = js_sys::global();
+    if let Ok(scope) = global.clone().dyn_into::<web_sys::WorkerGlobalScope>()
+        && let Ok(url) = web_sys::Url::new(&scope.location().href())
+        && let Some(value) = url.search_params().get(BOOT_PARAM)
+        && !value.is_empty()
+    {
+        return Some(value);
+    }
+    js_sys::Reflect::get(&global, &JsValue::from_str(BOOT_GLOBAL))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn boot_session<Id>(config: &DbWorkerConfig) -> Result<BootedSession<Id>, BootError>
 where
     Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
 {

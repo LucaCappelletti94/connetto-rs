@@ -425,6 +425,19 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// The generated bootstrap leaves its boot identity in a global, because a blob worker's own
+/// location carries no query for it to read.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_carries_its_identity() {
+    let identity = super::boot::BootIdentity::mint();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+        .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        source.contains(&format!("self.connettoBoot = \"{identity}\"")),
+        "the source must carry the identity: {source}"
+    );
+}
+
 /// The generated bootstrap module imports the glue by absolute URL, because a blob module
 /// resolves a relative specifier against `blob:`.
 #[wasm_bindgen_test]

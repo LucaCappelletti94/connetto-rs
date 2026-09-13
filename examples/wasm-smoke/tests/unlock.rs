@@ -347,15 +347,19 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
 async fn unlock_disabled_with_an_enrolled_credential_refuses_the_boot() {
     stage("test 4: unlock=false with enrolled credential");
     plant_enrolled_credential(0xcc, 0x02).await;
-    let failure_rx = wait_debug_for("FAILED");
-    let (worker, _boot) =
+    let (worker, boot) =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 4: waiting for boot failure");
-    let failure_msg = failure_rx.await.expect("must receive the failure message");
+    // The boot fails after its import succeeds, and the reason still reaches a waiting tab.
+    let reported = await_db_worker_ready(&[boot])
+        .await
+        .expect_err("a refused boot must not report readiness")
+        .as_string()
+        .unwrap_or_default();
     assert!(
-        failure_msg.contains(LOCKED_MESSAGE),
-        "boot with unlock=false and enrolled credential must fail, got: {failure_msg}"
+        reported.contains(LOCKED_MESSAGE),
+        "the wait must report why the boot failed, got: {reported}"
     );
     worker.terminate();
     stage("test 4: done");
