@@ -245,3 +245,112 @@ async fn content_signer_read_token_refused_as_write() {
         "read ticket must be refused when presented as write"
     );
 }
+
+/// Proves: a public `http://` base is refused and the error names the base.
+#[test]
+fn http_public_base_is_refused() {
+    let Err(err) = connetto_file_server::TicketSigner::generate(
+        "http://files.example.com".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    ) else {
+        panic!("public http base must be refused, got Ok")
+    };
+    assert!(
+        matches!(
+            &err,
+            connetto_file_server::ticket::TicketError::InsecureBase { base }
+                if base == "http://files.example.com"
+        ),
+        "expected InsecureBase with the named base, got: {err:?}"
+    );
+}
+
+/// Proves: an `http://127.0.0.1` base is accepted because the host is loopback.
+#[test]
+fn http_loopback_127_base_is_accepted() {
+    connetto_file_server::TicketSigner::generate(
+        "http://127.0.0.1:8080".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    )
+    .expect("loopback http base must be accepted");
+}
+
+/// Proves: another address in `127.0.0.0/8` is refused, because the browser transport
+/// sends only to `127.0.0.1` and a base that signs must be a base a client will send.
+#[test]
+fn an_unsendable_loopback_base_is_refused() {
+    let Err(err) = connetto_file_server::TicketSigner::generate(
+        "http://127.0.0.2:8080".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    ) else {
+        panic!("a base no client sends to must be refused, got Ok")
+    };
+    assert!(
+        matches!(
+            &err,
+            connetto_file_server::ticket::TicketError::InsecureBase { base }
+                if base == "http://127.0.0.2:8080"
+        ),
+        "expected InsecureBase naming the base, got {err:?}"
+    );
+}
+
+/// Proves: an authority whose userinfo reads as loopback is refused, because the host a
+/// client resolves is the one after the at sign.
+#[test]
+fn a_loopback_userinfo_base_is_refused() {
+    let Err(err) = connetto_file_server::TicketSigner::generate(
+        "http://localhost:80@evil.example".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    ) else {
+        panic!("a userinfo authority must be refused, got Ok")
+    };
+    assert!(
+        matches!(
+            &err,
+            connetto_file_server::ticket::TicketError::InsecureBase { base }
+                if base == "http://localhost:80@evil.example"
+        ),
+        "expected InsecureBase naming the base, got {err:?}"
+    );
+}
+
+/// Proves: the bracketed `IPv6` loopback is accepted with a port, which is the form a
+/// harness binds when it serves on `::1`.
+#[test]
+fn http_loopback_ipv6_base_is_accepted() {
+    connetto_file_server::TicketSigner::generate(
+        "http://[::1]:8080".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    )
+    .expect("loopback http base must be accepted");
+}
+
+/// Proves: an `https://` base is accepted and the minted grant still carries
+/// that exact base, so the validation does not mangle the stored URL.
+#[tokio::test]
+async fn https_base_accepted_and_preserved_in_grant() {
+    let (signer, _) = connetto_file_server::TicketSigner::generate(
+        "https://files.example.com".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    )
+    .expect("https base must be accepted");
+    let url = connetto_core::traits::ContentTicketSigner::mint(
+        &signer,
+        "alice",
+        [1u8; 32],
+        connetto_core::messages::ContentVerb::Read,
+    )
+    .await
+    .expect("mint must succeed");
+    assert!(
+        url.starts_with("https://files.example.com"),
+        "minted URL must start with the configured base; got: {url}"
+    );
+}
