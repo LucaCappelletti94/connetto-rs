@@ -474,6 +474,29 @@ async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
     );
 }
 
+/// A worker that throws after it reported ready has not failed its boot, so a later wait is not
+/// told that it did.
+#[wasm_bindgen_test]
+async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
+    let identity = super::boot::BootIdentity::mint();
+    let announcer =
+        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+        let _ = sender.post_message(&JsValue::from_str("ready"));
+        let _ = sender.post_message(&JsValue::from_str(&format!("failed:{identity}:late-crash")));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 400.0)
+        .await
+        .expect_err("no worker answers this wait");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a completed boot must not be replayed as failed, got {error:?}"
+    );
+    drop(announcer);
+}
+
 /// A boot that failed before anyone started waiting still explains itself, because a reconnect
 /// can begin after both the announcement and the failure have been broadcast.
 #[wasm_bindgen_test]

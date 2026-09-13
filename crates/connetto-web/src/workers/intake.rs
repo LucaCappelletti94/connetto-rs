@@ -171,7 +171,12 @@ pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<Boot
             if heard == "ready" {
                 *outcome.borrow_mut() = BootOutcome::Spent;
             } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
-                *outcome.borrow_mut() = BootOutcome::Failed(detail.to_owned());
+                // Only a pending boot can fail: a worker that has reported ready booted, and an
+                // error it throws later is not this boot's outcome.
+                let mut outcome = outcome.borrow_mut();
+                if *outcome == BootOutcome::Pending {
+                    *outcome = BootOutcome::Failed(detail.to_owned());
+                }
             } else if heard.starts_with("booting:") && heard != announcement {
                 // A newer boot is the one a waiter should hear about now.
                 *outcome.borrow_mut() = BootOutcome::Spent;
