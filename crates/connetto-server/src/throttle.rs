@@ -991,6 +991,13 @@ impl ByteThrottle {
             .is_ok()
     }
 
+    /// The mutation byte limit, or `None` when unlimited. A patch larger than
+    /// this can never fit a full bucket, so it is rejected rather than deferred.
+    pub fn mutation_limit(&self) -> Option<u64> {
+        (self.config.mutation_bytes_per_identity != 0)
+            .then_some(self.config.mutation_bytes_per_identity)
+    }
+
     /// Whether `identity` may send `patch_len` more bytes of mutation now, or
     /// how long until it may.
     ///

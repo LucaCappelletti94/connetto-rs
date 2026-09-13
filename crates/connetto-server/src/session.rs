@@ -980,6 +980,11 @@ struct SessionState<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
+    /// A deferred mutation and when its deferral ends. Every later sequence on
+    /// this connection is deferred behind it, because the watermark is one
+    /// number: a later write applied first would advance it past the deferred
+    /// one, whose resend the watermark check would then acknowledge unapplied.
+    deferred: Option<(u64, Instant)>,
     /// The connetto-minted session id from the verified token. The durable
     /// watermark keys on it, so a reconnect reusing the same session dedupes.
     session_id: SessionId,
@@ -2628,64 +2633,102 @@ where
         }
     }
 
-    /// Take the mutation's reader-share permit (R39), or defer the mutation
-    /// in R19's shape and report [`None`].
+    /// Take the mutation's reader-share permit (R39) and then charge its
+    /// compressed bytes to the caller's window, in that order so a write the
+    /// share defers has spent nothing and is not charged twice on resend. Either
+    /// refusal defers the mutation in R19's shape and reports [`None`].
     ///
     /// The refusal is correlated by the `client_seq` rendered as a string,
-    /// exactly as `NonFatalError` correlates. The mutation is neither applied
-    /// nor acknowledged, so it stays pending on the client and replays on
-    /// reconnect.
-    async fn mutation_reader_permit<T: Transport>(
+    /// exactly as `NonFatalError` correlates, and records the deferral so every
+    /// later sequence on this connection waits behind it. The mutation is
+    /// neither applied nor acknowledged, so it stays pending on the client and
+    /// replays in order. The byte window is keyed by identity, and by the
+    /// session handle for a caller with none, so unidentified runs never share
+    /// one bucket.
+    async fn mutation_permit<T: Transport>(
         &self,
         transport: &mut T,
-        client_seq: u64,
-        state: &SessionState<Id, Key>,
+        patch: &MutationPatch,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<Option<ReaderPermit>, SessionError> {
-        match self.guard.reader_permit(Tier::of(&state.principal)).await {
-            Ok(permit) => Ok(Some(permit)),
+        let client_seq = patch.client_seq;
+        let permit = match self.guard.reader_permit(Tier::of(&state.principal)).await {
+            Ok(permit) => permit,
             Err(wait) => {
-                let retry_after_ms = retry_ms(wait);
                 tracing::warn!(
                     client_seq,
-                    retry_after_ms,
+                    retry_after_ms = retry_ms(wait),
                     "mutation deferred, the unreserved reader share is full"
                 );
-                transport
-                    .send_control(ControlMessage::RateLimited(RateLimited {
-                        related_to: Some(client_seq.to_string()),
-                        retry_after_ms,
-                    }))
-                    .await
-                    .map_err(transport_err)?;
+                self.defer_mutation(transport, client_seq, wait, state)
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let key = state
+            .principal
+            .identity()
+            .map_or_else(|| state.session_id.to_string(), |id| id.user_id.to_string());
+        let patch_len = u64::try_from(patch.patchset_zstd.len()).unwrap_or(u64::MAX);
+        match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
+            Ok(()) => {
+                if state.deferred.is_some_and(|(seq, _)| seq == client_seq) {
+                    state.deferred = None;
+                }
+                Ok(Some(permit))
+            }
+            Err(wait) => {
+                tracing::warn!(
+                    client_seq,
+                    patch_len,
+                    retry_after_ms = retry_ms(wait),
+                    "mutation deferred, the caller's byte window is spent"
+                );
+                self.defer_mutation(transport, client_seq, wait, state)
+                    .await?;
                 Ok(None)
             }
         }
     }
 
-    /// Everything that gates a mutation before the watermark: the header and
-    /// patch must agree on the sequence (a disagreement is rejected), the
-    /// per-write measurement an operator sizes the meter from is logged, and
-    /// the compressed bytes are charged to the caller's window or the write is
-    /// deferred in the reader-share shape, `RateLimited` naming the sequence
-    /// and how long until the bytes fit, with the client keeping it pending.
-    /// The window is keyed by identity, and by the session handle for a caller
-    /// with none, so unidentified runs never share one bucket. `false` means
-    /// the mutation was answered here.
+    /// Answer `RateLimited` for `client_seq` and record the deferral so later
+    /// sequences on this connection wait behind it. An already deferred
+    /// sequence keeps its earlier deadline.
+    async fn defer_mutation<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+        wait: Duration,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        match state.deferred {
+            Some((seq, _)) if seq == client_seq => {}
+            _ => state.deferred = Some((client_seq, Instant::now() + wait)),
+        }
+        transport
+            .send_control(ControlMessage::RateLimited(RateLimited {
+                related_to: Some(client_seq.to_string()),
+                retry_after_ms: retry_ms(wait),
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
+    /// Everything that gates a mutation before the watermark. The header and
+    /// patch must agree on the sequence and the patch must fit the byte window
+    /// at all, each refused with a reject the client rolls back, since neither
+    /// can ever be resent as it is. The per-write measurement an operator sizes
+    /// the meter from is logged. A sequence past a deferred one is deferred
+    /// behind it with the same deadline, so writes apply in the order the
+    /// client numbered them. `false` means the mutation was answered here.
     async fn admit_mutation<T: Transport>(
         &self,
         transport: &mut T,
         header: &MutationHeader,
         patch: &MutationPatch,
-        state: &SessionState<Id, Key>,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<bool, SessionError> {
         let client_seq = patch.client_seq;
-        if header.client_seq != client_seq {
-            let reason = MutationRejectReason::Other {
-                detail: "mutation header and patch client_seq disagree".into(),
-            };
-            self.reject(transport, client_seq, reason).await?;
-            return Ok(false);
-        }
         let patch_len = patch.patchset_zstd.len();
         tracing::debug!(
             client_seq,
@@ -2693,31 +2736,40 @@ where
             patch_bytes = patch_len,
             "mutation received"
         );
-        let key = state
-            .principal
-            .identity()
-            .map_or_else(|| state.session_id.to_string(), |id| id.user_id.to_string());
-        let patch_len = u64::try_from(patch_len).unwrap_or(u64::MAX);
-        match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
-            Ok(()) => Ok(true),
-            Err(wait) => {
-                let retry_after_ms = retry_ms(wait);
-                tracing::warn!(
-                    client_seq,
-                    patch_len,
-                    retry_after_ms,
-                    "mutation deferred, the caller's byte window is spent"
-                );
-                transport
-                    .send_control(ControlMessage::RateLimited(RateLimited {
-                        related_to: Some(client_seq.to_string()),
-                        retry_after_ms,
-                    }))
-                    .await
-                    .map_err(transport_err)?;
-                Ok(false)
-            }
+        let refusal = if header.client_seq == client_seq {
+            self.guard
+                .bytes()
+                .mutation_limit()
+                .filter(|limit| u64::try_from(patch_len).unwrap_or(u64::MAX) > *limit)
+                .map(|limit| {
+                    format!("mutation of {patch_len} bytes exceeds the {limit} byte window")
+                })
+        } else {
+            Some("mutation header and patch client_seq disagree".to_owned())
+        };
+        if let Some(detail) = refusal {
+            self.reject(
+                transport,
+                client_seq,
+                MutationRejectReason::Other { detail },
+            )
+            .await?;
+            return Ok(false);
         }
+        if let Some((deferred_seq, until)) = state.deferred
+            && client_seq > deferred_seq
+        {
+            let wait = until.saturating_duration_since(Instant::now());
+            tracing::debug!(
+                client_seq,
+                deferred_seq,
+                "mutation deferred behind an earlier one"
+            );
+            self.defer_mutation(transport, client_seq, wait, state)
+                .await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Take a row subscription's reader-share permit (R39), or refuse it in
@@ -2959,6 +3011,7 @@ where
             outbound: outbound_tx,
             principal,
             pending_header: None,
+            deferred: None,
             session_id,
             applied_watermark,
             resume_lsn,
@@ -3374,10 +3427,7 @@ where
         // context so the database gates the write. The apply is the mutation's
         // one reader-pool checkout, so a share permit spans it (R39).
         let outcome = {
-            let Some(_reader_permit) = self
-                .mutation_reader_permit(transport, client_seq, state)
-                .await?
-            else {
+            let Some(_reader_permit) = self.mutation_permit(transport, &patch, state).await? else {
                 return Ok(());
             };
             self.target
