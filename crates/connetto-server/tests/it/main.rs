@@ -64,6 +64,8 @@ mod reconnect;
 
 mod reexec;
 
+mod mutation_budget;
+
 mod reserve;
 
 mod rls_computed;

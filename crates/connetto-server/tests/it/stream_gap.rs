@@ -29,7 +29,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, NoSigner, Oplog, OplogConfig,
     PageSpec, PgOplog, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, catchup_decision, loopback, pg_write_target, slot,
+    SnapshotSource, catchup_decision, loopback, pg_write_target, slot,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -275,7 +275,6 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
         SessionConfig::default(),
         None,
         NoSigner,
-        ThrottleConfig::default(),
     );
 
     let (server_end, mut client) = loopback();

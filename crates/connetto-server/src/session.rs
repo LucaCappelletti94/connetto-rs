@@ -1078,12 +1078,6 @@ pub struct SessionManager<
     /// server. Generic rather than boxed so a deployment wires it at compile
     /// time without a vtable allocation on the hot ticket path.
     signer: S,
-    /// Per-identity rolling bandwidth budget for the write verb.
-    ///
-    /// Charged once at the mint, before the signer is called, against the
-    /// declared upload size. Stays in memory: this is abuse prevention, not
-    /// accounting, and a restart forgiving recent history is not a vector.
-    content_throttle: crate::throttle::ContentThrottle,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -1122,7 +1116,6 @@ where
             config,
             None,
             NoSigner,
-            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
@@ -1165,7 +1158,6 @@ where
             config,
             upkeep,
             NoSigner,
-            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
@@ -1198,7 +1190,6 @@ where
         config: SessionConfig,
         upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
         signer: S,
-        content_config: crate::throttle::ThrottleConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
@@ -1221,7 +1212,6 @@ where
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
             signer,
-            content_throttle: crate::throttle::ContentThrottle::new(&content_config),
         })
     }
 }
@@ -2672,6 +2662,64 @@ where
         }
     }
 
+    /// Everything that gates a mutation before the watermark: the header and
+    /// patch must agree on the sequence (a disagreement is rejected), the
+    /// per-write measurement an operator sizes the meter from is logged, and
+    /// the compressed bytes are charged to the caller's window or the write is
+    /// deferred in the reader-share shape, `RateLimited` naming the sequence
+    /// and how long until the bytes fit, with the client keeping it pending.
+    /// The window is keyed by identity, and by the session handle for a caller
+    /// with none, so unidentified runs never share one bucket. `false` means
+    /// the mutation was answered here.
+    async fn admit_mutation<T: Transport>(
+        &self,
+        transport: &mut T,
+        header: &MutationHeader,
+        patch: &MutationPatch,
+        state: &SessionState<Id, Key>,
+    ) -> Result<bool, SessionError> {
+        let client_seq = patch.client_seq;
+        if header.client_seq != client_seq {
+            let reason = MutationRejectReason::Other {
+                detail: "mutation header and patch client_seq disagree".into(),
+            };
+            self.reject(transport, client_seq, reason).await?;
+            return Ok(false);
+        }
+        let patch_len = patch.patchset_zstd.len();
+        tracing::debug!(
+            client_seq,
+            op_count = header.op_count,
+            patch_bytes = patch_len,
+            "mutation received"
+        );
+        let key = state
+            .principal
+            .identity()
+            .map_or_else(|| state.session_id.to_string(), |id| id.user_id.to_string());
+        let patch_len = u64::try_from(patch_len).unwrap_or(u64::MAX);
+        match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
+            Ok(()) => Ok(true),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    client_seq,
+                    patch_len,
+                    retry_after_ms,
+                    "mutation deferred, the caller's byte window is spent"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(client_seq.to_string()),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Take a row subscription's reader-share permit (R39), or refuse it in
     /// R19's nonfatal shape and report [`None`], unwinding the registration.
     /// The route is not attached and the label not recorded at this point, so
@@ -3113,7 +3161,8 @@ where
         // a write that was never authorized costs nothing.
         if let ContentVerb::Write { declared_len } = req.verb
             && !self
-                .content_throttle
+                .guard
+                .bytes()
                 .allow_content_bytes(caller_str, declared_len)
         {
             return transport
@@ -3276,16 +3325,11 @@ where
                 "mutation patch arrived without a preceding header".into(),
             ));
         };
-        if header.client_seq != client_seq {
-            return self
-                .reject(
-                    transport,
-                    client_seq,
-                    MutationRejectReason::Other {
-                        detail: "mutation header and patch client_seq disagree".into(),
-                    },
-                )
-                .await;
+        if !self
+            .admit_mutation(transport, &header, &patch, state)
+            .await?
+        {
+            return Ok(());
         }
         // Exactly-once: a sequence at or below the durable watermark was
         // already applied (this session or an earlier one). Re-acknowledge

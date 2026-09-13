@@ -34,7 +34,7 @@ use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
     PgSnapshotSource, ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, ThrottleConfig, loopback, pg_write_target,
+    SessionConfig, SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1148,7 +1148,6 @@ pub async fn spawn_server(
         session,
         upkeep,
         signer,
-        ThrottleConfig::default(),
     );
     // R27 decision 6: move-out withdrawals are read on the admin pool, as the
     // binary reads them on DATABASE_URL's, because the caller can no longer

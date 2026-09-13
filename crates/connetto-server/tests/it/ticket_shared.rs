@@ -12,9 +12,9 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, Materializer, NoConnector, PageSpec, RequestGuard,
-    SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    ThrottleConfig, loopback, pg_write_target,
+    AbuseConfig, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, PageSpec,
+    RequestGuard, SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, with_user};
 use diesel_async::AsyncPgConnection;
@@ -286,13 +286,12 @@ pub(crate) type TicketManager<S> = SessionManager<
     S,
 >;
 
-/// Build a session manager whose reader gate the caller chooses.
+/// Build a session manager whose guard the caller chooses.
 pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
     guard: Arc<RequestGuard<String>>,
     signer: S,
-    throttle: &ThrottleConfig,
 ) -> Arc<TicketManager<S>> {
     SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
@@ -306,11 +305,10 @@ pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
         SessionConfig::default(),
         None,
         signer,
-        *throttle,
     )
 }
 
-/// Build a session manager with the default guard and oplog.
+/// Build a session manager whose guard carries `throttle`, with the default oplog.
 pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
@@ -320,9 +318,8 @@ pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
     build_manager_with_guard(
         reader_pool,
         roster,
-        Arc::new(RequestGuard::default()),
+        Arc::new(RequestGuard::new(*throttle, AbuseConfig::default())),
         signer,
-        throttle,
     )
 }
 

@@ -33,14 +33,14 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
-const PG_DDL: &str =
+pub(crate) const PG_DDL: &str =
     "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT);";
 
 /// Shared setup for both tests. `Fixture` holds the process-wide serialization
 /// lock, so the two do not race each other's `DROP TABLE notes`, and it
 /// provisions `_connetto_mutations` fresh, which the writer role is granted on
 /// below.
-async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
@@ -76,7 +76,7 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 }
 
 /// The `(id, owner)` rows in `notes`, read as admin so RLS does not hide any.
-async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<(i32, String)> {
+pub(crate) async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<(i32, String)> {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -93,7 +93,7 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<(i32, String)> {
 }
 
 /// A snapshot source that is never invoked (no subscriptions).
-struct NoSnapshot;
+pub(crate) struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
@@ -138,7 +138,7 @@ impl SnapshotSource for NoSnapshot {
 }
 
 /// A changeset inserting one fully-specified `notes` row.
-fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str) -> Vec<u8> {
+pub(crate) fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str) -> Vec<u8> {
     let table = SimpleTable::new("notes", &["id", "owner", "body", "edited_at"], &[0]);
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
@@ -184,14 +184,14 @@ fn reassign_changeset(id: i64, old_owner: &str, new_owner: &str, edited_at: &str
         .build()
 }
 
-async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
+pub(crate) async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
         Some(IncomingFrame::Control(msg)) => msg,
         other => panic!("expected control frame, got {other:?}"),
     }
 }
 
-async fn handshake<T: Transport>(transport: &mut T, client_id: &str) {
+pub(crate) async fn handshake<T: Transport>(transport: &mut T, client_id: &str) {
     // The verified grant's user_id becomes app.user_id under RLS.
     handshake_with(transport, client_id, &[&format!("user:{client_id}")]).await;
 }
@@ -212,7 +212,7 @@ async fn handshake_with<T: Transport>(transport: &mut T, client_id: &str, grants
     };
 }
 
-async fn upload<T: Transport>(transport: &mut T, client_seq: u64, changeset: Vec<u8>) {
+pub(crate) async fn upload<T: Transport>(transport: &mut T, client_seq: u64, changeset: Vec<u8>) {
     let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress");
     transport
         .send_control(ControlMessage::MutationHeader(MutationHeader::new(
@@ -230,7 +230,7 @@ async fn upload<T: Transport>(transport: &mut T, client_seq: u64, changeset: Vec
 
 /// Ping and return the next control frame. A pong proves every preceding frame
 /// was handled; a reject for an earlier upload arrives before it.
-async fn barrier<T: Transport>(transport: &mut T, nonce: u64) -> ControlMessage {
+pub(crate) async fn barrier<T: Transport>(transport: &mut T, nonce: u64) -> ControlMessage {
     transport
         .send_control(ControlMessage::Ping(Ping { nonce }))
         .await

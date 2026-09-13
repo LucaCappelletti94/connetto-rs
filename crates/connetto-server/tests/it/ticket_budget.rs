@@ -117,7 +117,6 @@ async fn ticket_path_holds_reader_permit() {
             .withholding(WITHHELD_ID),
         guard,
         OkSigner,
-        &ThrottleConfig::default(),
     );
 
     // Both sessions handshake while the anonymous share is free: the watermark
