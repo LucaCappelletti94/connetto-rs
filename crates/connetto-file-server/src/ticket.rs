@@ -101,30 +101,26 @@ pub struct TicketSigner {
 /// Returns `TicketError::InsecureBase` when the scheme is `http` and the host
 /// is not `localhost`, `127.0.0.1`, or `[::1]`.
 fn validate_base(base_url: &str) -> Result<(), TicketError> {
-    let after_scheme = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"));
-    let is_http = base_url.starts_with("http://");
-    let loopback = match after_scheme {
-        Some(rest) => {
-            let authority = rest.split('/').next().unwrap_or(rest);
-            let host = match authority.strip_prefix('[') {
-                // A bracketed IPv6 host holds colons of its own, so the port is whatever
-                // follows the closing bracket.
-                Some(inside) => inside.split(']').next().unwrap_or(inside),
-                None => authority.split(':').next().unwrap_or(authority),
-            };
-            matches!(host, "localhost" | "127.0.0.1" | "::1")
-        }
+    let insecure = || TicketError::InsecureBase {
+        base: base_url.to_owned(),
+    };
+    let url = url::Url::parse(base_url).map_err(|_| insecure())?;
+    // The host comes from the parser rather than from the text, because userinfo of the
+    // form localhost@elsewhere reads as a loopback authority and resolves elsewhere.
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     };
-    if after_scheme.is_some() && (!is_http || loopback) {
-        Ok(())
-    } else {
-        Err(TicketError::InsecureBase {
-            base: base_url.to_owned(),
-        })
+    if url.username().is_empty() && url.password().is_none() {
+        match url.scheme() {
+            "https" => return Ok(()),
+            "http" if loopback => return Ok(()),
+            _ => {}
+        }
     }
+    Err(insecure())
 }
 
 impl TicketSigner {

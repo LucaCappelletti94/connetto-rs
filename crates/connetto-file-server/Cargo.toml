@@ -40,6 +40,8 @@ serde = { workspace = true }
 # URL-safe base64 for ticket token encoding.
 base64 = "0.22"
 bytes = "1"
+# Standards-compliant URL parsing, so a ticket base's host is the host a client resolves.
+url = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 [dev-dependencies]

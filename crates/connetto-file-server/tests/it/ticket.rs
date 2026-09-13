@@ -277,6 +277,27 @@ fn http_loopback_127_base_is_accepted() {
     .expect("loopback http base must be accepted");
 }
 
+/// Proves: an authority whose userinfo reads as loopback is refused, because the host a
+/// client resolves is the one after the at sign.
+#[test]
+fn a_loopback_userinfo_base_is_refused() {
+    let Err(err) = connetto_file_server::TicketSigner::generate(
+        "http://localhost:80@evil.example".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    ) else {
+        panic!("a userinfo authority must be refused, got Ok")
+    };
+    assert!(
+        matches!(
+            &err,
+            connetto_file_server::ticket::TicketError::InsecureBase { base }
+                if base == "http://localhost:80@evil.example"
+        ),
+        "expected InsecureBase naming the base, got {err:?}"
+    );
+}
+
 /// Proves: the bracketed `IPv6` loopback is accepted with a port, which is the form a
 /// harness binds when it serves on `::1`.
 #[test]
