@@ -425,6 +425,31 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// A boot parameter already on the worker URL is replaced, not duplicated, because the worker
+/// reads the first value of the name.
+#[wasm_bindgen_test]
+fn boot_tagged_url_replaces_an_existing_boot_parameter() {
+    let identity = super::boot::BootIdentity::mint();
+    let tagged = super::boot::boot_tagged_url("./db-worker.js?boot=stale&keep=yes", &identity)
+        .expect("a relative worker URL must be taggable");
+    let url = web_sys::Url::new(&tagged).expect("the tagged URL must parse");
+    let params = url.search_params();
+    assert_eq!(
+        params.get_all("boot").length(),
+        1,
+        "the boot parameter must appear once: {tagged}"
+    );
+    assert!(
+        identity.matches_str(&params.get("boot").unwrap_or_default()),
+        "the boot parameter must name this boot: {tagged}"
+    );
+    assert_eq!(
+        params.get("keep").as_deref(),
+        Some("yes"),
+        "an unrelated parameter must survive: {tagged}"
+    );
+}
+
 /// The generated bootstrap leaves its boot identity in a global, because a blob worker's own
 /// location carries no query for it to read.
 #[wasm_bindgen_test]

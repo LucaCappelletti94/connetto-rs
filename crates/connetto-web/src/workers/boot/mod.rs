@@ -11,6 +11,9 @@ mod services;
 /// The query parameter a spawned worker reads its boot identity from.
 const BOOT_PARAM: &str = "boot";
 
+/// The query parameter a bootstrap script reads the glue URL from.
+const GLUE_PARAM: &str = "glue";
+
 /// The global a generated bootstrap leaves its boot identity in, because a blob worker's own
 /// location carries no query.
 const BOOT_GLOBAL: &str = "connettoBoot";
@@ -345,18 +348,9 @@ pub fn spawn_db_worker(
             let base = current_location_href()?;
             let url = web_sys::Url::new_with_base(script_url, &base)
                 .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
-            let encoded = String::from(js_sys::encode_uri_component(glue_url));
-            let existing = url.search();
-            // existing is "" or "?key=val"; set_search prepends "?" automatically.
-            let new_search = if existing.is_empty() {
-                format!("glue={encoded}&{BOOT_PARAM}={identity}")
-            } else {
-                format!(
-                    "{}&glue={encoded}&{BOOT_PARAM}={identity}",
-                    existing.trim_start_matches('?')
-                )
-            };
-            url.set_search(&new_search);
+            let params = url.search_params();
+            params.set(GLUE_PARAM, glue_url);
+            params.set(BOOT_PARAM, &identity.to_string());
             let worker = Worker::new_with_options(&url.href(), &options)
                 .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
             Ok((worker, identity))
@@ -374,22 +368,18 @@ pub fn spawn_db_worker(
 
 /// The URL a worker is spawned from, carrying the boot identity as a query parameter.
 ///
+/// A reserved parameter already present is replaced, because the worker reads the first
+/// value of the name and a second one would name a boot nobody is waiting for.
+///
 /// The worker reads it back from its own location, which is how a boot failure after the
 /// import names the boot it belongs to.
-fn boot_tagged_url(url: &str, identity: &BootIdentity) -> Result<String, BootError> {
+pub(super) fn boot_tagged_url(url: &str, identity: &BootIdentity) -> Result<String, BootError> {
     let base = current_location_href()?;
     let tagged = web_sys::Url::new_with_base(url, &base)
         .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
-    let existing = tagged.search();
-    let query = if existing.is_empty() {
-        format!("{BOOT_PARAM}={identity}")
-    } else {
-        format!(
-            "{}&{BOOT_PARAM}={identity}",
-            existing.trim_start_matches('?')
-        )
-    };
-    tagged.set_search(&query);
+    tagged
+        .search_params()
+        .set(BOOT_PARAM, &identity.to_string());
     Ok(tagged.href())
 }
 

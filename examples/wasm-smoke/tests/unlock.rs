@@ -76,8 +76,7 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
     let wasm_url = glue_url
         .strip_suffix(".js")
         .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
-    // Broadcast failures to both channels: debug preserves the old assertion,
-    // hello lets readiness fail by name.
+    // This blob carries no boot identity, so its failures reach the debug channel only.
     let source = format!(
         "try {{\
          \n  const mod = await import(\"{g}\");\
@@ -85,7 +84,6 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
          \n  await mod.db_worker_unlock_boot();\
          \n}} catch (err) {{\
          \n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker FAILED: \" + err);\
-         \n  new BroadcastChannel(\"connetto-hello\").postMessage(\"failed:\" + err);\
          \n  throw err;\
          \n}}\n",
         g = glue_url,
