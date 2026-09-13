@@ -4628,9 +4628,9 @@ Storage quotas and the deployment-wide ceilings are NOT in this phase. They are 
 
 ## R87: storage quotas and the deployment ceilings
 
-**Status.** NOT STARTED. Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto.
+**Status.** NOT STARTED. Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto. The four points the 2026-09-12 review found undefined were decided 2026-09-13 and are recorded under Decided.
 
-**Blocked on** R65, which is done. R67 and R68 do NOT depend on this phase.
+**Blocked on** R69's pull request A, which puts the file routes in the shipped executable: until then no deployment serves files, so saturation has nowhere to be observed. R67 and R68 do NOT depend on this phase.
 
 ### Purpose
 
@@ -4642,16 +4642,25 @@ Why here and not in R66: the numbers already exist in the file server's own tabl
 
 1. The per-identity storage quota, checked at commit, summed over that uploader's committed manifests.
 2. The deployment-wide storage ceiling, the same sum without the identity predicate.
-3. The deployment-wide bandwidth ceiling over a window, measured from bytes actually served and accepted rather than from bytes authorized.
-4. Saturation logging. A refusal caused by a deployment ceiling is an operator event, so the caller sees the same byte-identical refusal while the structured log names which ceiling saturated, letting an operator see it coming instead of learning from a support ticket.
+3. The deployment-wide bandwidth ceiling over a rolling window, measured from bytes actually served and accepted rather than from bytes authorized, counted in a `_cfs_traffic` table per the decision below.
+4. Saturation logging: the warning fraction and the once-per-crossing events per the decision below, so an operator sees a ceiling coming instead of learning from a support ticket.
+5. The HTTP answers per the decision below, and the client side of them: the outbox driver backs off on `503` through its existing `Sleeper`, and `resolve` reports a `507` on commit as a typed quota event the application can name to the user.
 
 ### Decided
 
 **Deduplication accounting, decided 2026-09-08.** Every declarer is charged the full size, and the deployment-wide ceiling is measured separately from real usage rather than by summing quotas. So the quotas may sum to more than the disk holds, which is intended: a user's usage never moves because a stranger uploaded or deleted the same content. Rejected: charging the deduplicated share, which makes one user's reported usage depend on what other users store and is a weak cross-user signal about their content, and charging the first uploader only, which is unfair and makes deletion awkward.
 
+**The window and its counter, decided 2026-09-13.** The file server is stateless and scales out (R69 decision 1), so the counter lives in Postgres or each replica counts alone: a `_cfs_traffic` table with one row per day carrying served and accepted bytes, upserted per response, in `DEPLOYMENT_DDL` and checked by preflight. The window is a configured trailing duration (default thirty days), summed over the day rows it covers. Each file server caches the window's sum and the deployment's stored-bytes sum (distinct chunks in the registry, which is what real usage means under the deduplication decision) and refreshes both on a short cadence, so a `GET` and a commit check a number in memory. The overshoot is bounded by the cadence times the deployment's throughput and is written into the setting's documentation rather than hidden. Rejected: a calendar month, which lines up with a bill but saturates in a cliff at month's end and forgives everything at once on the first. Rejected: an exact sum per request, one extra query on every served response for a bound nobody needs to the byte.
+
+**The HTTP answers, decided 2026-09-13, narrowing the done-when's indistinguishability to R38's reason.** R38 makes refusals indistinguishable so no answer reveals whether a file exists or who may see it, and a ceiling reveals neither. A commit over the uploader's own quota answers `507 Insufficient Storage`, because the user can delete something and is owed a message saying so. A deployment ceiling, storage or bandwidth, answers `503` with `Retry-After` (the seconds to the window rolling past the oldest counted day for bandwidth, a fixed interval for storage), the server's existing transient convention (`RegistryConflict`), so the outbox driver backs off and a read shows its placeholder rather than a broken image, while the structured log names the ceiling. Rejected: `404` for all three, which makes a served-out deployment look like every photo vanished and teaches the operator's own client nothing. Rejected: `503` for the quota too, telling a user to wait for something that never clears on its own.
+
+**The warning, recorded 2026-09-13.** One setting, a fraction of each ceiling (default 0.8), fires one structured warning per crossing per ceiling, re-armed when usage drops below the fraction again, and an error at saturation. Nothing to decide, recorded so the phase does not rediscover it.
+
+**Two meters, recorded 2026-09-13, restating chapter 18.** R66's per-identity bandwidth rate is abuse prevention: charged at the mint from declared sizes, in connetto's memory, forgiven by a restart. This phase's ceilings are accounting: measured in the file server from bytes actually served and accepted, durable in Postgres. They neither replace nor consult each other.
+
 ### Done when
 
-A commit is refused when the uploader is over quota and when the deployment is over its storage ceiling, each refusal indistinguishable from the others on the wire and each naming its cause in the log, with the deployment-wide numbers measured from the file server's own tables.
+A commit is refused with `507` when the uploader is over quota and with `503` when the deployment is over its storage ceiling, a read is refused with `503` when the deployment is over its bandwidth window, each naming its cause in the log and none revealing existence or visibility, the warning fires once at the fraction, and the deployment-wide numbers are measured from the file server's own tables and shared by every replica of it.
 
 ---
 
