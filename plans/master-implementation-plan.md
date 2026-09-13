@@ -138,8 +138,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R24~~ | File-sync integration, a design, from which R64 to R69 derive |
 | done | ~~R25~~ | Device-to-device sync, a design, from which R74 to R80 derive |
 | done | ~~R30~~ | Grouped aggregates revisited, a design, from which R82 to R85 derive |
-| any | R51 | Native Apple gate. Needs the provisioned-app packaging and a phone, and nothing depends on it |
-| any | R52 | Native Android gate. Needs a device, and nothing depends on it |
+| any | R88 | The mobile build of a demo, Android first on this workstation, then iOS through the Mac. R51, R52, R76 and R80 need it |
+| any | R51 | Native Apple gate. Needs R88's iOS leg, and nothing depends on it |
+| any | R52 | Native Android gate. Needs R88's Android leg, and nothing depends on it |
 | blocked | R53 | Windows gate. Blocked on hardware |
 | any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
@@ -153,11 +154,11 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
 | any | R74 | Device identity and certificates, first of the peer phases. Needs nothing |
 | any | R75 | The per-device applied frontier. Needs R74 |
-| any | R76 | The peer link. Needs R74 |
+| any | R76 | The peer link. Needs R74, and R88 for its platform notes to be real on a phone |
 | any | R77 | The exchange and the provisional tier. Needs R75, R76 and R57 step 8 |
 | any | R78 | Courier recovery. Needs R75 and R77 |
 | any | R79 | Media over the peer link. Needs R77 and R67 |
-| any | R80 | Peer sync in every demo. Needs R77, R78 and R79, and a mobile build of a demo that nothing yet owns |
+| any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
 ## Status and blockers
@@ -196,8 +197,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R50 the policy answers a write it never asks | **DONE** (2026-08-18) | nothing | no, discharged |
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
-| R51 native Apple gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
-| R52 native Android gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
+| R51 native Apple gate | NOT STARTED | R88's iOS leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
+| R52 native Android gate | NOT STARTED | R88's Android leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
+| R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -247,11 +249,11 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
 | R74 device identity and certificates | NOT STARTED | nothing | no |
 | R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
-| R76 the peer link | NOT STARTED | R74 | no |
+| R76 the peer link | NOT STARTED | R74, and R88 for the platform notes to run on a phone (added 2026-09-13) | no |
 | R77 the peer exchange and provisional tier | NOT STARTED | R75 and R76. The retraction's reason rides on R57 step 8's fix | no |
 | R78 courier recovery | NOT STARTED | R75 and R77 | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
-| R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
+| R80 peer sync in every demo | NOT STARTED | R77, R78, R79 and R88 (added 2026-09-13) | no |
 | R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | no longer: the GROUP BY/HAVING refusal defect is resolved upstream and adopted (2026-08-25) |
 | R82 grouped and re-executed delivery | **DONE** (2026-08-26) | nothing | no longer: everything it needed is upstream and adopted (subql `3d75cca`) |
 | R83 client resting table | **DONE** (2026-08-26) | nothing | no: it needed nothing and the design's eight decisions were built as recorded, with decision 1 amending R30's decision 6 (the resting key is query identity, not `sub_id`) |
@@ -2672,6 +2674,8 @@ Found while gating `R62` by mirroring `ci.yml` job for job instead of running th
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19 so each surface lands alone.
 
+**Blocked on** R88, the mobile build of a demo, whose iOS leg is the signed provisioned `.app` this phase's gated item needs (added 2026-09-13).
+
 Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store` 1.0.1 `protected::Store` with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). Nothing needs contributing upstream. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
 
 ### Steps
@@ -2688,6 +2692,8 @@ The probe app remains the platform evidence for prompting behaviour, since provi
 ## R52: native Android gate for stored secrets
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19.
+
+**Blocked on** R88, the mobile build of a demo, whose Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in (added 2026-09-13).
 
 Gate both items through a hand-built Keystore key with `set_user_authentication_required(true)` (probe A6: the flag gates correctly, an ungated read is refused by the Keystore). Stock `keyring::Entry` in `android-keyring` 0.2.0 hardcodes the flag off, so the key is built by hand, and the crate is a single-author dependency that would hold the key to every local replica, which this phase weighs explicitly (use, wrap, vendor, or contribute). The read-past-refusal prompt (`BiometricPrompt` plus `CryptoObject`) belongs to the application shell, and the demo carries a minimal one. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
 
@@ -4875,7 +4881,7 @@ A write applied through any path is refused by every other path, proven three wa
 
 **Status.** NOT STARTED.
 
-**Blocked on** R74.
+**Blocked on** R74, and on R88 for step 3's platform notes to be exercised on a phone (added 2026-09-13).
 
 ### Purpose
 
@@ -4968,7 +4974,7 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 
 **Status.** NOT STARTED.
 
-**Blocked on** R77, R78 and R79.
+**Blocked on** R77, R78 and R79, and on R88 for the phones the field test and the mixed-fleet demonstration run on (added 2026-09-13).
 
 ### Steps
 
@@ -4979,6 +4985,34 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 ### Done when
 
 A person with two devices on one hotspot exercises the whole flow through a demo, and the field test's answer is recorded in chapter 19.
+
+---
+
+## R88: the mobile build of a demo
+
+**Status.** NOT STARTED. Minted 2026-09-13 by the review of the remaining phases: R51, R52, R76 and R80 each need a demo running on a phone, and nothing produces one. `connetto-client` already compiles per platform (`auth.rs` selects the Apple keychain store for macOS and iOS, keyutils for Linux, Windows native, and answers `native auth has no keyring store for this platform` on Android), so the library has an iOS path and a deliberately absent Android one, and no demo has a mobile target, a manifest, an entitlement or a signing recipe. The probes that measured the platforms (`webauth-spike`, a sibling repository) are standalone apps and answer only platform questions.
+
+**Blocked on nothing.** Two legs by where the hardware is, decided with the maintainer 2026-09-13: **Android first**, because this workstation carries the SDK, NDK 28, the four Android Rust targets and `dx`, and the maintainer's device attaches to it. **iOS and iPadOS second**, through the maintainer's Mac, because Xcode, a provisioning profile and the `keychain-access-groups` entitlement exist only there, and R51 already records that the gated keychain item lives only in a signed provisioned `.app`.
+
+### Purpose
+
+The phases that need a phone need one demo that builds for it, launches against the dev stack, signs in, syncs and writes offline. This phase owns that build and nothing the phases on top of it own: R52's Keystore key and prompt, R51's gated keychain item, R76's hotspot and local-network permissions and R80's camp flow each land in their own phase on the target this one provides.
+
+### Steps
+
+1. **Which demo.** `dioxus-desktop-demo` gains the mobile targets rather than a new example crate, so the R54 rule keeps one native demo carrying every feature. If Dioxus's mobile packaging forces a split (a separate manifest and asset tree), the split is a `mobile` binary in the same crate, never a second demo whose feature list drifts.
+2. **Android.** The `dx` Android target, the manifest with the permissions the built library needs today (network, cleartext to the dev stack's loopback through `adb reverse`, nothing peer-related yet), a debug-signed build that installs on the attached device, the Android arm of `install_keyring_store` left as the honest refusal it is until R52 (R23's custody surface reports it), and a device recipe: `adb reverse` for the dev stack's ports, the identity provider reachable, sign-in in the WebView.
+3. **iOS and iPadOS.** The `dx` iOS target, the bundle identifier, the `keychain-access-groups` entitlement R51 needs (harmless before R51 uses it), the local-network usage description R76 will need, a development-signed build through the maintainer's Mac that installs on the phone and the iPad, and the same device recipe over the LAN. The iPad is named because chapter 14 records it as unmeasured.
+4. **CI legs that need no device.** `cargo check -p dioxus-desktop-demo --target aarch64-linux-android` in the gate and in `.github/workflows/ci.yml`, catching link and `cfg` breakage on every pull request. The iOS check runs only where an Apple SDK exists, so it is a gate line the maintainer runs on the Mac and CI records as not run rather than green.
+5. **Chapter 14's platform rows** gain what the build measured: which custody the demo reports on each phone before R51 and R52.
+
+### Proof
+
+The demo launches on the maintainer's Android device and on the iPhone, signs in against the dev stack, syncs the demo tables, writes an order offline and uploads it on reconnect. Recorded with the device, OS version and build date in this section, since no test can run it.
+
+### Done when
+
+One demo builds and runs on both mobile platforms from a written recipe, the Android check leg is in CI, and R51, R52, R76 and R80 name this phase as their target.
 
 ---
 
