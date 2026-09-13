@@ -26,7 +26,7 @@ use crate::abuse::{
 use crate::audit::{AuditHook, AuthEvent, AuthOp};
 use crate::ban::{Ban, BanError, BanStore, NewBan};
 use crate::reserve::{ReaderGate, ReaderPermit};
-use crate::throttle::{AuthThrottle, Counters, HandleThrottle, ThrottleConfig, Tier};
+use crate::throttle::{AuthThrottle, ByteThrottle, Counters, HandleThrottle, ThrottleConfig, Tier};
 
 /// Closes every live connection one banned person holds, telling them nothing.
 ///
@@ -116,6 +116,7 @@ impl ConnectionTallies {
 pub struct RequestGuard<Id> {
     handles: HandleThrottle,
     auth: AuthThrottle,
+    bytes: ByteThrottle,
     owners: Mutex<HashMap<SessionId, Owner<Id>>>,
     abuse: AbuseConfig,
     person_retain: Duration,
@@ -165,6 +166,7 @@ where
             key_cap: throttle.key_cap(),
             auth: AuthThrottle::new(&throttle),
             handles: HandleThrottle::new(&throttle),
+            bytes: ByteThrottle::new(&throttle),
             owners: Mutex::new(HashMap::new()),
             person_retain: abuse.person_retain(),
             abuse,
@@ -176,6 +178,12 @@ where
             close: OnceLock::new(),
             reader: None,
         }
+    }
+
+    /// The upload and mutation byte meters, built from the same configuration
+    /// as every other limit so a deployer sets it once.
+    pub(crate) const fn bytes(&self) -> &ByteThrottle {
+        &self.bytes
     }
 
     /// Attach the ban list. Without one connetto cannot ban and cannot refuse a

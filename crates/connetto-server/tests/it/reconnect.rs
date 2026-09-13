@@ -26,7 +26,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, OplogConfig, PageSpec,
     RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    ThrottleConfig, loopback, pg_write_target,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -389,7 +389,6 @@ async fn cursor_outside_window_forces_full_resync() {
         SessionConfig::default(),
         None,
         NoSigner,
-        ThrottleConfig::default(),
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

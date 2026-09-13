@@ -980,6 +980,11 @@ struct SessionState<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
+    /// A deferred mutation and when its deferral ends. Every later sequence on
+    /// this connection is deferred behind it, because the watermark is one
+    /// number: a later write applied first would advance it past the deferred
+    /// one, whose resend the watermark check would then acknowledge unapplied.
+    deferred: Option<(u64, Instant)>,
     /// The connetto-minted session id from the verified token. The durable
     /// watermark keys on it, so a reconnect reusing the same session dedupes.
     session_id: SessionId,
@@ -1078,12 +1083,6 @@ pub struct SessionManager<
     /// server. Generic rather than boxed so a deployment wires it at compile
     /// time without a vtable allocation on the hot ticket path.
     signer: S,
-    /// Per-identity rolling bandwidth budget for the write verb.
-    ///
-    /// Charged once at the mint, before the signer is called, against the
-    /// declared upload size. Stays in memory: this is abuse prevention, not
-    /// accounting, and a restart forgiving recent history is not a vector.
-    content_throttle: crate::throttle::ContentThrottle,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -1122,7 +1121,6 @@ where
             config,
             None,
             NoSigner,
-            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
@@ -1165,7 +1163,6 @@ where
             config,
             upkeep,
             NoSigner,
-            crate::throttle::ThrottleConfig::default(),
         )
     }
 }
@@ -1198,7 +1195,6 @@ where
         config: SessionConfig,
         upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
         signer: S,
-        content_config: crate::throttle::ThrottleConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             catalog: Arc::new(materializer.catalog().clone()),
@@ -1221,7 +1217,6 @@ where
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
             signer,
-            content_throttle: crate::throttle::ContentThrottle::new(&content_config),
         })
     }
 }
@@ -2638,38 +2633,143 @@ where
         }
     }
 
-    /// Take the mutation's reader-share permit (R39), or defer the mutation
-    /// in R19's shape and report [`None`].
+    /// Take the mutation's reader-share permit (R39) and then charge its
+    /// compressed bytes to the caller's window, in that order so a write the
+    /// share defers has spent nothing and is not charged twice on resend. Either
+    /// refusal defers the mutation in R19's shape and reports [`None`].
     ///
     /// The refusal is correlated by the `client_seq` rendered as a string,
-    /// exactly as `NonFatalError` correlates. The mutation is neither applied
-    /// nor acknowledged, so it stays pending on the client and replays on
-    /// reconnect.
-    async fn mutation_reader_permit<T: Transport>(
+    /// exactly as `NonFatalError` correlates, and records the deferral so every
+    /// later sequence on this connection waits behind it. The mutation is
+    /// neither applied nor acknowledged, so it stays pending on the client and
+    /// replays in order. The byte window is keyed by identity, and by the
+    /// session handle for a caller with none, so unidentified runs never share
+    /// one bucket.
+    async fn mutation_permit<T: Transport>(
         &self,
         transport: &mut T,
-        client_seq: u64,
-        state: &SessionState<Id, Key>,
+        patch: &MutationPatch,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<Option<ReaderPermit>, SessionError> {
-        match self.guard.reader_permit(Tier::of(&state.principal)).await {
-            Ok(permit) => Ok(Some(permit)),
+        let client_seq = patch.client_seq;
+        let permit = match self.guard.reader_permit(Tier::of(&state.principal)).await {
+            Ok(permit) => permit,
             Err(wait) => {
-                let retry_after_ms = retry_ms(wait);
                 tracing::warn!(
                     client_seq,
-                    retry_after_ms,
+                    retry_after_ms = retry_ms(wait),
                     "mutation deferred, the unreserved reader share is full"
                 );
-                transport
-                    .send_control(ControlMessage::RateLimited(RateLimited {
-                        related_to: Some(client_seq.to_string()),
-                        retry_after_ms,
-                    }))
-                    .await
-                    .map_err(transport_err)?;
+                self.defer_mutation(transport, client_seq, wait, state)
+                    .await?;
+                return Ok(None);
+            }
+        };
+        let key = state
+            .principal
+            .identity()
+            .map_or_else(|| state.session_id.to_string(), |id| id.user_id.to_string());
+        let patch_len = u64::try_from(patch.patchset_zstd.len()).unwrap_or(u64::MAX);
+        match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
+            Ok(()) => {
+                if state.deferred.is_some_and(|(seq, _)| seq == client_seq) {
+                    state.deferred = None;
+                }
+                Ok(Some(permit))
+            }
+            Err(wait) => {
+                tracing::warn!(
+                    client_seq,
+                    patch_len,
+                    retry_after_ms = retry_ms(wait),
+                    "mutation deferred, the caller's byte window is spent"
+                );
+                self.defer_mutation(transport, client_seq, wait, state)
+                    .await?;
                 Ok(None)
             }
         }
+    }
+
+    /// Answer `RateLimited` for `client_seq` and record the deferral so later
+    /// sequences on this connection wait behind it. An already deferred
+    /// sequence keeps its earlier deadline.
+    async fn defer_mutation<T: Transport>(
+        &self,
+        transport: &mut T,
+        client_seq: u64,
+        wait: Duration,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        match state.deferred {
+            Some((seq, _)) if seq == client_seq => {}
+            _ => state.deferred = Some((client_seq, Instant::now() + wait)),
+        }
+        transport
+            .send_control(ControlMessage::RateLimited(RateLimited {
+                related_to: Some(client_seq.to_string()),
+                retry_after_ms: retry_ms(wait),
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
+    /// Everything that gates a mutation before the watermark. The header and
+    /// patch must agree on the sequence and the patch must fit the byte window
+    /// at all, each refused with a reject the client rolls back, since neither
+    /// can ever be resent as it is. The per-write measurement an operator sizes
+    /// the meter from is logged. A sequence past a deferred one is deferred
+    /// behind it with the same deadline, so writes apply in the order the
+    /// client numbered them. `false` means the mutation was answered here.
+    async fn admit_mutation<T: Transport>(
+        &self,
+        transport: &mut T,
+        header: &MutationHeader,
+        patch: &MutationPatch,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<bool, SessionError> {
+        let client_seq = patch.client_seq;
+        let patch_len = patch.patchset_zstd.len();
+        tracing::debug!(
+            client_seq,
+            op_count = header.op_count,
+            patch_bytes = patch_len,
+            "mutation received"
+        );
+        let refusal = if header.client_seq == client_seq {
+            self.guard
+                .bytes()
+                .mutation_limit()
+                .filter(|limit| u64::try_from(patch_len).unwrap_or(u64::MAX) > *limit)
+                .map(|limit| {
+                    format!("mutation of {patch_len} bytes exceeds the {limit} byte window")
+                })
+        } else {
+            Some("mutation header and patch client_seq disagree".to_owned())
+        };
+        if let Some(detail) = refusal {
+            self.reject(
+                transport,
+                client_seq,
+                MutationRejectReason::Other { detail },
+            )
+            .await?;
+            return Ok(false);
+        }
+        if let Some((deferred_seq, until)) = state.deferred
+            && client_seq > deferred_seq
+        {
+            let wait = until.saturating_duration_since(Instant::now());
+            tracing::debug!(
+                client_seq,
+                deferred_seq,
+                "mutation deferred behind an earlier one"
+            );
+            self.defer_mutation(transport, client_seq, wait, state)
+                .await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Take a row subscription's reader-share permit (R39), or refuse it in
@@ -2911,6 +3011,7 @@ where
             outbound: outbound_tx,
             principal,
             pending_header: None,
+            deferred: None,
             session_id,
             applied_watermark,
             resume_lsn,
@@ -3113,7 +3214,8 @@ where
         // a write that was never authorized costs nothing.
         if let ContentVerb::Write { declared_len } = req.verb
             && !self
-                .content_throttle
+                .guard
+                .bytes()
                 .allow_content_bytes(caller_str, declared_len)
         {
             return transport
@@ -3276,16 +3378,11 @@ where
                 "mutation patch arrived without a preceding header".into(),
             ));
         };
-        if header.client_seq != client_seq {
-            return self
-                .reject(
-                    transport,
-                    client_seq,
-                    MutationRejectReason::Other {
-                        detail: "mutation header and patch client_seq disagree".into(),
-                    },
-                )
-                .await;
+        if !self
+            .admit_mutation(transport, &header, &patch, state)
+            .await?
+        {
+            return Ok(());
         }
         // Exactly-once: a sequence at or below the durable watermark was
         // already applied (this session or an earlier one). Re-acknowledge
@@ -3330,10 +3427,7 @@ where
         // context so the database gates the write. The apply is the mutation's
         // one reader-pool checkout, so a share permit spans it (R39).
         let outcome = {
-            let Some(_reader_permit) = self
-                .mutation_reader_permit(transport, client_seq, state)
-                .await?
-            else {
+            let Some(_reader_permit) = self.mutation_permit(transport, &patch, state).await? else {
                 return Ok(());
             };
             self.target
@@ -3613,6 +3707,32 @@ where
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let tier = Tier::of(&state.principal);
+        // The reader-share permit (R39) comes first and the allowance second,
+        // so a subscribe the share defers has spent nothing and its retry is
+        // not refused by count, while a probe that fails to resolve still pays
+        // (R36 counts probing, and a free failure would hand it an unlimited
+        // budget). The permit is held across registration, which is a
+        // materializer-lock translate and touches no database, and a computed
+        // subscription drops it before bootstrapping on the owner pool.
+        let reader_permit = match self.guard.reader_permit(tier).await {
+            Ok(permit) => permit,
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(
+                    sub_id = %sub.sub_id,
+                    retry_after_ms,
+                    "subscription deferred, the unreserved reader share is full"
+                );
+                transport
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(sub.sub_id),
+                        retry_after_ms,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
+        };
         if let Some(wait) = self.guard.subscription(state.session_id, tier) {
             let retry_after_ms = retry_ms(wait);
             tracing::warn!(
@@ -3670,18 +3790,26 @@ where
                     pg_sql,
                     member_tables,
                 };
-                self.serve_term_row(transport, sub, state, tier, reg).await
+                self.serve_term_row(transport, sub, state, tier, reg, reader_permit)
+                    .await
             }
             Registration::Computed(capture) => {
+                // Aggregates bootstrap through the re-execution connector on
+                // the owner pool and hold no share permit (R39).
+                drop(reader_permit);
                 self.subscribe_computed(transport, sub, state, capture)
                     .await
             }
         }
     }
 
-    /// Serve one registered row subscription: the R39 reader permit, the R27
-    /// allowance pre-charge for the membership subscription a term needs, the
-    /// snapshot or catchup, and the membership open behind it.
+    /// Serve one registered row subscription under the R39 reader permit the
+    /// caller already holds, which spans the whole row delivery (the snapshot
+    /// read or the catchup replay's visibility questions, which check out
+    /// reader connections one at a time, so an unidentified caller counts once
+    /// for the operation however many checkouts it makes): the R27 allowance
+    /// pre-charge for the membership subscription a term needs, the snapshot
+    /// or catchup, and the membership open behind it.
     async fn serve_term_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -3689,19 +3817,8 @@ where
         state: &mut SessionState<Id, Key>,
         tier: Tier,
         reg: RowRegistration,
+        reader_permit: ReaderPermit,
     ) -> Result<(), SessionError> {
-        // One share permit spans the whole row delivery (R39): the snapshot
-        // read or the catchup replay's visibility questions, which check out
-        // reader connections one at a time, so an unidentified caller counts
-        // once for the operation however many checkouts it makes. Aggregates
-        // bootstrap through the re-execution connector on the owner pool and
-        // take none.
-        let Some(reader_permit) = self
-            .subscribe_reader_permit(transport, tier, &sub.sub_id, reg.sub_id)
-            .await?
-        else {
-            return Ok(());
-        };
         let sub_label = sub.sub_id.clone();
         let (consumer_id, sub_id) = (reg.consumer_id, reg.sub_id);
         // R27 decisions 4 and 7: the membership subscription this term needs

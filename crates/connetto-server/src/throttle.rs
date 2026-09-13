@@ -15,8 +15,8 @@
 //! Occurrence counters use fixed windows: an event over the limit is refused
 //! and not counted, so hammering does not extend the wait, and the refusal
 //! states how long is left so a caller waits once instead of probing.
-//! The upload byte meter is a token bucket: allowance accrues continuously so
-//! straddling a window edge cannot authorize two full limits.
+//! The byte meters (uploads, mutations) are token buckets: allowance accrues
+//! continuously so straddling a window edge cannot authorize two full limits.
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
@@ -205,6 +205,8 @@ pub struct ThrottleConfig {
     max_tracked: usize,
     content_bytes_per_identity: u64,
     content_bytes_window: Duration,
+    mutation_bytes_per_identity: u64,
+    mutation_bytes_window: Duration,
 }
 
 /// How many distinct keys one signal tracks before it starts evicting.
@@ -225,6 +227,12 @@ const DEFAULT_REEXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// never reaches it in a sustained burst and tight enough that declaring a
 /// thousand max-size tickets in one minute is refused.
 const DEFAULT_CONTENT_BYTES: u64 = 1024 * MIB;
+/// Sixty-four mebibytes of compressed patch per minute per identity, a
+/// sixteenth of the upload default and the largest frame the websocket carries.
+/// Chosen by symmetry: nothing in this tree writes past 5 KB a minute, so the
+/// measured tail cannot size it, and a full pending-queue replay of 256
+/// mutations passes unless each averages a quarter mebibyte.
+const DEFAULT_MUTATION_BYTES: u64 = 64 * MIB;
 
 impl Default for ThrottleConfig {
     fn default() -> Self {
@@ -237,6 +245,8 @@ impl Default for ThrottleConfig {
             max_tracked: DEFAULT_MAX_TRACKED,
             content_bytes_per_identity: DEFAULT_CONTENT_BYTES,
             content_bytes_window: MINUTE,
+            mutation_bytes_per_identity: DEFAULT_MUTATION_BYTES,
+            mutation_bytes_window: MINUTE,
         }
     }
 }
@@ -321,6 +331,22 @@ impl ThrottleConfig {
     ) -> Self {
         self.content_bytes_per_identity = max_bytes;
         self.content_bytes_window = window;
+        self
+    }
+
+    /// How many bytes of compressed mutation patch one identity may send per window.
+    ///
+    /// Zero means unlimited. A refused mutation is deferred with `RateLimited`
+    /// and stays pending on the client, the same shape as the reader-share
+    /// deferral, so an honest burst waits once and a flood is counted.
+    #[must_use]
+    pub const fn with_mutation_bytes_per_identity(
+        mut self,
+        max_bytes: u64,
+        window: Duration,
+    ) -> Self {
+        self.mutation_bytes_per_identity = max_bytes;
+        self.mutation_bytes_window = window;
         self
     }
 
@@ -601,7 +627,14 @@ impl BucketWindow {
     /// Deduct `declared` bytes, refilling from elapsed time first.
     ///
     /// A refused request is not charged: hammering cannot drain a partial refill.
-    fn take(&mut self, limit_bytes: u64, window: Duration, declared: u64, now: Instant) -> bool {
+    /// The refusal carries how long until `declared` fits, at the bucket's refill rate.
+    fn take(
+        &mut self,
+        limit_bytes: u64,
+        window: Duration,
+        declared: u64,
+        now: Instant,
+    ) -> Result<(), Duration> {
         let elapsed = now.saturating_duration_since(self.last_update);
         let refill = {
             let limit_u128 = u128::from(limit_bytes); // lossless: u64 fits u128
@@ -613,10 +646,16 @@ impl BucketWindow {
         self.available = self.available.saturating_add(refill).min(limit_bytes);
         self.last_update = now;
         if declared > self.available {
-            return false;
+            let short = u128::from(declared - self.available);
+            let nanos = short
+                .saturating_mul(window.as_nanos())
+                .checked_div(u128::from(limit_bytes))
+                .unwrap_or(u128::MAX);
+            let wait = u64::try_from(nanos).map_or(window, Duration::from_nanos);
+            return Err(wait.min(window));
         }
         self.available -= declared;
-        true
+        Ok(())
     }
 
     /// A full bucket opened at `now`: a new caller starts with their whole allowance.
@@ -708,9 +747,15 @@ impl<K: Eq + Hash + Clone> ByteCounters<K> {
         }
     }
 
-    /// Accumulate `declared` bytes for `key` under `policy`, returning whether
-    /// the request is allowed.
-    fn allow(&self, key: &K, policy: BytePolicy, declared: u64, now: Instant) -> bool {
+    /// Accumulate `declared` bytes for `key` under `policy`, refusing with the
+    /// wait until the bytes fit.
+    fn allow(
+        &self,
+        key: &K,
+        policy: BytePolicy,
+        declared: u64,
+        now: Instant,
+    ) -> Result<(), Duration> {
         let (limit_bytes, window, retain, cap) =
             (policy.limit_bytes, policy.window, policy.retain, policy.cap);
         let mut state = self.state.lock();
@@ -724,7 +769,7 @@ impl<K: Eq + Hash + Clone> ByteCounters<K> {
         }
         let mut fresh = BucketWindow::full(limit_bytes, now);
         let ok = fresh.take(limit_bytes, window, declared, now);
-        if ok {
+        if ok.is_ok() {
             state.admit(key, cap, fresh);
         }
         ok
@@ -904,23 +949,26 @@ impl AuthThrottle {
     }
 }
 
-/// The per-identity upload bandwidth meter.
+/// The per-identity byte meters: upload bandwidth and mutation patch bytes.
 ///
 /// Charges each ticket request its declared size, so minting many tickets
-/// cannot authorize unlimited upload. In memory only, because this bounds abuse
-/// rather than accounting for usage.
+/// cannot authorize unlimited upload, and each mutation its compressed patch,
+/// so a write flood is counted rather than only absorbed by the reader share.
+/// In memory only, because this bounds abuse rather than accounting for usage.
 #[derive(Debug)]
-pub(crate) struct ContentThrottle {
+pub(crate) struct ByteThrottle {
     config: ThrottleConfig,
     per_identity: ByteCounters<String>,
+    mutations: ByteCounters<String>,
 }
 
-impl ContentThrottle {
+impl ByteThrottle {
     /// Build the counters for `config`.
     pub(crate) fn new(config: &ThrottleConfig) -> Self {
         Self {
             config: *config,
             per_identity: ByteCounters::new(),
+            mutations: ByteCounters::new(),
         }
     }
 
@@ -940,6 +988,32 @@ impl ContentThrottle {
         };
         self.per_identity
             .allow(&identity.to_owned(), policy, declared_len, Instant::now())
+            .is_ok()
+    }
+
+    /// The mutation byte limit, or `None` when unlimited. A patch larger than
+    /// this can never fit a full bucket, so it is rejected rather than deferred.
+    pub fn mutation_limit(&self) -> Option<u64> {
+        (self.config.mutation_bytes_per_identity != 0)
+            .then_some(self.config.mutation_bytes_per_identity)
+    }
+
+    /// Whether `identity` may send `patch_len` more bytes of mutation now, or
+    /// how long until it may.
+    ///
+    /// Zero configured means unlimited.
+    pub fn allow_mutation_bytes(&self, identity: &str, patch_len: u64) -> Result<(), Duration> {
+        if self.config.mutation_bytes_per_identity == 0 {
+            return Ok(());
+        }
+        let policy = BytePolicy {
+            limit_bytes: self.config.mutation_bytes_per_identity,
+            window: self.config.mutation_bytes_window,
+            retain: self.config.mutation_bytes_window,
+            cap: self.config.max_tracked,
+        };
+        self.mutations
+            .allow(&identity.to_owned(), policy, patch_len, Instant::now())
     }
 }
 
@@ -1130,7 +1204,7 @@ mod tests {
     /// A single request within the configured ceiling is allowed.
     #[test]
     fn a_single_request_under_the_limit_is_allowed() {
-        let throttle = ContentThrottle::new(
+        let throttle = ByteThrottle::new(
             &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
         );
         assert!(
@@ -1142,7 +1216,7 @@ mod tests {
     /// Consecutive requests whose declared bytes sum past the ceiling are refused.
     #[test]
     fn requests_summing_past_the_limit_are_refused() {
-        let throttle = ContentThrottle::new(
+        let throttle = ByteThrottle::new(
             &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
         );
         assert!(throttle.allow_content_bytes("alice", 60 * MIB));
@@ -1159,7 +1233,7 @@ mod tests {
     #[test]
     fn the_window_rolls_over_so_a_refused_caller_is_allowed_later() {
         let brief = Duration::from_millis(50);
-        let throttle = ContentThrottle::new(
+        let throttle = ByteThrottle::new(
             &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, brief),
         );
         assert!(throttle.allow_content_bytes("alice", 100 * MIB));
@@ -1180,7 +1254,7 @@ mod tests {
     /// budget must not spend bob's.
     #[test]
     fn two_identities_do_not_share_a_budget() {
-        let throttle = ContentThrottle::new(
+        let throttle = ByteThrottle::new(
             &ThrottleConfig::new().with_content_bytes_per_identity(100 * MIB, MINUTE),
         );
         assert!(throttle.allow_content_bytes("alice", 100 * MIB));
@@ -1213,14 +1287,42 @@ mod tests {
         let t_after = t0 + window + Duration::from_millis(1);
         let mut bucket = BucketWindow::full(limit, t0);
         assert!(
-            bucket.take(limit, window, limit, t_before),
+            bucket.take(limit, window, limit, t_before).is_ok(),
             "first: full budget drains just before the boundary"
         );
+        let wait = bucket
+            .take(limit, window, limit, t_after)
+            .expect_err("second: only 2 ms of refill have accrued (~2 MiB of 100 MiB)");
         assert!(
-            !bucket.take(limit, window, limit, t_after),
-            "second: only 2 ms of refill have accrued (~2 MiB of 100 MiB), \
-             so a full-limit request must be refused"
+            wait > Duration::from_millis(90) && wait <= window,
+            "the wait is the time for the ~98 MiB shortfall to refill, not the whole window twice: {wait:?}"
         );
+    }
+
+    /// A refused mutation names a wait that is enough: sleeping it admits the same bytes.
+    #[test]
+    fn a_mutation_refusal_names_a_wait_that_admits_on_retry() {
+        let window = Duration::from_millis(20);
+        let throttle = ByteThrottle::new(
+            &ThrottleConfig::new().with_mutation_bytes_per_identity(1000, window),
+        );
+        assert!(throttle.allow_mutation_bytes("alice", 1000).is_ok());
+        let wait = throttle
+            .allow_mutation_bytes("alice", 500)
+            .expect_err("the bucket is empty");
+        std::thread::sleep(wait + Duration::from_millis(2));
+        assert!(
+            throttle.allow_mutation_bytes("alice", 500).is_ok(),
+            "half the limit refills in half the window"
+        );
+    }
+
+    /// Zero configured means no mutation is ever refused.
+    #[test]
+    fn a_zero_mutation_limit_is_unlimited() {
+        let throttle =
+            ByteThrottle::new(&ThrottleConfig::new().with_mutation_bytes_per_identity(0, MINUTE));
+        assert!(throttle.allow_mutation_bytes("alice", u64::MAX).is_ok());
     }
 
     /// The content meter stays within the configured key cap under many identities.
@@ -1231,7 +1333,7 @@ mod tests {
     #[test]
     fn content_meter_is_capped_under_many_identities() {
         const CAP: usize = 4;
-        let throttle = ContentThrottle::new(
+        let throttle = ByteThrottle::new(
             &ThrottleConfig::new()
                 .with_content_bytes_per_identity(100 * MIB, MINUTE)
                 .with_max_tracked(CAP),

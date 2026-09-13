@@ -23,7 +23,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, Materializer, NoConnector, NoSigner, OplogConfig, PageKey, PageSpec,
     RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    ThrottleConfig, loopback, pg_write_target,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
@@ -293,7 +293,6 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         SessionConfig::default(),
         None,
         NoSigner,
-        ThrottleConfig::default(),
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

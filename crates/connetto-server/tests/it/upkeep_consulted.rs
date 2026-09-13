@@ -20,8 +20,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
 use connetto_server::{
     InMemoryOplog, Materializer, NoConnector, NoSigner, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
-    pg_write_target,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, ChangeEvent, PgLsn, PgSqliteEmuSource};
@@ -134,7 +133,6 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
         SessionConfig::default(),
         Some(upkeep),
         NoSigner,
-        ThrottleConfig::default(),
     );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");

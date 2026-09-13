@@ -697,7 +697,6 @@ async fn main() -> Result<()> {
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
         Some(upkeep),
         NoSigner,
-        ThrottleConfig::default(),
     );
     install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing

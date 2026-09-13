@@ -341,7 +341,8 @@ async fn start_sync_server(services: &Services) -> Result<ChildGuard> {
     command
         .envs(services.envs.iter().cloned())
         .env("CONNETTO_AUTH_BIND", "127.0.0.1:0")
-        .stdout(Stdio::null())
+        // The server logs to stdout. Nulling it hid every server line from CI.
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut child = command.spawn().context("spawning connetto-server")?;
     wait_for_child_port(&mut child, SYNC_BIND, "connetto-server").await?;
