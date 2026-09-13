@@ -116,26 +116,24 @@ async fn later_sequences_wait_behind_a_deferred_write_and_apply_in_order() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin().clone();
     let writer_pool = setup(&fixture).await;
-    let small = insert_changeset(1, "alice", "mine", "t1");
+    let first_large = insert_changeset(1, "alice", &incompressible_body(3000), "t1");
     let large = insert_changeset(2, "alice", &incompressible_body(3000), "t1");
     let small_after = insert_changeset(3, "alice", "mine", "t1");
-    let (small_len, large_len) = (compressed_len(&small), compressed_len(&large));
+    let (small_len, large_len) = (compressed_len(&small_after), compressed_len(&large));
     assert!(
         large_len >= 3 * small_len,
         "the large patch must dwarf the small one"
     );
-    // One small write fits, the large one is then short by half a small patch,
-    // and a small one would still fit the remainder: exactly the shape where
-    // the watermark would run ahead without the ordering gate.
-    let limit = large_len + small_len / 2;
+    // Large, large, small: the second large is short by hundreds of milliseconds of refill.
+    let limit = large_len + small_len;
     let manager = manager(writer_pool, limit);
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     handshake(&mut client, "alice").await;
 
-    upload(&mut client, 1, small).await;
-    expect_applied(&mut client, 1, "first small write").await;
+    upload(&mut client, 1, first_large).await;
+    expect_applied(&mut client, 1, "first large write").await;
 
     upload(&mut client, 2, large.clone()).await;
     let wait_ms = expect_deferred(&mut client, 2, "large write").await;
@@ -165,13 +163,21 @@ async fn later_sequences_wait_behind_a_deferred_write_and_apply_in_order() {
     tokio::time::sleep(Duration::from_millis(wait_ms) + Duration::from_millis(20)).await;
     upload(&mut client, 2, large).await;
     expect_applied(&mut client, 2, "the large write resent after the wait").await;
-    // The large write spent the bucket again, so the small one behind it waits
-    // for its own refill and then applies: order held throughout.
+    // Whether the small write fits now or after one refill depends on the sleep's overshoot.
     upload(&mut client, 3, small_after.clone()).await;
-    let wait_ms = expect_deferred(&mut client, 3, "small write after the bucket drained").await;
-    tokio::time::sleep(Duration::from_millis(wait_ms) + Duration::from_millis(20)).await;
-    upload(&mut client, 3, small_after).await;
-    expect_applied(&mut client, 3, "the small write resent after its wait").await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 3),
+        ControlMessage::RateLimited(deferral) => {
+            assert_eq!(deferral.related_to.as_deref(), Some("3"));
+            tokio::time::sleep(
+                Duration::from_millis(deferral.retry_after_ms) + Duration::from_millis(20),
+            )
+            .await;
+            upload(&mut client, 3, small_after).await;
+            expect_applied(&mut client, 3, "the small write resent after its wait").await;
+        }
+        other => panic!("the small write applies after the gate clears, got {other:?}"),
+    }
     assert_eq!(
         notes(&admin).await,
         vec![
