@@ -154,10 +154,11 @@ async fn tidy_spares_unsent_and_pinned_and_evicts_the_rest() {
 async fn tidy_keeps_a_chunk_two_files_share() {
     let dir = tempdir().expect("temp dir");
     let chunks = dir.path().join("chunks");
-    // Every upload attempt is refused past the deployment's ceiling, which is
-    // the permanent refusal: the entries retire and both files become cache,
-    // which is the state the sweep acts on.
-    let http = RecordingHttp::new(vec![(413, Vec::new()), (413, Vec::new())]);
+    // Both files upload successfully, so both are dequeued and become cache.
+    // The longer file is then pinned, making it the one tidy spares.
+    let mut replies = one_chunk_upload();
+    replies.extend(one_chunk_upload());
+    let http = RecordingHttp::new(replies);
     let client = connected_client(
         &dir.path().join("replica.sqlite"),
         Scripted::granting(INTENT_URL),
@@ -168,8 +169,8 @@ async fn tidy_keeps_a_chunk_two_files_share() {
 
     assert_eq!(
         content.flush_outbox().await.expect("walk the outbox"),
-        0,
-        "both are refused rather than sent, so neither is unsent any more"
+        2,
+        "both files upload successfully and are dequeued"
     );
     content
         .pin_content(

@@ -183,6 +183,28 @@ pub enum ForgetRefused {
     Failed(String),
 }
 
+/// Why listing refused content did not return results.
+#[derive(Debug, thiserror::Error)]
+pub enum RefusedContentRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the replica read failed.
+    #[error("refused content: {0}")]
+    Failed(String),
+}
+
+/// Why clearing a content refusal did not take effect.
+#[derive(Debug, thiserror::Error)]
+pub enum RetryRefusalRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the replica write failed.
+    #[error("retry refused: {0}")]
+    Failed(String),
+}
+
 /// Something the hub tells its owner about, so platform glue can react
 /// without living inside the core (the DB worker registers a liveness
 /// watcher per handshake, for example).
@@ -225,6 +247,17 @@ enum HubEvent {
     Import(
         Vec<u8>,
         futures_channel::oneshot::Sender<Result<(ImportOutcome, usize), ArchiveServiceError>>,
+    ),
+    /// Query every refused outbox entry with its detail, answered from the
+    /// replica. Same reason: only the core can reach the connection.
+    RefusedContent(
+        futures_channel::oneshot::Sender<Result<Vec<(FileId, String)>, ArchiveServiceError>>,
+    ),
+    /// Clear the refusal mark on one outbox entry, answered from the replica.
+    /// Same reason: only the core can reach the connection.
+    RetryRefused(
+        FileId,
+        futures_channel::oneshot::Sender<Result<(), ArchiveServiceError>>,
     ),
 }
 
@@ -752,6 +785,36 @@ impl RelayHub {
             .map_err(|err| ForgetRefused::Failed(err.to_string()))
     }
 
+    /// Every refused outbox entry with its permanent refusal detail.
+    ///
+    /// Answered from the replica, so it is served while the connection is idle
+    /// and interrupts an attach, the same class as [`forget_retired_content`](Self::forget_retired_content).
+    ///
+    /// # Errors
+    ///
+    /// [`RefusedContentRefused::Gone`] when the core has ended.
+    /// [`RefusedContentRefused::Failed`] when the replica read failed.
+    pub async fn refused_content(&self) -> Result<Vec<(FileId, String)>, RefusedContentRefused> {
+        self.ask(HubEvent::RefusedContent)
+            .await?
+            .map_err(|err| RefusedContentRefused::Failed(err.to_string()))
+    }
+
+    /// Clears the refusal mark on one outbox entry so the next walk attempts it.
+    ///
+    /// Answered from the replica and wakes the outbox driver wherever the
+    /// request was served, so neither a reconnect nor an import is needed.
+    ///
+    /// # Errors
+    ///
+    /// [`RetryRefusalRefused::Gone`] when the core has ended.
+    /// [`RetryRefusalRefused::Failed`] when the replica write failed.
+    pub async fn retry_refused(&self, file_id: FileId) -> Result<(), RetryRefusalRefused> {
+        self.ask(|reply| HubEvent::RetryRefused(file_id, reply))
+            .await?
+            .map_err(|err| RetryRefusalRefused::Failed(err.to_string()))
+    }
+
     /// Queue one request the core answers on its own channel, and wait for it.
     async fn ask<T>(
         &self,
@@ -1175,7 +1238,7 @@ where
             }
         };
         Ok(ContentWalk::Complete {
-            queued: content.pending_files(worker)? > 0,
+            queued: content.sendable_files(worker)? > 0,
             progressed: flush == ContentFlush::Progressed,
         })
     }
@@ -1216,7 +1279,7 @@ where
 
     /// Run the content driver now when anything is queued.
     fn wake_content(&mut self) -> Result<(), RelayError> {
-        if content_pending_files(&mut self.worker, self.content.as_ref())? > 0 {
+        if content_sendable_files(&mut self.worker, self.content.as_ref())? > 0 {
             self.retry.schedule(true, true);
         }
         Ok(())
@@ -1464,6 +1527,23 @@ where
     }
 }
 
+/// Sendable content files (outbox entries without a refusal mark), zero when content is disabled.
+///
+/// The outbox driver schedules from this count so a refused file never wakes
+/// the driver. Pending work reports every outbox row through `content_pending_files`.
+fn content_sendable_files<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+) -> Result<u64, RelayError>
+where
+    U: Transport,
+{
+    match content {
+        Some(content) => Ok(content.sendable_files(worker)?),
+        None => Ok(0),
+    }
+}
+
 /// Files whose unsent bytes were lost and remain unacknowledged, none when
 /// content is disabled.
 fn retired_content<U>(
@@ -1530,6 +1610,30 @@ where
             // taken again rather than trusted.
             walk.orphans.clear();
             walk.outbox_wake = true;
+        }
+        HubEvent::RefusedContent(reply) => {
+            let answer = match content {
+                Some(content) => content
+                    .refused_content(worker)
+                    .map_err(ArchiveServiceError::from),
+                None => Ok(Vec::new()),
+            };
+            let _ = reply.send(answer);
+        }
+        HubEvent::RetryRefused(file_id, reply) => {
+            let answer = match content {
+                Some(content) => content
+                    .retry_refused(worker, file_id)
+                    .map_err(ArchiveServiceError::from),
+                None => Ok(()),
+            };
+            let succeeded = answer.is_ok();
+            let _ = reply.send(answer);
+            // Wake the outbox driver wherever this request was served, so
+            // neither a reconnect nor an import is needed to attempt the entry.
+            if succeeded {
+                walk.outbox_wake = true;
+            }
         }
         HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
     }
@@ -2040,14 +2144,16 @@ fn recovery_serves_idle(event: &HubEvent) -> bool {
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
+            | HubEvent::RefusedContent(_)
+            | HubEvent::RetryRefused(_, _)
     )
 }
 
 /// What interrupts an attach or a subscription replay rather than waiting for it.
 ///
-/// The four requests answered from the replica, because a caller waits on each. A
-/// departure and a kill unsubscribe through the connection the attach owns and nothing
-/// waits on them, so they keep their place in the queue instead.
+/// Every request answered from the replica, because a caller waits on each. A departure
+/// and a kill unsubscribe through the connection the attach owns and nothing waits on
+/// them, so they keep their place in the queue instead.
 fn recovery_interrupts_attach(event: &HubEvent) -> bool {
     matches!(
         event,
@@ -2055,6 +2161,8 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
+            | HubEvent::RefusedContent(_)
+            | HubEvent::RetryRefused(_, _)
     )
 }
 
@@ -4188,6 +4296,198 @@ mod tests {
         assert!(
             runtime.walk.unverified.is_empty(),
             "and the walk finishes file by file"
+        );
+    }
+
+    /// A hub request answers the refusals with their details, and a hub retry clears the
+    /// mark and wakes the outbox driver.
+    #[wasm_bindgen_test]
+    async fn a_hub_request_answers_refusals_and_a_hub_retry_clears_the_mark() {
+        use super::{ContentRetry, HubEvent, HubRuntime, HubState, WalkState};
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_client::{BrowserStore, ContentArchive};
+        use connetto_file_core::FileId;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let config = ClientConfig::new("worker");
+        let mut worker =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("the worker opens offline");
+        let content = ContentArchive::new(BrowserStore::ephemeral(), [5; 32]);
+        content.install(&mut worker).expect("content tables");
+
+        // Insert a refused outbox entry via raw SQL; connetto-file-client's db
+        // module is private from here.
+        let file_id = FileId::from_bytes([0xAA; 32]);
+        let mut hex_id = String::with_capacity(64);
+        for b in file_id.as_bytes() {
+            use core::fmt::Write;
+            write!(hex_id, "{b:02X}").expect("writing to a String cannot fail");
+        }
+        worker
+            .conn()
+            .batch_execute(&format!(
+                "INSERT INTO _connetto_content_outbox (file_id, refused) \
+                 VALUES (X'{hex_id}', 'over the ceiling')"
+            ))
+            .expect("insert refused entry");
+
+        let (notices, _notice_rx) = unbounded_channel();
+        let (_events, event_rx) = unbounded_channel();
+        let mut runtime = HubRuntime {
+            worker,
+            state: HubState::default(),
+            notices,
+            content: Some(content),
+            events: event_rx,
+            retry: ContentRetry::default(),
+            walk: WalkState::default(),
+        };
+
+        // Serve a RefusedContent request and verify the reply lists the refused entry.
+        let (reply, answer) = futures_channel::oneshot::channel();
+        runtime
+            .serve_local(Some(HubEvent::RefusedContent(reply)))
+            .await
+            .expect("the request is served");
+        let refusals = answer
+            .await
+            .expect("the caller is answered")
+            .expect("the read succeeds");
+        assert_eq!(refusals.len(), 1, "one refused entry must appear");
+        assert_eq!(refusals[0].0, file_id, "the refused entry names the file");
+        assert!(
+            !refusals[0].1.is_empty(),
+            "the refused entry carries a non-empty detail"
+        );
+
+        // Serve a RetryRefused request and verify the mark is cleared and the walk wakes.
+        let (retry_reply, retry_answer) = futures_channel::oneshot::channel();
+        runtime
+            .serve_local(Some(HubEvent::RetryRefused(file_id, retry_reply)))
+            .await
+            .expect("the retry request is served");
+        retry_answer
+            .await
+            .expect("the caller is answered")
+            .expect("the clear succeeds");
+        assert!(
+            runtime.walk.outbox_wake,
+            "clearing a refusal must schedule the outbox driver"
+        );
+
+        // A second RefusedContent request must find an empty list.
+        let (reply2, answer2) = futures_channel::oneshot::channel();
+        runtime
+            .serve_local(Some(HubEvent::RefusedContent(reply2)))
+            .await
+            .expect("the second request is served");
+        let after = answer2
+            .await
+            .expect("the caller is answered")
+            .expect("the read succeeds");
+        assert!(
+            after.is_empty(),
+            "no refused entries must remain after the mark is cleared"
+        );
+    }
+
+    /// Both new requests are served while the connection is idle and interrupt an attach,
+    /// asserted through the recovery predicates.
+    #[wasm_bindgen_test]
+    fn both_refusal_requests_are_served_during_recovery_and_interrupt_an_attach() {
+        use connetto_core::messages::{ControlMessage, Ping};
+        use connetto_core::traits::IncomingFrame;
+        use connetto_file_core::FileId;
+
+        let mut deferred = std::collections::VecDeque::new();
+        let (reply_a, _) = futures_channel::oneshot::channel();
+        let (reply_b, _) = futures_channel::oneshot::channel();
+
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut deferred,
+                    HubEvent::RefusedContent(reply_a),
+                    recovery_serves_idle,
+                ),
+                Some(HubEvent::RefusedContent(_))
+            ),
+            "RefusedContent must be served while the connection is idle"
+        );
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut deferred,
+                    HubEvent::RetryRefused(FileId::from_bytes([1; 32]), reply_b),
+                    recovery_serves_idle,
+                ),
+                Some(HubEvent::RetryRefused(_, _))
+            ),
+            "RetryRefused must be served while the connection is idle"
+        );
+
+        // A held request is queued first, because a served one leaves the queue empty and
+        // the order rule only bites behind something already waiting.
+        let mut deferred = std::collections::VecDeque::new();
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::Frame(
+                    1,
+                    IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 }))
+                ),
+                recovery_interrupts_attach,
+            )
+            .is_none(),
+            "a frame waits for the upstream"
+        );
+        let (reply_c, _) = futures_channel::oneshot::channel();
+        let (reply_d, _) = futures_channel::oneshot::channel();
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::RefusedContent(reply_c),
+                recovery_interrupts_attach,
+            )
+            .is_none(),
+            "RefusedContent behind a queued event must not overtake it"
+        );
+        assert!(
+            schedule_recovery_event(
+                &mut deferred,
+                HubEvent::RetryRefused(FileId::from_bytes([2; 32]), reply_d),
+                recovery_interrupts_attach,
+            )
+            .is_none(),
+            "RetryRefused behind a queued event must not overtake it"
+        );
+
+        let (reply_e, _) = futures_channel::oneshot::channel();
+        let (reply_f, _) = futures_channel::oneshot::channel();
+        let mut empty = std::collections::VecDeque::new();
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut empty,
+                    HubEvent::RefusedContent(reply_e),
+                    recovery_interrupts_attach,
+                ),
+                Some(HubEvent::RefusedContent(_))
+            ),
+            "RefusedContent at the queue head must interrupt an attach"
+        );
+        assert!(
+            matches!(
+                schedule_recovery_event(
+                    &mut empty,
+                    HubEvent::RetryRefused(FileId::from_bytes([3; 32]), reply_f),
+                    recovery_interrupts_attach,
+                ),
+                Some(HubEvent::RetryRefused(_, _))
+            ),
+            "RetryRefused at the queue head must interrupt an attach"
         );
     }
 }

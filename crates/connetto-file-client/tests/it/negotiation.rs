@@ -300,13 +300,14 @@ async fn put_bodies_are_plaintext_not_ciphertext() {
     );
 }
 
-/// `HTTP 413` at the intent stage retires the outbox entry; `HTTP 503` keeps it for retry.
+/// `HTTP 413` at the intent stage marks the outbox entry as refused so the next walk skips it;
+/// `HTTP 503` keeps it for retry.
 ///
 /// Both cases are proved through the `ContentEvent` stream and through a
-/// second `flush_outbox` that either finds the outbox empty (413) or retries
+/// second `flush_outbox` that either finds nothing sendable (413) or retries
 /// and defers again (503).
 #[tokio::test]
-async fn http_413_retires_entry_and_503_keeps_it_for_retry() {
+async fn http_413_marks_entry_refused_and_503_keeps_it_for_retry() {
     let permanent = tempdir().expect("temp dir");
     let cc = staged_outbox_entry(permanent.path(), RecordingHttp::new([(413_u16, vec![])])).await;
     let mut events = cc.events();
@@ -321,7 +322,7 @@ async fn http_413_retires_entry_and_503_keeps_it_for_retry() {
     cc.flush_outbox().await.expect("second flush");
     assert!(
         events.try_recv().is_err(),
-        "outbox is empty after 413 retires the entry; second flush must produce no event"
+        "the refused entry is excluded from sendable; second flush must produce no event"
     );
 
     let transient = tempdir().expect("temp dir");
@@ -381,5 +382,63 @@ async fn malformed_grant_url_sends_no_requests_and_retires_entry() {
     assert!(
         matches!(ev, ContentEvent::UploadRefused { .. }),
         "a malformed grant URL must produce UploadRefused; got {ev:?}"
+    );
+}
+
+/// A 413 response marks the entry as refused: it stays in the outbox, appears in
+/// `refused_content`, and is excluded from the next upload walk.
+#[tokio::test]
+async fn permanent_upload_failure_is_recorded_in_refused_content() {
+    let dir = tempdir().expect("temp dir");
+    let cc = staged_outbox_entry(dir.path(), RecordingHttp::new([(413_u16, vec![])])).await;
+    let mut events = cc.events();
+    cc.flush_outbox().await.expect("flush");
+    let ev = events.try_recv().expect("UploadRefused event must arrive");
+    let ContentEvent::UploadRefused { file_id, .. } = ev else {
+        panic!("expected UploadRefused, got {ev:?}");
+    };
+    let refused = cc.refused_content().await.expect("read refused_content");
+    assert_eq!(
+        refused.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![file_id],
+        "permanent failure must record the identity in refused_content"
+    );
+    assert!(
+        cc.retired_content()
+            .await
+            .expect("read retired_content")
+            .is_empty(),
+        "retired_content must remain empty after a permanent upload refusal"
+    );
+    let sent = cc.flush_outbox().await.expect("second flush");
+    let second_ev = events.try_recv();
+    assert_eq!(
+        sent, 0,
+        "a refused entry is not re-attempted by the next flush"
+    );
+    assert!(
+        second_ev.is_err(),
+        "no event on second flush because the refused entry is skipped"
+    );
+}
+
+/// A successful upload leaves `retired_content` empty.
+#[tokio::test]
+async fn successful_upload_leaves_retired_content_empty() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new([(200_u16, br#"{"needed":[]}"#.to_vec()), (200_u16, vec![])]);
+    let cc = staged_outbox_entry(dir.path(), http).await;
+    let mut events = cc.events();
+    let sent = cc.flush_outbox().await.expect("flush");
+    assert_eq!(sent, 1, "one file uploaded");
+    let ev = events.try_recv().expect("Uploaded event must arrive");
+    assert!(
+        matches!(ev, ContentEvent::Uploaded { .. }),
+        "success must produce Uploaded, got {ev:?}"
+    );
+    let retired = cc.retired_content().await.expect("read retired_content");
+    assert!(
+        retired.is_empty(),
+        "successful upload must leave retired_content empty, got {retired:?}"
     );
 }

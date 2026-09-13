@@ -112,6 +112,9 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// bytes it had. One store belongs to one process, the same assumption the
     /// store's temporary names rest on, so one mutex closes it.
     content_writes: tokio::sync::Mutex<()>,
+    /// Signalled when an import commits or when a refusal is cleared, waking
+    /// `drive_outbox` without a replica mutation or a reconnect.
+    outbox_wake: tokio::sync::Notify,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -140,7 +143,10 @@ where
         http: H,
     ) -> Result<Self, ContentError> {
         client
-            .with_conn(|conn| conn.batch_execute(db::CONTENT_DDL))
+            .with_conn(|conn| {
+                conn.batch_execute(db::CONTENT_DDL)?;
+                db::add_refused_column(conn.conn())
+            })
             .await?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let local = ChunkStoreSource::new(EncryptingStore::new(store.clone(), &root_key));
@@ -152,6 +158,7 @@ where
             sources: vec![Box::new(local)],
             events,
             content_writes: tokio::sync::Mutex::new(()),
+            outbox_wake: tokio::sync::Notify::new(),
         })
     }
 
@@ -200,8 +207,9 @@ where
             .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
             .await?;
-        // The import is committed, so a failed replay is left to the outbox driver.
+        // The import is committed; a failed replay is left to the outbox driver.
         let _ = self.client.replay_pending().await;
+        self.outbox_wake.notify_one();
         Ok(outcome)
     }
 
@@ -321,19 +329,49 @@ where
         self.client.with_conn(|conn| db::retired(conn.conn())).await
     }
 
+    /// Every refused outbox entry with its permanent refusal detail.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub async fn refused_content(&self) -> Result<Vec<(FileId, String)>, ContentError> {
+        self.client
+            .with_conn(|conn| db::refusals(conn.conn()))
+            .await
+    }
+
+    /// Clears the refusal mark on one outbox entry so the next walk attempts it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub async fn retry_refused(&self, file_id: FileId) -> Result<(), ContentError> {
+        self.client
+            .with_conn(move |conn| db::clear_refusal(conn.conn(), file_id))
+            .await
+            .map_err(ContentError::from)?;
+        self.outbox_wake.notify_one();
+        Ok(())
+    }
+
     /// Drops the losses the application has dealt with.
     ///
     /// # Errors
     ///
     /// [`ContentError::Replica`] when the record cannot be written.
     pub async fn forget_retired_content(&self, files: &[FileId]) -> Result<(), ContentError> {
-        for file_id in files {
-            let file_id = *file_id;
-            self.client
-                .with_conn(move |conn| db::forget_retired(conn.conn(), file_id))
-                .await?;
-        }
-        Ok(())
+        let files = files.to_vec();
+        self.client
+            .with_conn(move |conn| {
+                conn.conn().transaction(|c| {
+                    for file_id in &files {
+                        db::forget_retired(c, *file_id)?;
+                    }
+                    Ok::<(), diesel::result::Error>(())
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// How many of one unsent file's chunks cannot be read, or `None` when all
@@ -366,7 +404,7 @@ where
     pub async fn flush_outbox(&self) -> Result<usize, ContentError> {
         let waiting = self
             .client
-            .with_conn(|conn| db::outbox(conn.conn()))
+            .with_conn(|conn| db::sendable(conn.conn()))
             .await?;
         let mut sent = 0;
         for file_id in waiting {
@@ -385,13 +423,15 @@ where
                     });
                 }
                 Err(err) => {
-                    self.client
-                        .with_conn(|conn| db::dequeue(conn.conn(), file_id))
-                        .await?;
-                    let _ = self.events.send(ContentEvent::UploadRefused {
+                    let event = ContentEvent::UploadRefused {
                         file_id,
                         detail: err.to_string(),
-                    });
+                    };
+                    let detail = err.to_string();
+                    self.client
+                        .with_conn(move |conn| db::refuse(conn.conn(), file_id, &detail))
+                        .await?;
+                    let _ = self.events.send(event);
                 }
             }
         }
@@ -441,7 +481,7 @@ where
             let _ = self.flush_outbox().await;
             let queued = self
                 .client
-                .with_conn(|conn| db::outbox(conn.conn()))
+                .with_conn(|conn| db::sendable(conn.conn()))
                 .await
                 .is_ok_and(|waiting| !waiting.is_empty());
             if queued {
@@ -451,14 +491,17 @@ where
             }
             attempt = 0;
             loop {
-                match events.recv().await {
-                    Ok(
-                        ClientEvent::Reconnected
-                        | ClientEvent::SyncStatus(SyncStatus::Connected)
-                        | ClientEvent::MutationApplied { .. },
-                    ) => break,
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
+                tokio::select! {
+                    () = self.outbox_wake.notified() => break,
+                    result = events.recv() => match result {
+                        Ok(
+                            ClientEvent::Reconnected
+                            | ClientEvent::SyncStatus(SyncStatus::Connected)
+                            | ClientEvent::MutationApplied { .. },
+                        ) => break,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 }
             }
         }
@@ -793,5 +836,99 @@ where
                 .map_err(|err| ContentError::Store(err.to_string()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use connetto_client::live::ConnettoClient;
+    use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+    use connetto_core::test_support::FakeTransport;
+    use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+
+    use super::{ContentClient, ContentEvent};
+    use crate::db;
+    use crate::http::ReqwestHttp;
+    use crate::store::FsStore;
+
+    /// Clearing a refusal wakes a parked driver: the driver parks with only a
+    /// refused entry, the application clears it, and the driver wakes and
+    /// attempts the entry without any reconnect, import or mutation.
+    ///
+    /// The driver is offline, so the upload fails immediately with a retryable
+    /// client error, which is visible as `ContentEvent::UploadDeferred`.
+    /// Before the fix `retry_refused` never signalled the notification and the
+    /// driver stayed parked until the test timed out.
+    #[tokio::test]
+    async fn clearing_a_refusal_wakes_the_parked_driver() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = FsStore::new(dir.path().join("chunks"));
+        let connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("wake-on-retry"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = Arc::new(
+            ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+                .await
+                .expect("content attaches"),
+        );
+
+        let encrypted = EncryptingStore::new(store, &[1u8; 32]);
+        let manifest = process_file(&vec![1u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        let file_id = manifest.file_id();
+        content
+            .client
+            .with_conn(|conn| {
+                db::put_manifest(conn.conn(), &manifest)?;
+                db::enqueue(conn.conn(), file_id)
+            })
+            .await
+            .expect("stage the file");
+        content
+            .client
+            .with_conn(move |conn| db::refuse(conn.conn(), file_id, "over the ceiling"))
+            .await
+            .expect("refuse the file");
+
+        let mut events = content.events();
+        let driver_content = content.clone();
+        tokio::spawn(async move {
+            driver_content
+                .drive_outbox(|_: Duration| async { core::future::pending::<()>().await })
+                .await;
+        });
+
+        // Give the driver one loop to run: it flushes (nothing sendable),
+        // checks the queue (empty), and parks waiting for the notification.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Clear the refusal. Without the fix this never wakes the driver.
+        content
+            .retry_refused(file_id)
+            .await
+            .expect("retry_refused runs");
+
+        // The driver wakes, calls flush_outbox, finds the entry sendable, and
+        // tries to upload. The upload fails immediately (offline) with a
+        // retryable error, so UploadDeferred is emitted within the timeout.
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("the driver woke and emitted an event within the timeout")
+            .expect("an event was received");
+        assert!(
+            matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
+            "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
     }
 }

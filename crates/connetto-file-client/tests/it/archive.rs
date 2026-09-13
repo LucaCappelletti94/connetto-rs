@@ -2,14 +2,17 @@
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::{ArchiveAttachment, ExportScope, ImportChoices};
-use connetto_file_client::{ContentClient, ContentError, FsStore, Resolved};
+use connetto_file_client::{ContentClient, ContentError, ContentEvent, FsStore, Resolved};
 use connetto_file_core::{ChunkHash, FileId, MimeClass};
+use core::fmt::Write as FmtWrite;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use tempfile::tempdir;
+use tokio::sync::broadcast;
 
 use crate::support::{
     RecordingHttp, Scripted, attach_content, connected_client, connected_content_bulk_failing,
-    insert_row_and_pin_album, learn_file_id, offline_client, photos, stage_photo,
+    insert_row_and_pin_album, learn_file_id, offline_client, offline_content, photos, stage_photo,
 };
 
 const PHOTO: &[u8] = b"an offline photograph that must survive a device replacement";
@@ -340,4 +343,109 @@ async fn import_succeeds_when_replay_fails_after_commit() {
         panic!("restored content must resolve locally after replay failure");
     };
     assert_eq!(bytes, PHOTO);
+}
+
+/// A content-only import wakes the outbox driver without any replica mutation.
+#[tokio::test]
+async fn content_only_import_wakes_outbox_driver() {
+    const INTENT: &str = "http://files.test/files/\
+        0000000000000000000000000000000000000000000000000000000000000000/intent?t=TOKEN";
+    let source_dir = tempdir().expect("source dir");
+    let source = offline_client(&source_dir.path().join("replica.sqlite"));
+    let file_id = FileId::from_chunks([PHOTO]);
+    let archive = raw_archive(
+        &source,
+        content_attachments(file_id, ChunkHash::from_data(PHOTO), PHOTO.len(), PHOTO),
+    )
+    .await;
+    let target_dir = tempdir().expect("target dir");
+    let http = RecordingHttp::new([(200_u16, br#"{"needed":[]}"#.to_vec()), (200_u16, vec![])]);
+    let target = attach_content(
+        connected_client(
+            &target_dir.path().join("replica.sqlite"),
+            Scripted::granting(INTENT),
+        )
+        .await,
+        &target_dir.path().join("chunks"),
+        http,
+    )
+    .await;
+    let plan = target
+        .prepare_local_data_import(&archive)
+        .await
+        .expect("prepare");
+    let mut events = target.events();
+    // The driver parks after the boot pass. The import signals import_notify,
+    // waking the driver, which uploads the file and emits Uploaded.
+    tokio::select! {
+        () = target.drive_outbox(|_: core::time::Duration| core::future::ready(())) => {
+            panic!("drive_outbox must not return while the test runs");
+        }
+        result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            async {
+                tokio::time::sleep(core::time::Duration::from_millis(50)).await;
+                target
+                    .apply_local_data_import(&plan, &ImportChoices::keeping_the_file())
+                    .await
+                    .expect("import");
+                loop {
+                    match events.recv().await {
+                        Ok(ContentEvent::Uploaded { .. }) => break,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("event stream closed before Uploaded arrived");
+                        }
+                    }
+                }
+            },
+        ) => {
+            result.expect("Uploaded event must arrive within five seconds of the import");
+        }
+    }
+}
+
+/// `forget_retired_content` wraps the whole list in one transaction.
+#[tokio::test]
+async fn forget_retired_content_is_all_or_nothing() {
+    let dir = tempdir().expect("temp dir");
+    let (client, content) = offline_content(dir.path()).await;
+    let file_a = FileId::from_chunks([b"file alpha" as &[u8]]);
+    let file_b = FileId::from_chunks([b"file beta" as &[u8]]);
+    let (mut hex_a, mut hex_b) = (String::with_capacity(64), String::with_capacity(64));
+    for b in file_a.as_bytes() {
+        write!(hex_a, "{b:02x}").expect("write to String infallible");
+    }
+    for b in file_b.as_bytes() {
+        write!(hex_b, "{b:02x}").expect("write to String infallible");
+    }
+    // Insert both and install a trigger that aborts any delete when one row remains.
+    client
+        .with_conn(|conn| {
+            conn.conn().batch_execute(&format!(
+                "INSERT OR IGNORE INTO _connetto_content_retired (file_id) VALUES (x'{hex_a}'); \
+                 INSERT OR IGNORE INTO _connetto_content_retired (file_id) VALUES (x'{hex_b}'); \
+                 CREATE TRIGGER test_abort_second_forget \
+                 BEFORE DELETE ON _connetto_content_retired \
+                 WHEN (SELECT COUNT(*) FROM _connetto_content_retired) = 1 \
+                 BEGIN SELECT RAISE(ABORT, 'test-induced failure'); END",
+            ))
+        })
+        .await
+        .expect("insert retired records and trigger");
+    let result = content.forget_retired_content(&[file_a, file_b]).await;
+    assert!(
+        result.is_err(),
+        "second delete must fail due to the trigger"
+    );
+    let still_retired = content.retired_content().await.expect("read retired");
+    let present: std::collections::HashSet<_> = still_retired.into_iter().collect();
+    assert!(
+        present.contains(&file_a),
+        "file_a must remain after transaction rollback"
+    );
+    assert!(
+        present.contains(&file_b),
+        "file_b must remain after transaction rollback"
+    );
 }

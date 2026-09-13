@@ -177,10 +177,9 @@ where
         &self,
         connection: &mut ConnettoConnection<T>,
     ) -> Result<(), ContentError> {
-        connection
-            .conn()
-            .batch_execute(db::CONTENT_DDL)
-            .map_err(Into::into)
+        let conn = connection.conn();
+        conn.batch_execute(db::CONTENT_DDL)?;
+        db::add_refused_column(conn).map_err(ContentError::from)
     }
 
     /// Counts content files that have not reached the server.
@@ -193,6 +192,22 @@ where
         connection: &mut ConnettoConnection<T>,
     ) -> Result<u64, ContentError> {
         db::outbox_count(connection.conn())
+    }
+
+    /// Counts content files that are sendable: in the outbox and not permanently refused.
+    ///
+    /// The outbox driver schedules walks from this count rather than from
+    /// [`pending_files`](Self::pending_files), so a refused entry never triggers a walk.
+    /// Pending work keeps counting every row.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox cannot be read.
+    pub fn sendable_files<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<u64, ContentError> {
+        db::sendable_count(connection.conn())
     }
 
     /// Lists the files waiting in the outbox, in queue order.
@@ -436,6 +451,31 @@ where
         db::retired(connection.conn())
     }
 
+    /// Every refused outbox entry with its permanent refusal detail.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be read.
+    pub fn refused_content<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<(FileId, String)>, ContentError> {
+        db::refusals(connection.conn())
+    }
+
+    /// Clears the refusal mark on one outbox entry so the next walk attempts it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be written.
+    pub fn retry_refused<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<(), ContentError> {
+        db::clear_refusal(connection.conn(), file_id).map_err(ContentError::from)
+    }
+
     /// Drops the losses the application has dealt with.
     ///
     /// # Errors
@@ -446,10 +486,15 @@ where
         connection: &mut ConnettoConnection<T>,
         files: &[FileId],
     ) -> Result<(), ContentError> {
-        for file_id in files {
-            db::forget_retired(connection.conn(), *file_id)?;
-        }
-        Ok(())
+        connection
+            .conn()
+            .transaction(|conn| {
+                for file_id in files {
+                    db::forget_retired(conn, *file_id)?;
+                }
+                Ok::<(), diesel::result::Error>(())
+            })
+            .map_err(ContentError::from)
     }
 
     /// Attempts one raw-connection outbox entry.
@@ -554,7 +599,7 @@ where
         connection: &mut ConnettoConnection<T>,
         state: &mut ContentFlushState,
     ) -> Result<Option<FileId>, ContentError> {
-        let waiting = db::outbox(connection.conn())?;
+        let waiting = db::sendable(connection.conn())?;
         if let Some(file_id) = state.pending_ticket.as_ref().map(|ticket| ticket.file_id)
             && waiting.contains(&file_id)
         {
@@ -604,8 +649,12 @@ where
     ) -> Result<ContentFlush, ContentError> {
         match result {
             Err(error) if error.is_retryable() => Ok(ContentFlush::Deferred),
-            Ok(()) | Err(_) => {
+            Ok(()) => {
                 db::dequeue(connection.conn(), file_id)?;
+                Ok(ContentFlush::Progressed)
+            }
+            Err(error) => {
+                db::refuse(connection.conn(), file_id, &error.to_string())?;
                 Ok(ContentFlush::Progressed)
             }
         }
@@ -732,6 +781,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{FileId, next_after};
@@ -1366,6 +1416,253 @@ mod tests {
                 .expect("read the outbox")
                 .is_empty(),
             "a retired entry leaves the outbox"
+        );
+    }
+
+    /// A permanent upload error marks the entry as refused rather than removing it, so the
+    /// file stays in the outbox with its detail, the retired table stays empty, and the
+    /// pending-work count stays at one.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_permanent_refusal_stays_in_the_outbox() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("refuse-stays"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let manifest = process_file(&vec![1u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+
+        // HTTP 413 is a permanent ceiling rejection.
+        let permanent = crate::error::ContentError::Http {
+            status: 413,
+            stage: "commit",
+        };
+        super::ContentArchive::<crate::store::FsStore>::finish_attempt(
+            &mut connection,
+            manifest.file_id(),
+            Err(permanent),
+        )
+        .expect("finish_attempt runs");
+
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read the outbox"),
+            vec![manifest.file_id()],
+            "a refused file must stay in the outbox"
+        );
+        assert_eq!(
+            db::outbox_count(connection.conn()).expect("count the outbox"),
+            1,
+            "the pending-work count must stay at one"
+        );
+        assert!(
+            db::retired(connection.conn())
+                .expect("read retired")
+                .is_empty(),
+            "the retired table must be empty"
+        );
+        let refusals = db::refusals(connection.conn()).expect("read refusals");
+        assert_eq!(refusals.len(), 1, "one refusal record must appear");
+        assert_eq!(
+            refusals[0].0,
+            manifest.file_id(),
+            "the refusal must name the refused file"
+        );
+    }
+
+    /// A refused outbox entry is not offered to the upload driver, while an unmarked entry
+    /// in the same outbox is still sendable.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_refused_entry_is_skipped_while_an_unmarked_entry_is_sendable() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("sendable"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let refused = file(0xAA);
+        let sendable = file(0xBB);
+        db::enqueue(connection.conn(), refused).expect("queue the refused file");
+        db::enqueue(connection.conn(), sendable).expect("queue the sendable file");
+        db::refuse(connection.conn(), refused, "over the ceiling").expect("mark as refused");
+
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read outbox"),
+            vec![refused, sendable],
+            "outbox returns every entry regardless of refusal"
+        );
+        assert_eq!(
+            db::sendable(connection.conn()).expect("read sendable"),
+            vec![sendable],
+            "sendable returns only unmarked entries"
+        );
+    }
+
+    /// Clearing the refusal mark through `retry_refused` makes the entry sendable again, so
+    /// the next walk can attempt it.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn retry_refused_clears_the_mark_and_the_entry_becomes_sendable() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("retry-refused"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let file_id = file(0xCC);
+        db::enqueue(connection.conn(), file_id).expect("queue the file");
+        db::refuse(connection.conn(), file_id, "too large").expect("mark as refused");
+        assert!(
+            db::sendable(connection.conn())
+                .expect("read sendable before retry")
+                .is_empty(),
+            "the refused entry must not be sendable before retry"
+        );
+
+        archive
+            .retry_refused(&mut connection, file_id)
+            .expect("retry_refused runs");
+
+        assert_eq!(
+            db::sendable(connection.conn()).expect("read sendable after retry"),
+            vec![file_id],
+            "the entry must be sendable after the refusal is cleared"
+        );
+    }
+
+    /// The integrity walk retires a refused entry whose bytes are conclusively gone, so a
+    /// refusal does not make a loss invisible.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn the_integrity_walk_retires_a_refused_entry_with_missing_bytes() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("retire-refused"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let manifest = process_file(&vec![2u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        encrypted
+            .delete_chunk(&manifest.chunks()[0].hash)
+            .await
+            .expect("drop the only chunk");
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), manifest.file_id()).expect("queue the file");
+        db::refuse(connection.conn(), manifest.file_id(), "too large").expect("mark as refused");
+
+        let step = archive
+            .scan_unsent_file(
+                &mut connection,
+                manifest.file_id(),
+                super::ChunkScan::default(),
+                8,
+            )
+            .await
+            .expect("the scan runs");
+        assert!(
+            matches!(step, super::ScanStep::Retired),
+            "a refused entry with missing bytes must be retired, got {step:?}"
+        );
+        assert!(
+            db::outbox(connection.conn())
+                .expect("read the outbox")
+                .is_empty(),
+            "a retired refused entry leaves the outbox"
+        );
+    }
+
+    /// `sendable_files` counts only unmarked entries while `pending_files` counts both,
+    /// keeping the two meanings apart: pending work is the full outbox, sendable work
+    /// is what the driver actually attempts.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn sendable_files_excludes_refused_while_pending_files_counts_both() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("sendable-count"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let refused = file(0x01);
+        let sendable = file(0x02);
+        db::enqueue(connection.conn(), refused).expect("queue the refused file");
+        db::enqueue(connection.conn(), sendable).expect("queue the sendable file");
+        db::refuse(connection.conn(), refused, "over the ceiling").expect("mark as refused");
+
+        assert_eq!(
+            archive
+                .pending_files(&mut connection)
+                .expect("pending count"),
+            2,
+            "pending_files counts every outbox row including refused ones"
+        );
+        assert_eq!(
+            archive
+                .sendable_files(&mut connection)
+                .expect("sendable count"),
+            1,
+            "sendable_files counts only unmarked entries"
         );
     }
 }

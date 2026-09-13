@@ -474,6 +474,30 @@ pub enum LogoutMessage {
         /// Why the acknowledgement did not take effect.
         detail: String,
     },
+    /// Tab to worker: list every refused outbox entry with its detail.
+    RefusedContent,
+    /// Worker to tabs: the list of refused entries.
+    RefusedFiles {
+        /// Each entry as a hex identity and its refusal detail.
+        files: Vec<(String, String)>,
+    },
+    /// Tab to worker: clear the refusal mark on one outbox entry so the next walk attempts it.
+    RetryRefused {
+        /// The hex identity of the entry to retry.
+        file_id: String,
+    },
+    /// Worker to tabs: the refusal mark was cleared. The identity is echoed.
+    RefusalCleared {
+        /// The hex identity the request named.
+        file_id: String,
+    },
+    /// Worker to tabs: the refusal mark could not be cleared.
+    RetryRefusalFailed {
+        /// The identity the request named.
+        file_id: String,
+        /// Why the clear did not take effect.
+        detail: String,
+    },
 }
 
 /// The tokens plus session metadata connetto-server returns from its token and
@@ -1563,6 +1587,48 @@ pub async fn forget_retired_content(files: Vec<String>) -> Result<(), AuthError>
         move |message| match message {
             LogoutMessage::Forgot { files } if files == asked => Some(Ok(())),
             LogoutMessage::ForgetFailed { files, detail } if files == asked => {
+                Some(Err(AuthError::Store(detail)))
+            }
+            _ => None,
+        },
+    )
+    .await?
+}
+
+/// Asks the worker for every refused outbox entry with its permanent refusal detail.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers.
+pub async fn refused_content() -> Result<Vec<(String, String)>, AuthError> {
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::RefusedContent,
+        |message| match message {
+            LogoutMessage::RefusedFiles { files } => Some(files),
+            _ => None,
+        },
+    )
+    .await
+}
+
+/// Asks the worker to clear the refusal mark on one outbox entry so the next walk attempts it.
+///
+/// The reply echoes the identity, so one tab's answer cannot satisfy another tab's request
+/// for a different file.
+///
+/// # Errors
+///
+/// [`AuthError::Cancelled`] when no worker answers, and [`AuthError::Store`]
+/// when one answers that the clear did not take effect.
+pub async fn retry_refused(file_id: String) -> Result<(), AuthError> {
+    let asked = file_id.clone();
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::RetryRefused { file_id },
+        move |message| match message {
+            LogoutMessage::RefusalCleared { file_id } if file_id == asked => Some(Ok(())),
+            LogoutMessage::RetryRefusalFailed { file_id, detail } if file_id == asked => {
                 Some(Err(AuthError::Store(detail)))
             }
             _ => None,

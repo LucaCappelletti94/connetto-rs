@@ -107,6 +107,54 @@ async fn handle_forget_retired(
     }
 }
 
+async fn handle_refused_content(
+    hub: &crate::relay::RelayHub,
+) -> Option<crate::auth::LogoutMessage> {
+    use crate::auth::LogoutMessage;
+    use core::fmt::Write;
+    match hub.refused_content().await {
+        Ok(refusals) => {
+            let files = refusals
+                .into_iter()
+                .map(|(file_id, detail)| {
+                    let mut hex = String::with_capacity(64);
+                    for b in file_id.as_bytes() {
+                        write!(hex, "{b:02x}").expect("writing to a String cannot fail");
+                    }
+                    (hex, detail)
+                })
+                .collect();
+            Some(LogoutMessage::RefusedFiles { files })
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "db worker: the hub cannot list refused content");
+            None
+        }
+    }
+}
+
+async fn handle_retry_refused(
+    file_id: &str,
+    hub: &crate::relay::RelayHub,
+) -> Option<crate::auth::LogoutMessage> {
+    use crate::auth::LogoutMessage;
+    let Some(fid) = file_id_from_hex(file_id) else {
+        return Some(LogoutMessage::RetryRefusalFailed {
+            file_id: file_id.to_owned(),
+            detail: "the file identity was not readable".to_owned(),
+        });
+    };
+    match hub.retry_refused(fid).await {
+        Ok(()) => Some(LogoutMessage::RefusalCleared {
+            file_id: file_id.to_owned(),
+        }),
+        Err(err) => Some(LogoutMessage::RetryRefusalFailed {
+            file_id: file_id.to_owned(),
+            detail: err.to_string(),
+        }),
+    }
+}
+
 async fn guard_replica_deletion(
     replica_db_name: &str,
     content_namespace: Option<&str>,
@@ -158,11 +206,20 @@ async fn serve_logout(
         LogoutMessage::ForgetRetired { files } => {
             return handle_forget_retired(files, hub).await;
         }
+        LogoutMessage::RefusedContent => {
+            return handle_refused_content(hub).await;
+        }
+        LogoutMessage::RetryRefused { file_id } => {
+            return handle_retry_refused(file_id, hub).await;
+        }
         LogoutMessage::Pending { .. }
         | LogoutMessage::Done { .. }
         | LogoutMessage::Refused { .. }
         | LogoutMessage::Forgot { .. }
-        | LogoutMessage::ForgetFailed { .. } => {
+        | LogoutMessage::ForgetFailed { .. }
+        | LogoutMessage::RefusedFiles { .. }
+        | LogoutMessage::RefusalCleared { .. }
+        | LogoutMessage::RetryRefusalFailed { .. } => {
             return None;
         }
     };
