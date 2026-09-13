@@ -160,6 +160,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R79 | Media over the peer link. Needs R77 and R67 |
 | any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
 | any | R89 | A failing re-execution read ends its subscription, not live delivery. A running defect, needs nothing |
+| any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
 ## Status and blockers
@@ -202,6 +203,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R52 native Android gate | NOT STARTED | R88's Android leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | NOT STARTED, minted 2026-09-13 | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the single retry |
+| R90 the browser's refresh token in an `HttpOnly` cookie | NOT STARTED, minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -5053,6 +5055,37 @@ No read failure of any class can make the change stream reconnect or stop, a poi
 
 ---
 
+## R90: the browser's refresh token moves into an `HttpOnly` cookie
+
+**Status.** NOT STARTED. Minted 2026-09-13 from the Parked entry of 2026-08-06 that found chapter 11 claiming backend-for-frontend while the browser holds a durable credential. Decided with the maintainer the same day.
+
+**Blocked on nothing.** Native clients are untouched.
+
+### Purpose
+
+`draft-ietf-oauth-browser-based-apps` names two sanctioned backend patterns: the BFF, where the browser holds only an `HttpOnly` session cookie, and the token-mediating backend, where the browser holds the short-lived access token and the backend keeps the refresh token. connetto is the confidential client at the provider boundary, which is the BFF half chapter 11 states truly, and at its own boundary it hands the worker both its access token and its refresh token, the refresh token durable in an encrypted SQLite under a device key in `IndexedDB` (`RefreshStore`, chapter 14). Neither pattern gives the browser the refresh token. Worker custody and the device key narrow the exposure and chapter 14 states their limits: no defence against a resident attacker who can call `load`, nor against one holding the profile directory, and the pre-enrolment `kek` record holds the key in the clear until R23's gate enrols. The browser gains nothing from holding the token that a cookie would not give it: cold-start resume and leader failover both work because the refresh request carries the cookie.
+
+### Decision, taken with the maintainer 2026-09-13
+
+**The browser's refresh token lives in an `HttpOnly` cookie and the websocket keeps its bearer access token.** The refresh endpoint is an HTTP `POST`, where a required custom header forces a cross-origin preflight, so the CSRF defence a websocket cannot have exists there. The handshake keeps presenting the short-lived access token from worker memory, so the websocket's auth model, cross-site hijacking posture and native clients are all unchanged. The browser then holds no durable credential: `RefreshStore`, `DeferredRefreshStore`, the refresh half of the device key and R23's refresh half are deleted, and the gate protects the replica key alone. Rejected: amending chapter 11 only, which leaves the durable secret in storage the BCP says does not protect against script in the origin. Rejected: a full BFF cookie session with the websocket included, which puts a cookie-authenticated handshake behind an origin allowlist and `SameSite` alone, the exposure the Parked entry named.
+
+### Steps
+
+1. **Server, the browser path on the three endpoints.** A request carrying the custom header (`X-Connetto-Client: browser`, the same header that forces the preflight) is answered with the refresh token in `Set-Cookie` and omitted from the JSON body, on `/auth/token` and `/auth/refresh`. One cookie per account, named from the encoded identity, `HttpOnly`, `Secure` except on a loopback origin, `Path` scoped to the auth routes, `SameSite` from a setting that defaults to `Strict` and is `None` for a deployment serving the application off another origin, which is the list `CONNETTO_AUTH_CORS_ORIGINS` already carries and which then also allows credentials. `/auth/refresh` and `/auth/logout` read the cookie for the account the body names and refuse a browser-marked request without the header. Native clients keep the JSON body path exactly as today.
+2. **Browser client.** `fetch` with `credentials: include` and the header on the three calls. `RefreshStore` and `DeferredRefreshStore` deleted, the device key's refresh half and `clear_device_key` deleted, `storage::device_key` reduced to what the replica key still needs. The remembered-account marker (`IDENTITY_RECORD`) and R42's account index stay as plain browser records, since neither is a secret. Logout clears that account's cookie server-side and leaves the others, R42's per-account sign-out unchanged.
+3. **R23's gate covers the replica key alone in the browser.** Chapter 14's "both secrets are covered" paragraph is amended: the browser's second secret no longer exists client-side. The `kek` pre-enrolment hazard shrinks to the replica key, and the first-run dance that held the token in memory until enrolment resolved goes with the deferred store.
+4. **Chapters 11, 12 and 14** state the pattern precisely: confidential client at the provider boundary, token-mediating at connetto's, the refresh token in a cookie for browsers and in the keychain natively, and the Parked entry retires. Chapter 12's note that the unidentified run's resume credential "gets the same treatment" as the refresh token is corrected, since that credential is not a login credential and stays where it is.
+
+### Proof
+
+The browser suites: a cold start resumes through the cookie with no credential in `IndexedDB` or OPFS, a leader failover resumes the same way, a logout clears one account's cookie and the next boot offers the other (R42's two-account boot), a cross-origin `POST` without the header is refused before the service runs, and the R23 unlock proof passes protecting the replica key alone. The native suites are unchanged and stay green.
+
+### Done when
+
+No durable credential exists in browser storage, the three auth endpoints serve browser and native clients through one service, and the chapters name the pattern the code implements.
+
+---
+
 ## R81: the aggregate read has no time bound
 
 **Status.** **DONE** (2026-08-22). Minted the same day by the second full review, three questions answered with the maintainer before any code (recorded below with their costs and the options rejected), then built. connetto owns its re-execution connector, a seed spends its caller's tier and a triggered read the server's shorter bound, and a timed-out read ends its subscription with R38's one phrase on the wire and the cause in the log. Proven Docker-gated in `crates/connetto-server/tests/read_ceiling.rs::aggregates`, three tests: a seed past the caller's own limit refused, a triggered read past the shared bound ending the subscription with the log naming it, and the same trigger inside the bound delivering a value. The build also fixed a defect in R58's landing and produced one upstream finding, both recorded below.
@@ -5653,7 +5686,7 @@ Tick these off across the whole programme, because each is easy to lose inside a
 
 These are decided or recorded and belong to **no** phase. They are here so nobody treats their absence as an oversight.
 
-**Chapter 11 claims backend-for-frontend while the tokens live in JavaScript-reachable storage. Recorded 2026-08-06, not decided, and it has no phase.** Found while researching where a websocket should be authenticated (`docs/research-websocket-auth-placement.md`), and independent of that question. `draft-ietf-oauth-browser-based-apps-26`, a Best Current Practice in the RFC Editor queue, requires a BFF to keep its session in a cookie that **MUST** be `HttpOnly` and `Secure`, and states plainly that JavaScript-reachable storage does not protect against an attacker executing in the origin. Connetto keeps its tokens in worker-side IndexedDB and uses no cookies anywhere, verified by grep across the server and the browser client. It is partly mitigated: the refresh store is encrypted under a device key, R23 exists to put that key behind user verification, and OWASP permits IndexedDB when the key is not itself recoverable from the browser. What the cookie would buy is precisely defeating exfiltration and offline replay, and it would not defeat online proxying through the victim's browser, which the same draft says cannot be prevented at the application layer. What it would cost is cross-site websocket hijacking, whose standard defence (a custom header forcing a preflight) is structurally unavailable on a websocket, leaving an origin allowlist and `SameSite`. **The gap is between what the chapter claims and what the code does**, so either the code moves or the chapter stops claiming BFF, and neither is decided here.
+**~~Chapter 11 claims backend-for-frontend while the tokens live in JavaScript-reachable storage.~~ Owned by R90 (2026-09-13), so this is no longer parked: the browser's refresh token moves into an `HttpOnly` cookie and the websocket keeps its bearer. Recorded 2026-08-06, and the reasoning is kept.** Found while researching where a websocket should be authenticated (`docs/research-websocket-auth-placement.md`), and independent of that question. `draft-ietf-oauth-browser-based-apps-26`, a Best Current Practice in the RFC Editor queue, requires a BFF to keep its session in a cookie that **MUST** be `HttpOnly` and `Secure`, and states plainly that JavaScript-reachable storage does not protect against an attacker executing in the origin. Connetto keeps its tokens in worker-side IndexedDB and uses no cookies anywhere, verified by grep across the server and the browser client. It is partly mitigated: the refresh store is encrypted under a device key, R23 exists to put that key behind user verification, and OWASP permits IndexedDB when the key is not itself recoverable from the browser. What the cookie would buy is precisely defeating exfiltration and offline replay, and it would not defeat online proxying through the victim's browser, which the same draft says cannot be prevented at the application layer. What it would cost is cross-site websocket hijacking, whose standard defence (a custom header forcing a preflight) is structurally unavailable on a websocket, leaving an origin allowlist and `SameSite`. **The gap is between what the chapter claims and what the code does**, so either the code moves or the chapter stops claiming BFF, and neither is decided here.
 
 **~~The client should not present a share key whose `exp` has passed.~~ Built (R45 step 3, 2026-08-09), so this is no longer parked.** Recorded 2026-08-06, owned by R45 on 2026-08-08, and retired here. `crates/connetto-client/src/grant_expiry.rs` reads `exp` out of the base64url payload of a token the client already holds and the handshake drops the dead key, advisory as specified: anything it cannot read is presented, because the server verifies `exp` authoritatively either way. The rule it contradicted was already amended in `02-protocol.md` on 2026-08-06, and `Grant`'s own doc comment in `connetto-core` now states the same exception. **It replaced R36 step 7**, a `HandshakeAck` boolean reporting that some grant failed, removed on 2026-08-06 once the justification collapsed: revoking a share produces no refusal at all, so the boolean was silent for the case it was written for and fired only for expiry, which the client can answer offline.
 
