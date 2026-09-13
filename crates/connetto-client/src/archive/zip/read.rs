@@ -190,21 +190,33 @@ fn read_entry(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, ClientError> {
+    read_entry_bounded(zip, path, MAX_ATTACHMENTS_BYTES)
+}
+
+/// Reads one compressed entry, refusing output above `limit`.
+///
+/// The limit is a parameter so a test proves the boundary over kilobytes rather than over
+/// the gigabytes the shipped ceiling names.
+fn read_entry_bounded(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    path: &str,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, ClientError> {
     let Ok(entry) = zip.by_name(path) else {
         return Ok(None);
     };
     // The ZIP entry streams into the decoder rather than through a buffer of its own,
     // because its own compression expands unboundedly before any ceiling could apply.
     let decoder = zstd::stream::read::Decoder::new(entry)?;
-    let limit = usize::try_from(MAX_ATTACHMENTS_BYTES)
-        .expect("2 GiB decompression limit fits usize on supported targets");
+    let ceiling =
+        usize::try_from(limit).expect("the decompression limit fits usize on supported targets");
     let mut decompressed = Vec::new();
     // One byte past the ceiling, so an entry of exactly the ceiling is accepted and the
     // one that follows is refused.
     decoder
-        .take(MAX_ATTACHMENTS_BYTES.saturating_add(1))
+        .take(limit.saturating_add(1))
         .read_to_end(&mut decompressed)?;
-    if decompressed.len() > limit {
+    if decompressed.len() > ceiling {
         return Err(ClientError::Import(format!(
             "archive entry {path} exceeds the decompression limit"
         )));
@@ -370,22 +382,37 @@ mod tests {
         assert!(read(b"not a zip at all").is_err());
     }
 
-    /// A row entry that expands past the decompression ceiling is refused, naming the entry.
+    /// An entry whose output passes the ceiling is refused, naming the entry, while an
+    /// entry of exactly the ceiling is read.
     #[test]
-    fn decompression_ceiling_is_enforced() {
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).expect("zstd encoder");
-        let chunk = vec![0u8; 4 * 1024 * 1024];
-        let chunk_len = u64::try_from(chunk.len()).expect("chunk len fits u64");
-        let total: u64 = 3 * 1024 * 1024 * 1024;
-        let mut remaining = total;
-        while remaining > 0 {
-            let n = remaining.min(chunk_len);
-            encoder
-                .write_all(&chunk[..usize::try_from(n).expect("n fits usize")])
-                .expect("write chunk");
-            remaining -= n;
+    fn the_decompression_ceiling_is_the_boundary() {
+        let limit: u64 = 64 * 1024;
+        let exact = usize::try_from(limit).expect("limit fits usize");
+        for (len, expected) in [(exact, None), (exact + 1, Some("decompression limit"))] {
+            let bytes =
+                zip_with_entry(&zstd::encode_all(vec![0u8; len].as_slice(), 1).expect("zstd"));
+            let mut zip =
+                zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).expect("zip");
+            let outcome = super::read_entry_bounded(&mut zip, "device-private.patchset", limit);
+            match (expected, outcome) {
+                (None, Ok(Some(entry))) => {
+                    assert_eq!(entry.len(), exact, "the exact ceiling reads");
+                }
+                (Some(needle), Err(error)) => {
+                    let text = error.to_string();
+                    assert!(text.contains(needle), "expected {needle} in error: {text}");
+                    assert!(
+                        text.contains("device-private.patchset"),
+                        "expected the entry name in error: {text}"
+                    );
+                }
+                (_, outcome) => panic!("unexpected outcome for {len} bytes: {outcome:?}"),
+            }
         }
-        let compressed = encoder.finish().expect("zstd finish");
+    }
+
+    /// One archive holding a manifest and one zstd row entry, for the reader tests.
+    fn zip_with_entry(entry: &[u8]) -> Vec<u8> {
         let manifest = json!({
             "format": "connetto-local-data",
             "version": 3,
@@ -396,8 +423,7 @@ mod tests {
             "note": "test",
             "entries": [{"kind": "rows", "path": "device-private.patchset", "encoding": "zstd"}],
         });
-        let cursor = std::io::Cursor::new(Vec::new());
-        let mut zip = zip::ZipWriter::new(cursor);
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("manifest.json", options)
             .expect("start manifest");
@@ -405,17 +431,8 @@ mod tests {
             .expect("write manifest");
         zip.start_file("device-private.patchset", options)
             .expect("start entry");
-        zip.write_all(&compressed).expect("write entry");
-        let bytes = zip.finish().expect("finish archive").into_inner();
-        let error = read(&bytes).expect_err("oversized entry must be refused");
-        assert!(
-            error.to_string().contains("device-private.patchset"),
-            "expected entry name in error: {error}"
-        );
-        assert!(
-            error.to_string().contains("decompression limit"),
-            "expected 'decompression limit' in error: {error}"
-        );
+        zip.write_all(entry).expect("write entry");
+        zip.finish().expect("finish archive").into_inner()
     }
 
     /// A queue entry with a length field of `u64::MAX` is refused rather than panicking.
