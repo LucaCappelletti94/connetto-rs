@@ -112,9 +112,9 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// bytes it had. One store belongs to one process, the same assumption the
     /// store's temporary names rest on, so one mutex closes it.
     content_writes: tokio::sync::Mutex<()>,
-    /// Signalled by `apply_local_data_import` so `drive_outbox` wakes without
-    /// a replica mutation when a content-only archive lands.
-    import_notify: tokio::sync::Notify,
+    /// Signalled when an import commits or when a refusal is cleared, waking
+    /// `drive_outbox` without a replica mutation or a reconnect.
+    outbox_wake: tokio::sync::Notify,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -158,7 +158,7 @@ where
             sources: vec![Box::new(local)],
             events,
             content_writes: tokio::sync::Mutex::new(()),
-            import_notify: tokio::sync::Notify::new(),
+            outbox_wake: tokio::sync::Notify::new(),
         })
     }
 
@@ -209,7 +209,7 @@ where
             .await?;
         // The import is committed; a failed replay is left to the outbox driver.
         let _ = self.client.replay_pending().await;
-        self.import_notify.notify_one();
+        self.outbox_wake.notify_one();
         Ok(outcome)
     }
 
@@ -349,7 +349,9 @@ where
         self.client
             .with_conn(move |conn| db::clear_refusal(conn.conn(), file_id))
             .await
-            .map_err(ContentError::from)
+            .map_err(ContentError::from)?;
+        self.outbox_wake.notify_one();
+        Ok(())
     }
 
     /// Drops the losses the application has dealt with.
@@ -490,7 +492,7 @@ where
             attempt = 0;
             loop {
                 tokio::select! {
-                    () = self.import_notify.notified() => break,
+                    () = self.outbox_wake.notified() => break,
                     result = events.recv() => match result {
                         Ok(
                             ClientEvent::Reconnected
@@ -834,5 +836,99 @@ where
                 .map_err(|err| ContentError::Store(err.to_string()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use connetto_client::live::ConnettoClient;
+    use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+    use connetto_core::test_support::FakeTransport;
+    use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+
+    use super::{ContentClient, ContentEvent};
+    use crate::db;
+    use crate::http::ReqwestHttp;
+    use crate::store::FsStore;
+
+    /// Clearing a refusal wakes a parked driver: the driver parks with only a
+    /// refused entry, the application clears it, and the driver wakes and
+    /// attempts the entry without any reconnect, import or mutation.
+    ///
+    /// The driver is offline, so the upload fails immediately with a retryable
+    /// client error, which is visible as `ContentEvent::UploadDeferred`.
+    /// Before the fix `retry_refused` never signalled the notification and the
+    /// driver stayed parked until the test timed out.
+    #[tokio::test]
+    async fn clearing_a_refusal_wakes_the_parked_driver() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = FsStore::new(dir.path().join("chunks"));
+        let connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("wake-on-retry"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = Arc::new(
+            ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+                .await
+                .expect("content attaches"),
+        );
+
+        let encrypted = EncryptingStore::new(store, &[1u8; 32]);
+        let manifest = process_file(&vec![1u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        let file_id = manifest.file_id();
+        content
+            .client
+            .with_conn(|conn| {
+                db::put_manifest(conn.conn(), &manifest)?;
+                db::enqueue(conn.conn(), file_id)
+            })
+            .await
+            .expect("stage the file");
+        content
+            .client
+            .with_conn(move |conn| db::refuse(conn.conn(), file_id, "over the ceiling"))
+            .await
+            .expect("refuse the file");
+
+        let mut events = content.events();
+        let driver_content = content.clone();
+        tokio::spawn(async move {
+            driver_content
+                .drive_outbox(|_: Duration| async { core::future::pending::<()>().await })
+                .await;
+        });
+
+        // Give the driver one loop to run: it flushes (nothing sendable),
+        // checks the queue (empty), and parks waiting for the notification.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Clear the refusal. Without the fix this never wakes the driver.
+        content
+            .retry_refused(file_id)
+            .await
+            .expect("retry_refused runs");
+
+        // The driver wakes, calls flush_outbox, finds the entry sendable, and
+        // tries to upload. The upload fails immediately (offline) with a
+        // retryable error, so UploadDeferred is emitted within the timeout.
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("the driver woke and emitted an event within the timeout")
+            .expect("an event was received");
+        assert!(
+            matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
+            "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
     }
 }

@@ -289,6 +289,15 @@ pub(crate) fn outbox_count(conn: &mut SqliteConnection) -> Result<u64, ContentEr
     Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))
 }
 
+/// Number of files waiting for upload that have not been marked as permanently refused.
+pub(crate) fn sendable_count(conn: &mut SqliteConnection) -> Result<u64, ContentError> {
+    let count = _connetto_content_outbox::table
+        .count()
+        .filter(_connetto_content_outbox::refused.is_null())
+        .get_result::<i64>(conn)?;
+    Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))
+}
+
 /// Marks an outbox entry as permanently refused, recording the detail.
 ///
 /// The entry stays in the outbox and is counted by `outbox` and

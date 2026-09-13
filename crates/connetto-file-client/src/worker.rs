@@ -194,6 +194,22 @@ where
         db::outbox_count(connection.conn())
     }
 
+    /// Counts content files that are sendable: in the outbox and not permanently refused.
+    ///
+    /// The outbox driver schedules walks from this count rather than from
+    /// [`pending_files`](Self::pending_files), so a refused entry never triggers a walk.
+    /// Pending work keeps counting every row.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the outbox cannot be read.
+    pub fn sendable_files<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<u64, ContentError> {
+        db::sendable_count(connection.conn())
+    }
+
     /// Lists the files waiting in the outbox, in queue order.
     ///
     /// # Errors
@@ -765,6 +781,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{FileId, next_after};
@@ -1602,6 +1619,50 @@ mod tests {
                 .expect("read the outbox")
                 .is_empty(),
             "a retired refused entry leaves the outbox"
+        );
+    }
+
+    /// `sendable_files` counts only unmarked entries while `pending_files` counts both,
+    /// keeping the two meanings apart: pending work is the full outbox, sendable work
+    /// is what the driver actually attempts.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn sendable_files_excludes_refused_while_pending_files_counts_both() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("sendable-count"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let refused = file(0x01);
+        let sendable = file(0x02);
+        db::enqueue(connection.conn(), refused).expect("queue the refused file");
+        db::enqueue(connection.conn(), sendable).expect("queue the sendable file");
+        db::refuse(connection.conn(), refused, "over the ceiling").expect("mark as refused");
+
+        assert_eq!(
+            archive
+                .pending_files(&mut connection)
+                .expect("pending count"),
+            2,
+            "pending_files counts every outbox row including refused ones"
+        );
+        assert_eq!(
+            archive
+                .sendable_files(&mut connection)
+                .expect("sendable count"),
+            1,
+            "sendable_files counts only unmarked entries"
         );
     }
 }
