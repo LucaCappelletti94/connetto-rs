@@ -159,6 +159,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R78 | Courier recovery. Needs R75 and R77 |
 | any | R79 | Media over the peer link. Needs R77 and R67 |
 | any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
+| any | R89 | A failing re-execution read ends its subscription, not live delivery. A running defect, needs nothing |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
 ## Status and blockers
@@ -200,6 +201,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R51 native Apple gate | NOT STARTED | R88's iOS leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
 | R52 native Android gate | NOT STARTED | R88's Android leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
+| R89 a failing re-execution read ends its subscription, not live delivery | NOT STARTED, minted 2026-09-13 | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the single retry |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -5016,6 +5018,41 @@ One demo builds and runs on both mobile platforms from a written recipe, the And
 
 ---
 
+## R89: a failing re-execution read ends its subscription, not live delivery
+
+**Status.** NOT STARTED. Minted 2026-09-13 by the survey of the plan's open sections, from the finding R81 recorded and deliberately left unowned. Designed the same day with the maintainer, two decisions below.
+
+**Blocked on nothing.** A running defect: it needs no phase before it and everything computed is exposed to it.
+
+### Purpose
+
+R81 decision 3 ends a subscription whose re-execution read times out, because a timeout is policy and retrying it replaces nothing. Every other read failure bubbles out of `dispatch_with_grants`, `ingest` returns it, and `ingest_with_reconnect` treats it as a transport outage: it reconnects the change stream, replays the unacked event, meets the same read, and after `max_attempts` logs that live delivery has stopped. So one computed subscription whose read fails the same way every time, a viewer's `set_config` binding refused under R85, a column dropped from under a registered query, a fold that divides by zero, stalls live delivery for every client of the deployment. R81's record said these failures were "silently skipped", and since the subql adoption they are worse than skipped.
+
+The classification the fix needs is partly unavailable: `DieselAsyncError` wraps `diesel::result::Error`, and diesel-async's wrapper maps eight SQLSTATEs to `DatabaseErrorKind` and everything else to `Unknown` with the `DbError` held privately, so `too_many_connections` and `admin_shutdown` arrive looking like a syntax error. The design is shaped by that loss rather than by pretending it away.
+
+### Decisions, taken with the maintainer 2026-09-13
+
+1. **Three classes replace the boolean, and the unknown class retries once before ending.** `TimedOutRead` becomes a classification with three answers. `Timeout` ends the subscription at once, R81 decision 3 unchanged. `Transient` is the set the connector can name (`Pool`, `UnableToSendCommand`, `ClosedConnection`, `SerializationFailure`, the transaction-manager states) and retries in place. `Other` is everything else: it retries exactly once after a short backoff, and a second failure ends that subscription through `refuse_computed`, R38's one phrase on the wire and the cause in the log, with the event redispatched without it. Bounded both ways: a deterministic failure costs one extra read and never loops, and a transient failure that surfaced as `Unknown` (a Postgres restart) costs one read rather than the subscription. Rejected: deterministic by default with no retry, under which a routine Postgres restart ends every computed subscription in the deployment at once, and refusals are not retried by design, so clients would lose live aggregates that survive a restart today. Rejected: blocking on an upstream change that exposes the SQLSTATE, which leaves the live-lock standing until it lands. If diesel-async or subql later carries the code, `Other` splits by class (08, 53, 57 and 58 transient) and the single retry goes, so that request is worth writing after a prior-art search, as an improvement rather than a dependency.
+2. **Transient retries in place under `DeliveryPaused`, never by tearing the change stream down, and this makes the parked backoff primitive real.** `ingest` already has the arm: `AuthUnavailable` pauses delivery with a cause, backs off through `auth_retry`, retries the dispatch and resumes (R5b step 10). A transient read gets the same arm with `PauseCause::DatabaseUnreachable`. The shared primitive `10-subscription-materializer.md` specified (exponential with jitter, an attempt cap, a duration cap) then has three consumers, the client reconnect, the change-stream reconnect and this arm, and the Parked entry that called it partially owned retires here. Rejected: keeping the stream teardown as the transient path, which drops and re-establishes the replication connection for a pool timeout.
+
+### Steps
+
+1. The classification: `ReadFailure::{Timeout, Transient, Other}` replacing `TimedOutRead`'s boolean on every connector error type, with the shipped connector's mapping written out and the `MaterializerError::Read` variant carrying the class.
+2. The dispatch loop: `Timeout` ends now, `Transient` pauses and retries under the shared backoff, `Other` retries once then ends, each pass removing at most one subscription so the loop terminates as today's does.
+3. The shared backoff primitive, one type with jitter and both caps, adopted by the three loops, the client's `reconnect::Sleeper` seam included.
+4. `refuse_computed`'s log line names the class and the attempt count, so an operator reading "computed re-execution failed" knows whether it was policy, a blip, or a poisoned query.
+5. Chapter 10's retry paragraph and R81's finding paragraph amended when the maintainer names the docs.
+
+### Proof
+
+Docker-gated, beside `read_ceiling.rs`: a fold registered over a view that a migration then drops fails on the next change, its subscription ends with the refusal phrase after exactly one retry, the change stream never reconnects, and a sibling row subscription on the same event still receives its patch. A second test kills the reader pool's connections mid-dispatch, sees `DeliveryPaused { DatabaseUnreachable }`, restores them, and sees `DeliveryResumed` with the event delivered and no subscription ended.
+
+### Done when
+
+No read failure of any class can make the change stream reconnect or stop, a poisoned computed subscription ends alone with its cause logged, a transient outage pauses and resumes delivery, and one backoff type serves the three loops.
+
+---
+
 ## R81: the aggregate read has no time bound
 
 **Status.** **DONE** (2026-08-22). Minted the same day by the second full review, three questions answered with the maintainer before any code (recorded below with their costs and the options rejected), then built. connetto owns its re-execution connector, a seed spends its caller's tier and a triggered read the server's shorter bound, and a timed-out read ends its subscription with R38's one phrase on the wire and the cause in the log. Proven Docker-gated in `crates/connetto-server/tests/read_ceiling.rs::aggregates`, three tests: a seed past the caller's own limit refused, a triggered read past the shared bound ending the subscription with the log naming it, and the same trigger inside the bound delivering a value. The build also fixed a defect in R58's landing and produced one upstream finding, both recorded below.
@@ -5034,7 +5071,7 @@ R58 bounded row snapshot reads with a per-tier `SET LOCAL statement_timeout` (`c
 2. ~~**Whose limit bounds a triggered re-execution?**~~ **DECIDED 2026-08-22: a separate, tighter server-wide bound, distinct from the caller tiers.** Two numbers because there are two harms. The seed runs in the subscribing caller's own path and keeps that caller's tier limit. A trigger is serviced inside `dispatch_with_grants` (`session.rs:1643-1650`), awaited inline on the loop that fans every patch to every client, so what it delays is the change stream rather than its owner. The tier is knowable (each captured query gets a fresh id and records exactly one consumer, `subql/src/reexec/engine.rs:281`), and it is deliberately not the number used. Rejected: reusing the owner's tier, which lets one signed-in caller freeze live delivery for everybody for a full 30 seconds. Rejected: hardcoding the anonymous 5 seconds, which leaves a deployment with a genuinely slow aggregate no way to raise it. **Cost accepted:** a fourth configurable number, and a signed-in caller's aggregate stoppable by a bound shorter than its tier promises.
 3. ~~**What does a timed-out re-execution do mid-life, where there is no request to refuse?**~~ **DECIDED 2026-08-22: the timeout is a refusal, so it ends that aggregate subscription.** This reuses the split R58 built: a failure is transient and retried, a refusal is policy and retrying it replaces nothing for ever. The client learns nothing beyond R38's one fixed phrase, per the maintainer: an unusably heavy subscription is the developer's to see in the log, not the caller's to be told about. The machinery exists, `refuse_subscription` (`session.rs:4111`) sends `NonFatalError { related_to, detail: SUBSCRIPTION_REFUSED }` and unregisters, and `Outbound::Control` carries the same frame from the ingest loop, which holds no transport. Every other connector failure keeps today's skip, untouched. Rejected: a non-fatal notice that keeps the subscription alive, which floods a busy table with one message per change while the displayed value stays stale for ever. Rejected: keeping the silent skip, which is the defect R57 step 8 is opened against for refused writes.
 
-**A finding this discussion produced, deliberately not folded in.** `session.rs:1648` defers re-execution retry and failure surfacing to a "Phase 6" that no phase in this plan owns, and Q5.5 places it here rather than upstream. Every non-timeout connector failure is still silently skipped. Naming it is this phase's whole contribution to it.
+**A finding this discussion produced, deliberately not folded in.** `session.rs:1648` defers re-execution retry and failure surfacing to a "Phase 6" that no phase in this plan owns, and Q5.5 places it here rather than upstream. Every non-timeout connector failure is still silently skipped. Naming it is this phase's whole contribution to it. **Owned by R89 since 2026-09-13**, which found the failures no longer skipped but looping the change stream to a stop.
 
 **The edge R30 asked this phase to state.** R81 bounds one read, and Q5.5's debounce and concurrency bound how many reads happen. The re-execution tier R82 to R85 build multiplies reads (per group for a hybrid re-query, per viewer on an RLS table), so every read that tier issues arrives already bounded by the connector this phase creates, which is why the connector is the right home rather than any one call site.
 
@@ -5632,7 +5669,7 @@ These are decided or recorded and belong to **no** phase. They are here so nobod
 
 **The unsynced-data warning as a session nears expiry needs no phase.** `expiry_warning` in `crates/connetto-client/src/teardown.rs` already takes the expiry, a lead time and the unsynced sequence numbers, and `session_expires_at` already reaches the client on the auth response. Its caller is the embedding application by design.
 
-**Backoff and retry uniformity, partially owned.** R5b step 13 unifies the three backoff loops that exist by then (client reconnect, CDC reconnect, and the authorization-service outage it adds) into one policy with per-caller bounds. The fuller shared primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, covering re-execution retry, delivery back-pressure, and mutation retry as well) still has no phase and no observable criterion beyond those three loops. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
+**~~Backoff and retry uniformity, partially owned.~~ Owned by R89 (2026-09-13), so this is no longer parked.** R5b step 13 unified the three backoff loops that existed by then (client reconnect, CDC reconnect, and the authorization-service outage it adds) into one policy with per-caller bounds. The fuller shared primitive `10-subscription-materializer.md` specifies (exponential with jitter, an attempt cap, a total-duration cap, covering re-execution retry as well) lands with R89 decision 2, whose transient read retry is its third consumer and its observable criterion. Its former companion here, operator alerting on a bounded CDC outage, is parked no longer: R12 step 2 emits the change-stream connection-failure log line, and alerting on that line belongs to the deployment's aggregator.
 
 ---
 
