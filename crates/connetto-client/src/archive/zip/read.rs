@@ -190,19 +190,21 @@ fn read_entry(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, ClientError> {
-    let Ok(mut entry) = zip.by_name(path) else {
+    let Ok(entry) = zip.by_name(path) else {
         return Ok(None);
     };
-    let mut packed = Vec::new();
-    entry.read_to_end(&mut packed).map_err(read_error)?;
-    let decoder = zstd::stream::read::Decoder::new(packed.as_slice())?;
-    let mut decompressed = Vec::new();
-    decoder
-        .take(MAX_ATTACHMENTS_BYTES)
-        .read_to_end(&mut decompressed)?;
+    // The ZIP entry streams into the decoder rather than through a buffer of its own,
+    // because its own compression expands unboundedly before any ceiling could apply.
+    let decoder = zstd::stream::read::Decoder::new(entry)?;
     let limit = usize::try_from(MAX_ATTACHMENTS_BYTES)
         .expect("2 GiB decompression limit fits usize on supported targets");
-    if decompressed.len() == limit {
+    let mut decompressed = Vec::new();
+    // One byte past the ceiling, so an entry of exactly the ceiling is accepted and the
+    // one that follows is refused.
+    decoder
+        .take(MAX_ATTACHMENTS_BYTES.saturating_add(1))
+        .read_to_end(&mut decompressed)?;
+    if decompressed.len() > limit {
         return Err(ClientError::Import(format!(
             "archive entry {path} exceeds the decompression limit"
         )));
@@ -248,6 +250,12 @@ pub(super) fn decode_pending(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ClientError> 
             .try_into()
             .map_err(|_| malformed())?,
     );
+    // Every record costs at least its eight length bytes, so a count above what the entry
+    // can hold is refused before one vector per record is allocated.
+    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 8).unwrap_or(u64::MAX);
+    if count > capacity {
+        return Err(malformed());
+    }
     let mut at: usize = 8;
     let mut records = Vec::new();
     for _ in 0..count {
