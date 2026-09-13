@@ -89,8 +89,7 @@ fn decode_insert(
     }
     let mut flags = vec![0u8; table.number_of_columns()];
     table.write_pk_flags(&mut flags);
-    // The flag is the column's 1-based position in the key, so sorting by
-    // it puts a composite key in key order rather than table order.
+    // flag value is the 1-based key ordinal, so sorting by it gives composite key order
     let mut key: Vec<(u8, String, Cell)> = flags
         .iter()
         .zip(columns.iter().zip(values.iter()))
@@ -98,6 +97,11 @@ fn decode_insert(
         .map(|(flag, (column, value))| (*flag, column.clone(), value.clone()))
         .collect();
     key.sort_by_key(|(flag, _, _)| *flag);
+    if key.is_empty() {
+        return Err(ClientError::Import(format!(
+            "the archive carries a row for {name} with no primary key"
+        )));
+    }
     Ok(IncomingRow {
         table: name,
         columns: columns.clone(),
@@ -280,4 +284,30 @@ pub(crate) fn fingerprint(
             let _ = write!(hex, "{byte:02x}");
             hex
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable};
+
+    use super::read_rows;
+
+    /// A patchset naming a table with no primary key is refused, naming the table.
+    #[test]
+    fn a_row_with_no_primary_key_is_refused() {
+        let table = SimpleTable::new("things", &["a", "b"], &[]);
+        let patchset: PatchSet<_, String, Vec<u8>> = PatchSet::new().insert(Insert::from(table));
+        let bytes = Vec::<u8>::from(patchset);
+        let mut known = HashMap::new();
+        known.insert("things".to_owned(), vec!["a".to_owned(), "b".to_owned()]);
+        let Err(error) = read_rows(&bytes, &known) else {
+            panic!("no-pk row must be refused");
+        };
+        assert!(
+            error.to_string().contains("things"),
+            "expected table name in error: {error}"
+        );
+    }
 }

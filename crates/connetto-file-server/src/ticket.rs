@@ -66,6 +66,15 @@ pub enum TicketError {
     /// Ring key-generation error.
     #[error("key generation: {0}")]
     Ring(String),
+    /// The base URL is neither HTTPS nor plain HTTP on a loopback host.
+    ///
+    /// Accepted schemes and hosts: `https` with any host, or `http` with
+    /// `localhost`, `127.0.0.1`, or `[::1]`.
+    #[error("base URL is not HTTPS or loopback: {base}")]
+    InsecureBase {
+        /// The rejected base URL.
+        base: String,
+    },
 }
 
 /// Holds the Ed25519 private key and mints ticket tokens.
@@ -85,6 +94,37 @@ pub struct TicketSigner {
     read_ceiling: u64,
 }
 
+/// Returns `Ok(())` when `base_url` is safe to mint tickets against.
+///
+/// # Errors
+///
+/// Returns `TicketError::InsecureBase` when the scheme is `http` and the host
+/// is not `localhost`, `127.0.0.1`, or `[::1]`.
+fn validate_base(base_url: &str) -> Result<(), TicketError> {
+    let insecure = || TicketError::InsecureBase {
+        base: base_url.to_owned(),
+    };
+    let url = url::Url::parse(base_url).map_err(|_| insecure())?;
+    // The host comes from the parser rather than from the text, because userinfo of the
+    // form localhost@elsewhere reads as a loopback authority and resolves elsewhere.
+    // The set is exactly what every client accepts, rather than the whole 127.0.0.0/8
+    // range, so a base that signs here is a base a browser will send.
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        match url.scheme() {
+            "https" => return Ok(()),
+            "http" if loopback => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(insecure())
+}
+
 impl TicketSigner {
     /// Generates a fresh keypair.
     ///
@@ -95,12 +135,14 @@ impl TicketSigner {
     ///
     /// # Errors
     ///
+    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or loopback HTTP.
     /// Returns `TicketError::Ring` if key generation fails or if the ring library rejects the generated PKCS8 document.
     pub fn generate(
         base_url: String,
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<(Self, Vec<u8>), TicketError> {
+        validate_base(&base_url)?;
         let rng = SystemRandom::new();
         let doc = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|e| TicketError::Ring(format!("{e:?}")))?;
@@ -125,6 +167,7 @@ impl TicketSigner {
     ///
     /// # Errors
     ///
+    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or loopback HTTP.
     /// Returns `TicketError::Ring` if `der` is not a valid PKCS8 document for an Ed25519 key pair.
     pub fn from_pkcs8_der(
         der: &[u8],
@@ -132,6 +175,7 @@ impl TicketSigner {
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<Self, TicketError> {
+        validate_base(&base_url)?;
         let kp =
             Ed25519KeyPair::from_pkcs8(der).map_err(|e| TicketError::Ring(format!("{e:?}")))?;
         Ok(Self {

@@ -4,8 +4,8 @@ use std::io::Read;
 use crate::ClientError;
 
 use super::super::{
-    ArchiveAttachment, ExportScope, FORMAT, Incoming, LOCAL_ROWS, MANIFEST, PENDING, SYNCED_ROWS,
-    VERSION, read_error,
+    ArchiveAttachment, ExportScope, FORMAT, Incoming, LOCAL_ROWS, MANIFEST, MAX_ATTACHMENTS_BYTES,
+    PENDING, SYNCED_ROWS, VERSION, read_error,
 };
 use super::{Entry, Manifest, checked_attachment_total, validate_attachment_path};
 
@@ -190,12 +190,38 @@ fn read_entry(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, ClientError> {
-    let Ok(mut entry) = zip.by_name(path) else {
+    read_entry_bounded(zip, path, MAX_ATTACHMENTS_BYTES)
+}
+
+/// Reads one compressed entry, refusing output above `limit`.
+///
+/// The limit is a parameter so a test proves the boundary over kilobytes rather than over
+/// the gigabytes the shipped ceiling names.
+fn read_entry_bounded(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    path: &str,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    let Ok(entry) = zip.by_name(path) else {
         return Ok(None);
     };
-    let mut packed = Vec::new();
-    entry.read_to_end(&mut packed).map_err(read_error)?;
-    Ok(Some(zstd::decode_all(packed.as_slice())?))
+    // The ZIP entry streams into the decoder rather than through a buffer of its own,
+    // because its own compression expands unboundedly before any ceiling could apply.
+    let decoder = zstd::stream::read::Decoder::new(entry)?;
+    let ceiling =
+        usize::try_from(limit).expect("the decompression limit fits usize on supported targets");
+    let mut decompressed = Vec::new();
+    // One byte past the ceiling, so an entry of exactly the ceiling is accepted and the
+    // one that follows is refused.
+    decoder
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut decompressed)?;
+    if decompressed.len() > ceiling {
+        return Err(ClientError::Import(format!(
+            "archive entry {path} exceeds the decompression limit"
+        )));
+    }
+    Ok(Some(decompressed))
 }
 
 fn read_attachments(
@@ -236,20 +262,31 @@ pub(super) fn decode_pending(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ClientError> 
             .try_into()
             .map_err(|_| malformed())?,
     );
-    let mut at = 8;
+    // Every record costs at least its eight length bytes, so a count above what the entry
+    // can hold is refused before one vector per record is allocated.
+    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 8).unwrap_or(u64::MAX);
+    if count > capacity {
+        return Err(malformed());
+    }
+    let mut at: usize = 8;
     let mut records = Vec::new();
     for _ in 0..count {
         let len = usize::try_from(u64::from_be_bytes(
             bytes
-                .get(at..at + 8)
+                .get(at..at.checked_add(8).ok_or_else(malformed)?)
                 .ok_or_else(malformed)?
                 .try_into()
                 .map_err(|_| malformed())?,
         ))
         .map_err(|_| malformed())?;
         at += 8;
-        records.push(bytes.get(at..at + len).ok_or_else(malformed)?.to_vec());
-        at += len;
+        records.push(
+            bytes
+                .get(at..at.checked_add(len).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .to_vec(),
+        );
+        at = at.checked_add(len).ok_or_else(malformed)?;
     }
     Ok(records)
 }
@@ -261,6 +298,7 @@ mod tests {
     use serde_json::json;
 
     use super::super::super::{Archive, ExportScope};
+    use super::decode_pending;
     use super::read;
 
     /// What an export writes, an import reads back unchanged.
@@ -342,6 +380,72 @@ mod tests {
     #[test]
     fn a_foreign_file_is_refused() {
         assert!(read(b"not a zip at all").is_err());
+    }
+
+    /// An entry whose output passes the ceiling is refused, naming the entry, while an
+    /// entry of exactly the ceiling is read.
+    #[test]
+    fn the_decompression_ceiling_is_the_boundary() {
+        let limit: u64 = 64 * 1024;
+        let exact = usize::try_from(limit).expect("limit fits usize");
+        for (len, expected) in [(exact, None), (exact + 1, Some("decompression limit"))] {
+            let bytes =
+                zip_with_entry(&zstd::encode_all(vec![0u8; len].as_slice(), 1).expect("zstd"));
+            let mut zip =
+                zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).expect("zip");
+            let outcome = super::read_entry_bounded(&mut zip, "device-private.patchset", limit);
+            match (expected, outcome) {
+                (None, Ok(Some(entry))) => {
+                    assert_eq!(entry.len(), exact, "the exact ceiling reads");
+                }
+                (Some(needle), Err(error)) => {
+                    let text = error.to_string();
+                    assert!(text.contains(needle), "expected {needle} in error: {text}");
+                    assert!(
+                        text.contains("device-private.patchset"),
+                        "expected the entry name in error: {text}"
+                    );
+                }
+                (_, outcome) => panic!("unexpected outcome for {len} bytes: {outcome:?}"),
+            }
+        }
+    }
+
+    /// One archive holding a manifest and one zstd row entry, for the reader tests.
+    fn zip_with_entry(entry: &[u8]) -> Vec<u8> {
+        let manifest = json!({
+            "format": "connetto-local-data",
+            "version": 3,
+            "scope": "unsynced",
+            "schema_fingerprint": "abc123",
+            "account": null,
+            "compression": "per-entry",
+            "note": "test",
+            "entries": [{"kind": "rows", "path": "device-private.patchset", "encoding": "zstd"}],
+        });
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("manifest.json", options)
+            .expect("start manifest");
+        zip.write_all(&serde_json::to_vec(&manifest).expect("manifest json"))
+            .expect("write manifest");
+        zip.start_file("device-private.patchset", options)
+            .expect("start entry");
+        zip.write_all(entry).expect("write entry");
+        zip.finish().expect("finish archive").into_inner()
+    }
+
+    /// A queue entry with a length field of `u64::MAX` is refused rather than panicking.
+    #[test]
+    fn oversized_queue_entry_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        let error = decode_pending(&bytes).expect_err("overflowing queue entry must be refused");
+        assert!(
+            error.to_string().contains("malformed"),
+            "expected 'malformed' in error: {error}"
+        );
     }
 
     fn assert_invalid_entries(
