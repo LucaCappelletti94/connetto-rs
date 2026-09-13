@@ -238,7 +238,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
     // This page wins the leader election and owns the DB worker. A
     // multi-page app races the same leader lock, and the winner runs this.
     let membership = leader::join(&format!("connetto-leader-{base}"), &glue_url());
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[]).await.expect("db worker ready");
     stage("db worker ready");
 
     // Tab A holds its liveness lock BEFORE connecting, the protocol the

@@ -283,7 +283,7 @@ impl ParityFixture {
         // This page wins the leader election and owns the DB worker that hosts
         // the relay hub the tab client speaks to.
         let membership = leader::join(&format!("connetto-parity-{base}"), &glue_url());
-        await_db_worker_ready().await.expect("db worker ready");
+        await_db_worker_ready(&[]).await.expect("db worker ready");
         stage("db worker ready");
 
         // The direct client: a plain server session, the parity reference.

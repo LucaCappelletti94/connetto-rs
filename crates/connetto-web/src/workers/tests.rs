@@ -17,8 +17,8 @@ use super::archive_channel::{
 };
 use super::helpers::content_store_namespace;
 use super::{
-    DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError, announce_tab,
-    await_db_worker_ready, request_custody, request_export, request_import,
+    BootIdentity, DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError,
+    announce_tab, await_db_worker_ready, request_custody, request_export, request_import,
 };
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -299,25 +299,73 @@ async fn import_wait_ends_when_worker_generation_is_replaced() {
     alive.release();
 }
 
-/// A boot-failure message on the hello channel causes `await_db_worker_ready` to return
-/// the typed `BootFailed` variant, not an opaque `JsValue`.
+/// A failure whose identity the caller does not know is ignored, so the wait expires instead.
+#[wasm_bindgen_test]
+async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
+    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let sender = channel.clone();
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str("failed:foreign00000000:some-error"));
+    });
+    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 300.0)
+        .await
+        .expect_err("deadline must expire");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, not a foreign failure: {error:?}"
+    );
+    channel.close();
+}
+
+/// A failure whose identity matches the one this caller was given is reported with its detail.
 ///
 /// The assertion that would have failed before the fix: callers had to call
 /// `err.as_string()` (a `JsValue` method) to inspect the failure; now `matches!`
 /// on the enum variant suffices.
 #[wasm_bindgen_test]
-async fn await_db_worker_ready_reports_boot_failure_as_typed_error() {
+async fn await_db_worker_ready_reports_failure_for_own_identity() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
     let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
     let sender = channel.clone();
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
-        let _ = sender.post_message(&JsValue::from_str("failed:schema-mismatch"));
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{id_str}:schema-mismatch"
+        )));
     });
-    let error = await_db_worker_ready()
+    let error = await_db_worker_ready(&[identity])
         .await
-        .expect_err("boot failure is reported");
+        .expect_err("own-identity failure is reported");
     assert!(
         matches!(&error, IntakeError::BootFailed { detail } if detail.contains("schema-mismatch")),
+        "expected BootFailed with the worker detail, got {error:?}"
+    );
+    channel.close();
+}
+
+/// An identity announced via `booting:` while waiting is learned and later matched against a
+/// failure, so a follower tab fails fast for the boot that was announced.
+#[wasm_bindgen_test]
+async fn await_db_worker_ready_reports_failure_for_announced_identity() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
+    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let sender = channel.clone();
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str(&format!("booting:{id_str}")));
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{id_str}:network-error"
+        )));
+    });
+    let error = await_db_worker_ready(&[])
+        .await
+        .expect_err("announced failure is reported");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("network-error")),
         "expected BootFailed with the worker detail, got {error:?}"
     );
     channel.close();
@@ -357,14 +405,12 @@ async fn announce_tab_returns_ok_when_worker_acknowledges() {
 #[wasm_bindgen_test]
 async fn request_custody_without_worker_returns_timeout() {
     let error = request_custody().await.expect_err("no worker is running");
+    let IntakeError::Timeout { deadline_ms } = error else {
+        panic!("expected Timeout, got {error:?}")
+    };
     assert!(
-        matches!(
-            error,
-            IntakeError::Timeout {
-                deadline_ms: 15_000
-            }
-        ),
-        "expected Timeout {{deadline_ms: 15_000}}, got {error:?}"
+        (deadline_ms - 15_000.0).abs() < f64::EPSILON,
+        "expected the 15 s readiness deadline, got {deadline_ms}"
     );
 }
 
@@ -383,7 +429,8 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
 /// resolves a relative specifier against `blob:`.
 #[wasm_bindgen_test]
 fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
-    let source = super::boot::generated_bootstrap_source("./db-worker.js")
+    let identity = super::boot::BootIdentity::mint();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
         .expect("a relative glue URL must produce a bootstrap source");
     assert!(
         !source.contains("\"./db-worker.js\""),
@@ -392,5 +439,19 @@ fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
     assert!(
         source.contains("await import(\"http"),
         "the import specifier must be absolute: {source}"
+    );
+}
+
+/// The generated bootstrap source embeds the boot identity in the failure message, so a waiter
+/// that holds the identity can match the failure rather than waiting out the deadline.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_source_carries_the_boot_identity() {
+    let identity = super::boot::BootIdentity::mint();
+    let id_str = identity.to_string();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+        .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        source.contains(&format!("\"failed:{id_str}:\" + err")),
+        "the failure message must carry the boot identity: {source}"
     );
 }

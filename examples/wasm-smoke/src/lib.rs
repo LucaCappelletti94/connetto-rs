@@ -108,9 +108,23 @@ pub mod workers {
     use web_sys::Worker;
 
     pub use connetto_web::workers::{
-        DB_ALIVE_LOCK, HELLO_CHANNEL, announce_tab, await_db_worker_ready, request_custody, sleep,
+        BootIdentity, DB_ALIVE_LOCK, HELLO_CHANNEL, announce_tab, request_custody, sleep,
         tab_wire_factory,
     };
+
+    /// Waits for the DB worker, acting on a boot failure of `known` alone.
+    ///
+    /// A test that spawned the worker passes the identity it was given, and one that only
+    /// joined passes nothing, which is what a follower tab does.
+    ///
+    /// # Errors
+    ///
+    /// The readiness failure as [`connetto_web::workers::IntakeError`] describes it.
+    pub async fn await_db_worker_ready(known: &[BootIdentity]) -> Result<(), JsValue> {
+        connetto_web::workers::await_db_worker_ready(known)
+            .await
+            .map_err(JsValue::from)
+    }
 
     /// The demo server every smoke context connects to.
     pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
@@ -144,7 +158,7 @@ pub mod workers {
     /// # Errors
     ///
     /// The `Worker` constructor's error when the worker cannot be created.
-    pub fn spawn_db_worker(glue_url: &str) -> Result<Worker, JsValue> {
+    pub fn spawn_db_worker(glue_url: &str) -> Result<(Worker, BootIdentity), JsValue> {
         connetto_web::workers::spawn_db_worker(
             glue_url,
             &connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url)),

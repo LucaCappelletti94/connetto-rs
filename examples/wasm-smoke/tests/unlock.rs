@@ -243,7 +243,7 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
     }
 
     stage("test 1: waiting for worker ready");
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[]).await.expect("db worker ready");
 
     assert!(
         logins.get() >= 1,
@@ -268,11 +268,13 @@ async fn custody_without_the_unlock_flag_reads_as_offerable() {
     common::play_the_tab();
 
     // Spawn a worker with unlock=false (the default from spawn_db_worker).
-    let worker =
+    let (worker, boot) =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 2: waiting for worker ready");
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
 
     stage("test 2: reading custody from the worker");
     let custody = request_custody().await.expect("the worker answers custody");
@@ -346,7 +348,7 @@ async fn unlock_disabled_with_an_enrolled_credential_refuses_the_boot() {
     stage("test 4: unlock=false with enrolled credential");
     plant_enrolled_credential(0xcc, 0x02).await;
     let failure_rx = wait_debug_for("FAILED");
-    let worker =
+    let (worker, _boot) =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 4: waiting for boot failure");

@@ -13,8 +13,6 @@ use crate::frames::{MessageTransport, MessageTransportError};
 
 /// Deadline for all hello-channel exchanges.
 const HELLO_TIMEOUT_MS: f64 = 15_000.0;
-/// Deadline in milliseconds for the [`IntakeError::Timeout`] variant.
-const HELLO_TIMEOUT_DEADLINE_MS: u64 = 15_000;
 
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
@@ -43,10 +41,10 @@ pub enum IntakeError {
         detail: String,
     },
     /// the db worker did not answer within the readiness deadline
-    #[error("db worker did not answer within {deadline_ms} ms")]
+    #[error("db worker did not answer within {deadline_ms:.0} ms")]
     Timeout {
         /// the deadline that expired, in milliseconds
-        deadline_ms: u64,
+        deadline_ms: f64,
     },
 }
 
@@ -59,6 +57,7 @@ impl From<IntakeError> for JsValue {
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
+    deadline_ms: f64,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
     let started = js_sys::Date::now();
@@ -71,10 +70,8 @@ async fn poll_hello_channel(
             }
             HelloReady::Waiting => {}
         }
-        if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
-            return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
-            });
+        if js_sys::Date::now() - started >= deadline_ms {
+            return Err(IntakeError::Timeout { deadline_ms });
         }
         let _ = channel.post_message(&JsValue::from_str("ask"));
         sleep_ms(POLL_MS).await;
@@ -83,33 +80,55 @@ async fn poll_hello_channel(
 
 /// Page side: resolve once the DB worker's intake answers on the hello channel.
 ///
+/// `known` lists boot identities this caller may act on; a failure whose identity is not among
+/// them is ignored. The caller also learns an identity from a `booting:<identity>` message that
+/// arrives while it waits.
+///
 /// # Errors
 ///
 /// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened,
-/// [`IntakeError::BootFailed`] when the worker reported a failure, or
+/// [`IntakeError::BootFailed`] when the worker reported a failure for a known identity, or
 /// [`IntakeError::Timeout`] when the deadline expires.
-pub async fn await_db_worker_ready() -> Result<(), IntakeError> {
+pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Result<(), IntakeError> {
+    await_db_worker_ready_bounded(known, HELLO_TIMEOUT_MS).await
+}
+
+/// Waits for readiness under `deadline_ms`, so a test proves the ignoring of a foreign failure
+/// in milliseconds rather than over the shipped deadline.
+pub(super) async fn await_db_worker_ready_bounded(
+    known: &[super::boot::BootIdentity],
+    deadline_ms: f64,
+) -> Result<(), IntakeError> {
     let channel =
         BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
             operation: "hello channel",
             detail: format!("{err:?}"),
         })?;
     let state = Rc::new(RefCell::new(HelloReady::Waiting));
+    let known_ids = Rc::new(RefCell::new(known.to_vec()));
     let on_message = {
         let state = Rc::clone(&state);
+        let known_ids = Rc::clone(&known_ids);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
             if message == "ready" {
                 *state.borrow_mut() = HelloReady::Up;
-            } else if let Some(detail) = message.strip_prefix("failed:") {
+            } else if let Some(id) = message.strip_prefix("booting:") {
+                known_ids
+                    .borrow_mut()
+                    .push(super::boot::BootIdentity::from_wire(id));
+            } else if let Some(rest) = message.strip_prefix("failed:")
+                && let Some((id, detail)) = rest.split_once(':')
+                && known_ids.borrow().iter().any(|known| known.matches_str(id))
+            {
                 *state.borrow_mut() = HelloReady::Failed(detail.to_owned());
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let result = poll_hello_channel(&channel, &state).await;
+    let result = poll_hello_channel(&channel, &state, deadline_ms).await;
     channel.set_onmessage(None);
     channel.close();
     result
@@ -145,7 +164,7 @@ pub async fn announce_tab(wire: &str) -> Result<(), IntakeError> {
             channel.set_onmessage(None);
             channel.close();
             return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+                deadline_ms: HELLO_TIMEOUT_MS,
             });
         }
         sleep_ms(10).await;
@@ -171,7 +190,7 @@ pub fn tab_wire_factory(
             js_sys::Date::now()
         );
         Box::pin(async move {
-            await_db_worker_ready()
+            await_db_worker_ready(&[])
                 .await
                 .map_err(|err| MessageTransportError::Sink(err.to_string()))?;
             announce_tab(&wire)
@@ -224,7 +243,7 @@ pub async fn request_custody() -> Result<Custody, IntakeError> {
             channel.close();
             drop(on_message);
             return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+                deadline_ms: HELLO_TIMEOUT_MS,
             });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.

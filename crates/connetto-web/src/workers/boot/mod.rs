@@ -1,3 +1,6 @@
+use core::fmt;
+use std::rc::Rc;
+
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::{Worker, WorkerOptions, WorkerType};
@@ -7,6 +10,38 @@ mod services;
 
 /// Storage-pool slots reserved by [`boot_db_worker`]: 4 databases plus a rollback journal each.
 const BOOT_SLOTS: u32 = 8;
+
+/// An opaque identifier minted when a DB worker is spawned.
+///
+/// The spawning tab announces it as `booting:<identity>` on the hello channel, and the
+/// generated bootstrap posts it as `failed:<identity>:<detail>` when the worker cannot start.
+/// Cloning increments an `Rc` reference count rather than copying the string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BootIdentity(Rc<str>);
+
+impl fmt::Display for BootIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl BootIdentity {
+    /// Mints a fresh identity for one boot attempt.
+    #[must_use]
+    pub fn mint() -> Self {
+        Self(rosetta_uuid::Uuid::new_v4().to_string().into())
+    }
+
+    /// Whether a wire string names this boot.
+    pub(crate) fn matches_str(&self, wire: &str) -> bool {
+        &*self.0 == wire
+    }
+
+    /// Takes an identity from a hello-channel message.
+    pub(crate) fn from_wire(wire: &str) -> Self {
+        Self(Rc::from(wire))
+    }
+}
 
 /// Failure of the DB worker boot sequence or worker spawn.
 #[derive(Debug, thiserror::Error)]
@@ -284,13 +319,20 @@ pub enum WorkerBootstrap {
 ///
 /// [`BootError::BootstrapUrl`] when a URL cannot be parsed, [`BootError::WorkerSpawn`] when the
 /// `Worker` constructor fails.
-pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Worker, BootError> {
+pub fn spawn_db_worker(
+    glue_url: &str,
+    bootstrap: &WorkerBootstrap,
+) -> Result<(Worker, BootIdentity), BootError> {
+    let identity = BootIdentity::mint();
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");
     match bootstrap {
-        WorkerBootstrap::Glue => Worker::new_with_options(glue_url, &options)
-            .map_err(|e| BootError::WorkerSpawn(format!("{e:?}"))),
+        WorkerBootstrap::Glue => {
+            let worker = Worker::new_with_options(glue_url, &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
+            Ok((worker, identity))
+        }
         WorkerBootstrap::Script(script_url) => {
             let base = current_location_href()?;
             let url = web_sys::Url::new_with_base(script_url, &base)
@@ -299,27 +341,31 @@ pub fn spawn_db_worker(glue_url: &str, bootstrap: &WorkerBootstrap) -> Result<Wo
             let existing = url.search();
             // existing is "" or "?key=val"; set_search prepends "?" automatically.
             let new_search = if existing.is_empty() {
-                format!("glue={encoded}")
+                format!("glue={encoded}&boot={identity}")
             } else {
-                format!("{}&glue={encoded}", existing.trim_start_matches('?'))
+                format!(
+                    "{}&glue={encoded}&boot={identity}",
+                    existing.trim_start_matches('?')
+                )
             };
             url.set_search(&new_search);
-            Worker::new_with_options(&url.href(), &options)
-                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))
+            let worker = Worker::new_with_options(&url.href(), &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
+            Ok((worker, identity))
         }
         WorkerBootstrap::Generated => {
-            let object_url = generated_bootstrap_url(glue_url)?;
+            let object_url = generated_bootstrap_url(glue_url, &identity)?;
             let worker = Worker::new_with_options(&object_url, &options)
                 .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")));
             // The worker takes its reference to the blob during construction.
             let _ = web_sys::Url::revoke_object_url(&object_url);
-            worker
+            Ok((worker?, identity))
         }
     }
 }
 
-fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
-    let source = generated_bootstrap_source(glue_url)?;
+fn generated_bootstrap_url(glue_url: &str, identity: &BootIdentity) -> Result<String, BootError> {
+    let source = generated_bootstrap_source(glue_url, identity)?;
     let parts = js_sys::Array::of1(&JsValue::from_str(&source));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type("text/javascript");
@@ -330,7 +376,10 @@ fn generated_bootstrap_url(glue_url: &str) -> Result<String, BootError> {
 }
 
 /// Build the module source that imports the glue and initializes it against its wasm file.
-pub(super) fn generated_bootstrap_source(glue_url: &str) -> Result<String, BootError> {
+pub(super) fn generated_bootstrap_source(
+    glue_url: &str,
+    identity: &BootIdentity,
+) -> Result<String, BootError> {
     let base = current_location_href()?;
     let url = web_sys::Url::new_with_base(glue_url, &base)
         .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
@@ -352,12 +401,13 @@ pub(super) fn generated_bootstrap_source(glue_url: &str) -> Result<String, BootE
   await mod.default({{ module_or_path: {wasm} }});
 }} catch (err) {{
   new BroadcastChannel("connetto-debug").postMessage("db worker bootstrap FAILED: " + err);
-  new BroadcastChannel("connetto-hello").postMessage("failed:" + err);
+  new BroadcastChannel("connetto-hello").postMessage("failed:{id}:" + err);
   throw err;
 }}
 "#,
         glue = js_string_literal(&resolved_glue),
         wasm = js_string_literal(&wasm_url),
+        id = identity,
     ))
 }
 
