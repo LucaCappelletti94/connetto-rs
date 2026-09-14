@@ -626,8 +626,7 @@ where
     let (storage, key_store, was_enrolled) = services::prepare_boot_storage(config).await?;
     let mut spec =
         replica::resolve_replica_spec::<Id>(config, &storage, &key_store, was_enrolled).await?;
-    let replica_key =
-        replica::provision_or_load_key(&key_store, &spec.replica_db_name, spec.existing).await?;
+    let replica_key = replica::resolve_replica_key(&key_store, &spec).await?;
     let login = spec.login.take();
     let client_config = replica::build_boot_client_config(config, login, &spec);
     let transport = replica::try_connect_upstream(config.ws_url).await;

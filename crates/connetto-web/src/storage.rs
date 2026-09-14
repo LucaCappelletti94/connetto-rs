@@ -26,11 +26,13 @@
 use connetto_client::cipher::cipher_url;
 use connetto_core::ReplicaKey;
 use connetto_core::traits::ReplicaKeyStore;
+use connetto_file_client::{BrowserStore, BrowserStoreError};
 use indexed_db_futures::database::Database as IdbDatabase;
 use indexed_db_futures::object_store::ObjectStore;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
 
 use crate::auth::{AuthError, PendingWork};
 
@@ -213,8 +215,8 @@ pub fn tier_db_name(replica: &str) -> String {
     format!("{replica}-tier")
 }
 
-/// Data teardown: destroy the replica's key, then delete the replica and the
-/// device-private database beside it.
+/// Data teardown that destroys the replica's key, then deletes the replica, its
+/// device-private tier, and its content namespace.
 ///
 /// The browser mirror of `connetto_client::teardown::wipe_replica`, and the
 /// crypto-shredding half of the logout grid. Deleting the pool entry alone
@@ -231,6 +233,13 @@ pub fn tier_db_name(replica: &str) -> String {
 /// that opens it, and the next boot for this identity would mint a fresh key,
 /// meet the surviving file and fail to unlock it.
 ///
+/// The content namespace goes last, after the replica, so the order is key,
+/// tier, replica, content. It is `None` for a deployment with no content, and it
+/// cannot be recomputed from the replica name, so the pending-wipe record
+/// carries it. An environmental failure removing it defers to a later boot
+/// through [`WipeProgress::ContentPending`] while the replica stays destroyed,
+/// and an invalid namespace stays fatal.
+///
 /// The key goes first, so a failed delete leaves inert ciphertext rather than a
 /// readable database.
 ///
@@ -239,14 +248,16 @@ pub fn tier_db_name(replica: &str) -> String {
 /// # Errors
 ///
 /// [`WipeError::Unsynced`] when local work remains, [`WipeError::KeyStore`] when
-/// the record cannot be cleared, or [`WipeError::Storage`] when a delete fails.
+/// the record cannot be cleared, or [`WipeError::Storage`] when a delete fails or
+/// the content namespace is invalid.
 pub async fn wipe_replica<S>(
     storage: &ReplicaStorage,
     key_store: &S,
     name: &str,
+    content_namespace: Option<&str>,
     pending: &PendingWork,
     force: bool,
-) -> Result<(), WipeError>
+) -> Result<WipeProgress, WipeError>
 where
     S: ReplicaKeyStore<Error = AuthError>,
 {
@@ -262,7 +273,48 @@ where
         .map_err(|err| WipeError::Storage(err.to_string()))?;
     storage
         .delete_db(name)
-        .map_err(|err| WipeError::Storage(err.to_string()))
+        .map_err(|err| WipeError::Storage(err.to_string()))?;
+    match content_namespace {
+        Some(namespace) => remove_content_namespace(namespace).await,
+        None => Ok(WipeProgress::Complete),
+    }
+}
+
+/// How far a [`wipe_replica`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeProgress {
+    /// The replica, its tier, and any content namespace are all gone.
+    Complete,
+    /// The replica and its tier are gone, but the content namespace could not be
+    /// removed for an environmental reason and is left for a later boot to retry.
+    ContentPending,
+}
+
+/// Remove the browser content namespace `namespace`, the persistent OPFS store
+/// holding one replica's content chunks.
+///
+/// An environmental failure defers rather than aborts, so a wipe that already
+/// destroyed the replica leaves only the orphaned namespace for a later boot to
+/// retry. An invalid namespace is a programming error and stays fatal.
+///
+/// # Errors
+///
+/// [`WipeError::Storage`] when the namespace is invalid or the worker scope is
+/// unavailable.
+pub(crate) async fn remove_content_namespace(namespace: &str) -> Result<WipeProgress, WipeError> {
+    let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
+        .dyn_into()
+        .map_err(|value: js_sys::Object| WipeError::Storage(format!("worker scope: {value:?}")))?;
+    match BrowserStore::remove(&scope, namespace).await {
+        Ok(()) => Ok(WipeProgress::Complete),
+        Err(error @ BrowserStoreError::InvalidNamespace { .. }) => {
+            Err(WipeError::Storage(error.to_string()))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "content wipe deferred while browser storage is unavailable");
+            Ok(WipeProgress::ContentPending)
+        }
+    }
 }
 
 /// The key-store record holding this device's own key, the one that is not

@@ -75,18 +75,12 @@ fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
         .to_str()
         .expect("utf-8 path")
         .to_owned();
-    let tier_path = dir
-        .path()
-        .join("tier.sqlite")
-        .to_str()
-        .expect("utf-8 path")
-        .to_owned();
     let replica = Replica::encrypted_file(
         &replica_path,
         Some(connetto_core::test_support::replica_key()),
     )
     .expect("replica key")
-    .with_tier(&tier_path, tier_ddl);
+    .with_tier(tier_ddl);
     let conn = ConnettoConnection::<FakeTransport>::open(
         &replica,
         synced_ddl,

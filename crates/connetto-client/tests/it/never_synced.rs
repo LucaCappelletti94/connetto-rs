@@ -239,13 +239,12 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
 async fn device_private_rows_do_not_wait_on_a_server() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("local.sqlite");
-    let tier = dir.path().join("local-tier.sqlite");
     let replica = Replica::encrypted_file(
         path.to_str().expect("utf-8 path"),
         Some(connetto_core::test_support::replica_key()),
     )
     .expect("a resolved key")
-    .with_tier(tier.to_str().expect("utf-8 path"), TIER_DDL);
+    .with_tier(TIER_DDL);
 
     let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
         .expect("open the replica");
@@ -287,13 +286,12 @@ async fn device_private_rows_do_not_wait_on_a_server() {
 async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("local-only.sqlite");
-    let tier = dir.path().join("local-only-tier.sqlite");
     let replica = Replica::encrypted_file(
         path.to_str().expect("utf-8 path"),
         Some(connetto_core::test_support::replica_key()),
     )
     .expect("a resolved key")
-    .with_tier(tier.to_str().expect("utf-8 path"), TIER_DDL);
+    .with_tier(TIER_DDL);
 
     let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
         .expect("open the replica");

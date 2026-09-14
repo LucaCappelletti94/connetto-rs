@@ -55,15 +55,14 @@ diesel::table! {
 fn archive_carries_manifest_and_compressed_patchset_entries() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let replica_path = dir.path().join("replica.sqlite");
-    let tier_path = dir.path().join("tier.sqlite");
     let replica_path_str = replica_path.to_str().expect("utf-8 path").to_owned();
-    let tier_path_str = tier_path.to_str().expect("utf-8 path").to_owned();
+    let tier_path = dir.path().join("replica.sqlite-tier");
     let replica = Replica::encrypted_file(
         &replica_path_str,
         Some(connetto_core::test_support::replica_key()),
     )
     .expect("replica key")
-    .with_tier(&tier_path_str, TIER_DDL);
+    .with_tier(TIER_DDL);
     let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
         &replica,
         SYNCED_DDL,

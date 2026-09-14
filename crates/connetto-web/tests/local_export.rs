@@ -69,7 +69,7 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
         Some(ReplicaKey::from_bytes([0x26; ReplicaKey::LEN])),
     )
     .expect("a resolved key")
-    .with_tier(&tier, TIER_DDL);
+    .with_tier(TIER_DDL);
     let mut worker = ConnettoConnection::connect(
         // Silent, not merely accepting: an accepting transport reports a close
         // once its scripted frames run out, and the hub pump ends with it.

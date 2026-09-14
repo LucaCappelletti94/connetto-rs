@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use connetto_client::teardown::{
-    ForgetError, PurgeError, forget_device, purge_replica, wipe_replica,
+    ForgetError, PurgeError, content_dir, forget_device, purge_replica, wipe_replica,
 };
 use connetto_client::{
     ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
@@ -31,6 +31,8 @@ use diesel::prelude::*;
 const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+
+const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
 diesel::table! {
     /// Test table for items in the replica.
@@ -154,6 +156,95 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
             .expect("bob still opens"),
         vec![Some(MARKER.to_owned())],
         "the other identity's replica is still decryptable under its own key"
+    );
+}
+
+/// First-boot an encrypted replica for `user_id` with a device-private tier
+/// beside it, so a teardown has a tier to remove. Returns the replica path, its
+/// key-store record name, and the pending sequence numbers.
+async fn seed_replica_with_tier(
+    dir: &Path,
+    keys: &MemoryKeyStore,
+    user_id: &str,
+) -> (PathBuf, String, Vec<u64>) {
+    let record = replica_db_name("replica", user_id).expect("a replica name");
+    let path = dir.join(&record);
+    let db = url(&path);
+    let key = provision_replica_key(keys, &record)
+        .await
+        .expect("mint a key for a fresh replica");
+    let mut conn = ConnettoConnection::connect(
+        FakeTransport::accepting(),
+        &Replica::encrypted_file(&db, Some(key))
+            .expect("key is provided")
+            .with_tier(TIER_DDL),
+        SQLITE_DDL,
+        &config(),
+        None,
+    )
+    .await
+    .expect("first connect");
+    diesel::insert_into(items::table)
+        .values((items::id.eq(7), items::label.eq(MARKER)))
+        .execute(conn.conn())
+        .expect("write the canary");
+    conn.push().await.expect("upload the captured mutation");
+    (path, record, conn.unsynced())
+}
+
+/// A wipe removes everything the replica key opens: the replica and its
+/// sidecars, the device-private tier, and the content directory beside them,
+/// then destroys the key. Each is checked against the filesystem after the fact.
+#[tokio::test]
+async fn a_wipe_removes_the_tier_and_content_directory_beside_the_replica() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let keys = MemoryKeyStore::default();
+
+    let (path, record, unsynced) = seed_replica_with_tier(dir.path(), &keys, "alice").await;
+    let tier = PathBuf::from(format!("{}-tier", url(&path)));
+    assert!(tier.exists(), "the tier was created beside the replica");
+
+    // A chunk under the content directory, which a wipe orphans and must remove.
+    let content = content_dir(&path);
+    std::fs::create_dir_all(&content).expect("create the content directory");
+    std::fs::write(content.join("chunk-0"), b"orphaned content").expect("write a content chunk");
+
+    wipe_replica(&path, &keys, &record, &unsynced, true)
+        .await
+        .expect("wipe the replica");
+
+    assert!(!path.exists(), "the replica file is gone");
+    assert!(!tier.exists(), "the device-private tier is gone");
+    assert!(!content.exists(), "the content directory is gone");
+    assert_eq!(
+        keys.load(&record).await.expect("load"),
+        None,
+        "the key-store record is destroyed, so leftover ciphertext is inert"
+    );
+}
+
+/// `purge_replica` keeps the key but still removes the content directory, because
+/// a fresh replica has empty manifest tables and every chunk under the old
+/// directory is an orphan the sweep would otherwise reclaim one file at a time.
+#[tokio::test]
+async fn a_purge_removes_the_content_directory_but_keeps_the_key() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let keys = MemoryKeyStore::default();
+
+    let (path, record, unsynced) = seed_replica_with_tier(dir.path(), &keys, "alice").await;
+    let content = content_dir(&path);
+    std::fs::create_dir_all(&content).expect("create the content directory");
+    std::fs::write(content.join("chunk-0"), b"orphaned content").expect("write a content chunk");
+
+    purge_replica(&path, &unsynced, true).expect("purge the replica");
+
+    assert!(!path.exists(), "the replica file is gone");
+    assert!(!content.exists(), "the content directory is gone");
+    assert!(
+        keys.load(&record).await.expect("load").is_some(),
+        "a purge keeps the key, unlike a wipe"
     );
 }
 

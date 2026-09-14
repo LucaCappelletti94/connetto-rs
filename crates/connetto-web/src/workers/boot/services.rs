@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use connetto_client::ConnettoConnection;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_core::messages::SubscriptionSpec;
-use connetto_file_client::{BrowserStore, BrowserStoreError, ContentArchive};
+use connetto_file_client::{BrowserStore, ContentArchive};
 use tokio::sync::mpsc::UnboundedReceiver;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -70,51 +70,39 @@ async fn apply_pending_wipe(
     key_store: &crate::auth::IdbKeyStore,
     pending: &crate::storage::PendingWipe,
 ) -> Result<(), BootError> {
-    let content_removed = remove_pending_content(pending).await?;
-    if !pending.replica_deleted() {
+    let progress = if pending.replica_deleted() {
+        // The replica and key went on an earlier boot, and a fresh login may
+        // already own the name, so only the orphaned content is retried here.
+        match pending.content_namespace.as_deref() {
+            Some(namespace) => crate::storage::remove_content_namespace(namespace).await?,
+            None => crate::storage::WipeProgress::Complete,
+        }
+    } else {
         crate::storage::wipe_replica(
             storage,
             key_store,
             &pending.replica,
+            pending.content_namespace.as_deref(),
             &crate::auth::PendingWork::default(),
             true,
         )
-        .await?;
-    }
-    match (content_removed, pending.replica_deleted()) {
-        (true, _) => crate::storage::acknowledge_pending_wipe(pending)
-            .await
-            .map_err(BootError::KeyStore)?,
-        (false, false) => crate::storage::defer_pending_content_wipe(pending)
-            .await
-            .map_err(BootError::KeyStore)?,
-        (false, true) => {}
+        .await?
+    };
+    match (progress, pending.replica_deleted()) {
+        (crate::storage::WipeProgress::Complete, _) => {
+            crate::storage::acknowledge_pending_wipe(pending)
+                .await
+                .map_err(BootError::KeyStore)?;
+        }
+        (crate::storage::WipeProgress::ContentPending, false) => {
+            crate::storage::defer_pending_content_wipe(pending)
+                .await
+                .map_err(BootError::KeyStore)?;
+        }
+        (crate::storage::WipeProgress::ContentPending, true) => {}
     }
     tracing::info!(replica = %pending.replica, "db worker: advanced a pending data wipe");
     Ok(())
-}
-
-async fn remove_pending_content(pending: &crate::storage::PendingWipe) -> Result<bool, BootError> {
-    let Some(namespace) = &pending.content_namespace else {
-        return Ok(true);
-    };
-    let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
-        .dyn_into()
-        .map_err(|value: js_sys::Object| BootError::NotWorkerScope(format!("{value:?}")))?;
-    match BrowserStore::remove(&scope, namespace).await {
-        Ok(()) => Ok(true),
-        Err(error @ BrowserStoreError::InvalidNamespace { .. }) => {
-            Err(BootError::ContentStore(error))
-        }
-        Err(error) => {
-            tracing::warn!(
-                replica = %pending.replica,
-                error = %error,
-                "db worker: content wipe deferred while browser storage is unavailable"
-            );
-            Ok(false)
-        }
-    }
 }
 
 pub(super) async fn hold_alive_lock() {
@@ -179,18 +167,14 @@ async fn setup_content_store(
         return Ok((None, None, None));
     };
     let namespace = content_store_namespace(seed, replica_db_name);
-    let (store, root_key) = if identified {
-        let root_key = content_root_key.ok_or(BootError::ContentKey)?;
+    let root_key = content_root_key.ok_or(BootError::ContentKey)?;
+    let store = if identified {
         let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global()
             .dyn_into()
             .map_err(|value: js_sys::Object| BootError::NotWorkerScope(format!("{value:?}")))?;
-        let store = BrowserStore::install(&scope, &namespace).await?;
-        (store, root_key)
+        BrowserStore::install(&scope, &namespace).await?
     } else {
-        (
-            BrowserStore::ephemeral(),
-            content_root_key.unwrap_or([0; 32]),
-        )
+        BrowserStore::ephemeral()
     };
     let persistent = store.is_persistent();
     let wipe_namespace = identified.then_some(namespace);

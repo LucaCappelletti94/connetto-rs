@@ -147,10 +147,9 @@ fn every_configured_knob_holds_on_a_fresh_replica() {
 fn a_tier_rests_at_one_attached_database_and_stays_writable() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("replica.sqlite");
-    let tier = dir.path().join("tier.sqlite");
     let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
         .expect("a resolved key")
-        .with_tier(tier.to_str().expect("utf-8 path"), TIER_DDL);
+        .with_tier(TIER_DDL);
     let mut conn =
         ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).expect("open");
 
@@ -214,10 +213,10 @@ fn a_window_without_the_create_permit_refuses_a_missing_file() {
 fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("replica.sqlite");
-    let tier = dir.path().join("never-created.sqlite");
+    let tier = dir.path().join("replica.sqlite-tier");
     let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
         .expect("a resolved key")
-        .with_existing_tier(tier.to_str().expect("utf-8 path"));
+        .with_existing_tier();
 
     assert!(
         ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).is_err(),

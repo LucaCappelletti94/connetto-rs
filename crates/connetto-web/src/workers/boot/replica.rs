@@ -19,7 +19,6 @@ use crate::BrowserSocket;
 
 pub(crate) struct BootReplicaSpec<Id> {
     pub(crate) replica_db_name: String,
-    pub(crate) tier_db_name: String,
     pub(crate) replica_url: String,
     pub(crate) active_account: Option<String>,
     pub(crate) identified: bool,
@@ -50,7 +49,6 @@ impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
             None => None,
         };
         let existing = storage.exists(&replica_db_name);
-        let tier_db_name = crate::storage::tier_db_name(&replica_db_name);
         let replica_url = storage.db_url(&replica_db_name);
         let identified = session.is_some();
         let session_expires_at = session.as_ref().map(|s| s.session_expires_at);
@@ -58,7 +56,6 @@ impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
         let identity = session.map(|s| s.user_id);
         Ok(Self {
             replica_db_name,
-            tier_db_name,
             replica_url,
             active_account,
             identified,
@@ -273,6 +270,37 @@ pub(super) async fn provision_or_load_key(
     }
 }
 
+/// Clear any replica key an earlier anonymous boot stored under the bare prefix.
+///
+/// An anonymous boot provisions no key, so a record left by a boot from before
+/// this decision would sit under the bare prefix with nothing to ever remove it.
+/// The clear is idempotent, so a boot that finds none is unaffected.
+pub(super) async fn clear_anonymous_key(
+    key_store: &crate::auth::IdbKeyStore,
+    replica_db_name: &str,
+) -> Result<(), BootError> {
+    key_store
+        .clear(replica_db_name)
+        .await
+        .map_err(BootError::KeyStore)
+}
+
+/// Resolve this boot's replica key, provisioning only for an identified boot.
+///
+/// An anonymous boot has no durable file to open, so it provisions no key and
+/// instead clears any record a past anonymous boot left under the bare prefix.
+pub(super) async fn resolve_replica_key<Id>(
+    key_store: &crate::auth::IdbKeyStore,
+    spec: &BootReplicaSpec<Id>,
+) -> Result<Option<connetto_core::ReplicaKey>, BootError> {
+    if spec.identified {
+        provision_or_load_key(key_store, &spec.replica_db_name, spec.existing).await
+    } else {
+        clear_anonymous_key(key_store, &spec.replica_db_name).await?;
+        Ok(None)
+    }
+}
+
 pub(super) fn build_boot_client_config<Id: core::fmt::Display>(
     config: &DbWorkerConfig,
     login: Option<Grant>,
@@ -310,8 +338,11 @@ pub(super) async fn try_connect_upstream(ws_url: &str) -> Option<BrowserSocket> 
     }
 }
 
-/// Open the boot replica; the replica key is consumed here and its derived content root key
-/// is returned alongside the connection.
+/// Open the boot replica and return the content root key beside the connection.
+///
+/// For an identified boot the content root key is the replica key. For an
+/// anonymous boot the replica key is `None`, so a fresh content root key is
+/// minted for this worker when a content namespace is configured.
 pub(super) async fn open_boot_replica<Id>(
     transport: Option<BrowserSocket>,
     spec: &BootReplicaSpec<Id>,
@@ -319,15 +350,26 @@ pub(super) async fn open_boot_replica<Id>(
     client_config: &ClientConfig,
     replica_key: Option<connetto_core::ReplicaKey>,
 ) -> Result<(ConnettoConnection<BrowserSocket>, Option<[u8; 32]>), BootError> {
-    let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
-    let worker = if spec.identified {
+    let (worker, content_root_key) = if spec.identified {
+        let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
         let replica = Replica::encrypted_file(&spec.replica_url, replica_key)
             .map_err(BootError::ReplicaOpen)?
-            .with_tier(&spec.tier_db_name, config.frontend_ddl);
-        open_replica(transport, &replica, spec.existing, config, client_config).await?
+            .with_tier(config.frontend_ddl);
+        let worker =
+            open_replica(transport, &replica, spec.existing, config, client_config).await?;
+        (worker, content_root_key)
     } else {
+        // An anonymous content store is worker-lifetime memory, so its root key is
+        // minted for this worker and never stored, and only when a content
+        // namespace is configured at all.
+        let content_root_key = if config.content_namespace.is_some() {
+            Some(crate::auth::mint_content_root_key().map_err(BootError::KeyStore)?)
+        } else {
+            None
+        };
         let replica = Replica::in_memory().with_tier(config.frontend_ddl);
-        open_replica(transport, &replica, false, config, client_config).await?
+        let worker = open_replica(transport, &replica, false, config, client_config).await?;
+        (worker, content_root_key)
     };
     tracing::info!(
         replica = %spec.replica_db_name,
@@ -420,4 +462,70 @@ async fn open_replica<S: StorageKind>(
             .map_err(BootError::ReplicaOpen)?;
     }
     Ok(worker)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BootReplicaSpec, resolve_replica_key};
+    use connetto_core::traits::ReplicaKeyStore as _;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    /// An anonymous spec, whose replica name is the bare prefix a run with no
+    /// identity opens under.
+    fn anonymous_spec(prefix: &str) -> BootReplicaSpec<String> {
+        BootReplicaSpec {
+            replica_db_name: prefix.to_owned(),
+            replica_url: String::new(),
+            active_account: None,
+            identified: false,
+            existing: false,
+            identity: None,
+            session_expires_at: None,
+            login: None,
+        }
+    }
+
+    /// An anonymous boot provisions no key, and clears any record a boot from
+    /// before this decision left under the bare prefix.
+    #[wasm_bindgen_test]
+    async fn an_anonymous_boot_writes_no_key_and_clears_a_leftover() {
+        let key_store = crate::auth::IdbKeyStore::open()
+            .await
+            .expect("open the key store");
+
+        // A leftover record under the bare prefix, as a past anonymous boot wrote.
+        let leftover = "boot-anon-leftover.sqlite";
+        crate::auth::provision_replica_key(&key_store, leftover)
+            .await
+            .expect("seed a leftover key");
+        assert!(
+            key_store.load(leftover).await.expect("load").is_some(),
+            "the leftover record is present before the boot"
+        );
+
+        let resolved = resolve_replica_key(&key_store, &anonymous_spec(leftover))
+            .await
+            .expect("resolve the anonymous key");
+        assert!(resolved.is_none(), "an anonymous boot provisions no key");
+        assert_eq!(
+            key_store.load(leftover).await.expect("load"),
+            None,
+            "and it clears the leftover record under the bare prefix"
+        );
+
+        // With nothing present, an anonymous boot writes no record at all.
+        let fresh = "boot-anon-fresh.sqlite";
+        key_store.clear(fresh).await.expect("start from nothing");
+        let resolved = resolve_replica_key(&key_store, &anonymous_spec(fresh))
+            .await
+            .expect("resolve the anonymous key");
+        assert!(resolved.is_none());
+        assert_eq!(
+            key_store.load(fresh).await.expect("load"),
+            None,
+            "an anonymous boot leaves no key-store record behind"
+        );
+    }
 }
