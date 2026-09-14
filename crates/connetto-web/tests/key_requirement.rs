@@ -83,7 +83,7 @@ async fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
     let tables = refused(ConnettoConnection::<FakeTransport>::open(
         &Replica::encrypted_file(&url, Some(key()))
             .expect("a resolved key")
-            .with_tier(&tier, UNKEYED_TIER_DDL),
+            .with_tier(UNKEYED_TIER_DDL),
         REPLICA_DDL,
         &config(),
         None,
@@ -118,7 +118,7 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
         ConnettoConnection::<FakeTransport>::open(
             &Replica::encrypted_file(&url, Some(key()))
                 .expect("a resolved key")
-                .with_tier(&tier, UNKEYED_TIER_DDL),
+                .with_tier(UNKEYED_TIER_DDL),
             REPLICA_DDL,
             &config().with_unrecorded_tables(["scratch"]),
             None,
@@ -128,7 +128,7 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     let tables = refused(ConnettoConnection::<FakeTransport>::open_existing(
         &Replica::encrypted_file(&url, Some(key()))
             .expect("a resolved key")
-            .with_existing_tier(&tier),
+            .with_existing_tier(),
         &config(),
         None,
     ));
@@ -155,7 +155,7 @@ async fn an_accepted_tier_table_records_nothing_and_a_later_one_is_caught() {
         let mut conn = ConnettoConnection::<FakeTransport>::open(
             &Replica::encrypted_file(&url, Some(key()))
                 .expect("a resolved key")
-                .with_tier(&tier, UNKEYED_TIER_DDL),
+                .with_tier(UNKEYED_TIER_DDL),
             REPLICA_DDL,
             &config().with_unrecorded_tables(["scratch"]),
             None,

@@ -85,7 +85,7 @@ async fn a_file_lands_in_the_worker_tier() {
             Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])),
         )
         .expect("resolved src key")
-        .with_tier(&src_tier, TIER_DDL);
+        .with_tier(TIER_DDL);
         let mut src = ConnettoConnection::connect(
             FakeTransport::accepting_but_silent(),
             &src_replica,
@@ -113,7 +113,7 @@ async fn a_file_lands_in_the_worker_tier() {
         Some(ReplicaKey::from_bytes([0x56; ReplicaKey::LEN])),
     )
     .expect("resolved dst key")
-    .with_tier(&dst_tier, TIER_DDL);
+    .with_tier(TIER_DDL);
     let mut worker = ConnettoConnection::connect(
         FakeTransport::accepting_but_silent(),
         &dst_replica,

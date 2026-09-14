@@ -175,13 +175,9 @@ async fn sqlites_own_statistics_table_is_not_the_applications() {
 async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
     let dir = tempdir().expect("temp dir");
     let replica_path = dir.path().join("replica.db");
-    let tier_path = dir.path().join("tier.db");
     let replica = Replica::encrypted_file(replica_path.to_str().expect("utf-8"), Some(key()))
         .expect("replica")
-        .with_tier(
-            tier_path.to_str().expect("utf-8"),
-            "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)",
-        );
+        .with_tier("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)");
     let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, KEYED_DDL, &config(), None)
         .expect("open the replica");
     conn.batch_execute("CREATE TABLE connetto_local.scratch (body TEXT)")
@@ -219,16 +215,14 @@ fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
 fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     let dir = tempdir().expect("temp dir");
     let replica_path = dir.path().join("replica.db");
-    let tier_path = dir.path().join("tier.db");
     let path = replica_path.to_str().expect("utf-8");
-    let tier = tier_path.to_str().expect("utf-8");
     // The tier is created with the table accepted, which is the only way one
     // gets written at all, and then reopened without the acceptance.
     drop(
         ConnettoConnection::<FakeTransport>::open(
             &Replica::encrypted_file(path, Some(key()))
                 .expect("replica")
-                .with_tier(tier, "CREATE TABLE scratch (body TEXT)"),
+                .with_tier("CREATE TABLE scratch (body TEXT)"),
             KEYED_DDL,
             &config().with_unrecorded_tables(["scratch"]),
             None,
@@ -239,7 +233,7 @@ fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     let tables = refused(ConnettoConnection::<FakeTransport>::open_existing(
         &Replica::encrypted_file(path, Some(key()))
             .expect("replica")
-            .with_existing_tier(tier),
+            .with_existing_tier(),
         &config(),
         None,
     ));

@@ -21,6 +21,7 @@
 
 use crate::cipher::ReplicaKey;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 mod sealed {
     /// Closes [`ReplicaStorage`](super::ReplicaStorage) so the two cases below
@@ -64,25 +65,36 @@ pub enum Tier<'a> {
     /// file fails loudly instead of materializing as an empty database.
     Existing {
         /// Where it lives.
-        path: &'a str,
+        path: Cow<'a, str>,
     },
     /// Attach the one at `path`, creating it and applying `ddl` when empty.
     Create {
         /// Where it lives, `:memory:` when the replica keeps nothing at rest.
-        path: &'a str,
+        path: Cow<'a, str>,
         /// `CREATE TABLE` statements, each requalified into the attached schema.
         ddl: &'a str,
     },
 }
 
-impl<'a> Tier<'a> {
+impl Tier<'_> {
     /// Where it lives, or `None` when there is no device-private database.
     #[must_use]
-    pub const fn path(&self) -> Option<&'a str> {
+    pub fn path(&self) -> Option<&str> {
         match self {
             Self::None => None,
-            Self::Existing { path } | Self::Create { path, .. } => Some(path),
+            Self::Existing { path } | Self::Create { path, .. } => Some(path.as_ref()),
         }
+    }
+}
+
+/// The device-private tier beside the replica opened at `replica`.
+///
+/// It lives at the replica's own name with the `-tier` suffix, so a wipe finds it by derivation and no caller names a second path.
+/// The suffix goes ahead of any URI query, so a browser cipher URL keeps the VFS selector that opens the tier through the same codec as the replica.
+fn tier_url(replica: &str) -> String {
+    match replica.split_once('?') {
+        Some((name, query)) => format!("{name}-tier?{query}"),
+        None => format!("{replica}-tier"),
     }
 }
 
@@ -118,25 +130,19 @@ impl<'a> Tier<'a> {
 /// let visitor = Replica::in_memory().with_tier(DDL);
 /// assert_eq!(visitor.tier().path(), Some(":memory:"));
 ///
-/// let signed_in = Replica::encrypted_file("alice.db", Some(key))?.with_tier("alice-drafts.db", DDL);
-/// assert_eq!(signed_in.tier().path(), Some("alice-drafts.db"));
+/// let signed_in = Replica::encrypted_file("alice.db", Some(key))?.with_tier(DDL);
+/// assert_eq!(signed_in.tier().path(), Some("alice.db-tier"));
 /// # Ok::<(), connetto_client::ClientError>(())
 /// ```
 ///
 /// And the one that must not be a program. A run with no identity has no key,
-/// so a device-private file beside it would be written in the clear, which is
-/// the durable-plaintext case phase E5 deleted arriving through the back door.
-/// The builder that names a path does not exist on this side:
+/// so it cannot open a durable database beside it, and a device-wide file with
+/// no key would be readable by everyone who uses the machine. The builder that
+/// attaches one a previous run left on disk exists only on the encrypted side:
 ///
 /// ```compile_fail
 /// use connetto_client::Replica;
-/// # const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY)";
-/// let leaky = Replica::in_memory().with_tier("drafts.db", DDL);
-/// ```
-///
-/// ```compile_fail
-/// use connetto_client::Replica;
-/// let leaky = Replica::in_memory().with_existing_tier("drafts.db");
+/// let leaky = Replica::in_memory().with_existing_tier();
 /// ```
 #[derive(Debug, Clone)]
 pub struct Replica<'a, S: ReplicaStorage> {
@@ -172,9 +178,9 @@ impl<'a> Replica<'a, InMemory> {
     /// readable by everyone who uses the machine and there would be no key to
     /// write it under.
     #[must_use]
-    pub const fn with_tier(mut self, ddl: &'a str) -> Self {
+    pub fn with_tier(mut self, ddl: &'a str) -> Self {
         self.tier = Tier::Create {
-            path: ":memory:",
+            path: Cow::Borrowed(":memory:"),
             ddl,
         };
         self
@@ -220,8 +226,8 @@ impl<'a> Replica<'a, Encrypted> {
         })
     }
 
-    /// A durable device-private database at `path`, created with `ddl` when it
-    /// is empty.
+    /// A durable device-private database beside the replica, created with `ddl`
+    /// when it is empty.
     ///
     /// This is the only way to first-boot one, and the reason is a property of
     /// the page codec rather than a preference. A database created through an
@@ -230,18 +236,24 @@ impl<'a> Replica<'a, Encrypted> {
     /// key regardless of any `KEY` clause, so a file created by some other
     /// connection carries a different salt and will not decrypt here.
     #[must_use]
-    pub const fn with_tier(mut self, path: &'a str, ddl: &'a str) -> Self {
-        self.tier = Tier::Create { path, ddl };
+    pub fn with_tier(mut self, ddl: &'a str) -> Self {
+        self.tier = Tier::Create {
+            path: Cow::Owned(tier_url(self.path)),
+            ddl,
+        };
         self
     }
 
-    /// A durable device-private database that a previous run already created.
+    /// A durable device-private database that a previous run already created,
+    /// found at the replica's own name with the `-tier` suffix.
     ///
     /// Attach-create is disabled around the attach, so a missing file fails
     /// loudly rather than materializing as an empty database.
     #[must_use]
-    pub const fn with_existing_tier(mut self, path: &'a str) -> Self {
-        self.tier = Tier::Existing { path };
+    pub fn with_existing_tier(mut self) -> Self {
+        self.tier = Tier::Existing {
+            path: Cow::Owned(tier_url(self.path)),
+        };
         self
     }
 }
@@ -428,8 +440,8 @@ mod tests {
         let key = ReplicaKey::from_bytes([3u8; ReplicaKey::LEN]);
         let replica = Replica::encrypted_file("replica.sqlite", Some(key))
             .expect("a resolved key builds an encrypted replica")
-            .with_existing_tier("frontend.sqlite");
-        assert_eq!(replica.tier().path(), Some("frontend.sqlite"));
+            .with_existing_tier();
+        assert_eq!(replica.tier().path(), Some("replica.sqlite-tier"));
     }
 
     /// The property a start with no network rests on: an account read back out

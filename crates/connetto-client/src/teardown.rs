@@ -89,7 +89,48 @@ pub enum PurgeError {
     KeyStore(String),
 }
 
-/// Purge (delete) the replica at `db_path` and its WAL and SHM sidecars.
+/// The directory holding this replica's content chunks, beside the replica at
+/// `db_path` and named by derivation, where R69 builds its `FsStore`.
+#[cfg(feature = "native-transport")]
+#[must_use]
+pub fn content_dir(db_path: &std::path::Path) -> std::path::PathBuf {
+    with_suffix(db_path, "-content")
+}
+
+/// The device-private tier beside the replica at `db_path`, named by derivation.
+#[cfg(feature = "native-transport")]
+fn tier_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    with_suffix(db_path, "-tier")
+}
+
+/// `base` with `suffix` joined onto its final component rather than as a child.
+#[cfg(feature = "native-transport")]
+fn with_suffix(base: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = base.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Remove the file at `path`, treating an absent file as success so a retry
+/// after a partial failure is the same call again.
+#[cfg(feature = "native-transport")]
+fn remove_absent_ok(path: &std::path::Path) -> Result<(), PurgeError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(PurgeError::Io(err.to_string())),
+    }
+    Ok(())
+}
+
+/// Purge (delete) the replica at `db_path` and everything named beside it.
+///
+/// The replica goes with its WAL and SHM sidecars, the device-private tier at
+/// `db_path-tier` goes with its own, and the content directory [`content_dir`]
+/// is removed whole. Order is tier, replica, content, every one named by
+/// derivation so the call needs no second path. The content directory goes even
+/// though `purge_replica` keeps the key, because a fresh replica has empty
+/// manifest tables and every chunk under the old directory is an orphan.
 ///
 /// Blocks on `unsynced`: when it is non-empty and `force` is false, returns
 /// [`PurgeError::Unsynced`] and deletes nothing, so logout and expiry never
@@ -111,14 +152,18 @@ pub fn purge_replica(
     if !unsynced.is_empty() && !force {
         return Err(PurgeError::Unsynced(unsynced.to_vec()));
     }
-    for suffix in ["", "-wal", "-shm"] {
-        let mut name = db_path.as_os_str().to_owned();
-        name.push(suffix);
-        match std::fs::remove_file(std::path::PathBuf::from(name)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(PurgeError::Io(err.to_string())),
+    // Tier before replica, each with its own WAL and SHM sidecars.
+    for base in [tier_path(db_path), db_path.to_path_buf()] {
+        for suffix in ["", "-wal", "-shm"] {
+            remove_absent_ok(&with_suffix(&base, suffix))?;
         }
+    }
+    // The content chunks are orphaned once the replica's manifest tables go, so
+    // the whole directory is removed even when the key is kept.
+    match std::fs::remove_dir_all(content_dir(db_path)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(PurgeError::Io(err.to_string())),
     }
     Ok(())
 }

@@ -279,15 +279,14 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
 async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let replica_url = url(&dir.path().join("replica.sqlite"));
-    let tier_path = dir.path().join("tier.sqlite");
-    let tier = url(&tier_path);
+    let tier_path = dir.path().join("replica.sqlite-tier");
 
     // First boot. The tier is created through the replica connection, which is
     // what makes its key salt agree with the replica's, and nothing else does.
     {
         let replica = Replica::encrypted_file(&replica_url, Some(key()))
             .expect("key is Some")
-            .with_tier(&tier, TIER_DDL);
+            .with_tier(TIER_DDL);
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
             &replica,
@@ -317,7 +316,7 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     // because the first boot made the two salts agree.
     let replica = Replica::encrypted_file(&replica_url, Some(key()))
         .expect("key is Some")
-        .with_existing_tier(&tier);
+        .with_existing_tier();
     let mut conn =
         ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
             .await
@@ -338,12 +337,12 @@ async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_repli
     // created, which carries its own key salt. Neither can attach, and the point
     // is that neither silently leaves the tier in the clear.
     for (name, tier_key) in [("plaintext.sqlite", None), ("foreign.sqlite", Some(key()))] {
-        let tier = url(&dir.path().join(name));
         let replica_url = url(&dir.path().join(format!("replica-for-{name}")));
+        let tier = format!("{replica_url}-tier");
         first_boot_standalone(&tier, tier_key.as_ref(), TIER_DDL);
         let replica = Replica::encrypted_file(&replica_url, Some(key()))
             .expect("key is Some")
-            .with_existing_tier(&tier);
+            .with_existing_tier();
         let result = ConnettoConnection::connect(
             FakeTransport::accepting(),
             &replica,

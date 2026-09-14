@@ -4549,16 +4549,12 @@ mod tests {
     /// export of the same build cannot produce.
     fn tiered_connection(dir: &tempfile::TempDir) -> ConnettoConnection<FakeTransport> {
         let replica_path = dir.path().join("replica.db");
-        let tier_path = dir.path().join("tier.db");
         let replica = Replica::encrypted_file(
             replica_path.to_str().expect("path is utf-8"),
             Some(ReplicaKey::from_bytes([0x11; ReplicaKey::LEN])),
         )
         .expect("replica")
-        .with_tier(
-            tier_path.to_str().expect("path is utf-8"),
-            "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)",
-        );
+        .with_tier("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)");
         ConnettoConnection::<FakeTransport>::open(
             &replica,
             DDL,

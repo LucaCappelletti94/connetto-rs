@@ -1261,6 +1261,16 @@ fn mint_replica_key() -> Result<ReplicaKey, AuthError> {
     Ok(key)
 }
 
+/// A fresh 32-byte content root key from the platform RNG, for an anonymous
+/// worker whose content store is memory the worker also holds the key for.
+///
+/// # Errors
+///
+/// [`AuthError::Context`] if the platform RNG fails.
+pub(crate) fn mint_content_root_key() -> Result<[u8; 32], AuthError> {
+    Ok(*mint_replica_key()?.as_bytes())
+}
+
 /// The outcome of an acquisition attempt.
 pub enum Acquired<Id> {
     /// A ready session (silent refresh succeeded).

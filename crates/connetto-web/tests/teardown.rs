@@ -14,19 +14,23 @@
 
 use connetto_client::cipher::ReplicaKey;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_file_client::BrowserStore;
+use connetto_file_core::{ChunkHash, ChunkStore};
 use connetto_web::auth::{
     AuthError, IdbKeyStore, PendingWork, RefreshStore, provision_replica_key,
 };
 use connetto_web::storage::{
-    PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
-    take_pending_wipes, tier_db_name, wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, WipeProgress, clear_device_key, device_key,
+    mark_wipe_pending, take_pending_wipes, tier_db_name, wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use indexed_db_futures::database::Database as IdbDatabase;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use web_sys::DedicatedWorkerGlobalScope;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -141,7 +145,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
         "both are here"
     );
 
-    wipe_replica(&storage, &keys, alice, &work(&[]), false)
+    wipe_replica(&storage, &keys, alice, None, &work(&[]), false)
         .await
         .expect("wipe alice");
 
@@ -210,7 +214,7 @@ async fn a_wipe_destroys_the_tier_beside_the_replica() {
         "both device-private databases are here"
     );
 
-    wipe_replica(&storage, &keys, alice, &work(&[]), false)
+    wipe_replica(&storage, &keys, alice, None, &work(&[]), false)
         .await
         .expect("wipe alice");
 
@@ -241,10 +245,10 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
     write_marker(&mut open(&storage, name, &key));
 
     let blocked = work(&[7, 9]);
-    match wipe_replica(&storage, &keys, name, &blocked, false).await {
+    match wipe_replica(&storage, &keys, name, None, &blocked, false).await {
         Err(WipeError::Unsynced(actual)) => assert_eq!(actual, blocked),
         Err(other) => panic!("expected Unsynced, got {other:?}"),
-        Ok(()) => panic!("a wipe must not silently drop queued writes"),
+        Ok(_) => panic!("a wipe must not silently drop queued writes"),
     }
 
     // Nothing was destroyed, and specifically not the key: shredding it and then
@@ -499,6 +503,7 @@ async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
             &storage,
             &keys,
             &pending.replica,
+            pending.content_namespace.as_deref(),
             &PendingWork::default(),
             true,
         )
@@ -514,5 +519,55 @@ async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
         keys.load(name).await.expect("load"),
         None,
         "and its key is gone, so the leftover ciphertext is inert"
+    );
+}
+
+/// A wipe removes the content namespace it is given, alongside the replica and
+/// its key, so no orphaned chunks outlive the key that opened them.
+#[wasm_bindgen_test]
+async fn a_wipe_removes_the_content_namespace_it_is_given() {
+    let storage = ReplicaStorage::install().await;
+    let keys = IdbKeyStore::open().await.expect("open the key store");
+    let name = "e3-content-wipe.sqlite";
+    reset(&storage, &keys, name).await;
+
+    let key = provision_replica_key(&keys, name)
+        .await
+        .expect("mint a key");
+    write_marker(&mut open(&storage, name, &key));
+
+    let namespace = "e3-content-wipe-namespace";
+    let hash = ChunkHash::from_bytes([0x24; 32]);
+    let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    {
+        let store = BrowserStore::install(&worker, namespace)
+            .await
+            .expect("install the content store");
+        store
+            .write_chunk(&hash, b"orphaned content")
+            .await
+            .expect("write a content chunk");
+    }
+
+    let progress = wipe_replica(&storage, &keys, name, Some(namespace), &work(&[]), false)
+        .await
+        .expect("wipe the replica and its content");
+    assert_eq!(
+        progress,
+        WipeProgress::Complete,
+        "the namespace it was given is removed"
+    );
+
+    let reopened = BrowserStore::install(&worker, namespace)
+        .await
+        .expect("reopen the content store");
+    assert!(
+        !reopened.has_chunk(&hash).await.expect("probe the chunk"),
+        "the content chunk is gone with its namespace"
+    );
+    assert_eq!(
+        keys.load(name).await.expect("load"),
+        None,
+        "and the key is gone, so leftover ciphertext is inert"
     );
 }

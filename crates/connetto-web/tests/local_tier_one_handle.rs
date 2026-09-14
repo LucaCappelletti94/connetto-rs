@@ -60,7 +60,7 @@ async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
     {
         let replica = Replica::encrypted_file(&replica_url, Some(key))
             .expect("a resolved key")
-            .with_tier(&tier_name, TIER_DDL);
+            .with_tier(TIER_DDL);
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
             &replica,
@@ -126,7 +126,7 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
     {
         let replica = Replica::encrypted_file(&replica_url, Some(key.clone()))
             .expect("a resolved key")
-            .with_tier(&tier_name, TIER_DDL);
+            .with_tier(TIER_DDL);
         let mut conn = ConnettoConnection::connect(
             FakeTransport::accepting(),
             &replica,
@@ -144,7 +144,7 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
 
     let replica = Replica::encrypted_file(&replica_url, Some(key))
         .expect("a resolved key")
-        .with_existing_tier(&tier_name);
+        .with_existing_tier();
     let mut conn =
         ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
             .await
