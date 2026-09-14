@@ -153,10 +153,20 @@ async fn send_chunks<H: ContentHttp, S: ChunkStore>(
         if !needed.iter().any(|wanted| wanted == &hex) {
             continue;
         }
-        let bytes = store
-            .read_chunk(&chunk.hash)
-            .await
-            .map_err(|err| ContentError::Store(err.to_string()))?;
+        let bytes = match store.read_chunk(&chunk.hash).await {
+            Ok(bytes) => bytes,
+            // An unavailable store is ambiguous, so the walk keeps the entry.
+            Err(err) if store.read_failure_is_ambiguous(&err) => {
+                return Err(ContentError::Store(err.to_string()));
+            }
+            // A definite unreadable chunk is a loss, so the walk retires the entry.
+            Err(err) => {
+                return Err(ContentError::LostChunk {
+                    file_id: manifest.file_id(),
+                    detail: err.to_string(),
+                });
+            }
+        };
         let reply = send(http.put(&endpoints.chunk(&hex), bytes), "chunk").await?;
         expect(reply, 204, "chunk")?;
     }

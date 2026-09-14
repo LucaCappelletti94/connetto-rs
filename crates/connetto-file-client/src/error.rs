@@ -73,6 +73,14 @@ pub enum ContentError {
         /// The file with no manifest here.
         file_id: FileId,
     },
+    /// A chunk the manifest names is unreadable in a way no later attempt clears.
+    #[error("content for {file_id} names a chunk this device cannot read: {detail}")]
+    LostChunk {
+        /// The file whose bytes are gone.
+        file_id: FileId,
+        /// What the store reported about the unreadable chunk.
+        detail: String,
+    },
     /// Downloaded bytes did not hash to the identity that was asked for.
     #[error("downloaded bytes are not {expected}")]
     IdentityMismatch {
@@ -91,29 +99,34 @@ pub enum ContentError {
     },
 }
 
+/// What the outbox walk does with a failed upload attempt, decided by where the fact came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// Keep the entry and walk it again later.
+    Retry,
+    /// Keep the entry in the outbox, marked with its refusal detail.
+    Refused,
+    /// Retire the entry, because its bytes are gone from this device.
+    Lost,
+}
+
 impl ContentError {
-    /// Whether the outbox walk should keep the entry and try again later.
-    ///
-    /// The bias is deliberate: an unsent write cannot be refetched, so every
-    /// ambiguous failure keeps the entry. A refused ticket is retryable for
-    /// exactly that reason, since chapter 18 makes an invisible file and an
-    /// over-budget request byte-identical on the wire, and the over-budget
-    /// half clears as the rolling window moves.
-    ///
-    /// The permanent cases are the ones no later attempt changes: bytes past
-    /// the deployment's ceiling, bytes that disagree with their own hashes, a
-    /// request the server calls malformed, and an answer this client cannot
-    /// parse.
-    pub fn is_retryable(&self) -> bool {
+    /// How the outbox walk deals with this failure, per chapter 18's two-event rule.
+    #[must_use]
+    pub fn outcome(&self) -> AttemptOutcome {
         match self {
-            Self::Http { status, .. } => !matches!(status, 400 | 413 | 422),
-            Self::Decode { .. }
+            Self::NoManifest { .. } | Self::LostChunk { .. } => AttemptOutcome::Lost,
+            Self::Http {
+                status: 400 | 413 | 422,
+                ..
+            }
+            | Self::Decode { .. }
             | Self::MalformedGrant(_)
-            | Self::NoManifest { .. }
             | Self::IdentityMismatch { .. }
             | Self::Archive(_)
-            | Self::PinColumnMissing { .. } => false,
-            Self::Replica(_)
+            | Self::PinColumnMissing { .. } => AttemptOutcome::Refused,
+            Self::Http { .. }
+            | Self::Replica(_)
             | Self::Client(_)
             | Self::Store(_)
             | Self::Transport(_)
@@ -121,7 +134,79 @@ impl ContentError {
             | Self::TicketSignerError { .. }
             | Self::TicketRateLimited { .. }
             | Self::TicketAbandoned
-            | Self::TicketLagged => true,
+            | Self::TicketLagged => AttemptOutcome::Retry,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use connetto_file_core::FileId;
+
+    use super::{AttemptOutcome, ContentError};
+
+    fn file() -> FileId {
+        FileId::from_bytes([7; 32])
+    }
+
+    /// A device loss, a server refusal and a keep-and-retry failure are told apart.
+    #[test]
+    fn losses_refusals_and_retryable_failures_are_told_apart() {
+        assert_eq!(
+            ContentError::NoManifest { file_id: file() }.outcome(),
+            AttemptOutcome::Lost,
+        );
+        assert_eq!(
+            ContentError::LostChunk {
+                file_id: file(),
+                detail: "chunk gone".to_owned(),
+            }
+            .outcome(),
+            AttemptOutcome::Lost,
+        );
+        for status in [400, 413, 422] {
+            assert_eq!(
+                ContentError::Http {
+                    stage: "commit",
+                    status,
+                }
+                .outcome(),
+                AttemptOutcome::Refused,
+                "HTTP {status} is a server refusal",
+            );
+        }
+        assert_eq!(
+            ContentError::MalformedGrant("no token".to_owned()).outcome(),
+            AttemptOutcome::Refused,
+        );
+        let undecodable = serde_json::from_slice::<serde_json::Value>(b"not json").unwrap_err();
+        assert_eq!(
+            ContentError::Decode {
+                stage: "intent",
+                source: undecodable,
+            }
+            .outcome(),
+            AttemptOutcome::Refused,
+        );
+        assert_eq!(
+            ContentError::Http {
+                stage: "commit",
+                status: 503,
+            }
+            .outcome(),
+            AttemptOutcome::Retry,
+        );
+        assert_eq!(
+            ContentError::Transport("stalled".to_owned()).outcome(),
+            AttemptOutcome::Retry,
+        );
+        assert_eq!(
+            ContentError::Store("store unavailable".to_owned()).outcome(),
+            AttemptOutcome::Retry,
+        );
+        assert_eq!(
+            ContentError::TicketRefused { file_id: file() }.outcome(),
+            AttemptOutcome::Retry,
+        );
     }
 }

@@ -350,9 +350,9 @@ fn assert_deferred(events: &mut tokio::sync::broadcast::Receiver<ContentEvent>, 
     );
 }
 
-/// A granted URL without a `?t=` query is refused before any HTTP request is sent.
+/// A malformed grant is a server refusal, so no HTTP request goes out, the entry stays in the outbox refused, and nothing is retired.
 #[tokio::test]
-async fn malformed_grant_url_sends_no_requests_and_retires_entry() {
+async fn malformed_grant_url_sends_no_requests_and_refuses_entry() {
     let dir = tempdir().expect("temp dir");
     let replica = dir.path().join("replica.sqlite");
     let chunks = dir.path().join("chunks");
@@ -363,13 +363,14 @@ async fn malformed_grant_url_sends_no_requests_and_retires_entry() {
     let cc = ContentClient::attach(client, FsStore::new(&chunks), ROOT_KEY, http)
         .await
         .expect("attach");
-    cc.stage(
-        io::Cursor::new(b"content"),
-        MimeClass::Generic,
-        |_conn, _id| Ok(()),
-    )
-    .await
-    .expect("stage");
+    let (file_id, ()) = cc
+        .stage(
+            io::Cursor::new(b"content"),
+            MimeClass::Generic,
+            |_conn, _id| Ok(()),
+        )
+        .await
+        .expect("stage");
     let mut events = cc.events();
 
     cc.flush_outbox().await.expect("flush");
@@ -381,7 +382,21 @@ async fn malformed_grant_url_sends_no_requests_and_retires_entry() {
     let ev = events.try_recv().expect("UploadRefused event must arrive");
     assert!(
         matches!(ev, ContentEvent::UploadRefused { .. }),
-        "a malformed grant URL must produce UploadRefused; got {ev:?}"
+        "a malformed grant URL must produce UploadRefused, got {ev:?}"
+    );
+    assert_eq!(
+        cc.refused_content()
+            .await
+            .expect("read refused")
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![file_id],
+        "a malformed grant keeps the entry in the outbox, marked refused"
+    );
+    assert!(
+        cc.retired_content().await.expect("read retired").is_empty(),
+        "a refusal never retires the entry"
     );
 }
 
@@ -440,5 +455,54 @@ async fn successful_upload_leaves_retired_content_empty() {
     assert!(
         retired.is_empty(),
         "successful upload must leave retired_content empty, got {retired:?}"
+    );
+}
+
+/// The upload walk retires an unsent file whose bytes are gone and reports it lost, agreeing with the boot pass on the same fact.
+#[tokio::test]
+async fn the_walk_retires_an_unsent_file_whose_bytes_are_gone() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let http = SmartHttp::all_needed();
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting(FAKE_INTENT),
+    )
+    .await;
+    let cc = ContentClient::attach(client, FsStore::new(&chunks), ROOT_KEY, http)
+        .await
+        .expect("attach");
+    let mut events = cc.events();
+    let (file_id, ()) = cc
+        .stage(
+            io::Cursor::new(b"one chunk that then goes missing"),
+            MimeClass::Generic,
+            |_conn, _id| Ok(()),
+        )
+        .await
+        .expect("stage");
+
+    for path in crate::staging::walk_files(&chunks) {
+        std::fs::remove_file(&path).expect("remove a chunk file");
+    }
+
+    let sent = cc.flush_outbox().await.expect("the walk runs");
+    assert_eq!(sent, 0, "a file whose chunk is gone cannot upload");
+    assert!(
+        matches!(
+            events.try_recv(),
+            Ok(ContentEvent::BytesLost { file_id: named, unreadable })
+                if named == file_id && unreadable > 0
+        ),
+        "the walk reports the loss the boot pass would report"
+    );
+    assert_eq!(
+        cc.retired_content().await.expect("read retired"),
+        vec![file_id],
+        "the walk retires the entry into the retired record"
+    );
+    assert!(
+        cc.refused_content().await.expect("read refused").is_empty(),
+        "a device loss is never a refusal"
     );
 }

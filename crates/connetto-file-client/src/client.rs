@@ -18,7 +18,7 @@ use diesel::prelude::*;
 use tokio::sync::broadcast;
 
 use crate::db;
-use crate::error::ContentError;
+use crate::error::{AttemptOutcome, ContentError};
 use crate::http::ContentHttp;
 use crate::import::{
     ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
@@ -393,9 +393,9 @@ where
     /// Uploads every file waiting in the outbox, returning how many landed.
     ///
     /// Each file takes a fresh write ticket, because a ticket names one file
-    /// and one declared size. A failure the error calls retryable keeps the
-    /// entry for the next walk; anything else retires it, because keeping an
-    /// entry no attempt can satisfy is a walk that never finishes.
+    /// and one declared size.
+    /// A retryable failure keeps the entry, a server refusal marks it, and a
+    /// device loss retires it and reports the bytes lost.
     ///
     /// # Errors
     ///
@@ -416,23 +416,43 @@ where
                     sent += 1;
                     let _ = self.events.send(ContentEvent::Uploaded { file_id });
                 }
-                Err(err) if err.is_retryable() => {
-                    let _ = self.events.send(ContentEvent::UploadDeferred {
-                        file_id,
-                        detail: err.to_string(),
-                    });
-                }
-                Err(err) => {
-                    let event = ContentEvent::UploadRefused {
-                        file_id,
-                        detail: err.to_string(),
-                    };
-                    let detail = err.to_string();
-                    self.client
-                        .with_conn(move |conn| db::refuse(conn.conn(), file_id, &detail))
-                        .await?;
-                    let _ = self.events.send(event);
-                }
+                Err(err) => match err.outcome() {
+                    AttemptOutcome::Retry => {
+                        let _ = self.events.send(ContentEvent::UploadDeferred {
+                            file_id,
+                            detail: err.to_string(),
+                        });
+                    }
+                    AttemptOutcome::Refused => {
+                        let detail = err.to_string();
+                        self.client
+                            .with_conn(move |conn| db::refuse(conn.conn(), file_id, &detail))
+                            .await?;
+                        let _ = self.events.send(ContentEvent::UploadRefused {
+                            file_id,
+                            detail: err.to_string(),
+                        });
+                    }
+                    // The boot pass decides and counts the loss, so the event is
+                    // identical whichever pass reached the fact first.
+                    AttemptOutcome::Lost => match self.unreadable_chunks(file_id).await? {
+                        Some(unreadable) => {
+                            self.client
+                                .with_conn(move |conn| retire(conn.conn(), file_id))
+                                .await?;
+                            let _ = self.events.send(ContentEvent::BytesLost {
+                                file_id,
+                                unreadable,
+                            });
+                        }
+                        None => {
+                            let _ = self.events.send(ContentEvent::UploadDeferred {
+                                file_id,
+                                detail: err.to_string(),
+                            });
+                        }
+                    },
+                },
             }
         }
         Ok(sent)
