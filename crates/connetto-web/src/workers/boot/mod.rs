@@ -335,17 +335,14 @@ pub fn spawn_db_worker(
     bootstrap: &WorkerBootstrap,
 ) -> Result<(Worker, BootIdentity), BootError> {
     let identity = BootIdentity::mint();
-    super::intake::announce_current_boot(&identity);
     let options = WorkerOptions::new();
     options.set_type(WorkerType::Module);
     options.set_name("connetto-db");
-    match bootstrap {
+    let worker = match bootstrap {
         WorkerBootstrap::Glue => {
             let url = boot_tagged_url(glue_url, &identity)?;
-            let worker = Worker::new_with_options(&url, &options)
-                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
-            report_worker_errors(&worker, &identity);
-            Ok((worker, identity))
+            Worker::new_with_options(&url, &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?
         }
         WorkerBootstrap::Script(script_url) => {
             let base = current_location_href()?;
@@ -354,10 +351,8 @@ pub fn spawn_db_worker(
             let params = url.search_params();
             params.set(GLUE_PARAM, glue_url);
             params.set(BOOT_PARAM, &identity.to_string());
-            let worker = Worker::new_with_options(&url.href(), &options)
-                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?;
-            report_worker_errors(&worker, &identity);
-            Ok((worker, identity))
+            Worker::new_with_options(&url.href(), &options)
+                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?
         }
         WorkerBootstrap::Generated => {
             let object_url = generated_bootstrap_url(glue_url, &identity)?;
@@ -365,11 +360,14 @@ pub fn spawn_db_worker(
                 .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")));
             // The worker takes its reference to the blob during construction.
             let _ = web_sys::Url::revoke_object_url(&object_url);
-            let worker = worker?;
-            report_worker_errors(&worker, &identity);
-            Ok((worker, identity))
+            worker?
         }
-    }
+    };
+    report_worker_errors(&worker, &identity);
+    // Announced last, because a boot that never got a worker has nothing to announce and would
+    // stand in for the boot that replaces it.
+    super::intake::announce_current_boot(&identity);
+    Ok((worker, identity))
 }
 
 /// Reports an error the worker never got to handle, naming the boot it belongs to.

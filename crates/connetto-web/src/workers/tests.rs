@@ -18,7 +18,7 @@ use super::archive_channel::{
 use super::helpers::content_store_namespace;
 use super::{
     BootIdentity, DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError,
-    announce_tab, await_db_worker_ready, request_custody, request_export, request_import,
+    announce_tab, request_export, request_import,
 };
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -302,13 +302,14 @@ async fn import_wait_ends_when_worker_generation_is_replaced() {
 /// A failure whose identity the caller does not know is ignored, so the wait expires instead.
 #[wasm_bindgen_test]
 async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
-    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let hello = "connetto-hello-foreign-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
     let sender = channel.clone();
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
         let _ = sender.post_message(&JsValue::from_str("failed:foreign00000000:some-error"));
     });
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 300.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0)
         .await
         .expect_err("deadline must expire");
     assert!(
@@ -327,7 +328,8 @@ async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
 async fn await_db_worker_ready_reports_failure_for_own_identity() {
     let identity = BootIdentity::mint();
     let id_str = identity.to_string();
-    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let hello = "connetto-hello-own-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
     let sender = channel.clone();
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
@@ -335,7 +337,7 @@ async fn await_db_worker_ready_reports_failure_for_own_identity() {
             "failed:{id_str}:schema-mismatch"
         )));
     });
-    let error = await_db_worker_ready(&[identity])
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
         .await
         .expect_err("own-identity failure is reported");
     assert!(
@@ -351,7 +353,8 @@ async fn await_db_worker_ready_reports_failure_for_own_identity() {
 async fn await_db_worker_ready_reports_failure_for_announced_identity() {
     let identity = BootIdentity::mint();
     let id_str = identity.to_string();
-    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+    let hello = "connetto-hello-announced-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
     let sender = channel.clone();
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
@@ -361,7 +364,7 @@ async fn await_db_worker_ready_reports_failure_for_announced_identity() {
             "failed:{id_str}:network-error"
         )));
     });
-    let error = await_db_worker_ready(&[])
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
         .await
         .expect_err("announced failure is reported");
     assert!(
@@ -404,13 +407,15 @@ async fn announce_tab_returns_ok_when_worker_acknowledges() {
 /// `Result<_, JsValue>`.
 #[wasm_bindgen_test]
 async fn request_custody_without_worker_returns_timeout() {
-    let error = request_custody().await.expect_err("no worker is running");
+    let error = crate::workers::intake::request_custody_bounded(300.0)
+        .await
+        .expect_err("no worker is running");
     let IntakeError::Timeout { deadline_ms } = error else {
         panic!("expected Timeout, got {error:?}")
     };
     assert!(
-        (deadline_ms - 15_000.0).abs() < f64::EPSILON,
-        "expected the 15 s readiness deadline, got {deadline_ms}"
+        (deadline_ms - 300.0).abs() < f64::EPSILON,
+        "expected the deadline it was given, got {deadline_ms}"
     );
 }
 
@@ -430,20 +435,29 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
 #[wasm_bindgen_test]
 async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
     let older = super::boot::BootIdentity::mint();
-    let (worker, newer) = super::boot::spawn_db_worker(
-        "./connetto-absent-module.js",
-        &super::boot::WorkerBootstrap::Glue,
-    )
-    .expect("spawning the worker itself must succeed");
+    let newer = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-scoped-wait";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &newer)
+        .expect("the hello channel must open");
+    spawn_local({
+        let newer = newer.to_string();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            if let Ok(sender) = BroadcastChannel::new(hello) {
+                let _ =
+                    sender.post_message(&JsValue::from_str(&format!("failed:{newer}:later-spawn")));
+            }
+        }
+    });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[older], 700.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[older], 500.0)
         .await
         .expect_err("no worker reports readiness here");
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "the newer boot {newer}'s failure must not resolve this wait, got {error:?}"
     );
-    worker.terminate();
+    drop(announcer);
 }
 
 /// A waiter that named nothing, in a context whose own boot is in flight, still refuses another
@@ -465,13 +479,35 @@ async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 600.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 600.0)
         .await
         .expect_err("no worker reports readiness here");
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "another boot's failure must not resolve a wait for this context's boot, got {error:?}"
     );
+}
+
+/// A failure arriving in the same turn as readiness does not undo it, because a worker that
+/// answered the wait booted.
+#[wasm_bindgen_test]
+async fn a_failure_after_readiness_does_not_undo_it() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
+    // Readiness carries no identity, so it is spoken on a channel of this test's own rather
+    // than on the one every other waiter in this context is listening to.
+    let hello = "connetto-hello-terminal-readiness";
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str("ready"));
+            let _ = sender.post_message(&JsValue::from_str(&format!("failed:{id_str}:late-throw")));
+        }
+    });
+
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
+        .await
+        .expect("readiness stands even when the worker throws right after it");
 }
 
 /// A waiter never announces a boot, because a waiter can hold an identity whose boot has been
@@ -481,7 +517,8 @@ async fn a_waiter_does_not_announce_the_boot_it_holds() {
     let held = super::boot::BootIdentity::mint();
     let announcement = format!("booting:{held}");
     let heard = Rc::new(Cell::new(false));
-    let listener = BroadcastChannel::new(crate::workers::HELLO_CHANNEL).expect("hello channel");
+    let hello = "connetto-hello-waiter-silence";
+    let listener = BroadcastChannel::new(hello).expect("hello channel");
     let on_message = {
         let heard = Rc::clone(&heard);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -493,7 +530,7 @@ async fn a_waiter_does_not_announce_the_boot_it_holds() {
     listener.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
     spawn_local(async move {
-        let _ = crate::workers::intake::await_db_worker_ready_bounded(&[held], 600.0).await;
+        let _ = crate::workers::intake::await_db_worker_ready_bounded(hello, &[held], 600.0).await;
     });
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
     let _ = listener.post_message(&JsValue::from_str("ask"));
@@ -513,15 +550,16 @@ async fn a_waiter_does_not_announce_the_boot_it_holds() {
 #[wasm_bindgen_test]
 async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     let identity = super::boot::BootIdentity::mint();
-    let announcer =
-        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
-    if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+    let hello = "connetto-hello-spent-announcer";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
         let _ = sender.post_message(&JsValue::from_str("ready"));
         let _ = sender.post_message(&JsValue::from_str(&format!("failed:{identity}:late-crash")));
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 400.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 400.0)
         .await
         .expect_err("no worker answers this wait");
     assert!(
@@ -536,16 +574,17 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
 #[wasm_bindgen_test]
 async fn a_failure_broadcast_before_the_wait_is_replayed_to_it() {
     let identity = super::boot::BootIdentity::mint();
-    let announcer =
-        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
-    if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+    let hello = "connetto-hello-replayed-failure";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
         let _ = sender.post_message(&JsValue::from_str(&format!(
             "failed:{identity}:already-gone"
         )));
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 2_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
         .await
         .expect_err("a wait that starts after the failure must still learn of it");
     assert!(
@@ -561,18 +600,19 @@ async fn a_failure_broadcast_before_the_wait_is_replayed_to_it() {
 async fn an_announcer_answers_a_waiter_that_joined_late() {
     let identity = super::boot::BootIdentity::mint();
     let id_str = identity.to_string();
-    let announcer =
-        crate::workers::intake::announce_boot(&identity).expect("the hello channel must open");
+    let hello = "connetto-hello-late-joiner";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
 
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(300)).await;
-        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+        if let Ok(sender) = BroadcastChannel::new(hello) {
             let _ =
                 sender.post_message(&JsValue::from_str(&format!("failed:{id_str}:late-joiner")));
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 3_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 3_000.0)
         .await
         .expect_err("the late joiner must act on the announced boot's failure");
     assert!(
@@ -588,10 +628,11 @@ async fn an_announcer_answers_a_waiter_that_joined_late() {
 async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
     let mine = super::boot::BootIdentity::mint();
     let other = super::boot::BootIdentity::mint().to_string();
+    let hello = "connetto-hello-own-boot-only";
 
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(50)).await;
-        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+        if let Ok(sender) = BroadcastChannel::new(hello) {
             let _ = sender.post_message(&JsValue::from_str(&format!("booting:{other}")));
             crate::workers::sleep(core::time::Duration::from_millis(50)).await;
             let _ = sender.post_message(&JsValue::from_str(&format!(
@@ -600,7 +641,7 @@ async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[mine], 400.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 400.0)
         .await
         .expect_err("no worker reports readiness here");
     assert!(
@@ -612,21 +653,37 @@ async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
 /// A module that cannot be fetched fails before any Rust runs, and the spawning context
 /// reports it, so a reconnect attempt handed no identity still learns why.
 #[wasm_bindgen_test]
-async fn a_module_that_cannot_load_reports_its_failure_to_a_later_wait() {
-    let (worker, _identity) = super::boot::spawn_db_worker(
-        "./connetto-absent-module.js",
-        &super::boot::WorkerBootstrap::Glue,
-    )
-    .expect("spawning the worker itself must succeed");
+async fn a_worker_error_is_reported_by_the_context_that_spawned_it() {
+    // An empty module loads, so the worker exists and carries the spawn's error listener
+    // without the page also taking an uncaught module failure.
+    let parts = js_sys::Array::of1(&JsValue::from_str("// nothing to boot\n"));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .expect("the empty module blob");
+    let module_url = web_sys::Url::create_object_url_with_blob(&blob).expect("the module URL");
+    let (worker, _identity) =
+        super::boot::spawn_db_worker(&module_url, &super::boot::WorkerBootstrap::Glue)
+            .expect("spawning the worker must succeed");
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 5_000.0)
+    spawn_local({
+        let worker = worker.clone();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let event = web_sys::ErrorEvent::new("error").expect("the error event");
+            let _ = worker.dispatch_event(&event);
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 2_000.0)
         .await
-        .expect_err("a worker whose module is absent must not report readiness");
+        .expect_err("a worker that raised an error must not report readiness");
     assert!(
         matches!(&error, IntakeError::BootFailed { .. }),
         "expected the failure to be attributed, got {error:?}"
     );
     worker.terminate();
+    let _ = web_sys::Url::revoke_object_url(&module_url);
 }
 
 /// A boot parameter already on the worker URL is replaced, not duplicated, because the worker

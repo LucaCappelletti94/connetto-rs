@@ -156,7 +156,16 @@ impl Drop for BootAnnouncer {
 /// attributable to a context that did not spawn it.
 #[must_use]
 pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<BootAnnouncer> {
-    let channel = BroadcastChannel::new(super::HELLO_CHANNEL).ok()?;
+    announce_boot_on(super::HELLO_CHANNEL, identity)
+}
+
+/// Announces a boot on `channel_name`, so a test speaks on a channel of its own.
+#[must_use]
+pub(super) fn announce_boot_on(
+    channel_name: &str,
+    identity: &super::boot::BootIdentity,
+) -> Option<BootAnnouncer> {
+    let channel = BroadcastChannel::new(channel_name).ok()?;
     let announcement = format!("booting:{identity}");
     let outcome = Rc::new(RefCell::new(BootOutcome::Pending));
     let on_message = {
@@ -219,25 +228,27 @@ pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<Boot
 /// [`IntakeError::BootFailed`] when the worker reported a failure for a known identity, or
 /// [`IntakeError::Timeout`] when the deadline expires.
 pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Result<(), IntakeError> {
-    await_db_worker_ready_bounded(known, HELLO_TIMEOUT_MS).await
+    await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, HELLO_TIMEOUT_MS).await
 }
 
-/// Waits for readiness under `deadline_ms`, so a test proves the ignoring of a foreign failure
-/// in milliseconds rather than over the shipped deadline.
+/// Waits for readiness on `channel_name` under `deadline_ms`, so a test proves a boundary in
+/// milliseconds rather than over the shipped deadline, on a channel of its own rather than on
+/// the one every other waiter in the context is listening to.
 pub(super) async fn await_db_worker_ready_bounded(
+    channel_name: &str,
     known: &[super::boot::BootIdentity],
     deadline_ms: f64,
 ) -> Result<(), IntakeError> {
-    let channel =
-        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
-            operation: "hello channel",
-            detail: format!("{err:?}"),
-        })?;
+    let channel = BroadcastChannel::new(channel_name).map_err(|err| IntakeError::ChannelOpen {
+        operation: "hello channel",
+        detail: format!("{err:?}"),
+    })?;
     let state = Rc::new(RefCell::new(HelloReady::Waiting));
     let mut initial = known.to_vec();
-    if initial.is_empty() {
+    if initial.is_empty() && channel_name == super::HELLO_CHANNEL {
         // Only a caller that named nothing falls back to this context's boot, because a caller
-        // that named one is scoped to it and a newer spawn is not what it is waiting for.
+        // that named one is scoped to it and a newer spawn is not what it is waiting for. A boot
+        // is remembered for the channel it was announced on and explains nothing on another.
         initial.extend(current_boot_in_flight());
     }
     let known_ids = Rc::new(RefCell::new(initial));
@@ -254,16 +265,24 @@ pub(super) async fn await_db_worker_ready_bounded(
             if message == "ready" {
                 *state.borrow_mut() = HelloReady::Up;
             } else if let Some(id) = message.strip_prefix("booting:") {
-                // Only a spawn announces, so the newest announcement is the boot to watch and
-                // the one before it has been replaced.
-                if trusts_announcements {
-                    *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
+                // Only a spawn announces, so every announcement heard here is a boot that
+                // somebody really started, and a waiter with nothing of its own watches them
+                // all: two overlapping boots both explain why it has no worker.
+                let heard = super::boot::BootIdentity::from_wire(id);
+                let mut known_ids = known_ids.borrow_mut();
+                if trusts_announcements && !known_ids.contains(&heard) {
+                    known_ids.push(heard);
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
                 && let Some((id, detail)) = rest.split_once(':')
                 && known_ids.borrow().iter().any(|known| known.matches_str(id))
             {
-                *state.borrow_mut() = HelloReady::Failed(detail.to_owned());
+                // Readiness is terminal: a worker that answered this wait booted, and what it
+                // throws afterwards is not this wait's outcome.
+                let mut state = state.borrow_mut();
+                if matches!(*state, HelloReady::Waiting) {
+                    *state = HelloReady::Failed(detail.to_owned());
+                }
             }
         })
     };
@@ -360,6 +379,12 @@ fn decode_custody_reply(data: &JsValue) -> Option<Custody> {
 /// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened, or
 /// [`IntakeError::Timeout`] when the worker does not answer within the deadline.
 pub async fn request_custody() -> Result<Custody, IntakeError> {
+    request_custody_bounded(HELLO_TIMEOUT_MS).await
+}
+
+/// Asks for custody under `deadline_ms`, so a test proves the expiry in milliseconds rather
+/// than waiting out the shipped deadline.
+pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody, IntakeError> {
     let channel =
         BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
             operation: "hello channel",
@@ -378,13 +403,11 @@ pub async fn request_custody() -> Result<Custody, IntakeError> {
     let started = js_sys::Date::now();
     let mut answered = result.get();
     while answered.is_none() {
-        if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
+        if js_sys::Date::now() - started >= deadline_ms {
             channel.set_onmessage(None);
             channel.close();
             drop(on_message);
-            return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_MS,
-            });
+            return Err(IntakeError::Timeout { deadline_ms });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.
         let _ = channel.post_message(&JsValue::from_str("custody?"));
