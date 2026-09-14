@@ -611,6 +611,35 @@ async fn a_ready_boot_stops_reporting_worker_errors() {
     let _ = web_sys::Url::revoke_object_url(&module_url);
 }
 
+/// A superseded boot's failure says nothing about whether a worker is coming, so a waiter that
+/// named nothing drops it when a replacement is announced.
+#[wasm_bindgen_test]
+async fn a_replacement_announcement_drops_the_boot_it_replaced() {
+    let replaced = super::boot::BootIdentity::mint();
+    let replacement = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-superseded-boot";
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{replaced}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{replacement}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            // The replaced boot's failure was already in flight.
+            let _ = sender.post_message(&JsValue::from_str(&format!("failed:{replaced}:too-late")));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 600.0)
+        .await
+        .expect_err("nothing reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a superseded boot's failure must not resolve this wait, got {error:?}"
+    );
+}
+
 /// A readiness that names another boot does not spend this one, because readiness carries no
 /// identity for the waiters and an outgoing worker can answer after its replacement is announced.
 #[wasm_bindgen_test]

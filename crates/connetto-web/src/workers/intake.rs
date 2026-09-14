@@ -268,13 +268,11 @@ pub(super) async fn await_db_worker_ready_bounded(
             if message == "ready" || message.starts_with("ready:") {
                 *state.borrow_mut() = HelloReady::Up;
             } else if let Some(id) = message.strip_prefix("booting:") {
-                // Only a spawn announces, so every announcement heard here is a boot that
-                // somebody really started, and a waiter with nothing of its own watches them
-                // all: two overlapping boots both explain why it has no worker.
-                let heard = super::boot::BootIdentity::from_wire(id);
-                let mut known_ids = known_ids.borrow_mut();
-                if trusts_announcements && !known_ids.contains(&heard) {
-                    known_ids.push(heard);
+                // Only a spawn announces, so the newest announcement names the boot that will
+                // serve this waiter, and the one before it has been replaced: its failure no
+                // longer says anything about whether a worker is coming.
+                if trusts_announcements {
+                    *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
                 && let Some((id, detail)) = rest.split_once(':')
