@@ -397,8 +397,8 @@ impl BrowserStore {
 
     /// The store a worker gets when durable storage was asked for and refused.
     ///
-    /// It answers reads so an earlier session's content still displays, and
-    /// refuses writes, because the replica would record them as held.
+    /// It refuses writes, because the replica would record them as held.
+    /// A miss on a read is inconclusive rather than a loss, so an outbox entry whose bytes sit in an OPFS namespace this run cannot open is kept.
     fn fallback() -> Self {
         Self {
             inner: BrowserStoreInner::Memory(Arc::new(MemStore::new())),
