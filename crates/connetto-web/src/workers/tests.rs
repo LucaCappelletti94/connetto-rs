@@ -17,8 +17,8 @@ use super::archive_channel::{
 };
 use super::helpers::content_store_namespace;
 use super::{
-    DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError, announce_tab,
-    await_db_worker_ready, request_custody, request_export, request_import,
+    BootIdentity, DB_ALIVE_LOCK, EXPORT_CHANNEL, HELLO_CHANNEL, IMPORT_CHANNEL, IntakeError,
+    announce_tab, request_export, request_import,
 };
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -299,25 +299,76 @@ async fn import_wait_ends_when_worker_generation_is_replaced() {
     alive.release();
 }
 
-/// A boot-failure message on the hello channel causes `await_db_worker_ready` to return
-/// the typed `BootFailed` variant, not an opaque `JsValue`.
+/// A failure whose identity the caller does not know is ignored, so the wait expires instead.
+#[wasm_bindgen_test]
+async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
+    let hello = "connetto-hello-foreign-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
+    let sender = channel.clone();
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str("failed:foreign00000000:some-error"));
+    });
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0)
+        .await
+        .expect_err("deadline must expire");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, not a foreign failure: {error:?}"
+    );
+    channel.close();
+}
+
+/// A failure whose identity matches the one this caller was given is reported with its detail.
 ///
 /// The assertion that would have failed before the fix: callers had to call
 /// `err.as_string()` (a `JsValue` method) to inspect the failure; now `matches!`
 /// on the enum variant suffices.
 #[wasm_bindgen_test]
-async fn await_db_worker_ready_reports_boot_failure_as_typed_error() {
-    let channel = BroadcastChannel::new(HELLO_CHANNEL).expect("hello channel");
+async fn await_db_worker_ready_reports_failure_for_own_identity() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
+    let hello = "connetto-hello-own-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
     let sender = channel.clone();
     spawn_local(async move {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
-        let _ = sender.post_message(&JsValue::from_str("failed:schema-mismatch"));
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{id_str}:schema-mismatch"
+        )));
     });
-    let error = await_db_worker_ready()
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
         .await
-        .expect_err("boot failure is reported");
+        .expect_err("own-identity failure is reported");
     assert!(
         matches!(&error, IntakeError::BootFailed { detail } if detail.contains("schema-mismatch")),
+        "expected BootFailed with the worker detail, got {error:?}"
+    );
+    channel.close();
+}
+
+/// An identity announced via `booting:` while waiting is learned and later matched against a
+/// failure, so a follower tab fails fast for the boot that was announced.
+#[wasm_bindgen_test]
+async fn await_db_worker_ready_reports_failure_for_announced_identity() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
+    let hello = "connetto-hello-announced-failure";
+    let channel = BroadcastChannel::new(hello).expect("hello channel");
+    let sender = channel.clone();
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str(&format!("booting:{id_str}")));
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{id_str}:network-error"
+        )));
+    });
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
+        .await
+        .expect_err("announced failure is reported");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("network-error")),
         "expected BootFailed with the worker detail, got {error:?}"
     );
     channel.close();
@@ -356,15 +407,15 @@ async fn announce_tab_returns_ok_when_worker_acknowledges() {
 /// `Result<_, JsValue>`.
 #[wasm_bindgen_test]
 async fn request_custody_without_worker_returns_timeout() {
-    let error = request_custody().await.expect_err("no worker is running");
+    let error = crate::workers::intake::request_custody_bounded(300.0)
+        .await
+        .expect_err("no worker is running");
+    let IntakeError::Timeout { deadline_ms } = error else {
+        panic!("expected Timeout, got {error:?}")
+    };
     assert!(
-        matches!(
-            error,
-            IntakeError::Timeout {
-                deadline_ms: 15_000
-            }
-        ),
-        "expected Timeout {{deadline_ms: 15_000}}, got {error:?}"
+        (deadline_ms - 300.0).abs() < f64::EPSILON,
+        "expected the deadline it was given, got {deadline_ms}"
     );
 }
 
@@ -379,11 +430,424 @@ fn boot_spawn_db_worker_relative_glue_url_resolves_against_current_location() {
     );
 }
 
+/// A wait scoped to one boot ignores the failure of a boot spawned after it, because a caller
+/// that named an identity asked about that one.
+#[wasm_bindgen_test]
+async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
+    let older = super::boot::BootIdentity::mint();
+    let newer = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-scoped-wait";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &newer)
+        .expect("the hello channel must open");
+    spawn_local({
+        let newer = newer.to_string();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            if let Ok(sender) = BroadcastChannel::new(hello) {
+                let _ =
+                    sender.post_message(&JsValue::from_str(&format!("failed:{newer}:later-spawn")));
+            }
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[older], 500.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "the newer boot {newer}'s failure must not resolve this wait, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A waiter that named nothing, in a context whose own boot is in flight, still refuses another
+/// boot announced beside it.
+#[wasm_bindgen_test]
+async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
+    let mine = super::boot::BootIdentity::mint();
+    crate::workers::intake::announce_current_boot(&mine);
+    let other = super::boot::BootIdentity::mint().to_string();
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{other}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!(
+                "failed:{other}:someone-elses-boot"
+            )));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 600.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "another boot's failure must not resolve a wait for this context's boot, got {error:?}"
+    );
+}
+
+/// A failure arriving in the same turn as readiness does not undo it, because a worker that
+/// answered the wait booted.
+#[wasm_bindgen_test]
+async fn a_failure_after_readiness_does_not_undo_it() {
+    let identity = BootIdentity::mint();
+    let id_str = identity.to_string();
+    // Readiness carries no identity, so it is spoken on a channel of this test's own rather
+    // than on the one every other waiter in this context is listening to.
+    let hello = "connetto-hello-terminal-readiness";
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(20)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str("ready"));
+            let _ = sender.post_message(&JsValue::from_str(&format!("failed:{id_str}:late-throw")));
+        }
+    });
+
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
+        .await
+        .expect("readiness stands even when the worker throws right after it");
+}
+
+/// A waiter never announces a boot, because a waiter can hold an identity whose boot has been
+/// replaced and an announcement from it would silence the announcer of the boot that replaced it.
+#[wasm_bindgen_test]
+async fn a_waiter_does_not_announce_the_boot_it_holds() {
+    let held = super::boot::BootIdentity::mint();
+    let announcement = format!("booting:{held}");
+    let heard = Rc::new(Cell::new(false));
+    let hello = "connetto-hello-waiter-silence";
+    let listener = BroadcastChannel::new(hello).expect("hello channel");
+    let on_message = {
+        let heard = Rc::clone(&heard);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if event.data().as_string().as_deref() == Some(announcement.as_str()) {
+                heard.set(true);
+            }
+        })
+    };
+    listener.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    spawn_local(async move {
+        let _ = crate::workers::intake::await_db_worker_ready_bounded(hello, &[held], 600.0).await;
+    });
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+    let _ = listener.post_message(&JsValue::from_str("ask"));
+    crate::workers::sleep(core::time::Duration::from_millis(300)).await;
+
+    assert!(
+        !heard.get(),
+        "a waiter must not answer an ask with the boot it holds"
+    );
+    listener.set_onmessage(None);
+    listener.close();
+    drop(on_message);
+}
+
+/// A worker that throws after it reported ready has not failed its boot, so a later wait is not
+/// told that it did.
+#[wasm_bindgen_test]
+async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-spent-announcer";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        let _ = sender.post_message(&JsValue::from_str(&format!("ready:{identity}")));
+        let _ = sender.post_message(&JsValue::from_str(&format!("failed:{identity}:late-crash")));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 400.0)
+        .await
+        .expect_err("no worker answers this wait");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a completed boot must not be replayed as failed, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A worker that has reported ready booted, so an exception it throws afterwards is not posted
+/// as its boot's failure to whoever asks next.
+#[wasm_bindgen_test]
+async fn a_ready_boot_stops_reporting_worker_errors() {
+    let parts = js_sys::Array::of1(&JsValue::from_str("// nothing to boot\n"));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .expect("the empty module blob");
+    let module_url = web_sys::Url::create_object_url_with_blob(&blob).expect("the module URL");
+    let (worker, identity) =
+        super::boot::spawn_db_worker(&module_url, &super::boot::WorkerBootstrap::Glue)
+            .expect("spawning the worker must succeed");
+
+    // What the worker posts once it is serving.
+    if let Ok(sender) = BroadcastChannel::new(HELLO_CHANNEL) {
+        let _ = sender.post_message(&JsValue::from_str(&format!("ready:{identity}")));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+
+    // The exception arrives while a later tab is waiting, which is the ordering that matters.
+    spawn_local({
+        let worker = worker.clone();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(150)).await;
+            let event = web_sys::ErrorEvent::new("error").expect("the error event");
+            let _ = worker.dispatch_event(&event);
+        }
+    });
+
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[identity], 600.0)
+            .await
+            .expect_err("nothing answers this wait");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a booted worker's later error must not read as a boot failure, got {error:?}"
+    );
+    worker.terminate();
+    let _ = web_sys::Url::revoke_object_url(&module_url);
+}
+
+/// A superseded boot's failure says nothing about whether a worker is coming, so a waiter that
+/// named nothing drops it when a replacement is announced.
+#[wasm_bindgen_test]
+async fn a_replacement_announcement_drops_the_boot_it_replaced() {
+    let replaced = super::boot::BootIdentity::mint();
+    let replacement = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-superseded-boot";
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{replaced}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{replacement}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            // The replaced boot's failure was already in flight.
+            let _ = sender.post_message(&JsValue::from_str(&format!("failed:{replaced}:too-late")));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 600.0)
+        .await
+        .expect_err("nothing reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a superseded boot's failure must not resolve this wait, got {error:?}"
+    );
+}
+
+/// A readiness that names another boot does not spend this one, because readiness carries no
+/// identity for the waiters and an outgoing worker can answer after its replacement is announced.
+#[wasm_bindgen_test]
+async fn an_unscoped_readiness_does_not_spend_a_pending_boot() {
+    let replacement = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-outgoing-readiness";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &replacement)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        // What the worker being replaced left on the channel.
+        let _ = sender.post_message(&JsValue::from_str("ready"));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{replacement}:no-replacement"
+        )));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 1_000.0)
+        .await
+        .expect_err("the replacement's failure must still be tellable");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("no-replacement")),
+        "expected the replacement's failure, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A boot that failed before anyone started waiting still explains itself, because a reconnect
+/// can begin after both the announcement and the failure have been broadcast.
+#[wasm_bindgen_test]
+async fn a_failure_broadcast_before_the_wait_is_replayed_to_it() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-replayed-failure";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{identity}:already-gone"
+        )));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
+        .await
+        .expect_err("a wait that starts after the failure must still learn of it");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("already-gone")),
+        "expected the failure to be replayed, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A boot stays obtainable while it is in flight, so a waiter that joined after the announcement
+/// gets it from the announcer rather than from another waiter.
+#[wasm_bindgen_test]
+async fn an_announcer_answers_a_waiter_that_joined_late() {
+    let identity = super::boot::BootIdentity::mint();
+    let id_str = identity.to_string();
+    let hello = "connetto-hello-late-joiner";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(300)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ =
+                sender.post_message(&JsValue::from_str(&format!("failed:{id_str}:late-joiner")));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 3_000.0)
+        .await
+        .expect_err("the late joiner must act on the announced boot's failure");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("late-joiner")),
+        "expected the announcer to make the boot attributable, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A waiter that knows the boot it is waiting for does not adopt another boot announced beside
+/// it, because two boots can overlap while one worker replaces another.
+#[wasm_bindgen_test]
+async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
+    let mine = super::boot::BootIdentity::mint();
+    let other = super::boot::BootIdentity::mint().to_string();
+    let hello = "connetto-hello-own-boot-only";
+
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("booting:{other}")));
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let _ = sender.post_message(&JsValue::from_str(&format!(
+                "failed:{other}:someone-elses-boot"
+            )));
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 400.0)
+        .await
+        .expect_err("no worker reports readiness here");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "another boot's failure must not be adopted, got {error:?}"
+    );
+}
+
+/// A module that cannot be fetched fails before any Rust runs, and the spawning context
+/// reports it, so a reconnect attempt handed no identity still learns why.
+#[wasm_bindgen_test]
+async fn a_worker_error_is_reported_by_the_context_that_spawned_it() {
+    // An empty module loads, so the worker exists and carries the spawn's error listener
+    // without the page also taking an uncaught module failure.
+    let parts = js_sys::Array::of1(&JsValue::from_str("// nothing to boot\n"));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .expect("the empty module blob");
+    let module_url = web_sys::Url::create_object_url_with_blob(&blob).expect("the module URL");
+    let (worker, _identity) =
+        super::boot::spawn_db_worker(&module_url, &super::boot::WorkerBootstrap::Glue)
+            .expect("spawning the worker must succeed");
+
+    spawn_local({
+        let worker = worker.clone();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+            let event = web_sys::ErrorEvent::new("error").expect("the error event");
+            let _ = worker.dispatch_event(&event);
+        }
+    });
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 2_000.0)
+        .await
+        .expect_err("a worker that raised an error must not report readiness");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { .. }),
+        "expected the failure to be attributed, got {error:?}"
+    );
+    worker.terminate();
+    let _ = web_sys::Url::revoke_object_url(&module_url);
+}
+
+/// A relative worker URL resolves against the page's base, which a page can move with a
+/// `base href` and which the `Worker` constructor honours.
+#[wasm_bindgen_test]
+fn a_relative_worker_url_resolves_against_the_page_base() {
+    let identity = super::boot::BootIdentity::mint();
+    let tagged = super::boot::tagged_url_against(
+        "http://example.test/app/index.html",
+        "./db-worker.js",
+        &identity,
+    )
+    .expect("a relative worker URL must resolve against the base");
+    assert!(
+        tagged.starts_with("http://example.test/app/db-worker.js?"),
+        "the base must decide the path: {tagged}"
+    );
+}
+
+/// A boot parameter already on the worker URL is replaced, not duplicated, because the worker
+/// reads the first value of the name.
+#[wasm_bindgen_test]
+fn boot_tagged_url_replaces_an_existing_boot_parameter() {
+    let identity = super::boot::BootIdentity::mint();
+    let tagged = super::boot::boot_tagged_url("./db-worker.js?boot=stale&keep=yes", &identity)
+        .expect("a relative worker URL must be taggable");
+    let url = web_sys::Url::new(&tagged).expect("the tagged URL must parse");
+    let params = url.search_params();
+    assert_eq!(
+        params.get_all("boot").length(),
+        1,
+        "the boot parameter must appear once: {tagged}"
+    );
+    assert!(
+        identity.matches_str(&params.get("boot").unwrap_or_default()),
+        "the boot parameter must name this boot: {tagged}"
+    );
+    assert_eq!(
+        params.get("keep").as_deref(),
+        Some("yes"),
+        "an unrelated parameter must survive: {tagged}"
+    );
+}
+
+/// The generated bootstrap leaves its boot identity in a global, because a blob worker's own
+/// location carries no query for it to read.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_carries_its_identity() {
+    let identity = super::boot::BootIdentity::mint();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+        .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        source.contains(&format!("self.connettoBoot = \"{identity}\"")),
+        "the source must carry the identity: {source}"
+    );
+}
+
 /// The generated bootstrap module imports the glue by absolute URL, because a blob module
 /// resolves a relative specifier against `blob:`.
 #[wasm_bindgen_test]
 fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
-    let source = super::boot::generated_bootstrap_source("./db-worker.js")
+    let identity = super::boot::BootIdentity::mint();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
         .expect("a relative glue URL must produce a bootstrap source");
     assert!(
         !source.contains("\"./db-worker.js\""),
@@ -392,5 +856,19 @@ fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
     assert!(
         source.contains("await import(\"http"),
         "the import specifier must be absolute: {source}"
+    );
+}
+
+/// The generated bootstrap source embeds the boot identity in the failure message, so a waiter
+/// that holds the identity can match the failure rather than waiting out the deadline.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_source_carries_the_boot_identity() {
+    let identity = super::boot::BootIdentity::mint();
+    let id_str = identity.to_string();
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+        .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        source.contains(&format!("\"failed:{id_str}:\" + err")),
+        "the failure message must carry the boot identity: {source}"
     );
 }

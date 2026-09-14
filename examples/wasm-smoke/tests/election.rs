@@ -196,7 +196,7 @@ async fn election_promotes_a_survivor_and_serves_the_tab() {
     // Candidate A joins first: the lock is free, so it wins and spawns the
     // first DB worker.
     let membership_a = leader::join(&leader_lock, &glue);
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[]).await.expect("db worker ready");
     poll_until(|| membership_a.is_leader()).await;
     stage("candidate a leads, worker one ready");
 

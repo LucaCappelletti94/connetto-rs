@@ -32,7 +32,7 @@ use web_sys::{BroadcastChannel, ErrorEvent, Event, MessageEvent, Worker};
 
 use crate::locks::{HeldLock, hold_lock};
 use crate::unlock::{AccountChoice, UnlockError};
-use crate::workers::{WorkerBootstrap, spawn_db_worker};
+use crate::workers::{BootIdentity, WorkerBootstrap, spawn_db_worker};
 
 /// Failure of a leader-managed operation.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +67,7 @@ impl From<LeaderError> for JsValue {
 struct Leadership {
     held: HeldLock,
     worker: Worker,
+    boot_identity: BootIdentity,
 }
 
 /// How to launch a replacement worker, retained because a switch replaces the
@@ -100,6 +101,16 @@ impl Membership {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.leadership.borrow().is_some()
+    }
+
+    /// The identity of the DB worker this page most recently spawned, or `None` before the
+    /// election is won.
+    #[must_use]
+    pub fn boot_identity(&self) -> Option<BootIdentity> {
+        self.leadership
+            .borrow()
+            .as_ref()
+            .map(|l| l.boot_identity.clone())
     }
 
     /// Sign in as `account`, which must be one the worker offered.
@@ -208,10 +219,12 @@ impl Membership {
             return Ok(());
         };
         leadership.worker.terminate();
-        let worker = spawn_worker(&self.launch).map_err(|e| LeaderError::WorkerSpawn {
-            detail: format!("{e:?}"),
-        })?;
+        let (worker, identity) =
+            spawn_worker(&self.launch).map_err(|e| LeaderError::WorkerSpawn {
+                detail: format!("{e:?}"),
+            })?;
         leadership.worker = worker;
+        leadership.boot_identity = identity;
         Ok(())
     }
 }
@@ -249,11 +262,12 @@ fn decode_choice(message: &str) -> Option<AccountChoice> {
 /// the topology through [`join`] alone. Without it a gated profile could not be
 /// unlocked under the leader topology at all. The handler is inert unless the
 /// worker asks something, so a consumer with no gate pays nothing for it.
-fn spawn_worker(launch: &Launch) -> Result<Worker, JsValue> {
-    let worker = spawn_db_worker(&launch.glue_url, &launch.bootstrap)?;
+fn spawn_worker(launch: &Launch) -> Result<(Worker, BootIdentity), JsValue> {
+    let (worker, identity) =
+        spawn_db_worker(&launch.glue_url, &launch.bootstrap).map_err(JsValue::from)?;
     log_worker_errors(&worker);
     crate::unlock::serve_unlock(&worker)?;
-    Ok(worker)
+    Ok((worker, identity))
 }
 
 impl Drop for Membership {
@@ -324,7 +338,10 @@ fn serve_switch_requests(
         crate::unlock::set_pending_switch(choice);
         current.worker.terminate();
         match spawn_worker(&launch) {
-            Ok(worker) => current.worker = worker,
+            Ok((worker, identity)) => {
+                current.worker = worker;
+                current.boot_identity = identity;
+            }
             Err(err) => {
                 tracing::error!(error = ?err, "leader election: replacing the db worker failed");
             }
@@ -353,8 +370,12 @@ async fn run_election(
         return;
     }
     match spawn_worker(&launch) {
-        Ok(worker) => {
-            leadership.borrow_mut().replace(Leadership { held, worker });
+        Ok((worker, identity)) => {
+            leadership.borrow_mut().replace(Leadership {
+                held,
+                worker,
+                boot_identity: identity,
+            });
         }
         Err(err) => {
             tracing::error!(error = ?err, "leader election: spawning the db worker failed");

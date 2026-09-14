@@ -8,8 +8,16 @@
 const debug = new BroadcastChannel("connetto-debug");
 const hello = new BroadcastChannel("connetto-hello");
 
+const params = new URL(import.meta.url).searchParams;
+// The page spawns this worker with the identity of the boot it is waiting for, and a
+// failure before the Rust side starts has to name it too.
+const boot = params.get("boot");
+if (boot) {
+  self.connettoBoot = boot;
+}
+
 try {
-  const glue = new URL(import.meta.url).searchParams.get("glue");
+  const glue = params.get("glue");
   debug.postMessage("db worker: importing " + glue);
   const mod = await import(glue);
   // The harness glue omits its default module path, so name the wasm
@@ -20,6 +28,9 @@ try {
   debug.postMessage("db worker: serving");
 } catch (err) {
   debug.postMessage("db worker FAILED: " + err);
-  hello.postMessage("failed:" + err);
+  // A worker that cannot name its boot stays silent, because a page cannot attribute it.
+  if (boot) {
+    hello.postMessage("failed:" + boot + ":" + err);
+  }
   throw err;
 }

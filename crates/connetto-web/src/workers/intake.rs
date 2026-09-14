@@ -13,8 +13,6 @@ use crate::frames::{MessageTransport, MessageTransportError};
 
 /// Deadline for all hello-channel exchanges.
 const HELLO_TIMEOUT_MS: f64 = 15_000.0;
-/// Deadline in milliseconds for the [`IntakeError::Timeout`] variant.
-const HELLO_TIMEOUT_DEADLINE_MS: u64 = 15_000;
 
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
@@ -43,10 +41,10 @@ pub enum IntakeError {
         detail: String,
     },
     /// the db worker did not answer within the readiness deadline
-    #[error("db worker did not answer within {deadline_ms} ms")]
+    #[error("db worker did not answer within {deadline_ms:.0} ms")]
     Timeout {
         /// the deadline that expired, in milliseconds
-        deadline_ms: u64,
+        deadline_ms: f64,
     },
 }
 
@@ -59,6 +57,7 @@ impl From<IntakeError> for JsValue {
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
+    deadline_ms: f64,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
     let started = js_sys::Date::now();
@@ -71,45 +70,225 @@ async fn poll_hello_channel(
             }
             HelloReady::Waiting => {}
         }
-        if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
-            return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
-            });
+        if js_sys::Date::now() - started >= deadline_ms {
+            return Err(IntakeError::Timeout { deadline_ms });
         }
         let _ = channel.post_message(&JsValue::from_str("ask"));
         sleep_ms(POLL_MS).await;
     }
 }
 
-/// Page side: resolve once the DB worker's intake answers on the hello channel.
+thread_local! {
+    /// The boot this context spawned most recently, answering for it while it is in flight.
+    static CURRENT_BOOT: RefCell<Option<BootAnnouncer>> = const { RefCell::new(None) };
+}
+
+/// Announces the boot this context has just spawned, replacing the announcement before it.
 ///
-/// # Errors
+/// A reconnect attempt is handed no identity, and the boot it waits for is by construction the
+/// newest one this context spawned, so one slot is all a context needs.
+pub(super) fn announce_current_boot(identity: &super::boot::BootIdentity) {
+    let announcer = announce_boot(identity);
+    CURRENT_BOOT.with_borrow_mut(|current| *current = announcer);
+}
+
+/// The boot this context spawned, while a failure for it can still arrive.
+fn current_boot_in_flight() -> Option<super::boot::BootIdentity> {
+    CURRENT_BOOT.with_borrow(|current| {
+        current
+            .as_ref()
+            .filter(|announcer| announcer.in_flight())
+            .map(BootAnnouncer::identity)
+    })
+}
+
+/// What an announced boot has come to, which is what a later `ask` is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootOutcome {
+    /// A failure for this boot can still arrive.
+    Pending,
+    /// The boot failed, and the reason is still worth telling a waiter that joins now.
+    Failed(String),
+    /// The worker is up, or a newer boot has been announced, so this one has nothing to say.
+    Spent,
+}
+
+/// Keeps a boot's identity and its outcome obtainable for as long as they explain anything.
 ///
-/// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened,
-/// [`IntakeError::BootFailed`] when the worker reported a failure, or
-/// [`IntakeError::Timeout`] when the deadline expires.
-pub async fn await_db_worker_ready() -> Result<(), IntakeError> {
-    let channel =
-        BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
-            operation: "hello channel",
-            detail: format!("{err:?}"),
-        })?;
-    let state = Rc::new(RefCell::new(HelloReady::Waiting));
+/// Both the announcement and the failure are single broadcasts and a broadcast is not replayed,
+/// so a waiter that joins later would have nothing to attribute a failure to, and one that
+/// joins after the failure would have no failure either. This answers `ask` with the
+/// announcement while the boot is pending and with the announcement followed by the failure
+/// once it has failed, until a newer boot is announced or the worker reports ready. Dropping it
+/// stops answering.
+pub struct BootAnnouncer {
+    channel: BroadcastChannel,
+    identity: super::boot::BootIdentity,
+    outcome: Rc<RefCell<BootOutcome>>,
+    _on_message: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl BootAnnouncer {
+    /// The boot being announced.
+    #[must_use]
+    pub fn identity(&self) -> super::boot::BootIdentity {
+        self.identity.clone()
+    }
+
+    /// Whether a failure for this boot can still arrive, which it cannot once the worker
+    /// reported ready or the boot reported its failure.
+    #[must_use]
+    pub fn in_flight(&self) -> bool {
+        *self.outcome.borrow() == BootOutcome::Pending
+    }
+}
+
+impl Drop for BootAnnouncer {
+    fn drop(&mut self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+    }
+}
+
+/// Announces a boot and keeps answering for it, or `None` when the channel cannot be opened.
+///
+/// A caller that cannot announce still boots, because the announcement only makes a failure
+/// attributable to a context that did not spawn it.
+#[must_use]
+pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<BootAnnouncer> {
+    announce_boot_on(super::HELLO_CHANNEL, identity)
+}
+
+/// Announces a boot on `channel_name`, so a test speaks on a channel of its own.
+#[must_use]
+pub(super) fn announce_boot_on(
+    channel_name: &str,
+    identity: &super::boot::BootIdentity,
+) -> Option<BootAnnouncer> {
+    let channel = BroadcastChannel::new(channel_name).ok()?;
+    let announcement = format!("booting:{identity}");
+    let outcome = Rc::new(RefCell::new(BootOutcome::Pending));
     let on_message = {
-        let state = Rc::clone(&state);
+        let channel = channel.clone();
+        let failure = format!("failed:{identity}:");
+        // Readiness carries no identity for the waiters, so only the tagged form retires this
+        // announcer: an outgoing worker's queued readiness must not spend the boot replacing it.
+        let readiness = format!("ready:{identity}");
+        let announcement = announcement.clone();
+        let outcome = Rc::clone(&outcome);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let Some(message) = event.data().as_string() else {
+            let Some(heard) = event.data().as_string() else {
                 return;
             };
-            if message == "ready" {
-                *state.borrow_mut() = HelloReady::Up;
-            } else if let Some(detail) = message.strip_prefix("failed:") {
-                *state.borrow_mut() = HelloReady::Failed(detail.to_owned());
+            if heard == readiness {
+                *outcome.borrow_mut() = BootOutcome::Spent;
+            } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
+                // Only a pending boot can fail: a worker that has reported ready booted, and an
+                // error it throws later is not this boot's outcome.
+                let mut outcome = outcome.borrow_mut();
+                if *outcome == BootOutcome::Pending {
+                    *outcome = BootOutcome::Failed(detail.to_owned());
+                }
+            } else if heard.starts_with("booting:") && heard != announcement {
+                // A newer boot is the one a waiter should hear about now.
+                *outcome.borrow_mut() = BootOutcome::Spent;
+            } else if heard == "ask" {
+                let reason = match &*outcome.borrow() {
+                    BootOutcome::Pending => None,
+                    BootOutcome::Failed(detail) => Some(format!("{failure}{detail}")),
+                    BootOutcome::Spent => return,
+                };
+                // The identity goes first, because a waiter acts on a failure only for an
+                // identity it knows.
+                let _ = channel.post_message(&JsValue::from_str(&announcement));
+                if let Some(reason) = reason {
+                    let _ = channel.post_message(&JsValue::from_str(&reason));
+                }
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let result = poll_hello_channel(&channel, &state).await;
+    let _ = channel.post_message(&JsValue::from_str(&announcement));
+    Some(BootAnnouncer {
+        channel,
+        identity: identity.clone(),
+        outcome,
+        _on_message: on_message,
+    })
+}
+
+/// Page side: resolve once the DB worker's intake answers on the hello channel.
+///
+/// `known` lists boot identities this caller may act on; a failure whose identity is not among
+/// them is ignored. A caller that knows no identity, and spawned no boot in this context, learns
+/// one from the `booting:<identity>` a spawn announces or answers with, because the origin hosts
+/// one worker topology and that announcement is its boot. A caller that does know one stays with
+/// it.
+///
+/// # Errors
+///
+/// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened,
+/// [`IntakeError::BootFailed`] when the worker reported a failure for a known identity, or
+/// [`IntakeError::Timeout`] when the deadline expires.
+pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Result<(), IntakeError> {
+    await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, HELLO_TIMEOUT_MS).await
+}
+
+/// Waits for readiness on `channel_name` under `deadline_ms`, so a test proves a boundary in
+/// milliseconds rather than over the shipped deadline, on a channel of its own rather than on
+/// the one every other waiter in the context is listening to.
+pub(super) async fn await_db_worker_ready_bounded(
+    channel_name: &str,
+    known: &[super::boot::BootIdentity],
+    deadline_ms: f64,
+) -> Result<(), IntakeError> {
+    let channel = BroadcastChannel::new(channel_name).map_err(|err| IntakeError::ChannelOpen {
+        operation: "hello channel",
+        detail: format!("{err:?}"),
+    })?;
+    let state = Rc::new(RefCell::new(HelloReady::Waiting));
+    let mut initial = known.to_vec();
+    if initial.is_empty() && channel_name == super::HELLO_CHANNEL {
+        // Only a caller that named nothing falls back to this context's boot, because a caller
+        // that named one is scoped to it and a newer spawn is not what it is waiting for. A boot
+        // is remembered for the channel it was announced on and explains nothing on another.
+        initial.extend(current_boot_in_flight());
+    }
+    let known_ids = Rc::new(RefCell::new(initial));
+    // A waiter that knows which boot it waits for has no business adopting another one, and a
+    // waiter that knows none has only the announcement to go on.
+    let trusts_announcements = known_ids.borrow().is_empty();
+    let on_message = {
+        let state = Rc::clone(&state);
+        let known_ids = Rc::clone(&known_ids);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some(message) = event.data().as_string() else {
+                return;
+            };
+            if message == "ready" || message.starts_with("ready:") {
+                *state.borrow_mut() = HelloReady::Up;
+            } else if let Some(id) = message.strip_prefix("booting:") {
+                // Only a spawn announces, so the newest announcement names the boot that will
+                // serve this waiter, and the one before it has been replaced: its failure no
+                // longer says anything about whether a worker is coming.
+                if trusts_announcements {
+                    *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
+                }
+            } else if let Some(rest) = message.strip_prefix("failed:")
+                && let Some((id, detail)) = rest.split_once(':')
+                && known_ids.borrow().iter().any(|known| known.matches_str(id))
+            {
+                // Readiness is terminal: a worker that answered this wait booted, and what it
+                // throws afterwards is not this wait's outcome.
+                let mut state = state.borrow_mut();
+                if matches!(*state, HelloReady::Waiting) {
+                    *state = HelloReady::Failed(detail.to_owned());
+                }
+            }
+        })
+    };
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    let result = poll_hello_channel(&channel, &state, deadline_ms).await;
     channel.set_onmessage(None);
     channel.close();
     result
@@ -145,7 +324,7 @@ pub async fn announce_tab(wire: &str) -> Result<(), IntakeError> {
             channel.set_onmessage(None);
             channel.close();
             return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
+                deadline_ms: HELLO_TIMEOUT_MS,
             });
         }
         sleep_ms(10).await;
@@ -171,7 +350,7 @@ pub fn tab_wire_factory(
             js_sys::Date::now()
         );
         Box::pin(async move {
-            await_db_worker_ready()
+            await_db_worker_ready(&[])
                 .await
                 .map_err(|err| MessageTransportError::Sink(err.to_string()))?;
             announce_tab(&wire)
@@ -201,6 +380,12 @@ fn decode_custody_reply(data: &JsValue) -> Option<Custody> {
 /// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened, or
 /// [`IntakeError::Timeout`] when the worker does not answer within the deadline.
 pub async fn request_custody() -> Result<Custody, IntakeError> {
+    request_custody_bounded(HELLO_TIMEOUT_MS).await
+}
+
+/// Asks for custody under `deadline_ms`, so a test proves the expiry in milliseconds rather
+/// than waiting out the shipped deadline.
+pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody, IntakeError> {
     let channel =
         BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
             operation: "hello channel",
@@ -219,13 +404,11 @@ pub async fn request_custody() -> Result<Custody, IntakeError> {
     let started = js_sys::Date::now();
     let mut answered = result.get();
     while answered.is_none() {
-        if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
+        if js_sys::Date::now() - started >= deadline_ms {
             channel.set_onmessage(None);
             channel.close();
             drop(on_message);
-            return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_DEADLINE_MS,
-            });
+            return Err(IntakeError::Timeout { deadline_ms });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.
         let _ = channel.post_message(&JsValue::from_str("custody?"));
@@ -245,14 +428,23 @@ pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
             operation: "hello channel",
             detail: format!("{err:?}"),
         })?;
+    // Readiness stays untagged for the waiters, and names the boot as well so the spawning
+    // context can tell its own boot's readiness from a message an outgoing worker left behind.
+    let ready = super::boot::boot_identity_from_location()
+        .map(|identity| format!("ready:{identity}"))
+        .unwrap_or_default();
     let intake = {
         let hello = hello.clone();
+        let ready = ready.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
             if message == "ask" {
                 let _ = hello.post_message(&JsValue::from_str("ready"));
+                if !ready.is_empty() {
+                    let _ = hello.post_message(&JsValue::from_str(&ready));
+                }
             } else if message == "custody?" {
                 let encoded = encode_custody(crate::unlock::custody());
                 let _ = hello.post_message(&JsValue::from_str(&format!("custody:{encoded}")));
@@ -272,6 +464,9 @@ pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
     hello.set_onmessage(Some(intake.as_ref().unchecked_ref()));
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
+    if !ready.is_empty() {
+        let _ = hello.post_message(&JsValue::from_str(&ready));
+    }
     Ok(())
 }
 

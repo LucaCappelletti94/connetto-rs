@@ -486,7 +486,12 @@ async fn boot_window() -> Result<Boot, JsValue> {
     // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
     // import and `main` boots the tier, so no separate bootstrap is needed.
     let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Glue);
-    workers::await_db_worker_ready().await?;
+    // A leader knows the boot it spawned, so it hears that boot's failure at once, and a
+    // follower waits for the announcement or for the deadline.
+    let boot = membership
+        .boot_identity()
+        .map_or_else(Vec::new, |id| vec![id]);
+    workers::await_db_worker_ready(&boot).await?;
 
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");

@@ -192,7 +192,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
 
     // This page wins the leader election and owns the DB worker.
     let membership = leader::join(&format!("connetto-notes-leader-{base}"), &glue_url());
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[]).await.expect("db worker ready");
     stage("db worker ready");
 
     let client_a = rosetta_uuid::Uuid::new_v4().to_string();

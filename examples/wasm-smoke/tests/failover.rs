@@ -193,8 +193,10 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     // lock and the winner runs exactly this code.
     let leader_lock = locks::hold_lock(&format!("connetto-leader-{base}")).await;
     let glue = glue_url();
-    let worker_one = spawn_db_worker(&glue).expect("spawn worker one");
-    await_db_worker_ready().await.expect("db worker ready");
+    let (worker_one, boot_one) = spawn_db_worker(&glue).expect("spawn worker one");
+    await_db_worker_ready(&[boot_one])
+        .await
+        .expect("db worker ready");
     stage("worker one ready");
 
     // The tab client reconnects through the factory: fresh wire channel per
@@ -251,7 +253,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
 
     // The replacement generation: same replica file in OPFS, resumed from
     // the persisted cursor, then served to the reconnecting tab.
-    let worker_two = spawn_db_worker(&glue).expect("spawn worker two");
+    let (worker_two, _boot_two) = spawn_db_worker(&glue).expect("spawn worker two");
     stage("worker two spawned");
 
     // The tab converges on the missed row with no local interaction: alive

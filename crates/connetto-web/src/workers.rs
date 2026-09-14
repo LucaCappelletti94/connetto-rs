@@ -11,7 +11,8 @@ pub use archive_channel::{
     ChannelError, request_export, request_import, serve_export_requests, serve_import_requests,
 };
 pub use boot::{
-    BootError, BootedSession, DbWorkerConfig, WorkerBootstrap, boot_db_worker, spawn_db_worker,
+    BootError, BootIdentity, BootedSession, DbWorkerConfig, WorkerBootstrap, boot_db_worker,
+    spawn_db_worker,
 };
 pub use intake::{
     IntakeError, TabWire, announce_tab, await_db_worker_ready, request_custody, sleep,

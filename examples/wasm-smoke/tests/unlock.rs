@@ -76,8 +76,7 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
     let wasm_url = glue_url
         .strip_suffix(".js")
         .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
-    // Broadcast failures to both channels: debug preserves the old assertion,
-    // hello lets readiness fail by name.
+    // This blob carries no boot identity, so its failures reach the debug channel only.
     let source = format!(
         "try {{\
          \n  const mod = await import(\"{g}\");\
@@ -85,7 +84,6 @@ fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
          \n  await mod.db_worker_unlock_boot();\
          \n}} catch (err) {{\
          \n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker FAILED: \" + err);\
-         \n  new BroadcastChannel(\"connetto-hello\").postMessage(\"failed:\" + err);\
          \n  throw err;\
          \n}}\n",
         g = glue_url,
@@ -243,7 +241,7 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
     }
 
     stage("test 1: waiting for worker ready");
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[]).await.expect("db worker ready");
 
     assert!(
         logins.get() >= 1,
@@ -268,11 +266,13 @@ async fn custody_without_the_unlock_flag_reads_as_offerable() {
     common::play_the_tab();
 
     // Spawn a worker with unlock=false (the default from spawn_db_worker).
-    let worker =
+    let (worker, boot) =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 2: waiting for worker ready");
-    await_db_worker_ready().await.expect("db worker ready");
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
 
     stage("test 2: reading custody from the worker");
     let custody = request_custody().await.expect("the worker answers custody");
@@ -345,15 +345,19 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
 async fn unlock_disabled_with_an_enrolled_credential_refuses_the_boot() {
     stage("test 4: unlock=false with enrolled credential");
     plant_enrolled_credential(0xcc, 0x02).await;
-    let failure_rx = wait_debug_for("FAILED");
-    let worker =
+    let (worker, boot) =
         connetto_wasm_smoke::workers::spawn_db_worker(&glue_url()).expect("spawn default worker");
 
     stage("test 4: waiting for boot failure");
-    let failure_msg = failure_rx.await.expect("must receive the failure message");
+    // The boot fails after its import succeeds, and the reason still reaches a waiting tab.
+    let reported = await_db_worker_ready(&[boot])
+        .await
+        .expect_err("a refused boot must not report readiness")
+        .as_string()
+        .unwrap_or_default();
     assert!(
-        failure_msg.contains(LOCKED_MESSAGE),
-        "boot with unlock=false and enrolled credential must fail, got: {failure_msg}"
+        reported.contains(LOCKED_MESSAGE),
+        "the wait must report why the boot failed, got: {reported}"
     );
     worker.terminate();
     stage("test 4: done");

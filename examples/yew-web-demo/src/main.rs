@@ -435,7 +435,12 @@ async fn boot_window() -> Result<Boot, JsValue> {
     // Trunk's glue does not self-initialize, so connetto-web spawns the worker
     // from a generated bootstrap that imports the glue and runs init.
     let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Generated);
-    workers::await_db_worker_ready().await?;
+    // A leader knows the boot it spawned, so it hears that boot's failure at once, and a
+    // follower waits for the announcement or for the deadline.
+    let boot = membership
+        .boot_identity()
+        .map_or_else(Vec::new, |id| vec![id]);
+    workers::await_db_worker_ready(&boot).await?;
     // Read custody after the worker has settled, while still on the hello channel.
     let custody = workers::request_custody()
         .await
