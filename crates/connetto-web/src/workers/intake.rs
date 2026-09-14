@@ -209,9 +209,9 @@ pub(super) fn announce_boot(identity: &super::boot::BootIdentity) -> Option<Boot
 ///
 /// `known` lists boot identities this caller may act on; a failure whose identity is not among
 /// them is ignored. A caller that knows no identity, and spawned no boot in this context, learns
-/// one from a `booting:<identity>` announcement or from another waiter's answer to its `ask`,
-/// because the origin hosts one worker topology and that announcement is its boot. A caller that
-/// does know one stays with it.
+/// one from the `booting:<identity>` a spawn announces or answers with, because the origin hosts
+/// one worker topology and that announcement is its boot. A caller that does know one stays with
+/// it.
 ///
 /// # Errors
 ///
@@ -247,24 +247,17 @@ pub(super) async fn await_db_worker_ready_bounded(
     let on_message = {
         let state = Rc::clone(&state);
         let known_ids = Rc::clone(&known_ids);
-        let sender = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
             if message == "ready" {
                 *state.borrow_mut() = HelloReady::Up;
-            } else if message == "ask" {
-                // A waiter that joins after the announcement gets it from whoever heard it,
-                // because a broadcast is not replayed.
-                for identity in known_ids.borrow().iter() {
-                    let _ = sender.post_message(&JsValue::from_str(&format!("booting:{identity}")));
-                }
             } else if let Some(id) = message.strip_prefix("booting:") {
-                let heard = super::boot::BootIdentity::from_wire(id);
-                let mut known_ids = known_ids.borrow_mut();
-                if trusts_announcements && !known_ids.contains(&heard) {
-                    known_ids.push(heard);
+                // Only a spawn announces, so the newest announcement is the boot to watch and
+                // the one before it has been replaced.
+                if trusts_announcements {
+                    *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
                 && let Some((id, detail)) = rest.split_once(':')

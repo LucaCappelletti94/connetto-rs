@@ -474,6 +474,40 @@ async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
     );
 }
 
+/// A waiter never announces a boot, because a waiter can hold an identity whose boot has been
+/// replaced and an announcement from it would silence the announcer of the boot that replaced it.
+#[wasm_bindgen_test]
+async fn a_waiter_does_not_announce_the_boot_it_holds() {
+    let held = super::boot::BootIdentity::mint();
+    let announcement = format!("booting:{held}");
+    let heard = Rc::new(Cell::new(false));
+    let listener = BroadcastChannel::new(crate::workers::HELLO_CHANNEL).expect("hello channel");
+    let on_message = {
+        let heard = Rc::clone(&heard);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if event.data().as_string().as_deref() == Some(announcement.as_str()) {
+                heard.set(true);
+            }
+        })
+    };
+    listener.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    spawn_local(async move {
+        let _ = crate::workers::intake::await_db_worker_ready_bounded(&[held], 600.0).await;
+    });
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+    let _ = listener.post_message(&JsValue::from_str("ask"));
+    crate::workers::sleep(core::time::Duration::from_millis(300)).await;
+
+    assert!(
+        !heard.get(),
+        "a waiter must not answer an ask with the boot it holds"
+    );
+    listener.set_onmessage(None);
+    listener.close();
+    drop(on_message);
+}
+
 /// A worker that throws after it reported ready has not failed its boot, so a later wait is not
 /// told that it did.
 #[wasm_bindgen_test]
@@ -593,41 +627,6 @@ async fn a_module_that_cannot_load_reports_its_failure_to_a_later_wait() {
         "expected the failure to be attributed, got {error:?}"
     );
     worker.terminate();
-}
-
-/// A waiter that joins after the announcement asks for it, because a broadcast is not replayed.
-#[wasm_bindgen_test]
-async fn a_waiter_hears_an_announced_boot_from_another_waiter() {
-    let identity = super::boot::BootIdentity::mint();
-    let id_str = identity.to_string();
-
-    // The holder knows the identity and answers the newcomer's ask, then the failure lands.
-    spawn_local({
-        let id_str = id_str.clone();
-        async move {
-            let _ = crate::workers::intake::await_db_worker_ready_bounded(
-                &[super::boot::BootIdentity::from_wire(&id_str)],
-                4_000.0,
-            )
-            .await;
-        }
-    });
-    spawn_local(async move {
-        crate::workers::sleep(core::time::Duration::from_millis(400)).await;
-        if let Ok(sender) = BroadcastChannel::new(crate::workers::HELLO_CHANNEL) {
-            let _ = sender.post_message(&JsValue::from_str(&format!(
-                "failed:{id_str}:module-load-error"
-            )));
-        }
-    });
-
-    let error = crate::workers::intake::await_db_worker_ready_bounded(&[], 3_000.0)
-        .await
-        .expect_err("the newcomer must act on the announced boot's failure");
-    assert!(
-        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("module-load-error")),
-        "expected the newcomer to attribute the failure, got {error:?}"
-    );
 }
 
 /// A boot parameter already on the worker URL is replaced, not duplicated, because the worker
