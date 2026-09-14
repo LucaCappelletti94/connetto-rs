@@ -758,6 +758,23 @@ async fn a_worker_error_is_reported_by_the_context_that_spawned_it() {
     let _ = web_sys::Url::revoke_object_url(&module_url);
 }
 
+/// A relative worker URL resolves against the page's base, which a page can move with a
+/// `base href` and which the `Worker` constructor honours.
+#[wasm_bindgen_test]
+fn a_relative_worker_url_resolves_against_the_page_base() {
+    let identity = super::boot::BootIdentity::mint();
+    let tagged = super::boot::tagged_url_against(
+        "http://example.test/app/index.html",
+        "./db-worker.js",
+        &identity,
+    )
+    .expect("a relative worker URL must resolve against the base");
+    assert!(
+        tagged.starts_with("http://example.test/app/db-worker.js?"),
+        "the base must decide the path: {tagged}"
+    );
+}
+
 /// A boot parameter already on the worker URL is replaced, not duplicated, because the worker
 /// reads the first value of the name.
 #[wasm_bindgen_test]

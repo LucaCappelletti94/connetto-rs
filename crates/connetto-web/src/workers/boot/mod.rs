@@ -411,15 +411,21 @@ fn watch_boot_outcome(identity: &BootIdentity, pending: &Rc<std::cell::Cell<bool
     let readiness = format!("ready:{identity}");
     let failure = format!("failed:{identity}:");
     let pending = Rc::clone(pending);
-    let watcher =
+    let watcher = {
+        let hello = hello.clone();
         Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             let Some(heard) = event.data().as_string() else {
                 return;
             };
             if heard == readiness || heard.starts_with(failure.as_str()) {
                 pending.set(false);
+                // This boot has settled, so the listener would only keep reading other boots'
+                // traffic, one retained channel per worker the page ever replaced.
+                hello.set_onmessage(None);
+                hello.close();
             }
-        });
+        })
+    };
     hello.set_onmessage(Some(watcher.as_ref().unchecked_ref()));
     watcher.forget();
 }
@@ -432,8 +438,16 @@ fn watch_boot_outcome(identity: &BootIdentity, pending: &Rc<std::cell::Cell<bool
 /// The worker reads it back from its own location, which is how a boot failure after the
 /// import names the boot it belongs to.
 pub(super) fn boot_tagged_url(url: &str, identity: &BootIdentity) -> Result<String, BootError> {
-    let base = current_location_href()?;
-    let tagged = web_sys::Url::new_with_base(url, &base)
+    tagged_url_against(&current_base_href()?, url, identity)
+}
+
+/// Tags `url` resolved against `base`, which is what makes the resolution testable.
+pub(super) fn tagged_url_against(
+    base: &str,
+    url: &str,
+    identity: &BootIdentity,
+) -> Result<String, BootError> {
+    let tagged = web_sys::Url::new_with_base(url, base)
         .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?;
     tagged
         .search_params()
@@ -505,6 +519,25 @@ fn js_string_literal(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The base a relative worker URL resolves against.
+///
+/// A page can move that base with `<base href>`, and the `Worker` constructor honours it, so
+/// tagging a relative URL has to resolve against the same base or the module is fetched from
+/// somewhere the deployment never served it.
+fn current_base_href() -> Result<String, BootError> {
+    if let Ok(window) = js_sys::global().dyn_into::<web_sys::Window>()
+        && let Some(document) = window.document()
+    {
+        return Ok(document.base_uri().ok().flatten().unwrap_or(
+            window
+                .location()
+                .href()
+                .map_err(|e| BootError::BootstrapUrl(format!("{e:?}")))?,
+        ));
+    }
+    current_location_href()
 }
 
 /// Resolve the current document or worker location to an absolute URL string.
