@@ -31,7 +31,6 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 const REPLICA_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
 const DB_NAME: &str = "tier-smoke.sqlite";
-const FRONTEND_DB_NAME: &str = "tier-smoke-frontend.sqlite";
 
 /// A fixed key for this suite. One device, one key: the tier inherits it through
 /// the `ATTACH` rather than carrying its own.
@@ -78,14 +77,14 @@ async fn connect(config: &ClientConfig, first_boot: bool) -> ConnettoConnection<
     if first_boot {
         let replica = Replica::encrypted_file(&url, Some(replica_key()))
             .expect("create replica")
-            .with_tier(FRONTEND_DB_NAME, FRONTEND_DDL);
+            .with_tier(FRONTEND_DDL);
         ConnettoConnection::connect(transport, &replica, REPLICA_DDL, config, None)
             .await
             .expect("client connect")
     } else {
         let replica = Replica::encrypted_file(&url, Some(replica_key()))
             .expect("create replica")
-            .with_existing_tier(FRONTEND_DB_NAME);
+            .with_existing_tier();
         ConnettoConnection::connect_existing(transport, &replica, config, None)
             .await
             .expect("client connect")
