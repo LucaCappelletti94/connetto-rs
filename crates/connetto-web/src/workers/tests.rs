@@ -554,7 +554,7 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
         .expect("the hello channel must open");
     if let Ok(sender) = BroadcastChannel::new(hello) {
-        let _ = sender.post_message(&JsValue::from_str("ready"));
+        let _ = sender.post_message(&JsValue::from_str(&format!("ready:{identity}")));
         let _ = sender.post_message(&JsValue::from_str(&format!("failed:{identity}:late-crash")));
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
@@ -565,6 +565,36 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "a completed boot must not be replayed as failed, got {error:?}"
+    );
+    drop(announcer);
+}
+
+/// A readiness that names another boot does not spend this one, because readiness carries no
+/// identity for the waiters and an outgoing worker can answer after its replacement is announced.
+#[wasm_bindgen_test]
+async fn an_unscoped_readiness_does_not_spend_a_pending_boot() {
+    let replacement = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-outgoing-readiness";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &replacement)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        // What the worker being replaced left on the channel.
+        let _ = sender.post_message(&JsValue::from_str("ready"));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        let _ = sender.post_message(&JsValue::from_str(&format!(
+            "failed:{replacement}:no-replacement"
+        )));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 1_000.0)
+        .await
+        .expect_err("the replacement's failure must still be tellable");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("no-replacement")),
+        "expected the replacement's failure, got {error:?}"
     );
     drop(announcer);
 }

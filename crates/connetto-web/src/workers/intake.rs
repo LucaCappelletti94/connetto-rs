@@ -171,13 +171,16 @@ pub(super) fn announce_boot_on(
     let on_message = {
         let channel = channel.clone();
         let failure = format!("failed:{identity}:");
+        // Readiness carries no identity for the waiters, so only the tagged form retires this
+        // announcer: an outgoing worker's queued readiness must not spend the boot replacing it.
+        let readiness = format!("ready:{identity}");
         let announcement = announcement.clone();
         let outcome = Rc::clone(&outcome);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(heard) = event.data().as_string() else {
                 return;
             };
-            if heard == "ready" {
+            if heard == readiness {
                 *outcome.borrow_mut() = BootOutcome::Spent;
             } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
                 // Only a pending boot can fail: a worker that has reported ready booted, and an
@@ -262,7 +265,7 @@ pub(super) async fn await_db_worker_ready_bounded(
             let Some(message) = event.data().as_string() else {
                 return;
             };
-            if message == "ready" {
+            if message == "ready" || message.starts_with("ready:") {
                 *state.borrow_mut() = HelloReady::Up;
             } else if let Some(id) = message.strip_prefix("booting:") {
                 // Only a spawn announces, so every announcement heard here is a boot that
@@ -427,14 +430,23 @@ pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
             operation: "hello channel",
             detail: format!("{err:?}"),
         })?;
+    // Readiness stays untagged for the waiters, and names the boot as well so the spawning
+    // context can tell its own boot's readiness from a message an outgoing worker left behind.
+    let ready = super::boot::boot_identity_from_location()
+        .map(|identity| format!("ready:{identity}"))
+        .unwrap_or_default();
     let intake = {
         let hello = hello.clone();
+        let ready = ready.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
             if message == "ask" {
                 let _ = hello.post_message(&JsValue::from_str("ready"));
+                if !ready.is_empty() {
+                    let _ = hello.post_message(&JsValue::from_str(&ready));
+                }
             } else if message == "custody?" {
                 let encoded = encode_custody(crate::unlock::custody());
                 let _ = hello.post_message(&JsValue::from_str(&format!("custody:{encoded}")));
@@ -454,6 +466,9 @@ pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
     hello.set_onmessage(Some(intake.as_ref().unchecked_ref()));
     intake.forget();
     let _ = hello.post_message(&JsValue::from_str("ready"));
+    if !ready.is_empty() {
+        let _ = hello.post_message(&JsValue::from_str(&ready));
+    }
     Ok(())
 }
 

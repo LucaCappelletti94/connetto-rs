@@ -543,7 +543,7 @@ fn report_boot_failure(detail: &str) {
 
 /// The boot identity this worker was spawned with, from its own URL or from the global a
 /// generated bootstrap leaves behind.
-fn boot_identity_from_location() -> Option<String> {
+pub(super) fn boot_identity_from_location() -> Option<String> {
     let global = js_sys::global();
     if let Ok(scope) = global.clone().dyn_into::<web_sys::WorkerGlobalScope>()
         && let Ok(url) = web_sys::Url::new(&scope.location().href())
