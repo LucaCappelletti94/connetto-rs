@@ -110,7 +110,7 @@ async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, 
 /// keeps both, so its replica still opens under its own key.
 #[tokio::test]
 async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
 
@@ -157,11 +157,43 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
     );
 }
 
+/// The session guard leaves the persistent keyring where it found it. A real
+/// credential stored under the guard is linked into the persistent keyring, and
+/// once the guard drops it is gone again, so a passing or panicking keyring test
+/// frees its keys rather than leaking one per run against the per-user quota.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_session_guard_leaves_the_persistent_keyring_as_it_found_it() {
+    use connetto_client::KeyringStore;
+    use connetto_core::traits::RefreshTokenStore as _;
+
+    let service = format!("connetto-guard-{}", std::process::id());
+    assert!(
+        !connetto_test_harness::persistent_keyring_holds_service(&service),
+        "no key of this service exists before the guarded write"
+    );
+    {
+        let _keyring = connetto_test_harness::isolated_session_keyring();
+        let store = KeyringStore::new(&service);
+        store
+            .store("\"alice\"", "token")
+            .expect("store one account under the guard");
+        assert!(
+            connetto_test_harness::persistent_keyring_holds_service(&service),
+            "the credential is linked into the persistent keyring while the guard is held"
+        );
+    }
+    assert!(
+        !connetto_test_harness::persistent_keyring_holds_service(&service),
+        "the guard unlinked the credential, so the persistent keyring is back where it started"
+    );
+}
+
 /// The guard. A wipe with unsynced work and no force destroys nothing at all, so
 /// the queued writes can still be uploaded with the credential that is still live.
 #[tokio::test]
 async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
@@ -195,7 +227,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
 /// logout.
 #[tokio::test]
 async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
@@ -239,7 +271,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
 /// of the file alone, after which a fresh connect rebuilds.
 #[tokio::test]
 async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, _) = seed_replica(dir.path(), &keys, "alice").await;
@@ -289,7 +321,7 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
 /// never be uploaded, so a guard that ran afterwards would be protecting nothing.
 #[tokio::test]
 async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = MemoryKeyStore::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;

@@ -159,29 +159,95 @@ fn container_labels(role: &str) -> [(String, String); 2] {
     ]
 }
 
-/// Join a fresh anonymous session keyring for this thread and its descendants.
+/// Join a fresh anonymous session keyring for this thread and its descendants,
+/// and return a guard that unlinks on drop what the test wrote.
 ///
 /// The OS-keyring tests used to need an external `keyctl session` wrapper: a
 /// locked login collection wedged them silently, and parallel runs shared the
 /// caller's real session. `KEYCTL_JOIN_SESSION_KEYRING` scopes the join to the
 /// calling thread, and every thread or child process created afterwards
-/// inherits it, so calling this as the FIRST statement of a test covers the
+/// inherits it, so binding this as the FIRST statement of a test covers the
 /// tokio runtime the test macro builds, the blocking pool, and any spawned
 /// client binary, whose stored key the test can then read back. Each calling
 /// test gets its own fresh session, so keyring tests cannot see each other's
 /// entries whichever runner schedules them.
 ///
+/// The `keyring` crate links every key it stores into the user's persistent
+/// keyring, which outlives the process, so a test that stored one would leak a
+/// key per run against a per-user quota. The guard reads its own session on
+/// drop and unlinks each of those keys from the persistent keyring, so a
+/// passing or panicking test leaves the persistent keyring where it found it.
+///
 /// # Panics
 ///
-/// Panics when the Linux keyring API refuses the anonymous session join, which is a test setup failure.
+/// Panics when the Linux keyring API refuses the anonymous session join or the persistent-keyring attach, which is a test setup failure.
 #[cfg(target_os = "linux")]
-pub fn isolated_session_keyring() {
-    keyutils::Keyring::join_anonymous_session().expect("join a fresh anonymous session keyring");
+#[must_use = "the guard must be bound for the test body so its drop can clean up"]
+pub fn isolated_session_keyring() -> SessionKeyringGuard {
+    let mut session = keyutils::Keyring::join_anonymous_session()
+        .expect("join a fresh anonymous session keyring");
+    let persistent = session
+        .attach_persistent()
+        .expect("attach the persistent keyring so the guard can clean up");
+    SessionKeyringGuard {
+        session,
+        persistent,
+    }
+}
+
+/// Unlinks on drop the keyring entries a test wrote from the persistent keyring.
+#[cfg(target_os = "linux")]
+pub struct SessionKeyringGuard {
+    session: keyutils::Keyring,
+    persistent: keyutils::Keyring,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SessionKeyringGuard {
+    fn drop(&mut self) {
+        let Ok((keys, _)) = self.session.read() else {
+            return;
+        };
+        for key in &keys {
+            let _ = self.persistent.unlink_key(key);
+        }
+    }
+}
+
+/// Whether the persistent keyring holds a key this store's service owns.
+///
+/// The `keyring` crate names each key `keyring:{account}@{service}`, so a test
+/// proves the guard cleaned up by asking whether any key under its own service
+/// still hangs off the persistent keyring.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn persistent_keyring_holds_service(service: &str) -> bool {
+    let Ok(mut session) = keyutils::Keyring::attach(keyutils::SpecialKeyring::Session) else {
+        return false;
+    };
+    let Ok(persistent) = session.attach_persistent() else {
+        return false;
+    };
+    let Ok((keys, _)) = persistent.read() else {
+        return false;
+    };
+    let suffix = format!("@{service}");
+    keys.iter().any(|key| {
+        key.description()
+            .is_ok_and(|desc| desc.description.ends_with(&suffix))
+    })
 }
 
 /// On non-Linux targets the platform store needs no session isolation.
 #[cfg(not(target_os = "linux"))]
-pub fn isolated_session_keyring() {}
+#[must_use]
+pub fn isolated_session_keyring() -> SessionKeyringGuard {
+    SessionKeyringGuard
+}
+
+/// A no-op guard on targets whose platform store needs no session isolation.
+#[cfg(not(target_os = "linux"))]
+pub struct SessionKeyringGuard;
 
 /// Remove containers an earlier run abandoned, once per process.
 ///

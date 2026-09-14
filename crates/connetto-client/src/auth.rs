@@ -213,9 +213,15 @@ impl RefreshTokenStore for KeyringStore {
     /// credential, which costs an interactive login. The other order would leave
     /// a credential nothing can list, which is a secret the user cannot see or
     /// reach.
+    ///
+    /// Clearing the last account clears the index record rather than writing an
+    /// empty list, since an absent index reads as empty.
     fn clear(&self, account: &str) -> Result<(), ClientError> {
         self.keyring.clear(account)?;
         match indexed_without(&self.index()?, account) {
+            Some(updated) if updated.is_empty() => {
+                self.keyring.clear(crate::replica::ACCOUNTS_RECORD)
+            }
             Some(updated) => self.write_index(&updated),
             None => Ok(()),
         }
@@ -839,8 +845,10 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{MemoryKeyStore, indexed_with, indexed_without, provision_replica_key};
-    use connetto_core::traits::ReplicaKeyStore as _;
+    use super::{
+        KeyringStore, MemoryKeyStore, indexed_with, indexed_without, provision_replica_key,
+    };
+    use connetto_core::traits::{RefreshTokenStore as _, ReplicaKeyStore as _};
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()
@@ -908,6 +916,32 @@ mod tests {
             indexed_without(&names(&["\"bob\""]), crate::IDENTITY_RECORD),
             None,
             "and clearing the marker leaves the accounts alone"
+        );
+    }
+
+    /// R42 correction: the index the last account emptied is an absent record,
+    /// not one holding `[]`, so a store whose accounts are all gone leaves
+    /// nothing in the OS keyring under its own name.
+    ///
+    /// This reads the index back through the store's own keyring, which needs a
+    /// live secret store, so it stands beside the pure-logic
+    /// `the_account_index_drops_only_the_account_signed_out` above.
+    #[test]
+    fn clearing_the_last_account_removes_the_index_record() {
+        let _keyring = connetto_test_harness::isolated_session_keyring();
+        let service = format!("connetto-index-clear-{}", std::process::id());
+        let store = KeyringStore::new(&service);
+        store
+            .store("\"alice\"", "token")
+            .expect("store one account");
+        store.clear("\"alice\"").expect("clear the only account");
+        assert_eq!(
+            store
+                .keyring
+                .read(crate::replica::ACCOUNTS_RECORD)
+                .expect("read the index record"),
+            None,
+            "the last account's departure removes the index record rather than leaving it holding []",
         );
     }
 

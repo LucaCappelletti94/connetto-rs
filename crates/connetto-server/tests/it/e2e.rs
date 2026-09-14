@@ -576,7 +576,7 @@ async fn mint_refresh_token(auth_base: &str) -> String {
 
 #[tokio::test]
 async fn e2e_two_clients_snapshot_live_and_reconnect() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -678,7 +678,7 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
 
 #[tokio::test]
 async fn e2e_client_write_lands_in_pg_and_fans_out() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -773,7 +773,7 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
 
 #[tokio::test]
 async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -913,7 +913,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 /// proven in `fanout_counters.rs`.
 #[tokio::test]
 async fn e2e_unrestricted_table_delivers_without_policy() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -1017,7 +1017,7 @@ async fn run_server_exit_output(
 
 #[tokio::test]
 async fn e2e_startup_refuses_without_a_reader_role() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1049,7 +1049,7 @@ async fn e2e_startup_refuses_without_a_reader_role() {
 
 #[tokio::test]
 async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1096,7 +1096,7 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
 /// did nothing, which is the failure this pins.
 #[tokio::test]
 async fn e2e_startup_refuses_audit_without_auth() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1122,7 +1122,7 @@ async fn e2e_startup_refuses_audit_without_auth() {
 /// setting the binary reads.
 #[tokio::test]
 async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1150,7 +1150,7 @@ async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
 
 #[tokio::test]
 async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1187,7 +1187,7 @@ async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
 
 #[tokio::test]
 async fn e2e_startup_refuses_without_an_auth_store() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
@@ -1217,7 +1217,7 @@ async fn e2e_startup_refuses_without_an_auth_store() {
 /// belongs to no session carries no stand-in for one.
 #[tokio::test]
 async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(
         client_bin().exists(),
         "client binary missing at {}: build it with the same profile, \
@@ -1333,7 +1333,7 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
 /// and the table together, through a process nobody handed a collector to.
 #[tokio::test]
 async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
-    connetto_test_harness::isolated_session_keyring();
+    let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire().await;
