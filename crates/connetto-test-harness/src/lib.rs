@@ -180,13 +180,15 @@ fn container_labels(role: &str) -> [(String, String); 2] {
 ///
 /// # Panics
 ///
-/// Panics when the Linux keyring API refuses the anonymous session join, which is a test setup failure.
+/// Panics when the Linux keyring API refuses the anonymous session join or the persistent-keyring attach, which is a test setup failure.
 #[cfg(target_os = "linux")]
 #[must_use = "the guard must be bound for the test body so its drop can clean up"]
 pub fn isolated_session_keyring() -> SessionKeyringGuard {
     let mut session = keyutils::Keyring::join_anonymous_session()
         .expect("join a fresh anonymous session keyring");
-    let persistent = session.attach_persistent().ok();
+    let persistent = session
+        .attach_persistent()
+        .expect("attach the persistent keyring so the guard can clean up");
     SessionKeyringGuard {
         session,
         persistent,
@@ -197,20 +199,17 @@ pub fn isolated_session_keyring() -> SessionKeyringGuard {
 #[cfg(target_os = "linux")]
 pub struct SessionKeyringGuard {
     session: keyutils::Keyring,
-    persistent: Option<keyutils::Keyring>,
+    persistent: keyutils::Keyring,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for SessionKeyringGuard {
     fn drop(&mut self) {
-        let Some(persistent) = self.persistent.as_mut() else {
-            return;
-        };
         let Ok((keys, _)) = self.session.read() else {
             return;
         };
         for key in &keys {
-            let _ = persistent.unlink_key(key);
+            let _ = self.persistent.unlink_key(key);
         }
     }
 }
