@@ -377,10 +377,17 @@ pub fn spawn_db_worker(
 /// from here rather than from inside the worker.
 ///
 /// This listens rather than assigning `onerror`, because a caller installs its own handler and
-/// the last assignment would win.
+/// the last assignment would win, and it reports only until the boot is over: a worker that has
+/// reported ready booted, and an exception it throws hours later is not a boot failure for the
+/// tab that asks next.
 fn report_worker_errors(worker: &Worker, identity: &BootIdentity) {
     let message = format!("failed:{identity}:");
+    let pending = Rc::new(std::cell::Cell::new(true));
+    watch_boot_outcome(identity, &pending);
     let handler = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        if !pending.replace(false) {
+            return;
+        }
         if let Ok(hello) = web_sys::BroadcastChannel::new(super::HELLO_CHANNEL) {
             // A module that fails to fetch fires a plain event, so the message may be absent.
             let detail = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
@@ -394,6 +401,27 @@ fn report_worker_errors(worker: &Worker, identity: &BootIdentity) {
     });
     let _ = worker.add_event_listener_with_callback("error", handler.as_ref().unchecked_ref());
     handler.forget();
+}
+
+/// Clears `pending` once this boot has reported its readiness or its failure.
+fn watch_boot_outcome(identity: &BootIdentity, pending: &Rc<std::cell::Cell<bool>>) {
+    let Ok(hello) = web_sys::BroadcastChannel::new(super::HELLO_CHANNEL) else {
+        return;
+    };
+    let readiness = format!("ready:{identity}");
+    let failure = format!("failed:{identity}:");
+    let pending = Rc::clone(pending);
+    let watcher =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            let Some(heard) = event.data().as_string() else {
+                return;
+            };
+            if heard == readiness || heard.starts_with(failure.as_str()) {
+                pending.set(false);
+            }
+        });
+    hello.set_onmessage(Some(watcher.as_ref().unchecked_ref()));
+    watcher.forget();
 }
 
 /// The URL a worker is spawned from, carrying the boot identity as a query parameter.

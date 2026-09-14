@@ -569,6 +569,48 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     drop(announcer);
 }
 
+/// A worker that has reported ready booted, so an exception it throws afterwards is not posted
+/// as its boot's failure to whoever asks next.
+#[wasm_bindgen_test]
+async fn a_ready_boot_stops_reporting_worker_errors() {
+    let parts = js_sys::Array::of1(&JsValue::from_str("// nothing to boot\n"));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .expect("the empty module blob");
+    let module_url = web_sys::Url::create_object_url_with_blob(&blob).expect("the module URL");
+    let (worker, identity) =
+        super::boot::spawn_db_worker(&module_url, &super::boot::WorkerBootstrap::Glue)
+            .expect("spawning the worker must succeed");
+
+    // What the worker posts once it is serving.
+    if let Ok(sender) = BroadcastChannel::new(HELLO_CHANNEL) {
+        let _ = sender.post_message(&JsValue::from_str(&format!("ready:{identity}")));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+
+    // The exception arrives while a later tab is waiting, which is the ordering that matters.
+    spawn_local({
+        let worker = worker.clone();
+        async move {
+            crate::workers::sleep(core::time::Duration::from_millis(150)).await;
+            let event = web_sys::ErrorEvent::new("error").expect("the error event");
+            let _ = worker.dispatch_event(&event);
+        }
+    });
+
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[identity], 600.0)
+            .await
+            .expect_err("nothing answers this wait");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "a booted worker's later error must not read as a boot failure, got {error:?}"
+    );
+    worker.terminate();
+    let _ = web_sys::Url::revoke_object_url(&module_url);
+}
+
 /// A readiness that names another boot does not spend this one, because readiness carries no
 /// identity for the waiters and an outgoing worker can answer after its replacement is announced.
 #[wasm_bindgen_test]

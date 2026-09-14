@@ -39,7 +39,7 @@ Every stage of a boot has a reporter, because a stage that reports nothing is a 
 
 | When the boot fails | Who reports it | How it names the boot |
 |---|---|---|
-| the module cannot be fetched, or throws while initializing | the spawning context, from the worker's `error` event | the identity it minted |
+| the module cannot be fetched, or throws while initializing | the spawning context, from the worker's `error` event, until that boot reports ready or fails | the identity it minted |
 | the generated bootstrap's import or init throws | the blob module's `catch` | the identity compiled into it |
 | a deployment's own bootstrap script fails before Rust runs | that script's `catch` | the `boot` parameter it was spawned with, staying silent without one |
 | `boot_db_worker` returns an error | the worker itself | the `boot` parameter on its URL, or the `connettoBoot` global a blob bootstrap left |
