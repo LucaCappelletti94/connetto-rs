@@ -14,7 +14,7 @@ use connetto_core::messages::{
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpReply};
+use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpFailure, HttpReply};
 use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
 
@@ -236,7 +236,7 @@ impl ContentHttp for RecordingHttp {
         &self,
         url: &str,
         json: Option<Vec<u8>>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         ready(Ok(self.answer("POST", url, json.unwrap_or_default())))
     }
 
@@ -244,7 +244,7 @@ impl ContentHttp for RecordingHttp {
         &self,
         url: &str,
         body: Vec<u8>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         ready(Ok(self.answer("PUT", url, body)))
     }
 
@@ -252,7 +252,7 @@ impl ContentHttp for RecordingHttp {
         &self,
         url: &str,
         _range: Option<(u64, u64)>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         ready(Ok(self.answer("GET", url, Vec::new())))
     }
 }

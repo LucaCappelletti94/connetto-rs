@@ -29,7 +29,8 @@ pub enum BrowserContentError {
 /// A content client using the browser worker's storage and transport.
 pub type BrowserContentClient<T> = ContentClient<T, BrowserStore, BrowserHttp>;
 
-/// Attaches worker-owned browser content.
+/// Attaches worker-owned browser content whose transfers run under `http`,
+/// which carries the idle bound this device aborts a silent transfer after.
 ///
 /// # Errors
 ///
@@ -38,6 +39,7 @@ pub async fn attach_browser_content<T>(
     client: ConnettoClient<T>,
     namespace: impl Into<String>,
     root_key: [u8; 32],
+    http: BrowserHttp,
 ) -> Result<BrowserContentClient<T>, BrowserContentError>
 where
     T: Transport + MaybeSend + 'static,
@@ -47,7 +49,7 @@ where
         .dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
         .map_err(|_value: js_sys::Object| BrowserContentError::NotWorker)?;
     let store = BrowserStore::install(&worker, namespace).await?;
-    ContentClient::attach(client, store, root_key, BrowserHttp::new())
+    ContentClient::attach(client, store, root_key, http)
         .await
         .map_err(Into::into)
 }

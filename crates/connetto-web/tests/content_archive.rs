@@ -15,7 +15,7 @@ use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_file_client::{BrowserStore, ContentArchive};
+use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::relay::HubReconnect;
 use connetto_web::workers::{
@@ -38,7 +38,7 @@ use web_sys::{DedicatedWorkerGlobalScope, File};
 mod support;
 
 use support::{
-    fetch_bytes, install_blocked_content_fetch, install_content_fetch, timeout_ms, until,
+    fetch_bytes, install_blocked_content_transport, install_content_transport, timeout_ms, until,
 };
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -216,7 +216,7 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
     );
 
     let uploaded = Rc::new(RefCell::new(Vec::new()));
-    let fetch = install_content_fetch(&uploaded);
+    let transport = install_content_transport(&uploaded);
     assert_eq!(
         replacement
             .flush_outbox()
@@ -224,7 +224,7 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
             .expect("upload restored photo"),
         1
     );
-    drop(fetch);
+    drop(transport);
     assert_eq!(uploads_of(&uploaded, PHOTO), 1);
     serial.release();
 }
@@ -245,13 +245,13 @@ async fn a_relay_import_drives_the_worker_outbox() {
         .expect("install content store");
     let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [3; 32]));
     let uploaded = Rc::new(RefCell::new(Vec::new()));
-    let fetch = install_content_fetch(&uploaded);
+    let transport = install_content_transport(&uploaded);
     hub.import_local_data(archive).await.expect("relay import");
     assert!(
         until(async || uploads_of(&uploaded, RELAY_PHOTO) > 0).await,
         "the relay import must upload the restored photo"
     );
-    drop(fetch);
+    drop(transport);
     assert_eq!(uploads_of(&uploaded, RELAY_PHOTO), 1);
     serial.release();
 }
@@ -271,15 +271,15 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
         .expect("install content store");
     let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [4; 32]));
     let uploaded = Rc::new(RefCell::new(Vec::new()));
-    let fetch = install_blocked_content_fetch(&uploaded);
+    let transfer = install_blocked_content_transport(&uploaded);
     hub.import_local_data(archive).await.expect("relay import");
     assert!(
-        until(async || fetch.started.get()).await,
+        until(async || transfer.started.get()).await,
         "the content transfer must start"
     );
 
     let answer = select(Box::pin(hub.unsynced()), Box::pin(timeout_ms(1_000))).await;
-    fetch.release();
+    transfer.release();
     let pending = match answer {
         Either::Left((answer, _)) => answer.expect("pending-work reply"),
         Either::Right(_) => panic!("the hub did not service local work during content transfer"),
@@ -305,9 +305,14 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
 }
 
 async fn stage_source(photo: &'static [u8]) -> (Vec<u8>, FileId) {
-    let source = attach_browser_content(offline_client(), "r68-archive-source", [1; 32])
-        .await
-        .expect("attach source content");
+    let source = attach_browser_content(
+        offline_client(),
+        "r68-archive-source",
+        [1; 32],
+        BrowserHttp::new(),
+    )
+    .await
+    .expect("attach source content");
     let (file_id, ()) = source
         .stage(photo, MimeClass::Jpeg, |connection, file_id| {
             diesel::insert_into(photos::table)
@@ -398,9 +403,14 @@ fn start_recovering_relay(
         policy: ReconnectPolicy::new().with_max_attempts(Some(1)),
         upstream: Vec::new(),
     };
-    let (hub, pump, _notices) =
-        RelayHub::with_reconnect_and_content(worker, ":memory:", reconnect, content)
-            .expect("content relay");
+    let (hub, pump, _notices) = RelayHub::with_reconnect_and_content(
+        worker,
+        ":memory:",
+        reconnect,
+        content,
+        BrowserHttp::new(),
+    )
+    .expect("content relay");
     spawn_local(async move {
         pump.await.expect("content relay pump");
     });
@@ -416,9 +426,14 @@ async fn wait_for_reconnect(completed_subscribes: &Cell<u32>) {
 
 async fn restore_target(archive: &[u8]) -> Rc<BrowserContentClient<TicketTransport>> {
     let replacement = Rc::new(
-        attach_browser_content(connected_client().await, "r68-archive-replacement", [2; 32])
-            .await
-            .expect("attach replacement content"),
+        attach_browser_content(
+            connected_client().await,
+            "r68-archive-replacement",
+            [2; 32],
+            BrowserHttp::new(),
+        )
+        .await
+        .expect("attach replacement content"),
     );
     let plan = replacement
         .prepare_local_data_import(archive)
