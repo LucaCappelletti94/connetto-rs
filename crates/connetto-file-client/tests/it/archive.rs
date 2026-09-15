@@ -7,7 +7,7 @@ use connetto_file_client::{
 };
 use connetto_file_core::{ChunkHash, ChunkStore, FileId, MimeClass};
 use core::fmt::Write as FmtWrite;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -552,6 +552,151 @@ async fn refused_import_leaves_chunk_store_empty() {
         !store.has_chunk(&hash_b).await.expect("probe chunk b"),
         "chunk b must not be in the store after a refused import"
     );
+}
+
+/// A source whose bytes change between the two passes is refused, and the
+/// store keeps nothing the second pass read.
+///
+/// The first pass proves the bytes it read and not the bytes the second pass
+/// gets, because a file on disk can be rewritten in between. Two guards stand
+/// between that and a stored chunk, the entry checksum the reader took when
+/// the archive was opened and the hash the writing pass recomputes, and
+/// either refusal is the same answer to the caller.
+#[tokio::test]
+async fn a_source_that_changes_between_the_passes_is_refused() {
+    const CHUNK: &[u8] = b"a chunk that will be rewritten under the importer";
+    const REWRITTEN: &[u8] = b"a chunk that was rewritten under the importer !!!";
+    let dir = tempdir().expect("temp dir");
+    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let content = attach_content(
+        client.clone(),
+        &dir.path().join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+
+    let hash = ChunkHash::from_data(CHUNK);
+    let file_id = FileId::from_chunks([CHUNK]);
+    let index = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "files": [{
+            "file_id": file_id.to_string(),
+            "chunks": [{"hash": hash.to_string(), "len": CHUNK.len()}],
+        }],
+    }))
+    .expect("encode test index");
+    let index_len = u64::try_from(index.len()).expect("index len fits u64");
+    let chunk_len = u64::try_from(CHUNK.len()).expect("chunk len fits u64");
+    let entries = |body: &[u8]| {
+        vec![
+            (
+                ArchiveAttachment::new("content/manifests.json", index_len).expect("index decl"),
+                index.clone(),
+            ),
+            (
+                ArchiveAttachment::new(format!("content/chunks/{hash}"), chunk_len)
+                    .expect("chunk decl"),
+                body.to_vec(),
+            ),
+        ]
+    };
+
+    // The replacement is a whole archive of its own, so its checksums and
+    // lengths agree with its bytes and only the chunk hash gives it away.
+    let archive = raw_archive(&client, entries(CHUNK)).await;
+    let rewritten = raw_archive(&client, entries(REWRITTEN)).await;
+    let (source, rewrite) = SwappingSource::new(archive, rewritten);
+
+    let mut plan = content
+        .prepare_local_data_import(source)
+        .await
+        .expect("the archive as first read validates");
+    rewrite.store(true, Ordering::Relaxed);
+    let error = content
+        .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+        .await
+        .expect_err("bytes that changed under the importer must be refused");
+    assert!(
+        matches!(error, ContentError::Client(_) | ContentError::Archive(_)),
+        "a changed source is refused as the archive it no longer is: {error}"
+    );
+
+    let store = FsStore::new(dir.path().join("chunks"));
+    assert!(
+        !store.has_chunk(&hash).await.expect("probe the chunk"),
+        "no chunk may be stored under a name its bytes do not hash to"
+    );
+}
+
+/// A seekable source that serves one archive, then the other once its flag is
+/// set.
+///
+/// The stand-in for a file rewritten between the validating pass and the
+/// writing one.
+struct SwappingSource {
+    first: Vec<u8>,
+    second: Vec<u8>,
+    pos: usize,
+    rewritten: Arc<AtomicBool>,
+}
+
+impl SwappingSource {
+    fn new(first: Vec<u8>, second: Vec<u8>) -> (Self, Arc<AtomicBool>) {
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "the replacement keeps the archive's length"
+        );
+        let rewritten = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                first,
+                second,
+                pos: 0,
+                rewritten: Arc::clone(&rewritten),
+            },
+            rewritten,
+        )
+    }
+
+    fn current(&self) -> &[u8] {
+        if self.rewritten.load(Ordering::Relaxed) {
+            &self.second
+        } else {
+            &self.first
+        }
+    }
+}
+
+impl std::io::Read for SwappingSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let taken = {
+            let rest = &self.current()[self.pos.min(self.current().len())..];
+            let taken = rest.len().min(buf.len());
+            buf[..taken].copy_from_slice(&rest[..taken]);
+            taken
+        };
+        self.pos += taken;
+        Ok(taken)
+    }
+}
+
+impl std::io::Seek for SwappingSource {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let len = i64::try_from(self.current().len()).expect("the archive length fits i64");
+        let pos = i64::try_from(self.pos).expect("the position fits i64");
+        let target = match from {
+            std::io::SeekFrom::Start(offset) => i64::try_from(offset).expect("the offset fits i64"),
+            std::io::SeekFrom::End(offset) => len + offset,
+            std::io::SeekFrom::Current(offset) => pos + offset,
+        };
+        if target < 0 {
+            return Err(std::io::Error::other("a seek before the archive"));
+        }
+
+        self.pos = usize::try_from(target).expect("the target fits usize");
+        Ok(target.unsigned_abs())
+    }
 }
 
 /// A sink that reports how many bytes the archive has taken so far.

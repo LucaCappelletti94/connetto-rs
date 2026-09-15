@@ -55,7 +55,10 @@ impl<W: Write> LocalDataExport<W> {
     /// [`ClientError::Export`] when `path` was not declared, was already
     /// written, or `bytes` is not the length its declaration named.
     pub fn write_attachment(&mut self, path: &str, bytes: &[u8]) -> Result<(), ClientError> {
-        let declared = self.owed.remove(path).ok_or_else(|| {
+        // The declaration stays owed until the body is in the archive, so a
+        // refused write leaves an export that can be retried and a finish
+        // that still refuses the entry nothing wrote.
+        let declared = *self.owed.get(path).ok_or_else(|| {
             ClientError::Export(format!(
                 "the archive declares no unwritten attachment at {path}"
             ))
@@ -71,7 +74,9 @@ impl<W: Write> LocalDataExport<W> {
             )));
         }
         self.zip.start_file(path, stored()).map_err(zip_error)?;
-        self.zip.write_all(bytes).map_err(zip_error)
+        self.zip.write_all(bytes).map_err(zip_error)?;
+        self.owed.remove(path);
+        Ok(())
     }
 
     /// Closes the archive and returns the sink.
@@ -206,4 +211,64 @@ pub(super) fn encode_pending(records: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(record);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::{Archive, ArchiveAttachment, ExportScope};
+
+    fn export_of(declaration: &ArchiveAttachment) -> super::LocalDataExport<Vec<u8>> {
+        super::start(
+            Vec::new(),
+            &Archive {
+                scope: ExportScope::Unsynced,
+                fingerprint: "abc123".to_owned(),
+                account: None,
+                synced_rows: None,
+                local_rows: None,
+                pending: Vec::new(),
+                attachments: std::slice::from_ref(declaration),
+            },
+        )
+        .expect("start")
+    }
+
+    /// A body of the wrong length is refused and the entry stays owed, so the
+    /// same export takes the right bytes afterwards.
+    ///
+    /// The manifest already names the entry, so an export that forgot it and
+    /// closed anyway would write an archive no reader accepts.
+    #[test]
+    fn a_refused_body_leaves_the_attachment_owed() {
+        let declaration =
+            ArchiveAttachment::new("content/chunks/one", 5).expect("attachment declaration");
+        let mut export = export_of(&declaration);
+        let error = export
+            .write_attachment("content/chunks/one", b"six!!!")
+            .expect_err("a body of the wrong length is refused");
+        assert!(
+            error.to_string().contains("declares 5 bytes and carries 6"),
+            "the refusal names both lengths: {error}"
+        );
+
+        export
+            .write_attachment("content/chunks/one", b"bytes")
+            .expect("the same entry takes the right body");
+        export.finish().expect("finish");
+    }
+
+    /// An export that never writes a declared attachment is refused rather
+    /// than closing an archive whose manifest names an absent entry.
+    #[test]
+    fn an_unwritten_attachment_refuses_the_finish() {
+        let declaration =
+            ArchiveAttachment::new("content/chunks/one", 5).expect("attachment declaration");
+        let error = export_of(&declaration)
+            .finish()
+            .expect_err("an unwritten declaration is refused");
+        assert!(
+            error.to_string().contains("content/chunks/one"),
+            "the refusal names the entry: {error}"
+        );
+    }
 }

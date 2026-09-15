@@ -50,6 +50,13 @@ pub(crate) fn prepare_content_import<T: Transport, R: Read + Seek>(
 
 /// Reads each distinct chunk from the archive and writes it to the store,
 /// one chunk at a time with one reused buffer.
+///
+/// The hash is checked again here, because the source is the caller's and
+/// nothing stops a file on disk from being rewritten between the two passes.
+/// The entry checksum the reader took when the archive was opened catches an
+/// ordinary rewrite, and this catches one that keeps the checksum, because a
+/// chunk stored under a name its bytes do not hash to is content the device
+/// can never resolve.
 pub(crate) async fn write_import_chunks<B, R>(
     store: &B,
     root_key: &[u8; 32],
@@ -70,6 +77,12 @@ where
     for hash in chunks {
         let chunk_path = format!("{CHUNK_PREFIX}{hash}");
         replica.read_attachment(&chunk_path, &mut buf)?;
+        let actual = ChunkHash::from_data(&buf);
+        if actual != *hash {
+            return Err(ContentError::Archive(format!(
+                "content chunk {hash} reads back as {actual}"
+            )));
+        }
         enc_store
             .write_chunk(hash, &buf)
             .await
