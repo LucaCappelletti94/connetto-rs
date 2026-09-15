@@ -4505,7 +4505,8 @@ mod tests {
 
         let (tx, mut rx) = unbounded_channel();
         tx.send(HubEvent::Kill(9)).expect("queue an event");
-        let transfer = async { Err::<(), ContentError>(ContentError::Transport("done".to_owned())) };
+        let transfer =
+            async { Err::<(), ContentError>(ContentError::Transport("done".to_owned())) };
         tokio::pin!(transfer);
         let step = transfer_step(&mut transfer, &mut rx, true).await;
         assert!(
