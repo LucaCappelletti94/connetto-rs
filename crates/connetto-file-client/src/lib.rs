@@ -20,7 +20,7 @@ pub use browser_store::{BrowserStore, BrowserStoreError};
 
 pub use client::{ContentClient, ContentEvent};
 pub use connetto_file_core::{ChunkHash, FileId};
-pub use error::ContentError;
+pub use error::{AttemptOutcome, ContentError};
 pub use import::ContentImportPlan;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

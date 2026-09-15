@@ -13,7 +13,7 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
 use crate::db;
-use crate::error::ContentError;
+use crate::error::{AttemptOutcome, ContentError};
 use crate::http::ContentHttp;
 use crate::import::{apply_content_import, prepare_content_import, write_import_chunks};
 use crate::{ticket, upload};
@@ -648,15 +648,22 @@ where
         result: Result<(), ContentError>,
     ) -> Result<ContentFlush, ContentError> {
         match result {
-            Err(error) if error.is_retryable() => Ok(ContentFlush::Deferred),
             Ok(()) => {
                 db::dequeue(connection.conn(), file_id)?;
                 Ok(ContentFlush::Progressed)
             }
-            Err(error) => {
-                db::refuse(connection.conn(), file_id, &error.to_string())?;
-                Ok(ContentFlush::Progressed)
-            }
+            Err(error) => match error.outcome() {
+                AttemptOutcome::Retry => Ok(ContentFlush::Deferred),
+                AttemptOutcome::Refused => {
+                    db::refuse(connection.conn(), file_id, &error.to_string())?;
+                    Ok(ContentFlush::Progressed)
+                }
+                // A device loss retires the entry the way the integrity scan does.
+                AttemptOutcome::Lost => {
+                    retire(connection.conn(), file_id)?;
+                    Ok(ContentFlush::Progressed)
+                }
+            },
         }
     }
 
@@ -1416,6 +1423,66 @@ mod tests {
                 .expect("read the outbox")
                 .is_empty(),
             "a retired entry leaves the outbox"
+        );
+    }
+
+    /// A missing manifest is a device loss, so the upload walk retires the entry
+    /// into the retired record exactly as the integrity scan does for the same fact.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_missing_manifest_is_a_loss_on_the_walk_and_the_scan() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("missing-manifest"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let walked = file(0x5A);
+        db::enqueue(connection.conn(), walked).expect("queue the walked file");
+        super::ContentArchive::<crate::store::FsStore>::finish_attempt(
+            &mut connection,
+            walked,
+            Err(crate::error::ContentError::NoManifest { file_id: walked }),
+        )
+        .expect("finish_attempt runs");
+        assert!(
+            db::outbox(connection.conn())
+                .expect("read the outbox")
+                .is_empty(),
+            "a lost file leaves the outbox"
+        );
+        assert!(
+            db::refusals(connection.conn())
+                .expect("read refusals")
+                .is_empty(),
+            "a loss is not a refusal"
+        );
+
+        let scanned = file(0x5B);
+        db::enqueue(connection.conn(), scanned).expect("queue the scanned file");
+        let step = archive
+            .scan_unsent_file(&mut connection, scanned, super::ChunkScan::default(), 8)
+            .await
+            .expect("the scan runs");
+        assert!(
+            matches!(step, super::ScanStep::Retired),
+            "the scan retires the same fact, got {step:?}"
+        );
+
+        assert_eq!(
+            db::retired(connection.conn()).expect("read retired"),
+            vec![walked, scanned],
+            "both passes retire the file with the missing manifest"
         );
     }
 

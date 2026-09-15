@@ -96,6 +96,14 @@ impl<S: ChunkStore> EncryptingStore<S> {
 impl<S: ChunkStore + Sync> ChunkStore for EncryptingStore<S> {
     type Error = EncryptStoreError<S::Error>;
 
+    /// An unavailable inner store stays ambiguous, while a crypto or format failure is definite.
+    fn read_failure_is_ambiguous(&self, error: &Self::Error) -> bool {
+        match error {
+            EncryptStoreError::Inner(inner) => self.inner.read_failure_is_ambiguous(inner),
+            _ => false,
+        }
+    }
+
     async fn write_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<(), Self::Error> {
         let stored = encrypt_chunk(hash, data, &self.key, self.skip_compression)?;
         self.inner
