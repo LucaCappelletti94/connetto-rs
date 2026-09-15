@@ -66,12 +66,13 @@ async fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// Drains a chunked body, taking `step` bytes at a time and pausing `pause`
-/// between reads, and answers how many payload bytes arrived.
+/// between reads, and answers how many payload bytes arrived, or nothing when
+/// what arrived is not a whole body.
 ///
 /// Both parameters are what a test sets its link rate with. A pause inside the
 /// bound keeps the pulls coming, and a step that leaves the socket buffers
 /// drainable in a few reads keeps the buffered tail inside the bound as well.
-async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> usize {
+async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> Option<usize> {
     let mut buffer = vec![0_u8; step];
     let mut body = Vec::new();
     while !body.ends_with(b"0\r\n\r\n") {
@@ -85,27 +86,25 @@ async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> usi
     chunked_payload(&body)
 }
 
-/// How many payload bytes a chunked body carries, framing removed, so a
-/// transport that dropped payload cannot pass for one that sent it.
-fn chunked_payload(body: &[u8]) -> usize {
+/// How many payload bytes a whole chunked body carries, framing removed, and
+/// nothing when a chunk, its delimiter or the terminator is missing, so a
+/// transfer that lost bytes cannot pass for one that sent them.
+fn chunked_payload(body: &[u8]) -> Option<usize> {
     let mut rest = body;
-    let mut payload = 0;
-    while let Some(line) = rest.windows(2).position(|pair| pair == b"\r\n") {
-        let size = core::str::from_utf8(&rest[..line])
-            .ok()
-            .and_then(|size| usize::from_str_radix(size, 16).ok())
-            .unwrap_or(0);
+    let mut payload = 0_usize;
+    loop {
+        let line = rest.windows(2).position(|pair| pair == b"\r\n")?;
+        let size = usize::from_str_radix(core::str::from_utf8(&rest[..line]).ok()?, 16).ok()?;
+        rest = rest.get(line.saturating_add(2)..)?;
         if size == 0 {
-            break;
+            return rest.starts_with(b"\r\n").then_some(payload);
         }
-        payload += size;
-        let next = line.saturating_add(4).saturating_add(size);
-        if next >= rest.len() {
-            break;
+        if rest.get(size..size.saturating_add(2))? != b"\r\n" {
+            return None;
         }
-        rest = &rest[next..];
+        payload = payload.saturating_add(size);
+        rest = rest.get(size.saturating_add(2)..)?;
     }
-    payload
 }
 
 /// Answers one request head with `reply`, once the request has fully arrived.
@@ -115,7 +114,7 @@ async fn write_reply(stream: &mut TcpStream, reply: &str) {
 }
 
 /// A server that reads a request at the trickle rate and then answers it.
-fn trickling_server(listener: TcpListener) -> JoinHandle<usize> {
+fn trickling_server(listener: TcpListener) -> JoinHandle<Option<usize>> {
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
@@ -208,7 +207,7 @@ async fn a_trickling_upload_is_never_aborted() {
     );
     assert_eq!(
         server.await.expect("server"),
-        TRICKLED,
+        Some(TRICKLED),
         "every payload byte arrived, framing aside"
     );
 }
