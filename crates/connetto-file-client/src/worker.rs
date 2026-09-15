@@ -630,13 +630,13 @@ where
 
     /// Finishes local bookkeeping for an HTTP transfer.
     ///
-    /// A loss is confirmed by reading the named chunk again, since a concurrent import can
-    /// restore it during the transfer, and reading only that chunk keeps a large lost file
-    /// from holding the worker while every other chunk is decrypted.
+    /// A loss is confirmed against the current manifest, since a concurrent import can
+    /// replace it or restore its bytes during the transfer, and only the one chunk that
+    /// manifest still names is read, so a large lost file never holds the worker.
     ///
     /// # Errors
     ///
-    /// [`ContentError::Replica`] when the outbox entry cannot be removed.
+    /// [`ContentError::Replica`] when the manifest cannot be read or the entry removed.
     pub async fn finish_upload<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
@@ -645,7 +645,10 @@ where
     ) -> Result<ContentFlush, ContentError> {
         match &result {
             Err(error) if error.outcome() == AttemptOutcome::Lost => {
-                if self.loss_is_confirmed(error).await {
+                if self
+                    .loss_is_confirmed(connection, upload.file_id, error)
+                    .await?
+                {
                     retire(connection.conn(), upload.file_id)?;
                     Ok(ContentFlush::Progressed)
                 } else {
@@ -656,16 +659,30 @@ where
         }
     }
 
-    /// Whether the reported loss still holds after reading the named chunk once more.
-    async fn loss_is_confirmed(&self, error: &ContentError) -> bool {
-        let ContentError::LostChunk { hash, .. } = error else {
-            return true;
+    /// Whether the reported loss still holds against the manifest this device holds now.
+    ///
+    /// A manifest an import replaced under the same identity can name other chunks, so a
+    /// reported chunk the current manifest no longer names is stale and keeps the entry.
+    async fn loss_is_confirmed<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+        error: &ContentError,
+    ) -> Result<bool, ContentError> {
+        let Some(manifest) = db::load_manifest(connection.conn(), file_id)? else {
+            return Ok(true);
         };
+        let ContentError::LostChunk { hash, .. } = error else {
+            return Ok(false);
+        };
+        if !manifest.chunks().iter().any(|chunk| chunk.hash == *hash) {
+            return Ok(false);
+        }
         let store = EncryptingStore::new(self.store.clone(), &self.root_key);
-        match store.read_chunk(hash).await {
+        Ok(match store.read_chunk(hash).await {
             Ok(_) => false,
             Err(err) => !store.read_failure_is_ambiguous(&err),
-        }
+        })
     }
 
     fn finish_attempt<T: Transport>(
@@ -1714,6 +1731,99 @@ mod tests {
             reads.load(Ordering::Relaxed),
             1,
             "confirming the loss reads only the one named chunk"
+        );
+    }
+
+    /// A manifest an import replaced under the same identity keeps the entry, because the
+    /// chunk the transfer reported lost is no longer the file this device holds.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn finish_upload_keeps_a_file_whose_manifest_was_replaced() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{
+            ChunkHash, ChunkMeta, ChunkStore, EncryptingStore, Manifest, MimeClass, process_file,
+        };
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("replaced-manifest"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store.clone(), &[1; 32]);
+        let original = process_file(&vec![7u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("chunk the file");
+        let file_id = original.file_id();
+        let lost_hash = original.chunks()[0].hash;
+        // The chunk the transfer named is gone from the store.
+        encrypted
+            .delete_chunk(&lost_hash)
+            .await
+            .expect("drop the reported chunk");
+
+        // An import replaced the manifest under the same identity with different chunking,
+        // and its bytes are present.
+        let replacement_bytes = b"the same file chunked another way".to_vec();
+        let replacement_hash = ChunkHash::from_bytes([0xBB; 32]);
+        assert_ne!(
+            replacement_hash, lost_hash,
+            "the replacement names another chunk"
+        );
+        encrypted
+            .write_chunk(&replacement_hash, &replacement_bytes)
+            .await
+            .expect("store the replacement chunk");
+        let replacement = Manifest::new(
+            file_id,
+            vec![ChunkMeta {
+                hash: replacement_hash,
+                len: u64::try_from(replacement_bytes.len()).expect("length fits u64"),
+            }],
+        );
+        db::put_manifest(connection.conn(), &replacement).expect("record the replacement manifest");
+        db::enqueue(connection.conn(), file_id).expect("queue the file");
+
+        let upload = super::ContentUpload {
+            file_id,
+            upload_url: String::new(),
+            manifest: original.clone(),
+            store: store.clone(),
+            root_key: [1; 32],
+        };
+        let error = crate::error::ContentError::LostChunk {
+            file_id,
+            hash: lost_hash,
+            detail: "chunk gone".to_owned(),
+        };
+
+        let flush = archive
+            .finish_upload(&mut connection, &upload, Err(error))
+            .await
+            .expect("finish_upload runs");
+        assert_eq!(
+            flush,
+            super::ContentFlush::Deferred,
+            "a replaced manifest that no longer names the reported chunk keeps the entry"
+        );
+        assert!(
+            db::retired(connection.conn())
+                .expect("read retired")
+                .is_empty(),
+            "the replacement is not retired"
+        );
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read the outbox"),
+            vec![file_id],
+            "the entry stays queued for another walk"
         );
     }
 
