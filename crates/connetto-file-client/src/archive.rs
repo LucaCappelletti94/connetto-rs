@@ -1,15 +1,16 @@
 //! Plaintext content attachments in the device archive.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek};
 
-use connetto_client::ArchiveAttachment;
+use connetto_client::{ArchiveAttachment, ImportPlan};
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId, FileIdHasher, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::ContentError;
 
 pub(crate) const MANIFESTS_PATH: &str = "content/manifests.json";
-const CHUNK_PREFIX: &str = "content/chunks/";
+pub(crate) const CHUNK_PREFIX: &str = "content/chunks/";
 const VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -33,15 +34,21 @@ struct ChunkRecord {
     len: u64,
 }
 
-pub(crate) struct DecodedContent {
-    pub(crate) manifests: Vec<Manifest>,
-    pub(crate) chunks: Vec<(ChunkHash, Vec<u8>)>,
+/// Everything an export needs before it writes one byte of content.
+pub(crate) struct ContentDeclaration {
+    /// The serialized `content/manifests.json` bytes.
+    pub(crate) manifest_bytes: Vec<u8>,
+    /// Every attachment declaration, the index first and then the chunks in
+    /// hash order.
+    pub(crate) attachments: Vec<ArchiveAttachment>,
+    /// The distinct chunk hashes, in the order their entries are written.
+    pub(crate) chunk_hashes: Vec<ChunkHash>,
 }
 
-pub(crate) fn encode(
-    manifests: &[Manifest],
-    mut chunks: Vec<(ChunkHash, Vec<u8>)>,
-) -> Result<Vec<ArchiveAttachment>, ContentError> {
+/// Declares the content entries of one export.
+///
+/// Every length comes from the manifests, so no chunk is read here.
+pub(crate) fn declare_content(manifests: &[Manifest]) -> Result<ContentDeclaration, ContentError> {
     let files = manifests
         .iter()
         .map(|manifest| FileRecord {
@@ -56,60 +63,86 @@ pub(crate) fn encode(
                 .collect(),
         })
         .collect();
-    let index = serde_json::to_vec_pretty(&ContentIndex {
+    let manifest_bytes = serde_json::to_vec_pretty(&ContentIndex {
         version: VERSION,
         files,
     })
     .map_err(|error| archive_error(format!("encode content manifests: {error}")))?;
-    let mut attachments = Vec::with_capacity(chunks.len() + 1);
-    attachments.push(ArchiveAttachment::new(MANIFESTS_PATH, index)?);
-    chunks.sort_unstable_by_key(|(hash, _)| hash.to_string());
-    for (hash, bytes) in chunks {
+
+    let index_len = u64::try_from(manifest_bytes.len())
+        .map_err(|_| archive_error("manifest index overflows u64".to_owned()))?;
+    let index_decl = ArchiveAttachment::new(MANIFESTS_PATH, index_len)?;
+
+    // Hex is monotonic in the bytes it spells, so the byte order is the order
+    // the entry names sort in, without a string per comparison.
+    let mut seen: HashMap<ChunkHash, u64> = HashMap::new();
+    for manifest in manifests {
+        for chunk in manifest.chunks() {
+            seen.entry(chunk.hash).or_insert(chunk.len);
+        }
+    }
+    let mut distinct: Vec<(ChunkHash, u64)> = seen.into_iter().collect();
+    distinct.sort_unstable_by_key(|(hash, _)| *hash.as_bytes());
+
+    let mut attachments = Vec::with_capacity(distinct.len() + 1);
+    attachments.push(index_decl);
+    let mut chunk_hashes = Vec::with_capacity(distinct.len());
+    for (hash, len) in distinct {
         attachments.push(ArchiveAttachment::new(
             format!("{CHUNK_PREFIX}{hash}"),
-            bytes,
+            len,
         )?);
+        chunk_hashes.push(hash);
     }
-    Ok(attachments)
-}
 
-pub(crate) fn decode(attachments: &[ArchiveAttachment]) -> Result<DecodedContent, ContentError> {
-    if let Some(attachment) = attachments
-        .iter()
-        .find(|attachment| !attachment.path().starts_with("content/"))
-    {
-        return Err(archive_error(format!(
-            "archive attachment {} is not handled by the content importer",
-            attachment.path()
-        )));
-    }
-    if attachments.is_empty() {
-        return Ok(DecodedContent {
-            manifests: Vec::new(),
-            chunks: Vec::new(),
-        });
-    }
-    let content: Vec<_> = attachments.iter().collect();
-    let index = decode_index(&content)?;
-    let chunks = decode_chunks(&content)?;
-    let manifests = decode_manifests(&index.files, &chunks)?;
-    Ok(DecodedContent {
-        manifests,
-        chunks: chunks.into_iter().collect(),
+    Ok(ContentDeclaration {
+        manifest_bytes,
+        attachments,
+        chunk_hashes,
     })
 }
 
-fn decode_index(content: &[&ArchiveAttachment]) -> Result<ContentIndex, ContentError> {
-    let indices: Vec<_> = content
+/// Validates every content attachment the plan names and writes nothing.
+///
+/// Returns the manifests and the distinct chunk hashes in the order
+/// [`declare_content`] writes them.
+pub(crate) fn validate_import<R: Read + Seek>(
+    plan: &mut ImportPlan<R>,
+) -> Result<(Vec<Manifest>, Vec<ChunkHash>), ContentError> {
+    let attachments = plan.attachments();
+
+    if let Some(bad) = attachments
         .iter()
-        .filter(|attachment| attachment.path() == MANIFESTS_PATH)
-        .collect();
-    let [index] = indices.as_slice() else {
-        return Err(archive_error(
-            "content attachments require exactly one content/manifests.json".to_owned(),
-        ));
-    };
-    let index: ContentIndex = serde_json::from_slice(index.bytes())
+        .find(|a| !a.path().starts_with("content/"))
+    {
+        return Err(archive_error(format!(
+            "archive attachment {} is not handled by the content importer",
+            bad.path()
+        )));
+    }
+
+    if attachments.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut chunk_decls: HashMap<ChunkHash, u64> = HashMap::new();
+    for attachment in attachments {
+        let path = attachment.path();
+        if path == MANIFESTS_PATH {
+            continue;
+        }
+        let Some(name) = path.strip_prefix(CHUNK_PREFIX) else {
+            return Err(archive_error(format!("unknown content attachment {path}")));
+        };
+        let hash = ChunkHash::from_bytes(decode_hash(name)?);
+        if chunk_decls.insert(hash, attachment.byte_len()).is_some() {
+            return Err(archive_error(format!("content chunk {name} is repeated")));
+        }
+    }
+
+    let mut buf = Vec::new();
+    plan.read_attachment(MANIFESTS_PATH, &mut buf)?;
+    let index: ContentIndex = serde_json::from_slice(&buf)
         .map_err(|error| archive_error(format!("decode content manifests: {error}")))?;
     if index.version != VERSION {
         return Err(archive_error(format!(
@@ -117,40 +150,14 @@ fn decode_index(content: &[&ArchiveAttachment]) -> Result<ContentIndex, ContentE
             index.version
         )));
     }
-    Ok(index)
-}
 
-fn decode_chunks(
-    content: &[&ArchiveAttachment],
-) -> Result<HashMap<ChunkHash, Vec<u8>>, ContentError> {
-    let mut chunks = HashMap::new();
-    for attachment in content {
-        if attachment.path() == MANIFESTS_PATH {
-            continue;
-        }
-        let Some(name) = attachment.path().strip_prefix(CHUNK_PREFIX) else {
-            return Err(archive_error(format!(
-                "unknown content attachment {}",
-                attachment.path()
-            )));
-        };
-        let hash = ChunkHash::from_bytes(decode_hash(name)?);
-        if chunks.insert(hash, attachment.bytes().to_vec()).is_some() {
-            return Err(archive_error(format!("content chunk {name} is repeated")));
-        }
-    }
-    Ok(chunks)
-}
-
-fn decode_manifests(
-    files: &[FileRecord],
-    chunks: &HashMap<ChunkHash, Vec<u8>>,
-) -> Result<Vec<Manifest>, ContentError> {
+    // The identity hashes the bytes in manifest order, not in entry order.
     let mut file_ids = HashSet::new();
     let mut referenced = HashSet::new();
-    let mut manifests = Vec::with_capacity(files.len());
-    for file in files {
-        let manifest = decode_manifest(file, chunks, &mut referenced)?;
+    let mut manifests = Vec::with_capacity(index.files.len());
+
+    for file in &index.files {
+        let manifest = validate_file_record(file, &chunk_decls, plan, &mut buf, &mut referenced)?;
         if !file_ids.insert(manifest.file_id()) {
             return Err(archive_error(format!(
                 "content file {} is repeated",
@@ -159,17 +166,26 @@ fn decode_manifests(
         }
         manifests.push(manifest);
     }
-    if let Some(extra) = chunks.keys().find(|hash| !referenced.contains(hash)) {
+
+    if let Some(extra) = chunk_decls.keys().find(|hash| !referenced.contains(*hash)) {
         return Err(archive_error(format!(
             "content chunk {extra} is not named by a manifest"
         )));
     }
-    Ok(manifests)
+
+    let mut distinct: Vec<ChunkHash> = referenced.into_iter().collect();
+    distinct.sort_unstable_by_key(|hash| *hash.as_bytes());
+
+    Ok((manifests, distinct))
 }
 
-fn decode_manifest(
+/// Validates one file record against the entries the archive declares and the
+/// bytes they hold.
+fn validate_file_record<R: Read + Seek>(
     file: &FileRecord,
-    chunks: &HashMap<ChunkHash, Vec<u8>>,
+    chunk_decls: &HashMap<ChunkHash, u64>,
+    plan: &mut ImportPlan<R>,
+    buf: &mut Vec<u8>,
     referenced: &mut HashSet<ChunkHash>,
 ) -> Result<Manifest, ContentError> {
     let file_id = FileId::from_bytes(decode_hash(&file.file_id)?);
@@ -180,50 +196,49 @@ fn decode_manifest(
     }
     let mut hasher = FileIdHasher::new();
     let mut metas = Vec::with_capacity(file.chunks.len());
+
     for chunk in &file.chunks {
-        metas.push(decode_chunk(chunk, chunks, referenced, &mut hasher)?);
+        let hash = ChunkHash::from_bytes(decode_hash(&chunk.hash)?);
+        let chunk_path = format!("{CHUNK_PREFIX}{hash}");
+
+        let &declared_len = chunk_decls
+            .get(&hash)
+            .ok_or_else(|| archive_error(format!("content chunk {hash} is absent")))?;
+        if declared_len != chunk.len {
+            return Err(archive_error(format!(
+                "content chunk {hash} has length {declared_len}, expected {}",
+                chunk.len
+            )));
+        }
+
+        plan.read_attachment(&chunk_path, buf)?;
+
+        let actual = ChunkHash::from_data(buf);
+        if actual != hash {
+            return Err(archive_error(format!(
+                "content chunk {hash} has hash {actual}"
+            )));
+        }
+
+        hasher.update(buf);
+        referenced.insert(hash);
+        metas.push(ChunkMeta {
+            hash,
+            len: chunk.len,
+        });
     }
-    let actual = hasher.finalize();
-    if actual != file_id {
+
+    let actual_id = hasher.finalize();
+    if actual_id != file_id {
         return Err(archive_error(format!(
-            "content file {file_id} reconstructs as {actual}"
+            "content file {file_id} reconstructs as {actual_id}"
         )));
     }
+
     Ok(Manifest::new(file_id, metas))
 }
 
-fn decode_chunk(
-    chunk: &ChunkRecord,
-    chunks: &HashMap<ChunkHash, Vec<u8>>,
-    referenced: &mut HashSet<ChunkHash>,
-    hasher: &mut FileIdHasher,
-) -> Result<ChunkMeta, ContentError> {
-    let hash = ChunkHash::from_bytes(decode_hash(&chunk.hash)?);
-    let bytes = chunks
-        .get(&hash)
-        .ok_or_else(|| archive_error(format!("content chunk {hash} is absent")))?;
-    if u64::try_from(bytes.len()).ok() != Some(chunk.len) {
-        return Err(archive_error(format!(
-            "content chunk {hash} has length {}, expected {}",
-            bytes.len(),
-            chunk.len
-        )));
-    }
-    let actual = ChunkHash::from_data(bytes);
-    if actual != hash {
-        return Err(archive_error(format!(
-            "content chunk {hash} has hash {actual}"
-        )));
-    }
-    hasher.update(bytes);
-    referenced.insert(hash);
-    Ok(ChunkMeta {
-        hash,
-        len: chunk.len,
-    })
-}
-
-fn decode_hash(value: &str) -> Result<[u8; 32], ContentError> {
+pub(crate) fn decode_hash(value: &str) -> Result<[u8; 32], ContentError> {
     let bytes = value.as_bytes();
     if bytes.len() != 64 {
         return Err(archive_error(format!(

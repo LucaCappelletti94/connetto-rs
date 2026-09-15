@@ -42,26 +42,36 @@ const LOCAL_ROWS: &str = "device-private.patchset";
 const PENDING: &str = "pending.changesets";
 /// Human-readable description of the entry encodings.
 const NOTE: &str = "rows are zstd SQLite change records. Attachments declare their encoding";
+/// The most one attachment may ask a device to hold on disk, and in memory
+/// while its own entry is written or read.
 const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+/// The most every attachment together may ask a device to hold on disk.
 const MAX_ATTACHMENTS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// An opaque file another client layer carries in the device archive.
+/// An opaque file another client layer carries in the device archive, named
+/// and sized rather than held.
+///
+/// The bytes travel through the archive one entry at a time, so an attachment
+/// is a declaration on the way out, written with
+/// [`LocalDataExport::write_attachment`](crate::LocalDataExport::write_attachment),
+/// and a name on the way in, read with
+/// [`ImportPlan::read_attachment`](crate::ImportPlan::read_attachment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveAttachment {
     path: String,
-    bytes: Vec<u8>,
+    byte_len: u64,
 }
 
 impl ArchiveAttachment {
-    /// Creates a safe raw archive entry.
+    /// Declares a safe raw archive entry of `byte_len` bytes.
     ///
     /// # Errors
     ///
     /// [`ClientError`] when `path` is unsafe or reserved by the archive format.
-    pub fn new(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, ClientError> {
+    pub fn new(path: impl Into<String>, byte_len: u64) -> Result<Self, ClientError> {
         let path = path.into();
         zip::validate_attachment_path(&path, ClientError::Export)?;
-        Ok(Self { path, bytes })
+        Ok(Self { path, byte_len })
     }
 
     /// The entry's relative archive path.
@@ -70,15 +80,15 @@ impl ArchiveAttachment {
         &self.path
     }
 
-    /// The raw entry bytes.
+    /// How many bytes the entry carries.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
     }
 
-    /// Constructs a pre-validated entry directly, for use by the zip reader.
-    fn from_raw(path: String, bytes: Vec<u8>) -> Self {
-        Self { path, bytes }
+    /// Constructs a pre-validated declaration directly, for use by the zip reader.
+    const fn from_raw(path: String, byte_len: u64) -> Self {
+        Self { path, byte_len }
     }
 }
 
@@ -254,20 +264,35 @@ pub(crate) struct PlannedRow {
     pub(crate) collision: Option<usize>,
 }
 
-/// A read and checked archive, and what applying it would overwrite.
+/// A checked archive, still open, and what applying it would overwrite.
 ///
-/// Nothing has been written when this exists: every refusal happened while it
-/// was built, and the collisions are reported before anything is overwritten,
-/// which is the shape the logout protocol already has (R56 decision 3).
+/// Nothing has been written when this exists, because every refusal the rows
+/// and the manifest can raise happened while it was built, and the collisions
+/// are reported before anything is overwritten, which is the shape the logout
+/// protocol already has (R56 decision 3).
+///
+/// The plan holds the source open, because the attachments it names are read
+/// from it one at a time rather than carried.
 #[must_use = "pass this plan and an ImportChoices to apply_import. Dropping it leaves the import incomplete"]
-#[derive(Debug)]
-pub struct ImportPlan {
+pub struct ImportPlan<R> {
     pub(crate) archive: Incoming,
     pub(crate) rows: Vec<PlannedRow>,
     pub(crate) collisions: Vec<Collision>,
+    pub(crate) reader: zip::read::ArchiveReader<R>,
 }
 
-impl ImportPlan {
+impl<R> core::fmt::Debug for ImportPlan<R> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ImportPlan")
+            .field("archive", &self.archive)
+            .field("rows", &self.rows)
+            .field("collisions", &self.collisions)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> ImportPlan<R> {
     /// The rows this import would overwrite, each with both versions.
     #[must_use]
     pub fn collisions(&self) -> &[Collision] {
@@ -286,7 +311,7 @@ impl ImportPlan {
         self.archive.pending.len()
     }
 
-    /// Opaque files supplied by optional client layers.
+    /// The opaque files optional client layers supplied, each named and sized.
     #[must_use]
     pub fn attachments(&self) -> &[ArchiveAttachment] {
         &self.archive.attachments
@@ -310,6 +335,21 @@ impl ImportPlan {
     }
 }
 
+impl<R: std::io::Read + std::io::Seek> ImportPlan<R> {
+    /// Reads one attachment the plan names into `into`, replacing its contents.
+    ///
+    /// The caller owns the buffer, so a walk over every attachment holds one
+    /// of them at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Import`] when the archive carries no attachment at
+    /// `path`, or when the entry does not read back at its declared length.
+    pub fn read_attachment(&mut self, path: &str, into: &mut Vec<u8>) -> Result<(), ClientError> {
+        self.reader.read_attachment(path, into)
+    }
+}
+
 /// What an import did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImportOutcome {
@@ -330,5 +370,6 @@ fn read_error(error: impl core::fmt::Display) -> ClientError {
 }
 
 pub(crate) use rows::{fingerprint, index_rows, read_rows, schema_columns, write_row};
-pub(crate) use zip::read::read;
-pub(crate) use zip::write::write;
+pub(crate) use zip::read::open;
+pub use zip::write::LocalDataExport;
+pub(crate) use zip::write::start;

@@ -186,14 +186,13 @@ fn export_path() -> PathBuf {
     data_dir().join("connetto-local-data.zip")
 }
 
-/// Write an export archive beside the replica, reporting what the user can go
-/// and open. The bytes are handed over whole rather than streamed: they are
-/// already in memory, and the archive is the whole point of the call.
-fn write_export(bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// Opens the export file beside the replica, which the archive is written
+/// straight into, and names it so the user can go and open it.
+fn create_export_file() -> std::io::Result<(PathBuf, std::fs::File)> {
     let path = export_path();
     std::fs::create_dir_all(data_dir())?;
-    std::fs::write(&path, bytes)?;
-    Ok(path)
+    let file = std::fs::File::create(&path)?;
+    Ok((path, file))
 }
 
 /// Restart the current binary and exit this process, so a sign-out takes
@@ -1096,19 +1095,27 @@ fn app() -> Element {
                     onclick: move |_| {
                         let client = export_client.clone();
                         spawn(async move {
-                            let message = match client
-                                .with_conn(|c| c.export_local_data(ExportScope::Everything))
-                                .await
-                            {
-                                Ok(bytes) => match write_export(&bytes) {
-                                    Ok(path) => format!(
-                                        "Wrote {} bytes to {}",
-                                        bytes.len(),
-                                        path.display()
-                                    ),
-                                    Err(err) => format!("could not write the export: {err}"),
+                            let message = match create_export_file() {
+                                Err(err) => format!("could not open the export file: {err}"),
+                                Ok((path, file)) => match client
+                                    .with_conn(move |c| {
+                                        c.export_local_data(ExportScope::Everything, file)
+                                    })
+                                    .await
+                                {
+                                    Ok(file) => match file.metadata() {
+                                        Ok(meta) => format!(
+                                            "Wrote {} bytes to {}",
+                                            meta.len(),
+                                            path.display()
+                                        ),
+                                        Err(err) => format!(
+                                            "wrote {} but could not measure it: {err}",
+                                            path.display()
+                                        ),
+                                    },
+                                    Err(err) => format!("export failed: {err}"),
                                 },
-                                Err(err) => format!("export failed: {err}"),
                             };
                             export_status.set(Some(message));
                         });
@@ -1147,9 +1154,15 @@ fn app() -> Element {
                             else {
                                 return;
                             };
-                            let bytes = file.read().await;
+                            let source = match std::fs::File::open(file.path()) {
+                                Ok(source) => source,
+                                Err(err) => {
+                                    import_status.set(Some(format!("could not open it: {err}")));
+                                    return;
+                                }
+                            };
                             let message =
-                                match client.with_conn(move |c| c.import_local_data(&bytes)).await
+                                match client.with_conn(move |c| c.import_local_data(source)).await
                                 {
                                     Err(err) => format!("refused: {err}"),
                                     Ok(plan) => {

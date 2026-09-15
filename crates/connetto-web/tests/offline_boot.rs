@@ -16,7 +16,7 @@ use connetto_client::ExportScope;
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
 use connetto_web::storage::{PendingWipe, ReplicaStorage, mark_wipe_pending, take_pending_wipes};
-use connetto_web::workers::{DbWorkerConfig, boot_db_worker, request_export};
+use connetto_web::workers::{BlobSource, DbWorkerConfig, boot_db_worker, request_export};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::DedicatedWorkerGlobalScope;
@@ -121,7 +121,10 @@ async fn the_worker_starts_with_no_server_reachable() {
     let archive = request_export(ExportScope::Unsynced)
         .await
         .expect("content-aware worker export");
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("archive");
-    let has_content = zip.by_name("content/manifests.json").is_ok();
-    assert!(has_content);
+    let source = BlobSource::new(archive).expect("BlobSource in dedicated worker");
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(source)).expect("archive");
+    assert!(
+        zip.by_name("content/manifests.json").is_ok(),
+        "the content archive entry must be present"
+    );
 }
