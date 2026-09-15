@@ -216,7 +216,7 @@ fn validate_ticket_url(grant_url: &str) -> Result<(), ContentError> {
 /// A transport reports its own failure or the redirect it refused, and the
 /// status rule stays here, so every `3xx` that reaches the negotiation is the
 /// same refusal as a reply that landed elsewhere.
-async fn send<E: core::fmt::Display>(
+async fn send<E: core::error::Error + 'static>(
     request: impl Future<Output = Result<HttpReply, HttpFailure<E>>>,
     stage: &'static str,
 ) -> Result<HttpReply, ContentError> {

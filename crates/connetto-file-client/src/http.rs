@@ -18,30 +18,19 @@ pub struct HttpReply {
 }
 
 /// Why one content request has no reply for the negotiation to read.
-#[derive(Debug)]
-pub enum HttpFailure<E> {
+#[derive(Debug, thiserror::Error)]
+pub enum HttpFailure<E: core::error::Error + 'static> {
     /// The transport failed before a reply arrived.
+    #[error(transparent)]
     Transport(E),
     /// A redirect was followed or refused, which the content protocol treats
     /// as an answer about the server. The mint issues exact addresses, so no
     /// hop belongs to a transfer.
+    #[error("redirected to {}", origin.as_deref().unwrap_or("an undisclosed address"))]
     Redirected {
         /// The origin of the reply that landed, absent when no reply landed.
         origin: Option<String>,
     },
-}
-
-impl<E: core::fmt::Display> core::fmt::Display for HttpFailure<E> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Transport(error) => write!(formatter, "{error}"),
-            Self::Redirected { origin } => write!(
-                formatter,
-                "redirected to {}",
-                origin.as_deref().unwrap_or("an undisclosed address")
-            ),
-        }
-    }
 }
 
 /// The idle bound a transfer is aborted after, per chapter 18.
@@ -50,7 +39,7 @@ pub(crate) const DEFAULT_IDLE_BOUND: core::time::Duration = core::time::Duration
 /// The three request shapes the content protocol uses.
 pub trait ContentHttp {
     /// The transport's own failure type, for a request that never got a status.
-    type Error: core::fmt::Display;
+    type Error: core::error::Error + 'static;
 
     /// `POST` to `url`, with `json` as an `application/json` body when present.
     ///

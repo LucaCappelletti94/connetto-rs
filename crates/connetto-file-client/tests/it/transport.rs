@@ -9,13 +9,17 @@ use core::time::Duration;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use connetto_file_client::{ContentHttp, HttpFailure, ReqwestHttp, ReqwestHttpError};
+use connetto_file_client::{ContentHttp, HttpFailure, HttpReply, ReqwestHttp, ReqwestHttpError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 /// The bound every test here injects, in place of the shipped thirty seconds.
 const BOUND: Duration = Duration::from_millis(500);
+
+/// How long a stage that must abort is given, which no transport keeping a
+/// bound of its own could answer inside.
+const CEILING: Duration = Duration::from_secs(4);
 
 /// A body past any socket buffer, so a server that stops reading stalls the
 /// pulls the watchdog observes.
@@ -32,7 +36,7 @@ const TRICKLE_PAUSE: Duration = Duration::from_millis(25);
 /// trickle rate, which is what a total deadline would have aborted.
 const TRICKLED: usize = 64 * 1024 * 1024;
 
-/// A reply that ends the connection, so no test waits on a keep-alive.
+/// A reply that closes the connection, so no test waits on a reused one.
 const NO_CONTENT: &str =
     "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -62,27 +66,46 @@ async fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// Drains a chunked body, taking `step` bytes at a time and pausing `pause`
-/// between reads, and answers how many bytes arrived.
+/// between reads, and answers how many payload bytes arrived.
 ///
 /// Both parameters are what a test sets its link rate with. A pause inside the
 /// bound keeps the pulls coming, and a step that leaves the socket buffers
 /// drainable in a few reads keeps the buffered tail inside the bound as well.
 async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> usize {
     let mut buffer = vec![0_u8; step];
-    let mut tail = Vec::new();
-    let mut received = 0;
-    while !tail.ends_with(b"0\r\n\r\n") {
+    let mut body = Vec::new();
+    while !body.ends_with(b"0\r\n\r\n") {
         let read = match stream.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        received += read;
-        tail.extend_from_slice(&buffer[..read]);
-        let keep = tail.len().saturating_sub(8);
-        tail.drain(..keep);
+        body.extend_from_slice(&buffer[..read]);
         tokio::time::sleep(pause).await;
     }
-    received
+    chunked_payload(&body)
+}
+
+/// How many payload bytes a chunked body carries, framing removed, so a
+/// transport that dropped payload cannot pass for one that sent it.
+fn chunked_payload(body: &[u8]) -> usize {
+    let mut rest = body;
+    let mut payload = 0;
+    while let Some(line) = rest.windows(2).position(|pair| pair == b"\r\n") {
+        let size = core::str::from_utf8(&rest[..line])
+            .ok()
+            .and_then(|size| usize::from_str_radix(size, 16).ok())
+            .unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        payload += size;
+        let next = line.saturating_add(4).saturating_add(size);
+        if next >= rest.len() {
+            break;
+        }
+        rest = &rest[next..];
+    }
+    payload
 }
 
 /// Answers one request head with `reply`, once the request has fully arrived.
@@ -115,11 +138,10 @@ fn deaf_server(listener: TcpListener, reply: Option<&'static str>) -> JoinHandle
 }
 
 /// The stage each abort test drives, named by what it aborts.
-async fn put_unbufferable(address: SocketAddr) -> Result<u16, HttpFailure<ReqwestHttpError>> {
+async fn put_unbufferable(address: SocketAddr) -> Result<HttpReply, HttpFailure<ReqwestHttpError>> {
     transport()
         .put(&chunk_url(address), vec![7_u8; UNBUFFERABLE])
         .await
-        .map(|reply| reply.status)
 }
 
 /// Where one chunk's bytes go on a local listener.
@@ -132,8 +154,22 @@ fn intent_url(address: SocketAddr) -> String {
     format!("http://{address}/files/deadbeef/intent?t=ticket")
 }
 
-/// Asserts a failure is the idle abort, and that it waited out the bound.
-fn assert_idle(failure: &HttpFailure<ReqwestHttpError>, started: Instant, what: &str) {
+/// Drives one stage that must abort, and answers the failure it aborted with.
+///
+/// The ceiling is what makes the injected bound load-bearing, because a
+/// transport that kept a bound of its own would answer nowhere near it, and
+/// the floor is the bound itself, which a transport may never abort before.
+async fn abort_of<T>(
+    work: impl Future<Output = Result<T, HttpFailure<ReqwestHttpError>>>,
+    what: &str,
+) -> HttpFailure<ReqwestHttpError> {
+    let started = Instant::now();
+    let answer = tokio::time::timeout(CEILING, work)
+        .await
+        .unwrap_or_else(|_| panic!("{what} must abort under the injected bound, not its own"));
+    let Err(failure) = answer else {
+        panic!("{what} must abort");
+    };
     assert!(
         matches!(
             failure,
@@ -146,6 +182,7 @@ fn assert_idle(failure: &HttpFailure<ReqwestHttpError>, started: Instant, what: 
         "{what} must not abort before the bound, aborted after {:?}",
         started.elapsed()
     );
+    failure
 }
 
 /// An upload that keeps moving is never aborted, however long it runs, and
@@ -169,9 +206,10 @@ async fn a_trickling_upload_is_never_aborted() {
         "the upload must outlast the bound for this to prove anything, took {:?}",
         started.elapsed()
     );
-    assert!(
-        server.await.expect("server") >= TRICKLED,
-        "the whole body arrived"
+    assert_eq!(
+        server.await.expect("server"),
+        TRICKLED,
+        "every payload byte arrived, framing aside"
     );
 }
 
@@ -180,13 +218,9 @@ async fn a_trickling_upload_is_never_aborted() {
 async fn a_stalled_upload_aborts_after_the_bound() {
     let (listener, address) = local_listener().await;
     let server = deaf_server(listener, None);
-    let started = Instant::now();
 
-    let failure = put_unbufferable(address)
-        .await
-        .expect_err("a stalled upload aborts");
+    abort_of(put_unbufferable(address), "a stalled send").await;
 
-    assert_idle(&failure, started, "a stalled send");
     server.abort();
 }
 
@@ -200,19 +234,17 @@ async fn a_stalled_status_wait_aborts_after_the_bound() {
         drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
         core::future::pending::<()>().await;
     });
-    let started = Instant::now();
 
-    let failure = transport()
-        .put(&chunk_url(address), b"a small chunk".to_vec())
-        .await
-        .map(|reply| reply.status)
-        .expect_err("a withheld answer aborts");
+    abort_of(
+        transport().put(&chunk_url(address), b"a small chunk".to_vec()),
+        "a withheld status line",
+    )
+    .await;
 
-    assert_idle(&failure, started, "a withheld status line");
     server.abort();
 }
 
-/// A reply that stops mid-body aborts the download.
+/// A reply that stops before its length is reached aborts the download.
 #[tokio::test]
 async fn a_stalled_download_aborts_after_the_bound() {
     let (listener, address) = local_listener().await;
@@ -220,15 +252,13 @@ async fn a_stalled_download_aborts_after_the_bound() {
         listener,
         Some("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nfour"),
     );
-    let started = Instant::now();
 
-    let failure = transport()
-        .get(&format!("http://{address}/files/deadbeef?t=ticket"), None)
-        .await
-        .map(|reply| reply.status)
-        .expect_err("a stalled reply aborts");
+    abort_of(
+        transport().get(&format!("http://{address}/files/deadbeef?t=ticket"), None),
+        "a stalled reply body",
+    )
+    .await;
 
-    assert_idle(&failure, started, "a stalled reply body");
     server.abort();
 }
 
