@@ -1497,8 +1497,11 @@ enum TransferStep {
     Event(Option<HubEvent>),
 }
 
-/// Waits for whichever comes first, or for the transfer alone once local
+/// Serves a queued local event before the transfer, or the transfer alone once local
 /// events are no longer being served.
+///
+/// The select is biased to the event queue, so completion is reported only when no event
+/// is waiting, and an import that restores a chunk is applied before a loss is finalized.
 async fn transfer_step(
     transfer: &mut core::pin::Pin<&mut impl Future<Output = Result<(), ContentError>>>,
     events: &mut UnboundedReceiver<HubEvent>,
@@ -1508,8 +1511,9 @@ async fn transfer_step(
         return TransferStep::Done(transfer.as_mut().await);
     }
     tokio::select! {
-        result = transfer.as_mut() => TransferStep::Done(result),
+        biased;
         event = events.recv() => TransferStep::Event(event),
+        result = transfer.as_mut() => TransferStep::Done(result),
     }
 }
 
@@ -4488,6 +4492,25 @@ mod tests {
                 Some(HubEvent::RetryRefused(_, _))
             ),
             "RetryRefused at the queue head must interrupt an attach"
+        );
+    }
+
+    /// A queued event is served before a transfer that is also ready, so an import waiting
+    /// in the channel is applied before an upload's loss is finalized.
+    #[wasm_bindgen_test]
+    async fn transfer_step_serves_a_queued_event_before_a_ready_transfer() {
+        use super::{TransferStep, transfer_step};
+        use connetto_file_client::ContentError;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(HubEvent::Kill(9)).expect("queue an event");
+        let transfer = async { Err::<(), ContentError>(ContentError::Transport("done".to_owned())) };
+        tokio::pin!(transfer);
+        let step = transfer_step(&mut transfer, &mut rx, true).await;
+        assert!(
+            matches!(step, TransferStep::Event(Some(HubEvent::Kill(9)))),
+            "a queued event must be served before a transfer that is also ready"
         );
     }
 }

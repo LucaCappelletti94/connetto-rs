@@ -630,8 +630,9 @@ where
 
     /// Finishes local bookkeeping for an HTTP transfer.
     ///
-    /// A loss is confirmed by reading the store again, since a concurrent import can
-    /// restore a missing chunk during the transfer, matching the boot pass and the scan.
+    /// A loss is confirmed by reading the named chunk again, since a concurrent import can
+    /// restore it during the transfer, and reading only that chunk keeps a large lost file
+    /// from holding the worker while every other chunk is decrypted.
     ///
     /// # Errors
     ///
@@ -642,31 +643,28 @@ where
         upload: &ContentUpload<B>,
         result: Result<(), ContentError>,
     ) -> Result<ContentFlush, ContentError> {
-        if let Err(error) = &result
-            && error.outcome() == AttemptOutcome::Lost
-        {
-            return self.retire_if_still_lost(connection, upload.file_id).await;
+        match &result {
+            Err(error) if error.outcome() == AttemptOutcome::Lost => {
+                if self.loss_is_confirmed(error).await {
+                    retire(connection.conn(), upload.file_id)?;
+                    Ok(ContentFlush::Progressed)
+                } else {
+                    Ok(ContentFlush::Deferred)
+                }
+            }
+            _ => Self::finish_attempt(connection, upload.file_id, result),
         }
-        Self::finish_attempt(connection, upload.file_id, result)
     }
 
-    /// Retires the entry only when its bytes are still conclusively unreadable.
-    async fn retire_if_still_lost<T: Transport>(
-        &self,
-        connection: &mut ConnettoConnection<T>,
-        file_id: FileId,
-    ) -> Result<ContentFlush, ContentError> {
-        let still_lost = match db::load_manifest(connection.conn(), file_id)? {
-            None => true,
-            Some(manifest) => unreadable_chunk_count(&self.store, &self.root_key, &manifest)
-                .await
-                .is_some(),
+    /// Whether the reported loss still holds after reading the named chunk once more.
+    async fn loss_is_confirmed(&self, error: &ContentError) -> bool {
+        let ContentError::LostChunk { hash, .. } = error else {
+            return true;
         };
-        if still_lost {
-            retire(connection.conn(), file_id)?;
-            Ok(ContentFlush::Progressed)
-        } else {
-            Ok(ContentFlush::Deferred)
+        let store = EncryptingStore::new(self.store.clone(), &self.root_key);
+        match store.read_chunk(hash).await {
+            Ok(_) => false,
+            Err(err) => !store.read_failure_is_ambiguous(&err),
         }
     }
 
@@ -1551,8 +1549,10 @@ mod tests {
             store: store.clone(),
             root_key: [1; 32],
         };
+        let hash = manifest.chunks()[0].hash;
         let lost = || crate::error::ContentError::LostChunk {
             file_id,
+            hash,
             detail: "chunk gone".to_owned(),
         };
 
@@ -1600,6 +1600,120 @@ mod tests {
                 .expect("read the outbox")
                 .is_empty(),
             "a retired entry leaves the outbox"
+        );
+    }
+
+    /// Counts `read_chunk` calls, to prove a loss is confirmed against one chunk.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[derive(Clone)]
+    struct CountingStore {
+        inner: crate::store::FsStore,
+        reads: std::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    impl connetto_file_core::ChunkStore for CountingStore {
+        type Error = crate::store::FsStoreError;
+
+        async fn write_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+            data: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.inner.write_chunk(hash, data).await
+        }
+
+        async fn read_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.reads
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.inner.read_chunk(hash).await
+        }
+
+        async fn has_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<bool, Self::Error> {
+            self.inner.has_chunk(hash).await
+        }
+
+        async fn delete_chunk(
+            &self,
+            hash: &connetto_file_core::ChunkHash,
+        ) -> Result<(), Self::Error> {
+            self.inner.delete_chunk(hash).await
+        }
+    }
+
+    /// Confirming a loss reads only the chunk the transfer named, never the whole file, so a
+    /// large lost upload cannot hold the worker while every other chunk is decrypted.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn finish_upload_reads_only_the_reported_chunk() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+        use core::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let reads = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let store = CountingStore {
+            inner: crate::store::FsStore::new(dir.path().join("chunks")),
+            reads: reads.clone(),
+        };
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("targeted-loss"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store.clone(), &[1; 32]);
+        // Jpeg chunks in fixed 16 MiB slabs, so 33 MiB is three chunks.
+        let manifest = process_file(&vec![7u8; 33 * 1024 * 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("chunk the file");
+        assert!(
+            manifest.chunks().len() > 1,
+            "the file must have several chunks to tell a targeted read apart"
+        );
+        let file_id = manifest.file_id();
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), file_id).expect("queue the file");
+
+        let upload = super::ContentUpload {
+            file_id,
+            upload_url: String::new(),
+            manifest: manifest.clone(),
+            store: store.clone(),
+            root_key: [1; 32],
+        };
+        let error = crate::error::ContentError::LostChunk {
+            file_id,
+            hash: manifest.chunks()[1].hash,
+            detail: "chunk gone".to_owned(),
+        };
+
+        reads.store(0, Ordering::Relaxed);
+        let flush = archive
+            .finish_upload(&mut connection, &upload, Err(error))
+            .await
+            .expect("finish_upload runs");
+        assert_eq!(
+            flush,
+            super::ContentFlush::Deferred,
+            "the named chunk is present, so the entry is kept"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "confirming the loss reads only the one named chunk"
         );
     }
 

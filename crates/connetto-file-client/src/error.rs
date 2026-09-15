@@ -1,6 +1,6 @@
 //! The one error type the content surface returns.
 
-use connetto_file_core::FileId;
+use connetto_file_core::{ChunkHash, FileId};
 use thiserror::Error;
 
 /// Errors produced by the content client.
@@ -78,6 +78,8 @@ pub enum ContentError {
     LostChunk {
         /// The file whose bytes are gone.
         file_id: FileId,
+        /// The chunk the manifest names that the store cannot read.
+        hash: ChunkHash,
         /// What the store reported about the unreadable chunk.
         detail: String,
     },
@@ -159,6 +161,7 @@ mod tests {
         assert_eq!(
             ContentError::LostChunk {
                 file_id: file(),
+                hash: connetto_file_core::ChunkHash::from_bytes([9; 32]),
                 detail: "chunk gone".to_owned(),
             }
             .outcome(),
