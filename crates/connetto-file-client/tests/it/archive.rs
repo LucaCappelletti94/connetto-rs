@@ -348,7 +348,7 @@ async fn import_succeeds_when_replay_fails_after_commit() {
 /// A content-only import wakes the outbox driver without any replica mutation.
 #[tokio::test]
 async fn content_only_import_wakes_outbox_driver() {
-    const INTENT: &str = "http://files.test/files/\
+    const INTENT: &str = "https://files.test/files/\
         0000000000000000000000000000000000000000000000000000000000000000/intent?t=TOKEN";
     let source_dir = tempdir().expect("source dir");
     let source = offline_client(&source_dir.path().join("replica.sqlite"));

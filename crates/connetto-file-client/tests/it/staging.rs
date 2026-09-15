@@ -163,7 +163,7 @@ async fn the_boot_pass_preserves_outbox_when_absence_is_not_authoritative() {
     let http = RecordingHttp::new(vec![(200, br#"{"needed":[]}"#.to_vec()), (200, Vec::new())]);
     let client = connected_client(
         &dir.path().join("replica.sqlite"),
-        Scripted::granting("http://files.test/files/ab/intent?t=TOKEN"),
+        Scripted::granting("https://files.test/files/ab/intent?t=TOKEN"),
     )
     .await;
     let content = attach_content(client.clone(), &dir.path().join("chunks"), http).await;
@@ -353,7 +353,7 @@ async fn the_driver_retries_a_deferred_upload_with_no_reconnect() {
     ]);
     let client = connected_client(
         &dir.path().join("replica.sqlite"),
-        Scripted::granting("http://files.test/files/ab/intent?t=TOKEN"),
+        Scripted::granting("https://files.test/files/ab/intent?t=TOKEN"),
     )
     .await;
     let content = attach_content(client, &dir.path().join("chunks"), http).await;

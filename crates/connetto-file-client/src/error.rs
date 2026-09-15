@@ -57,6 +57,17 @@ pub enum ContentError {
         /// The HTTP status code.
         status: u16,
     },
+    /// A content request was redirected, which the protocol refuses on every
+    /// path. The mint issues exact addresses, so no hop belongs to a transfer.
+    #[error("content request at {stage} was redirected to {}", origin.as_deref().unwrap_or("an undisclosed address"))]
+    Redirected {
+        /// The stage of the negotiation that was redirected.
+        stage: &'static str,
+        /// The origin of the reply that landed, absent when the redirect was
+        /// refused before a reply landed. The origin rather than the whole
+        /// address, because a landed address can carry the ticket.
+        origin: Option<String>,
+    },
     /// The file server's answer could not be decoded.
     #[error("content server answer at {stage} could not be decoded: {source}")]
     Decode {
@@ -123,6 +134,7 @@ impl ContentError {
                 ..
             }
             | Self::Decode { .. }
+            | Self::Redirected { .. }
             | Self::MalformedGrant(_)
             | Self::IdentityMismatch { .. }
             | Self::Archive(_)
@@ -191,6 +203,17 @@ mod tests {
             .outcome(),
             AttemptOutcome::Refused,
         );
+        for origin in [None, Some("https://elsewhere.invalid".to_owned())] {
+            assert_eq!(
+                ContentError::Redirected {
+                    stage: "chunk",
+                    origin,
+                }
+                .outcome(),
+                AttemptOutcome::Refused,
+                "a redirect is an answer about the server",
+            );
+        }
         assert_eq!(
             ContentError::Http {
                 stage: "commit",

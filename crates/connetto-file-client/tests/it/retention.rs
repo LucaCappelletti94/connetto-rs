@@ -12,7 +12,7 @@ use crate::support::{
 };
 
 /// The granted write address every upload in this module runs under.
-const INTENT_URL: &str = "http://files.test/files/aa/intent?t=TOKEN";
+const INTENT_URL: &str = "https://files.test/files/aa/intent?t=TOKEN";
 
 /// A scripted upload: the intent answer asking for one chunk, the chunk's 204,
 /// and the commit's 200.

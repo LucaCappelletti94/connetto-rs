@@ -148,6 +148,8 @@ pub struct DbWorkerConfig {
     pub(crate) hub_meta_name: &'static str,
     /// Seed for account-isolated browser content storage.
     pub(crate) content_namespace: Option<&'static str>,
+    /// The transport every content transfer runs under, carrying the idle bound.
+    pub(crate) content_http: connetto_file_client::BrowserHttp,
     /// Schema version presented to the server at handshake.
     pub(crate) schema_version: connetto_core::SchemaVersion,
     /// Custom SQLite functions registered on every connection before any DDL.
@@ -194,6 +196,7 @@ impl DbWorkerConfig {
             upstream_query: "",
             hub_meta_name: "",
             content_namespace: None,
+            content_http: connetto_file_client::BrowserHttp::new(),
             schema_version,
             sql_functions: connetto_client::SqlFunctions::default(),
             policy_tables: connetto_client::PolicyTables::new(),
@@ -258,6 +261,17 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_content_namespace(mut self, namespace: &'static str) -> Self {
         self.content_namespace = Some(namespace);
+        self
+    }
+
+    /// How long a content transfer may stay silent before it is aborted.
+    ///
+    /// The bound covers every phase of a request on this device, and a
+    /// deployment whose commit verification is slow raises it rather than
+    /// gaining a second number. Thirty seconds by default.
+    #[must_use]
+    pub fn with_transfer_idle_bound(mut self, idle_bound: core::time::Duration) -> Self {
+        self.content_http = self.content_http.with_idle_bound(idle_bound);
         self
     }
 

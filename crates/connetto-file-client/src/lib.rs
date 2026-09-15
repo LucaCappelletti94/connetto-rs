@@ -30,8 +30,8 @@ pub use worker::{
     FlushCursor, ScanStep,
 };
 
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub use http::ReqwestHttp;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use http::{BrowserHttp, BrowserHttpError};
-pub use http::{ContentHttp, HttpReply};
+pub use http::{ContentHttp, HttpFailure, HttpReply};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use http::{ReqwestHttp, ReqwestHttpError};

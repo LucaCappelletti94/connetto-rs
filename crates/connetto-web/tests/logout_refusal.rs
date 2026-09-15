@@ -26,7 +26,7 @@ use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientConfig, ConnettoConnection, Replica};
 use connetto_core::test_support::{FakeTransport, replica_key};
 use connetto_core::{BulkMessage, ControlMessage, IncomingFrame, Transport};
-use connetto_file_client::{BrowserStore, ContentArchive};
+use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 use connetto_web::RelayHub;
 use connetto_web::auth::{
@@ -194,25 +194,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     )
     .await;
 
-    let reconnect_tickets = Rc::clone(&ticket_requests);
-    let reconnect_signal = Rc::clone(&ticket_sent);
-    let reconnect = HubReconnect {
-        factory: move || {
-            ready(Ok::<_, Infallible>(CountingTransport::new(
-                Rc::clone(&reconnect_tickets),
-                Rc::clone(&reconnect_signal),
-            )))
-        },
-        sleeper: |_| ready(()),
-        policy: ReconnectPolicy::default(),
-        upstream: Vec::new(),
-    };
-    let (hub, pump, _notices) =
-        RelayHub::with_reconnect_and_content(worker, ":memory:", reconnect, content)
-            .expect("hub meta");
-    wasm_bindgen_futures::spawn_local(async move {
-        pump.await.expect("hub pump");
-    });
+    let hub = start_content_hub(worker, content, &ticket_requests, &ticket_sent);
     serve_logout_requests(
         LogoutConfig {
             auth: unused_auth(),
@@ -285,4 +267,39 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
         )],
         "the forced delete names both stores"
     );
+}
+
+/// Starts a content-aware hub over `worker`, whose reconnects count their
+/// ticket requests the same way the stranded worker's transport does.
+fn start_content_hub(
+    worker: ConnettoConnection<CountingTransport>,
+    content: ContentArchive<BrowserStore>,
+    ticket_requests: &Rc<Cell<u32>>,
+    ticket_sent: &Rc<Notify>,
+) -> RelayHub {
+    let reconnect_tickets = Rc::clone(ticket_requests);
+    let reconnect_signal = Rc::clone(ticket_sent);
+    let reconnect = HubReconnect {
+        factory: move || {
+            ready(Ok::<_, Infallible>(CountingTransport::new(
+                Rc::clone(&reconnect_tickets),
+                Rc::clone(&reconnect_signal),
+            )))
+        },
+        sleeper: |_| ready(()),
+        policy: ReconnectPolicy::default(),
+        upstream: Vec::new(),
+    };
+    let (hub, pump, _notices) = RelayHub::with_reconnect_and_content(
+        worker,
+        ":memory:",
+        reconnect,
+        content,
+        BrowserHttp::new(),
+    )
+    .expect("hub meta");
+    wasm_bindgen_futures::spawn_local(async move {
+        pump.await.expect("hub pump");
+    });
+    hub
 }

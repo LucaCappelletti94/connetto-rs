@@ -137,7 +137,13 @@ pub(super) async fn start_boot_services<Id>(
         content_root_key,
     )
     .await?;
-    let (hub, notices) = start_relay_hub(worker, config.hub_meta_name, reconnect, content)?;
+    let (hub, notices) = start_relay_hub(
+        worker,
+        config.hub_meta_name,
+        reconnect,
+        content,
+        config.content_http,
+    )?;
     install_dead_tab_reaper(hub.clone(), notices);
     install_tab_services(
         config,
@@ -190,6 +196,7 @@ fn start_relay_hub<F, S>(
     hub_meta_name: &'static str,
     reconnect: HubReconnect<F, S>,
     content: Option<ContentArchive<BrowserStore>>,
+    content_http: connetto_file_client::BrowserHttp,
 ) -> Result<(RelayHub, UnboundedReceiver<HubNotice>), BootError>
 where
     F: TransportFactory<Transport = BrowserSocket> + 'static,
@@ -197,7 +204,7 @@ where
     S: Sleeper + Clone + 'static,
 {
     let (hub, pump, notices) =
-        RelayHub::with_reconnect_archive(worker, hub_meta_name, reconnect, content)?;
+        RelayHub::with_reconnect_archive(worker, hub_meta_name, reconnect, content, content_http)?;
     spawn_local(async move {
         if let Err(err) = pump.await {
             tracing::error!(error = %err, "relay hub ended");

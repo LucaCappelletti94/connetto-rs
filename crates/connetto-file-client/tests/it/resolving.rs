@@ -10,10 +10,10 @@ use crate::support::{
 };
 
 /// A granted read address, the shape the file server mints for a download.
-const READ_URL: &str = "http://files.test/files/ab?t=TOKEN";
+const READ_URL: &str = "https://files.test/files/ab?t=TOKEN";
 
 /// A granted write address, for the cases that also stage.
-const INTENT_URL: &str = "http://files.test/files/ab/intent?t=TOKEN";
+const INTENT_URL: &str = "https://files.test/files/ab/intent?t=TOKEN";
 
 /// The bytes every case here works with.
 const PHOTO: &[u8] = b"one photograph, resolved four different ways";

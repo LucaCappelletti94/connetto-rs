@@ -8,7 +8,9 @@ use core::future::ready;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use connetto_file_client::{ContentClient, ContentEvent, ContentHttp, FsStore, HttpReply};
+use connetto_file_client::{
+    ContentClient, ContentError, ContentEvent, ContentHttp, FsStore, HttpFailure, HttpReply,
+};
 use connetto_file_core::MimeClass;
 use tempfile::tempdir;
 
@@ -17,12 +19,13 @@ use crate::support::{ROOT_KEY, RecordingHttp, Scripted, Sent, connected_client};
 /// A `ContentHttp` that answers intent requests dynamically.
 ///
 /// The first `take_first_n` hashes from the intent body's `chunks` array are
-/// returned in `needed`; the rest are omitted. Commit requests answer 200 and
-/// chunk `PUT`s answer 204. Every request is recorded.
+/// returned in `needed`, and the rest are omitted. Commit requests answer 200
+/// and chunk `PUT`s answer `chunk_status`. Every request is recorded.
 #[derive(Clone)]
 struct SmartHttp {
     sent: Arc<Mutex<Vec<Sent>>>,
     take_first_n: usize,
+    chunk_status: u16,
 }
 
 impl SmartHttp {
@@ -31,6 +34,7 @@ impl SmartHttp {
         Self {
             sent: Arc::new(Mutex::new(Vec::new())),
             take_first_n: usize::MAX,
+            chunk_status: 204,
         }
     }
 
@@ -39,6 +43,16 @@ impl SmartHttp {
         Self {
             sent: Arc::new(Mutex::new(Vec::new())),
             take_first_n: 0,
+            chunk_status: 204,
+        }
+    }
+
+    /// Every chunk is asked for and every `PUT` is answered with a hop.
+    fn redirecting_chunks() -> Self {
+        Self {
+            sent: Arc::new(Mutex::new(Vec::new())),
+            take_first_n: usize::MAX,
+            chunk_status: 302,
         }
     }
 
@@ -55,7 +69,7 @@ impl ContentHttp for SmartHttp {
         &self,
         url: &str,
         json: Option<Vec<u8>>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         let body = json.unwrap_or_default();
         self.sent.lock().expect("sent lock").push(Sent {
             method: "POST",
@@ -90,14 +104,14 @@ impl ContentHttp for SmartHttp {
         &self,
         url: &str,
         body: Vec<u8>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         self.sent.lock().expect("sent lock").push(Sent {
             method: "PUT",
             url: url.to_owned(),
             body,
         });
         ready(Ok(HttpReply {
-            status: 204,
+            status: self.chunk_status,
             body: Vec::new(),
         }))
     }
@@ -106,7 +120,7 @@ impl ContentHttp for SmartHttp {
         &self,
         _url: &str,
         _range: Option<(u64, u64)>,
-    ) -> impl Future<Output = Result<HttpReply, Self::Error>> {
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
         ready(Ok(HttpReply {
             status: 404,
             body: Vec::new(),
@@ -117,14 +131,23 @@ impl ContentHttp for SmartHttp {
 /// A syntactically valid intent URL at a fixed file hex and token, for tests
 /// that do not need the grant to name the actual staged file.
 ///
-/// Parsing this URL yields base `http://files.test` and token `TOKEN`.
-const FAKE_INTENT: &str = "http://files.test/files/\
+/// Parsing this URL yields base `https://files.test` and token `TOKEN`.
+const FAKE_INTENT: &str = "https://files.test/files/\
     0000000000000000000000000000000000000000000000000000000000000000/intent?t=TOKEN";
 
 /// A grant URL with no `?t=` query, which the upload code must refuse without
 /// sending any HTTP request.
-const MALFORMED_INTENT: &str = "http://files.test/files/\
+const MALFORMED_INTENT: &str = "https://files.test/files/\
     0000000000000000000000000000000000000000000000000000000000000000/intent";
+
+/// A granted write address in cleartext on a host that is not loopback, which
+/// no mint signs and no upload may send a ticket to.
+const CLEARTEXT_INTENT: &str = "http://files.test/files/\
+    0000000000000000000000000000000000000000000000000000000000000000/intent?t=TOKEN";
+
+/// The same address rule on the read side.
+const CLEARTEXT_READ: &str = "http://files.test/files/\
+    0000000000000000000000000000000000000000000000000000000000000000?t=TOKEN";
 
 /// Creates a connected content client in `dir` with `http` and stages a
 /// generic payload, so the outbox has one entry ready for the next flush.
@@ -168,7 +191,7 @@ fn assert_upload_request_shapes(
     assert!(!puts.is_empty(), "at least one chunk PUT must be sent");
     for put in &puts {
         assert!(
-            put.url.starts_with("http://files.test/chunks/"),
+            put.url.starts_with("https://files.test/chunks/"),
             "chunk PUT must be at <base>/chunks/<hex>, got {}",
             put.url
         );
@@ -182,7 +205,7 @@ fn assert_upload_request_shapes(
     assert_eq!(last.method, "POST", "last request must be the commit POST");
     assert_eq!(
         last.url,
-        format!("http://files.test/files/{file_id}/commit?t=TOKEN"),
+        format!("https://files.test/files/{file_id}/commit?t=TOKEN"),
         "commit POST must name the actual file identity and carry the same token"
     );
 }
@@ -397,6 +420,152 @@ async fn malformed_grant_url_sends_no_requests_and_refuses_entry() {
     assert!(
         cc.retired_content().await.expect("read retired").is_empty(),
         "a refusal never retires the entry"
+    );
+}
+
+/// A grant that is neither HTTPS nor loopback HTTP is refused before any
+/// request leaves, because the ticket rides the address query.
+#[tokio::test]
+async fn a_cleartext_grant_sends_no_requests_and_refuses_entry() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new(std::iter::empty::<(u16, Vec<u8>)>());
+    let http_ref = http.clone();
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting(CLEARTEXT_INTENT),
+    )
+    .await;
+    let cc = ContentClient::attach(
+        client,
+        FsStore::new(dir.path().join("chunks")),
+        ROOT_KEY,
+        http,
+    )
+    .await
+    .expect("attach");
+    cc.stage(
+        io::Cursor::new(b"content"),
+        MimeClass::Generic,
+        |_conn, _id| Ok(()),
+    )
+    .await
+    .expect("stage");
+    let mut events = cc.events();
+
+    cc.flush_outbox().await.expect("flush");
+
+    assert!(
+        http_ref.sent().is_empty(),
+        "a cleartext address never reaches the network"
+    );
+    let event = events.try_recv().expect("UploadRefused must arrive");
+    assert!(
+        matches!(event, ContentEvent::UploadRefused { .. }),
+        "a cleartext grant is a refusal, got {event:?}"
+    );
+}
+
+/// A cleartext read address is refused the same way, before the download runs.
+#[tokio::test]
+async fn a_cleartext_read_grant_sends_no_request() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new(std::iter::empty::<(u16, Vec<u8>)>());
+    let http_ref = http.clone();
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting(CLEARTEXT_READ),
+    )
+    .await;
+    let cc = ContentClient::attach(
+        client,
+        FsStore::new(dir.path().join("chunks")),
+        ROOT_KEY,
+        http,
+    )
+    .await
+    .expect("attach");
+
+    let failure = cc
+        .bytes(connetto_file_core::FileId::from_bytes([3; 32]))
+        .await
+        .expect_err("a cleartext read address is refused");
+
+    assert!(
+        matches!(failure, ContentError::MalformedGrant(_)),
+        "a cleartext address is not the shape the mint signs, got {failure:?}"
+    );
+    assert!(
+        http_ref.sent().is_empty(),
+        "the refusal happens before any request leaves"
+    );
+}
+
+/// A `3xx` reply at any stage of the negotiation is a refusal, and it names no
+/// origin because nothing landed anywhere else.
+#[tokio::test]
+async fn a_redirect_reply_refuses_the_entry_at_every_stage() {
+    for (stage, replies) in [
+        ("intent", vec![(302_u16, Vec::new())]),
+        (
+            "commit",
+            vec![
+                (200_u16, br#"{"needed":[]}"#.to_vec()),
+                (303_u16, Vec::new()),
+            ],
+        ),
+    ] {
+        let dir = tempdir().expect("temp dir");
+        let cc = staged_outbox_entry(dir.path(), RecordingHttp::new(replies)).await;
+        let mut events = cc.events();
+
+        cc.flush_outbox().await.expect("flush");
+
+        let event = events.try_recv().expect("an event must arrive");
+        assert!(
+            matches!(event, ContentEvent::UploadRefused { .. }),
+            "a hop at the {stage} stage is a refusal, got {event:?}"
+        );
+        let refused = cc.refused_content().await.expect("read refused");
+        let detail = refused
+            .first()
+            .map(|(_, detail)| detail.clone())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("redirected"),
+            "the refusal detail names the hop, got {detail}"
+        );
+    }
+
+    let dir = tempdir().expect("temp dir");
+    let http = SmartHttp::redirecting_chunks();
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting(FAKE_INTENT),
+    )
+    .await;
+    let cc = ContentClient::attach(
+        client,
+        FsStore::new(dir.path().join("chunks")),
+        ROOT_KEY,
+        http,
+    )
+    .await
+    .expect("attach");
+    cc.stage(
+        io::Cursor::new(b"payload"),
+        MimeClass::Generic,
+        |_conn, _id| Ok(()),
+    )
+    .await
+    .expect("stage");
+    let mut events = cc.events();
+
+    cc.flush_outbox().await.expect("flush");
+
+    let event = events.try_recv().expect("an event must arrive");
+    assert!(
+        matches!(event, ContentEvent::UploadRefused { .. }),
+        "a hop at the chunk stage is a refusal, got {event:?}"
     );
 }
 

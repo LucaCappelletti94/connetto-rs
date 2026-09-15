@@ -11,7 +11,7 @@ use connetto_file_core::{ChunkStore, FileId, Manifest};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ContentError;
-use crate::http::{ContentHttp, HttpReply};
+use crate::http::{ContentHttp, HttpFailure, HttpReply};
 
 /// The intent body: the whole manifest the upload declares.
 #[derive(Serialize)]
@@ -54,6 +54,7 @@ struct WriteEndpoints {
 impl WriteEndpoints {
     /// Splits a granted write URL of the shape `<base>/files/<hex>/intent?t=<token>`.
     fn parse(grant_url: &str) -> Result<Self, ContentError> {
+        validate_ticket_url(grant_url)?;
         Self::split(grant_url).ok_or_else(|| ContentError::MalformedGrant(grant_url.to_owned()))
     }
 
@@ -179,18 +180,57 @@ pub(crate) async fn download<H: ContentHttp>(
     http: &H,
     grant_url: &str,
 ) -> Result<Vec<u8>, ContentError> {
+    validate_ticket_url(grant_url)?;
     let reply = send(http.get(grant_url, None), "download").await?;
     Ok(expect(reply, 200, "download")?.body)
 }
 
-/// Maps a transport failure onto the content error, naming the stage.
+/// Accepts only the addresses the mint signs, `https` anywhere or `http` on a
+/// loopback host.
+///
+/// The ticket rides the address query, so a rewritten scheme would carry it in
+/// clear off the machine whatever the mint refused to sign. The host comes
+/// from the parser rather than from the text, because userinfo of the form
+/// `localhost@elsewhere` reads as a loopback authority and resolves elsewhere.
+fn validate_ticket_url(grant_url: &str) -> Result<(), ContentError> {
+    let malformed = || ContentError::MalformedGrant(grant_url.to_owned());
+    let url = url::Url::parse(grant_url).map_err(|_| malformed())?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address == core::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == core::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        match url.scheme() {
+            "https" => return Ok(()),
+            "http" if loopback => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(malformed())
+}
+
+/// Maps one transport answer onto the content error, naming the stage.
+///
+/// A transport reports its own failure or the redirect it refused, and the
+/// status rule stays here, so every `3xx` that reaches the negotiation is the
+/// same refusal as a reply that landed elsewhere.
 async fn send<E: core::fmt::Display>(
-    request: impl Future<Output = Result<HttpReply, E>>,
+    request: impl Future<Output = Result<HttpReply, HttpFailure<E>>>,
     stage: &'static str,
 ) -> Result<HttpReply, ContentError> {
-    request
-        .await
-        .map_err(|err| ContentError::Transport(format!("{stage}: {err}")))
+    let reply = request.await.map_err(|failure| match failure {
+        HttpFailure::Transport(err) => ContentError::Transport(format!("{stage}: {err}")),
+        HttpFailure::Redirected { origin } => ContentError::Redirected { stage, origin },
+    })?;
+    if (300..400).contains(&reply.status) {
+        return Err(ContentError::Redirected {
+            stage,
+            origin: None,
+        });
+    }
+    Ok(reply)
 }
 
 /// Accepts exactly the status the protocol specifies for this stage.

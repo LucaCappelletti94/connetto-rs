@@ -594,7 +594,8 @@ impl RelayHub {
         Self::build(worker, hub_meta, Some(reconnect), None, None::<NoSleep>)
     }
 
-    /// Builds a content-aware reconnecting hub.
+    /// Builds a content-aware reconnecting hub whose transfers run under
+    /// `content_http`, which carries the deployment's idle bound.
     ///
     /// # Errors
     ///
@@ -608,6 +609,7 @@ impl RelayHub {
         hub_meta: &str,
         reconnect: HubReconnect<F, S>,
         content: ContentArchive<BrowserStore>,
+        content_http: BrowserHttp,
     ) -> Result<
         (
             Self,
@@ -627,7 +629,10 @@ impl RelayHub {
             worker,
             hub_meta,
             Some(reconnect),
-            Some(content),
+            Some(HubContent {
+                archive: content,
+                http: content_http,
+            }),
             Some(content_sleeper),
         )
     }
@@ -641,6 +646,7 @@ impl RelayHub {
         hub_meta: &str,
         reconnect: HubReconnect<F, S>,
         content: Option<ContentArchive<BrowserStore>>,
+        content_http: BrowserHttp,
     ) -> Result<
         (
             Self,
@@ -656,6 +662,10 @@ impl RelayHub {
         S: Sleeper + Clone,
     {
         let content_sleeper = content.as_ref().map(|_| reconnect.sleeper.clone());
+        let content = content.map(|archive| HubContent {
+            archive,
+            http: content_http,
+        });
         Self::build(worker, hub_meta, Some(reconnect), content, content_sleeper)
     }
 
@@ -670,7 +680,7 @@ impl RelayHub {
         mut worker: ConnettoConnection<U>,
         hub_meta: &str,
         reconnect: Option<HubReconnect<F, S>>,
-        content: Option<ContentArchive<BrowserStore>>,
+        content: Option<HubContent>,
         content_sleeper: Option<CS>,
     ) -> Result<
         (
@@ -687,7 +697,11 @@ impl RelayHub {
         S: Sleeper,
         CS: Sleeper,
     {
-        let local_tables = prepare_hub_worker(&mut worker, hub_meta, content.as_ref())?;
+        let local_tables = prepare_hub_worker(
+            &mut worker,
+            hub_meta,
+            content.as_ref().map(HubContent::archive),
+        )?;
         let (events_tx, events_rx) = unbounded_channel();
         let (notices_tx, notices_rx) = unbounded_channel();
         let hub = Self {
@@ -826,6 +840,20 @@ impl RelayHub {
     }
 }
 
+/// A hub's content wiring: the archive it walks and the transport its
+/// transfers run under, which carries the deployment's idle bound.
+struct HubContent {
+    archive: ContentArchive<BrowserStore>,
+    http: BrowserHttp,
+}
+
+impl HubContent {
+    /// The archive every content read and write goes through.
+    const fn archive(&self) -> &ContentArchive<BrowserStore> {
+        &self.archive
+    }
+}
+
 fn prepare_hub_worker<U: Transport>(
     worker: &mut ConnettoConnection<U>,
     hub_meta: &str,
@@ -954,13 +982,13 @@ enum ContentWalk {
 }
 
 /// Everything one hub task owns: the worker connection, tab state, the notice
-/// channel, the optional content archive, the event intake and the content
-/// retry schedule.
+/// channel, the optional content archive and the transport its transfers run
+/// under, the event intake and the content retry schedule.
 struct HubRuntime<U: Transport> {
     worker: ConnettoConnection<U>,
     state: HubState,
     notices: UnboundedSender<HubNotice>,
-    content: Option<ContentArchive<BrowserStore>>,
+    content: Option<HubContent>,
     events: UnboundedReceiver<HubEvent>,
     retry: ContentRetry,
     walk: WalkState,
@@ -1080,7 +1108,7 @@ where
             &mut self.worker,
             &mut self.state,
             &self.notices,
-            self.content.as_ref(),
+            self.content.as_ref().map(HubContent::archive),
             &mut self.walk,
             event,
         )
@@ -1146,7 +1174,7 @@ where
             driver,
             &mut self.state,
             &self.notices,
-            self.content.as_ref(),
+            self.content.as_ref().map(HubContent::archive),
             &mut self.events,
             &mut self.walk,
         )
@@ -1218,6 +1246,7 @@ where
             interrupted = Some(events.recv().await);
         };
         let (start, observed) = content
+            .archive()
             .begin_flush_next_or(worker, &mut retry.flush, cancel)
             .await;
         for event in observed {
@@ -1238,7 +1267,7 @@ where
             }
         };
         Ok(ContentWalk::Complete {
-            queued: content.sendable_files(worker)? > 0,
+            queued: content.archive().sendable_files(worker)? > 0,
             progressed: flush == ContentFlush::Progressed,
         })
     }
@@ -1248,7 +1277,7 @@ where
         let Some(content) = self.content.as_ref() else {
             return;
         };
-        match content.unsent_files(&mut self.worker) {
+        match content.archive().unsent_files(&mut self.worker) {
             Ok(files) => self.walk.unverified = files.into(),
             Err(err) => tracing::warn!(error = %err, "content integrity pass failed"),
         }
@@ -1266,7 +1295,9 @@ where
             retry,
             ..
         } = self;
-        if walk_turn(worker, content.as_ref(), walk).await == WalkTurn::Deferred {
+        if walk_turn(worker, content.as_ref().map(HubContent::archive), walk).await
+            == WalkTurn::Deferred
+        {
             retry.schedule(true, false);
             return Ok(true);
         }
@@ -1279,7 +1310,11 @@ where
 
     /// Run the content driver now when anything is queued.
     fn wake_content(&mut self) -> Result<(), RelayError> {
-        if content_sendable_files(&mut self.worker, self.content.as_ref())? > 0 {
+        if content_sendable_files(
+            &mut self.worker,
+            self.content.as_ref().map(HubContent::archive),
+        )? > 0
+        {
             self.retry.schedule(true, true);
         }
         Ok(())
@@ -1422,7 +1457,7 @@ async fn run_hub<U, F, S, CS>(
     events: UnboundedReceiver<HubEvent>,
     notices: UnboundedSender<HubNotice>,
     reconnect: Option<HubReconnect<F, S>>,
-    content: Option<ContentArchive<BrowserStore>>,
+    content: Option<HubContent>,
     content_sleeper: Option<CS>,
 ) -> Result<(), RelayError>
 where
@@ -1454,7 +1489,7 @@ async fn finish_content_upload<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     notices: &UnboundedSender<HubNotice>,
-    content: &ContentArchive<BrowserStore>,
+    content: &HubContent,
     events: &mut UnboundedReceiver<HubEvent>,
     walk: &mut WalkState,
     upload: &ContentUpload<BrowserStore>,
@@ -1463,8 +1498,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    let http = BrowserHttp::new();
-    let transfer = upload.transfer(&http);
+    let transfer = upload.transfer(&content.http);
     tokio::pin!(transfer);
     let mut serving = true;
     let mut event_error = None;
@@ -1476,7 +1510,8 @@ where
             TransferStep::Event(None) => serving = false,
             TransferStep::Event(Some(event)) => {
                 if let Err(error) =
-                    handle_hub_event(worker, state, notices, Some(content), walk, event).await
+                    handle_hub_event(worker, state, notices, Some(content.archive()), walk, event)
+                        .await
                 {
                     event_error = Some(error);
                     serving = false;
@@ -1484,7 +1519,10 @@ where
             }
         }
     };
-    let flush = content.finish_upload(worker, upload, result).await?;
+    let flush = content
+        .archive()
+        .finish_upload(worker, upload, result)
+        .await?;
     match event_error {
         Some(error) => Err(error),
         None => Ok(flush),
@@ -3705,8 +3743,8 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 #[cfg(test)]
 mod tests {
     use super::{
-        HubEvent, TabApplyError, apply_local_changeset, recovery_interrupts_attach,
-        recovery_serves_idle, schedule_recovery_event,
+        BrowserHttp, HubContent, HubEvent, TabApplyError, apply_local_changeset,
+        recovery_interrupts_attach, recovery_serves_idle, schedule_recovery_event,
     };
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
@@ -4272,7 +4310,10 @@ mod tests {
             worker,
             state: super::HubState::default(),
             notices,
-            content: Some(content),
+            content: Some(super::HubContent {
+                archive: content,
+                http: BrowserHttp::new(),
+            }),
             events: event_rx,
             retry: super::ContentRetry::default(),
             walk: super::WalkState {
@@ -4343,7 +4384,10 @@ mod tests {
             worker,
             state: HubState::default(),
             notices,
-            content: Some(content),
+            content: Some(HubContent {
+                archive: content,
+                http: BrowserHttp::new(),
+            }),
             events: event_rx,
             retry: ContentRetry::default(),
             walk: WalkState::default(),

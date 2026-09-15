@@ -34,14 +34,19 @@ diesel = { workspace = true }
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json = "1"
+# The ticket address rule is the mint's own, decided on a parsed URL.
+url = "2"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # The filesystem chunk store and the reqwest transport are native only. R68
 # adds the OPFS store and a worker transport for wasm behind the same seams.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 connetto-client = { path = "../connetto-client", default-features = false, features = ["native-transport"] }
-tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# The streamed request body whose pulls the idle watchdog observes.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"
@@ -61,15 +66,22 @@ web-sys = { version = "0.3", features = [
   "FileSystemRemoveOptions",
   "FileSystemWritableFileStream",
   "Headers",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
   "Request",
   "RequestInit",
   "RequestRedirect",
   "Response",
+  "ResponseType",
   "StorageManager",
   "WorkerGlobalScope",
   "WorkerNavigator",
   "Url",
   "WritableStream",
+  "XmlHttpRequest",
+  "XmlHttpRequestEventTarget",
+  "XmlHttpRequestResponseType",
+  "XmlHttpRequestUpload",
 ] }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
