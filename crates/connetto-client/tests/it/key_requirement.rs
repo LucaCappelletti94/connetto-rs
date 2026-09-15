@@ -290,6 +290,6 @@ fn the_export_skips_an_accepted_table() {
     .expect("open the replica");
     conn.batch_execute("INSERT INTO prefs (name, value) VALUES ('theme', 'dark')")
         .expect("write an accepted row");
-    conn.export_local_data(connetto_client::ExportScope::Everything)
+    conn.export_local_data(connetto_client::ExportScope::Everything, Vec::new())
         .expect("the accepted table is skipped rather than refused");
 }

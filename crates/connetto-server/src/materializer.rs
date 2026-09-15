@@ -1664,7 +1664,7 @@ where
         let table_id = catalog_helpers::table_id::<Postgres, _>(db, table)
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
         let version_column = version.name().to_owned();
-        let version_idx = catalog_helpers::column_id(db, table_id, &version_column)
+        let version_idx = catalog_helpers::column_id::<Postgres, _>(db, table_id, &version_column)
             .ok_or_else(|| MaterializerError::SchemaMismatch(version_column.clone()))?;
         let basis = basis(usize::from(version_idx))
             .ok_or_else(|| MaterializerError::MissingVersion(table.to_owned()))?;

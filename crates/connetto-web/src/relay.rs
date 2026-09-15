@@ -139,9 +139,11 @@ enum ArchiveServiceError {
     #[error(transparent)]
     Content(#[from] ContentError),
     #[error(
-        "the {bytes} bytes of unsent content are above the {ceiling} a browser worker can buffer, export from a native client"
+        "the {bytes} bytes of unsent content exceed the {ceiling}-byte disk ceiling for a device archive, export from a native client"
     )]
     Unbufferable { bytes: u64, ceiling: u64 },
+    #[error(transparent)]
+    Blob(#[from] crate::workers::BlobError),
 }
 
 /// The hub core has ended, so it can no longer answer.
@@ -235,7 +237,7 @@ enum HubEvent {
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
     Export(
         ExportScope,
-        futures_channel::oneshot::Sender<Result<Vec<u8>, ArchiveServiceError>>,
+        futures_channel::oneshot::Sender<Result<web_sys::Blob, ArchiveServiceError>>,
     ),
     /// Acknowledge lost content files, so they stop being reported. Same
     /// reason: only the core can reach the connection.
@@ -245,7 +247,7 @@ enum HubEvent {
     ),
     /// Import an archive: device-private rows and queued writes. Same reason.
     Import(
-        Vec<u8>,
+        web_sys::Blob,
         futures_channel::oneshot::Sender<Result<(ImportOutcome, usize), ArchiveServiceError>>,
     ),
     /// Query every refused outbox entry with its detail, answered from the
@@ -762,7 +764,10 @@ impl RelayHub {
     ///
     /// [`ExportRefused::Gone`] when the core has ended.
     /// [`ExportRefused::Failed`] when the core answered and the export failed.
-    pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ExportRefused> {
+    pub async fn export_local_data(
+        &self,
+        scope: ExportScope,
+    ) -> Result<web_sys::Blob, ExportRefused> {
         self.ask(|reply| HubEvent::Export(scope, reply))
             .await?
             .map_err(|err| ExportRefused::Failed(err.to_string()))
@@ -780,9 +785,9 @@ impl RelayHub {
     /// [`ImportRefused::Failed`] when the plan or apply step is refused.
     pub async fn import_local_data(
         &self,
-        bytes: Vec<u8>,
+        archive: web_sys::Blob,
     ) -> Result<(ImportOutcome, usize), ImportRefused> {
-        self.ask(|reply| HubEvent::Import(bytes, reply))
+        self.ask(|reply| HubEvent::Import(archive, reply))
             .await?
             .map_err(|err| ImportRefused::Failed(err.to_string()))
     }
@@ -1641,8 +1646,8 @@ where
         HubEvent::Export(scope, reply) => {
             let _ = reply.send(export_archive(worker, content, scope).await);
         }
-        HubEvent::Import(bytes, reply) => {
-            let _ = reply.send(import_archive(worker, content, &bytes).await);
+        HubEvent::Import(blob, reply) => {
+            let _ = reply.send(import_archive(worker, content, blob).await);
             // An import can restore the chunks a scan in progress has already missed, and
             // can leave its own behind when it fails part way.
             walk.scan = ChunkScan::default();
@@ -1703,45 +1708,47 @@ async fn export_archive<U>(
     worker: &mut ConnettoConnection<U>,
     content: Option<&ContentArchive<BrowserStore>>,
     scope: ExportScope,
-) -> Result<Vec<u8>, ArchiveServiceError>
+) -> Result<web_sys::Blob, ArchiveServiceError>
 where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    match content {
-        Some(content) => {
-            let bytes = content.unsent_content_bytes(worker)?;
-            if bytes > crate::workers::MAX_ARCHIVE_BUFFER_BYTES {
-                return Err(ArchiveServiceError::Unbufferable {
-                    bytes,
-                    ceiling: crate::workers::MAX_ARCHIVE_BUFFER_BYTES,
-                });
-            }
-            content
-                .export_local_data(worker, scope)
-                .await
-                .map_err(Into::into)
+    if let Some(content) = content {
+        let bytes = content.unsent_content_bytes(worker)?;
+        if bytes > crate::workers::MAX_ARCHIVE_BYTES {
+            return Err(ArchiveServiceError::Unbufferable {
+                bytes,
+                ceiling: crate::workers::MAX_ARCHIVE_BYTES,
+            });
         }
-        None => worker.export_local_data(scope).map_err(Into::into),
+        let sink = content
+            .export_local_data(worker, scope, crate::workers::BlobSink::new())
+            .await?;
+        Ok(sink.into_blob()?)
+    } else {
+        let sink = worker.export_local_data(scope, crate::workers::BlobSink::new())?;
+        Ok(sink.into_blob()?)
     }
 }
 
 async fn import_archive<U>(
     worker: &mut ConnettoConnection<U>,
     content: Option<&ContentArchive<BrowserStore>>,
-    bytes: &[u8],
+    blob: web_sys::Blob,
 ) -> Result<(ImportOutcome, usize), ArchiveServiceError>
 where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    let source = crate::workers::BlobSource::new(blob)?;
+    let mut reader = std::io::BufReader::new(source);
     if let Some(content) = content {
         content
-            .import_local_data(worker, bytes)
+            .import_local_data(worker, &mut reader)
             .await
-            .map_err(Into::into)
+            .map_err(ArchiveServiceError::from)
     } else {
-        let plan = worker.import_local_data(bytes)?;
+        let plan = worker.import_local_data(&mut reader)?;
         let collisions = plan.collisions().len();
         let outcome = worker.apply_import(&plan, &ImportChoices::keeping_the_file())?;
         // The import is committed, so a failed replay is left to the outbox driver.
@@ -4212,8 +4219,10 @@ mod tests {
             .await
             .expect("the write queues while the source is offline");
         let archive = source
-            .export_local_data(ExportScope::Everything)
-            .expect("the source exports");
+            .export_local_data(ExportScope::Everything, crate::workers::BlobSink::new())
+            .expect("the source exports")
+            .into_blob()
+            .expect("the sink closes into one blob");
 
         let mut target =
             ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
@@ -4223,7 +4232,7 @@ mod tests {
             .await
             .expect("the target attaches");
 
-        let (outcome, _collisions) = super::import_archive(&mut target, None, &archive)
+        let (outcome, _collisions) = super::import_archive(&mut target, None, archive)
             .await
             .expect("a committed import must survive a failing replay");
         assert!(
@@ -4254,8 +4263,10 @@ mod tests {
             .batch_execute("INSERT INTO drafts VALUES (1, 'swept')")
             .expect("the source writes one row");
         let archive = source
-            .export_local_data(ExportScope::Everything)
-            .expect("the source exports");
+            .export_local_data(ExportScope::Everything, crate::workers::BlobSink::new())
+            .expect("the source exports")
+            .into_blob()
+            .expect("the sink closes into one blob");
 
         let worker =
             ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use crate::ClientError;
 
@@ -9,10 +9,19 @@ use super::super::{
 };
 use super::{Entry, Manifest, checked_attachment_total, validate_attachment_path};
 
-/// Read an archive back, refusing a format or version this build does not
-/// know before any entry is decompressed.
-pub(crate) fn read(bytes: &[u8]) -> Result<Incoming, ClientError> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(read_error)?;
+/// An open archive, which reads one declared attachment at a time.
+///
+/// The source stays open behind the plan the caller holds, so an attachment
+/// costs its own bytes and nothing else, and an archive of attachments costs
+/// the largest one.
+pub(crate) struct ArchiveReader<R> {
+    zip: zip::ZipArchive<R>,
+}
+
+/// Open an archive, refusing a format or version this build does not know
+/// before any entry is decompressed.
+pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader<R>), ClientError> {
+    let mut zip = zip::ZipArchive::new(source).map_err(read_error)?;
     let manifest = read_manifest(&mut zip)?;
     if manifest.format != FORMAT {
         return Err(ClientError::Import(format!(
@@ -31,21 +40,59 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Incoming, ClientError> {
     let synced_present = declared.contains(SYNCED_ROWS);
     let local_rows = read_entry(&mut zip, LOCAL_ROWS)?;
     let pending = read_pending_queue(&mut zip)?;
-    let attachments = read_attachments(&mut zip, &manifest.entries)?;
-    Ok(Incoming {
-        scope,
-        fingerprint: manifest.schema_fingerprint,
-        account: manifest.account,
-        synced_present,
-        local_rows,
-        pending,
-        attachments,
+    let attachments = declare_attachments(&mut zip, &manifest.entries)?;
+    Ok((
+        Incoming {
+            scope,
+            fingerprint: manifest.schema_fingerprint,
+            account: manifest.account,
+            synced_present,
+            local_rows,
+            pending,
+            attachments,
+        },
+        ArchiveReader { zip },
+    ))
+}
+
+impl<R: Read + Seek> ArchiveReader<R> {
+    /// Reads one attachment into `into`, replacing whatever it held.
+    ///
+    /// The buffer is the caller's so a walk over many attachments reuses one
+    /// allocation.
+    pub(crate) fn read_attachment(
+        &mut self,
+        path: &str,
+        into: &mut Vec<u8>,
+    ) -> Result<(), ClientError> {
+        validate_attachment_path(path, ClientError::Import)?;
+        let mut file = self.zip.by_name(path).map_err(|_| {
+            ClientError::Import(format!("the archive carries no attachment at {path}"))
+        })?;
+        let size = file.size();
+        let capacity = capacity_for(path, size)?;
+        into.clear();
+        into.reserve(capacity);
+        file.read_to_end(into).map_err(read_error)?;
+        if into.len() != capacity {
+            return Err(ClientError::Import(format!(
+                "archive attachment {path} declares {size} bytes and reads back {}",
+                into.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn capacity_for(path: &str, size: u64) -> Result<usize, ClientError> {
+    usize::try_from(size).map_err(|_| {
+        ClientError::Import(format!(
+            "archive attachment {path} does not fit this platform"
+        ))
     })
 }
 
-fn read_manifest(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
-) -> Result<Manifest, ClientError> {
+fn read_manifest<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Manifest, ClientError> {
     let mut entry = zip.by_name(MANIFEST).map_err(|_| {
         ClientError::Import(
             "the archive carries no manifest, so it is not a connetto export".to_owned(),
@@ -67,8 +114,8 @@ fn parse_scope(scope: &str) -> Result<ExportScope, ClientError> {
     }
 }
 
-fn read_pending_queue(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+fn read_pending_queue<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
 ) -> Result<Vec<Vec<u8>>, ClientError> {
     match read_entry(zip, PENDING)? {
         Some(bytes) => decode_pending(&bytes),
@@ -76,8 +123,8 @@ fn read_pending_queue(
     }
 }
 
-fn validate_archive_layout(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+fn validate_archive_layout<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
     manifest: &Manifest,
     scope: ExportScope,
 ) -> Result<HashSet<String>, ClientError> {
@@ -107,9 +154,7 @@ fn declared_paths(entries: &[Entry]) -> Result<HashSet<String>, ClientError> {
     Ok(declared)
 }
 
-fn stored_paths(
-    zip: &zip::ZipArchive<std::io::Cursor<&[u8]>>,
-) -> Result<HashSet<String>, ClientError> {
+fn stored_paths<R: Read + Seek>(zip: &zip::ZipArchive<R>) -> Result<HashSet<String>, ClientError> {
     let mut stored = HashSet::new();
     for name in zip.file_names() {
         let path = name.to_owned();
@@ -186,8 +231,8 @@ fn require_encoding(entry: &Entry, expected: &str) -> Result<(), ClientError> {
     }
 }
 
-fn read_entry(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+fn read_entry<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, ClientError> {
     read_entry_bounded(zip, path, MAX_ATTACHMENTS_BYTES)
@@ -197,8 +242,8 @@ fn read_entry(
 ///
 /// The limit is a parameter so a test proves the boundary over kilobytes rather than over
 /// the gigabytes the shipped ceiling names.
-fn read_entry_bounded(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+fn read_entry_bounded<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
     path: &str,
     limit: u64,
 ) -> Result<Option<Vec<u8>>, ClientError> {
@@ -224,14 +269,18 @@ fn read_entry_bounded(
     Ok(Some(decompressed))
 }
 
-fn read_attachments(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+/// Names every attachment the archive carries and sizes it from the directory.
+///
+/// The per-entry and aggregate ceilings are decided here, so an archive above
+/// either is refused before one attachment body is read.
+fn declare_attachments<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
     entries: &[Entry],
 ) -> Result<Vec<ArchiveAttachment>, ClientError> {
     let mut attachments = Vec::new();
     let mut total = 0_u64;
     for entry in entries.iter().filter(|entry| entry.kind == "attachment") {
-        let mut file = zip.by_name(&entry.path).map_err(read_error)?;
+        let file = zip.by_name(&entry.path).map_err(read_error)?;
         if file.compression() != zip::CompressionMethod::Stored {
             return Err(ClientError::Import(format!(
                 "archive attachment {} must use ZIP Stored compression",
@@ -240,15 +289,8 @@ fn read_attachments(
         }
         let size = file.size();
         total = checked_attachment_total(&entry.path, size, total, ClientError::Import)?;
-        let capacity = usize::try_from(size).map_err(|_| {
-            ClientError::Import(format!(
-                "archive attachment {} does not fit this platform",
-                entry.path
-            ))
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes).map_err(read_error)?;
-        attachments.push(ArchiveAttachment::from_raw(entry.path.clone(), bytes));
+        capacity_for(&entry.path, size)?;
+        attachments.push(ArchiveAttachment::from_raw(entry.path.clone(), size));
     }
     Ok(attachments)
 }
@@ -297,9 +339,19 @@ mod tests {
 
     use serde_json::json;
 
-    use super::super::super::{Archive, ExportScope};
+    use super::super::super::ExportScope;
+    use super::super::super::{Archive, Incoming};
     use super::decode_pending;
-    use super::read;
+
+    /// Opens one archive held in a buffer and keeps only what it declares.
+    fn read(bytes: &[u8]) -> Result<Incoming, crate::ClientError> {
+        super::open(std::io::Cursor::new(bytes)).map(|(incoming, _)| incoming)
+    }
+
+    /// One archive in a buffer, the shape the refusal cases build by hand.
+    fn write(archive: &Archive<'_>) -> Result<Vec<u8>, crate::ClientError> {
+        super::super::write::start(Vec::new(), archive)?.finish()
+    }
 
     /// What an export writes, an import reads back unchanged.
     #[test]
@@ -313,7 +365,7 @@ mod tests {
             pending: vec![vec![9u8; 16]],
             attachments: &[],
         };
-        let bytes = super::super::write::write(&archive).expect("write");
+        let bytes = write(&archive).expect("write");
         let read_back = read(&bytes).expect("read");
         assert_eq!(read_back.scope, ExportScope::Unsynced);
         assert_eq!(read_back.fingerprint, "abc123");
@@ -448,6 +500,48 @@ mod tests {
         );
     }
 
+    /// An attachment above the per-entry ceiling is refused from what the
+    /// directory declares, so the bytes it claims never have to exist.
+    ///
+    /// The archive here is a few hundred bytes long and declares an entry of
+    /// 256 MiB plus one, which is the only honest way to test a ceiling that
+    /// large.
+    #[test]
+    fn an_attachment_above_the_entry_ceiling_is_refused_without_reading_it() {
+        let declaration = super::super::super::ArchiveAttachment::new("content/chunks/big", 5)
+            .expect("attachment declaration");
+        let mut export = super::super::write::start(
+            Vec::new(),
+            &Archive {
+                scope: ExportScope::Unsynced,
+                fingerprint: "abc123".to_owned(),
+                account: None,
+                synced_rows: None,
+                local_rows: None,
+                pending: Vec::new(),
+                attachments: std::slice::from_ref(&declaration),
+            },
+        )
+        .expect("start");
+        export
+            .write_attachment("content/chunks/big", b"small")
+            .expect("attachment body");
+        let mut bytes = export.finish().expect("finish");
+        let claimed = super::super::super::MAX_ATTACHMENT_BYTES + 1;
+        set_zip_uncompressed_size(&mut bytes, b"content/chunks/big", claimed);
+        assert!(
+            bytes.len() < 4096,
+            "the archive stays small, which is what makes the refusal meaningful"
+        );
+
+        let error = read(&bytes).expect_err("an oversized entry must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("content/chunks/big") && text.contains(&claimed.to_string()),
+            "the refusal names the entry and its size: {text}"
+        );
+    }
+
     fn assert_invalid_entries(
         entries: &serde_json::Value,
         files: &[(&str, &[u8])],
@@ -494,6 +588,23 @@ mod tests {
                 bytes[at - 22..at - 20].copy_from_slice(&method);
             } else if at >= 46 && &bytes[at - 46..at - 42] == b"PK\x01\x02" {
                 bytes[at - 36..at - 34].copy_from_slice(&method);
+            }
+        }
+    }
+
+    /// Rewrites one entry's declared uncompressed size in both headers.
+    fn set_zip_uncompressed_size(bytes: &mut [u8], path: &[u8], size: u64) {
+        let size = u32::try_from(size).unwrap_or(u32::MAX).to_le_bytes();
+        let positions: Vec<_> = bytes
+            .windows(path.len())
+            .enumerate()
+            .filter_map(|(at, value)| (value == path).then_some(at))
+            .collect();
+        for at in positions {
+            if at >= 30 && &bytes[at - 30..at - 26] == b"PK\x03\x04" {
+                bytes[at - 8..at - 4].copy_from_slice(&size);
+            } else if at >= 46 && &bytes[at - 46..at - 42] == b"PK\x01\x02" {
+                bytes[at - 22..at - 18].copy_from_slice(&size);
             }
         }
     }

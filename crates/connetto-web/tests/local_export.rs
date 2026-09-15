@@ -3,20 +3,22 @@
 //! The archive format changed in R56: entries are SQLite change records
 //! (patchsets), not plain databases. Each patchset is decompressed and
 //! applied to a fresh in-memory connection, and the rows are read back.
-//! The bytes are checked before the rows: the wasm SQLite build has
-//! silently returned empty results before.
+//! The blob size is checked as well as the rows, because the wasm SQLite
+//! build has silently returned empty results before.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
 use connetto_core::test_support::FakeTransport;
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
-use connetto_web::workers::{DB_ALIVE_LOCK, request_export, serve_export_requests};
+use connetto_web::workers::{
+    BlobSink, BlobSource, DB_ALIVE_LOCK, request_export, serve_export_requests,
+};
 use connetto_web::{RelayHub, locks};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
-use std::io::{Cursor, Read};
+use std::io::{BufReader, Read};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -71,8 +73,7 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
     .expect("a resolved key")
     .with_tier(TIER_DDL);
     let mut worker = ConnettoConnection::connect(
-        // Silent, not merely accepting: an accepting transport reports a close
-        // once its scripted frames run out, and the hub pump ends with it.
+        // accepting_but_silent avoids a close after the scripted frames run out.
         FakeTransport::accepting_but_silent(),
         &replica,
         REPLICA_DDL,
@@ -90,8 +91,6 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
         .execute(worker.conn())
         .expect("write a device-private row");
 
-    // The hub takes the connection, so from here the data is only reachable
-    // by asking the core, which is exactly what the export service does.
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
     wasm_bindgen_futures::spawn_local(async move {
         pump.await.expect("hub pump");
@@ -99,12 +98,14 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
     serve_export_requests(hub).expect("install the export service");
     let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
 
-    let bytes = request_export(ExportScope::Everything)
+    let blob = request_export(ExportScope::Everything)
         .await
         .expect("the worker answers");
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("a plain zip");
+    assert!(blob.size() > 0.0, "the blob carries archive bytes");
+    let source = BlobSource::new(blob).expect("BlobSource in dedicated worker");
+    let mut archive =
+        zip::ZipArchive::new(BufReader::new(source)).expect("a zip readable via BlobSource");
 
-    // The manifest declares the outer archive contract.
     let manifest: serde_json::Value =
         serde_json::from_slice(&entry_raw(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
@@ -118,64 +119,122 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
         "device-private rows travel as a patchset"
     );
 
-    // Read both patchsets (stored zstd-compressed inside the zip entry).
-    let synced_zstd = entry_raw(&mut archive, "synced.patchset");
-    let private_zstd = entry_raw(&mut archive, "device-private.patchset");
-    assert!(!synced_zstd.is_empty(), "the synced patchset is not empty");
-    assert!(
-        !private_zstd.is_empty(),
-        "the device-private patchset is not empty"
-    );
+    let synced_patch = decompress_entry(&mut archive, "synced.patchset");
+    let private_patch = decompress_entry(&mut archive, "device-private.patchset");
+    apply_and_assert_label(&synced_patch, REPLICA_DDL, "synced");
+    apply_and_assert_body(&private_patch, TIER_DDL, "device-private");
+}
 
-    let synced_patch = zstd::decode_all(synced_zstd.as_slice()).expect("decompress synced");
-    let private_patch = zstd::decode_all(private_zstd.as_slice()).expect("decompress private");
-    assert!(
-        !synced_patch.is_empty(),
-        "synced patchset decompresses to real bytes"
-    );
-    assert!(
-        !private_patch.is_empty(),
-        "private patchset decompresses to real bytes"
-    );
+/// Reads a zip entry and decompresses it from zstd.
+fn decompress_entry(archive: &mut zip::ZipArchive<BufReader<BlobSource>>, name: &str) -> Vec<u8> {
+    let raw = entry_raw(archive, name);
+    assert!(!raw.is_empty(), "{name} must not be empty");
+    let patch = zstd::decode_all(raw.as_slice()).expect("decompress patchset");
+    assert!(!patch.is_empty(), "{name} must decompress to bytes");
+    patch
+}
 
-    // Apply each patchset to a fresh in-memory connection and read the rows.
-    // This is the definitive proof: the wasm SQLite build has silently returned
-    // empty results before, so the byte check above and these queries are both
-    // required.
-    let mut synced_conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
-    synced_conn
-        .batch_execute(REPLICA_DDL)
-        .expect("synced schema");
-    synced_conn
-        .apply_patchset(&synced_patch, |_| ConflictAction::Abort)
-        .expect("apply synced patchset");
+/// Applies a patchset to a fresh `items` table and asserts the label.
+fn apply_and_assert_label(patch: &[u8], ddl: &str, expected: &str) {
+    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
+    conn.batch_execute(ddl).expect("schema");
+    conn.apply_patchset(patch, |_| ConflictAction::Abort)
+        .expect("apply patchset");
     assert_eq!(
         items::table
             .select(items::label)
-            .load::<Option<String>>(&mut synced_conn)
-            .expect("read synced rows"),
-        vec![Some("synced".to_owned())]
-    );
-
-    let mut private_conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
-    private_conn.batch_execute(TIER_DDL).expect("tier schema");
-    private_conn
-        .apply_patchset(&private_patch, |_| ConflictAction::Abort)
-        .expect("apply private patchset");
-    assert_eq!(
-        drafts::table
-            .select(drafts::body)
-            .load::<Option<String>>(&mut private_conn)
-            .expect("read private rows"),
-        vec![Some("device-private".to_owned())]
+            .load::<Option<String>>(&mut conn)
+            .expect("read rows"),
+        vec![Some(expected.to_owned())]
     );
 }
 
-/// One archive entry as raw bytes. Data entries are zstd-compressed; the
-/// manifest is plain JSON. The caller decides which is which.
-fn entry_raw(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
+/// Applies a patchset to a fresh `drafts` table and asserts the body.
+fn apply_and_assert_body(patch: &[u8], ddl: &str, expected: &str) {
+    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open sqlite");
+    conn.batch_execute(ddl).expect("schema");
+    conn.apply_patchset(patch, |_| ConflictAction::Abort)
+        .expect("apply patchset");
+    assert_eq!(
+        drafts::table
+            .select(drafts::body)
+            .load::<Option<String>>(&mut conn)
+            .expect("read rows"),
+        vec![Some(expected.to_owned())]
+    );
+}
+
+/// One archive entry as raw bytes, which are zstd for a row entry and plain
+/// for the manifest.
+fn entry_raw(archive: &mut zip::ZipArchive<BufReader<BlobSource>>, name: &str) -> Vec<u8> {
     let mut e = archive.by_name(name).expect("the entry is present");
     let mut bytes = Vec::new();
     e.read_to_end(&mut bytes).expect("read the entry");
     bytes
+}
+
+/// Bytes written into a `BlobSink` produce an archive a `BlobSource` reads
+/// back without a copy.
+///
+/// This also exercises data descriptors, because the streaming zip writer that
+/// `BlobSink` sees emits them after each entry.
+#[wasm_bindgen_test]
+async fn blob_sink_to_blob_source_round_trip() {
+    let storage = ReplicaStorage::install().await;
+    let replica = "r26-blob-sink-rt.sqlite";
+    let tier = tier_db_name(replica);
+    storage.delete_db(replica).expect("clear earlier replica");
+    storage.delete_db(&tier).expect("clear earlier tier");
+    storage.reserve(2).await.expect("room in the pool");
+    let url = storage.db_url(replica);
+    let rep = Replica::encrypted_file(&url, Some(ReplicaKey::from_bytes([0x27; ReplicaKey::LEN])))
+        .expect("a resolved key")
+        .with_tier(TIER_DDL);
+    let mut conn = ConnettoConnection::connect(
+        FakeTransport::accepting_but_silent(),
+        &rep,
+        REPLICA_DDL,
+        &ClientConfig::new("r26-sink-rt"),
+        None,
+    )
+    .await
+    .expect("connect");
+    diesel::insert_into(drafts::table)
+        .values((drafts::id.eq(42), drafts::body.eq("round-tripped")))
+        .execute(conn.conn())
+        .expect("write tier row");
+
+    // Export using BlobSink directly, proving the streaming writer path works.
+    let sink = BlobSink::new();
+    let sink = conn
+        .export_local_data(ExportScope::Unsynced, sink)
+        .expect("export to sink");
+    let blob = sink.into_blob().expect("sink into blob");
+    assert!(blob.size() > 0.0, "the blob is non-empty");
+
+    // Read it back with BlobSource and verify the tier row survives.
+    let source = BlobSource::new(blob).expect("BlobSource in dedicated worker");
+    let mut archive = zip::ZipArchive::new(BufReader::new(source)).expect("zip from BlobSource");
+    let private_zstd = {
+        let mut e = archive
+            .by_name("device-private.patchset")
+            .expect("private patchset entry");
+        let mut v = Vec::new();
+        e.read_to_end(&mut v).expect("read patchset entry");
+        v
+    };
+    let patch = zstd::decode_all(private_zstd.as_slice()).expect("decompress patchset");
+    let mut check = diesel::SqliteConnection::establish(":memory:").expect("check db");
+    check.batch_execute(TIER_DDL).expect("tier schema");
+    check
+        .apply_patchset(&patch, |_| ConflictAction::Abort)
+        .expect("apply patchset");
+    assert_eq!(
+        drafts::table
+            .select(drafts::body)
+            .load::<Option<String>>(&mut check)
+            .expect("read rows"),
+        vec![Some("round-tripped".to_owned())],
+        "the row written to the BlobSink survives a BlobSource read"
+    );
 }

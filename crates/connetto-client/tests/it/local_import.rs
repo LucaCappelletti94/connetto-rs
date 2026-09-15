@@ -149,12 +149,15 @@ async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
     write_offline(&mut source, "DELETE FROM items WHERE id = 10").await;
     let archive = source
         .conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export");
 
     // The replacement device: same build, same account, nothing on it.
     let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice");
-    let plan = fresh.conn.import_local_data(&archive).expect("plan");
+    let plan = fresh
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan");
     assert_eq!(plan.device_only_rows(), 2);
     assert_eq!(
         plan.queued_writes(),
@@ -214,6 +217,68 @@ async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
     assert_eq!(deletes, 1, "the offline delete travelled as a delete");
 }
 
+/// A file on disk restores the replica the same way a buffer does, which is
+/// the native shape the decision names for both ends.
+#[tokio::test]
+async fn an_archive_on_disk_restores_the_same_replica_a_buffer_does() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let path = dir.path().join("device.zip");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    source
+        .conn
+        .conn()
+        .batch_execute("INSERT INTO drafts (id, body) VALUES (1, 'first'), (2, 'second')")
+        .expect("seed the tier");
+    write_offline(
+        &mut source,
+        "INSERT INTO items (id, label) VALUES (10, 'made offline')",
+    )
+    .await;
+    source
+        .conn
+        .export_local_data(
+            ExportScope::Everything,
+            std::fs::File::create(&path).expect("create the archive file"),
+        )
+        .expect("export to the file");
+
+    let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice");
+    let plan = fresh
+        .conn
+        .import_local_data(std::fs::File::open(&path).expect("open the archive file"))
+        .expect("plan from the file");
+    assert_eq!(plan.device_only_rows(), 2);
+    assert_eq!(plan.queued_writes(), 1);
+    let outcome = fresh
+        .conn
+        .apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply");
+    assert_eq!(outcome.rows_restored, 2);
+    assert_eq!(outcome.writes_restored, 1);
+    assert_eq!(
+        drafts(&mut fresh.conn),
+        vec![
+            DraftRow {
+                id: 1,
+                body: "first".to_owned()
+            },
+            DraftRow {
+                id: 2,
+                body: "second".to_owned()
+            },
+        ],
+        "the data that never syncs came back out of the file",
+    );
+    assert_eq!(
+        items(&mut fresh.conn),
+        vec![ItemRow {
+            id: 10,
+            label: "made offline".to_owned()
+        }],
+        "the offline write replayed locally",
+    );
+}
+
 /// The file wins, but never silently: the clash is in the plan before anything
 /// is written, and the answer given is the one honoured.
 #[tokio::test]
@@ -226,7 +291,7 @@ async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoure
         .expect("seed");
     let archive = source
         .conn
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
 
     let mut mine = device(SYNCED_DDL, TIER_DDL, "alice");
@@ -235,7 +300,10 @@ async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoure
         .batch_execute("INSERT INTO drafts (id, body) VALUES (7, 'my version')")
         .expect("seed");
 
-    let plan = mine.conn.import_local_data(&archive).expect("plan");
+    let plan = mine
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan");
     let [clash] = plan.collisions() else {
         panic!(
             "expected exactly one clash, got {}",
@@ -267,7 +335,10 @@ async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoure
     assert_eq!(drafts(&mut mine.conn)[0].body, "my version");
 
     // Answering the same clash the other way takes the file's.
-    let plan = mine.conn.import_local_data(&archive).expect("plan again");
+    let plan = mine
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan again");
     let outcome = mine
         .conn
         .apply_import(&plan, &ImportChoices::keeping_mine().keep(0, Keep::TheFile))
@@ -282,10 +353,13 @@ async fn a_mismatched_schema_is_refused_by_name() {
     let mut source = device(WIDER_SYNCED_DDL, TIER_DDL, "alice");
     let archive = source
         .conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export");
     let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
-    match target.conn.import_local_data(&archive) {
+    match target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+    {
         Err(ClientError::Import(message)) => assert!(
             message.contains("different schema"),
             "the refusal names the schema: {message}"
@@ -301,10 +375,13 @@ async fn another_accounts_archive_is_refused_by_name() {
     let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
     let archive = source
         .conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export");
     let mut target = device(SYNCED_DDL, TIER_DDL, "bob");
-    match target.conn.import_local_data(&archive) {
+    match target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+    {
         Err(ClientError::Import(message)) => assert!(
             message.contains("another account"),
             "the refusal names the account: {message}"
@@ -327,10 +404,13 @@ async fn a_tier_with_an_extra_table_is_refused() {
         .expect("seed");
     let archive = source
         .conn
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
     let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
-    match target.conn.import_local_data(&archive) {
+    match target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+    {
         Err(ClientError::Import(message)) => assert!(
             message.contains("different schema"),
             "the refusal names the schema: {message}"
@@ -355,10 +435,13 @@ async fn a_full_queue_travels_whole() {
     }
     let archive = source
         .conn
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
     let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
-    let plan = target.conn.import_local_data(&archive).expect("plan");
+    let plan = target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan");
     assert_eq!(plan.queued_writes(), 8);
     let outcome = target
         .conn
@@ -384,7 +467,7 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
         .expect("seed the source");
     let archive = source
         .conn
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
 
     let mut target = device(SYNCED_DDL, KEPT_TIER_DDL, "alice");
@@ -398,7 +481,10 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
         )
         .expect("seed the target");
 
-    let plan = target.conn.import_local_data(&archive).expect("plan");
+    let plan = target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan");
     assert_eq!(plan.collisions().len(), 1);
     target
         .conn
@@ -424,18 +510,31 @@ async fn attachments_round_trip_and_bookkeeping_failure_rolls_back_the_import() 
         "INSERT INTO items (id, label) VALUES (17, 'with attachment')",
     )
     .await;
+    let body = b"plain chunk";
+    let body_len = u64::try_from(body.len()).expect("the body length fits u64");
     let attachment =
-        ArchiveAttachment::new("content/chunks/abc", b"plain chunk".to_vec()).expect("attachment");
-    let archive = source
+        ArchiveAttachment::new("content/chunks/abc", body_len).expect("attachment declaration");
+    let mut export = source
         .conn
-        .export_local_data_with_attachments(ExportScope::Unsynced, &[attachment])
+        .export_local_data_with_attachments(ExportScope::Unsynced, &[attachment], Vec::new())
         .expect("export");
+    export
+        .write_attachment("content/chunks/abc", body)
+        .expect("attachment body");
+    let archive = export.finish().expect("finish");
 
     let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
-    let plan = target.conn.import_local_data(&archive).expect("plan");
+    let mut plan = target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+        .expect("plan");
     assert_eq!(plan.attachments().len(), 1);
     assert_eq!(plan.attachments()[0].path(), "content/chunks/abc");
-    assert_eq!(plan.attachments()[0].bytes(), b"plain chunk");
+    assert_eq!(plan.attachments()[0].byte_len(), body_len);
+    let mut read_back = Vec::new();
+    plan.read_attachment("content/chunks/abc", &mut read_back)
+        .expect("attachment reads back");
+    assert_eq!(read_back, body);
 
     let plain_error = target
         .conn

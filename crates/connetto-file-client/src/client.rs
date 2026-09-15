@@ -2,7 +2,7 @@
 
 use core::fmt::Display;
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
@@ -24,7 +24,7 @@ use crate::import::{
     ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
 };
 use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
-use crate::worker::{content_attachments, outbox_manifests, retire, unreadable_chunk_count};
+use crate::worker::{outbox_manifests, retire, unreadable_chunk_count, write_content_entries};
 use crate::{ticket, upload};
 
 /// How many content events are held for a slow observer.
@@ -162,32 +162,43 @@ where
         })
     }
 
-    /// Exports unsent content and replica data.
+    /// Exports unsent content and replica data to `sink`.
+    ///
+    /// The sink is written through as each chunk is read from the store, so
+    /// one chunk is in memory at a time. Returns the sink once the archive is
+    /// complete.
     ///
     /// # Errors
     ///
     /// [`ContentError`] when the outbox, chunk store, or replica export fails.
-    pub async fn export_local_data(&self, scope: ExportScope) -> Result<Vec<u8>, ContentError> {
+    pub async fn export_local_data<W: std::io::Write>(
+        &self,
+        scope: ExportScope,
+        sink: W,
+    ) -> Result<W, ContentError> {
         let _writing = self.content_writes.lock().await;
         let manifests = self.client.with_conn(outbox_manifests).await?;
-        let attachments = content_attachments(&self.store, &self.root_key, &manifests).await?;
-        self.client
-            .with_conn(|conn| conn.export_local_data_with_attachments(scope, &attachments))
-            .await
-            .map_err(ContentError::Client)
+        let declaration = crate::archive::declare_content(&manifests)?;
+        let export = self
+            .client
+            .with_conn(|conn| {
+                conn.export_local_data_with_attachments(scope, &declaration.attachments, sink)
+            })
+            .await?;
+        write_content_entries(&self.store, &self.root_key, &declaration, export).await
     }
 
-    /// Verifies replica data and content identities without mutation.
+    /// Validates replica data and content identities without writing anywhere.
     ///
     /// # Errors
     ///
     /// [`ContentError`] when the archive or its content does not validate.
-    pub async fn prepare_local_data_import(
+    pub async fn prepare_local_data_import<R: Read + Seek>(
         &self,
-        bytes: &[u8],
-    ) -> Result<ContentImportPlan, ContentError> {
+        source: R,
+    ) -> Result<ContentImportPlan<R>, ContentError> {
         self.client
-            .with_conn(|connection| prepare_content_import(connection, bytes))
+            .with_conn(|connection| prepare_content_import(connection, source))
             .await
     }
 
@@ -196,9 +207,9 @@ where
     /// # Errors
     ///
     /// [`ContentError`] when chunk storage or replica import fails.
-    pub async fn apply_local_data_import(
+    pub async fn apply_local_data_import<R: Read + Seek>(
         &self,
-        plan: &ContentImportPlan,
+        plan: &mut ContentImportPlan<R>,
         choices: &ImportChoices,
     ) -> Result<ImportOutcome, ContentError> {
         let _writing = self.content_writes.lock().await;

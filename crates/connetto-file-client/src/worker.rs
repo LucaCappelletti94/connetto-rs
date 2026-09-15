@@ -710,21 +710,26 @@ where
         }
     }
 
-    /// Exports unsent content and replica data.
+    /// Exports unsent content and replica data to `sink`.
+    ///
+    /// The sink is written through as each chunk is read from the store, so
+    /// one chunk is in memory at a time. Returns the sink once the archive is
+    /// complete.
     ///
     /// # Errors
     ///
     /// [`ContentError`] when the outbox, chunk store, or replica export fails.
-    pub async fn export_local_data<T: Transport>(
+    pub async fn export_local_data<T: Transport, W: std::io::Write>(
         &self,
         connection: &mut ConnettoConnection<T>,
         scope: ExportScope,
-    ) -> Result<Vec<u8>, ContentError> {
+        sink: W,
+    ) -> Result<W, ContentError> {
         let manifests = outbox_manifests(connection)?;
-        let attachments = content_attachments(&self.store, &self.root_key, &manifests).await?;
-        connection
-            .export_local_data_with_attachments(scope, &attachments)
-            .map_err(Into::into)
+        let declaration = crate::archive::declare_content(&manifests)?;
+        let export =
+            connection.export_local_data_with_attachments(scope, &declaration.attachments, sink)?;
+        write_content_entries(&self.store, &self.root_key, &declaration, export).await
     }
 
     /// Validates and applies content under this device key.
@@ -732,14 +737,14 @@ where
     /// # Errors
     ///
     /// [`ContentError`] when validation, chunk storage, or replica import fails.
-    pub async fn import_local_data<T: Transport>(
+    pub async fn import_local_data<T: Transport, R: std::io::Read + std::io::Seek>(
         &self,
         connection: &mut ConnettoConnection<T>,
-        bytes: &[u8],
+        source: R,
     ) -> Result<(ImportOutcome, usize), ContentError> {
-        let plan = prepare_content_import(connection, bytes)?;
+        let mut plan = prepare_content_import(connection, source)?;
         let collisions = plan.replica_plan().collisions().len();
-        write_import_chunks(&self.store, &self.root_key, &plan).await?;
+        write_import_chunks(&self.store, &self.root_key, &mut plan).await?;
         let outcome = apply_content_import(connection, &plan, &ImportChoices::keeping_the_file())?;
         // The import is committed, so a failed replay is left to the outbox driver.
         let _ = connection.replay_pending().await;
@@ -759,30 +764,31 @@ pub(crate) fn outbox_manifests<T: Transport>(
         .collect()
 }
 
-pub(crate) async fn content_attachments<B>(
+/// Writes the content index entry and then one entry per distinct chunk.
+///
+/// Each chunk is read from the store immediately before its own entry is
+/// written, so the export holds one chunk at a time whatever the archive
+/// weighs, and both export paths get that from the same place.
+pub(crate) async fn write_content_entries<B, W>(
     store: &B,
     root_key: &[u8; 32],
-    manifests: &[Manifest],
-) -> Result<Vec<connetto_client::ArchiveAttachment>, ContentError>
+    declaration: &crate::archive::ContentDeclaration,
+    mut export: connetto_client::LocalDataExport<W>,
+) -> Result<W, ContentError>
 where
     B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    W: std::io::Write,
 {
+    export.write_attachment(crate::archive::MANIFESTS_PATH, &declaration.manifest_bytes)?;
     let store = EncryptingStore::new(store.clone(), root_key);
-    let mut seen = HashSet::new();
-    let mut chunks = Vec::new();
-    for manifest in manifests {
-        for chunk in manifest.chunks() {
-            if !seen.insert(chunk.hash) {
-                continue;
-            }
-            let bytes = store
-                .read_chunk(&chunk.hash)
-                .await
-                .map_err(|error| ContentError::Store(error.to_string()))?;
-            chunks.push((chunk.hash, bytes));
-        }
+    for hash in &declaration.chunk_hashes {
+        let bytes = store
+            .read_chunk(hash)
+            .await
+            .map_err(|error| ContentError::Store(error.to_string()))?;
+        export.write_attachment(&format!("{}{hash}", crate::archive::CHUNK_PREFIX), &bytes)?;
     }
-    crate::archive::encode(manifests, chunks)
+    Ok(export.finish()?)
 }
 
 /// Fingerprints the ordered chunk list, so a replaced manifest is never resumed into.

@@ -375,16 +375,14 @@ fn worker_origin() -> String {
         .unwrap_or_default()
 }
 
-/// Offer `bytes` to the user as a file download named `name`.
+/// Offer `blob` to the user as a file download named `name`.
 ///
-/// A `Blob` at an object URL plus a synthetic anchor click, which is the only
-/// way a page can hand over a file the user decides where to keep. The URL is
-/// revoked immediately: the click has already taken its own reference.
-fn download_bytes(name: &str, bytes: &[u8]) -> Result<(), JsValue> {
-    let parts = js_sys::Array::new();
-    parts.push(&js_sys::Uint8Array::from(bytes));
-    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+/// The worker hands over the archive as a `Blob` already, so the page puts it
+/// at an object URL and clicks a synthetic anchor without reading one byte of
+/// it. The URL is revoked immediately, since the click has already taken its
+/// own reference.
+fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), JsValue> {
+    let url = web_sys::Url::create_object_url_with_blob(blob)?;
     let document = web_sys::window()
         .and_then(|window| window.document())
         .ok_or_else(|| JsValue::from_str("no document"))?;
@@ -1317,7 +1315,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             {
                 let import_status = import_status.clone();
                 spawn_local(async move {
-                    let message = match workers::request_import(file).await {
+                    let message = match workers::request_import(file.into()).await {
                         Ok((outcome, clashes)) => {
                             let mut msg = format!(
                                 "{} row(s) restored, {} kept, {} write(s) restored",
@@ -1341,10 +1339,10 @@ fn dashboard(props: &DashboardProps) -> Html {
             let export_status = export_status.clone();
             spawn_local(async move {
                 let message = match workers::request_export(ExportScope::Everything).await {
-                    Ok(bytes) => {
-                        let len = bytes.len();
-                        match download_bytes(EXPORT_FILE_NAME, &bytes) {
-                            Ok(()) => format!("{len} bytes offered as {EXPORT_FILE_NAME}"),
+                    Ok(blob) => {
+                        let size = blob.size();
+                        match download_blob(EXPORT_FILE_NAME, &blob) {
+                            Ok(()) => format!("{size} bytes offered as {EXPORT_FILE_NAME}"),
                             Err(err) => format!("download refused: {err:?}"),
                         }
                     }
