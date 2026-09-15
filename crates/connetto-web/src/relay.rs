@@ -1484,7 +1484,7 @@ where
             }
         }
     };
-    let flush = content.finish_upload(worker, upload, result)?;
+    let flush = content.finish_upload(worker, upload, result).await?;
     match event_error {
         Some(error) => Err(error),
         None => Ok(flush),

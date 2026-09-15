@@ -521,7 +521,7 @@ where
             Ok(ContentFlushStart::Complete(flush)) => Ok(flush),
             Ok(ContentFlushStart::Upload(upload)) => {
                 let result = upload.transfer(http).await;
-                self.finish_upload(cursor.connection, &upload, result)
+                self.finish_upload(cursor.connection, &upload, result).await
             }
             Err(error) => Err(error),
         };
@@ -630,16 +630,44 @@ where
 
     /// Finishes local bookkeeping for an HTTP transfer.
     ///
+    /// A loss is confirmed by reading the store again, since a concurrent import can
+    /// restore a missing chunk during the transfer, matching the boot pass and the scan.
+    ///
     /// # Errors
     ///
     /// [`ContentError::Replica`] when the outbox entry cannot be removed.
-    pub fn finish_upload<T: Transport>(
+    pub async fn finish_upload<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
         upload: &ContentUpload<B>,
         result: Result<(), ContentError>,
     ) -> Result<ContentFlush, ContentError> {
+        if let Err(error) = &result
+            && error.outcome() == AttemptOutcome::Lost
+        {
+            return self.retire_if_still_lost(connection, upload.file_id).await;
+        }
         Self::finish_attempt(connection, upload.file_id, result)
+    }
+
+    /// Retires the entry only when its bytes are still conclusively unreadable.
+    async fn retire_if_still_lost<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<ContentFlush, ContentError> {
+        let still_lost = match db::load_manifest(connection.conn(), file_id)? {
+            None => true,
+            Some(manifest) => unreadable_chunk_count(&self.store, &self.root_key, &manifest)
+                .await
+                .is_some(),
+        };
+        if still_lost {
+            retire(connection.conn(), file_id)?;
+            Ok(ContentFlush::Progressed)
+        } else {
+            Ok(ContentFlush::Deferred)
+        }
     }
 
     fn finish_attempt<T: Transport>(
@@ -1483,6 +1511,95 @@ mod tests {
             db::retired(connection.conn()).expect("read retired"),
             vec![walked, scanned],
             "both passes retire the file with the missing manifest"
+        );
+    }
+
+    /// A loss reported by the transfer is confirmed against the store before retiring, so a
+    /// chunk a concurrent import restored during the transfer keeps the entry.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn finish_upload_confirms_the_loss_before_retiring() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("confirm-loss"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store.clone(), &[1; 32]);
+        let manifest = process_file(&vec![7u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the bytes chunk");
+        let file_id = manifest.file_id();
+        db::put_manifest(connection.conn(), &manifest).expect("record the manifest");
+        db::enqueue(connection.conn(), file_id).expect("queue the file");
+
+        let upload = super::ContentUpload {
+            file_id,
+            upload_url: String::new(),
+            manifest: manifest.clone(),
+            store: store.clone(),
+            root_key: [1; 32],
+        };
+        let lost = || crate::error::ContentError::LostChunk {
+            file_id,
+            detail: "chunk gone".to_owned(),
+        };
+
+        let flush = archive
+            .finish_upload(&mut connection, &upload, Err(lost()))
+            .await
+            .expect("finish_upload runs");
+        assert_eq!(
+            flush,
+            super::ContentFlush::Deferred,
+            "a chunk still present keeps the entry"
+        );
+        assert!(
+            db::retired(connection.conn())
+                .expect("read retired")
+                .is_empty(),
+            "nothing is retired while the bytes are present"
+        );
+        assert_eq!(
+            db::outbox(connection.conn()).expect("read the outbox"),
+            vec![file_id],
+            "the entry stays queued for another walk"
+        );
+
+        encrypted
+            .delete_chunk(&manifest.chunks()[0].hash)
+            .await
+            .expect("drop the only chunk");
+        let flush = archive
+            .finish_upload(&mut connection, &upload, Err(lost()))
+            .await
+            .expect("finish_upload runs");
+        assert_eq!(
+            flush,
+            super::ContentFlush::Progressed,
+            "a confirmed loss settles the entry"
+        );
+        assert_eq!(
+            db::retired(connection.conn()).expect("read retired"),
+            vec![file_id],
+            "a confirmed loss is retired"
+        );
+        assert!(
+            db::outbox(connection.conn())
+                .expect("read the outbox")
+                .is_empty(),
+            "a retired entry leaves the outbox"
         );
     }
 
