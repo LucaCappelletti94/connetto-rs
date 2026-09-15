@@ -1,6 +1,5 @@
 # connetto-rs
 
-[![Codacy](https://app.codacy.com/project/badge/Grade/118530a97b784c4bb6eed646eb69465d)](https://app.codacy.com/gh/LucaCappelletti94/connetto-rs/dashboard)
 
 Transport and sync layer for keeping `SQLite`-based edge and frontend clients in sync with a `PostgreSQL` backend. See `docs/architecture/` for the design; `docs/architecture/00-overview.md` is the entry point and `docs/architecture/open-questions.md` indexes every decision.
 
