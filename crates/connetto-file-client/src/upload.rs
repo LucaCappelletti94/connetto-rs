@@ -163,6 +163,7 @@ async fn send_chunks<H: ContentHttp, S: ChunkStore>(
             Err(err) => {
                 return Err(ContentError::LostChunk {
                     file_id: manifest.file_id(),
+                    hash: chunk.hash,
                     detail: err.to_string(),
                 });
             }
