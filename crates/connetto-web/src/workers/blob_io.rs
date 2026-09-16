@@ -14,10 +14,29 @@
 
 use std::io;
 
-/// Error returned when a [`Blob`](web_sys::Blob) construction or read fails.
+/// A browser refusal on the way in or out of a [`Blob`](web_sys::Blob).
 #[derive(Debug, thiserror::Error)]
-#[error("blob operation failed: {0}")]
-pub struct BlobError(String);
+pub enum BlobError {
+    /// `FileReaderSync` is absent, which is what a page rather than a
+    /// dedicated worker meets.
+    #[error("this context has no FileReaderSync, so a blob cannot be read here: {detail}")]
+    NoReader {
+        /// The browser exception text.
+        detail: String,
+    },
+    /// One part of a sink could not become a blob of its own.
+    #[error("the browser refused one part of the archive: {detail}")]
+    Part {
+        /// The browser exception text.
+        detail: String,
+    },
+    /// The parts could not be joined into the archive.
+    #[error("the browser refused the archive built from its parts: {detail}")]
+    Archive {
+        /// The browser exception text.
+        detail: String,
+    },
+}
 
 /// A synchronous seekable reader over a `web_sys::Blob`.
 ///
@@ -42,8 +61,9 @@ impl BlobSource {
     /// Returns a [`BlobError`] when `FileReaderSync::new()` fails, which
     /// happens outside a dedicated worker.
     pub fn new(blob: web_sys::Blob) -> Result<Self, BlobError> {
-        let reader = web_sys::FileReaderSync::new()
-            .map_err(|e| BlobError(format!("FileReaderSync unavailable: {e:?}")))?;
+        let reader = web_sys::FileReaderSync::new().map_err(|err| BlobError::NoReader {
+            detail: format!("{err:?}"),
+        })?;
         let size = blob.size();
         debug_assert!(
             size.is_finite() && size >= 0.0 && size.fract() == 0.0,
@@ -176,8 +196,11 @@ impl BlobSink {
     /// Hands `bytes` to the browser as one more part.
     fn push_part(parts: &js_sys::Array, bytes: &[u8]) -> Result<(), BlobError> {
         let array = js_sys::Uint8Array::from(bytes);
-        let part = web_sys::Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&array))
-            .map_err(|err| BlobError(format!("a sink part failed: {err:?}")))?;
+        let part = web_sys::Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&array)).map_err(
+            |err| BlobError::Part {
+                detail: format!("{err:?}"),
+            },
+        )?;
         parts.push(&part);
         Ok(())
     }
@@ -199,8 +222,9 @@ impl BlobSink {
     /// Returns a [`BlobError`] when the browser refuses a `Blob` constructor.
     pub fn into_blob(mut self) -> Result<web_sys::Blob, BlobError> {
         self.flush_part()?;
-        web_sys::Blob::new_with_blob_sequence(&self.parts)
-            .map_err(|err| BlobError(format!("the archive blob failed: {err:?}")))
+        web_sys::Blob::new_with_blob_sequence(&self.parts).map_err(|err| BlobError::Archive {
+            detail: format!("{err:?}"),
+        })
     }
 }
 

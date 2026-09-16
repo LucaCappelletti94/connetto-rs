@@ -21,7 +21,7 @@
 //!   IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source
 //!   `target/dev-idp.env` before starting the server.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use connetto_client::auth::{
@@ -186,13 +186,24 @@ fn export_path() -> PathBuf {
     data_dir().join("connetto-local-data.zip")
 }
 
-/// Opens the export file beside the replica, which the archive is written
-/// straight into, and names it so the user can go and open it.
+/// Opens the file the archive is written into, beside the one a previous
+/// export left.
+///
+/// A partly written archive never takes the name the user knows, so an export
+/// that fails leaves the last good one where it was.
 fn create_export_file() -> std::io::Result<(PathBuf, std::fs::File)> {
-    let path = export_path();
+    let path = export_path().with_extension("zip.part");
     std::fs::create_dir_all(data_dir())?;
     let file = std::fs::File::create(&path)?;
     Ok((path, file))
+}
+
+/// Moves a finished archive onto the name the user knows, replacing whatever
+/// a previous export left there.
+fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
+    let path = export_path();
+    std::fs::rename(part, &path)?;
+    Ok(path)
 }
 
 /// Restart the current binary and exit this process, so a sign-out takes
@@ -1097,23 +1108,28 @@ fn app() -> Element {
                         spawn(async move {
                             let message = match create_export_file() {
                                 Err(err) => format!("could not open the export file: {err}"),
-                                Ok((path, file)) => match client
+                                Ok((part, file)) => match client
                                     .with_conn(move |c| {
                                         c.export_local_data(ExportScope::Everything, file)
                                     })
                                     .await
                                 {
-                                    Ok(file) => match file.metadata() {
-                                        Ok(meta) => format!(
-                                            "Wrote {} bytes to {}",
-                                            meta.len(),
-                                            path.display()
-                                        ),
-                                        Err(err) => format!(
-                                            "wrote {} but could not measure it: {err}",
-                                            path.display()
-                                        ),
-                                    },
+                                    Ok(file) => {
+                                        let written = file.metadata().map(|meta| meta.len());
+                                        drop(file);
+                                        match (publish_export(&part), written) {
+                                            (Ok(path), Ok(bytes)) => {
+                                                format!("Wrote {bytes} bytes to {}", path.display())
+                                            }
+                                            (Ok(path), Err(err)) => format!(
+                                                "wrote {} but could not measure it: {err}",
+                                                path.display()
+                                            ),
+                                            (Err(err), _) => {
+                                                format!("could not replace the last export: {err}")
+                                            }
+                                        }
+                                    }
                                     Err(err) => format!("export failed: {err}"),
                                 },
                             };

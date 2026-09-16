@@ -29,10 +29,23 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 const REPLICA_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
-/// The replica holding the data to export.
+/// The replica holding the data the blob test exports.
 const SRC: &str = "r56-import-src.sqlite";
-/// The replica the import lands in.
+/// The replica the blob test imports into.
 const DST: &str = "r56-import-dst.sqlite";
+/// The replica holding the data the round-trip test exports.
+///
+/// Its own name because the suite runs every test at once in one page, where
+/// two tests sharing a database delete each other's while it is open.
+const RT_SRC: &str = "r56-rt-src.sqlite";
+/// The replica the round-trip test imports into.
+const RT_DST: &str = "r56-rt-dst.sqlite";
+/// Every replica and tier the tests in this file hold at once.
+///
+/// The suite runs them together in one page, so each reserves the whole
+/// figure rather than its own four, since a reservation counts the databases
+/// that exist when it is made and cannot see a sibling's yet.
+const POOL_SLOTS: u32 = 8;
 /// Export channel unique to this test so concurrent tests do not race.
 const BLOB_EXPORT_CH: &str = "r56-blob-tier-export";
 /// Import channel unique to this test so concurrent tests do not race.
@@ -84,8 +97,8 @@ async fn a_blob_lands_in_the_worker_tier() {
     storage
         .delete_db(&dst_tier)
         .expect("clear earlier dst tier");
-    // Two connections in sequence, so four slots, a replica and a tier each.
-    storage.reserve(4).await.expect("room in the pool");
+
+    storage.reserve(POOL_SLOTS).await.expect("room in the pool");
 
     let archive_blob = {
         let src_url = storage.db_url(SRC);
@@ -217,20 +230,24 @@ async fn verify_tier_row_restored(
 #[wasm_bindgen_test]
 async fn export_reply_blob_round_trips_into_import() {
     let storage = ReplicaStorage::install().await;
-    let src_tier = tier_db_name(SRC);
-    let dst_tier = tier_db_name(DST);
-    storage.delete_db(SRC).expect("clear earlier src replica");
+    let src_tier = tier_db_name(RT_SRC);
+    let dst_tier = tier_db_name(RT_DST);
+    storage
+        .delete_db(RT_SRC)
+        .expect("clear earlier src replica");
     storage
         .delete_db(&src_tier)
         .expect("clear earlier src tier");
-    storage.delete_db(DST).expect("clear earlier dst replica");
+    storage
+        .delete_db(RT_DST)
+        .expect("clear earlier dst replica");
     storage
         .delete_db(&dst_tier)
         .expect("clear earlier dst tier");
-    storage.reserve(4).await.expect("room in the pool");
+    storage.reserve(POOL_SLOTS).await.expect("room in the pool");
 
     let export_blob = {
-        let src_url = storage.db_url(SRC);
+        let src_url = storage.db_url(RT_SRC);
         let src_replica = Replica::encrypted_file(
             &src_url,
             Some(ReplicaKey::from_bytes([0x57; ReplicaKey::LEN])),
@@ -269,7 +286,7 @@ async fn export_reply_blob_round_trips_into_import() {
         "export blob must carry bytes before import"
     );
 
-    let dst_url = storage.db_url(DST);
+    let dst_url = storage.db_url(RT_DST);
     let dst_replica = Replica::encrypted_file(
         &dst_url,
         Some(ReplicaKey::from_bytes([0x57; ReplicaKey::LEN])),

@@ -139,9 +139,9 @@ enum ArchiveServiceError {
     #[error(transparent)]
     Content(#[from] ContentError),
     #[error(
-        "the {bytes} bytes of unsent content exceed the {ceiling}-byte disk ceiling for a device archive, export from a native client"
+        "the {bytes} bytes of unsent content are above the {ceiling} bytes an archive may carry as attachments"
     )]
-    Unbufferable { bytes: u64, ceiling: u64 },
+    ContentTooLarge { bytes: u64, ceiling: u64 },
     #[error(transparent)]
     Blob(#[from] crate::workers::BlobError),
 }
@@ -1715,10 +1715,10 @@ where
 {
     if let Some(content) = content {
         let bytes = content.unsent_content_bytes(worker)?;
-        if bytes > crate::workers::MAX_ARCHIVE_BYTES {
-            return Err(ArchiveServiceError::Unbufferable {
+        if bytes > connetto_client::MAX_ATTACHMENTS_BYTES {
+            return Err(ArchiveServiceError::ContentTooLarge {
                 bytes,
-                ceiling: crate::workers::MAX_ARCHIVE_BYTES,
+                ceiling: connetto_client::MAX_ATTACHMENTS_BYTES,
             });
         }
         let sink = content

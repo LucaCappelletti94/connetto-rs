@@ -44,9 +44,12 @@ const PENDING: &str = "pending.changesets";
 const NOTE: &str = "rows are zstd SQLite change records. Attachments declare their encoding";
 /// The most one attachment may ask a device to hold on disk, and in memory
 /// while its own entry is written or read.
-const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// The most every attachment together may ask a device to hold on disk.
-const MAX_ATTACHMENTS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+///
+/// Nothing bounds an archive's total size, because neither direction holds
+/// one.
+pub const MAX_ATTACHMENTS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// An opaque file another client layer carries in the device archive, named
 /// and sized rather than held.

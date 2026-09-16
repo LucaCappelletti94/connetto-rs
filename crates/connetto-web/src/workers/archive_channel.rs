@@ -829,15 +829,6 @@ pub async fn request_import_on(
     archive: Blob,
     channel: &str,
 ) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "MAX_ARCHIVE_BYTES is well within f64 exact integer range (2^53)"
-    )]
-    if archive.size() > super::MAX_ARCHIVE_BYTES as f64 {
-        return Err(crate::relay::ImportRefused::Failed(
-            "archive exceeds the device disk ceiling; import it from a native client".to_owned(),
-        ));
-    }
     let channel = BroadcastChannel::new(channel)
         .map_err(|err| crate::relay::ImportRefused::Failed(format!("import channel: {err:?}")))?;
     let state: ImportSlot = Rc::new(RefCell::new(ImportWait::default()));

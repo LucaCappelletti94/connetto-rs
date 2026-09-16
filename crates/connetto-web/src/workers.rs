@@ -32,8 +32,6 @@ pub const DB_ALIVE_LOCK: &str = "connetto-db-alive";
 pub const EXPORT_CHANNEL: &str = "connetto-export";
 /// The channel a tab asks for a local-data import on.
 pub const IMPORT_CHANNEL: &str = "connetto-import";
-/// Maximum bytes an archive may ask a device to hold on disk.
-pub const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests;

@@ -81,7 +81,7 @@ pub mod teardown;
 
 pub use archive::{
     ArchiveAttachment, Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome,
-    ImportPlan, Keep, LocalDataExport,
+    ImportPlan, Keep, LocalDataExport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES,
 };
 #[cfg(feature = "native-auth")]
 pub use auth::{
