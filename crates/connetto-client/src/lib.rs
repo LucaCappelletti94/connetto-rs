@@ -1785,10 +1785,14 @@ fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Requalify one `CREATE TABLE` statement into the local tier schema, so an
 /// unqualified DDL document lands in the attached database instead of `main`.
-fn qualify_create_table(statement: &str) -> Result<String, ClientError> {
+/// A `PRAGMA` names no table and passes through as connection state.
+fn qualify_tier_statement(statement: &str) -> Result<String, ClientError> {
+    if strip_ci(statement, "PRAGMA").is_some() {
+        return Ok(statement.to_owned());
+    }
     let rest = strip_ci(statement, "CREATE TABLE").ok_or_else(|| {
         ClientError::Session(format!(
-            "local tier DDL supports only CREATE TABLE statements, got: {statement}"
+            "local tier DDL supports only CREATE TABLE and PRAGMA statements, got: {statement}"
         ))
     })?;
     let (if_not_exists, name_part) = match strip_ci(rest.trim_start(), "IF NOT EXISTS") {
@@ -2295,6 +2299,9 @@ where
             cipher::unlock(&mut db, key)?;
         }
         db.batch_execute("PRAGMA journal_mode=WAL")?;
+        // The translated schema expects Postgres's case-sensitive LIKE, and the
+        // pragma is connection state, so the DDL's own copy covers a first boot alone.
+        db.batch_execute("PRAGMA case_sensitive_like = 1")?;
         // Incremental auto-vacuum keeps the freelist bookkeeping current at
         // every commit so the trimming pass can later hand pages back to the
         // filesystem. The mode is stored in the file and fixed at the first
@@ -2442,7 +2449,7 @@ where
                 // target and with no filesystem probe, which wasm does not have.
                 if local_tier_tables(&mut self.db)?.is_empty() {
                     for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        self.db.batch_execute(&qualify_create_table(statement)?)?;
+                        self.db.batch_execute(&qualify_tier_statement(statement)?)?;
                     }
                 }
             }

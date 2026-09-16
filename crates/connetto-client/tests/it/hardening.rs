@@ -52,6 +52,16 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The plain replica's table, for the LIKE dialect check.
+    items (id) {
+        /// Item identifier, the primary key.
+        id -> diesel::sql_types::BigInt,
+        /// Item label, matched with LIKE.
+        label -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+    }
+}
+
 fn config() -> ClientConfig {
     ClientConfig::new("r18").with_login(Some(Grant::new("user:tester")))
 }
@@ -320,5 +330,69 @@ fn a_column_default_may_only_call_an_innocuous_function() {
             .expect("read back"),
         vec![7],
         "and the value came from the function rather than from a fold"
+    );
+}
+
+/// The translated schema is Postgres's dialect, where `LIKE` is case
+/// sensitive, and the pragma that makes SQLite agree is connection state, so
+/// a reopen that runs no DDL must set it as much as the first boot does.
+#[test]
+fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("replica.sqlite");
+    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
+        .expect("a resolved key");
+    let lowercase_matches = |conn: &mut ConnettoConnection<FakeTransport>| {
+        items::table
+            .filter(items::label.like("a%"))
+            .count()
+            .get_result::<i64>(conn.conn())
+            .expect("count the lowercase matches")
+    };
+
+    let mut conn =
+        ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).expect("open");
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq("Alpha")))
+        .execute(conn.conn())
+        .expect("insert");
+    assert_eq!(
+        lowercase_matches(&mut conn),
+        0,
+        "a first boot matches like Postgres"
+    );
+    drop(conn);
+
+    let mut conn = ConnettoConnection::<FakeTransport>::open_existing(&replica, &config(), None)
+        .expect("reopen with no DDL");
+    assert_eq!(
+        lowercase_matches(&mut conn),
+        0,
+        "and so does a reopen that ran no DDL"
+    );
+}
+
+/// pg2sqlite leads every script it emits with the dialect pragma, and a tier
+/// script is one of those, so the pragma passes through and the table still
+/// lands in the tier.
+#[test]
+fn a_tier_script_may_lead_with_a_pragma() {
+    const PRAGMA_LED_TIER_DDL: &str = "PRAGMA case_sensitive_like = 1;\n\
+        CREATE TABLE drafts (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("replica.sqlite");
+    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
+        .expect("a resolved key")
+        .with_tier(PRAGMA_LED_TIER_DDL);
+    let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None)
+        .expect("a pragma in the tier script is not a refusal");
+    diesel::insert_into(drafts::table)
+        .values((drafts::id.eq(1), drafts::body.eq("in the tier")))
+        .execute(conn.conn())
+        .expect("the table the script declared exists in the tier");
+    assert_eq!(
+        conn.conn().get_limit(SqliteLimit::Attached),
+        1,
+        "the tier is attached and the pragma created nothing"
     );
 }
