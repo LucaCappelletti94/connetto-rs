@@ -663,6 +663,30 @@ impl Fixture {
         exec(&self.admin, sql).await;
     }
 
+    /// The position past everything committed so far, in the integer space a
+    /// live cursor carries, so a frame caused by an earlier change sits at or
+    /// below it and one caused by a later change above it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no admin connection is available or the read fails.
+    pub async fn committed_position(&self) -> u64 {
+        // Raw because `pg_lsn` has no diesel type, as in the server's `slot.rs`.
+        #[derive(diesel::QueryableByName)]
+        struct Position {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            position: i64,
+        }
+        let mut conn = self.admin.get().await.expect("admin connection");
+        let row: Position = sql_query(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS position",
+        )
+        .get_result(&mut *conn)
+        .await
+        .expect("read the committed position");
+        u64::try_from(row.position).expect("a WAL position is never negative")
+    }
+
     /// Run a batch of fixture DDL statements as admin, in order.
     pub async fn setup(&self, statements: &[&str]) {
         for statement in statements {

@@ -243,12 +243,27 @@ async fn live_past(
 /// A frame carries the position of the change that caused it, so a frame at or
 /// below this one belongs to a change the test already waited for and a frame
 /// past it belongs to a change nothing here asked to see.
+///
+/// The frames a test meets understate the change it waited for, because a
+/// membership move reads the live table and can deliver a row before the
+/// row's own event is dispatched, whose frame then arrives above every
+/// position seen so far. Before writing the change it wants silence about, a
+/// test therefore accounts for everything the database has committed
+/// ([`note_committed`](Self::note_committed)), which is exactly the set of
+/// changes it asked for and nothing after.
 #[derive(Default)]
 struct Accounted(Option<u64>);
 
 impl Accounted {
     fn note(&mut self, cursor: &Cursor) {
-        let position = position_of(cursor);
+        self.note_position(position_of(cursor));
+    }
+
+    async fn note_committed(&mut self, fixture: &Fixture) {
+        self.note_position(fixture.committed_position().await);
+    }
+
+    fn note_position(&mut self, position: u64) {
         self.0 = Some(self.0.map_or(position, |seen| seen.max(position)));
     }
 
@@ -264,6 +279,27 @@ fn position_of(cursor: &Cursor) -> u64 {
         .try_into()
         .expect("a live cursor carries a position");
     u64::from_be_bytes(bytes)
+}
+
+/// A patchset's operations, one verb and a key each, for a refusal to name.
+fn describe(patchset_zstd: &[u8]) -> String {
+    let bytes = zstd::decode_all(patchset_zstd).expect("decompress patch");
+    let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&bytes).expect("parse patch") else {
+        return "a non-patchset payload".to_owned();
+    };
+    let ops: Vec<String> = set
+        .iter()
+        .map(|op| match &op {
+            PatchsetOp::Insert { values, .. } => format!("insert {}", int_of(&values[0])),
+            PatchsetOp::Update { pk, .. } => format!("update {}", int_of(&pk[0])),
+            PatchsetOp::Delete { pk, .. } => format!("delete {}", int_of(&pk[0])),
+        })
+        .collect();
+    if ops.is_empty() {
+        "no operation".to_owned()
+    } else {
+        ops.join(", ")
+    }
 }
 
 /// Apply every `sub_id` frame until the replica holds exactly `expected`. A
@@ -329,9 +365,10 @@ async fn no_live_past(
                 let now = replica.ids();
                 assert!(
                     accounted.covers(&patch.cursor),
-                    "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}, and the replica went from {held:?} to {now:?}",
+                    "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}, carrying {} and taking the replica from {held:?} to {now:?}",
                     position_of(&patch.cursor),
-                    accounted.0
+                    accounted.0,
+                    describe(&patch.patchset_zstd)
                 );
                 assert_eq!(
                     now, held,
@@ -579,6 +616,7 @@ async fn a_membership_change_moves_rows_without_a_resync() {
     );
 
     // Rows of teams the caller never joined were never delivered.
+    accounted.note_committed(&fixture).await;
     fixture.exec("DELETE FROM items WHERE id = 31").await;
     no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
 
@@ -661,6 +699,74 @@ async fn the_first_row_of_a_team_already_joined_arrives_live() {
 
     // A team she never joined stays out, so the seed admitted one team rather
     // than everything.
+    accounted.note_committed(&fixture).await;
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (31, 'bob', 3, 'nope')")
+        .await;
+    no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
+}
+
+/// A membership move delivers a row before the row's own event does.
+///
+/// The move's read runs against the live table, so when one commit carries a
+/// membership row and the first row of the team it admits, the move already
+/// sees that row and delivers it at the membership event's position, and the
+/// row's own event follows above it carrying the same row again. That second
+/// frame is a legitimate repeat, and the silence check after it must account
+/// for the change by what the database committed rather than by the frames
+/// met, or it refuses the repeat as a delivery nobody asked for. Seen twice in
+/// CI on 2026-09-16 with the two events in separate commits, where a slow
+/// runner produced the same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_membership_move_may_deliver_a_row_ahead_of_its_own_event() {
+    let fixture = Fixture::acquire().await;
+    let server = membership_term_fixture(&fixture).await;
+
+    fixture.exec("INSERT INTO teams (id) VALUES (2), (3)").await;
+    fixture
+        .exec("INSERT INTO team_members (team_id, member) VALUES (1, 'alice')")
+        .await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("r27-alice", "user:alice").await;
+    alice.subscribe("docs", TERM_QUERY).await;
+    let mut replica = Replica::new();
+    let mut accounted = Accounted::default();
+    for patch in alice.expect_snapshot("docs").await {
+        replica.apply(&patch.patchset_zstd);
+    }
+    expect_membership_opened(&mut alice).await;
+    while let Some(patch) = alice.try_live(QUIET).await {
+        if patch.sub_id == "docs" {
+            accounted.note(&patch.cursor);
+            replica.apply(&patch.patchset_zstd);
+        }
+    }
+    assert_eq!(replica.ids(), vec![0], "alice is in team 1 alone");
+
+    // One commit: the membership row first, then the team's first row, so the
+    // move's read sees the row and the row's own event still follows.
+    fixture
+        .exec(
+            "BEGIN; \
+             INSERT INTO team_members (team_id, member) VALUES (2, 'alice'); \
+             INSERT INTO items (id, owner, team_id, label) VALUES (21, 'bob', 2, 'first'); \
+             COMMIT",
+        )
+        .await;
+    live_until(
+        &mut alice,
+        "docs",
+        &mut replica,
+        &mut accounted,
+        &[0, 21],
+        DELIVERY,
+    )
+    .await;
+
+    // The repeat of row 21 from its own event may still be in flight, and a
+    // row of a team she never joined must not arrive at all.
+    accounted.note_committed(&fixture).await;
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (31, 'bob', 3, 'nope')")
         .await;
@@ -740,6 +846,7 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
 
     // Policy admits, term excludes: alice's own row in team 9 never arrives,
     // because the subscription's filter is interest and interest excludes it.
+    accounted.note_committed(&fixture).await;
     fixture
         .exec("UPDATE items SET label = 'still excluded' WHERE id = 91")
         .await;
@@ -749,6 +856,7 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
     // (the withdrawal question is may_see on the current row, and the answer
     // is allow), and no resync either. The replica's own membership copy is
     // what stops the local query matching, which R27 step 5 serves.
+    accounted.note_committed(&fixture).await;
     fixture
         .exec("DELETE FROM team_members WHERE team_id = 2 AND member = 'alice'")
         .await;
@@ -821,6 +929,7 @@ async fn a_direct_caller_comparison_registers_and_self_seeds() {
     .await;
 
     // One owned by somebody else stays silent.
+    accounted.note_committed(&fixture).await;
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (54, 'bob', 1, 'not-hers')")
         .await;
