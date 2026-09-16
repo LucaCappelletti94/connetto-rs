@@ -17,32 +17,32 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 | Area | Built |
 |---|---|
-| Sync loop | Optimistic local writes, server apply under Postgres RLS, change data capture through `subql`, live row subscriptions, reconnect with resume, catch-up from the change log and a forced resync past its window, replication slot lifecycle |
-| Aggregates | `COUNT`, `SUM`, `AVG`, variance, grouped `GROUP BY` and `HAVING`, folded server-side per change. `MIN`, `MAX`, joins and row-shaped queries re-executed against Postgres under a read budget, per viewer on RLS tables |
-| Identity | OAuth 2.0 and OIDC login with connetto as the backend-for-frontend, durable sessions with revocation, grants that authorize without identifying, capabilities for sharing a row at read or write level, an audit table, request throttling, abuse bans, a reserved pool share for identified callers |
-| Authorization | Postgres RLS on every snapshot read and every write. On the change path the row policy is translated by `rls2fga` and answered locally or by OpenFGA, so a change reaches only the devices allowed to see the row as it was |
-| Clients | A native Diesel connection with a background sync worker, a browser client on a dedicated worker over OPFS with every tab relaying through it, and `use_live` hooks for Dioxus and Yew |
-| At rest | SQLCipher natively with OS keyring custody, `sqlite3mc` in the browser with IndexedDB custody and a passkey unlock gate, a device-private tier that never syncs, replica retention and trimming, several accounts signed in at once, a data wipe that removes everything the replica key opens |
-| Portability | Export and import of a device archive, one entry in memory at a time, restoring the device tier, unsent writes and unsent content under another key |
-| Files | Content-defined chunking with BLAKE3 identity and per-chunk encryption, a file server with a two-phase upload and ranged serving under tickets granted on the sync connection, and a client that keeps manifests, an outbox and pins in the replica, natively and in the browser |
-| Schema | PostgreSQL DDL translated to the replica's SQLite DDL at build time by `pg2sqlite`, with fail-closed write guards and a manifest the client is refused without |
-| Operations | Structured `tracing` logs on every crate, a Docker-backed test stack, browser suites under headless Chrome, and CI over the seven workspaces |
+| Sync loop | Optimistic writes applied under RLS, CDC through `subql`, live row subscriptions, reconnect with catch-up or resync |
+| Aggregates | `COUNT`, `SUM`, `AVG`, variance and grouped folds per change, `MIN`, `MAX`, joins and rows re-executed per viewer |
+| Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans |
+| Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
+| Clients | Native Diesel connection, browser client on a worker over OPFS, Dioxus and Yew hooks |
+| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock, a device-private tier, retention, several accounts |
+| Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
+| Files | Chunked, encrypted content with a file server and a client for both platforms |
+| Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
+| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over seven workspaces |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` is the record. Its status table tracks 87 phases, 63 of them done and 24 open. Every core mechanism above is built and proven by tests, and the remaining work is the last mile around it.
+The plan in `plans/master-implementation-plan.md` tracks 87 phases, 63 done and 24 open. The core is built and proven, and what remains is the last mile around it.
 
 | Remaining | Phases |
 |---|---|
-| Files in every demo, then storage quotas | R69, R87 |
-| Native unlock gates and the mobile build of a demo they need | R51, R52, R53, R88 |
-| One page codec on both targets, Linux key custody across a reboot | R21, R71 |
-| Application schema majors, the shared public store, the portability download | R31, R11, R61 |
+| Files in every demo, storage quotas | R69, R87 |
+| Native unlock gates and the mobile demo build | R51 to R53, R88 |
+| One page codec, Linux key custody across a reboot | R21, R71 |
+| Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline, failover verification | R70, R72, R73 |
-| The browser refresh token in an `HttpOnly` cookie, a failing re-execution read ending only its subscription, demo feature gaps | R90, R89, R57 |
-| Device-to-device sync without a server, designed in chapter 19 | R74 to R80 |
+| Refresh token in an `HttpOnly` cookie, re-execution read failure scope, demo gaps | R90, R89, R57 |
+| Device-to-device sync without a server | R74 to R80 |
 
-One thing is not supported and owned by no phase, because the authorization service does not offer it. A per-question consistency token, Zanzibar's zookie, would let a check be pinned to a specific permission write. OpenFGA lists it as future work, so on the change path a withdrawn permission takes effect within the read cache lifetime rather than against that exact write, while writes and teardowns are refused at once (chapter 08, the revocation promise).
+A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
 
 ## The design
 
