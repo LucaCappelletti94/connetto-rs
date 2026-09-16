@@ -309,7 +309,9 @@ async fn live_until(
 /// assertion weighs the position a frame carries rather than the wire being
 /// quiet. A tail frame is applied on arrival, because one that repeats what
 /// the replica holds is the shape the design permits and one that adds a row
-/// is the delivery this assertion exists to catch.
+/// is the delivery this assertion exists to catch. A frame past every
+/// accounted change is applied before it is refused, so the refusal says
+/// whether it delivered a row or carried nothing.
 async fn no_live_past(
     client: &mut Client,
     sub_id: &str,
@@ -323,16 +325,16 @@ async fn no_live_past(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match client.try_live(remaining).await {
             Some(patch) if patch.sub_id == sub_id => {
+                replica.apply(&patch.patchset_zstd);
+                let now = replica.ids();
                 assert!(
                     accounted.covers(&patch.cursor),
-                    "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}",
+                    "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}, and the replica went from {held:?} to {now:?}",
                     position_of(&patch.cursor),
                     accounted.0
                 );
-                replica.apply(&patch.patchset_zstd);
                 assert_eq!(
-                    replica.ids(),
-                    held,
+                    now, held,
                     "a frame at an accounted change added to the replica"
                 );
             }
