@@ -19,6 +19,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use subql::{CdcSource, PgSqliteEmuSource};
+use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 
@@ -54,12 +55,18 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
 }
 
 /// One in-process client on its own session.
+///
+/// The session task runs under the span the caller was in, so a record it
+/// emits carries whatever opened the connection.
 fn connect(manager: &Arc<Manager>) -> Client {
     let (server_end, client_end) = loopback();
     let session = Arc::clone(manager);
-    tokio::spawn(async move {
-        let _ = session.serve(server_end).await;
-    });
+    tokio::spawn(
+        async move {
+            let _ = session.serve(server_end).await;
+        }
+        .instrument(tracing::Span::current()),
+    );
     Client::new(client_end)
 }
 
@@ -165,51 +172,53 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
 /// about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
-    let logs = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
-    fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
-    fixture
-        .exec("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT)")
-        .await;
-    // One row per group, past the fold budget of 1024 groups.
-    fixture
-        .exec("INSERT INTO orders SELECT g, 'status-' || g FROM generate_series(1, 1025) AS g")
-        .await;
-    let manager = manager(&fixture);
+    crate::logging::with_capture("a_demoted_subscription_answers_whole_and_logs_the_transition", |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
+            fixture
+                .exec("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT)")
+                .await;
+            // One row per group, past the fold budget of 1024 groups.
+            fixture
+                .exec("INSERT INTO orders SELECT g, 'status-' || g FROM generate_series(1, 1025) AS g")
+                .await;
+            let manager = manager(&fixture);
 
-    let mut client = connect(&manager);
-    client.handshake_with("wide", "user:wide").await;
-    client
-        .subscribe(
-            "by-status",
-            "SELECT status, COUNT(*) FROM orders GROUP BY status",
-        )
-        .await;
+            let mut client = connect(&manager);
+            client.handshake_with("wide", "user:wide").await;
+            client
+                .subscribe(
+                    "by-status",
+                    "SELECT status, COUNT(*) FROM orders GROUP BY status",
+                )
+                .await;
 
-    // The demoted first answer is one whole row-shaped frame, not keyed
-    // upserts: the fold is gone, the whole re-read is the tier now.
-    let whole = take_aggregates(&mut client, "by-status", 1).await.remove(0);
-    assert!(
-        whole.is_full_result,
-        "a demoted subscription answers with full results"
-    );
-    assert_eq!(whole.group_key, None, "a whole answer addresses no group");
-    let rows: serde_json::Value = serde_json::from_str(
-        whole
-            .result_json
-            .as_deref()
-            .expect("a whole answer has a body"),
-    )
-    .expect("the whole answer is JSON rows");
-    assert_eq!(
-        rows.as_array().map(Vec::len),
-        Some(1025),
-        "every group is in the whole answer"
-    );
+            // The demoted first answer is one whole row-shaped frame, not keyed
+            // upserts: the fold is gone, the whole re-read is the tier now.
+            let whole = take_aggregates(&mut client, "by-status", 1).await.remove(0);
+            assert!(
+                whole.is_full_result,
+                "a demoted subscription answers with full results"
+            );
+            assert_eq!(whole.group_key, None, "a whole answer addresses no group");
+            let rows: serde_json::Value = serde_json::from_str(
+                whole
+                    .result_json
+                    .as_deref()
+                    .expect("a whole answer has a body"),
+            )
+            .expect("the whole answer is JSON rows");
+            assert_eq!(
+                rows.as_array().map(Vec::len),
+                Some(1025),
+                "every group is in the whole answer"
+            );
 
-    let named = logs
-        .lines()
-        .into_iter()
-        .any(|line| line["message"] == "subscription changed maintenance tier");
-    assert!(named, "the log names the transition");
+            let named = logs
+                .lines()
+                .into_iter()
+                .any(|line| line["message"] == "subscription changed maintenance tier");
+            assert!(named, "the log names the transition");
+    })
+    .await;
 }

@@ -11,6 +11,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use tracing::Instrument;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Collects every written line into a shared buffer.
@@ -54,13 +55,32 @@ fn an_event_is_one_json_object_and_picks_up_its_connection_context() {
     connection.in_scope(|| tracing::info!(bind = "127.0.0.1:8080", "sync listener started"));
     tracing::info!("outside every connection");
 
+    // A spawned task joins the chain by being instrumented with the span that spawned it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a runtime");
+    runtime.block_on(
+        async {
+            tokio::spawn(
+                async {
+                    tracing::info_span!("read", sub_id = "all")
+                        .in_scope(|| tracing::info!("read refused"));
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .expect("the spawned task ran");
+        }
+        .instrument(connection),
+    );
+
     let lines: Vec<serde_json::Value> = buffer
         .contents()
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
         .collect();
-    assert_eq!(lines.len(), 2, "one line per event: {lines:?}");
+    assert_eq!(lines.len(), 3, "one line per event: {lines:?}");
 
     // Named values, not a formatted string: the message and the event's own
     // fields sit beside each other at the root.
@@ -79,5 +99,37 @@ fn an_event_is_one_json_object_and_picks_up_its_connection_context() {
         lines[1]["span"].is_null(),
         "an event outside every context must carry none: {}",
         lines[1]
+    );
+    assert!(
+        lines[1]["spans"].is_null(),
+        "and no chain either: {}",
+        lines[1]
+    );
+
+    // The chain, outermost first, so a record emitted in a nested task names
+    // the connection and the session it belongs to.
+    assert_eq!(lines[2]["message"], "read refused");
+    let chain = lines[2]["spans"]
+        .as_array()
+        .expect("the span list rides each record");
+    let names: Vec<&str> = chain
+        .iter()
+        .map(|span| span["name"].as_str().expect("each span names itself"))
+        .collect();
+    assert_eq!(
+        names,
+        ["connection", "read"],
+        "outermost first: {}",
+        lines[2]
+    );
+    assert_eq!(
+        chain[0]["session"], "session-1",
+        "the enclosing span's values ride the chain: {}",
+        lines[2]
+    );
+    assert_eq!(
+        lines[2]["span"]["sub_id"], "all",
+        "`span` is still the innermost one: {}",
+        lines[2]
     );
 }

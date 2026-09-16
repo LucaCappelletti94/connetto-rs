@@ -28,6 +28,7 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
 use subql::{CdcSource, PgSqliteEmuSource};
+use tracing::Instrument;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -99,7 +100,9 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
 
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);
-    let serve = tokio::spawn(async move { server.serve(server_end).await });
+    let serve = tokio::spawn(
+        async move { server.serve(server_end).await }.instrument(tracing::Span::current()),
+    );
 
     client
         .send_control(ControlMessage::Handshake(
@@ -168,100 +171,181 @@ async fn first_reply<T: Transport>(client: &mut T, sub_id: &str, query: &str) ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_are_byte_identical_across_causes() {
-    let logs = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
-        materializer,
-        BrokenSnapshot,
-        RosterAuth::granting_nobody().withholding(WITHHELD_ID),
-        Arc::new(TestGrantChecker),
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
-            .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    crate::logging::with_capture(
+        "refusals_are_byte_identical_across_causes",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            let materializer = Materializer::new(PG_DDL).expect("build materializer");
+            let manager = SessionManager::new(
+                materializer,
+                BrokenSnapshot,
+                RosterAuth::granting_nobody().withholding(WITHHELD_ID),
+                Arc::new(TestGrantChecker),
+                pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+                    .expect("build write target"),
+                Arc::new(RequestGuard::default()),
+                SessionConfig::default(),
+            );
 
-    let (server_end, mut client) = loopback();
-    let server = Arc::clone(&manager);
-    let serve = tokio::spawn(async move { server.serve(server_end).await });
+            let (server_end, mut client) = loopback();
+            let server = Arc::clone(&manager);
+            let serve = tokio::spawn(
+                async move { server.serve(server_end).await }.instrument(tracing::Span::current()),
+            );
 
-    client
-        .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "probe-client")
-                .with_grant(connetto_core::messages::Grant::new("user:probe-client")),
-        ))
-        .await
-        .expect("send handshake");
-    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
-        panic!("expected handshake ack");
-    };
+            client
+                .send_control(ControlMessage::Handshake(
+                    Handshake::new(PROTOCOL_VERSION, "probe-client")
+                        .with_grant(connetto_core::messages::Grant::new("user:probe-client")),
+                ))
+                .await
+                .expect("send handshake");
+            let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+                panic!("expected handshake ack");
+            };
 
-    // Three causes under one sub id. A table that does not exist is refused
-    // at registration. A table that does exist fails in the snapshot source.
-    // An aggregate on that table fails at bootstrap, this manager having no
-    // connector. The caller must not be able to tell them apart.
-    let unknown = first_reply(
-        &mut client,
-        "probe",
-        "SELECT * FROM nosuch WHERE quantity > 0",
+            // Three causes under one sub id. A table that does not exist is refused
+            // at registration. A table that does exist fails in the snapshot source.
+            // An aggregate on that table fails at bootstrap, this manager having no
+            // connector. The caller must not be able to tell them apart.
+            let unknown = first_reply(
+                &mut client,
+                "probe",
+                "SELECT * FROM nosuch WHERE quantity > 0",
+            )
+            .await;
+            let broken = first_reply(&mut client, "probe", QUERY).await;
+            let aggregate = first_reply(&mut client, "probe", "SELECT COUNT(*) FROM orders").await;
+
+            for refusal in [&unknown, &broken, &aggregate] {
+                let ControlMessage::NonFatalError(err) = refusal else {
+                    panic!("the refusal must be the first and only reply: {refusal:?}");
+                };
+                assert_eq!(err.related_to.as_deref(), Some("probe"));
+                assert_eq!(err.detail, SUBSCRIPTION_REFUSED);
+            }
+            let unknown_bytes = encode_control(&unknown).expect("encode");
+            assert_eq!(
+                unknown_bytes,
+                encode_control(&broken).expect("encode"),
+                "a missing table and a failed snapshot must refuse identically"
+            );
+            assert_eq!(
+                unknown_bytes,
+                encode_control(&aggregate).expect("encode"),
+                "a failed aggregate bootstrap must refuse identically too"
+            );
+
+            // What the caller lost, the operator keeps: each cause reaches the log.
+            let lines = logs.lines();
+            let named = |message: &str, cause: &str| {
+                lines.iter().any(|line| {
+                    line["message"] == message
+                        && line["error"]
+                            .as_str()
+                            .is_some_and(|error| error.contains(cause))
+                })
+            };
+            assert!(
+                named("subscription registration refused", "nosuch"),
+                "the log names the unknown table"
+            );
+            assert!(
+                named("snapshot failed", "backing store unreachable"),
+                "the log names the snapshot cause"
+            );
+            assert!(
+                lines.iter().any(|line| {
+                    line["message"] == "computed bootstrap failed"
+                        && line["error"]
+                            .as_str()
+                            .is_some_and(|error| error.contains("multi-column aggregate seeds"))
+                }),
+                "the log names the bootstrap cause"
+            );
+
+            client.close().await.expect("close");
+            serve
+                .await
+                .expect("serve task")
+                .expect("session ends cleanly after three refusals");
+        },
     )
     .await;
-    let broken = first_reply(&mut client, "probe", QUERY).await;
-    let aggregate = first_reply(&mut client, "probe", "SELECT COUNT(*) FROM orders").await;
+}
 
-    for refusal in [&unknown, &broken, &aggregate] {
-        let ControlMessage::NonFatalError(err) = refusal else {
-            panic!("the refusal must be the first and only reply: {refusal:?}");
-        };
-        assert_eq!(err.related_to.as_deref(), Some("probe"));
-        assert_eq!(err.detail, SUBSCRIPTION_REFUSED);
-    }
-    let unknown_bytes = encode_control(&unknown).expect("encode");
-    assert_eq!(
-        unknown_bytes,
-        encode_control(&broken).expect("encode"),
-        "a missing table and a failed snapshot must refuse identically"
-    );
-    assert_eq!(
-        unknown_bytes,
-        encode_control(&aggregate).expect("encode"),
-        "a failed aggregate bootstrap must refuse identically too"
-    );
+/// A capture reads only the records its own test provoked.
+///
+/// The subscriber is process-global and every module in this target writes to
+/// one buffer, so a record another test's connection wrote is in the same
+/// buffer as this one's. Both connections here refuse the same read for the
+/// same cause, one of them served under this test's span and one outside it,
+/// and the capture reads the first alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_reads_only_the_records_its_own_test_provoked() {
+    crate::logging::with_capture(
+        "a_capture_reads_only_the_records_its_own_test_provoked",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            let manager = SessionManager::new(
+                Materializer::new(PG_DDL).expect("build materializer"),
+                BrokenSnapshot,
+                RosterAuth::granting_nobody().withholding(WITHHELD_ID),
+                Arc::new(TestGrantChecker),
+                pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+                    .expect("build write target"),
+                Arc::new(RequestGuard::default()),
+                SessionConfig::default(),
+            );
 
-    // What the caller lost, the operator keeps: each cause reaches the log.
-    let lines = logs.lines();
-    let named = |message: &str, cause: &str| {
-        lines.iter().any(|line| {
-            line["message"] == message
-                && line["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains(cause))
-        })
-    };
-    assert!(
-        named("subscription registration refused", "nosuch"),
-        "the log names the unknown table"
-    );
-    assert!(
-        named("snapshot failed", "backing store unreachable"),
-        "the log names the snapshot cause"
-    );
-    assert!(
-        lines.iter().any(|line| {
-            line["message"] == "computed bootstrap failed"
-                && line["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("multi-column aggregate seeds"))
-        }),
-        "the log names the bootstrap cause"
-    );
+            // The session this test owns, under the span this body runs in.
+            let (mine_end, mut mine) = loopback();
+            let serving_mine = Arc::clone(&manager);
+            let mine_serve = tokio::spawn(
+                async move { serving_mine.serve(mine_end).await }
+                    .instrument(tracing::Span::current()),
+            );
+            // Any other test in this target, outside this test's span and so
+            // outside what the capture reads.
+            let (theirs_end, mut theirs) = loopback();
+            let serving_theirs = Arc::clone(&manager);
+            let theirs_serve = tokio::spawn(async move { serving_theirs.serve(theirs_end).await });
 
-    client.close().await.expect("close");
-    serve
-        .await
-        .expect("serve task")
-        .expect("session ends cleanly after three refusals");
+            client_handshake(&mut mine, "mine").await;
+            client_handshake(&mut theirs, "theirs").await;
+            // The refusal follows the record, so awaiting both leaves nothing in
+            // flight that the assertion below is racing.
+            for (client, sub_id) in [(&mut theirs, "theirs"), (&mut mine, "mine")] {
+                let reply = first_reply(client, sub_id, QUERY).await;
+                let ControlMessage::NonFatalError(refusal) = reply else {
+                    panic!("a failed snapshot is refused: {reply:?}");
+                };
+                assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            }
+
+            let lines = logs.lines();
+            let refused: Vec<&str> = lines
+                .iter()
+                .filter(|line| line["message"] == "snapshot failed")
+                .filter_map(|line| line["sub_id"].as_str())
+                .collect();
+            assert_eq!(
+                refused,
+                ["mine"],
+                "the other connection's refusal belongs to no assertion here: {lines:?}"
+            );
+
+            mine.close().await.expect("close");
+            theirs.close().await.expect("close");
+            for serve in [mine_serve, theirs_serve] {
+                serve
+                    .await
+                    .expect("serve task")
+                    .expect("the session ends cleanly after a refusal");
+            }
+        },
+    )
+    .await;
 }
 
 /// The resync path must be as silent as the fresh one. `FullResyncRequired`
@@ -321,7 +405,9 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
 
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);
-    let serve = tokio::spawn(async move { server.serve(server_end).await });
+    let serve = tokio::spawn(
+        async move { server.serve(server_end).await }.instrument(tracing::Span::current()),
+    );
     client
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "resume-probe")
@@ -524,7 +610,9 @@ async fn a_mid_read_page_failure_causes_exactly_one_restart_then_refuses() {
     );
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);
-    let serve = tokio::spawn(async move { server.serve(server_end).await });
+    let serve = tokio::spawn(
+        async move { server.serve(server_end).await }.instrument(tracing::Span::current()),
+    );
 
     client_handshake(&mut client, "restart-probe").await;
     let ControlMessage::SnapshotBegin(_) = first_reply(&mut client, "paged", QUERY).await else {

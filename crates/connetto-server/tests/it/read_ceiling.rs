@@ -22,7 +22,9 @@ use connetto_server::{
     ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+use pg_walstream::{ChangeEvent, Lsn};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
+use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
                       CREATE TABLE narrow (id INT PRIMARY KEY, n INT); \
@@ -64,12 +66,18 @@ fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> 
 }
 
 /// One in-process client on its own session.
+///
+/// The session task runs under the span the caller was in, so a record it
+/// emits carries whatever opened the connection.
 fn connect(manager: &Arc<Manager>) -> Client {
     let (server_end, client_end) = loopback();
     let session = Arc::clone(manager);
-    tokio::spawn(async move {
-        let _ = session.serve(server_end).await;
-    });
+    tokio::spawn(
+        async move {
+            let _ = session.serve(server_end).await;
+        }
+        .instrument(tracing::Span::current()),
+    );
     Client::new(client_end)
 }
 
@@ -203,98 +211,108 @@ async fn wide_rows_page_smaller_under_the_same_budget() {
 /// file-shaped data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers() {
-    let logs = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
-    fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
-    fixture
-        .exec("CREATE TABLE things (id INT PRIMARY KEY, body TEXT)")
-        .await;
-    // One outlier among ten thousand ordinary rows, so the table's average
-    // stays well under the ceiling and it is the row itself that trips it. The
-    // outlier takes the lowest key, so it lands in the first page and the
-    // refusal comes before anything is sent.
-    fixture
-        .exec("INSERT INTO things (id, body) VALUES (1, repeat('x', 200000))")
-        .await;
-    fixture
-        .exec(
-            "INSERT INTO things (id, body) \
-             SELECT g, repeat('x', 8) FROM generate_series(2, 10000) AS g",
-        )
-        .await;
-    fixture.exec("ANALYZE things").await;
-    let manager = manager(&fixture, limits(8 * 1024, 4096, Duration::from_secs(30)));
+    crate::logging::with_capture(
+        "a_row_above_the_ceiling_is_refused_and_the_log_names_three_numbers",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
+            fixture
+                .exec("CREATE TABLE things (id INT PRIMARY KEY, body TEXT)")
+                .await;
+            // One outlier among ten thousand ordinary rows, so the table's average
+            // stays well under the ceiling and it is the row itself that trips it. The
+            // outlier takes the lowest key, so it lands in the first page and the
+            // refusal comes before anything is sent.
+            fixture
+                .exec("INSERT INTO things (id, body) VALUES (1, repeat('x', 200000))")
+                .await;
+            fixture
+                .exec(
+                    "INSERT INTO things (id, body) \
+                     SELECT g, repeat('x', 8) FROM generate_series(2, 10000) AS g",
+                )
+                .await;
+            fixture.exec("ANALYZE things").await;
+            let manager = manager(&fixture, limits(8 * 1024, 4096, Duration::from_secs(30)));
 
-    let mut client = connect(&manager);
-    client.handshake_with("wide", "user:wide").await;
-    client.subscribe("all", "SELECT * FROM things").await;
+            let mut client = connect(&manager);
+            client.handshake_with("wide", "user:wide").await;
+            client.subscribe("all", "SELECT * FROM things").await;
 
-    let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
-        panic!("a row above the ceiling must be refused, with nothing sent ahead of it");
-    };
-    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+                panic!("a row above the ceiling must be refused, with nothing sent ahead of it");
+            };
+            assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
 
-    let named = logs.lines().into_iter().any(|line| {
-        line["message"] == "read refused"
-            && line["cause"].as_str().is_some_and(|cause| {
-                cause.contains("200004 bytes")
-                    && cause.contains("4096 byte ceiling")
-                    && cause.contains("averaging")
-            })
-    });
-    assert!(
-        named,
-        "the log names the row, the ceiling and the table average: {:?}",
-        logs.lines()
-    );
+            let named = logs.lines().into_iter().any(|line| {
+                line["message"] == "read refused"
+                    && line["cause"].as_str().is_some_and(|cause| {
+                        cause.contains("200004 bytes")
+                            && cause.contains("4096 byte ceiling")
+                            && cause.contains("averaging")
+                    })
+            });
+            assert!(
+                named,
+                "the log names the row, the ceiling and the table average: {:?}",
+                logs.lines()
+            );
+        },
+    )
+    .await;
 }
 
 /// A table whose predicted average row is already above the ceiling is refused
 /// before a single row is read, which is the one refusal the estimate pays for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_table_wider_than_the_ceiling_is_refused_before_the_read() {
-    let logs = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
-    fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
-    fixture
-        .exec("CREATE TABLE things (id INT PRIMARY KEY, body TEXT)")
-        .await;
-    // Stored out of line and uncompressed, so the planner's predicted width is
-    // the value's own. A repeated character compresses to almost nothing, and
-    // the planner then predicts a width two orders of magnitude under the row
-    // as it arrives, which is why the ceiling on a delivered row is measured on
-    // the bytes rather than taken from the estimate.
-    fixture
-        .exec("ALTER TABLE things ALTER COLUMN body SET STORAGE EXTERNAL")
-        .await;
-    fixture
-        .exec(
-            "INSERT INTO things (id, body) \
-             SELECT g, repeat('x', 4096) FROM generate_series(1, 20) AS g",
-        )
-        .await;
-    fixture.exec("ANALYZE things").await;
-    let manager = manager(&fixture, limits(8 * 1024, 64, Duration::from_secs(30)));
+    crate::logging::with_capture(
+        "a_table_wider_than_the_ceiling_is_refused_before_the_read",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fixture.exec("DROP TABLE IF EXISTS things CASCADE").await;
+            fixture
+                .exec("CREATE TABLE things (id INT PRIMARY KEY, body TEXT)")
+                .await;
+            // Stored out of line and uncompressed, so the planner's predicted width is
+            // the value's own. A repeated character compresses to almost nothing, and
+            // the planner then predicts a width two orders of magnitude under the row
+            // as it arrives, which is why the ceiling on a delivered row is measured on
+            // the bytes rather than taken from the estimate.
+            fixture
+                .exec("ALTER TABLE things ALTER COLUMN body SET STORAGE EXTERNAL")
+                .await;
+            fixture
+                .exec(
+                    "INSERT INTO things (id, body) \
+                     SELECT g, repeat('x', 4096) FROM generate_series(1, 20) AS g",
+                )
+                .await;
+            fixture.exec("ANALYZE things").await;
+            let manager = manager(&fixture, limits(8 * 1024, 64, Duration::from_secs(30)));
 
-    let mut client = connect(&manager);
-    client.handshake_with("tooWide", "user:too-wide").await;
-    client.subscribe("all", "SELECT * FROM things").await;
+            let mut client = connect(&manager);
+            client.handshake_with("tooWide", "user:too-wide").await;
+            client.subscribe("all", "SELECT * FROM things").await;
 
-    let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
-        panic!("a table above the ceiling must be refused");
-    };
-    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
-    let named = logs.lines().into_iter().any(|line| {
-        line["message"] == "read refused"
-            && line["cause"]
-                .as_str()
-                .is_some_and(|cause| cause.contains("the table's average row is"))
-    });
-    assert!(
-        named,
-        "the log says the refusal came from the estimate: {:?}",
-        logs.lines()
-    );
+            let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+                panic!("a table above the ceiling must be refused");
+            };
+            assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            let named = logs.lines().into_iter().any(|line| {
+                line["message"] == "read refused"
+                    && line["cause"]
+                        .as_str()
+                        .is_some_and(|cause| cause.contains("the table's average row is"))
+            });
+            assert!(
+                named,
+                "the log says the refusal came from the estimate: {:?}",
+                logs.lines()
+            );
+        },
+    )
+    .await;
 }
 
 /// A read whose plan needs a sort is stopped by the time limit rather than
@@ -367,36 +385,55 @@ async fn read_refusals_are_byte_identical_across_causes() {
 /// at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
-    let logs = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
-    fill(&fixture, 40, 64).await;
-    let serving = manager(
-        &fixture,
-        limits(8 * 1024, 32 * 1024, Duration::from_secs(30)),
-    );
+    crate::logging::with_capture(
+        "a_refused_replacement_ends_the_subscription_instead_of_retrying",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fill(&fixture, 40, 64).await;
+            let serving = manager(
+                &fixture,
+                limits(8 * 1024, 32 * 1024, Duration::from_secs(30)),
+            );
 
-    let mut client = connect(&serving);
-    client.handshake_with("replaced", "user:replaced").await;
-    client.subscribe("all", "SELECT * FROM things").await;
-    let pages = drain_pages(&mut client, "all").await;
-    assert!(!pages.is_empty(), "the first read is served");
+            let mut client = connect(&serving);
+            client.handshake_with("replaced", "user:replaced").await;
+            client.subscribe("all", "SELECT * FROM things").await;
+            let pages = drain_pages(&mut client, "all").await;
+            assert!(!pages.is_empty(), "the first read is served");
 
-    // A ceiling under the table's own rows, so a read here can only be
-    // refused.
-    let refusing = manager(&fixture, limits(8 * 1024, 1, Duration::from_secs(30)));
-    let mut narrowed = connect(&refusing);
-    narrowed.handshake_with("narrowed", "user:narrowed").await;
-    narrowed.subscribe("all", "SELECT * FROM things").await;
+            // A row past the ceiling, taking the lowest key so the replacement
+            // is refused in its first page with nothing sent ahead of it.
+            fixture
+                .exec("INSERT INTO things (id, body) VALUES (0, repeat('x', 200000))")
+                .await;
+            // A truncate is served as a replacement rather than as a patch that
+            // applies nothing (R48).
+            serving
+                .dispatch_event(&ChangeEvent::truncate(
+                    vec![Arc::from("things")],
+                    Lsn::new(1),
+                ))
+                .await
+                .expect("dispatch the truncate");
 
-    let ControlMessage::NonFatalError(refusal) = narrowed.next_control().await else {
-        panic!("the read is refused");
-    };
-    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
-    // One refusal line, and no retry line: a refusal is not retried.
-    let retried = logs.lines().into_iter().any(|line| {
-        line["message"] == "replacing a subscription failed, retrying" && line["sub_id"] == "all"
-    });
-    assert!(!retried, "a refused read is never retried");
+            let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+                panic!("the replacement read is refused");
+            };
+            assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            let lines = logs.lines();
+            let ended = lines.iter().any(|line| {
+                line["message"] == "replacing a subscription was refused, ending it"
+                    && line["sub_id"] == "all"
+            });
+            assert!(ended, "the refusal ended the subscription: {lines:?}");
+            let retried = lines.iter().any(|line| {
+                line["message"] == "replacing a subscription failed, retrying"
+                    && line["sub_id"] == "all"
+            });
+            assert!(!retried, "a refused read is never retried");
+        },
+    )
+    .await;
 }
 
 /// The aggregate half of the same ceiling (R81).
@@ -420,18 +457,25 @@ mod aggregates {
     };
     use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
     use subql::{CdcSource, PgSqliteEmuSource};
+    use tracing::Instrument;
 
     /// A manager whose aggregates read through connetto's own connector.
     type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
 
     /// One in-process client on its own session, as the row tests do it, over
     /// the manager type that carries a connector.
+    ///
+    /// The session task runs under the span the caller was in, so a record it
+    /// emits carries whatever opened the connection.
     fn connect_to(manager: &Arc<Manager>) -> Client {
         let (server_end, client_end) = loopback();
         let session = Arc::clone(manager);
-        tokio::spawn(async move {
-            let _ = session.serve(server_end).await;
-        });
+        tokio::spawn(
+            async move {
+                let _ = session.serve(server_end).await;
+            }
+            .instrument(tracing::Span::current()),
+        );
         Client::new(client_end)
     }
     /// A guard whose tier reads may take `seed` and whose triggered
@@ -530,40 +574,47 @@ mod aggregates {
     /// refusal carries, and the log carries the cause.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_triggered_read_past_the_shared_bound_ends_the_subscription() {
-        let logs = crate::logging::capture().await;
-        let fixture = Fixture::acquire().await;
-        fill_counts(&fixture, 200_000).await;
-        let manager = manager(
-            &fixture,
-            guard(Duration::from_secs(30), Duration::from_millis(1)),
-        );
+        crate::logging::with_capture(
+            "a_triggered_read_past_the_shared_bound_ends_the_subscription",
+            |logs| async move {
+                let fixture = Fixture::acquire().await;
+                fill_counts(&fixture, 200_000).await;
+                let manager = manager(
+                    &fixture,
+                    guard(Duration::from_secs(30), Duration::from_millis(1)),
+                );
 
-        let mut client = connect_to(&manager);
-        client.handshake_with("watcher", "user:watcher").await;
-        client
-            .subscribe("cheapest", "SELECT MIN(n) FROM counts")
-            .await;
-        let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
-            panic!(
-                "the seed is served under the caller's own tier: {:?}",
-                logs.lines()
-            );
-        };
-        assert_eq!(seeded.result_json.as_deref(), Some("1"));
+                let mut client = connect_to(&manager);
+                client.handshake_with("watcher", "user:watcher").await;
+                client
+                    .subscribe("cheapest", "SELECT MIN(n) FROM counts")
+                    .await;
+                let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
+                    panic!(
+                        "the seed is served under the caller's own tier: {:?}",
+                        logs.lines()
+                    );
+                };
+                assert_eq!(seeded.result_json.as_deref(), Some("1"));
 
-        let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
-        retire_the_extreme(&mut source, &manager).await;
+                let mut source =
+                    PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+                retire_the_extreme(&mut source, &manager).await;
 
-        let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
-            panic!("a triggered read past the shared bound must be refused");
-        };
-        assert_eq!(refusal.related_to.as_deref(), Some("cheapest"));
-        assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
-        let named = logs.lines().into_iter().any(|line| {
-            line["message"] == "a computed subscription's read was refused, ending the subscription"
-                && line["sub_id"] == "cheapest"
-        });
-        assert!(named, "the log names the subscription it ended");
+                let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+                    panic!("a triggered read past the shared bound must be refused");
+                };
+                assert_eq!(refusal.related_to.as_deref(), Some("cheapest"));
+                assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+                let named = logs.lines().into_iter().any(|line| {
+                    line["message"]
+                        == "a computed subscription's read was refused, ending the subscription"
+                        && line["sub_id"] == "cheapest"
+                });
+                assert!(named, "the log names the subscription it ended");
+            },
+        )
+        .await;
     }
 
     /// The same trigger under a bound it fits delivers a value, which is what

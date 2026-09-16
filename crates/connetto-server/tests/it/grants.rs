@@ -25,6 +25,7 @@ use connetto_server::{
     SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
 /// Records the principal the session presents to the snapshot read, which is
@@ -127,7 +128,11 @@ async fn arrive(
         SessionConfig::default(),
     );
     let (server_transport, mut client) = loopback();
-    let server = tokio::spawn(manager.serve(server_transport));
+    let server = tokio::spawn(
+        manager
+            .serve(server_transport)
+            .instrument(tracing::Span::current()),
+    );
 
     let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id).with_grants(
         grants
@@ -325,38 +330,42 @@ async fn an_invented_handle_is_refused_and_a_fresh_run_starts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_grant_names_the_caller_and_which_grant_in_the_log() {
-    let buffer = crate::logging::capture().await;
-    let fixture = Fixture::acquire().await;
+    crate::logging::with_capture(
+        "a_refused_grant_names_the_caller_and_which_grant_in_the_log",
+        |buffer| async move {
+            let fixture = Fixture::acquire().await;
 
-    // A client id unique to this test, so the assertion names what this test
-    // provoked even when the log carries other records.
-    let client_id = "refusal-probe";
-    let arrival = arrive(
-        &fixture,
-        client_id,
-        &["user:alice", "not-a-grant-at-all"],
-        None,
+            // The client id the refusal is expected to name.
+            let client_id = "refusal-probe";
+            let arrival = arrive(
+                &fixture,
+                client_id,
+                &["user:alice", "not-a-grant-at-all"],
+                None,
+            )
+            .await;
+            assert_eq!(
+                arrival.caller.identity().expect("signed in").user_id,
+                "alice",
+                "the refusal did not end anything"
+            );
+
+            let refusal = buffer
+                .lines()
+                .into_iter()
+                .find(|line| line["message"] == "grant refused" && line["client_id"] == client_id)
+                .expect("the refusal reached the log");
+
+            assert_eq!(
+                refusal["grant"], 1,
+                "which grant, by its position in what the caller presented"
+            );
+            assert_eq!(refusal["reason"], "invalid");
+            assert!(
+                refusal["span"]["session"].is_string(),
+                "inside the connection context, so the run it belongs to rides along: {refusal}"
+            );
+        },
     )
     .await;
-    assert_eq!(
-        arrival.caller.identity().expect("signed in").user_id,
-        "alice",
-        "the refusal did not end anything"
-    );
-
-    let refusal = buffer
-        .lines()
-        .into_iter()
-        .find(|line| line["message"] == "grant refused" && line["client_id"] == client_id)
-        .expect("the refusal reached the log");
-
-    assert_eq!(
-        refusal["grant"], 1,
-        "which grant, by its position in what the caller presented"
-    );
-    assert_eq!(refusal["reason"], "invalid");
-    assert!(
-        refusal["span"]["session"].is_string(),
-        "inside the connection context, so the run it belongs to rides along: {refusal}"
-    );
 }

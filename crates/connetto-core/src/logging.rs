@@ -5,6 +5,10 @@
 //! process, this crate's consumers included, lands on stdout as one JSON
 //! object per line.
 //!
+//! Each line carries the span it was emitted in under `span` and the whole
+//! enclosing chain under `spans`, outermost first, so a record from a nested
+//! task names the connection and the session it belongs to.
+//!
 //! Browser programs have no stdout and install `connetto_web::logging`
 //! instead. See `docs/architecture/08-authorization.md` under "Audit" for the
 //! values an event carries.
@@ -19,7 +23,8 @@ const DEFAULT_FILTER: &str = "info";
 ///
 /// One JSON object per line, filtered by `RUST_LOG` and defaulting to `info`.
 /// The enclosing span's values, which is where a connection puts its session
-/// handle and the caller's identity, ride each line under `span`.
+/// handle and the caller's identity, ride each line under `span`, and every
+/// span enclosing that one rides it under `spans`.
 ///
 /// Calling this a second time leaves the first destination in place, so a
 /// program with more than one entry path cannot lose its logging to a panic.
@@ -49,7 +54,7 @@ where
         .json()
         .flatten_event(true)
         .with_current_span(true)
-        .with_span_list(false)
+        .with_span_list(true)
         .with_writer(writer)
         .with_env_filter(EnvFilter::new(directives))
         .try_init();
