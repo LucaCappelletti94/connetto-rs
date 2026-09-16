@@ -9,7 +9,7 @@ The numbering records the order chapters were written, not a reading order and n
 | Chapter | Owns |
 |---|---|
 | `00-overview.md` | What connetto is, what it does not do, and the vocabulary the other chapters use |
-| `01-pieces.md` | A catalogue of every component that must exist, and the seven crates in the workspace |
+| `01-pieces.md` | A catalogue of every component that must exist, and the ten crates in the workspace |
 | `02-protocol.md` | How client and server talk: the two planes, the framing, the message types, and the sequencing rules |
 | `03-sync-pipeline.md` | How writes travel to the server and how server-side changes travel back |
 | `04-subscriptions.md` | How a client declares interest in data, and the life of a subscription |

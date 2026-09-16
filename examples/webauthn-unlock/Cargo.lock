@@ -693,8 +693,8 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.12"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.13"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -727,7 +727,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -736,8 +736,8 @@ dependencies = [
 
 [[package]]
 name = "diesel_derives"
-version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.10"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -750,7 +750,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "syn 3.0.5",
 ]
@@ -785,7 +785,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "darling",
  "either",
@@ -2110,7 +2110,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0b241d333e4c898f11d4b093116a01a194ef6f69"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2123,7 +2123,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0b241d333e4c898f11d4b093116a01a194ef6f69"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2513,7 +2513,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#b5950628a53de0ac1336d20cd1c618830e2706f0"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9296011a1c2ba0905310f10c7c1287d9cc12b62c"
 dependencies = [
  "log",
  "recursive",
@@ -2524,7 +2524,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#56b12d922e3c38c23ddae889fc5668e8edd16009"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#50cc6a4a7223b2cb86096529466bdcce779f75b4"
 dependencies = [
  "seahash",
  "sqlparser",

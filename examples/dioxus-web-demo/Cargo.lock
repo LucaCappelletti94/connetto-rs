@@ -987,8 +987,8 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.12"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.13"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1030,8 +1030,8 @@ dependencies = [
 
 [[package]]
 name = "diesel_derives"
-version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.10"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "syn 3.0.5",
 ]
@@ -1525,7 +1525,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "darling 0.24.1",
  "either",
@@ -1608,7 +1608,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3031,7 +3031,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8d76d33f66575ed75831935344ced94ef1d04096"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#01d308e91fd94cd73d6aa657b5e552ee8521109d"
 dependencies = [
  "git2",
  "sql-traits",
@@ -3254,7 +3254,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3514,7 +3514,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0b241d333e4c898f11d4b093116a01a194ef6f69"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -3527,7 +3527,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0b241d333e4c898f11d4b093116a01a194ef6f69"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3622,7 +3622,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4044,7 +4044,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#56b12d922e3c38c23ddae889fc5668e8edd16009"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#50cc6a4a7223b2cb86096529466bdcce779f75b4"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -4225,10 +4225,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4913,7 +4913,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

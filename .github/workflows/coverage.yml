@@ -1,0 +1,112 @@
+---
+name: Coverage
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  coverage:
+    name: Coverage ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Neither a fork's pull request nor a Dependabot run can read
+    # CODECOV_TOKEN, so the upload runs for same-repo branches and main only.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    strategy:
+      fail-fast: false
+      # The same three shards as the Rust tests in ci.yml, for the same
+      # reason: one instrumented run of the whole graph would not fit the cap.
+      # Codecov merges the three reports of one commit by their flags.
+      matrix:
+        include:
+          - name: server
+            packages: -p connetto-server
+            bins: -p connetto-server -p connetto-client
+          - name: client
+            packages: -p connetto-client
+            bins: ''
+          - name: rest
+            packages: >-
+              -p connetto-core
+              -p connetto-test-harness
+              -p connetto-dioxus
+              -p connetto-yew
+              -p connetto-file-core
+              -p connetto-file-server
+              -p connetto-file-client
+            bins: ''
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable toolchain with llvm-tools
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component llvm-tools-preview
+
+      - name: Install keyring helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y keyutils
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+
+      # The spawned server and client binaries are built under the same
+      # instrumentation environment as the tests, so the e2e suites count
+      # what the child processes execute, not only the test process.
+      - name: Build spawned binaries
+        if: matrix.bins != ''
+        run: |
+          source <(cargo +stable llvm-cov show-env --sh)
+          cargo +stable build --profile testfast --all-features --bins ${{ matrix.bins }}
+
+      # testfast is release without the fat link: instrumentation on top of
+      # lto and one codegen unit more than doubles the build.
+      - name: Run Rust suite under coverage
+        run: |
+          source <(cargo +stable llvm-cov show-env --sh)
+          keyctl session -- cargo +stable nextest run \
+            --cargo-profile testfast \
+            --all-features \
+            --test-threads 4 \
+            ${{ matrix.packages }}
+          cargo +stable llvm-cov report \
+            --profile testfast \
+            --codecov \
+            --output-path codecov.json
+
+      - uses: codecov/codecov-action@v7
+        with:
+          files: codecov.json
+          flags: ${{ matrix.name }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true

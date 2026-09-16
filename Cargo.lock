@@ -1296,8 +1296,8 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.12"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.13"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "bigdecimal",
  "bitflags 2.13.2",
@@ -1355,7 +1355,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1364,8 +1364,8 @@ dependencies = [
 
 [[package]]
 name = "diesel_derives"
-version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+version = "2.3.10"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -1378,7 +1378,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "syn 3.0.5",
 ]
@@ -1753,7 +1753,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?rev=caf515ee06de34f2fc59579355aecb17907e3521#caf515ee06de34f2fc59579355aecb17907e3521"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#51fb453f125a41d13ee707eb9b462d20dece525b"
 dependencies = [
  "darling 0.24.1",
  "either",
@@ -4111,7 +4111,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#37095d2a9ef20cd18f4972373e767e3fe2c8d2ae"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#01d308e91fd94cd73d6aa657b5e552ee8521109d"
 dependencies = [
  "git2",
  "sql-traits",
@@ -5729,7 +5729,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#56b12d922e3c38c23ddae889fc5668e8edd16009"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#50cc6a4a7223b2cb86096529466bdcce779f75b4"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -5962,7 +5962,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

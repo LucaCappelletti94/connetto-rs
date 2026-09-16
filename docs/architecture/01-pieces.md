@@ -121,13 +121,13 @@ A structured inventory of every component that must exist. This is not a depende
 
 | Piece | Description |
 |---|---|
-| File metadata table | A normal synced table: file ID, path, size, content hash, version. Syncs through the standard row-sync path. |
-| Content channel | Separate from the row-sync channel; transfers raw bytes. |
-| Chunker | Splits file content into fixed-size chunks addressed by hash. |
-| Upload path | Client → server: client announces intent, uploads chunks, server reassembles and stores. *(Reliability: per-chunk retry; see §10.)* |
-| Download path | Server → client: server announces new/changed file via metadata update, client requests chunks by hash. *(Reliability: per-chunk retry; see §10.)* |
-| Resumability | Client tracks which chunks it already has; skips re-downloading identical chunks. The retry policy and idempotency story for individual chunk transfers live in §10. |
-| WASM constraints | No direct filesystem; content must be streamed into browser storage. *(See `09-wasm.md`.)* |
+| File metadata table | A normal synced table: the file's content identity in a column the application declares. Syncs through the standard row-sync path. **Built (R66).** |
+| Content channel | Separate from the row-sync channel: plain HTTP under a content ticket the control plane grants. **Built (R66).** |
+| Chunker | Content-defined chunking (FastCDC per mime class), each chunk compressed then encrypted, addressed by its plaintext hash, the file identified by BLAKE3 of its bytes. **Built (R64).** |
+| Upload path | Client to server: intent naming the manifest, the needed hashes back, chunk `PUT`s, commit. **Built (R65, R67, R68).** |
+| Download path | Server to client: a signed URL by default, local bytes when unsent or pinned. **Built (R65, R67, R68).** |
+| Resumability | The intent reply names the chunks the server lacks, so an interrupted upload resends only those. A transfer is bounded by silence, never by elapsed time. **Built.** |
+| WASM constraints | No direct filesystem: the worker owns an encrypted OPFS chunk store, with worker-lifetime memory as the fallback. **Built (R68).** *(See `18-file-handling.md`, the normative chapter.)* |
 
 ---
 
@@ -159,7 +159,7 @@ A structured inventory of every component that must exist. This is not a depende
 ## Open Questions
 
 1. ~~Should the core traits (`Transport`, `Store`, etc.) live in a dedicated `connetto-core` crate, or inline in this repo?~~ **Decided (Q1.1):** Dedicated `connetto-core` crate, now at `crates/connetto-core`. Both `connetto-server` and `connetto-client` depend on it. Neither depends on the other.
-2. ~~Which pieces are in-scope for a first prototype versus later iterations?~~ **Decided (Q1.2):** All pieces (A through L) are in scope for v1, except file sync (J), which is handled by a separate stack.
+2. ~~Which pieces are in-scope for a first prototype versus later iterations?~~ **Decided (Q1.2):** All pieces (A through L) are in scope for v1, except file sync (J), which is its own stack: the three file crates below, which depend on connetto and never the reverse (chapter 18).
 3. ~~Is `SharedWorker` a requirement for multi-tab browser support, or is tab-per-worker acceptable initially?~~ **Decided (Q1.3), and since corrected twice:** the answer was "`SharedWorker` only, no fallback", and connetto never used one and cannot, because OPFS sync access handles exist only in a dedicated worker. The shipped topology is a dedicated worker with a Web Locks election. Both Android platforms are technically capable, and **Android is supported both on the web and as a native app**: the exclusion rested on the `SharedWorker` premise and both of its reasons are now withdrawn. See the corrections under Q1.3 and Q9.1 in `open-questions.md`.
 
 ---
@@ -176,11 +176,14 @@ A structured inventory of every component that must exist. This is not a depende
 | `connetto-web` | Browser platform for wasm32: `BrowserSocket` (a `Transport` over `web_sys::WebSocket`), dedicated-worker relay topology, leader election, and multi-tab routing. | **Built** |
 | `connetto-dioxus` | Dioxus adapter: `use_live` and `use_live_fn` hooks binding live queries to component scope. | **Built** |
 | `connetto-yew` | Yew adapter: the same `use_live` and `use_live_fn` hooks with an abort-on-unmount lifecycle suited to Yew's detached `spawn_local` task model. | **Built** |
-| `connetto-test-harness` | In-process CDC-loop test harness over a real Postgres. Test infrastructure, not a shipped component. Tests run `#[ignore]` against Docker. | **Built** |
+| `connetto-test-harness` | In-process CDC-loop test harness over a real Postgres, and the browser stack runner. Test infrastructure, not a shipped component. The Docker-backed tests start their own throwaway containers and run in the ordinary suite. | **Built** |
+| `connetto-file-core` | Chunking, identity, per-chunk encryption, and the `ChunkStore` and `ChunkInventory` seams. Builds for wasm. | **Built (R64)** |
+| `connetto-file-server` | Chunk storage on a filesystem or an object store, the two-phase upload, ranged serving, sweep, and the `ContentTicketSigner` the server mints through. | **Built (R65)** |
+| `connetto-file-client` | The encrypted store, manifests and outbox in the replica, the upload walk, the resolver, and content pins, natively and in the browser. | **Built (R67, R68)** |
 
 ---
 
 ## Notes
 
-- This inventory will be refined as each area (B to L) gets its own doc and decisions are made.
+- The three file crates depend on connetto and never the reverse (chapter 18).
 - Items marked "see Xnn.md" are elaborated in their own file.
