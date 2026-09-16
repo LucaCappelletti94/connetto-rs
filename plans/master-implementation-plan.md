@@ -59,6 +59,8 @@ cargo +stable test --profile testfast --all-features -p connetto-server --test i
 
 Docker-gated Postgres tests and headless Chrome may both be run freely.
 
+**A silence assertion is bounded by the change it is about, decided 2026-09-16.** A live patch carries the position of the change that caused it, and `live_until` returns the moment the replica holds what a test waited for, so that change's settling tail is still in flight when the next assertion starts. A test therefore records the highest position it has accounted for on a subscription, and a silence assertion refuses only a frame past it rather than refusing every frame inside a window, which had failed twice on loaded runners with no defect behind it. The harness client keeps the live patches it meets while waiting for a control frame, so nothing it received is invisible to that comparison. An assertion on a subscription that has been delivered nothing needs no bound, because there is no settling tail there to confuse with a violation.
+
 ## Sequence
 
 Execution order and nothing else. Status, blockers, landing dates and what each phase found live in the Status table below and nowhere else. This table carried all of that too until 2026-09-13, when it was stripped back: it had become a second hand-maintained status view and drifted twice in three weeks (R60 and R63). A struck phase is finished in whatever way the Status table records, and its row keeps only the reason it sat where it did.

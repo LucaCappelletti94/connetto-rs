@@ -17,6 +17,7 @@
 //! express, which is the sanctioned raw-SQL case. Read-back assertions in a test
 //! MUST instead define a typed `diesel::table!` and load through the DSL.
 
+use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
@@ -1127,7 +1128,7 @@ impl Server {
         tokio::spawn(async move {
             let _ = session.serve(server_transport).await;
         });
-        Client { transport: client }
+        Client::new(client)
     }
 
     /// Connect a new in-process session and hand back the bare client end, for
@@ -1257,6 +1258,12 @@ fn spawn_ingest_task(
 /// tests need to run a session conversation.
 pub struct Client {
     transport: LoopbackTransport,
+    /// Live patches met while waiting for something else, oldest first.
+    ///
+    /// Waiting for a control frame tolerates a patch in flight from an earlier
+    /// commit, and an assertion about what was delivered has to weigh that
+    /// patch rather than never meet it.
+    live_backlog: VecDeque<LivePatch>,
 }
 
 impl Client {
@@ -1265,7 +1272,10 @@ impl Client {
     /// rather than through [`spawn_server`].
     #[must_use]
     pub fn new(transport: LoopbackTransport) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            live_backlog: VecDeque::new(),
+        }
     }
 
     /// Send the handshake as `client_id` and wait for its ack. The client id
@@ -1512,6 +1522,9 @@ impl Client {
     ///
     /// Panics when the transport returns a receive error, or when a frame that is neither a `LivePatch` nor a control frame arrives.
     pub async fn try_live(&mut self, timeout: Duration) -> Option<LivePatch> {
+        if let Some(patch) = self.live_backlog.pop_front() {
+            return Some(patch);
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1552,11 +1565,13 @@ impl Client {
                     let patches = self.expect_snapshot(sub_id).await;
                     return Some((resync.reason, patches));
                 }
-                // A live patch may be in flight from an earlier commit, and a
-                // keepalive pong may interleave. Neither is what this waits for.
-                Some(
-                    IncomingFrame::Bulk(BulkMessage::LivePatch(_)) | IncomingFrame::Control(_),
-                ) => {}
+                // A keepalive pong may interleave, and a live patch in flight
+                // from an earlier commit is kept for the next live read rather
+                // than dropped.
+                Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
+                    self.live_backlog.push_back(patch);
+                }
+                Some(IncomingFrame::Control(_)) => {}
                 other => panic!("expected a resync notice, got {other:?}"),
             }
         }
@@ -1595,6 +1610,49 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+#[cfg(test)]
+mod client_tests {
+    use std::time::Duration;
+
+    use connetto_core::messages::{BulkMessage, LivePatch};
+    use connetto_core::traits::Transport;
+    use connetto_core::{Cursor, transport::loopback};
+
+    use super::Client;
+
+    /// A live patch met while waiting for a resync notice stays readable.
+    ///
+    /// The wait tolerates a patch in flight from an earlier commit, and a
+    /// silence assertion downstream has to weigh that patch rather than never
+    /// meet it.
+    #[tokio::test]
+    async fn a_patch_met_while_waiting_for_a_resync_is_not_lost() {
+        let (mut server_end, client_end) = loopback();
+        let mut client = Client::new(client_end);
+        server_end
+            .send_bulk(BulkMessage::LivePatch(LivePatch::new(
+                "docs",
+                Cursor::new(7_u64.to_be_bytes().to_vec()),
+                Vec::new(),
+            )))
+            .await
+            .expect("send the patch");
+
+        assert!(
+            client
+                .try_resync("docs", Duration::from_millis(50))
+                .await
+                .is_none(),
+            "no resync notice was sent"
+        );
+        let patch = client
+            .try_live(Duration::from_millis(50))
+            .await
+            .expect("the patch the resync wait met is still there");
+        assert_eq!(patch.cursor.as_bytes(), 7_u64.to_be_bytes());
+    }
 }
 
 #[cfg(test)]
