@@ -161,4 +161,54 @@ impl AnyStore {
             Self::Custom(s) => s.delete(hash).await,
         }
     }
+
+    /// Opens the `Object` backend named by an `object_store` URL.
+    ///
+    /// The URL's own path becomes a prefix inside the backend, so
+    /// `s3://bucket/tenant` stores its chunks under `tenant/chunks/...`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Object` when the scheme is unknown or the
+    /// backend cannot be built from the URL.
+    pub fn from_url(url: &url::Url) -> Result<Self, StoreError> {
+        let (store, prefix) = object_store::parse_url(url)?;
+        let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::from(store);
+        let store = if prefix.as_ref().is_empty() {
+            store
+        } else {
+            std::sync::Arc::new(object_store::prefix::PrefixStore::new(store, prefix))
+        };
+        Ok(Self::Object(ObjectStoreBackend::new(store)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn two_urls_sharing_a_root_store_under_their_own_prefixes() {
+        // The URL prefix is what lets two deployments share one bucket or
+        // directory, so a chunk written through one URL must be invisible to
+        // another URL that addresses a sibling location.
+        let root = tempfile::tempdir().expect("a temporary root");
+        let hash = connetto_file_core::ChunkHash::from_bytes([3u8; 32]);
+        let a = AnyStore::from_url(
+            &url::Url::from_file_path(root.path().join("tenant-a")).expect("a file url"),
+        )
+        .expect("a file url opens");
+        let b = AnyStore::from_url(
+            &url::Url::from_file_path(root.path().join("tenant-b")).expect("a file url"),
+        )
+        .expect("a file url opens");
+        a.write(&hash, bytes::Bytes::from_static(b"tenant a bytes"))
+            .await
+            .expect("write through the first url");
+        assert!(a.exists(&hash).await.expect("read back the first"));
+        assert!(
+            !b.exists(&hash).await.expect("read back the second"),
+            "the prefix must separate sibling locations"
+        );
+    }
 }

@@ -61,15 +61,41 @@
 //!   is alarming belongs to the deployment's log aggregator, so the line goes
 //!   out at one level on a fixed interval rather than escalating on a
 //!   threshold connetto picked.
+//! - `CONNETTO_CONTENT_URL`: the base URL content tickets embed, which is the
+//!   auth listener's public address. Unset means no file routes and the
+//!   signer-refused detail on every ticket request, as today. Set, the four
+//!   file routes mount on the auth listener under its CORS layer, and the
+//!   file server's preflight must pass before the server starts, so the
+//!   `_cfs_` tables and the two deployment contract functions
+//!   (`connetto_visible_files`, `connetto_set_content_state`) must be in
+//!   place.
+//! - `CONNETTO_CONTENT_KEY`: a PKCS8 DER Ed25519 keypair for ticket signing.
+//!   Unset with the URL set generates an ephemeral keypair, so tickets do
+//!   not survive a restart.
+//! - `CONNETTO_CONTENT_STORE`: the chunk store, `fs:<dir>` for a directory
+//!   or any `object_store` URL (`s3://bucket`, `file:///data`). Required
+//!   once `CONNETTO_CONTENT_URL` is set.
+//! - `CONNETTO_CONTENT_TICKET_TTL_SECS`: ticket lifetime in seconds
+//!   (default 3600). A ticket's revocation lag is exactly this.
+//! - `CONNETTO_CONTENT_READ_CEILING`: the bytes one response may serve
+//!   under a read ticket (default 64 MiB).
+//! - `CONNETTO_CONTENT_SWEEP_GRACE_SECS`: how long a recent manifest is
+//!   spared by the sweep (default: the ticket lifetime).
+//! - `CONNETTO_CONTENT_SWEEP_SECS`: how often the sweep runs
+//!   (default 3600, `0` turns it off).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::env::{read_ddl, var_or};
-use connetto_core::messages::FatalErrorReason;
-use connetto_core::traits::HandshakeAuthority;
+use connetto_core::messages::{ContentVerb, FatalErrorReason};
+use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
 use connetto_core::{SchemaVersion, SessionId};
+#[cfg(feature = "content")]
+use connetto_file_server::{
+    self as files, DbPool, DefaultFileSchema, TicketSigner, TicketVerifier,
+};
 use connetto_server::audit::pg_audit_hook;
 use connetto_server::capability::DEFAULT_USER_SETTING;
 use connetto_server::openfga::{
@@ -79,13 +105,12 @@ use connetto_server::reach::GrantReach;
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
     DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    NoSigner, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
-    ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
-    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
-    SessionConfig, SessionError, SessionManager, ThrottleConfig, TokenAuthority,
-    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
-    connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
-    preflight,
+    OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, ProviderRegistry,
+    ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
+    RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig,
+    SessionError, SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
+    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
+    is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
@@ -464,6 +489,178 @@ fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
     }
 }
 
+/// The chunk store named by `CONNETTO_CONTENT_STORE`, parsed before anything
+/// opens it so the sweep task and the router each hold their own handle on
+/// the same location.
+#[cfg(feature = "content")]
+enum StoreSpec {
+    /// A directory chunk store.
+    Fs(std::path::PathBuf),
+    /// An `object_store` URL backend.
+    Object(url::Url),
+}
+
+/// Parse the `CONNETTO_CONTENT_STORE` value: `fs:<dir>` for the directory
+/// store, anything else an `object_store` URL.
+#[cfg(feature = "content")]
+fn parse_store_spec(spec: &str) -> Result<StoreSpec> {
+    if let Some(dir) = spec.strip_prefix("fs:") {
+        if dir.trim().is_empty() {
+            return Err(anyhow!("CONNETTO_CONTENT_STORE: fs: needs a directory"));
+        }
+        return Ok(StoreSpec::Fs(std::path::PathBuf::from(dir)));
+    }
+    url::Url::parse(spec)
+        .map(StoreSpec::Object)
+        .with_context(|| format!("parsing CONNETTO_CONTENT_STORE: {spec:?}"))
+}
+
+/// Open the store one handle names.
+#[cfg(feature = "content")]
+fn open_store(spec: &StoreSpec) -> Result<files::AnyStore> {
+    match spec {
+        StoreSpec::Fs(dir) => files::FsStore::new(dir)
+            .map(files::AnyStore::Fs)
+            .map_err(|err| anyhow!("opening the chunk store at {}: {err}", dir.display())),
+        StoreSpec::Object(url) => files::AnyStore::from_url(url)
+            .map_err(|err| anyhow!("opening the chunk store at {url}: {err}")),
+    }
+}
+
+/// The ticket keypair: `CONNETTO_CONTENT_KEY`'s PKCS8 DER when set, an
+/// ephemeral one otherwise, warned about the way the JWT keys warn. Returns
+/// the signer and the public half the mounted routes verify with.
+#[cfg(feature = "content")]
+fn ticket_keypair(
+    der: Option<&[u8]>,
+    base_url: String,
+    ttl: Duration,
+    read_ceiling: u64,
+) -> Result<(TicketSigner, Vec<u8>)> {
+    if let Some(der) = der {
+        let signer = TicketSigner::from_pkcs8_der(der, base_url, ttl, read_ceiling)
+            .map_err(|err| anyhow!("loading the content ticket key: {err}"))?;
+        let public = signer.public_key_bytes().to_vec();
+        Ok((signer, public))
+    } else {
+        tracing::warn!(
+            "no CONNETTO_CONTENT_KEY set, generating an ephemeral content ticket keypair, \
+             so tickets do not survive a restart"
+        );
+        TicketSigner::generate(base_url, ttl, read_ceiling)
+            .map_err(|err| anyhow!("generating the content ticket keypair: {err}"))
+    }
+}
+
+/// The file-serving half of the deployment, from the `CONNETTO_CONTENT_*`
+/// settings.
+///
+/// `CONNETTO_CONTENT_URL` unset answers no signer and no router, which is
+/// the no-files deployment of today. Set, the store opens, the keypair
+/// loads, and the file server's preflight runs before startup proceeds, so a
+/// deployment missing its `_cfs_` tables or its two contract functions
+/// refuses to start naming what is absent.
+///
+/// The router mounts on the auth listener under its `CorsLayer` (R69
+/// decision 1), and the pools are the file router's own two built from the
+/// same conninfos, so an upload never queues behind the change stream for
+/// the owner pool and a bulk read never spends the change path's reader
+/// share (R81's finding).
+#[cfg(feature = "content")]
+async fn build_content(
+    admin_url: &str,
+    reader_url: &str,
+    reader_pool_size: u32,
+) -> Result<(ServerSigner, Option<axum::Router>)> {
+    let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
+        return Ok((ServerSigner::None, None));
+    };
+    let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
+    let read_ceiling = env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?;
+    let grace = Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_GRACE_SECS", ttl.as_secs())?);
+    let store_setting = var_nonempty("CONNETTO_CONTENT_STORE")
+        .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?;
+    let spec = parse_store_spec(&store_setting)?;
+    let der = match var_nonempty("CONNETTO_CONTENT_KEY") {
+        Some(path) => Some(std::fs::read(&path).with_context(|| format!("reading {path}"))?),
+        None => None,
+    };
+    let (signer, public) = ticket_keypair(der.as_deref(), base_url.clone(), ttl, read_ceiling)?;
+    let admin = build_pool(admin_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
+    let reader = build_pool(reader_url, reader_pool_size).await?;
+    let router = files::serve(files::Config::<DefaultFileSchema> {
+        pools: files::AppPools {
+            admin: admin.clone(),
+            reader,
+        },
+        store: open_store(&spec)?,
+        verifier: TicketVerifier::new(public),
+        grace,
+        _schema: std::marker::PhantomData,
+    })
+    .await
+    .map_err(|err| anyhow!("content preflight: {err}"))?;
+    let cadence = Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?);
+    spawn_sweep(admin, spec, grace, cadence);
+    tracing::info!(
+        base = %base_url,
+        store = %store_setting,
+        ticket_ttl_secs = ttl.as_secs(),
+        sweep_secs = cadence.as_secs(),
+        "file routes mounted on the auth listener",
+    );
+    Ok((ServerSigner::Files(Box::new(signer)), Some(router)))
+}
+
+/// The no-op shape of [`build_content`] for a binary built without the
+/// `content` feature. A configured deployment still hears about it.
+#[cfg(not(feature = "content"))]
+async fn build_content(
+    _admin_url: &str,
+    _reader_url: &str,
+    _reader_pool_size: u32,
+) -> Result<(ServerSigner, Option<axum::Router>)> {
+    if var_nonempty("CONNETTO_CONTENT_URL").is_some() {
+        tracing::warn!(
+            "CONNETTO_CONTENT_URL is set but this binary was built without the content \
+             feature, so no file routes are mounted"
+        );
+    }
+    Ok((ServerSigner::None, None))
+}
+
+/// Reclaim unreferenced chunks on a cadence, the way the slot watch runs.
+/// A failed pass is logged, not fatal, the next pass retries what it lost.
+#[cfg(feature = "content")]
+fn spawn_sweep(admin: DbPool, spec: StoreSpec, grace: Duration, cadence: Duration) {
+    if cadence.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        let store = match open_store(&spec) {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::error!(error = %err, "the content sweep has no store");
+                return;
+            }
+        };
+        let mut ticker = tokio::time::interval(cadence);
+        // The first tick completes at once, before the deployment can have
+        // orphaned anything, so spend it here.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match files::sweep::<DefaultFileSchema>(&admin, &store, grace).await {
+                Ok(0) => {}
+                Ok(removed) => {
+                    tracing::info!(removed, "content sweep reclaimed unreferenced chunks");
+                }
+                Err(err) => tracing::warn!(error = %err, "content sweep failed"),
+            }
+        }
+    });
+}
+
 /// Read a `u32` from `<key>`, or `default` when unset.
 fn env_u32(key: &str, default: u32) -> Result<u32> {
     match std::env::var(key) {
@@ -473,6 +670,26 @@ fn env_u32(key: &str, default: u32) -> Result<u32> {
             .parse()
             .with_context(|| format!("parsing {key}: {text:?}")),
     }
+}
+
+/// Read a `u64` from `<key>`, or `default` when unset.
+#[cfg(feature = "content")]
+fn env_u64(key: &str, default: u64) -> Result<u64> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .with_context(|| format!("parsing {key}: {text:?}")),
+    }
+}
+
+/// The value of `<key>` when it is set to something other than blank.
+fn var_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Parse `CONNETTO_WRITABLE` into a runtime write policy. Each comma-separated
@@ -574,8 +791,64 @@ fn caller_mapping() -> Option<SessionVariableMapping> {
 }
 
 /// The concrete manager this binary serves.
-type ServerManager =
-    SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgReadConnector, PgOplog>;
+type ServerManager = SessionManager<
+    PgSnapshotSource,
+    ServerAuth,
+    ConnettoWatermark,
+    PgReadConnector,
+    PgOplog,
+    String,
+    String,
+    ServerSigner,
+>;
+
+/// The content ticket signer this binary mints with, chosen at startup.
+///
+/// `None` is the no-files deployment of today: the session answers every
+/// ticket request with the distinct signer-failure detail. `Files` is the
+/// file server's own signer over the one keypair the decision keeps in
+/// `main`, whose public half verifies the tickets at the routes mounted
+/// beside the login endpoints.
+enum ServerSigner {
+    /// `CONNETTO_CONTENT_URL` is unset.
+    None,
+    /// The file server's signer, boxed so the variant stays small.
+    #[cfg(feature = "content")]
+    Files(Box<TicketSigner>),
+}
+
+/// Why one mint through [`ServerSigner`] failed.
+#[derive(Debug, thiserror::Error)]
+enum SignerError {
+    /// The deployment serves no files.
+    #[error("this deployment serves no files (CONNETTO_CONTENT_URL is unset)")]
+    NotConfigured,
+    /// The file server's signer refused.
+    #[cfg(feature = "content")]
+    #[error(transparent)]
+    Ticket(#[from] files::ticket::TicketError),
+}
+
+impl ContentTicketSigner for ServerSigner {
+    type Error = SignerError;
+
+    async fn mint(
+        &self,
+        caller: &str,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> Result<String, Self::Error> {
+        match self {
+            Self::None => Err(SignerError::NotConfigured),
+            #[cfg(feature = "content")]
+            Self::Files(signer) => {
+                ContentTicketSigner::mint(signer.as_ref(), caller, file_id, verb)
+                    .await
+                    .map_err(SignerError::Ticket)
+            }
+        }
+    }
+}
 
 /// R27 decision 6: move-out withdrawals are read on `DATABASE_URL`'s pool,
 /// because the policy that made those rows visible to the caller is exactly
@@ -665,6 +938,10 @@ async fn main() -> Result<()> {
         )
     })?;
     let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
+    // The file routes mount on the auth listener beside the login
+    // endpoints, and the session mints with the same keypair the mounted
+    // routes verify with, so no key material leaves the process.
+    let (signer, file_router) = build_content(&database_url, &reader_url, reader_pool_size).await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?
         .with_publication(publication.as_str());
@@ -696,7 +973,7 @@ async fn main() -> Result<()> {
         Arc::clone(&guard),
         SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
         Some(upkeep),
-        NoSigner,
+        signer,
     );
     install_withdrawals(&manager, &pool, &pg_ddl)?;
     // Revoking a session closes its live connection rather than only refusing
@@ -723,7 +1000,7 @@ async fn main() -> Result<()> {
             });
         }));
     }
-    spawn_auth_endpoints(&service, registry);
+    spawn_auth_endpoints(&service, registry, file_router);
     run(
         &manager,
         &pool,
@@ -736,8 +1013,39 @@ async fn main() -> Result<()> {
     .await
 }
 
-/// Serve the login and refresh endpoints beside the sync listener.
-fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<ProviderRegistry>) {
+/// The auth listener's `CorsLayer`: loopback origins plus what
+/// `CONNETTO_AUTH_CORS_ORIGINS` lists. The file routes ride the same layer
+/// because a `PUT` or a JSON `POST` from a dev-server origin preflights, and
+/// one origin means a deployment names its origins once.
+fn cors_layer(cors_origins: &[String]) -> CorsLayer {
+    let origins = cors_origins.to_vec();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
+            origin.to_str().is_ok_and(|origin| {
+                is_loopback_origin(origin) || origins.iter().any(|allowed| allowed == origin)
+            })
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// Mount the file router on the auth listener's router before the CORS layer
+/// goes on, so the file routes answer at the login endpoints' origin.
+fn mount_on_auth_listener(auth: axum::Router, files: Option<axum::Router>) -> axum::Router {
+    match files {
+        Some(files) => auth.merge(files),
+        None => auth,
+    }
+}
+
+/// Serve the login and refresh endpoints beside the sync listener, and the
+/// file routes when the deployment configured a content backend. The one
+/// `CorsLayer` covers both surfaces, so a browser client sees one origin.
+fn spawn_auth_endpoints(
+    service: &Arc<AuthService<ServerStore>>,
+    registry: Arc<ProviderRegistry>,
+    file_router: Option<axum::Router>,
+) {
     let auth_bind = var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
     // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
     // non-loopback client redirect URIs that are permitted (a browser client
@@ -761,20 +1069,15 @@ fn spawn_auth_endpoints(service: &Arc<AuthService<ServerStore>>, registry: Arc<P
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
-            origin.to_str().is_ok_and(|origin| {
-                is_loopback_origin(origin) || cors_origins.iter().any(|allowed| allowed == origin)
-            })
-        }))
-        .allow_methods(Any)
-        .allow_headers(Any);
-    let router = auth_router(
-        Arc::clone(service),
-        registry,
-        RedirectPolicy::new(allowlist),
+    let router = mount_on_auth_listener(
+        auth_router(
+            Arc::clone(service),
+            registry,
+            RedirectPolicy::new(allowlist),
+        ),
+        file_router,
     )
-    .layer(cors);
+    .layer(cors_layer(&cors_origins));
     tokio::spawn(async move {
         match TcpListener::bind(&auth_bind).await {
             Ok(listener) => {
@@ -951,9 +1254,7 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
 /// Start CDC ingestion and serve connections until the listener fails or a
 /// shutdown signal arrives.
 async fn run(
-    manager: &Arc<
-        SessionManager<PgSnapshotSource, ServerAuth, ConnettoWatermark, PgReadConnector, PgOplog>,
-    >,
+    manager: &Arc<ServerManager>,
     pool: &Pool<AsyncPgConnection>,
     database_url: &str,
     slot: &str,
@@ -1068,4 +1369,165 @@ async fn run(
         tracing::warn!("shutdown grace elapsed with sessions still open");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn an_unset_deployment_refuses_every_ticket() {
+        let err =
+            ContentTicketSigner::mint(&ServerSigner::None, "u-1", [0u8; 32], ContentVerb::Read)
+                .await
+                .expect_err("no signer is configured");
+        assert!(matches!(err, SignerError::NotConfigured));
+    }
+
+    #[tokio::test]
+    async fn the_file_routes_share_the_auth_listeners_cors_layer() {
+        let file_routes =
+            axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" }));
+        let app = mount_on_auth_listener(axum::Router::new(), Some(file_routes))
+            .layer(cors_layer(&["https://app.example".to_owned()]));
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/files/abc")
+                    .header("origin", "https://app.example")
+                    .header("access-control-request-method", "PUT")
+                    .body(Body::empty())
+                    .expect("a preflight request"),
+            )
+            .await
+            .expect("the layer answers the preflight");
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            allowed_origin(&preflight).as_deref(),
+            Some("https://app.example"),
+            "a listed origin may upload"
+        );
+
+        let served = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/files/abc")
+                    .header("origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .expect("a get request"),
+            )
+            .await
+            .expect("the merged router serves the file route");
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            allowed_origin(&served).as_deref(),
+            Some("http://localhost:5173"),
+            "a loopback origin is always allowed"
+        );
+
+        let refused = app
+            .oneshot(
+                Request::builder()
+                    .uri("/files/abc")
+                    .header("origin", "https://elsewhere.example")
+                    .body(Body::empty())
+                    .expect("a get request"),
+            )
+            .await
+            .expect("the router still serves the body");
+        assert!(
+            allowed_origin(&refused).is_none(),
+            "an unlisted origin must not be handed the response"
+        );
+    }
+
+    /// The `access-control-allow-origin` header, if the CORS layer granted one.
+    fn allowed_origin(response: &axum::http::Response<Body>) -> Option<String> {
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|value| value.to_str().expect("ascii header").to_owned())
+    }
+
+    #[cfg(feature = "content")]
+    mod content {
+        use super::*;
+
+        #[test]
+        fn fs_prefix_names_a_directory() {
+            match parse_store_spec("fs:/var/lib/connetto/content").expect("a directory store") {
+                StoreSpec::Fs(dir) => assert_eq!(dir.as_os_str(), "/var/lib/connetto/content"),
+                StoreSpec::Object(_) => panic!("fs: names the directory store"),
+            }
+        }
+
+        #[test]
+        fn an_object_url_names_an_object_store() {
+            match parse_store_spec("s3://bucket/prefix").expect("an object store") {
+                StoreSpec::Object(url) => assert_eq!(url.scheme(), "s3"),
+                StoreSpec::Fs(_) => panic!("a url names an object store"),
+            }
+        }
+
+        #[test]
+        fn fs_without_a_directory_and_an_unparsable_url_are_refused() {
+            assert!(parse_store_spec("fs:").is_err());
+            assert!(parse_store_spec("not a url").is_err());
+        }
+
+        #[tokio::test]
+        async fn a_keypair_loaded_from_der_mints_what_its_public_half_verifies() {
+            let rng = ring::rand::SystemRandom::new();
+            let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("a fresh key");
+            let (signer, public) = ticket_keypair(
+                Some(doc.as_ref()),
+                "http://127.0.0.1:8081".to_owned(),
+                Duration::from_secs(60),
+                1 << 20,
+            )
+            .expect("a keypair from its DER");
+            let url = ContentTicketSigner::mint(&signer, "caller-1", [7u8; 32], ContentVerb::Read)
+                .await
+                .expect("a minted read url");
+            let token = url.split_once("?t=").expect("the token rides the url").1;
+            let payload = TicketVerifier::new(public)
+                .verify(token)
+                .expect("the minted token verifies");
+            assert_eq!(payload.file_id, [7u8; 32]);
+            assert_eq!(payload.caller, "caller-1");
+        }
+
+        #[tokio::test]
+        async fn an_ephemeral_keypair_mints_what_its_public_half_verifies() {
+            let (signer, public) = ticket_keypair(
+                None,
+                "http://127.0.0.1:8081".to_owned(),
+                Duration::from_secs(60),
+                1 << 20,
+            )
+            .expect("an ephemeral keypair");
+            let url = ContentTicketSigner::mint(
+                &signer,
+                "caller-2",
+                [9u8; 32],
+                ContentVerb::Write { declared_len: 128 },
+            )
+            .await
+            .expect("a minted write url");
+            assert!(url.starts_with("http://127.0.0.1:8081/files/"));
+            assert!(url.contains("/intent?t="));
+            let token = url.split_once("?t=").expect("the token rides the url").1;
+            let payload = TicketVerifier::new(public)
+                .verify(token)
+                .expect("the minted token verifies");
+            assert_eq!(payload.file_id, [9u8; 32]);
+        }
+    }
 }
